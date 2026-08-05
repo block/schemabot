@@ -556,10 +556,10 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		return
 	}
 
-	// The check refresh request depends only on the apply settling to terminal
+	// The merge gate request depends only on the apply settling to terminal
 	// success; record it before control-request cleanup so a cleanup error
 	// cannot suppress it.
-	s.recordCheckRefreshIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+	s.recordMergeGateIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
 
 	// If the derived state above settled the apply terminally and a stop or
 	// cancel is still pending, complete it now so the request does not linger
@@ -738,10 +738,10 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// error must not suppress it.
 	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
 
-	// Like the terminal summary, the check refresh request depends only on the
+	// Like the terminal summary, the merge gate request depends only on the
 	// apply settling to terminal success; record it before control-request
 	// cleanup so a cleanup error cannot suppress it.
-	s.recordCheckRefreshIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID)
+	s.recordMergeGateIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID)
 
 	if err := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
@@ -914,11 +914,11 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// summary; publish it if this projection won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, finalApply, result)
 
-	// Like the terminal summary, the check refresh request depends only on the
+	// Like the terminal summary, the merge gate request depends only on the
 	// apply settling to terminal success (the data-plane apply can complete
 	// while a stop was requested); record it before control-request cleanup so
 	// a cleanup error cannot suppress it.
-	s.recordCheckRefreshIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+	s.recordMergeGateIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
 
 	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
@@ -1019,20 +1019,20 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 	return nil
 }
 
-// hasCheckRefreshConsumer reports whether a check refresh consumer — a
+// hasMergeGateConsumer reports whether a merge gate consumer — a
 // running refresh processor, registered by the code-host integration — exists
 // on this server. A nil callback means no code-host integration is running a
 // processor: no stored check state to refresh and nothing to drain requests.
-func (s *Service) hasCheckRefreshConsumer() bool {
-	return s.OnCheckRefreshRecorded != nil
+func (s *Service) hasMergeGateConsumer() bool {
+	return s.OnMergeGateRecorded != nil
 }
 
-// recordCheckRefreshIfApplyResolved records a durable settle check refresh
+// recordMergeGateIfApplyResolved records a durable settle merge gate
 // request once the apply has settled terminally. A completed apply —
 // including a completed rollback — changes the live schema of its
 // (environment, database type, database) target, which stales the stored plan
-// check state of every other open change planning against that target; the check
-// refresh processor consumes the settle to re-plan those PRs. A terminal
+// check state of every other open change planning against that target; the merge
+// gate processor consumes the settle to re-plan those PRs. A terminal
 // outcome that did not change the schema (failed, stopped, cancelled) needs a
 // settle only when a preflight request held sibling checks before the apply
 // started — the settle's re-plan is what releases those holds. The apply is
@@ -1040,82 +1040,82 @@ func (s *Service) hasCheckRefreshConsumer() bool {
 // mutate the caller's row. Recording is idempotent (one request per apply and
 // kind) and never fails the drive tail: errors are logged and counted, and
 // the backstop sweeps re-record anything missed here. No-op on a server with
-// no check refresh consumer (no code-host integration running a processor).
-func (s *Service) recordCheckRefreshIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
-	if !s.hasCheckRefreshConsumer() {
+// no merge gate consumer (no code-host integration running a processor).
+func (s *Service) recordMergeGateIfApplyResolved(ctx context.Context, driverID int, applyID int64) {
+	if !s.hasMergeGateConsumer() {
 		// Without a code-host integration this server has no stored check
 		// state to refresh and no processor to drain requests, so a recorded
 		// row would sit pending forever.
-		s.logger.Debug("operator: no check refresh consumer registered (no code-host integration on this server); skipping check refresh recording",
+		s.logger.Debug("operator: no merge gate consumer registered (no code-host integration on this server); skipping merge gate recording",
 			"driver", driverID)
 		return
 	}
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
-		s.logger.Error("operator: failed to reload apply before recording settle check refresh request; the backstop sweep will record it",
+		s.logger.Error("operator: failed to reload apply before recording settle merge gate request; the backstop sweep will record it",
 			"driver", driverID, "error", fmt.Errorf("reload apply %d: %w", applyID, err))
 		return
 	}
 	if apply == nil {
-		s.logger.Error("operator: apply not found while recording settle check refresh request; no refresh will be recorded",
+		s.logger.Error("operator: apply not found while recording settle merge gate request; no settle will be recorded",
 			"driver", driverID, "error", fmt.Errorf("reload apply %d: %w", applyID, storage.ErrApplyNotFound))
 		return
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		s.logger.Debug("operator: apply is not terminal; no settle check refresh recorded",
+		s.logger.Debug("operator: apply is not terminal; no settle merge gate recorded",
 			append(apply.LogAttrs(), "driver", driverID)...)
 		return
 	}
 	if !state.IsState(apply.State, state.Apply.Completed) {
 		// Only terminal success mutates the target schema, so a non-success
 		// outcome needs a settle only to release a preflight hold.
-		preflight, err := s.storage.CheckRefreshRequests().GetByApplyAndKind(ctx, apply.ID, storage.CheckRefreshKindPreflight)
+		preflight, err := s.storage.MergeGateRequests().GetByApplyAndKind(ctx, apply.ID, storage.MergeGateKindPreflight)
 		if err != nil {
-			s.logger.Error("operator: failed to look up preflight check refresh request for settled apply; the release sweep will record the settle if sibling checks are held",
+			s.logger.Error("operator: failed to look up preflight merge gate request for settled apply; the release sweep will record the settle if sibling checks are held",
 				append(apply.LogAttrs(), "driver", driverID, "error", err)...)
-			metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
+			metrics.RecordMergeGateRecordFailure(ctx, apply.Database, apply.Environment)
 			return
 		}
 		if preflight == nil {
-			s.logger.Debug("operator: apply settled without terminal success and no preflight held sibling checks; no settle check refresh needed",
+			s.logger.Debug("operator: apply settled without terminal success and no preflight held sibling checks; no settle merge gate needed",
 				append(apply.LogAttrs(), "driver", driverID)...)
 			return
 		}
 	}
 
-	recorded, err := s.storage.CheckRefreshRequests().Record(ctx, &storage.CheckRefreshRequest{
+	recorded, err := s.storage.MergeGateRequests().Record(ctx, &storage.MergeGateRequest{
 		ApplyID:         apply.ID,
-		Kind:            storage.CheckRefreshKindSettle,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: apply.ApplyIdentifier,
 		Environment:     apply.Environment,
 		DatabaseType:    apply.DatabaseType,
 		DatabaseName:    apply.Database,
 		Repository:      apply.Repository,
-		PullRequest:     apply.PullRequest,
+		ChangeKey:       storage.ChangeKeyForPullRequest(apply.PullRequest),
 		RequestedBy:     apply.Caller,
 	})
 	if err != nil {
-		s.logger.Error("operator: failed to record settle check refresh request for settled apply; sibling change checks stay stale or held until the backstop sweep records it",
+		s.logger.Error("operator: failed to record settle merge gate request for settled apply; sibling change checks stay stale or held until the backstop sweep records it",
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
-		metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
+		metrics.RecordMergeGateRecordFailure(ctx, apply.Database, apply.Environment)
 		return
 	}
 	if !recorded {
-		s.logger.Debug("operator: settle check refresh request already recorded for settled apply",
+		s.logger.Debug("operator: settle merge gate request already recorded for settled apply",
 			append(apply.LogAttrs(), "driver", driverID)...)
 		return
 	}
-	s.logger.Info("operator: recorded settle check refresh request; sibling change checks against the target will be re-planned",
+	s.logger.Info("operator: recorded settle merge gate request; sibling change checks against the target will be re-planned",
 		append(apply.LogAttrs(), "driver", driverID)...)
-	metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourceDriveTail)
+	metrics.RecordMergeGateRecorded(ctx, apply.Database, apply.Environment, metrics.MergeGateSourceDriveTail)
 	// Non-nil by the consumer gate above; wake the processor to drain now.
-	s.OnCheckRefreshRecorded()
+	s.OnMergeGateRecorded()
 }
 
 const (
 	// checkPreflightGateTimeout bounds how long one drive attempt waits for
 	// the preflight fan-out to hold sibling change checks before the apply's
-	// engine work may start. It exceeds the check refresh processor's poll
+	// engine work may start. It exceeds the merge gate processor's poll
 	// interval so a wake-up kick lost across pods still completes within one
 	// wait. On expiry the drive attempt is abandoned and the apply stays
 	// claimable — fail closed: engine work never starts before the holds are
@@ -1128,12 +1128,12 @@ const (
 )
 
 // gateApplyStartOnCheckPreflight blocks an apply's engine work until the
-// preflight check refresh fan-out has durably held every sibling change's
+// preflight merge gate fan-out has durably held every sibling change's
 // stored check on the apply's target action-required (with a comment on the
 // change explaining the hold). Merges must not land on check verdicts this
 // apply is about to invalidate, so the holds are a hard precondition of the
 // drive: a nil return means the holds are confirmed (or the gate does not
-// apply — no check refresh consumer, or a task-less apply that cannot change
+// apply — no merge gate consumer, or a task-less apply that cannot change
 // the schema). An error
 // means the holds could not be confirmed; the caller abandons the drive
 // attempt and the apply stays claimable, so the start is retried on a later
@@ -1143,21 +1143,21 @@ const (
 // the preflight request is unique per apply, and a completed request passes
 // immediately, so mid-apply resumes and cutover drives pay one storage read.
 func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
-	if !s.hasCheckRefreshConsumer() {
+	if !s.hasMergeGateConsumer() {
 		// Without a code-host integration there is no stored check state to
 		// hold and no processor to drain the request; the apply starts ungated.
-		s.logger.Debug("operator: no check refresh consumer registered (no code-host integration on this server); apply starts without a check preflight",
+		s.logger.Debug("operator: no merge gate consumer registered (no code-host integration on this server); apply starts without a check preflight",
 			"driver", driverID)
 		return nil
 	}
 
-	store := s.storage.CheckRefreshRequests()
-	req, err := store.GetByApplyAndKind(ctx, apply.ID, storage.CheckRefreshKindPreflight)
+	store := s.storage.MergeGateRequests()
+	req, err := store.GetByApplyAndKind(ctx, apply.ID, storage.MergeGateKindPreflight)
 	if err != nil {
 		metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
-		return fmt.Errorf("load preflight check refresh request: %w", err)
+		return fmt.Errorf("load preflight merge gate request: %w", err)
 	}
-	if req != nil && req.State == storage.CheckRefreshCompleted {
+	if req != nil && req.State == storage.MergeGateCompleted {
 		// The common resume/cutover fast path: holds were confirmed on an
 		// earlier drive attempt.
 		s.logger.Debug("operator: check preflight already completed; apply may start",
@@ -1178,29 +1178,29 @@ func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID i
 				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
 			return nil
 		}
-		recorded, err := store.Record(ctx, &storage.CheckRefreshRequest{
+		recorded, err := store.Record(ctx, &storage.MergeGateRequest{
 			ApplyID:         apply.ID,
-			Kind:            storage.CheckRefreshKindPreflight,
+			Kind:            storage.MergeGateKindPreflight,
 			ApplyIdentifier: apply.ApplyIdentifier,
 			Environment:     apply.Environment,
 			DatabaseType:    apply.DatabaseType,
 			DatabaseName:    apply.Database,
 			Repository:      apply.Repository,
-			PullRequest:     apply.PullRequest,
+			ChangeKey:       storage.ChangeKeyForPullRequest(apply.PullRequest),
 			RequestedBy:     apply.Caller,
 		})
 		if err != nil {
-			metrics.RecordCheckRefreshRecordFailure(ctx, apply.Database, apply.Environment)
+			metrics.RecordMergeGateRecordFailure(ctx, apply.Database, apply.Environment)
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
-			return fmt.Errorf("record preflight check refresh request: %w", err)
+			return fmt.Errorf("record preflight merge gate request: %w", err)
 		}
 		if recorded {
-			s.logger.Info("operator: recorded preflight check refresh request; apply start waits for sibling change checks on the target to be held",
+			s.logger.Info("operator: recorded preflight merge gate request; apply start waits for sibling change checks on the target to be held",
 				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
-			metrics.RecordCheckRefreshRecorded(ctx, apply.Database, apply.Environment, metrics.CheckRefreshSourcePreflightGate)
+			metrics.RecordMergeGateRecorded(ctx, apply.Database, apply.Environment, metrics.MergeGateSourcePreflightGate)
 		}
 		// Non-nil by the consumer gate above; wake the processor to drain now.
-		s.OnCheckRefreshRecorded()
+		s.OnMergeGateRecorded()
 	}
 
 	return s.waitForCheckPreflight(ctx, driverID, apply, deployment)
@@ -1213,39 +1213,39 @@ func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID i
 // retry cap) blocks the apply only until the cause clears, not until manual
 // intervention.
 func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
-	store := s.storage.CheckRefreshRequests()
+	store := s.storage.MergeGateRequests()
 	deadline := time.Now().Add(checkPreflightGateTimeout)
 	for {
-		req, err := store.GetByApplyAndKind(ctx, apply.ID, storage.CheckRefreshKindPreflight)
+		req, err := store.GetByApplyAndKind(ctx, apply.ID, storage.MergeGateKindPreflight)
 		if err != nil {
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
-			return fmt.Errorf("poll preflight check refresh request: %w", err)
+			return fmt.Errorf("poll preflight merge gate request: %w", err)
 		}
 		if req == nil {
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
-			return fmt.Errorf("preflight check refresh request for apply %s disappeared while the gate waited on it", apply.ApplyIdentifier)
+			return fmt.Errorf("preflight merge gate request for apply %s disappeared while the gate waited on it", apply.ApplyIdentifier)
 		}
-		if req.State == storage.CheckRefreshCompleted {
+		if req.State == storage.MergeGateCompleted {
 			s.logger.Info("operator: check preflight completed; sibling change checks on the target are held and the apply may start",
 				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "passed")
 			return nil
 		}
-		if req.State == storage.CheckRefreshFailed && req.RetryAfter == nil {
+		if req.State == storage.MergeGateFailed && req.RetryAfter == nil {
 			reopened, err := store.ReopenForRetry(ctx, req.ID)
 			if err != nil {
 				metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
-				return fmt.Errorf("re-arm terminally failed preflight check refresh request: %w", err)
+				return fmt.Errorf("re-arm terminally failed preflight merge gate request: %w", err)
 			}
 			if reopened {
-				s.logger.Warn("operator: preflight check refresh request had terminally failed; re-armed it for retry and the gate keeps waiting",
+				s.logger.Warn("operator: preflight merge gate request had terminally failed; re-armed it for retry and the gate keeps waiting",
 					append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment, "last_error", req.LastError)...)
-				s.OnCheckRefreshRecorded()
+				s.OnMergeGateRecorded()
 			}
 		}
 		if time.Now().After(deadline) {
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "timeout")
-			return fmt.Errorf("preflight holds for apply %s not confirmed within %s (request state %s, attempts %d): apply start stays blocked until the check refresh processor confirms them",
+			return fmt.Errorf("preflight holds for apply %s not confirmed within %s (request state %s, attempts %d): apply start stays blocked until the merge gate processor confirms them",
 				apply.ApplyIdentifier, checkPreflightGateTimeout, req.State, req.Attempts)
 		}
 		select {

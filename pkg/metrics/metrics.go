@@ -1512,50 +1512,50 @@ func RecordPendingDropsCleanupError(ctx context.Context, database, environment, 
 	)
 }
 
-// Check refresh recording sources for RecordCheckRefreshRecorded.
+// Merge gate recording sources for RecordMergeGateRecorded.
 const (
-	// CheckRefreshSourceDriveTail marks a request recorded inline by the
+	// MergeGateSourceDriveTail marks a request recorded inline by the
 	// operator drive tail that settled the apply.
-	CheckRefreshSourceDriveTail = "drive_tail"
-	// CheckRefreshSourceSweep marks a request recorded by the backstop sweep
+	MergeGateSourceDriveTail = "drive_tail"
+	// MergeGateSourceSweep marks a request recorded by the backstop sweep
 	// over recently completed applies.
-	CheckRefreshSourceSweep = "sweep"
-	// CheckRefreshSourcePreflightGate marks a preflight request recorded by
+	MergeGateSourceSweep = "sweep"
+	// MergeGateSourcePreflightGate marks a preflight request recorded by
 	// the operator gate before an apply's engine work starts.
-	CheckRefreshSourcePreflightGate = "preflight_gate"
-	// CheckRefreshSourceReleaseSweep marks a settle request backfilled by the
+	MergeGateSourcePreflightGate = "preflight_gate"
+	// MergeGateSourceReleaseSweep marks a settle request backfilled by the
 	// sweep over terminal applies whose preflight held sibling checks but
 	// whose settle was never recorded.
-	CheckRefreshSourceReleaseSweep = "release_sweep"
+	MergeGateSourceReleaseSweep = "release_sweep"
 )
 
-// RecordCheckRefreshRecorded counts durable check refresh requests recorded
+// RecordMergeGateRecorded counts durable merge gate requests recorded
 // when an apply settles to terminal success. A sustained "sweep" rate means
 // drive tails are failing to record — check the operator logs for the
 // recording error.
-func RecordCheckRefreshRecorded(ctx context.Context, database, environment, source string) {
-	addCounter(ctx, "schemabot.check_refresh.requests_recorded_total",
-		"Total durable check refresh requests recorded for applies that settled to terminal success", "{request}",
+func RecordMergeGateRecorded(ctx context.Context, database, environment, source string) {
+	addCounter(ctx, "schemabot.merge_gate.requests_recorded_total",
+		"Total durable merge gate requests recorded for applies that settled to terminal success", "{request}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("source", source),
 	)
 }
 
-// RecordCheckRefreshRecordFailure counts failures to record a durable check
-// refresh request for a completed apply. The backstop sweep retries the
+// RecordMergeGateRecordFailure counts failures to record a durable merge
+// gate request for a completed apply. The backstop sweep retries the
 // recording on its next pass, so a transient blip self-heals; a sustained rate
 // means storage writes are failing and sibling PR checks are going stale —
 // check the operator logs for the storage error.
-func RecordCheckRefreshRecordFailure(ctx context.Context, database, environment string) {
-	addCounter(ctx, "schemabot.check_refresh.record_failures_total",
-		"Total failures to record a durable check refresh request for a completed apply", "{failure}",
+func RecordMergeGateRecordFailure(ctx context.Context, database, environment string) {
+	addCounter(ctx, "schemabot.merge_gate.record_failures_total",
+		"Total failures to record a durable merge gate request for a completed apply", "{failure}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 	)
 }
 
-// RecordCheckRefreshPROutcome counts per-PR outcomes of check refresh fan-out.
+// RecordMergeGatePROutcome counts per-PR outcomes of merge gate fan-out.
 // Outcomes:
 //   - "refreshed": the PR's stored check state was re-planned against the
 //     mutated target schema.
@@ -1571,9 +1571,9 @@ func RecordCheckRefreshRecordFailure(ctx context.Context, database, environment 
 //   - "skipped_superseded": a racing write (a synchronize that re-planned a
 //     newer head, or an apply that claimed the row) landed first and is
 //     authoritative; the refresh yielded to it.
-func RecordCheckRefreshPROutcome(ctx context.Context, repository, database, environment, outcome string) {
-	addCounter(ctx, "schemabot.check_refresh.pr_refreshes_total",
-		"Total per-PR outcomes of check refresh fan-out after a target schema changed", "{refresh}",
+func RecordMergeGatePROutcome(ctx context.Context, repository, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.merge_gate.pr_refreshes_total",
+		"Total per-PR outcomes of merge gate fan-out after a target schema changed", "{refresh}",
 		attribute.String("repository", repository),
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
@@ -1581,8 +1581,8 @@ func RecordCheckRefreshPROutcome(ctx context.Context, repository, database, envi
 	)
 }
 
-// RecordCheckRefreshEventOutcome counts terminal outcomes of driving one
-// durable check refresh request. Outcomes:
+// RecordMergeGateEventOutcome counts terminal outcomes of driving one
+// durable merge gate request. Outcomes:
 //   - "completed": the fan-out refreshed (or safely skipped) every sibling PR.
 //   - "failed_retrying": the fan-out failed and the request will be retried.
 //   - "failed_terminal": the fan-out failed on its final attempt — sibling PR
@@ -1590,9 +1590,9 @@ func RecordCheckRefreshPROutcome(ctx context.Context, repository, database, envi
 //     Check the server logs for the failing PR and re-plan it.
 //   - "lease_lost": the drive lost its lease mid-fan-out; another driver
 //     re-drives the request (re-planning the same PRs again is safe).
-func RecordCheckRefreshEventOutcome(ctx context.Context, database, environment, outcome string) {
-	addCounter(ctx, "schemabot.check_refresh.events_total",
-		"Total terminal outcomes of driving durable check refresh requests", "{event}",
+func RecordMergeGateEventOutcome(ctx context.Context, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.merge_gate.events_total",
+		"Total terminal outcomes of driving durable merge gate requests", "{event}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),
@@ -1605,13 +1605,13 @@ func RecordCheckRefreshEventOutcome(ctx context.Context, database, environment, 
 //   - "passed": the preflight fan-out confirmed the holds; the apply started.
 //   - "timeout": the holds were not confirmed within the gate deadline; the
 //     drive attempt was abandoned and the apply stays claimable. A sustained
-//     rate means the check refresh processor is failing to drain preflight
-//     requests — check its logs; applies on servers with a check refresh
+//     rate means the merge gate processor is failing to drain preflight
+//     requests — check its logs; applies on servers with a merge gate
 //     consumer will not start until it recovers.
 //   - "error": the gate could not read or record the preflight request
 //     (storage failure); the drive attempt was abandoned, fail closed.
 func RecordCheckPreflightGateOutcome(ctx context.Context, database, environment, outcome string) {
-	addCounter(ctx, "schemabot.check_refresh.preflight_gate_total",
+	addCounter(ctx, "schemabot.merge_gate.preflight_gate_total",
 		"Total operator preflight gate outcomes before apply engine work starts", "{gate}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
@@ -1619,14 +1619,14 @@ func RecordCheckPreflightGateOutcome(ctx context.Context, database, environment,
 	)
 }
 
-// RecordCheckRefreshTerminatedStuck counts check refresh requests terminated
+// RecordMergeGateTerminatedStuck counts merge gate requests terminated
 // by the stuck-processing sweep: rows wedged past the attempt cap with an
 // expired lease (a driver hard-killed on its final attempt). Each terminated
 // request means sibling PR stored checks for its target may remain stale —
 // find the request's target in the server logs and re-plan the affected PRs.
-func RecordCheckRefreshTerminatedStuck(ctx context.Context, terminated int64) {
-	addCounterN(ctx, terminated, "schemabot.check_refresh.terminated_stuck_total",
-		"Total check refresh requests terminated by the stuck-processing sweep", "{request}",
+func RecordMergeGateTerminatedStuck(ctx context.Context, terminated int64) {
+	addCounterN(ctx, terminated, "schemabot.merge_gate.terminated_stuck_total",
+		"Total merge gate requests terminated by the stuck-processing sweep", "{request}",
 	)
 }
 

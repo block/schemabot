@@ -1,6 +1,6 @@
 //go:build integration
 
-// Check refresh guardrail integration tests. Before an apply's engine work
+// Merge gate guardrail integration tests. Before an apply's engine work
 // starts on a (environment, database type, database) target, a preflight
 // request holds every sibling PR's stored check on that target
 // action-required — with a PR comment explaining the hold — so a merge cannot
@@ -38,27 +38,27 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const checkRefreshTestLeaseOwner = "check-refresh-test-driver"
+const mergeGateTestLeaseOwner = "merge-gate-test-driver"
 
-// clearCheckRefreshRequests empties the shared check_refresh_requests table.
+// clearMergeGateRequests empties the shared merge_gate_requests table.
 // The table is cross-test shared state: apply drive tails in earlier tests
 // record requests the processor never drains there, and this test's drain
 // would otherwise claim them before its own.
-func clearCheckRefreshRequests(t *testing.T) {
+func clearMergeGateRequests(t *testing.T) {
 	t.Helper()
 	db, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
-	_, err = db.ExecContext(t.Context(), "DELETE FROM check_refresh_requests")
+	_, err = db.ExecContext(t.Context(), "DELETE FROM merge_gate_requests")
 	require.NoError(t, err)
 }
 
-// recordRefreshRequest records a pending refresh request directly, standing in
+// recordRefreshRequest records a pending merge gate request directly, standing in
 // for the operator drive tail so the processor side can be exercised in
 // isolation.
-func recordRefreshRequest(t *testing.T, svc *api.Service, req *storage.CheckRefreshRequest) *storage.CheckRefreshRequest {
+func recordRefreshRequest(t *testing.T, svc *api.Service, req *storage.MergeGateRequest) *storage.MergeGateRequest {
 	t.Helper()
-	recorded, err := svc.Storage().CheckRefreshRequests().Record(t.Context(), req)
+	recorded, err := svc.Storage().MergeGateRequests().Record(t.Context(), req)
 	require.NoError(t, err)
 	require.True(t, recorded)
 	return req
@@ -84,16 +84,16 @@ func seedRefreshTargetCheck(t *testing.T, svc *api.Service, pr int, env, dbName,
 	return check
 }
 
-// TestE2ECheckRefreshRecordedOnApplyTerminalSuccess drives a real apply
+// TestE2EMergeGateRecordedOnApplyTerminalSuccess drives a real apply
 // through the webhook command path to terminal success and verifies both
 // durable requests around it: the operator gate records a preflight the
 // processor must complete before the apply's engine work starts, and the
 // drive tail records a settle for the apply's target before the apply is
 // considered done — the request other pods' sibling PR checks are refreshed
 // from.
-func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_drivetail"
+func TestE2EMergeGateRecordedOnApplyTerminalSuccess(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_drivetail"
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
@@ -116,10 +116,10 @@ func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
 	// for its next poll tick. The probe chains the handler's own kick: the
 	// preflight gate blocks the apply until the processor completes the
 	// preflight fan-out, so the wake-up must still reach the processor.
-	kick := svc.OnCheckRefreshRecorded
+	kick := svc.OnMergeGateRecorded
 	require.NotNil(t, kick, "the handler registers the processor kick on the service at construction")
 	kicked := make(chan struct{}, 1)
-	svc.OnCheckRefreshRecorded = func() {
+	svc.OnMergeGateRecorded = func() {
 		select {
 		case kicked <- struct{}{}:
 		default:
@@ -166,45 +166,45 @@ func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
 
 	// The gate's preflight is a hard precondition of the drive: a completed
 	// apply proves its preflight fan-out finished before the engine started.
-	preflight, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.CheckRefreshKindPreflight)
+	preflight, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.MergeGateKindPreflight)
 	require.NoError(t, err)
 	require.NotNil(t, preflight, "the gate records a preflight request before the apply starts")
-	assert.Equal(t, storage.CheckRefreshCompleted, preflight.State,
+	assert.Equal(t, storage.MergeGateCompleted, preflight.State,
 		"an apply cannot reach terminal state before its preflight fan-out completed")
 
 	// The drive tail records the settle request as part of the terminal
 	// transition, so it must be visible as soon as the apply is completed.
-	var refreshReq *storage.CheckRefreshRequest
+	var gateReq *storage.MergeGateRequest
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		req, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.CheckRefreshKindSettle)
+		req, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.MergeGateKindSettle)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, req) {
 			return
 		}
-		refreshReq = req
+		gateReq = req
 	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
 
-	assert.Equal(t, apply.ApplyIdentifier, refreshReq.ApplyIdentifier)
-	assert.Equal(t, "staging", refreshReq.Environment)
-	assert.Equal(t, "mysql", refreshReq.DatabaseType)
-	assert.Equal(t, dbName, refreshReq.DatabaseName)
-	assert.Equal(t, "octocat/hello-world", refreshReq.Repository)
-	assert.Equal(t, 1, refreshReq.PullRequest)
-	assert.Equal(t, apply.Caller, refreshReq.RequestedBy)
+	assert.Equal(t, apply.ApplyIdentifier, gateReq.ApplyIdentifier)
+	assert.Equal(t, "staging", gateReq.Environment)
+	assert.Equal(t, "mysql", gateReq.DatabaseType)
+	assert.Equal(t, dbName, gateReq.DatabaseName)
+	assert.Equal(t, "octocat/hello-world", gateReq.Repository)
+	assert.Equal(t, "1", gateReq.ChangeKey)
+	assert.Equal(t, apply.Caller, gateReq.RequestedBy)
 
 	select {
 	case <-kicked:
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the drive tail to invoke the check refresh recorded-notifier")
+		t.Fatal("timed out waiting for the drive tail to invoke the merge gate recorded-notifier")
 	}
 }
 
-// TestE2ECheckRefreshSweepBackfillsMissedApply verifies the outbox backstop: a
-// completed apply with no refresh request (a pod crash between the terminal
+// TestE2EMergeGateSweepBackfillsMissedApply verifies the outbox backstop: a
+// completed apply with no merge gate request (a pod crash between the terminal
 // write and the drive-tail recording) is found by the processor's sweep and
 // its request backfilled with full attribution, so the fan-out is never lost.
-func TestE2ECheckRefreshSweepBackfillsMissedApply(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_sweep"
+func TestE2EMergeGateSweepBackfillsMissedApply(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_sweep"
 	// The sweep reads and writes storage only, so the lighter storage-backed
 	// service is enough — no target database, tern client, or operator.
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
@@ -225,7 +225,7 @@ func TestE2ECheckRefreshSweepBackfillsMissedApply(t *testing.T) {
 	})
 
 	apply := &storage.Apply{
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_sweep_%d", time.Now().UnixNano()),
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_sweep_%d", time.Now().UnixNano()),
 		LockID:          lock.ID,
 		PlanID:          1,
 		Database:        dbName,
@@ -245,37 +245,37 @@ func TestE2ECheckRefreshSweepBackfillsMissedApply(t *testing.T) {
 	apply.CompletedAt = &completedAt
 	require.NoError(t, svc.Storage().Applies().Update(ctx, apply))
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, gh.NewClient(nil))
-	h.sweepCheckRefreshRequests(ctx)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, gh.NewClient(nil))
+	h.sweepMergeGateRequests(ctx)
 
-	refreshReq, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(ctx, applyID, storage.CheckRefreshKindSettle)
+	gateReq, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(ctx, applyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
-	require.NotNil(t, refreshReq, "the sweep must backfill a refresh request for a completed apply that has none")
-	assert.Equal(t, apply.ApplyIdentifier, refreshReq.ApplyIdentifier)
-	assert.Equal(t, "staging", refreshReq.Environment)
-	assert.Equal(t, dbName, refreshReq.DatabaseName)
-	assert.Equal(t, "cli:sweeper@host", refreshReq.RequestedBy)
-	assert.Equal(t, storage.CheckRefreshPending, refreshReq.State)
+	require.NotNil(t, gateReq, "the sweep must backfill a merge gate request for a completed apply that has none")
+	assert.Equal(t, apply.ApplyIdentifier, gateReq.ApplyIdentifier)
+	assert.Equal(t, "staging", gateReq.Environment)
+	assert.Equal(t, dbName, gateReq.DatabaseName)
+	assert.Equal(t, "cli:sweeper@host", gateReq.RequestedBy)
+	assert.Equal(t, storage.MergeGatePending, gateReq.State)
 
 	// Recording is idempotent per apply: a second sweep pass over the same
 	// window must not duplicate or reset the request.
-	h.sweepCheckRefreshRequests(ctx)
-	again, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(ctx, applyID, storage.CheckRefreshKindSettle)
+	h.sweepMergeGateRequests(ctx)
+	again, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(ctx, applyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, again)
-	assert.Equal(t, refreshReq.ID, again.ID)
+	assert.Equal(t, gateReq.ID, again.ID)
 }
 
-// TestE2ECheckRefreshReplansSiblingPRAndSkipsOriginator verifies the fan-out:
+// TestE2EMergeGateReplansSiblingPRAndSkipsOriginator verifies the fan-out:
 // after an apply on another PR changes a target's live schema, a sibling PR
 // with stored plan check state on that target is re-planned against the live
 // schema at its current head, and the refreshed check's change summary carries
 // the attribution (which apply, by whom) so a reviewer knows why an unchanged
 // PR was re-planned. The originating PR's own check state is left to its apply
 // lifecycle and never re-planned.
-func TestE2ECheckRefreshReplansSiblingPRAndSkipsOriginator(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_fanout"
+func TestE2EMergeGateReplansSiblingPRAndSkipsOriginator(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_fanout"
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
@@ -300,22 +300,22 @@ func TestE2ECheckRefreshReplansSiblingPRAndSkipsOriginator(t *testing.T) {
 	originator := seedRefreshTargetCheck(t, svc, 2, "staging", dbName,
 		checkStatusCompleted, checkConclusionActionRequired, "originator summary")
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
-	applyIdentifier := fmt.Sprintf("apply_checkrefresh_fanout_%d", time.Now().UnixNano())
-	refreshReq := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	applyIdentifier := fmt.Sprintf("apply_mergegate_fanout_%d", time.Now().UnixNano())
+	gateReq := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000001,
-		Kind:            storage.CheckRefreshKindSettle,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: applyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		Repository:      "octocat/hello-world",
-		PullRequest:     2,
+		ChangeKey:       "2",
 		RequestedBy:     "cli:tester@host",
 	})
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
 	// The sibling PR's stored check state was re-planned against the live
 	// schema at its current head, with the attribution note appended.
@@ -339,21 +339,21 @@ func TestE2ECheckRefreshReplansSiblingPRAndSkipsOriginator(t *testing.T) {
 	assert.Empty(t, originatorAfter.BlockingReason)
 
 	// The request itself is terminal-successful.
-	finished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), refreshReq.ApplyID, storage.CheckRefreshKindSettle)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), gateReq.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
-	assert.Equal(t, storage.CheckRefreshCompleted, finished.State)
+	assert.Equal(t, storage.MergeGateCompleted, finished.State)
 }
 
-// TestE2ECheckRefreshReplanFailureFailsCheckClosed verifies the fail-closed
+// TestE2EMergeGateReplanFailureFailsCheckClosed verifies the fail-closed
 // guarantee: when a sibling PR's re-plan fails (here: its schema files no
 // longer parse), its stored check state is durably flipped to a blocking
 // conclusion with a fixed sanitized message — a plan computed against a schema
 // that no longer exists must not keep passing — and the request still
 // completes because the block is a durable outcome, not a retry.
-func TestE2ECheckRefreshReplanFailureFailsCheckClosed(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_failclosed"
+func TestE2EMergeGateReplanFailureFailsCheckClosed(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_failclosed"
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
@@ -372,12 +372,12 @@ func TestE2ECheckRefreshReplanFailureFailsCheckClosed(t *testing.T) {
 	seedRefreshTargetCheck(t, svc, 1, "staging", dbName,
 		checkStatusCompleted, checkConclusionSuccess, "no changes")
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
-	applyIdentifier := fmt.Sprintf("apply_checkrefresh_failclosed_%d", time.Now().UnixNano())
-	refreshReq := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	applyIdentifier := fmt.Sprintf("apply_mergegate_failclosed_%d", time.Now().UnixNano())
+	gateReq := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000002,
-		Kind:            storage.CheckRefreshKindSettle,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: applyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -385,7 +385,7 @@ func TestE2ECheckRefreshReplanFailureFailsCheckClosed(t *testing.T) {
 		RequestedBy:     "cli:tester@host",
 	})
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
 	blocked, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
@@ -398,20 +398,20 @@ func TestE2ECheckRefreshReplanFailureFailsCheckClosed(t *testing.T) {
 	assert.Contains(t, blocked.ChangeSummary, "re-plan failed — see server logs")
 	assert.Contains(t, blocked.ChangeSummary, applyIdentifier)
 
-	finished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), refreshReq.ApplyID, storage.CheckRefreshKindSettle)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), gateReq.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
-	assert.Equal(t, storage.CheckRefreshCompleted, finished.State)
+	assert.Equal(t, storage.MergeGateCompleted, finished.State)
 }
 
-// TestE2ECheckRefreshLeavesInFlightApplyCheckUntouched verifies that a started
+// TestE2EMergeGateLeavesInFlightApplyCheckUntouched verifies that a started
 // apply remains authoritative: a sibling PR whose stored check state is owned
 // by an in-flight apply (status in_progress with an apply id) is never
 // re-planned or flipped — the apply's own terminal update refreshes it — and
 // the request completes without touching GitHub for that PR.
-func TestE2ECheckRefreshLeavesInFlightApplyCheckUntouched(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_inflight"
+func TestE2EMergeGateLeavesInFlightApplyCheckUntouched(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_inflight"
 	// The in-flight guard fires on stored check state alone, so the lighter
 	// storage-backed service is enough — no target database or operator.
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
@@ -428,19 +428,19 @@ func TestE2ECheckRefreshLeavesInFlightApplyCheckUntouched(t *testing.T) {
 	inFlight.ApplyID = 424242
 	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), inFlight))
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
-	refreshReq := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	gateReq := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000003,
-		Kind:            storage.CheckRefreshKindSettle,
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_inflight_%d", time.Now().UnixNano()),
+		Kind:            storage.MergeGateKindSettle,
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_inflight_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		RequestedBy:     "cli:tester@host",
 	})
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
 	untouched, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
@@ -450,20 +450,20 @@ func TestE2ECheckRefreshLeavesInFlightApplyCheckUntouched(t *testing.T) {
 	assert.Equal(t, "apply in flight", untouched.ChangeSummary)
 	assert.Empty(t, untouched.BlockingReason)
 
-	finished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), refreshReq.ApplyID, storage.CheckRefreshKindSettle)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), gateReq.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
-	assert.Equal(t, storage.CheckRefreshCompleted, finished.State)
+	assert.Equal(t, storage.MergeGateCompleted, finished.State)
 }
 
-// TestE2ECheckRefreshCoalescesPendingSiblingRequests verifies coalescing: two
+// TestE2EMergeGateCoalescesPendingSiblingRequests verifies coalescing: two
 // applies completing on the same target need only one fan-out, because a
 // re-plan against the live schema covers every schema change recorded before
 // it started. The drain drives the older request and completes the younger one
 // without ever claiming it.
-func TestE2ECheckRefreshCoalescesPendingSiblingRequests(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_coalesce"
+func TestE2EMergeGateCoalescesPendingSiblingRequests(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_coalesce"
 	// Coalescing is pure request-lifecycle behavior in storage, so the lighter
 	// storage-backed service is enough — no target database or operator.
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
@@ -473,50 +473,50 @@ func TestE2ECheckRefreshCoalescesPendingSiblingRequests(t *testing.T) {
 	t.Cleanup(server.Close)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
-	first := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	first := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000004,
-		Kind:            storage.CheckRefreshKindSettle,
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_coalesce_a_%d", time.Now().UnixNano()),
+		Kind:            storage.MergeGateKindSettle,
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_coalesce_a_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		RequestedBy:     "cli:tester@host",
 	})
-	second := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	second := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000005,
-		Kind:            storage.CheckRefreshKindSettle,
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_coalesce_b_%d", time.Now().UnixNano()),
+		Kind:            storage.MergeGateKindSettle,
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_coalesce_b_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		RequestedBy:     "cli:tester@host",
 	})
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
-	driven, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), first.ApplyID, storage.CheckRefreshKindSettle)
+	driven, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), first.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, driven)
-	assert.Equal(t, storage.CheckRefreshCompleted, driven.State)
+	assert.Equal(t, storage.MergeGateCompleted, driven.State)
 	assert.Equal(t, 1, driven.Attempts, "the older request runs the fan-out")
 
-	coalesced, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), second.ApplyID, storage.CheckRefreshKindSettle)
+	coalesced, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), second.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, coalesced)
-	assert.Equal(t, storage.CheckRefreshCompleted, coalesced.State)
+	assert.Equal(t, storage.MergeGateCompleted, coalesced.State)
 	assert.Equal(t, 0, coalesced.Attempts, "the younger request is coalesced, never claimed")
 }
 
-// TestE2ECheckRefreshKickDrainsWithoutTick verifies the recorded-request kick:
+// TestE2EMergeGateKickDrainsWithoutTick verifies the recorded-request kick:
 // a request recorded while the processor sleeps between polls is drained as
 // soon as the drive tail's notifier fires, so sibling PR checks re-plan
 // without waiting out the poll interval. The poll interval is set far beyond
 // the test deadline, so only the kick can explain the drain.
-func TestE2ECheckRefreshKickDrainsWithoutTick(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_kick"
+func TestE2EMergeGateKickDrainsWithoutTick(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_kick"
 	// The request lifecycle is storage-only when no sibling checks exist, so
 	// the lighter storage-backed service is enough — no target database or
 	// operator.
@@ -527,54 +527,54 @@ func TestE2ECheckRefreshKickDrainsWithoutTick(t *testing.T) {
 	t.Cleanup(server.Close)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
 	// A sentinel recorded before start is drained by the driver's startup
 	// pass; its completion means the driver is parked on the (hour-long)
 	// ticker, so nothing but a kick can drain the next request.
-	sentinel := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	sentinel := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000006,
-		Kind:            storage.CheckRefreshKindSettle,
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_kick_sentinel_%d", time.Now().UnixNano()),
+		Kind:            storage.MergeGateKindSettle,
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_kick_sentinel_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		RequestedBy:     "cli:tester@host",
 	})
 
-	h.checkRefreshPollInterval = time.Hour
-	h.StartCheckRefreshProcessor(t.Context())
-	t.Cleanup(h.StopCheckRefreshProcessor)
-	require.NotNil(t, svc.OnCheckRefreshRecorded,
+	h.mergeGatePollInterval = time.Hour
+	h.StartMergeGateProcessor(t.Context())
+	t.Cleanup(h.StopMergeGateProcessor)
+	require.NotNil(t, svc.OnMergeGateRecorded,
 		"starting the processor registers the drive-tail kick on the service")
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		got, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), sentinel.ApplyID, storage.CheckRefreshKindSettle)
+		got, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), sentinel.ApplyID, storage.MergeGateKindSettle)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, got) {
 			return
 		}
-		assert.Equal(collect, storage.CheckRefreshCompleted, got.State)
+		assert.Equal(collect, storage.MergeGateCompleted, got.State)
 	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
 		"the startup pass drains the sentinel request")
 
-	kicked := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	kicked := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000007,
-		Kind:            storage.CheckRefreshKindSettle,
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_kick_%d", time.Now().UnixNano()),
+		Kind:            storage.MergeGateKindSettle,
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_kick_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		RequestedBy:     "cli:tester@host",
 	})
 	// Wake the driver through the same registration the drive tail uses.
-	svc.OnCheckRefreshRecorded()
+	svc.OnMergeGateRecorded()
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		got, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), kicked.ApplyID, storage.CheckRefreshKindSettle)
+		got, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), kicked.ApplyID, storage.MergeGateKindSettle)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, got) {
 			return
 		}
-		assert.Equal(collect, storage.CheckRefreshCompleted, got.State)
+		assert.Equal(collect, storage.MergeGateCompleted, got.State)
 	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
 		"the kick drains the request without a poll tick")
 }
@@ -599,7 +599,7 @@ func seedApplyWithLock(t *testing.T, svc *api.Service, dbName, applyState string
 	})
 
 	apply := &storage.Apply{
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_%s_%d", applyState, time.Now().UnixNano()),
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_%s_%d", applyState, time.Now().UnixNano()),
 		LockID:          lock.ID,
 		PlanID:          1,
 		Database:        dbName,
@@ -627,8 +627,8 @@ func seedApplyWithLock(t *testing.T, svc *api.Service, dbName, applyState string
 // comment: the flip skips already-held rows and the comment is deduplicated
 // by its hidden marker.
 func TestE2ECheckPreflightHoldsSiblingChecksAndComments(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_preflight"
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_preflight"
 	// The hold flips stored state and talks to GitHub; no re-plan runs, so the
 	// lighter storage-backed service is enough — no target database.
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
@@ -665,22 +665,22 @@ func TestE2ECheckPreflightHoldsSiblingChecksAndComments(t *testing.T) {
 	seedRefreshTargetCheck(t, svc, 1, "staging", dbName,
 		checkStatusCompleted, checkConclusionSuccess, "no changes")
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
-	applyIdentifier := fmt.Sprintf("apply_checkrefresh_preflight_%d", time.Now().UnixNano())
-	preflight := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	applyIdentifier := fmt.Sprintf("apply_mergegate_preflight_%d", time.Now().UnixNano())
+	preflight := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000008,
-		Kind:            storage.CheckRefreshKindPreflight,
+		Kind:            storage.MergeGateKindPreflight,
 		ApplyIdentifier: applyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		Repository:      "octocat/hello-world",
-		PullRequest:     2,
+		ChangeKey:       "2",
 		RequestedBy:     "cli:preflighter@host",
 	})
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
 	held, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
@@ -705,10 +705,10 @@ func TestE2ECheckPreflightHoldsSiblingChecksAndComments(t *testing.T) {
 		t.Fatal("the preflight fan-out must post a comment explaining the hold")
 	}
 
-	finished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.CheckRefreshKindPreflight)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.MergeGateKindPreflight)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
-	assert.Equal(t, storage.CheckRefreshCompleted, finished.State)
+	assert.Equal(t, storage.MergeGateCompleted, finished.State)
 
 	// A retried fan-out (for example after a lease handover) converges: the
 	// already-held row is not re-flipped and the marker search suppresses a
@@ -717,17 +717,17 @@ func TestE2ECheckPreflightHoldsSiblingChecksAndComments(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	_, err = db.ExecContext(t.Context(), `
-		UPDATE check_refresh_requests
+		UPDATE merge_gate_requests
 		SET state = 'pending', attempts = 0, lease_owner = NULL, lease_token = NULL,
 			lease_expires_at = NULL, completed_at = NULL
 		WHERE id = ?`, finished.ID)
 	require.NoError(t, err)
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
-	refinished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.CheckRefreshKindPreflight)
+	refinished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.MergeGateKindPreflight)
 	require.NoError(t, err)
-	assert.Equal(t, storage.CheckRefreshCompleted, refinished.State)
+	assert.Equal(t, storage.MergeGateCompleted, refinished.State)
 	select {
 	case body := <-result.comments:
 		t.Fatalf("a retried preflight fan-out must not post a duplicate hold comment, got: %s", body)
@@ -810,8 +810,8 @@ func TestE2ECheckPreflightStoredHoldsLandDuringGitHubOutage(t *testing.T) {
 // re-plans the held sibling against the live schema, replacing the hold with
 // a live verdict.
 func TestE2ECheckReleaseSweepSettlesFailedPreflightedApply(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_release"
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_release"
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
@@ -828,15 +828,15 @@ func TestE2ECheckReleaseSweepSettlesFailedPreflightedApply(t *testing.T) {
 	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 
 	apply := seedApplyWithLock(t, svc, dbName, state.Apply.Failed, 2)
-	recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         apply.ID,
-		Kind:            storage.CheckRefreshKindPreflight,
+		Kind:            storage.MergeGateKindPreflight,
 		ApplyIdentifier: apply.ApplyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		Repository:      "octocat/hello-world",
-		PullRequest:     2,
+		ChangeKey:       "2",
 		RequestedBy:     apply.Caller,
 	})
 
@@ -846,10 +846,10 @@ func TestE2ECheckReleaseSweepSettlesFailedPreflightedApply(t *testing.T) {
 	heldCheck.BlockingReason = applyInFlightBlock.blockingReason
 	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), heldCheck))
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
 	h.sweepPreflightedAppliesMissingSettle(t.Context())
-	settle, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.CheckRefreshKindSettle)
+	settle, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, settle, "the release sweep must backfill a settle for a preflighted terminal apply")
 	assert.Equal(t, apply.ApplyIdentifier, settle.ApplyIdentifier)
@@ -858,12 +858,12 @@ func TestE2ECheckReleaseSweepSettlesFailedPreflightedApply(t *testing.T) {
 	// Recording is idempotent per apply and kind: a second sweep pass must not
 	// duplicate the settle.
 	h.sweepPreflightedAppliesMissingSettle(t.Context())
-	again, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.CheckRefreshKindSettle)
+	again, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, again)
 	assert.Equal(t, settle.ID, again.ID)
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
 	released, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
 	require.NoError(t, err)
@@ -871,9 +871,9 @@ func TestE2ECheckReleaseSweepSettlesFailedPreflightedApply(t *testing.T) {
 	assert.Empty(t, released.BlockingReason, "the settle re-plan replaces the hold with a live verdict")
 	assert.Contains(t, released.ChangeSummary, "re-planned:")
 
-	finished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.CheckRefreshKindSettle)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
-	assert.Equal(t, storage.CheckRefreshCompleted, finished.State)
+	assert.Equal(t, storage.MergeGateCompleted, finished.State)
 }
 
 // TestE2ECheckSettleDefersToActivePreflightedApply verifies hold ordering
@@ -884,8 +884,8 @@ func TestE2ECheckReleaseSweepSettlesFailedPreflightedApply(t *testing.T) {
 // touching the checks; the active apply's own settle re-plans them when it
 // finishes.
 func TestE2ECheckSettleDefersToActivePreflightedApply(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_defer"
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_defer"
 	// The deferral decision is storage-only, so the lighter storage-backed
 	// service is enough — no target database and no GitHub fixtures: any
 	// GitHub call would fail the drain loudly.
@@ -899,47 +899,47 @@ func TestE2ECheckSettleDefersToActivePreflightedApply(t *testing.T) {
 	// A later apply on the target is mid-drive with its preflight already
 	// completed, so its holds are live.
 	active := seedApplyWithLock(t, svc, dbName, state.Apply.Running, 2)
-	activePreflight := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	activePreflight := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         active.ID,
-		Kind:            storage.CheckRefreshKindPreflight,
+		Kind:            storage.MergeGateKindPreflight,
 		ApplyIdentifier: active.ApplyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		Repository:      "octocat/hello-world",
-		PullRequest:     2,
+		ChangeKey:       "2",
 		RequestedBy:     active.Caller,
 	})
-	claimed, err := svc.Storage().CheckRefreshRequests().ClaimNext(t.Context(), checkRefreshTestLeaseOwner, time.Minute)
+	claimed, err := svc.Storage().MergeGateRequests().ClaimNext(t.Context(), mergeGateTestLeaseOwner, time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, activePreflight.ID, claimed.ID)
-	require.NoError(t, svc.Storage().CheckRefreshRequests().MarkCompleted(t.Context(), claimed.ID, claimed.LeaseToken))
+	require.NoError(t, svc.Storage().MergeGateRequests().MarkCompleted(t.Context(), claimed.ID, claimed.LeaseToken))
 
 	heldCheck := seedRefreshTargetCheck(t, svc, 1, "staging", dbName,
 		checkStatusCompleted, checkConclusionActionRequired, "held: apply in flight")
 	heldCheck.BlockingReason = applyInFlightBlock.blockingReason
 	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), heldCheck))
 
-	h := newE2EHandlerWithoutRefreshProcessor(t, svc, client)
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
 
 	// An earlier apply on the same target settles while the later one runs.
-	settle := recordRefreshRequest(t, svc, &storage.CheckRefreshRequest{
+	settle := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000009,
-		Kind:            storage.CheckRefreshKindSettle,
-		ApplyIdentifier: fmt.Sprintf("apply_checkrefresh_defer_%d", time.Now().UnixNano()),
+		Kind:            storage.MergeGateKindSettle,
+		ApplyIdentifier: fmt.Sprintf("apply_mergegate_defer_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
 		DatabaseName:    dbName,
 		RequestedBy:     "cli:tester@host",
 	})
 
-	h.drainCheckRefreshRequests(t.Context(), checkRefreshTestLeaseOwner)
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
-	finished, err := svc.Storage().CheckRefreshRequests().GetByApplyAndKind(t.Context(), settle.ApplyID, storage.CheckRefreshKindSettle)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), settle.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
-	assert.Equal(t, storage.CheckRefreshCompleted, finished.State,
+	assert.Equal(t, storage.MergeGateCompleted, finished.State,
 		"the deferred settle completes; the active apply's own settle covers the target")
 
 	stillHeld, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
