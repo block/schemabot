@@ -1,12 +1,13 @@
-CREATE TABLE `check_refresh_requests` (
+CREATE TABLE `merge_gate_requests` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `apply_id` bigint unsigned NOT NULL,
   `apply_identifier` varchar(255) NOT NULL,
   `environment` varchar(50) NOT NULL,
   `database_type` varchar(50) NOT NULL,
   `database_name` varchar(255) NOT NULL,
+  `provider` varchar(50) NOT NULL DEFAULT 'github',
   `repository` varchar(255) NOT NULL DEFAULT '',
-  `pull_request` int unsigned NOT NULL DEFAULT '0',
+  `change_key` varchar(255) NOT NULL DEFAULT '',
   `requested_by` varchar(255) NOT NULL DEFAULT '',
   `state` varchar(50) NOT NULL,
   `attempts` int unsigned NOT NULL DEFAULT '0',
@@ -19,7 +20,7 @@ CREATE TABLE `check_refresh_requests` (
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `idx_check_refresh_apply` (`apply_id`),
-  KEY `idx_check_refresh_claimable` (`state`,`retry_after`,`lease_expires_at`,`created_at`),
-  KEY `idx_check_refresh_target` (`environment`,`database_type`,`database_name`,`state`)
+  UNIQUE KEY `idx_merge_gate_apply` (`apply_id`),
+  KEY `idx_merge_gate_claimable` (`state`,`retry_after`,`lease_expires_at`,`created_at`),
+  KEY `idx_merge_gate_target` (`environment`,`database_type`,`database_name`,`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

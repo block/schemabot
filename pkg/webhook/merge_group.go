@@ -179,7 +179,7 @@ func mergeGroupCheckContent() passingAggregateCheckContent {
 // outside any HTTP request, does not have to re-resolve a repo-level install.
 func (h *Handler) enqueueDurableMergeGroup(ctx context.Context, payload mergeGroupPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
 	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: deliveryID,
 		Event:      "merge_group",
 		Action:     payload.Action,

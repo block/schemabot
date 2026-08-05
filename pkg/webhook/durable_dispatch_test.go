@@ -146,7 +146,7 @@ func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, `{"message":"auto-plan queued"}`, rr.Body.String())
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-1")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-1")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	require.Equal(t, "pull_request", event.Event)
@@ -283,7 +283,7 @@ func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
 		"installation": {"id": 12345}
 	}`)
 	return &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-driver-1",
 		Event:       "pull_request",
 		Action:      "opened",
@@ -297,7 +297,7 @@ func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
 
 func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-unsupported",
 		Event:      "issue_comment",
 		Payload:    []byte(`{}`),
@@ -318,7 +318,7 @@ func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
 
 func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-malformed",
 		Event:      "pull_request",
 		Payload:    []byte(`{not json`),
@@ -440,9 +440,9 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 // a burst of queued deliveries is worked down without waiting for the next tick.
 func TestDurableWebhookDrainProcessesBacklogInOnePass(t *testing.T) {
 	store := newScriptedWebhookEventStore(
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d1", Event: "issue_comment", Payload: []byte(`{}`)},
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d2", Event: "issue_comment", Payload: []byte(`{}`)},
-		&storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "d3", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.ProviderGitHub, DeliveryID: "d1", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.ProviderGitHub, DeliveryID: "d2", Event: "issue_comment", Payload: []byte(`{}`)},
+		&storage.WebhookEvent{Provider: storage.ProviderGitHub, DeliveryID: "d3", Event: "issue_comment", Payload: []byte(`{}`)},
 	)
 	h := newDurableDriverHandler(t, store, nil, nil)
 
@@ -536,7 +536,7 @@ func TestDurableWebhookShutdownReleasesClaimWhenCancelErrorIsStringified(t *test
 
 func TestDurableWebhookHeartbeatTransientErrorKeepsRunAlive(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-transient-heartbeat",
 		Event:      "push",
 		Payload:    []byte(`{}`),
@@ -567,7 +567,7 @@ func TestDurableWebhookHeartbeatTransientErrorKeepsRunAlive(t *testing.T) {
 
 func TestDurableWebhookDispatchLifecycleDrainsQueuedEvent(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-lifecycle",
 		Event:      "push",
 		Payload:    []byte(`{"ref": "refs/heads/feature", "after": "abc123def456", "repository": {"full_name": "octocat/hello-world", "default_branch": "main"}}`),

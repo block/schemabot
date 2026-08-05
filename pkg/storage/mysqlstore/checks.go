@@ -509,7 +509,7 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 }
 
 // GetByTarget returns all checks for a target across all repositories and PRs.
-// The check refresh fan-out uses it: a CLI/gRPC apply carries no repository, so
+// The merge gate fan-out uses it: a CLI/gRPC apply carries no repository, so
 // the fan-out must find every PR planned against the target regardless of repo.
 func (s *checkStore) GetByTarget(ctx context.Context, environment, dbType, database string) ([]*storage.Check, error) {
 	rows, err := s.db.QueryContext(ctx, `
@@ -527,7 +527,7 @@ func (s *checkStore) GetByTarget(ctx context.Context, environment, dbType, datab
 }
 
 // MarkBlockedForFailedRefresh flips stored check state to a blocking conclusion
-// after a check refresh re-plan failed. The head SHA predicate makes the write
+// after a merge gate re-plan failed. The head SHA predicate makes the write
 // optimistic-concurrency: a racing synchronize that already stored a result for
 // a newer commit does not match and is preserved. An in-progress apply-owned
 // row is never touched — the started apply's lifecycle stays authoritative.

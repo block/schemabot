@@ -24,7 +24,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	webhookEvents   *webhookEventStore
-	checkRefreshes  *checkRefreshRequestStore
+	mergeGatees     *mergeGateRequestStore
 }
 
 // New creates a new MySQL storage instance.
@@ -43,7 +43,7 @@ func New(db *sql.DB) *Storage {
 		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
 		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
 		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
-		checkRefreshes:  &checkRefreshRequestStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		mergeGatees:     &mergeGateRequestStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
 	}
 }
 
@@ -107,9 +107,9 @@ func (s *Storage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
 }
 
-// CheckRefreshRequests returns the durable check refresh request store.
-func (s *Storage) CheckRefreshRequests() storage.CheckRefreshRequestStore {
-	return s.checkRefreshes
+// MergeGateRequests returns the durable merge gate request store.
+func (s *Storage) MergeGateRequests() storage.MergeGateRequestStore {
+	return s.mergeGatees
 }
 
 // Ping verifies the database connection is alive.

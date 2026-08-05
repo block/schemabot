@@ -26,7 +26,7 @@ func durableMergeGroupEvent() *storage.WebhookEvent {
 		"installation": {"id": 12345}
 	}`)
 	return &storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-mg-1",
 		Event:      "merge_group",
 		Action:     "checks_requested",
@@ -59,7 +59,7 @@ func TestDurableMergeGroupWebhookQueuesAndAcks(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, `{"message":"merge_group check queued"}`, rr.Body.String())
 
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-mg-1")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-mg-1")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	require.Equal(t, "merge_group", event.Event)

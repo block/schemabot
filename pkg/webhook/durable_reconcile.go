@@ -207,7 +207,7 @@ pages:
 				continue
 			}
 			scanned++
-			found, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr.Number, pr.HeadSHA)
+			found, err := store.HasEventForHead(ctx, storage.ProviderGitHub, repo, pr.Number, pr.HeadSHA)
 			if err != nil {
 				h.logger.Warn("webhook reconciler failed to query inbox for PR head",
 					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)

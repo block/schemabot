@@ -34,7 +34,7 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	}
 	provider := event.Provider
 	if provider == "" {
-		provider = storage.WebhookProviderGitHub
+		provider = storage.ProviderGitHub
 	}
 	payload := nullJSON(event.Payload)
 	// New deliveries are always pending. Accepting any other state here would
@@ -116,7 +116,7 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 
 func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*storage.WebhookEvent, error) {
 	if provider == "" {
-		provider = storage.WebhookProviderGitHub
+		provider = storage.ProviderGitHub
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+webhookEventColumns+`
@@ -153,7 +153,7 @@ func webhookClaimableArgs() []any {
 
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
 	if provider == "" {
-		provider = storage.WebhookProviderGitHub
+		provider = storage.ProviderGitHub
 	}
 	if repository == "" || pullRequest == 0 || headSHA == "" {
 		return false, fmt.Errorf("repository, pull request, and head SHA are required")

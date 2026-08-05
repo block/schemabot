@@ -64,7 +64,7 @@ func TestWebhookReconcilerReportsMissingInboxRow(t *testing.T) {
 func TestWebhookReconcilerSkipsRecordedHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-recorded",
 		Event:       "pull_request",
 		Repository:  "octocat/hello-world",
@@ -120,7 +120,7 @@ func TestWebhookReconcilerTerminatesStuckProcessingEvent(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	leaseExpired := time.Now().Add(-time.Minute)
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:       storage.WebhookProviderGitHub,
+		Provider:       storage.ProviderGitHub,
 		DeliveryID:     "delivery-stuck",
 		Event:          "pull_request",
 		Repository:     "octocat/hello-world",
@@ -138,7 +138,7 @@ func TestWebhookReconcilerTerminatesStuckProcessingEvent(t *testing.T) {
 
 	h.reconcileWebhookInbox(t.Context())
 
-	got, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-stuck")
+	got, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-stuck")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, storage.WebhookEventFailed, got.State)

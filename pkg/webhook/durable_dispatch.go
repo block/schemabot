@@ -403,7 +403,7 @@ func (h *Handler) startDurableWebhookHeartbeat(ctx context.Context, driverID int
 }
 
 func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
-	if event.Provider != storage.WebhookProviderGitHub {
+	if event.Provider != storage.ProviderGitHub {
 		h.logger.Info("durable webhook delivery ignored because provider is unsupported",
 			"delivery_id", event.DeliveryID, "provider", event.Provider, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
@@ -655,7 +655,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 
 func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullRequestPayload, body []byte, deliveryID string, installationID int64) (bool, error) {
 	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
 		Action:      payload.Action,
@@ -669,7 +669,7 @@ func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullReq
 
 func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPayload, body []byte, deliveryID string, pr int, installationID int64) (bool, error) {
 	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  deliveryID,
 		Event:       "check_run",
 		Action:      payload.Action,

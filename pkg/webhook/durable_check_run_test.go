@@ -29,7 +29,7 @@ func durableCheckRunRerequestEvent(t *testing.T) *storage.WebhookEvent {
 		"installation": {"id": 12345}
 	}`)
 	return &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-check-run-1",
 		Event:       "check_run",
 		Action:      "rerequested",
@@ -60,7 +60,7 @@ func TestDurableCheckRunRerequestQueuesAndAcks(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, `{"message":"check_run rerequest queued"}`, rr.Body.String())
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-check-run-1")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-check-run-1")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	require.Equal(t, "check_run", event.Event)
@@ -126,7 +126,7 @@ func TestDurableCheckRunRerequestSkipsNonSchemaBotCheck(t *testing.T) {
 // so a replayed or future-producer row cannot wedge the queue.
 func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-check-run-completed",
 		Event:      "check_run",
 		Action:     "completed",
@@ -150,7 +150,7 @@ func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
 // terminally (no retry) rather than crash-looping the fleet on a poison row.
 func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-check-run-malformed",
 		Event:      "check_run",
 		Payload:    []byte(`{not json`),
