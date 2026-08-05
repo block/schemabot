@@ -178,18 +178,18 @@ type Service struct {
 	// against any still-live per-driver observer.
 	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
-	// OnCheckRefreshRecorded is called after a drive tail durably records a
-	// check refresh request. Set by the webhook handler to wake its refresh
+	// OnMergeGateRecorded is called after a drive tail durably records a
+	// merge gate request. Set by the webhook handler to wake its merge gate
 	// processor immediately instead of waiting for the next poll tick; the
 	// durable request row stays the source of truth, so a lost wake-up only
-	// costs poll latency, never the refresh.
+	// costs poll latency, never the fan-out.
 	//
 	// Registration doubles as the drive tails' consumer signal: when nil, no
 	// GitHub webhook runtime exists on this server — there is no PR check
 	// state to refresh and no processor to drain requests — so drive tails
 	// skip recording entirely. Implementations must be non-blocking and safe
 	// for concurrent drivers.
-	OnCheckRefreshRecorded func()
+	OnMergeGateRecorded func()
 
 	pendingObserverMu sync.Mutex
 	pendingObservers  map[pendingObserverKey]tern.ProgressObserver

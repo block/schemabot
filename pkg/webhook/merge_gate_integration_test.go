@@ -1,9 +1,9 @@
 //go:build integration
 
-// Check refresh guardrail integration tests. When an apply reaches terminal
+// Merge gate guardrail integration tests. When an apply reaches terminal
 // success on a (environment, database type, database) target, every other open
 // PR with stored check state against that target planned against a schema that
-// no longer exists. These tests exercise the durable refresh request lifecycle
+// no longer exists. These tests exercise the durable merge gate request lifecycle
 // against the real webhook harness, starting with recording at the operator
 // drive tail.
 
@@ -27,27 +27,27 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// clearCheckRefreshRequests empties the shared check_refresh_requests table.
+// clearMergeGateRequests empties the shared merge_gate_requests table.
 // The table is cross-test shared state: apply drive tails in earlier tests
 // record requests the processor never drains there, and this test's drain
 // would otherwise claim them before its own.
-func clearCheckRefreshRequests(t *testing.T) {
+func clearMergeGateRequests(t *testing.T) {
 	t.Helper()
 	db, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
-	_, err = db.ExecContext(t.Context(), "DELETE FROM check_refresh_requests")
+	_, err = db.ExecContext(t.Context(), "DELETE FROM merge_gate_requests")
 	require.NoError(t, err)
 }
 
-// TestE2ECheckRefreshRecordedOnApplyTerminalSuccess drives a real apply
+// TestE2EMergeGateRecordedOnApplyTerminalSuccess drives a real apply
 // through the webhook command path to terminal success and verifies the
-// operator drive tail durably records a check refresh request for the apply's
+// operator drive tail durably records a merge gate request for the apply's
 // target before the apply is considered done — the request other pods' sibling
 // PR checks are refreshed from.
-func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
-	clearCheckRefreshRequests(t)
-	dbName := "webhook_checkrefresh_drivetail"
+func TestE2EMergeGateRecordedOnApplyTerminalSuccess(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_drivetail"
 	svc := setupE2EService(t, dbName)
 
 	mux := http.NewServeMux()
@@ -70,7 +70,7 @@ func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
 	// for its next poll tick. Installed after the handler so this probe is
 	// the active registration.
 	kicked := make(chan struct{}, 1)
-	svc.OnCheckRefreshRecorded = func() {
+	svc.OnMergeGateRecorded = func() {
 		select {
 		case kicked <- struct{}{}:
 		default:
@@ -114,29 +114,29 @@ func TestE2ECheckRefreshRecordedOnApplyTerminalSuccess(t *testing.T) {
 		assert.Fail(collect, "no completed apply for the target database yet")
 	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
 
-	// The drive tail records the refresh request as part of the terminal
+	// The drive tail records the merge gate request as part of the terminal
 	// transition, so it must be visible as soon as the apply is completed.
-	var refreshReq *storage.CheckRefreshRequest
+	var gateReq *storage.MergeGateRequest
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		req, err := svc.Storage().CheckRefreshRequests().GetByApplyID(t.Context(), apply.ID)
+		req, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), apply.ID)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, req) {
 			return
 		}
-		refreshReq = req
+		gateReq = req
 	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
 
-	assert.Equal(t, apply.ApplyIdentifier, refreshReq.ApplyIdentifier)
-	assert.Equal(t, "staging", refreshReq.Environment)
-	assert.Equal(t, "mysql", refreshReq.DatabaseType)
-	assert.Equal(t, dbName, refreshReq.DatabaseName)
-	assert.Equal(t, "octocat/hello-world", refreshReq.Repository)
-	assert.Equal(t, 1, refreshReq.PullRequest)
-	assert.Equal(t, apply.Caller, refreshReq.RequestedBy)
-	assert.Equal(t, storage.CheckRefreshPending, refreshReq.State)
+	assert.Equal(t, apply.ApplyIdentifier, gateReq.ApplyIdentifier)
+	assert.Equal(t, "staging", gateReq.Environment)
+	assert.Equal(t, "mysql", gateReq.DatabaseType)
+	assert.Equal(t, dbName, gateReq.DatabaseName)
+	assert.Equal(t, "octocat/hello-world", gateReq.Repository)
+	assert.Equal(t, "1", gateReq.ChangeKey)
+	assert.Equal(t, apply.Caller, gateReq.RequestedBy)
+	assert.Equal(t, storage.MergeGatePending, gateReq.State)
 
 	select {
 	case <-kicked:
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the drive tail to invoke the check refresh recorded-notifier")
+		t.Fatal("timed out waiting for the drive tail to invoke the merge gate recorded-notifier")
 	}
 }
