@@ -25,7 +25,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 
 // applyCommandCore generates a plan, acquires a lock, and applies automatically
 // unless safety rechecks require a manual confirmation. It returns a durability
-// disposition for a future durable issue_comment driver:
+// disposition for the durable issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (command
 //     bootstrap, a GitHub read, or a storage operation) that a durable driver
@@ -415,7 +415,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 
 // applyConfirmCommandCore verifies lock ownership, re-plans for drift detection,
 // executes the apply, and watches progress. It returns a durability disposition
-// for a future durable issue_comment driver:
+// for the durable issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (command
 //     bootstrap, a GitHub read, or a storage operation) that a durable driver
@@ -639,7 +639,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 // the durability disposition, which only a durable issue_comment driver
 // consumes.
 func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	_, _ = h.unlockCommandCore(repo, pr, installationID, requestedBy, result)
+	_, _ = h.unlockCommandCore(context.Background(), repo, pr, installationID, requestedBy, result)
 }
 
 // unlockRejectionError marks a deterministic unlock rejection: the message is
@@ -662,8 +662,8 @@ func isUnlockRejection(err error) bool {
 // `--force`, it can also release a CLI-owned lock for the database inferred
 // from this PR's SchemaBot config; `-d <database>` disambiguates multi-database
 // PRs. This lets a PR author clear a stale local-session lock from the PR
-// workflow that it is blocking. It returns a durability disposition for a
-// future durable issue_comment driver:
+// workflow that it is blocking. It returns a durability disposition for the
+// durable issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (a GitHub
 //     read during database inference, a storage lock lookup, the active-apply
@@ -690,11 +690,15 @@ func isUnlockRejection(err error) bool {
 // post best-effort error comments too, so a durable driver re-driving one may
 // post the same comment again.
 //
+// The parent context scopes the command beyond its own timeout: the
+// synchronous wrapper passes context.Background(), while the durable driver
+// passes its run context so lease loss or shutdown cancels in-flight work.
+//
 // Every failure is logged where it is classified — by the core at its own
 // exits, and by the authorization gates for gate outcomes — so the synchronous
 // wrapper can discard the result without losing observability.
-func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
-	ctx, cancel := h.commandContext(context.Background(), 30*time.Second)
+func (h *Handler) unlockCommandCore(parent context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	ctx, cancel := h.commandContext(parent, 30*time.Second)
 	defer cancel()
 	if result.Force && result.Database == "" {
 		database, err := h.inferUnlockDatabase(ctx, repo, pr, installationID)

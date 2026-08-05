@@ -404,6 +404,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply-confirm started"})
 	case action.Unlock:
+		if h.durableWebhookDispatch {
+			h.enqueueDurableIssueCommentCommand(ctx, w, metricApp, body, deliveryID, repo, pr, installationID, result.Action)
+			return
+		}
 		h.goSafe(repo, pr, installationID, func() {
 			h.handleUnlockCommand(repo, pr, installationID, requestedBy, result)
 		})
@@ -780,8 +784,9 @@ func appendSupportChannelFooter(body string, support api.SupportChannelConfig) s
 	})
 }
 
-// enqueueDurableIssueCommentCommand persists an apply or apply-confirm command
-// delivery into the durable inbox and ACKs the webhook. The request path has
+// enqueueDurableIssueCommentCommand persists a durably dispatched command
+// delivery (apply, apply-confirm, or unlock) into the durable inbox and ACKs
+// the webhook. The request path has
 // already run the routing and usage gates, so the stored row is a command this
 // deployment committed to act on; a leased driver re-drives the command core
 // with retries so a process restart cannot drop an acknowledged command.
@@ -825,7 +830,7 @@ func (h *Handler) enqueueDurableIssueComment(ctx context.Context, body []byte, d
 	})
 }
 
-// processDurableIssueComment re-drives an apply or apply-confirm command from
+// processDurableIssueComment re-drives a durably dispatched command from
 // a claimed issue_comment delivery. The request path runs the synchronous
 // routing gates (tenant addressing, environment ownership, usage errors) and
 // the acknowledgment reaction before enqueueing, so the driver's job is the
@@ -904,6 +909,8 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 		coreRetry, coreErr = h.applyCommandCore(ctx, repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 	case action.ApplyConfirm:
 		coreRetry, coreErr = h.applyConfirmCommandCore(ctx, repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
+	case action.Unlock:
+		coreRetry, coreErr = h.unlockCommandCore(ctx, repo, pr, installationID, requestedBy, result)
 	default:
 		h.logger.Info("durable issue_comment delivery ignored because its command has no durable driver",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
@@ -931,7 +938,12 @@ func durableIssueCommentCommandReady(result CommandResult) bool {
 	if !result.Found || result.TenantError || result.EnvironmentError || result.MissingEnv {
 		return false
 	}
-	return result.Action == action.Apply || result.Action == action.ApplyConfirm
+	switch result.Action {
+	case action.Apply, action.ApplyConfirm, action.Unlock:
+		return true
+	default:
+		return false
+	}
 }
 
 // durableIssueCommentRoutingBlock re-runs the request-path routing and usage

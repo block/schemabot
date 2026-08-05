@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -75,6 +76,7 @@ func TestDurableIssueCommentCommandQueuesAndAcks(t *testing.T) {
 	}{
 		{name: "apply", comment: "schemabot apply -e production", message: "apply queued"},
 		{name: "apply-confirm", comment: "schemabot apply-confirm -e production", message: "apply-confirm queued"},
+		{name: "unlock", comment: "schemabot unlock", message: "unlock queued"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -448,6 +450,84 @@ func TestDurableIssueCommentDriverAnswersApplyThroughCore(t *testing.T) {
 	require.Empty(t, store.failed)
 	body := requireComment(t, comments, "environment-not-configured apply answer")
 	require.Contains(t, body, `database "orders" environment "staging" is not configured on this server`)
+}
+
+// durableUnlockDriverStorage augments the durable-driver storage with the
+// lock and apply stores the unlock command core reads.
+type durableUnlockDriverStorage struct {
+	emptyStorage
+	webhookEvents storage.WebhookEventStore
+	locks         storage.LockStore
+	applies       storage.ApplyStore
+}
+
+func (s *durableUnlockDriverStorage) WebhookEvents() storage.WebhookEventStore {
+	return s.webhookEvents
+}
+
+func (s *durableUnlockDriverStorage) Locks() storage.LockStore { return s.locks }
+
+func (s *durableUnlockDriverStorage) Applies() storage.ApplyStore { return s.applies }
+
+// newDurableUnlockDriverHarness builds a durable-driver handler whose storage
+// serves the given lock store and whose stub GitHub server records posted PR
+// comments, so a driven unlock command can walk the core to its user-facing
+// answer.
+func newDurableUnlockDriverHarness(t *testing.T, store storage.WebhookEventStore, locks storage.LockStore) (*Handler, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st := &durableUnlockDriverStorage{webhookEvents: store, locks: locks, applies: &noActiveAppliesStore{}}
+	service := api.New(st, &api.ServerConfig{}, nil, logger)
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch()), comments
+}
+
+// A routed unlock command must reach the command core through the driver: with
+// no locks held by the PR, the core posts the no-locks answer — the command's
+// terminal answer — and the delivery completes.
+func TestDurableIssueCommentDriverAnswersUnlockThroughCore(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot unlock"))
+	h, comments := newDurableUnlockDriverHarness(t, store, &unlockTestLockStore{})
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case <-store.completed:
+	default:
+		t.Fatal("expected the driven unlock command to complete its delivery")
+	}
+	require.Empty(t, store.failed)
+	body := requireComment(t, comments, "no-locks unlock answer")
+	require.Contains(t, body, "No Locks Found")
+	require.Contains(t, body, "Nothing to unlock")
+}
+
+// A storage failure while looking up the PR's locks is retryable: the unlock
+// was acknowledged, so the driver re-drives it rather than dropping it on a
+// transient storage blip.
+func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot unlock"))
+	h, _ := newDurableUnlockDriverHarness(t, store, &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")})
+
+	before := time.Now()
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.NotNil(t, failure.retryAfter, "lock lookup failure must stay retryable")
+		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
+		require.Contains(t, failure.errMsg, "lock lookup failed")
+	default:
+		t.Fatal("expected unlock lock-lookup failure to be marked failed")
+	}
+	require.Empty(t, store.completed)
 }
 
 // Cancelling the driver's context (shutdown or lease loss) must reach the

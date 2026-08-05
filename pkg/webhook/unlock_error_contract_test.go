@@ -81,7 +81,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser",
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser",
 			CommandResult{Action: action.Unlock, Force: true})
 
 		require.Error(t, err)
@@ -97,7 +97,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.Error(t, err)
 		assert.True(t, retry, "a transient lock lookup failure must stay retryable for a durable driver")
@@ -112,7 +112,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &failingApplyLookupStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.Error(t, err)
 		assert.True(t, retry, "an unverifiable active-apply state must be retried, not treated as the command's answer")
@@ -130,7 +130,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.Error(t, err)
 		assert.True(t, retry, "a failed lock release must stay retryable so a re-drive can release the remaining locks")
@@ -157,7 +157,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.Error(t, err)
 		assert.True(t, retry, "the failed release keeps the delivery retryable for the lock still held")
@@ -183,7 +183,7 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		})
 		h := actorAuthStorageTestHandler(cfg, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "mona", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "mona", CommandResult{Action: action.Unlock})
 
 		require.Error(t, err)
 		assert.True(t, retry, "an unevaluable authorization gate fails closed for this delivery but stays retryable")
@@ -210,7 +210,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser",
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser",
 			CommandResult{Action: action.Unlock, Force: true})
 
 		require.NoError(t, err)
@@ -227,7 +227,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "an empty lock set is the command's answer, not a failure")
@@ -245,7 +245,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := actorAuthStorageTestHandler(aggregateLeaderConfig(), st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "a non-owning fan-out skip is the command's terminal answer, not a retryable failure")
@@ -259,7 +259,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &activeApplyStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "an active apply verifiably blocking the unlock is the command's answer; re-driving would re-block")
@@ -282,7 +282,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser",
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser",
 			CommandResult{Action: action.Unlock, Force: true, Database: "orders"})
 
 		require.NoError(t, err)
@@ -304,7 +304,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		})
 		h := actorAuthStorageTestHandler(cfg, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "mona", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "mona", CommandResult{Action: action.Unlock})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "an evaluated denial is the command's answer; re-driving would re-deny")
@@ -320,7 +320,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+		retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 		require.NoError(t, err)
 		assert.False(t, retry, "a completed release is the command's answer; a re-drive would find nothing to release")
@@ -439,7 +439,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 			st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
 			h := actorAuthStorageTestHandler(tc.config, st, ghclient.NewInstallationClient(client, testLogger()))
 
-			retry, err := h.unlockCommandCore("octocat/hello-world", 1, 12345, "testuser",
+			retry, err := h.unlockCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser",
 				CommandResult{Action: action.Unlock, Force: true})
 
 			require.NoError(t, err)
