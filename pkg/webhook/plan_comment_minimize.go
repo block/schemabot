@@ -137,6 +137,63 @@ func (h *Handler) minimizeStalePlanComments(ctx context.Context, client *ghclien
 	h.minimizePlanCommentsForSlot(ctx, client, repo, pr, database, databaseType, headSHA, nil)
 }
 
+// sweepStalePlanCommentsForRemovedDatabases collapses the stale plan comments
+// of databases that no longer resolve a schema config in the PR diff — for
+// example a later commit reverted the schema change, so the schema file
+// dropped out of the net diff. No plan runs for such a database, so no
+// per-slot plan outcome supersedes its comments; without this sweep a prior
+// head's plan comment would keep advertising pending DDL and an apply prompt
+// that no longer match the branch. Each slot goes through
+// minimizeStalePlanComments, so the fresh-head verification and the
+// apply-owned hold apply unchanged. affectedDatabases holds the databases the
+// current delivery still plans; their slots are left to their own plan
+// outcomes.
+func (h *Handler) sweepStalePlanCommentsForRemovedDatabases(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	comments, err := h.service.Storage().PlanComments().ListUnminimizedForPR(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to list plan comments for removed-database sweep; plan comments for databases no longer in the PR stay expanded until the next push",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return
+	}
+
+	type databaseSlot struct {
+		database     string
+		databaseType string
+	}
+	slots := map[databaseSlot]bool{}
+	for _, comment := range comments {
+		if affectedDatabases[comment.DatabaseName] {
+			h.logger.Debug("keeping plan comment slot out of the removed-database sweep because its database is still in the PR; its own plan outcome supersedes the slot",
+				"repo", repo, "pr", pr, "database", comment.DatabaseName,
+				"database_type", comment.DatabaseType, "head_sha", headSHA)
+			continue
+		}
+		slots[databaseSlot{database: comment.DatabaseName, databaseType: comment.DatabaseType}] = true
+	}
+	if len(slots) == 0 {
+		h.logger.Debug("no plan comment slots for databases removed from the PR; nothing to sweep",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return
+	}
+
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		h.logger.Error("failed to create GitHub client for removed-database plan comment sweep; plan comments for databases no longer in the PR stay expanded until the next push",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "installation_id", installationID, "error", err)
+		return
+	}
+
+	for slot := range slots {
+		h.logger.Info("minimizing stale plan comments for database no longer in the PR",
+			"repo", repo, "pr", pr, "database", slot.database,
+			"database_type", slot.databaseType, "head_sha", headSHA)
+		h.minimizeStalePlanComments(ctx, client, repo, pr, slot.database, slot.databaseType, headSHA)
+	}
+}
+
 // minimizePlanCommentsForSlot sweeps the slot's unminimized plan comments and
 // collapses the superseded ones. posted is the newly posted comment when the
 // sweep follows a post: its own row is skipped and supersession follows

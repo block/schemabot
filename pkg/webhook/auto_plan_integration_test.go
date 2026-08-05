@@ -30,6 +30,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -847,6 +848,142 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	select {
 	case body := <-comments:
 		t.Fatalf("expected no plan comment for no-schema auto-plan, got: %s", body)
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+// TestE2EAutoPlanSynchronizeSchemaRevertedSweepsStalePlanComment exercises the
+// reverted-schema-change UX through the full webhook path: a PR that
+// previously planned a schema change receives a synchronize whose net diff no
+// longer touches any schema file — a revert commit removed the change. No
+// plan runs for the database, so the sweep collapses the prior head's plan
+// comment (its pending DDL and apply prompt no longer match the branch), while
+// a plan comment whose head produced an apply stays expanded as the
+// operational record of what ran.
+func TestE2EAutoPlanSynchronizeSchemaRevertedSweepsStalePlanComment(t *testing.T) {
+	dbName := "webhook_autoplan_schema_reverted"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			State: new("open"),
+			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new("newsha")},
+			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("basesha")},
+			User:  &gh.User{Login: new("testuser")},
+		})
+	})
+	// The net diff after the revert touches no schema files.
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new("app/service.go"), Status: new("modified")},
+		})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	minimized := make(chan string, 4)
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var gql struct {
+			Variables map[string]string `json:"variables"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&gql))
+		minimized <- gql.Variables["id"]
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"minimizeComment": map[string]any{
+					"minimizedComment": map[string]any{"isMinimized": true},
+				},
+			},
+		})
+	})
+
+	// Two of the database's plan comments are still expanded on the PR: one
+	// from a plan that never applied, one whose plan became an apply.
+	insertPlanCommentRow(t, svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_reverted_prior")
+	insertPlanCommentRow(t, svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "ownedsha", 9002, "IC_reverted_owned")
+
+	planID, err := svc.Storage().Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: "plan_reverted_owned",
+		Database:       dbName,
+		DatabaseType:   "mysql",
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+		HeadSHA:        "ownedsha",
+		CreatedAt:      time.Now(),
+	})
+	require.NoError(t, err)
+	lock := &storage.Lock{
+		DatabaseName: dbName,
+		DatabaseType: "mysql",
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		Owner:        "octocat/hello-world#1",
+	}
+	require.NoError(t, svc.Storage().Locks().Acquire(ctx, lock))
+	lock, err = svc.Storage().Locks().Get(ctx, dbName, "mysql")
+	require.NoError(t, err)
+	_, err = svc.Storage().Applies().Create(ctx, &storage.Apply{
+		ApplyIdentifier: "apply_reverted_owned",
+		LockID:          lock.ID,
+		PlanID:          planID,
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		Environment:     "staging",
+		Engine:          "spirit",
+		State:           state.Apply.Completed,
+	})
+	require.NoError(t, err)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:    "synchronize",
+		beforeSHA: "priorsha",
+		headSHA:   "newsha",
+		headRef:   "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The never-applied prior head's plan comment collapses even though no plan
+	// ran and no new comment replaces it.
+	select {
+	case node := <-minimized:
+		assert.Equal(t, "IC_reverted_prior", node)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the reverted schema change's stale plan comment to be minimized")
+	}
+	require.Eventually(t, func() bool {
+		heads := unminimizedHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")
+		return len(heads) == 1 && heads[0] == "ownedsha"
+	}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond,
+		"the swept comment must be recorded minimized and the apply-owned comment must stay expanded")
+
+	// The apply-owned comment must not receive a late minimize, and the sweep
+	// never posts a comment of its own.
+	select {
+	case node := <-minimized:
+		t.Fatalf("expected no further minimize after the sweep, but %q was minimized", node)
+	case body := <-comments:
+		t.Fatalf("expected no plan comment after the schema change was reverted, got: %s", body)
 	case <-time.After(250 * time.Millisecond):
 	}
 }

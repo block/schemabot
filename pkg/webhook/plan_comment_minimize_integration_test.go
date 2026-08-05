@@ -436,6 +436,34 @@ func TestStalePlanCommentSweepSkipsWhenHeadMoved(t *testing.T) {
 		"every comment stays expanded until the current head's own sweep")
 }
 
+// TestRemovedDatabaseSweepMinimizesOnlyRemovedSlots exercises the sweep that
+// runs when a database's schema files drop out of the PR's net diff — for
+// example a revert commit removed the schema change, so no plan runs for that
+// database and no per-slot plan outcome would otherwise touch its comments.
+// The removed database's stale comments collapse; a slot whose database is
+// still planned by the delivery is left to its own plan outcome, and a
+// removed-database comment already rendered at the current head stays
+// expanded.
+func TestRemovedDatabaseSweepMinimizesOnlyRemovedSlots(t *testing.T) {
+	const repo = "org/plan-min-removed-db-sweep"
+	h, st, fake := setupPlanCommentHandler(t, repo)
+
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_removed_shaA")
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaB", 9002, "IC_removed_shaB")
+	insertPlanCommentRow(t, st, repo, 42, "billing", "staging", "shaA", 9003, "IC_planned_shaA")
+	fake.setCurrentHead("shaB")
+
+	h.sweepStalePlanCommentsForRemovedDatabases(repo, 42, "shaB", 12345, map[string]bool{"billing": true})
+
+	assert.Equal(t, []string{"IC_removed_shaA"}, fake.minimizedNodes(),
+		"only the removed database's prior-head comment is minimized")
+	assert.Equal(t, []string{"shaB"}, unminimizedHeads(t, st, repo, 42, "orders", "mysql"),
+		"the removed database's current-head comment stays expanded")
+	assert.Equal(t, []string{"shaA"}, unminimizedHeads(t, st, repo, 42, "billing", "mysql"),
+		"a slot the delivery still plans is left to its own plan outcome")
+	assert.Equal(t, 0, fake.createCount(), "the sweep posts no comment")
+}
+
 // TestStalePlanCommentSweepKeepsApplyOwnedHeadExpanded covers the safety hold
 // on the no-new-comment sweep: once an apply exists for the head a plan
 // comment was rendered at, that comment is the operational record of what ran.

@@ -703,6 +703,12 @@ type PlanCommentStore interface {
 	// caller decides which of them a newly posted comment supersedes.
 	ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
 
+	// ListUnminimizedForPR returns the not-yet-minimized comments across every
+	// database slot on a pull request, ordered by id ascending. Callers use it
+	// to find slots whose database no longer resolves a schema config in the
+	// PR diff, since no per-slot plan outcome sweeps those.
+	ListUnminimizedForPR(ctx context.Context, repo string, pr int) ([]*PlanComment, error)
+
 	// MarkMinimized stamps minimized_at after the GitHub minimize call
 	// succeeded. An already-minimized row is not an error.
 	MarkMinimized(ctx context.Context, id int64) error

@@ -36,6 +36,18 @@ func (s *emptyStorage) Locks() storage.LockStore {
 	return &emptyLockStore{}
 }
 
+func (s *emptyStorage) PlanComments() storage.PlanCommentStore {
+	return &emptyPlanCommentStore{}
+}
+
+type emptyPlanCommentStore struct {
+	storage.PlanCommentStore
+}
+
+func (s *emptyPlanCommentStore) ListUnminimizedForPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
+	return nil, nil
+}
+
 type emptyLockStore struct {
 	storage.LockStore
 }

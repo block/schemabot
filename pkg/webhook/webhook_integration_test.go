@@ -215,6 +215,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 	// returns nil.
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plan_comments WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
