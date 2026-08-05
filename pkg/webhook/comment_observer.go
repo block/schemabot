@@ -668,7 +668,9 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 // the operation set (e.g. OnTerminal) use this to avoid re-reading
 // apply_operations. A failed apply's summary carries the collapsed recent-logs
 // section, appended after whichever layout rendered, so triage data lands on
-// the PR without an extra operator step.
+// the PR without an extra operator step. A completed apply whose accepted
+// cancel was overtaken by engine completion carries the mooted-cancel note,
+// so the operator who issued the cancel sees that the change landed anyway.
 func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
 	var body string
 	if opsErr != nil {
@@ -678,6 +680,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 	} else {
 		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
+	body += mootedCancelSection(ctx, o.stor, o.logger, apply, body)
 	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
 }
 

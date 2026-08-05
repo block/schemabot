@@ -4022,6 +4022,43 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 </details>
 
 <details>
+<summary><a name="summary-completed-cancel-did-not-take-effect"></a><strong>Summary: Completed (Cancel Did Not Take Effect)</strong></summary>
+
+
+## ✅ Schema Change Applied — Staging
+
+**Database**: `testapp`
+
+
+> Applied successfully — your schema changes are live!
+
+<details><summary>Apply details (3 tables)</summary>
+
+_Apply ID: `apply-a1b2c3d4e5f6`_
+
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+</details>
+
+> ⚠️ **Cancel did not take effect** — the schema change completed on the engine before the cancel requested by @jackjackbits could act. The change is live on the target.
+
+</details>
+
+<details>
 <summary><a name="summary-cancelled"></a><strong>Summary: Cancelled</strong></summary>
 
 

@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -53,23 +54,83 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 // state except stopped — a stopped apply remains cancellable, so its pending
 // cancel stays deliverable for the next drive. Sweeping the mooted requests
 // keeps a request issued moments before the apply settled — or one that lost
-// to a contradictory command — from lingering pending forever.
-func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
+// to a contradictory command — from lingering pending forever. A swept cancel
+// records an operator-visible apply event via
+// completeCancelRequestForTerminalApply.
+func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	ops := []storage.ControlOperation{
 		storage.ControlOperationStop,
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
 		storage.ControlOperationVolume,
 	}
-	if !state.IsState(apply.State, state.Apply.Stopped) {
-		ops = append(ops, storage.ControlOperationCancel)
-	}
 	for _, op := range ops {
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}
 	}
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		return nil
+	}
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationCancel)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	return completeCancelRequestForTerminalApply(ctx, store, logger, apply, controlReq)
+}
+
+// completeCancelRequestForTerminalApply completes an apply's pending cancel
+// request that its terminal state resolved. When the terminal state is
+// anything other than cancelled, the cancel was mooted — the engine settled
+// the apply before the accepted cancel could take effect — so an
+// operator-visible apply event records that outcome: without it the apply
+// history shows an accepted cancel followed by a different terminal state
+// with no explanation.
+func completeCancelRequestForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest) error {
+	if err := completePendingControlRequests(ctx, store, apply, storage.ControlOperationCancel); err != nil {
+		return err
+	}
+	if controlReq == nil || state.IsState(apply.State, state.Apply.Cancelled) {
+		return nil
+	}
+	appendMootedCancelApplyEvent(ctx, store, logger, apply, controlReq)
 	return nil
+}
+
+// appendMootedCancelApplyEvent records the apply event disclosing that an
+// accepted cancel never took effect because the apply settled to a different
+// terminal state first. Best-effort: the cancel request is already completed,
+// so an append failure is logged rather than returned — retrying the sweep
+// would find no pending cancel and never write the event.
+func appendMootedCancelApplyEvent(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest) {
+	entry := &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelWarn,
+		EventType: storage.LogEventInfo,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   mootedCancelEventMessage(apply.State, controlReq),
+		CreatedAt: time.Now(),
+	}
+	if err := store.ApplyLogs().Append(ctx, entry); err != nil {
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("failed to log mooted-cancel apply event",
+			append(apply.LogAttrs(), "error", err)...)
+	}
+}
+
+// mootedCancelEventMessage renders the operator-facing apply-log line for a
+// cancel that was overtaken by the apply settling to applyState.
+func mootedCancelEventMessage(applyState string, controlReq *storage.ApplyControlRequest) string {
+	outcome := fmt.Sprintf("reached %s on the engine before the cancel could take effect", applyState)
+	if state.IsState(applyState, state.Apply.Completed) {
+		outcome = "completed on the engine before the cancel could take effect; the change is live on the target"
+	}
+	return fmt.Sprintf("Cancel did not take effect: the schema change %s%s", outcome, callerApplyLogSuffix(controlRequestCaller(controlReq)))
 }
 
 // failPendingControlRequests marks the pending control request of the given

@@ -103,7 +103,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,
-		templates.PreviewCommentSummaryStopped,
+		templates.PreviewCommentSummaryStopped, templates.PreviewCommentSummaryMootedCancel,
 		templates.PreviewCommentSummaryCompletedLarge, templates.PreviewCommentSummaryVitessVSchema,
 		templates.PreviewCommentSummaryVitessVSchemaOnly,
 		templates.PreviewCommentSummaryFailedLarge,

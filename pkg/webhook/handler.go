@@ -512,6 +512,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
+		summaryBase += mootedCancelSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}

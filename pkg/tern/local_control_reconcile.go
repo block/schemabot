@@ -107,7 +107,7 @@ func (c *LocalClient) reconcileEngineTerminalTruthBeforeCommands(ctx context.Con
 	// completes the pending stop, and the pending cancel too for every adopted
 	// state (none of them is stopped, the one state that keeps a cancel
 	// deliverable).
-	if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+	if err := completePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 		return true, err
 	}
 	c.notifyTerminalObserver(apply, tasks)

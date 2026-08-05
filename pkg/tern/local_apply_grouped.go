@@ -968,7 +968,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"stored_state", freshApply.State,
 			"progress_state", apply.State)
 		*apply = *freshApply
-		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, logger, apply); err != nil {
 			logger.Warn("failed to complete pending control requests for terminal apply; current apply owner will exit for operator retry",
 				"error", err)
 			return true
@@ -1015,7 +1015,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+		if err := completePendingRequestsForTerminalApply(ctx, c.storage, logger, apply); err != nil {
 			logger.Warn("failed to complete pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
 				"error", err)
 			return true

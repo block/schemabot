@@ -47,6 +47,18 @@ func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.o
 
 func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
 
+func (s *stubStorage) ControlRequests() storage.ControlRequestStore { return stubControlRequestStore{} }
+
+// stubControlRequestStore reports no control requests, so terminal summaries
+// render without the mooted-cancel note.
+type stubControlRequestStore struct {
+	storage.ControlRequestStore
+}
+
+func (stubControlRequestStore) GetByOperation(context.Context, int64, storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	return nil, nil
+}
+
 // stubTaskStore supplies the per-shard read the comment dispatch path makes; the
 // routing tests have no shard rows, so it returns none.
 type stubTaskStore struct {

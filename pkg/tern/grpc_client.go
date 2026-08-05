@@ -952,7 +952,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := completeCancelRequestForTerminalApply(ctx, c.storage, slog.Default(), apply, controlReq); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
@@ -1006,7 +1006,13 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
 	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
-	if isTerminalProtoState(progress.State) {
+	// A stopped remote is not a cancel outcome: stopped remotes remain
+	// cancellable, so the durable cancel request stays pending — for the
+	// remote driver holding the accepted cancel, or the next drive — instead
+	// of being consumed here, where a pending start could later resume a
+	// change the user cancelled. It also writes no mooted-cancel disclosure:
+	// the cancel can still take effect.
+	if isTerminalProtoState(progress.State) && progress.State != ternv1.State_STATE_STOPPED {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
@@ -1015,7 +1021,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := completeCancelRequestForTerminalApply(ctx, c.storage, slog.Default(), apply, controlReq); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
