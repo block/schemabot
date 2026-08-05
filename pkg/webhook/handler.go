@@ -173,19 +173,19 @@ type Handler struct {
 	webhookReconcileGrace    time.Duration
 	webhookReconcileMaxPages int
 
-	// Check refresh processor lifecycle (see check_refresh.go). The intervals
+	// Merge gate processor lifecycle (see merge_gate.go). The intervals
 	// have package defaults set at construction; tests override them directly.
-	checkRefreshPollInterval  time.Duration
-	checkRefreshLeaseDuration time.Duration
-	checkRefreshSweepLookback time.Duration
-	checkRefreshMu            sync.Mutex
-	checkRefreshStop          chan struct{}
-	checkRefreshCancel        context.CancelFunc
-	checkRefreshWg            sync.WaitGroup
-	// checkRefreshKick wakes the driver to run a pass now instead of waiting
+	mergeGatePollInterval  time.Duration
+	mergeGateLeaseDuration time.Duration
+	mergeGateSweepLookback time.Duration
+	mergeGateMu            sync.Mutex
+	mergeGateStop          chan struct{}
+	mergeGateCancel        context.CancelFunc
+	mergeGateWg            sync.WaitGroup
+	// mergeGateKick wakes the driver to run a pass now instead of waiting
 	// for the next poll tick; buffered so one pending kick coalesces any
 	// number of concurrent recordings.
-	checkRefreshKick chan struct{}
+	mergeGateKick chan struct{}
 
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
@@ -272,10 +272,10 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
-		checkRefreshPollInterval:    defaultCheckRefreshPollInterval,
-		checkRefreshLeaseDuration:   defaultCheckRefreshLeaseDuration,
-		checkRefreshSweepLookback:   defaultCheckRefreshSweepLookback,
-		checkRefreshKick:            make(chan struct{}, 1),
+		mergeGatePollInterval:       defaultMergeGatePollInterval,
+		mergeGateLeaseDuration:      defaultMergeGateLeaseDuration,
+		mergeGateSweepLookback:      defaultMergeGateSweepLookback,
+		mergeGateKick:               make(chan struct{}, 1),
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
