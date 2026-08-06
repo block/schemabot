@@ -9,11 +9,8 @@ import (
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -28,27 +25,7 @@ import (
 func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := postgres.Run(ctx,
-		"postgres:16",
-		postgres.WithDatabase("schemabot_test"),
-		postgres.WithUsername("schemabot"),
-		postgres.WithPassword("test"),
-		postgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err, "failed to start postgres")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "sslmode=disable")
-	require.NoError(t, err, "failed to get connection string")
-
-	db, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoError(t, db.PingContext(ctx))
+	_, db := testutil.StartPostgres(t, "schemabot_test")
 
 	for name, content := range readSchemaDir(t, "postgres") {
 		for stmt := range strings.SplitSeq(content, ";") {
