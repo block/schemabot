@@ -494,8 +494,20 @@ over gRPC run with that deployment's engine settings.
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,
-`EnsureSchema` diffs the embedded schema files against the live storage
-database and applies whatever DDL is needed before the server accepts traffic.
+`EnsureSchema` converges the live storage database against the embedded schema
+files before the server accepts traffic. How far that convergence goes depends
+on the storage dialect:
+
+- **MySQL** diffs the embedded schema files against the live database and
+  applies whatever DDL is needed (via Spirit) — new tables, new columns, and
+  index changes all converge automatically.
+- **PostgreSQL** creates missing tables only. A table that already exists is
+  left untouched, so column or index drift on an existing table is not
+  detected or repaired, and `allow_destructive_schema_changes` has no effect —
+  the flow never produces destructive DDL. Evolving an already-bootstrapped
+  PostgreSQL storage schema requires a separate schema change mechanism.
+
+The rest of this section describes the MySQL flow.
 
 By default, destructive statements in that diff — `DROP TABLE`, or an
 `ALTER TABLE` containing `DROP COLUMN` — are refused and skipped whole (a
