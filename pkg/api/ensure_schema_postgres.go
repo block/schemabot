@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -57,17 +58,22 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 
 	// Diagnostic preamble: log the actual database target before doing any
 	// work, so a bootstrap against the wrong database is visible from the
-	// startup logs alone.
+	// startup logs alone. Best-effort like the MySQL flow — a failed
+	// diagnostic must not abort the bootstrap. current_schema() is NULL when
+	// the role's search_path resolves to no schema, so coalesce it rather
+	// than failing the scan; the real failure surfaces at table creation
+	// with the server's error.
 	var database, schemaName string
-	if err := db.QueryRowContext(ctx, "SELECT current_database(), current_schema()").Scan(&database, &schemaName); err != nil {
-		return fmt.Errorf("query storage database identity: %w", err)
+	if err := db.QueryRowContext(ctx, "SELECT current_database(), COALESCE(current_schema(), '')").Scan(&database, &schemaName); err != nil {
+		logger.Warn("storage target diagnostic failed", "error", err)
+	} else {
+		logger.Info("EnsureSchema storage target",
+			"dialect", schema.DialectPostgres,
+			"database", database,
+			"schema", schemaName,
+			"embedded_tables", len(tables),
+		)
 	}
-	logger.Info("EnsureSchema storage target",
-		"dialect", schema.DialectPostgres,
-		"database", database,
-		"schema", schemaName,
-		"embedded_tables", len(tables),
-	)
 
 	// Fast path: check existence without a lock. If every table exists,
 	// return immediately.
@@ -182,61 +188,35 @@ func missingPostgresTables(ctx context.Context, db *sql.DB, want []string) ([]st
 // PostgreSQL DDL is transactional, so the table appears with all of its
 // indexes or not at all; an interrupted bootstrap never leaves a
 // partially-indexed table behind.
+//
+// The file executes whole in one Exec: pgx uses the simple query protocol for
+// zero-argument Execs, and the simple protocol runs a multi-statement string
+// natively, so no client-side statement splitting is needed.
 func createPostgresTable(ctx context.Context, db *sql.DB, table, content string, logger *slog.Logger) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	// Rollback after a successful commit is a no-op returning sql.ErrTxDone;
-	// asserting on it would surface that guaranteed error as noise.
-	defer func() { _ = tx.Rollback() }()
-
-	for _, stmt := range splitPostgresStatements(content) {
-		logger.Info("schema change",
-			"table", table,
-			"ddl", stmt,
-		)
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("execute statement %q: %w", stmt, err)
+	// any other rollback failure is worth surfacing.
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			logger.Warn("failed to roll back transaction", "table", table, "error", err)
 		}
+	}()
+
+	logger.Info("schema change",
+		"table", table,
+		"operation", "create",
+		"ddl", content,
+	)
+	if _, err := tx.ExecContext(ctx, content); err != nil {
+		return fmt.Errorf("execute schema file: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
-}
-
-// splitPostgresStatements splits an embedded PostgreSQL schema file into its
-// individual statements on semicolons outside single-quoted string literals.
-// The embedded files hold plain CREATE TABLE and CREATE INDEX statements only
-// — no dollar-quoted function bodies or procedural blocks (an invariant
-// documented on schema.PostgresFS and exercised by the schema parity tests) —
-// so quote-aware splitting is exact for this input.
-func splitPostgresStatements(content string) []string {
-	var stmts []string
-	var b strings.Builder
-	inString := false
-	for i := 0; i < len(content); i++ {
-		c := content[i]
-		switch {
-		case c == '\'':
-			// A doubled quote inside a literal toggles twice, leaving the
-			// state unchanged — exactly PostgreSQL's escape semantics.
-			inString = !inString
-			b.WriteByte(c)
-		case c == ';' && !inString:
-			if stmt := strings.TrimSpace(b.String()); stmt != "" {
-				stmts = append(stmts, stmt)
-			}
-			b.Reset()
-		default:
-			b.WriteByte(c)
-		}
-	}
-	if stmt := strings.TrimSpace(b.String()); stmt != "" {
-		stmts = append(stmts, stmt)
-	}
-	return stmts
 }
 
 // acquirePostgresEnsureSchemaLock acquires a session-scoped advisory lock to
@@ -264,6 +244,13 @@ func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *sl
 	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
 	if err != nil {
 		utils.CloseAndLog(conn)
+		// The overall EnsureSchema deadline expires before the server-side
+		// lock wait (which starts later, with the same duration), so a
+		// contended timeout surfaces here as a context error — name the
+		// likely cause instead of reporting only the raw cancellation.
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}
 	if !acquired {

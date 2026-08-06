@@ -7,14 +7,13 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -24,45 +23,7 @@ import (
 // for assertions.
 func startPostgresStorage(t *testing.T) (string, *sql.DB) {
 	t.Helper()
-	ctx := t.Context()
-
-	container, err := postgres.Run(ctx,
-		"postgres:16",
-		postgres.WithDatabase("schemabot"),
-		postgres.WithUsername("schemabot"),
-		postgres.WithPassword("test"),
-		postgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err, "failed to start postgres")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "sslmode=disable")
-	require.NoError(t, err, "failed to get connection string")
-
-	db, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoError(t, db.PingContext(ctx))
-
-	return dsn, db
-}
-
-// pgTableExists reports whether table exists in the public schema. It is a
-// PostgreSQL-side counterpart to testutil.TableExists, whose `?` placeholders
-// only bind on MySQL.
-func pgTableExists(t *testing.T, db *sql.DB, table string) bool {
-	t.Helper()
-	var count int
-	err := db.QueryRowContext(t.Context(),
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
-		table,
-	).Scan(&count)
-	require.NoError(t, err)
-	return count > 0
+	return testutil.StartPostgres(t, "schemabot")
 }
 
 // requireStorageTables asserts that every embedded PostgreSQL schema file's
@@ -72,7 +33,7 @@ func requireStorageTables(t *testing.T, db *sql.DB) {
 	tables, _, err := readEmbeddedPostgresSchemaFiles()
 	require.NoError(t, err)
 	for _, table := range tables {
-		require.True(t, pgTableExists(t, db, table),
+		require.True(t, testutil.PostgresTableExists(t, db, "public", table),
 			"storage table %q missing after bootstrap", table)
 	}
 }
@@ -142,5 +103,53 @@ func TestEnsureSchemaPostgres_ConcurrentPods(t *testing.T) {
 	}
 	require.NoError(t, g.Wait())
 
+	requireStorageTables(t, db)
+}
+
+// A bootstrap that finds tables missing must park on the advisory lock while
+// another pod holds it — creating nothing in the meantime — then proceed
+// under the lock once the holder releases and converge the schema. The lock
+// contention is pinned deterministically: the test holds the production lock,
+// proves the bootstrap is waiting on it via pg_locks, and only then releases.
+func TestEnsureSchemaPostgres_WaitsForAdvisoryLock(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Hold the EnsureSchema advisory lock the way a leading pod would.
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, namedlock.Postgres{})
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	}()
+
+	// Wait until the bootstrap is provably parked on the advisory lock: its
+	// pg_advisory_lock call shows up in pg_locks as an ungranted advisory
+	// lock request.
+	require.Eventually(t, func() bool {
+		var waiters int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted").Scan(&waiters); err != nil {
+			t.Logf("poll pg_locks for advisory-lock waiters: %v", err)
+			return false
+		}
+		return waiters > 0
+	}, 30*time.Second, 50*time.Millisecond, "bootstrap never waited on the advisory lock")
+
+	// While parked, the bootstrap must not have created any tables.
+	require.False(t, testutil.PostgresTableExists(t, db, "public", "tasks"),
+		"bootstrap created tables while waiting for the advisory lock")
+
+	// Closing the lock connection ends its session, releasing the lock.
+	utils.CloseAndLog(lockConn)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("bootstrap did not complete after the advisory lock was released")
+	}
 	requireStorageTables(t, db)
 }

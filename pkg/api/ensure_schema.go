@@ -31,6 +31,10 @@ import (
 // while the leader applies, then see no changes. Too short a value cancels the
 // apply mid-copy ("failed to read chunk data: context canceled") and leaves
 // storage uninitialized.
+//
+// The same constant bounds the PostgreSQL bootstrap flow — its existence
+// checks, advisory-lock wait, and transactional table creation — so tuning it
+// for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits.
 const EnsureSchemaTimeout = 5 * time.Minute
 
 // EnsureSchemaOption customizes EnsureSchema behavior.
@@ -579,6 +583,13 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
 	if err != nil {
 		utils.CloseAndLog(conn)
+		// The overall EnsureSchema deadline expires before the server-side
+		// lock wait (which starts later, with the same duration), so a
+		// contended timeout surfaces here as a context error — name the
+		// likely cause instead of reporting only the raw cancellation.
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}
 	if !acquired {
