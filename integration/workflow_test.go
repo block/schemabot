@@ -76,13 +76,13 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 	schemabotDB, err := sql.Open("mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
-	storage := mysqlstore.New(schemabotDB)
+	store := mysqlstore.New(schemabotDB)
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
 		Type:      "mysql",
 		TargetDSN: appDSN,
-	}, storage, logger)
+	}, store, logger)
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
@@ -95,7 +95,7 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 			},
 		},
 	}
-	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
+	svc := schemabotapi.New(store, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
 	startTestOperatorWithInterval(t, svc, operatorInterval)
@@ -119,7 +119,7 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 		_ = schemabotDB.Close()
 	})
 
-	return testServer{Addr: addr, Storage: storage, Service: svc}
+	return testServer{Addr: addr, Storage: store, Service: svc}
 }
 
 func startTestOperator(t *testing.T, svc *schemabotapi.Service) {

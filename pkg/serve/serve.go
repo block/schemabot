@@ -322,8 +322,8 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	storage := mysqlstore.New(db)
-	svc := api.New(storage, cfg, nil, logger)
+	store := mysqlstore.New(db)
+	svc := api.New(store, cfg, nil, logger)
 	defer func() {
 		if !success {
 			utils.CloseAndLog(svc)
@@ -359,7 +359,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// gRPC transport reuses the same instance.
 	var dataPlaneClient tern.Client
 	if cfg.TargetResolver.Enabled() {
-		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), o.engines, svc.WakeOperator)
+		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, store, logger, os.Getenv("TERN_ENVIRONMENT"), o.engines, svc.WakeOperator)
 		if err != nil {
 			return nil, fmt.Errorf("build data-plane target router: %w", err)
 		}
@@ -385,7 +385,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	return &Server{
 		cfg:             cfg,
 		svc:             svc,
-		storage:         storage,
+		storage:         store,
 		logger:          logger,
 		dataPlaneClient: dataPlaneClient,
 		webhook:         webhookRuntime,

@@ -26,6 +26,8 @@ type Storage struct {
 	webhookEvents   *webhookEventStore
 }
 
+var _ storage.Storage = (*Storage)(nil)
+
 // New creates a new MySQL storage instance.
 func New(db *sql.DB) *Storage {
 	return &Storage{
