@@ -84,8 +84,10 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 	switch o.dialect {
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
+	case schema.DialectPostgres:
+		return ensurePostgresSchema(dsn, logger, namedlock.Postgres{})
 	default:
-		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q)", o.dialect, schema.DialectMySQL)
+		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}
 }
 
