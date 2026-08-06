@@ -15,7 +15,7 @@ const settingColumns = `id, setting_key, setting_value, created_at, updated_at`
 
 // settingsStore implements storage.SettingsStore using MySQL.
 type settingsStore struct {
-	db      *sql.DB
+	db      *rebindDB
 	dialect Dialect
 }
 

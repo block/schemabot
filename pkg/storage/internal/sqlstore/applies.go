@@ -54,7 +54,7 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	dialect  Dialect
 	identity identityInserter
 	// locker serializes concurrent applies against the same target with a
@@ -188,7 +188,7 @@ func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation strin
 	return &applyWriteTx{tx: tx}, nil
 }
 
-func beginApplyTargetWriteTx(ctx context.Context, db *sql.DB, locker namedlock.Locker, operation, database, dbType, environment string) (*applyWriteTx, error) {
+func beginApplyTargetWriteTx(ctx context.Context, db *rebindDB, locker namedlock.Locker, operation, database, dbType, environment string) (*applyWriteTx, error) {
 	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
 	if err != nil {
 		return nil, err
@@ -229,7 +229,7 @@ func applyTargetLockName(database, dbType, environment string) string {
 	return "schemabot_apply_" + hex.EncodeToString(sum[:16])
 }
 
-func acquireApplyTargetLockConn(ctx context.Context, db *sql.DB, locker namedlock.Locker, database, dbType, environment string) (*sql.Conn, string, error) {
+func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedlock.Locker, database, dbType, environment string) (*sql.Conn, string, error) {
 	if !hasApplyTarget(database, dbType, environment) {
 		return nil, "", fmt.Errorf("active apply target is required for %s/%s/%s", database, dbType, environment)
 	}
@@ -1746,7 +1746,7 @@ func (o claimOutcome) claimedAndComplete() bool {
 // window between the re-check and the commit. When another active apply owns the
 // target the claim is refused and the pending start control request is failed so
 // the operator sees why.
-func persistApplyClaim(ctx context.Context, db *sql.DB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
+func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
@@ -1784,7 +1784,7 @@ func persistApplyClaim(ctx context.Context, db *sql.DB, locker namedlock.Locker,
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
 // re-check and the commit. The lock is released only after the commit.
-func claimStoppedApplyUnderTargetLock(ctx context.Context, db *sql.DB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker namedlock.Locker, tx *sql.Tx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
 	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
 	if err != nil {
 		return claimLostRace, err

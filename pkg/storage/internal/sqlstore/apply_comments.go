@@ -18,7 +18,7 @@ const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, pos
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
-	db      *sql.DB
+	db      *rebindDB
 	dialect Dialect
 }
 

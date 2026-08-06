@@ -1025,7 +1025,7 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	// Hold the same target lock that the create path must acquire. The creates
 	// below use the public store API; a result before release means active
 	// apply writes are not serialized by the per-target lock.
-	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, testDB, namedlock.MySQL{}, "testdb", "mysql", "staging")
+	guardConn, guardLockName, err := acquireApplyTargetLockConn(ctx, newRebindDB(testDB, MySQLDialect{}), namedlock.MySQL{}, "testdb", "mysql", "staging")
 	require.NoError(t, err)
 	releaseGuard := func() {
 		if guardConn == nil {

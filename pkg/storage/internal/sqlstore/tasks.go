@@ -41,7 +41,7 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	identity identityInserter
 }
 

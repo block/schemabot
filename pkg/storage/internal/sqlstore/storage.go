@@ -14,7 +14,7 @@ import (
 
 // Storage implements the storage.Storage interface using MySQL.
 type Storage struct {
-	db              *sql.DB
+	db              *rebindDB
 	locks           *lockStore
 	plans           *planStore
 	applies         *applyStore
@@ -33,20 +33,21 @@ var _ storage.Storage = (*Storage)(nil)
 
 // New creates a new MySQL storage instance.
 func New(db *sql.DB) *Storage {
+	rdb := newRebindDB(db, MySQLDialect{})
 	return &Storage{
-		db:              db,
-		locks:           &lockStore{db: db},
-		plans:           &planStore{db: db, identity: MySQLDialect{}},
-		applies:         &applyStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
-		tasks:           &taskStore{db: db, identity: MySQLDialect{}},
-		applyLogs:       &applyLogStore{db: db, identity: MySQLDialect{}},
-		controlRequests: &controlRequestStore{db: db, identity: MySQLDialect{}},
-		applyComments:   &applyCommentStore{db: db, dialect: MySQLDialect{}},
-		planComments:    &planCommentStore{db: db, identity: MySQLDialect{}},
-		applyOperations: &applyOperationStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
-		checks:          &checkStore{db: db, dialect: MySQLDialect{}},
-		settings:        &settingsStore{db: db, dialect: MySQLDialect{}},
-		webhookEvents:   &webhookEventStore{db: db, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		db:              rdb,
+		locks:           &lockStore{db: rdb},
+		plans:           &planStore{db: rdb, identity: MySQLDialect{}},
+		applies:         &applyStore{db: rdb, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
+		tasks:           &taskStore{db: rdb, identity: MySQLDialect{}},
+		applyLogs:       &applyLogStore{db: rdb, identity: MySQLDialect{}},
+		controlRequests: &controlRequestStore{db: rdb, identity: MySQLDialect{}},
+		applyComments:   &applyCommentStore{db: rdb, dialect: MySQLDialect{}},
+		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}},
+		applyOperations: &applyOperationStore{db: rdb, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
+		checks:          &checkStore{db: rdb, dialect: MySQLDialect{}},
+		settings:        &settingsStore{db: rdb, dialect: MySQLDialect{}},
+		webhookEvents:   &webhookEventStore{db: rdb, dialect: MySQLDialect{}, identity: MySQLDialect{}},
 	}
 }
 
