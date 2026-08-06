@@ -784,12 +784,12 @@ func appendSupportChannelFooter(body string, support api.SupportChannelConfig) s
 	})
 }
 
-// enqueueDurableIssueCommentCommand persists a durably dispatched command
-// delivery (apply, apply-confirm, or unlock) into the durable inbox and ACKs
-// the webhook. The request path has
-// already run the routing and usage gates, so the stored row is a command this
-// deployment committed to act on; a leased driver re-drives the command core
-// with retries so a process restart cannot drop an acknowledged command.
+// enqueueDurableIssueCommentCommand persists a command delivery the
+// ready-check admits into the durable inbox and ACKs the webhook. The request
+// path has already run the routing and usage gates, so the stored row is a
+// command this deployment committed to act on; a leased driver re-drives the
+// command core with retries so a process restart cannot drop an acknowledged
+// command.
 // Enqueue failure is a deliberate 500 with no in-process fallback — it fails
 // loudly (a red delivery in GitHub's webhook UI) so an operator can Redeliver.
 func (h *Handler) enqueueDurableIssueCommentCommand(ctx context.Context, w http.ResponseWriter, metricApp string, body []byte, deliveryID, repo string, pr int, installationID int64, commandAction string) {
@@ -910,10 +910,15 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	case action.ApplyConfirm:
 		coreRetry, coreErr = h.applyConfirmCommandCore(ctx, repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 	case action.Unlock:
-		coreRetry, coreErr = h.unlockCommandCore(ctx, repo, pr, installationID, requestedBy, result)
+		coreRetry, coreErr = h.unlockCommandCore(ctx, event.ReceivedAt, repo, pr, installationID, requestedBy, result)
 	default:
-		h.logger.Info("durable issue_comment delivery ignored because its command has no durable driver",
+		// The ready-check and this routing switch are two enumerations of the
+		// durably dispatched command set; a command admitted by one and missing
+		// from the other would swallow work the user already saw acknowledged.
+		// Keep the swallow operator-visible the same way as a ready-check miss.
+		h.logger.Warn("durable issue_comment delivery completed without dispatch because its command has no durable driver",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
+		metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_unrouted")
 		return false, nil
 	}
 	if coreErr != nil {

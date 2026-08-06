@@ -50,8 +50,10 @@ func newDurableIssueCommentEnqueueHandler(t *testing.T, events storage.WebhookEv
 	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch())
 }
 
-// durableIssueCommentEvent returns a claimable issue_comment inbox row for an
-// apply command, mirroring what the HTTP path enqueues.
+// durableIssueCommentEvent returns a claimable issue_comment inbox row for a
+// command comment, mirroring what the HTTP path enqueues. ReceivedAt is set
+// the way the store populates it on insert, so drivers that bound their work
+// to the delivery's receipt time see a realistic value.
 func durableIssueCommentEvent(comment string) *storage.WebhookEvent {
 	return &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
@@ -62,11 +64,12 @@ func durableIssueCommentEvent(comment string) *storage.WebhookEvent {
 		PullRequest: 7,
 		TenantID:    "12345",
 		Payload:     durableIssueCommentPayload(comment),
+		ReceivedAt:  time.Now(),
 	}
 }
 
-// With durable dispatch enabled, an apply or apply-confirm command acks fast
-// by persisting an inbox row rather than dispatching an in-process goroutine,
+// With durable dispatch enabled, a durably dispatched command acks fast by
+// persisting an inbox row rather than dispatching an in-process goroutine,
 // so a deploy after the ACK cannot drop the acknowledged command.
 func TestDurableIssueCommentCommandQueuesAndAcks(t *testing.T) {
 	tests := []struct {
@@ -528,6 +531,56 @@ func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
 		t.Fatal("expected unlock lock-lookup failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
+}
+
+// cancelOnLookupLockStore cancels the drive context during the lock lookup and,
+// like a real store, refuses to mutate lock state once its context is
+// cancelled. It pins that the driver's context reaches the unlock core's
+// storage calls: a core detached from the drive context would release the lock
+// anyway.
+type cancelOnLookupLockStore struct {
+	storage.LockStore
+	cancel   context.CancelFunc
+	locks    []*storage.Lock
+	released int
+}
+
+func (s *cancelOnLookupLockStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Lock, error) {
+	s.cancel()
+	return s.locks, nil
+}
+
+func (s *cancelOnLookupLockStore) Release(ctx context.Context, _, _, _ string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.released++
+	return nil
+}
+
+// Cancelling the driver's context (shutdown or lease loss) mid-unlock must
+// stop the core's lock releases: once the lease cannot be proven, this driver
+// must not keep mutating lock state, and the claim is released so the next
+// claimant re-drives the command from current state.
+func TestDurableIssueCommentDriverCancelledUnlockStopsLockReleases(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot unlock"))
+	driveCtx, cancelDrive := context.WithCancel(t.Context())
+	t.Cleanup(cancelDrive)
+	lock := prOwnedOrdersLock()
+	lock.CreatedAt = time.Now().Add(-time.Hour)
+	locks := &cancelOnLookupLockStore{cancel: cancelDrive, locks: []*storage.Lock{lock}}
+	h, _ := newDurableUnlockDriverHarness(t, store, locks)
+
+	h.driveNextDurableWebhook(driveCtx, 0, "test-host/1/webhook-driver-0")
+
+	require.Zero(t, locks.released, "a cancelled run must not release locks it can no longer prove it owns")
+	select {
+	case released := <-store.released:
+		require.Equal(t, "token-1", released.leaseToken)
+	default:
+		t.Fatal("expected the cancelled run to release its claim for re-drive")
+	}
+	require.Empty(t, store.completed, "a cancelled run must not complete the delivery")
 }
 
 // Cancelling the driver's context (shutdown or lease loss) must reach the

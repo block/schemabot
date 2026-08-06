@@ -639,7 +639,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 // the durability disposition, which only a durable issue_comment driver
 // consumes.
 func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	_, _ = h.unlockCommandCore(context.Background(), repo, pr, installationID, requestedBy, result)
+	_, _ = h.unlockCommandCore(context.Background(), time.Now(), repo, pr, installationID, requestedBy, result)
 }
 
 // unlockRejectionError marks a deterministic unlock rejection: the message is
@@ -672,8 +672,17 @@ func isUnlockRejection(err error) bool {
 //     locks that remain.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (a completed release, a deterministic inference or lookup rejection, no
-//     locks found, an authorization block on the merits, or an active apply
-//     still protecting the lock).
+//     locks found, an authorization block on the merits, an active apply
+//     still protecting the lock, or a command that predates every lock it
+//     matched).
+//
+// issuedAt bounds the release targets: a lock acquired after the command was
+// received is never released. The command's intent covered the locks that
+// existed when it was issued; on the durable path a re-drive can run minutes
+// later — or arbitrarily later via redelivery — by which time a matched lock
+// may be protecting a fresh apply awaiting confirmation or another session's
+// work. The synchronous wrapper passes time.Now(); the durable driver passes
+// the delivery's received-at.
 //
 // A terminal rejection is a per-delivery decision: it is deterministic for
 // the PR head this delivery read, and a later push can change the answer.
@@ -697,7 +706,7 @@ func isUnlockRejection(err error) bool {
 // Every failure is logged where it is classified — by the core at its own
 // exits, and by the authorization gates for gate outcomes — so the synchronous
 // wrapper can discard the result without losing observability.
-func (h *Handler) unlockCommandCore(parent context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel := h.commandContext(parent, 30*time.Second)
 	defer cancel()
 	if result.Force && result.Database == "" {
@@ -721,6 +730,30 @@ func (h *Handler) unlockCommandCore(parent context.Context, repo string, pr int,
 			return false, nil
 		}
 		return true, fmt.Errorf("unlock command lock lookup %s#%d: %w", repo, pr, err)
+	}
+
+	// Release only locks that existed when the command was received. A lock
+	// acquired afterwards was never covered by the command's intent and may be
+	// protecting newer work — a fresh apply awaiting confirmation, or another
+	// session's CLI lock on a force unlock.
+	fresh := make([]*storage.Lock, 0, len(locks))
+	var skippedNewer int
+	for _, lock := range locks {
+		if lock.CreatedAt.After(issuedAt) {
+			skippedNewer++
+			h.logger.Warn("unlock will not release a lock acquired after the command was received",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "lock_created_at", lock.CreatedAt, "command_received_at", issuedAt)
+			continue
+		}
+		fresh = append(fresh, lock)
+	}
+	locks = fresh
+	if len(locks) == 0 && skippedNewer > 0 {
+		h.logger.Info("unlock released nothing because every matched lock postdates the command", "repo", repo, "pr", pr)
+		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
+			"Every lock matched by this unlock command was acquired after the command was received, so nothing was released. Comment `schemabot unlock` again to release the current locks.")
+		return false, nil
 	}
 
 	if len(locks) == 0 {
@@ -794,6 +827,17 @@ func (h *Handler) unlockCommandCore(parent context.Context, repo string, pr int,
 			err = h.service.Storage().Locks().ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType)
 		} else {
 			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		}
+		if errors.Is(err, storage.ErrLockNotFound) || errors.Is(err, storage.ErrLockNotOwned) {
+			// The lock vanished (or changed owner) between lookup and release —
+			// a concurrent unlock or apply's own stale-lock cleanup got there
+			// first. The lock this command targeted is gone, which is the
+			// command's goal, so this is not a failure to retry; skip the
+			// success comment too, since this command did not do the releasing.
+			h.logger.Info("unlock target already released",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "force", result.Force, "error", err)
+			continue
 		}
 		if err != nil {
 			h.logger.Error("failed to release lock",
