@@ -1563,7 +1563,7 @@ func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*s
 
 	// Do not wait for the lock: whoever holds it is doing this pass's work, and
 	// this instance's next tick is soon enough.
-	acquired, err := s.locker.Acquire(ctx, conn, strandedReaperLockName, 0)
+	acquired, err := s.locker.Acquire(ctx, conn.raw(), strandedReaperLockName, 0)
 	if err != nil {
 		return nil, fmt.Errorf("acquire stranded reaper lock: %w", err)
 	}
@@ -1574,7 +1574,7 @@ func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*s
 		// A held lock parks every instance's reaper until this session is
 		// retired, so the two ways it can survive the pass are reported apart:
 		// the release errored, or it ran and reported the lock was not held.
-		released, err := s.locker.Release(context.WithoutCancel(ctx), conn, strandedReaperLockName)
+		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.raw(), strandedReaperLockName)
 		if err != nil {
 			slog.WarnContext(ctx, "failed to release the stranded reaper lock; reapers stay blocked until this session is retired",
 				"lock", strandedReaperLockName, "error", err)

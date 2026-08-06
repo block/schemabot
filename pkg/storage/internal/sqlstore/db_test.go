@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -57,16 +58,36 @@ type noopTx struct{}
 func (noopTx) Commit() error   { return nil }
 func (noopTx) Rollback() error { return nil }
 
+// rebindMarker is appended by countingBinder so tests can assert, on the SQL
+// the driver actually received, that a statement was rebound exactly once.
+const rebindMarker = " /* rebound */"
+
 // countingBinder rewrites the query to a recognizable form and counts how many
 // times it was invoked, so tests can prove each execution rebinds exactly once
-// and forwards the rebound SQL downstream.
+// and forwards the rebound SQL downstream. It also records whether it was ever
+// handed a query that was already rebound, which would mean a double rebind.
 type countingBinder struct {
-	calls int
+	calls         int
+	doubleRebound bool
 }
 
 func (b *countingBinder) Rebind(query string) string {
 	b.calls++
-	return query + " /* rebound */"
+	if strings.Contains(query, rebindMarker) {
+		b.doubleRebound = true
+	}
+	return query + rebindMarker
+}
+
+// assertReboundExactlyOnce verifies every statement the driver received was
+// rebound exactly once: the binder never saw already-rebound SQL, and each
+// recorded query carries exactly one marker.
+func assertReboundExactlyOnce(t *testing.T, b *countingBinder, connector *recordingConnector) {
+	t.Helper()
+	assert.False(t, b.doubleRebound, "binder received already-rebound SQL")
+	for _, q := range connector.queries {
+		assert.Equal(t, 1, strings.Count(q, rebindMarker), "query not rebound exactly once: %s", q)
+	}
 }
 
 // newRecordingRebindDB returns a rebindDB whose pool is backed by the
@@ -118,31 +139,79 @@ func TestRebindDBQueryRowContextRebindsOnce(t *testing.T) {
 	assert.Equal(t, [][]driver.Value{{int64(7)}}, connector.args)
 }
 
-// Transactions and pinned connections are raw passthrough handles: obtaining
-// them must not invoke the binder, and statements executed on them reach the
-// driver with the store's native placeholders unchanged.
-func TestRebindDBTransactionAndConnBypassBinder(t *testing.T) {
+// Statements executed inside a pool transaction pass through the binder
+// exactly once, the same as direct pool execution.
+func TestRebindTxRebindsOnce(t *testing.T) {
 	b := &countingBinder{}
 	rdb, connector := newRecordingRebindDB(t, b)
 	ctx := t.Context()
 
 	tx, err := rdb.BeginTx(ctx, nil)
 	require.NoError(t, err)
+
 	_, err = tx.ExecContext(ctx, "UPDATE applies SET state = ? WHERE id = ?", "stopped", int64(7))
 	require.NoError(t, err)
+
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM tasks WHERE apply_id = ?", int64(7))
+	require.NoError(t, err)
+	require.NoError(t, rows.Close())
+
+	var id int64
+	err = tx.QueryRowContext(ctx, "SELECT id FROM applies WHERE id = ?", int64(7)).Scan(&id)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
 	require.NoError(t, tx.Rollback())
+
+	assert.Equal(t, 3, b.calls)
+	assert.Equal(t, []string{
+		"UPDATE applies SET state = ? WHERE id = ?" + rebindMarker,
+		"SELECT id FROM tasks WHERE apply_id = ?" + rebindMarker,
+		"SELECT id FROM applies WHERE id = ?" + rebindMarker,
+	}, connector.queries)
+	assertReboundExactlyOnce(t, b, connector)
+}
+
+// A transaction begun on a pinned connection rebinds its statements the same
+// way as one begun on the pool, so the advisory-lock apply-write path cannot
+// leak native placeholders past the binder.
+func TestRebindConnTxRebindsOnce(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+	ctx := t.Context()
 
 	conn, err := rdb.Conn(ctx)
 	require.NoError(t, err)
-	_, err = conn.ExecContext(ctx, "SELECT GET_LOCK(?, ?)", "lock", int64(0))
+
+	tx, err := conn.BeginTx(ctx, nil)
 	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, "UPDATE applies SET state = ? WHERE id = ?", "running", int64(7))
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, conn.Close())
+
+	assert.Equal(t, 1, b.calls)
+	assert.Equal(t, []string{"UPDATE applies SET state = ? WHERE id = ?" + rebindMarker}, connector.queries)
+	assertReboundExactlyOnce(t, b, connector)
+}
+
+// The raw() escape hands the advisory locker the pinned session without the
+// binder in the way: locker SQL reaches the driver with its engine-native
+// placeholders untouched, and the binder is never invoked.
+func TestRebindConnRawEscapeBypassesBinder(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+	ctx := t.Context()
+
+	conn, err := rdb.Conn(ctx)
+	require.NoError(t, err)
+
+	var result sql.NullInt64
+	err = conn.raw().QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", "lock", int64(0)).Scan(&result)
+	require.ErrorIs(t, err, sql.ErrNoRows)
 	require.NoError(t, conn.Close())
 
 	assert.Equal(t, 0, b.calls)
-	assert.Equal(t, []string{
-		"UPDATE applies SET state = ? WHERE id = ?",
-		"SELECT GET_LOCK(?, ?)",
-	}, connector.queries)
+	assert.Equal(t, []string{"SELECT GET_LOCK(?, ?)"}, connector.queries)
 }
 
 func TestMySQLDialectRebindIsIdentity(t *testing.T) {
