@@ -172,15 +172,17 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 // applying the appropriate SET clause with its placeholder args and the write
 // guard's join / predicate. It centralizes the guard load, argument ordering,
 // error wrapping, and idempotent row-existence check shared by the
-// state-transition helpers.
+// state-transition helpers. Every write stamps updated_at explicitly: the
+// column is the claim's lease heartbeat read by the staleness predicates, and
+// stamping is the application's responsibility on every dialect.
 func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, unqualifiedSetClause, qualifiedSetClause string, setArgs ...any) error {
 	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	setClause := unqualifiedSetClause
+	setClause := unqualifiedSetClause + ", updated_at = NOW()"
 	if guard.kind == operationGuardApply {
-		setClause = qualifiedSetClause
+		setClause = qualifiedSetClause + ", ao.updated_at = NOW()"
 	}
 	guardArgs := guard.args()
 	args := make([]any, 0, len(setArgs)+1+len(guardArgs))
@@ -190,7 +192,7 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET `+setClause+`
+		SET `+setClause+`, ao.updated_at = NOW()
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -483,9 +485,9 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 		return err
 	}
 	args := append([]any{externalOperationID, operationID}, guard.args()...)
-	setClause := "external_operation_id = ?"
+	setClause := "external_operation_id = ?, updated_at = NOW()"
 	if guard.kind == operationGuardApply {
-		setClause = "ao.external_operation_id = ?"
+		setClause = "ao.external_operation_id = ?, ao.updated_at = NOW()"
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
@@ -511,9 +513,9 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 		return err
 	}
 	args := append([]any{externalID, operationID}, guard.args()...)
-	setClause := "external_id = ?"
+	setClause := "external_id = ?, updated_at = NOW()"
 	if guard.kind == operationGuardApply {
-		setClause = "ao.external_id = ?"
+		setClause = "ao.external_id = ?, ao.updated_at = NOW()"
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
@@ -528,8 +530,9 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 }
 
 // SaveEngineResumeState stores opaque engine state on the operation that owns
-// the execution. It updates only resume-state columns so callers can persist
-// engine progress without changing operation lifecycle state.
+// the execution. It updates only resume-state columns (plus the updated_at
+// heartbeat) so callers can persist engine progress without changing operation
+// lifecycle state.
 func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *storage.EngineResumeState) error {
 	if resumeState == nil {
 		return fmt.Errorf("save engine resume state for apply_operation %d: resume state is nil", operationID)
@@ -546,9 +549,9 @@ func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operati
 		metadata = "{}"
 	}
 	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, guard.args()...)
-	setClause := "engine_resume_context = ?, engine_resume_metadata = ?"
+	setClause := "engine_resume_context = ?, engine_resume_metadata = ?, updated_at = NOW()"
 	if guard.kind == operationGuardApply {
-		setClause = "ao.engine_resume_context = ?, ao.engine_resume_metadata = ?"
+		setClause = "ao.engine_resume_context = ?, ao.engine_resume_metadata = ?, ao.updated_at = NOW()"
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
@@ -1105,7 +1108,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			res, err := tx.ExecContext(ctx, `
 				UPDATE apply_operations o
 				JOIN applies a ON a.id = o.apply_id
-				SET o.attempt = o.attempt + 1
+				SET o.attempt = o.attempt + 1, o.updated_at = NOW()
 				WHERE o.id = ? AND a.state = ?
 			`, ad.ID, state.Apply.FailedRetryable)
 			if err != nil {

@@ -106,6 +106,76 @@ func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	assert.Equal(t, "remote-apply-1", got.ExternalID)
 }
 
+// TestApplyOperationStore_WritesStampUpdatedAt verifies that every operation
+// write renews the row's updated_at heartbeat. The claim staleness predicates
+// read this column to decide whether a driver's claim can be taken over, and
+// stamping it is the application's responsibility on every dialect. A replay
+// that writes identical values still renews the heartbeat: activity, not
+// logical change, is what keeps a claim fresh.
+func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_updated_at_stamp", 1)
+
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-a",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	backdate := func(t *testing.T) time.Time {
+		t.Helper()
+		_, err := testDB.ExecContext(t.Context(), `
+			UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+		`, operationID)
+		require.NoError(t, err)
+		stale, err := store.ApplyOperations().Get(t.Context(), operationID)
+		require.NoError(t, err)
+		require.NotNil(t, stale)
+		return stale.UpdatedAt
+	}
+
+	writes := []struct {
+		name  string
+		write func(t *testing.T)
+	}{
+		{"state transition", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationID, state.ApplyOperation.Running))
+		}},
+		{"save external operation id", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
+		}},
+		{"save external id", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, operationID, "remote-apply-1"))
+		}},
+		{"save engine resume state", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
+				ApplyOperationID: operationID,
+				MigrationContext: "ctx-123",
+				Metadata:         `{"branch_name":"branch-123"}`,
+			}))
+		}},
+		{"identical-value replay", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, operationID, "remote-apply-1"))
+		}},
+	}
+	for _, w := range writes {
+		t.Run(w.name, func(t *testing.T) {
+			stale := backdate(t)
+			w.write(t)
+			got, err := store.ApplyOperations().Get(ctx, operationID)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.True(t, got.UpdatedAt.After(stale),
+				"write must renew the updated_at heartbeat (stale=%s got=%s)", stale, got.UpdatedAt)
+		})
+	}
+}
+
 func TestApplyOperationStore_OperationKindRoundTrip(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
