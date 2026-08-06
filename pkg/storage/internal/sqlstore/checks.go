@@ -24,7 +24,7 @@ const (
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
-	db      *sql.DB
+	db      *rebindDB
 	dialect Dialect
 }
 

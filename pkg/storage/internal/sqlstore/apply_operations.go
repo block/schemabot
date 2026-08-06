@@ -27,7 +27,7 @@ const applyOperationColumns = `id, apply_id, deployment, operation_key, operatio
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	dialect  Dialect
 	identity identityInserter
 	locker   namedlock.Locker

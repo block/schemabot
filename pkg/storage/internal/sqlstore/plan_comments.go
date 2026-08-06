@@ -5,7 +5,6 @@ package sqlstore
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -17,7 +16,7 @@ const planCommentColumns = `id, repository, pull_request, database_name, databas
 
 // planCommentStore implements storage.PlanCommentStore using MySQL.
 type planCommentStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	identity identityInserter
 }
 

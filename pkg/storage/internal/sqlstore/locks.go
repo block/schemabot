@@ -20,7 +20,7 @@ const lockColumns = `id, database_name, database_type, repository, pull_request,
 
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
-	db *sql.DB
+	db *rebindDB
 }
 
 // Acquire attempts to acquire a lock. Returns ErrLockHeld if held by another owner.

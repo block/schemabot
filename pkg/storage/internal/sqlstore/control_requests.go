@@ -14,7 +14,7 @@ const controlRequestColumns = `id, apply_id, operation, status,
 	requested_by, error_message, metadata, completed_at, created_at, updated_at`
 
 type controlRequestStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	identity identityInserter
 }
 

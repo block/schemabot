@@ -18,7 +18,7 @@ const applyLogColumns = `id, apply_id, task_id, level, event_type, source, messa
 
 // applyLogStore implements storage.ApplyLogStore using MySQL.
 type applyLogStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	identity identityInserter
 }
 

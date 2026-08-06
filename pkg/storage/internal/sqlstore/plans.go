@@ -20,7 +20,7 @@ const planColumns = `id, plan_identifier, database_name, database_type,
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
-	db       *sql.DB
+	db       *rebindDB
 	identity identityInserter
 }
 
