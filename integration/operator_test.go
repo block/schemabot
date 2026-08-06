@@ -35,7 +35,7 @@ import (
 type operatorClaimFixture struct {
 	appDBName string
 	storageDB *sql.DB
-	store     *mysqlstore.Storage
+	store     storage.Storage
 }
 
 type blockingResumeClient struct {
@@ -1164,7 +1164,7 @@ func TestOperator_ClaimOrdering(t *testing.T) {
 // seedStartedOperation inserts a running apply_operations row for the apply so
 // claim-policy tests can exercise FindNextApplyOperation against work that
 // looks like a drive already started it.
-func seedStartedOperation(t *testing.T, stor *mysqlstore.Storage, applyID int64, deployment string) int64 {
+func seedStartedOperation(t *testing.T, stor storage.Storage, applyID int64, deployment string) int64 {
 	t.Helper()
 
 	opID, err := stor.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
@@ -1457,7 +1457,7 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	waitForOperatorAppliesCompleted(t, stor, []int64{apply1ID}, 5*time.Second)
 }
 
-func planCreateTableForOperator(t *testing.T, client tern.Client, stor *mysqlstore.Storage, dbName, tableName string) *storage.Plan {
+func planCreateTableForOperator(t *testing.T, client tern.Client, stor storage.Storage, dbName, tableName string) *storage.Plan {
 	t.Helper()
 
 	resp, err := client.Plan(t.Context(), &ternv1.PlanRequest{
@@ -1489,7 +1489,7 @@ CREATE TABLE %s (
 
 func seedStaleOperatorApply(
 	t *testing.T,
-	stor *mysqlstore.Storage,
+	stor storage.Storage,
 	db *sql.DB,
 	dbName string,
 	plan *storage.Plan,
@@ -1553,7 +1553,7 @@ func seedStaleOperatorApply(
 	return applyID
 }
 
-func waitForOperatorAppliesCompleted(t *testing.T, stor *mysqlstore.Storage, applyIDs []int64, timeout time.Duration) {
+func waitForOperatorAppliesCompleted(t *testing.T, stor storage.Storage, applyIDs []int64, timeout time.Duration) {
 	t.Helper()
 
 	completed := make(map[int64]bool, len(applyIDs))

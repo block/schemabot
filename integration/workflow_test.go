@@ -22,6 +22,7 @@ import (
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -33,7 +34,7 @@ import (
 // testServer holds the address and storage of a running SchemaBot HTTP server.
 type testServer struct {
 	Addr    string
-	Storage *mysqlstore.Storage
+	Storage storage.Storage
 	Service *schemabotapi.Service
 }
 
@@ -75,13 +76,13 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 	schemabotDB, err := sql.Open("mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
-	storage := mysqlstore.New(schemabotDB)
+	store := mysqlstore.New(schemabotDB)
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
 		Type:      "mysql",
 		TargetDSN: appDSN,
-	}, storage, logger)
+	}, store, logger)
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
@@ -94,7 +95,7 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 			},
 		},
 	}
-	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
+	svc := schemabotapi.New(store, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
 	startTestOperatorWithInterval(t, svc, operatorInterval)
@@ -118,7 +119,7 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 		_ = schemabotDB.Close()
 	})
 
-	return testServer{Addr: addr, Storage: storage, Service: svc}
+	return testServer{Addr: addr, Storage: store, Service: svc}
 }
 
 func startTestOperator(t *testing.T, svc *schemabotapi.Service) {

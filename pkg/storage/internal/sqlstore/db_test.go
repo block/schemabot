@@ -1,0 +1,151 @@
+package sqlstore
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"io"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// recordingConnector is a database/sql driver stub that records every SQL
+// statement text the pool hands to the driver, so tests can assert exactly
+// what reached the wire after rebinding.
+type recordingConnector struct {
+	queries []string
+	args    [][]driver.Value
+}
+
+func (c *recordingConnector) Connect(context.Context) (driver.Conn, error) { return c, nil }
+func (c *recordingConnector) Driver() driver.Driver                        { return nil }
+
+func (c *recordingConnector) Prepare(query string) (driver.Stmt, error) {
+	c.queries = append(c.queries, query)
+	return &recordingStmt{connector: c}, nil
+}
+func (c *recordingConnector) Close() error              { return nil }
+func (c *recordingConnector) Begin() (driver.Tx, error) { return noopTx{}, nil }
+
+type recordingStmt struct {
+	connector *recordingConnector
+}
+
+func (s *recordingStmt) Close() error  { return nil }
+func (s *recordingStmt) NumInput() int { return -1 }
+
+func (s *recordingStmt) Exec(args []driver.Value) (driver.Result, error) {
+	s.connector.args = append(s.connector.args, args)
+	return driver.RowsAffected(0), nil
+}
+
+func (s *recordingStmt) Query(args []driver.Value) (driver.Rows, error) {
+	s.connector.args = append(s.connector.args, args)
+	return emptyRows{}, nil
+}
+
+type emptyRows struct{}
+
+func (emptyRows) Columns() []string              { return nil }
+func (emptyRows) Close() error                   { return nil }
+func (emptyRows) Next(dest []driver.Value) error { return io.EOF }
+
+type noopTx struct{}
+
+func (noopTx) Commit() error   { return nil }
+func (noopTx) Rollback() error { return nil }
+
+// countingBinder rewrites the query to a recognizable form and counts how many
+// times it was invoked, so tests can prove each execution rebinds exactly once
+// and forwards the rebound SQL downstream.
+type countingBinder struct {
+	calls int
+}
+
+func (b *countingBinder) Rebind(query string) string {
+	b.calls++
+	return query + " /* rebound */"
+}
+
+// newRecordingRebindDB returns a rebindDB whose pool is backed by the
+// recording driver stub, so tests observe the exact SQL reaching the driver.
+func newRecordingRebindDB(t *testing.T, b binder) (*rebindDB, *recordingConnector) {
+	connector := &recordingConnector{}
+	pool := sql.OpenDB(connector)
+	t.Cleanup(func() {
+		require.NoError(t, pool.Close())
+	})
+	return newRebindDB(pool, b), connector
+}
+
+func TestRebindDBExecContextRebindsOnce(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+
+	_, err := rdb.ExecContext(t.Context(), "UPDATE applies SET state = ? WHERE id = ?", "running", int64(7))
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, b.calls)
+	assert.Equal(t, []string{"UPDATE applies SET state = ? WHERE id = ? /* rebound */"}, connector.queries)
+	assert.Equal(t, [][]driver.Value{{"running", int64(7)}}, connector.args)
+}
+
+func TestRebindDBQueryContextRebindsOnce(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+
+	rows, err := rdb.QueryContext(t.Context(), "SELECT id FROM applies WHERE state = ?", "running")
+	require.NoError(t, err)
+	require.NoError(t, rows.Close())
+
+	assert.Equal(t, 1, b.calls)
+	assert.Equal(t, []string{"SELECT id FROM applies WHERE state = ? /* rebound */"}, connector.queries)
+	assert.Equal(t, [][]driver.Value{{"running"}}, connector.args)
+}
+
+func TestRebindDBQueryRowContextRebindsOnce(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+
+	var id int64
+	err := rdb.QueryRowContext(t.Context(), "SELECT id FROM applies WHERE id = ?", int64(7)).Scan(&id)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+
+	assert.Equal(t, 1, b.calls)
+	assert.Equal(t, []string{"SELECT id FROM applies WHERE id = ? /* rebound */"}, connector.queries)
+	assert.Equal(t, [][]driver.Value{{int64(7)}}, connector.args)
+}
+
+// Transactions and pinned connections are raw passthrough handles: obtaining
+// them must not invoke the binder, and statements executed on them reach the
+// driver with the store's native placeholders unchanged.
+func TestRebindDBTransactionAndConnBypassBinder(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+	ctx := t.Context()
+
+	tx, err := rdb.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, "UPDATE applies SET state = ? WHERE id = ?", "stopped", int64(7))
+	require.NoError(t, err)
+	require.NoError(t, tx.Rollback())
+
+	conn, err := rdb.Conn(ctx)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(ctx, "SELECT GET_LOCK(?, ?)", "lock", int64(0))
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+
+	assert.Equal(t, 0, b.calls)
+	assert.Equal(t, []string{
+		"UPDATE applies SET state = ? WHERE id = ?",
+		"SELECT GET_LOCK(?, ?)",
+	}, connector.queries)
+}
+
+func TestMySQLDialectRebindIsIdentity(t *testing.T) {
+	query := "SELECT id FROM applies WHERE state = ? AND database_name = ?"
+	assert.Equal(t, query, MySQLDialect{}.Rebind(query))
+}
