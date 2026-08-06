@@ -17,18 +17,34 @@ const closedPortDSN = "user:pass@tcp(127.0.0.1:1)/schemabot"
 // EnsureSchema routes to the schema bootstrapper for the storage database's
 // dialect and fails closed for a dialect that has none: it must return an
 // error naming the dialect before touching the database, never fall back to
-// running the MySQL flow against another family's storage database. The DSN
+// running another family's flow against the storage database. The DSN
 // points at a closed loopback port so any accidental connection attempt fails
 // the test rather than hanging.
 func TestEnsureSchemaFailsClosedForUnsupportedDialect(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.DiscardHandler)
 
-	err := EnsureSchema(closedPortDSN, logger, WithDialect(schema.DialectPostgres))
+	unsupported := schema.Dialect("sqlite")
+	err := EnsureSchema(closedPortDSN, logger, WithDialect(unsupported))
 
 	require.Error(t, err)
 	require.ErrorContains(t, err, "no schema bootstrapper")
-	require.ErrorContains(t, err, string(schema.DialectPostgres))
+	require.ErrorContains(t, err, string(unsupported))
+}
+
+// EnsureSchema with the postgres dialect routes into the PostgreSQL
+// bootstrapper. The closed-port DSN makes its connection attempt fail
+// instantly, and the resulting error proves the dialect routed into the
+// PostgreSQL flow rather than the fail-closed branch.
+func TestEnsureSchemaRoutesPostgresDialect(t *testing.T) {
+	t.Parallel()
+	logger := slog.New(slog.DiscardHandler)
+
+	err := EnsureSchema("postgres://user:pass@127.0.0.1:1/schemabot", logger, WithDialect(schema.DialectPostgres))
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "no schema bootstrapper")
+	require.ErrorContains(t, err, "ping storage database")
 }
 
 // EnsureSchema without a dialect option defaults to the MySQL bootstrapper —

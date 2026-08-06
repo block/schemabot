@@ -81,6 +81,25 @@ func TestPostgresFilesContainNoMySQLSyntax(t *testing.T) {
 	}
 }
 
+// TestPostgresFilesContainOnlyPlainStatements pins the PostgresFS invariant
+// that every file holds plain semicolon-separated statements: no SQL comments,
+// dollar-quoted blocks, or E-strings. The statement-level lints in this
+// package (and the format assumptions in the bootstrap) parse the files
+// assuming exactly this shape, so a stray comment header would silently
+// escape them.
+func TestPostgresFilesContainOnlyPlainStatements(t *testing.T) {
+	// \W keeps a closing quote after a word ending in "e" (e.g. 'none') from
+	// matching; a real E-string is always preceded by a non-word character.
+	eStringRe := regexp.MustCompile(`(?i)(^|\W)e'`)
+
+	for name, content := range readSchemaDir(t, "postgres") {
+		assert.NotContains(t, content, "--", "%s contains a SQL comment", name)
+		assert.NotContains(t, content, "/*", "%s contains a SQL comment", name)
+		assert.NotContains(t, content, "$$", "%s contains a dollar-quoted block", name)
+		assert.NotRegexp(t, eStringRe, content, "%s contains an E-string literal", name)
+	}
+}
+
 // TestPostgresTableNamesMatchFilenames verifies each postgres file defines
 // exactly one table named after the file, matching the mysql convention the
 // schema bootstrapper relies on.
