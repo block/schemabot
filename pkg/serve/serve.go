@@ -234,7 +234,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 type Server struct {
 	cfg             *api.ServerConfig
 	svc             *api.Service
-	storage         *mysqlstore.Storage
+	storage         storage.Storage
 	logger          *slog.Logger
 	dataPlaneClient tern.Client
 	// grpcClient is the single-database client RegisterGRPC builds when no
@@ -598,7 +598,7 @@ func (s *Server) Close() error {
 // environment is unused in this mode because each request carries its own.
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
-func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string, engineFactories map[string]tern.EngineFactory, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
+func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st storage.Storage, logger *slog.Logger, env string, engineFactories map[string]tern.EngineFactory, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
 	var wake func(applyIdentifier, database, environment string)
 	if len(wakeOperator) > 0 {
 		wake = wakeOperator[0]

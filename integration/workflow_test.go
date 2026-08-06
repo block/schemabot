@@ -22,6 +22,7 @@ import (
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -33,7 +34,7 @@ import (
 // testServer holds the address and storage of a running SchemaBot HTTP server.
 type testServer struct {
 	Addr    string
-	Storage *mysqlstore.Storage
+	Storage storage.Storage
 	Service *schemabotapi.Service
 }
 
