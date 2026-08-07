@@ -1354,6 +1354,122 @@ func TestGRPCClient_ResumeApplyOperationDispatchesGroupFinalizerAsVSchemaOnly(t 
 	assert.Contains(t, req.SchemaFiles, "commerce", "the vschema.json must be carried for a materializing remote")
 }
 
+func TestGRPCClient_ResumeApplyOperationDispatchesTasklessVSchemaOnlyWork(t *testing.T) {
+	// A VSchema-only change carries no DDL, so its apply gets one whole-deployment
+	// work operation and no task rows. The remote drive must dispatch that
+	// operation's namespaces as a VSchema-only apply — every VSchema-changing
+	// namespace in one dispatch, since the data plane deploys the whole branch as
+	// one operation — rather than reading the empty task set as a stale claim and
+	// failing the apply before it reaches the data plane.
+	server := &capturingTernServer{remoteApplyID: "remote-vschema-only-1"} // default Progress = COMPLETED
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              9,
+		ApplyIdentifier: "apply-vschema-only",
+		PlanID:          77,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(61)
+	vschema := `{"sharded":true,"vindexes":{"xxhash":{"type":"xxhash"}}}`
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-vschema-only",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce":         {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+				"commerce_sharded": {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce":         {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+				"commerce_sharded": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKind: storage.ApplyOperationKindWork,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err, "a task-less VSchema-only work operation must dispatch, not fail closed on no tasks")
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the work operation to dispatch a VSchema apply to remote Tern")
+	require.Len(t, req.DdlChanges, 2, "every VSchema-changing namespace travels in one dispatch")
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, req.DdlChanges[0].ChangeType)
+	assert.Equal(t, "commerce", req.DdlChanges[0].Namespace)
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, req.DdlChanges[1].ChangeType)
+	assert.Equal(t, "commerce_sharded", req.DdlChanges[1].Namespace)
+	assert.Empty(t, req.TargetShards, "a namespace VSchema apply targets no shard")
+	assert.Contains(t, req.SchemaFiles, "commerce", "the vschema.json must be carried for a materializing remote")
+	assert.Contains(t, req.SchemaFiles, "commerce_sharded")
+}
+
+func TestGRPCClient_ResumeApplyOperationFailsClosedOnTasklessWorkWithDDLPlan(t *testing.T) {
+	// The task-less dispatch is gated on the plan carrying nothing but VSchema. A
+	// work operation whose plan has DDL should have produced task rows, so an
+	// empty task set is an invalid or stale claim: fail closed before any dispatch
+	// or state mutation rather than sending the data plane an apply with no work.
+	server := &capturingTernServer{remoteApplyID: "remote-must-not-dispatch"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              10,
+		ApplyIdentifier: "apply-stale-claim",
+		PlanID:          78,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	operationID := int64(62)
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-with-ddl",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {
+					Tables:    []storage.TableChange{{Table: "games", DDL: "ALTER TABLE games ADD COLUMN played_at timestamp NULL", Operation: "alter"}},
+					Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				},
+			},
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKind: storage.ApplyOperationKindWork,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.ErrorIs(t, err, ErrNoTasksForApplyOperation)
+	assert.Nil(t, server.getApplyRequest(), "must not dispatch a task-less work operation whose plan carries DDL")
+}
+
 func TestGRPCClient_ResumeApplyOperationReflectsFinalizerTerminalStateOntoOperationRow(t *testing.T) {
 	// A task-less group_finalizer in a multi-operation apply carries no task rows,
 	// so the operator's task-derived projection can never move its operation row.
