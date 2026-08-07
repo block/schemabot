@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -8,20 +9,36 @@ import (
 
 // The rejection lists the teams and users allowed to run the command, so a
 // blocked user knows who to ask instead of guessing at the access model. The
-// principals render as inline code, never @-mentions — the list is guidance,
+// database's own operators lead in their own section — mirroring the
+// review-required comment — with the broader admins as an explicit fallback.
+// Principals render as inline code, never @-mentions — the list is guidance,
 // and mentions would notify every admin and operator on every rejection.
 func TestRenderPRCommandNotAuthorizedListsPrincipals(t *testing.T) {
 	out := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",
-		AuthorizedPrincipals: []string{"octocat/db-admins", "octocat/orders-operators", "kara"},
+		OperatorPrincipals: []string{"octocat/orders-operators", "lee"},
+		OtherPrincipals:    []string{"octocat/db-admins", "kara"},
 	})
 	require.Contains(t, out, "@dave is not authorized")
-	require.Contains(t, out, "**Who can run this command**")
-	require.Contains(t, out, "- `octocat/db-admins`")
+	require.Contains(t, out, "**Operators of `orders`**")
+	require.Contains(t, out, "**Other authorized teams and users**")
 	require.Contains(t, out, "- `octocat/orders-operators`")
+	require.Contains(t, out, "- `lee`")
+	require.Contains(t, out, "- `octocat/db-admins`")
 	require.Contains(t, out, "- `kara`")
+	operatorsIdx := strings.Index(out, "- `octocat/orders-operators`")
+	othersIdx := strings.Index(out, "- `octocat/db-admins`")
+	require.Less(t, operatorsIdx, othersIdx, "the database's operators lead the list")
 	require.NotContains(t, out, "@octocat/db-admins", "team principals must never render as mentions")
 	require.NotContains(t, out, "@kara", "user principals must never render as mentions")
+
+	noOperators := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
+		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",
+		OtherPrincipals: []string{"octocat/db-admins", "kara"},
+	})
+	require.Contains(t, noOperators, "**Who can run this command**")
+	require.Contains(t, noOperators, "- `octocat/db-admins`")
+	require.NotContains(t, noOperators, "Operators of", "a database with no operators renders one flat list")
 
 	fallback := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",
