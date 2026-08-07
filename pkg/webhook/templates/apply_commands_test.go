@@ -29,6 +29,7 @@ func TestRenderPRCommandNotAuthorizedListsPrincipals(t *testing.T) {
 	operatorsIdx := strings.Index(out, "- `octocat/orders-operators`")
 	othersIdx := strings.Index(out, "- `octocat/db-admins`")
 	require.Less(t, operatorsIdx, othersIdx, "the database's operators lead the list")
+	require.Contains(t, out, "request membership in one of the teams above", "teams are listed, so joining one is offered")
 	require.NotContains(t, out, "@octocat/db-admins", "team principals must never render as mentions")
 	require.NotContains(t, out, "@kara", "user principals must never render as mentions")
 
@@ -39,6 +40,14 @@ func TestRenderPRCommandNotAuthorizedListsPrincipals(t *testing.T) {
 	require.Contains(t, noOperators, "**Who can run this command**")
 	require.Contains(t, noOperators, "- `octocat/db-admins`")
 	require.NotContains(t, noOperators, "Operators of", "a database with no operators renders one flat list")
+
+	usersOnly := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
+		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",
+		OperatorPrincipals: []string{"kara"},
+		OtherPrincipals:    []string{"lee"},
+	})
+	require.Contains(t, usersOnly, "Ask one of them to run it.")
+	require.NotContains(t, usersOnly, "request membership", "no teams are listed, so there is no team to join")
 
 	fallback := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",

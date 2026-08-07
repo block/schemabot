@@ -72,11 +72,11 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 			sb.WriteString("\n**Other authorized teams and users**:\n")
 			writePrincipalList(&sb, data.OtherPrincipals)
 		}
-		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
+		writeAskPrincipalsGuidance(&sb, data.OperatorPrincipals, data.OtherPrincipals)
 	case hasOthers:
 		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
 		writePrincipalList(&sb, data.OtherPrincipals)
-		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
+		writeAskPrincipalsGuidance(&sb, data.OtherPrincipals)
 	default:
 		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
 	}
@@ -88,6 +88,30 @@ func writePrincipalList(sb *strings.Builder, principals []string) {
 	for _, principal := range principals {
 		fmt.Fprintf(sb, "- `%s`\n", principal)
 	}
+}
+
+// writeAskPrincipalsGuidance closes the principal lists with what the blocked
+// user can do next. Requesting team membership is only suggested when a team
+// is actually listed — lists of plain user logins have no team to join.
+func writeAskPrincipalsGuidance(sb *strings.Builder, principalLists ...[]string) {
+	if anyTeamPrincipal(principalLists...) {
+		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
+		return
+	}
+	sb.WriteString("\nAsk one of them to run it.\n")
+}
+
+// anyTeamPrincipal reports whether any listed principal is a GitHub team
+// (org/team) rather than a user login.
+func anyTeamPrincipal(principalLists ...[]string) bool {
+	for _, principals := range principalLists {
+		for _, principal := range principals {
+			if strings.Contains(principal, "/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RenderPRCommandDatabaseNotConfigured renders a comment when a mutating PR
