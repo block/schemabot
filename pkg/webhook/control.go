@@ -75,7 +75,11 @@ func (h *Handler) inferApplyForPRControl(
 		h.logger.Error("failed to load the PR's applies to infer the apply id for a control command",
 			"command", command, "repo", repo, "pr", pr,
 			"environment", result.Environment, "requested_by", requestedBy, "error", err)
-		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, "Failed to look up this PR's schema changes: "+err.Error())
+		// The lookup failure is logged above with the identifiers that make it
+		// triageable. The PR comment is public, so it carries the outcome rather
+		// than raw storage text naming hosts, addresses, or driver internals.
+		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy,
+			"Failed to look up this PR's schema changes. Retry, and see server logs if it persists.")
 		return nil, false
 	}
 
@@ -113,6 +117,15 @@ func (h *Handler) replyForUnresolvedApplyID(
 			"pr", pr,
 			"environment", result.Environment,
 			"requested_by", requestedBy)
+		return
+	}
+
+	// On an unscoped fan-out this deployment stores only its own slice of the
+	// PR's applies, which is why the apply id was not inferred. A candidate list
+	// built from that slice would present a partial view of the PR as the whole
+	// of it, so the reply stays the usage line the leader posts once.
+	if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(command))
 		return
 	}
 

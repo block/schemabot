@@ -1353,3 +1353,50 @@ func TestE2ECancelCommandWithoutApplyIDListsCandidatesWhenThePRHasSeveral(t *tes
 		assert.Nil(t, controlReq, "an ambiguous cancel must not settle on one of the candidates")
 	}
 }
+
+// An unscoped control command on an aggregate repo fans out to deployments that
+// each store their own slice of the PR's applies, so "exactly one here" is not a
+// statement about the PR. The reply stays the usage line rather than a candidate
+// table this deployment cannot see the whole of.
+func TestE2ECancelCommandWithoutApplyIDDoesNotListCandidatesOnAnAggregateFanOut(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier, database := "apply_c9f4a1bb", "cancel_fanout_db"
+	cleanup := func() { cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database) }
+	cleanup()
+	t.Cleanup(func() {
+		cleanup()
+		utils.CloseAndLog(schemabotDB)
+	})
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+
+	client, mux := setupGitHubServer(t)
+	comments, _ := captureCommentsAndReactions(t, mux)
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader}},
+	}
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postCancelCommandWithoutApplyID(t, h, "alice")
+
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Missing Apply ID")
+	assert.NotContains(t, comment, "Which Schema Change?")
+	assert.NotContains(t, comment, applyIdentifier,
+		"a deployment holding one slice of the PR must not present its slice as the PR's candidates")
+
+	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a fan-out cancel with no apply id must not settle on this deployment's apply")
+}
