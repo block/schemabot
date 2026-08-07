@@ -364,6 +364,13 @@ type ApplyStore interface {
 	// Returns ErrActiveApplyExists when moving an apply into an active state
 	// would overlap another active apply for the same database, database type,
 	// and environment.
+	// Returns ErrApplyTerminalStateImmutable when the update would move an
+	// apply from a terminal state to an active state: a settled apply re-enters
+	// the active lifecycle only through the dedicated guarded transition of
+	// claiming a stopped apply, never through Update.
+	// Terminal-to-terminal writes, including same-state refreshes, are allowed.
+	// Returns ErrApplyNotFound when an update to an active state matches no
+	// rows because the apply row no longer exists.
 	Update(ctx context.Context, apply *Apply) error
 
 	// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.

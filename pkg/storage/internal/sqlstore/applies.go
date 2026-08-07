@@ -462,6 +462,33 @@ func ensureApplyLeaseStillOwned(ctx context.Context, db queryRower, lease storag
 	return nil
 }
 
+// ensureApplyStillActiveOnZeroRows resolves a zero-rows result from an update
+// that carried the terminal-state guard (new state is active). Zero rows is
+// ambiguous: the write can be an idempotent no-op (every column already held
+// its target value), the row can be gone, or the guard refused because the row
+// is already terminal. It re-reads the row to distinguish the three so callers
+// can log the right cause: a missing row returns ErrApplyNotFound, a terminal
+// row returns ErrApplyTerminalStateImmutable, and a still-active row is a
+// benign no-op.
+func ensureApplyStillActiveOnZeroRows(ctx context.Context, db queryRower, apply *storage.Apply) error {
+	// The re-read must observe the latest committed row, not the transaction's
+	// repeatable-read snapshot: a concurrent terminal write committed after the
+	// snapshot is exactly what the guard refused. FOR UPDATE reads current data
+	// on the row lock the guarded UPDATE already examined.
+	var currentState string
+	err := db.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("apply %s no longer exists for update to state %s: %w", apply.ApplyIdentifier, apply.State, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("re-read apply %s after guarded update to state %s: %w", apply.ApplyIdentifier, apply.State, err)
+	}
+	if state.IsTerminalApplyState(currentState) {
+		return fmt.Errorf("apply %s is %s; update to active state %s refused: %w", apply.ApplyIdentifier, currentState, apply.State, storage.ErrApplyTerminalStateImmutable)
+	}
+	return nil
+}
+
 // confirmLeaseOnZeroRows fails closed when a lease-scoped write changed no rows.
 // Zero rows is ambiguous: either a legitimate idempotent no-op (the lease is
 // still valid) or the lease token no longer matches because ownership was lost.
@@ -951,24 +978,44 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		leasePredicate = " AND lease_token = ?"
 		args = append(args, lease.Token)
 	}
+	// Terminal states are immutable through a general update: a caller writing
+	// from a stale snapshot must not resurrect a settled apply back into the
+	// active lifecycle. When the new state is active, match only rows that are
+	// still active; terminal rows re-enter the lifecycle solely through the
+	// dedicated guarded transition of claiming a stopped apply.
+	// Terminal-to-terminal writes (including same-state refreshes) stay allowed.
+	terminalGuard := isActiveApplyState(apply.State)
+	terminalGuardPredicate := ""
+	if terminalGuard {
+		predicate, guardArgs := nonTerminalApplyStatePredicate("state")
+		terminalGuardPredicate = " AND " + predicate
+		args = append(args, guardArgs...)
+	}
 
 	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, error_message = ?, attempt = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?%s
-	`, optionsUpdate, leasePredicate), args...)
+		WHERE id = ?%s%s
+	`, optionsUpdate, leasePredicate, terminalGuardPredicate), args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
 	}
-	if hasLease {
+	if hasLease || terminalGuard {
 		rows, err := result.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
 		}
 		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
-				return err
+			if hasLease {
+				if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
+					return err
+				}
+			}
+			if terminalGuard {
+				if err := ensureApplyStillActiveOnZeroRows(ctx, writeTx.tx, apply); err != nil {
+					return err
+				}
 			}
 		}
 	}

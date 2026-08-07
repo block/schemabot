@@ -7,10 +7,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -77,4 +81,81 @@ func TestWriteControlError_LogsCarryFullApplyAttrs(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, line["state"])
 	assert.Equal(t, "remote-apply-7", line["external_id"])
 	assert.Contains(t, line, "error")
+}
+
+// TestCompleteResolvedStopBeforeStart verifies the stop-request normalization
+// that runs before a start of a remote apply: when the data plane reports the
+// apply stopped, the stored row is written to stopped only if it still holds
+// the state the handler read before the remote check. If a driver advanced the
+// row while the check was in flight, the stale write is skipped, the pending
+// stop request stays with the current owner, and the handler proceeds from the
+// reloaded state instead of overwriting a newer verdict.
+func TestCompleteResolvedStopBeforeStart(t *testing.T) {
+	newSnapshot := func() *storage.Apply {
+		return &storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply_stop_sync",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			ExternalID:      "remote-apply-7",
+			State:           state.Apply.Running,
+		}
+	}
+	newService := func(t *testing.T, applies *staticApplyStore) (*Service, *memoryControlRequestStore) {
+		t.Helper()
+		controls := &memoryControlRequestStore{}
+		_, _, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID:     7,
+			Operation:   storage.ControlOperationStop,
+			RequestedBy: "alice",
+			Status:      storage.ControlRequestPending,
+		})
+		require.NoError(t, err)
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		return New(&mockStorageWithApplyStores{
+			applies:   applies,
+			controls:  controls,
+			applyLogs: &noopApplyLogStore{},
+		}, testServerConfig(), nil, logger), controls
+	}
+	remoteStopped := &mockTernClient{
+		isRemote:     true,
+		progressResp: &ternv1.ProgressResponse{State: ternv1.State_STATE_STOPPED},
+	}
+
+	t.Run("stored row still matches the handler's read", func(t *testing.T) {
+		snapshot := newSnapshot()
+		stored := *snapshot
+		applies := &staticApplyStore{apply: &stored}
+		svc, controls := newService(t, applies)
+
+		require.NoError(t, svc.completeResolvedStopBeforeStart(t.Context(), remoteStopped, snapshot, "bob"))
+
+		assert.Equal(t, state.Apply.Stopped, stored.State)
+		assert.Equal(t, state.Apply.Stopped, snapshot.State)
+		assert.NotNil(t, snapshot.CompletedAt)
+		pending, err := controls.GetPending(t.Context(), 7, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "resolved stop request must be completed")
+	})
+
+	t.Run("stored row advanced while the remote check was in flight", func(t *testing.T) {
+		snapshot := newSnapshot()
+		completedAt := time.Now().Add(-time.Minute)
+		stored := *snapshot
+		stored.State = state.Apply.Completed
+		stored.CompletedAt = &completedAt
+		applies := &staticApplyStore{apply: &stored}
+		svc, controls := newService(t, applies)
+
+		require.NoError(t, svc.completeResolvedStopBeforeStart(t.Context(), remoteStopped, snapshot, "bob"))
+
+		assert.Equal(t, state.Apply.Completed, stored.State, "a stale stop write must not overwrite the newer verdict")
+		assert.Equal(t, state.Apply.Completed, snapshot.State, "handler must proceed from the reloaded state")
+		pending, err := controls.GetPending(t.Context(), 7, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "pending stop request must stay with the current owner")
+		assert.Equal(t, "alice", pending.RequestedBy)
+	})
 }

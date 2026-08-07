@@ -37,6 +37,13 @@ var (
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
 
+	// ErrApplyTerminalStateImmutable is returned when a general update would
+	// move an apply from a terminal state back to an active state. A settled
+	// apply re-enters the active lifecycle only through the dedicated guarded
+	// transition of claiming a stopped apply, never through an update written
+	// from a caller's in-memory snapshot.
+	ErrApplyTerminalStateImmutable = errors.New("terminal apply state is immutable")
+
 	// ErrPlanNotFound is returned when a plan does not exist.
 	ErrPlanNotFound = errors.New("plan not found")
 

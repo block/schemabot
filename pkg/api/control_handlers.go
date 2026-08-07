@@ -1388,14 +1388,39 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		return nil
 	}
 
+	// The remote progress check above is an arbitrary time window: a driver can
+	// advance the stored row while the RPC is in flight. Write stopped only if
+	// the row still holds the state this decision was made from, so a stale
+	// snapshot never overwrites a newer state.
 	now := time.Now()
 	oldState := apply.State
+	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, oldState, state.Apply.Stopped, apply.ErrorMessage, nil, &now)
+	if err != nil {
+		return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+	}
+	if !swapped {
+		fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+		if err != nil {
+			return fmt.Errorf("reload apply %s after concurrent state change before start: %w", apply.ApplyIdentifier, err)
+		}
+		if fresh == nil {
+			return fmt.Errorf("reload apply %s after concurrent state change before start: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+		}
+		*apply = *fresh
+		s.logger.Info("stored apply advanced while checking remote state; leaving pending stop request for the current owner and starting from the reloaded state",
+			"apply_id", apply.ApplyIdentifier,
+			"external_apply_id", apply.ExternalID,
+			"database", apply.Database,
+			"environment", apply.Environment,
+			"requested_by", stopCaller,
+			"start_requested_by", caller,
+			"expected_state", oldState,
+			"state", apply.State)
+		return nil
+	}
 	apply.State = state.Apply.Stopped
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
-	if err := s.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
-	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}
