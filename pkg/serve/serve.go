@@ -234,7 +234,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 type Server struct {
 	cfg             *api.ServerConfig
 	svc             *api.Service
-	storage         *mysqlstore.Storage
+	storage         storage.Storage
 	logger          *slog.Logger
 	dataPlaneClient tern.Client
 	// grpcClient is the single-database client RegisterGRPC builds when no
@@ -322,8 +322,8 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	storage := mysqlstore.New(db)
-	svc := api.New(storage, cfg, nil, logger)
+	store := mysqlstore.New(db)
+	svc := api.New(store, cfg, nil, logger)
 	defer func() {
 		if !success {
 			utils.CloseAndLog(svc)
@@ -359,7 +359,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// gRPC transport reuses the same instance.
 	var dataPlaneClient tern.Client
 	if cfg.TargetResolver.Enabled() {
-		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, storage, logger, os.Getenv("TERN_ENVIRONMENT"), o.engines, svc.WakeOperator)
+		dataPlaneClient, err = buildGRPCTernClient(ctx, cfg, store, logger, os.Getenv("TERN_ENVIRONMENT"), o.engines, svc.WakeOperator)
 		if err != nil {
 			return nil, fmt.Errorf("build data-plane target router: %w", err)
 		}
@@ -385,7 +385,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	return &Server{
 		cfg:             cfg,
 		svc:             svc,
-		storage:         storage,
+		storage:         store,
 		logger:          logger,
 		dataPlaneClient: dataPlaneClient,
 		webhook:         webhookRuntime,
@@ -598,7 +598,7 @@ func (s *Server) Close() error {
 // environment is unused in this mode because each request carries its own.
 // Otherwise it falls back to a single LocalClient bound to the one database
 // configured for env.
-func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st *mysqlstore.Storage, logger *slog.Logger, env string, engineFactories map[string]tern.EngineFactory, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
+func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st storage.Storage, logger *slog.Logger, env string, engineFactories map[string]tern.EngineFactory, wakeOperator ...func(applyIdentifier, database, environment string)) (tern.Client, error) {
 	var wake func(applyIdentifier, database, environment string)
 	if len(wakeOperator) > 0 {
 		wake = wakeOperator[0]

@@ -260,7 +260,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 
 ### Storage Schema (Self-Bootstrapping)
 
-SchemaBot's storage schema is self-bootstrapping via `EnsureSchema` (`pkg/api/ensure_schema.go`), which runs on every server startup before accepting traffic. It reads all embedded SQL files from `pkg/schema/mysql/`, diffs them against the live database using Spirit, and applies any DDL needed. This means adding a new table or column to `pkg/schema/mysql/` is all that's needed — the next deploy picks it up automatically. No manual schema changes or ordering concerns.
+SchemaBot's storage schema is self-bootstrapping via `EnsureSchema` (`pkg/api/ensure_schema.go`), which runs on every server startup before accepting traffic and routes to a per-dialect bootstrapper. On MySQL it reads all embedded SQL files from `pkg/schema/mysql/`, diffs them against the live database using Spirit, and applies any DDL needed — adding a new table or column to `pkg/schema/mysql/` is all that's needed; the next deploy picks it up automatically. On PostgreSQL (`pkg/api/ensure_schema_postgres.go`) it creates missing tables from `pkg/schema/postgres/` but does not diff or repair existing ones — a new table converges automatically, but a column or index change to an existing table needs its own schema change mechanism. Keep the two dialect directories in lockstep; the schema parity tests in `pkg/schema` pin this.
 
 ### SQL Schema
 
