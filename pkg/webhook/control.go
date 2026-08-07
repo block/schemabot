@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -33,20 +34,117 @@ func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, 
 	}
 }
 
-func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
-	if result.ApplyID == "" {
-		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
-			h.logger.Info("skipping missing-apply-id reply for unscoped fan-out control command; the leader posts it once",
-				"command", command,
-				"repo", repo,
-				"pr", pr,
-				"environment", result.Environment,
-				"requested_by", requestedBy)
-			return nil, false
-		}
-		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(command))
+// controllableApplyState reports whether a control command can still act on an
+// apply in this state. Stopped is terminal but not settled — stopping leaves the
+// schema change half-applied, and cancel is how an operator finishes it — so a
+// stopped apply is still something an operator's command can be about.
+func controllableApplyState(applyState string) bool {
+	return !state.IsTerminalApplyState(applyState) || state.IsState(applyState, state.Apply.Stopped)
+}
+
+// inferApplyForPRControl resolves the apply an operator meant when their control
+// command named no apply ID.
+//
+// `schemabot apply` takes no ID, so operators reach for `schemabot cancel -e
+// <env>` the same way; on a PR carrying a single schema change in that
+// environment there is only one apply the command can be about, and demanding
+// the ID sends them to `schemabot status` to copy back a value SchemaBot already
+// knows. Anything less certain than one candidate is answered, not guessed: no
+// candidates gets the usage reply, and several get their identifiers listed so
+// the operator names the one they mean.
+//
+// Inference is scoped to what this deployment stores, so it is only sound when
+// this deployment is the one answering. An unscoped command on an aggregate repo
+// fans out to deployments that each hold their own slice of the PR's applies,
+// where "exactly one here" does not mean "exactly one on this PR" — those keep
+// the usage reply and its explicit ID.
+func (h *Handler) inferApplyForPRControl(
+	ctx context.Context, applyStore storage.ApplyStore,
+	repo string, pr int, installationID int64, requestedBy string,
+	result CommandResult, command string,
+) (*storage.Apply, bool) {
+	if h.silentOnUnscopedFanOut(repo, result.Tenant) {
+		h.logger.Info("not inferring an apply id for an unscoped fan-out control command; this deployment holds only part of the PR's applies",
+			"command", command, "repo", repo, "pr", pr,
+			"environment", result.Environment, "requested_by", requestedBy)
 		return nil, false
 	}
+
+	applies, err := applyStore.GetByPR(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to load the PR's applies to infer the apply id for a control command",
+			"command", command, "repo", repo, "pr", pr,
+			"environment", result.Environment, "requested_by", requestedBy, "error", err)
+		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, "Failed to look up this PR's schema changes: "+err.Error())
+		return nil, false
+	}
+
+	var candidates []*storage.Apply
+	for _, apply := range applies {
+		if apply.Environment == result.Environment && controllableApplyState(apply.State) {
+			candidates = append(candidates, apply)
+		}
+	}
+
+	if len(candidates) == 1 {
+		h.logger.Info("inferred the apply id for a control command from the PR's only schema change in this environment",
+			append(candidates[0].LogAttrs(), "command", command, "requested_by", requestedBy)...)
+		return candidates[0], true
+	}
+	h.logger.Info("control command named no apply id and the PR's applies do not resolve it to one",
+		"command", command, "repo", repo, "pr", pr,
+		"environment", result.Environment, "requested_by", requestedBy,
+		"candidates", len(candidates))
+	return nil, false
+}
+
+// replyForUnresolvedApplyID answers a control command whose apply the PR could
+// not resolve: the usage line when nothing on the PR matches, and the candidates
+// themselves when several do.
+func (h *Handler) replyForUnresolvedApplyID(
+	ctx context.Context, applyStore storage.ApplyStore,
+	repo string, pr int, installationID int64, requestedBy string,
+	result CommandResult, command string,
+) {
+	if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+		h.logger.Info("skipping missing-apply-id reply for unscoped fan-out control command; the leader posts it once",
+			"command", command,
+			"repo", repo,
+			"pr", pr,
+			"environment", result.Environment,
+			"requested_by", requestedBy)
+		return
+	}
+
+	applies, err := applyStore.GetByPR(ctx, repo, pr)
+	if err != nil {
+		// The usage reply stands on its own, so a lookup failure here costs the
+		// operator the candidate list, not the answer.
+		h.logger.Warn("failed to load the PR's applies to list control command candidates; replying with usage only",
+			"command", command, "repo", repo, "pr", pr,
+			"environment", result.Environment, "requested_by", requestedBy, "error", err)
+		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(command))
+		return
+	}
+
+	var candidates []templates.ControlApplyCandidate
+	for _, apply := range applies {
+		if apply.Environment == result.Environment && controllableApplyState(apply.State) {
+			candidates = append(candidates, templates.ControlApplyCandidate{
+				ApplyID:  apply.ApplyIdentifier,
+				Database: apply.Database,
+				State:    apply.State,
+			})
+		}
+	}
+	if len(candidates) == 0 {
+		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(command))
+		return
+	}
+	h.postComment(repo, pr, installationID, templates.RenderControlAmbiguousApplyID(command, result.Environment, candidates))
+}
+
+func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
 	if h.service == nil {
 		h.logger.Error("service not configured for PR control command",
 			"command", command,
@@ -82,6 +180,19 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 		h.postCommandError(repo, pr, installationID, command, result.Environment, requestedBy, "SchemaBot apply storage is not configured for "+command+" commands")
 		return nil, false
 	}
+	// An operator who names no apply is answered from the PR itself: acted on
+	// when the PR resolves to exactly one candidate, and asked which one when it
+	// does not.
+	if result.ApplyID == "" {
+		inferred, ok := h.inferApplyForPRControl(ctx, applyStore, repo, pr, installationID, requestedBy, result, command)
+		if !ok {
+			h.replyForUnresolvedApplyID(ctx, applyStore, repo, pr, installationID, requestedBy, result, command)
+			return nil, false
+		}
+		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
+		return inferred, true
+	}
+
 	apply, err := applyStore.GetByApplyIdentifier(ctx, result.ApplyID)
 	if err != nil {
 		h.logger.Error("failed to load apply for PR control command",
@@ -159,16 +270,22 @@ func runControlCommand[R any](
 	h *Handler,
 	ctx context.Context,
 	repo string, pr int, installationID int64, requestedBy string,
-	result CommandResult,
+	result *CommandResult,
 	actionName string,
 	execute func(ctx context.Context, req apitypes.ControlRequest) (*R, error),
 	accepted func(*R) bool,
 	errorMessage func(*R) string,
 ) *R {
-	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, result, actionName)
+	apply, ok := h.loadApplyForPRControl(ctx, repo, pr, installationID, requestedBy, *result, actionName)
 	if !ok {
 		return nil
 	}
+	// The apply the command acts on is settled here, whether the operator named
+	// it or the PR resolved it. The result is threaded by pointer so everything
+	// downstream — the request, the logs, and the caller's acknowledgement
+	// comment — reports that apply, and an inferred command reads back the
+	// identifier it acted on rather than a blank.
+	result.ApplyID = apply.ApplyIdentifier
 	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, actionName)
 	if blocked {
 		return nil
@@ -227,7 +344,7 @@ func (h *Handler) handleStopCommand(repo string, pr int, installationID int64, r
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Stop,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Stop,
 		h.service.ExecuteStop,
 		func(r *apitypes.StopResponse) bool { return r.Accepted },
 		func(r *apitypes.StopResponse) string { return r.ErrorMessage })
@@ -260,7 +377,7 @@ func (h *Handler) handleCancelCommand(repo string, pr int, installationID int64,
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cancel,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Cancel,
 		h.service.ExecuteCancel,
 		func(r *apitypes.CancelResponse) bool { return r.Accepted },
 		func(r *apitypes.CancelResponse) string { return r.ErrorMessage })
@@ -293,7 +410,7 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Start,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Start,
 		h.service.ExecuteStart,
 		func(r *apitypes.StartResponse) bool { return r.Accepted },
 		func(r *apitypes.StartResponse) string { return r.ErrorMessage })
@@ -327,7 +444,7 @@ func (h *Handler) handleReleaseCommand(repo string, pr int, installationID int64
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Release,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Release,
 		h.service.ExecuteRelease,
 		func(r *apitypes.ReleaseResponse) bool { return r.Accepted },
 		func(r *apitypes.ReleaseResponse) string { return r.ErrorMessage })
@@ -356,7 +473,7 @@ func (h *Handler) handleCutoverCommand(repo string, pr int, installationID int64
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Cutover,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Cutover,
 		h.service.ExecuteCutover,
 		func(r *apitypes.ControlResponse) bool { return r.Accepted },
 		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
@@ -423,7 +540,7 @@ func (h *Handler) handleVolumeCommand(repo string, pr int, installationID int64,
 		return
 	}
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Volume,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Volume,
 		func(ctx context.Context, req apitypes.ControlRequest) (*apitypes.VolumeResponse, error) {
 			return h.service.ExecuteVolume(ctx, req, result.VolumeLevel)
 		},
@@ -452,7 +569,7 @@ func (h *Handler) handleSkipRevertCommand(repo string, pr int, installationID in
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.SkipRevert,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.SkipRevert,
 		h.service.ExecuteSkipRevert,
 		func(r *apitypes.ControlResponse) bool { return r.Accepted },
 		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
@@ -477,7 +594,7 @@ func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64,
 	ctx, cancel := h.commandContext(context.Background(), commandTimeout)
 	defer cancel()
 
-	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, result, action.Revert,
+	resp := runControlCommand(h, ctx, repo, pr, installationID, requestedBy, &result, action.Revert,
 		h.service.ExecuteRevert,
 		func(r *apitypes.ControlResponse) bool { return r.Accepted },
 		func(r *apitypes.ControlResponse) string { return r.ErrorMessage })
