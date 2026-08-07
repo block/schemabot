@@ -52,7 +52,7 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	if state.IsState(curState, state.Apply.Stopped) {
 		return fmt.Errorf("schema change is stopped - start it first, then adjust volume")
 	}
-	if !state.IsState(curState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.CuttingOver, state.Apply.WaitingForCutover) {
+	if !state.IsRunningApplyState(curState) && !state.IsState(curState, state.Apply.CuttingOver, state.Apply.WaitingForCutover) {
 		return fmt.Errorf("cannot adjust volume in state: %s", curState)
 	}
 

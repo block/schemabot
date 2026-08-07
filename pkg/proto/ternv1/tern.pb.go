@@ -98,6 +98,13 @@ const (
 	// reverting -> reverted). Distinct from running so a multi-minute revert is
 	// not surfaced as an ordinary in-progress apply.
 	State_STATE_REVERTING State = 18
+	// Post-copy phases: the row copy is done and the engine is draining its
+	// accumulated changeset or verifying the copied data. Running-family —
+	// distinct from STATE_RUNNING so operators see which phase an unbounded
+	// drain or verify is actually in.
+	State_STATE_CATCHING_UP   State = 19
+	State_STATE_CHECKSUMMING  State = 20
+	State_STATE_POST_CHECKSUM State = 21
 )
 
 // Enum value maps for State.
@@ -122,6 +129,9 @@ var (
 		16: "STATE_VALIDATING_BRANCH",
 		17: "STATE_RECOVERING",
 		18: "STATE_REVERTING",
+		19: "STATE_CATCHING_UP",
+		20: "STATE_CHECKSUMMING",
+		21: "STATE_POST_CHECKSUM",
 	}
 	State_value = map[string]int32{
 		"STATE_NO_ACTIVE_CHANGE":          0,
@@ -143,6 +153,9 @@ var (
 		"STATE_VALIDATING_BRANCH":         16,
 		"STATE_RECOVERING":                17,
 		"STATE_REVERTING":                 18,
+		"STATE_CATCHING_UP":               19,
+		"STATE_CHECKSUMMING":              20,
+		"STATE_POST_CHECKSUM":             21,
 	}
 )
 
@@ -3766,7 +3779,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x06Engine\x12\x11\n" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
 	"\x12ENGINE_PLANETSCALE\x10\x01\x12\x11\n" +
-	"\rENGINE_STRATA\x10\x02*\xe9\x03\n" +
+	"\rENGINE_STRATA\x10\x02*\xb1\x04\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -3787,7 +3800,10 @@ const file_tern_proto_rawDesc = "" +
 	"\x1fSTATE_VALIDATING_DEPLOY_REQUEST\x10\x0f\x12\x1b\n" +
 	"\x17STATE_VALIDATING_BRANCH\x10\x10\x12\x14\n" +
 	"\x10STATE_RECOVERING\x10\x11\x12\x13\n" +
-	"\x0fSTATE_REVERTING\x10\x12*\x81\x01\n" +
+	"\x0fSTATE_REVERTING\x10\x12\x12\x15\n" +
+	"\x11STATE_CATCHING_UP\x10\x13\x12\x16\n" +
+	"\x12STATE_CHECKSUMMING\x10\x14\x12\x17\n" +
+	"\x13STATE_POST_CHECKSUM\x10\x15*\x81\x01\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +

@@ -513,6 +513,9 @@ func seedTestRows(t *testing.T, db *sql.DB, tableName string, columns string, va
 	if rowCount > 10000 {
 		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e`
 	}
+	if rowCount > 100000 {
+		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) f`
+	}
 	seqGen += `, (SELECT @row := 0) r) nums`
 
 	query := fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s LIMIT %d`,

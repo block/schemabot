@@ -1600,16 +1600,17 @@ func validateStartRequestState(apply *storage.Apply) error {
 
 // isStartRequestAllowedState is an allowlist for states where /start has a
 // concrete action. New apply states must opt in here before they can reach the
-// operator or Tern start paths.
+// operator or Tern start paths. The running family is allowed because stop
+// persists stopped task rows before the derived apply row flips, so a start
+// against a still-running-family apply row may have real resume work.
 func isStartRequestAllowedState(applyState string) bool {
-	return state.IsState(
-		applyState,
-		state.Apply.WaitingForDeploy,
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.RunningDegraded,
-		state.Apply.Stopped,
-	)
+	return state.IsRunningApplyState(applyState) ||
+		state.IsState(
+			applyState,
+			state.Apply.WaitingForDeploy,
+			state.Apply.Pending,
+			state.Apply.Stopped,
+		)
 }
 
 func startNotAllowedForState(apply *storage.Apply) error {

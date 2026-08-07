@@ -1274,6 +1274,7 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 		if retryableFailure && state.IsTerminalTaskState(task.State) {
 			continue
 		}
+		engineTaskState := newState
 		if tp, ok := engineProgressForTask(tableProgress, task); ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
@@ -1287,6 +1288,13 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			}
 			if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
 				task.CompletedAt = tp.CompletedAt
+			}
+			// A generic running apply refines into the table's post-copy phase
+			// when the engine reports one, so a table catching up on accumulated
+			// changes, checksumming, or cutting over is stored — and rendered —
+			// as that phase rather than as a serene fully-copied bar.
+			if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
+				engineTaskState = phase
 			}
 			// Persist the per-shard breakdown as per-shard tasks so the renderer
 			// can show per-shard state from storage. No-op outside the lease-held
@@ -1312,7 +1320,22 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 		if result.State == engine.StateCompleted {
 			task.ProgressPercent = 100
 		}
-		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, newState), "")
+		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskState), "")
+	}
+}
+
+// tablePhaseTaskState maps a per-table engine state to the refined task state
+// it represents, when that state is one of the post-copy phases surfaced per
+// table: applying the accumulated changeset, verifying via checksum, or
+// cutting over. Any other per-table state does not refine the task state — in
+// particular "completed", which for engines like Spirit means only that the
+// table's row copy finished, not that the table cut over.
+func tablePhaseTaskState(tableState string) (string, bool) {
+	switch normalized := state.NormalizeTaskStatus(tableState); normalized {
+	case state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.CuttingOver:
+		return normalized, true
+	default:
+		return "", false
 	}
 }
 

@@ -81,6 +81,12 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered && !m.deployTriggered:
 		b.WriteString(m.spinner.View() + "Running...")
 		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.CatchingUp) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Catching up on accumulated changes...\n")
+	case state.IsState(m.state, state.Apply.Checksumming) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Checksumming to verify data...\n")
+	case state.IsState(m.state, state.Apply.PostChecksum) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Data verified, applying final changes...\n")
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
@@ -241,7 +247,7 @@ func (m WatchModel) progressView() string {
 			b.WriteString("SchemaBot is recovering after restart.\n")
 			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 		}
-	case state.IsState(m.state, state.Apply.Running):
+	case state.IsRunningApplyState(m.state):
 		b.WriteString("\n\n")
 		if m.volumeMode {
 			// Volume mode - show volume adjustment UI

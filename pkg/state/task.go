@@ -12,7 +12,9 @@ import (
 var Task = struct {
 	Pending           string
 	Running           string
+	CatchingUp        string
 	Checksumming      string
+	PostChecksum      string
 	WaitingForDeploy  string
 	WaitingForCutover string
 	Recovering        string
@@ -28,7 +30,9 @@ var Task = struct {
 }{
 	Pending:           "pending",
 	Running:           "running",
+	CatchingUp:        "catching_up",
 	Checksumming:      "checksumming",
+	PostChecksum:      "post_checksum",
 	WaitingForDeploy:  "waiting_for_deploy",
 	WaitingForCutover: "waiting_for_cutover",
 	Recovering:        "recovering",
@@ -73,7 +77,7 @@ func IsTerminalTaskState(s string) bool {
 // whether to resume or retry — so they are excluded here.
 func IsInFlightTaskState(s string) bool {
 	switch NormalizeState(s) {
-	case Task.Running, Task.Checksumming, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering, Task.Reverting:
+	case Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.WaitingForCutover, Task.CuttingOver, Task.WaitingForDeploy, Task.Recovering, Task.Reverting:
 		return true
 	default:
 		return false
@@ -97,19 +101,31 @@ func NormalizeTaskStatus(raw string) string {
 
 	// Checksumming — Spirit verifies the copied data against the source before
 	// cutover. On a large table this phase can run for hours, so it is surfaced
-	// as its own table state rather than folded into Running. PostChecksum stays
-	// Running: it is applying changeset deltas accumulated during the verify, not
-	// verifying.
+	// as its own table state rather than folded into Running.
 	case spiritstatus.Checksum.String():
 		return Task.Checksumming
+
+	// Catching up — the row copy is done and Spirit is applying the changeset
+	// accumulated from the binlog during the copy. This catch-up can run for
+	// hours on a busy source and can even diverge, so it is surfaced as its
+	// own table state rather than folded into Running, where a stalled
+	// catch-up would render as a serene complete copy.
+	case spiritstatus.ApplyChangeset.String():
+		return Task.CatchingUp
+
+	// Post-checksum — the verify passed and Spirit is applying the changes
+	// that accumulated while it ran. Same catch-up mechanics as CatchingUp,
+	// but it is a distinct, later phase: mapping it back to CatchingUp would
+	// pin the stored (monotonic) task state at Checksumming for the whole
+	// second drain, rendering an indeterminate verify that already finished.
+	case spiritstatus.PostChecksum.String():
+		return Task.PostChecksum
 
 	// Running — Spirit sub-states (camelCase from Spirit's State.String())
 	case spiritstatus.CopyRows.String(),
 		spiritstatus.Initial.String(),
-		spiritstatus.ApplyChangeset.String(),
 		spiritstatus.RestoreSecondaryIndexes.String(),
 		spiritstatus.AnalyzeTable.String(),
-		spiritstatus.PostChecksum.String(),
 		spiritstatus.ErrCleanup.String():
 		return Task.Running
 
@@ -140,7 +156,7 @@ func NormalizeTaskStatus(raw string) string {
 		return Task.Cancelled
 
 	// Pass-through for already-normalized values
-	case Task.Pending, Task.Running, Task.Checksumming, Task.Completed, Task.Stopped, Task.Failed,
+	case Task.Pending, Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverting, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:
@@ -150,7 +166,7 @@ func NormalizeTaskStatus(raw string) string {
 	switch normalized := NormalizeState(s); normalized {
 	case NormalizeState(string(vitessstatus.OnlineDDLStatusComplete)):
 		return Task.Completed
-	case Task.Pending, Task.Running, Task.Checksumming, Task.Completed, Task.Stopped, Task.Failed,
+	case Task.Pending, Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverting, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:

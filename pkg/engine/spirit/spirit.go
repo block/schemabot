@@ -679,7 +679,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	// If Spirit provides per-table progress, use it
 	if len(spiritProgress.Tables) > 0 {
-		tableProgress = buildSpiritTableProgress(spiritProgress, stateStr, ddlByTable, rm.tableNamespace)
+		tableProgress = buildSpiritTableProgress(spiritProgress, spiritState, ddlByTable, rm.tableNamespace)
 	} else {
 		// Fallback: no per-table progress available
 		for i, tableName := range rm.tables {
@@ -748,7 +748,14 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // established row total; completed tables keep 0, as do tables without a total
 // yet and estimates that aren't ready (still measuring the copy rate, or
 // essentially done).
-func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable, tableNamespace map[string]string) []engine.TableProgress {
+//
+// Spirit's per-table RowsTotal is a statistics-based estimate, not a count, so
+// a finished copy can land above or below it. Once the copy is complete the
+// copied count is ground truth: the total is reconciled to it so the table
+// reports a consistent 100% instead of a full bar contradicted by its own rows
+// line (estimate high) or an over-100 ratio (estimate low).
+func buildSpiritTableProgress(prog status.Progress, spiritState status.State, ddlByTable, tableNamespace map[string]string) []engine.TableProgress {
+	stateStr := spiritState.String()
 	var etaSeconds int64
 	if prog.ETA.State == status.ETAReady {
 		etaSeconds = int64(prog.ETA.Duration.Seconds())
@@ -763,29 +770,53 @@ func buildSpiritTableProgress(prog status.Progress, stateStr string, ddlByTable,
 			RowsCopied: int64(st.RowsCopied),
 			RowsTotal:  int64(st.RowsTotal),
 		}
-		// Calculate percent (clamp to 100 — concurrent inserts can cause RowsCopied > RowsTotal)
-		if st.RowsTotal > 0 {
-			tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
-			tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
-				st.RowsCopied, st.RowsTotal, tp.Progress)
-		}
 		if st.IsComplete {
-			tp.State = "completed"
+			tp.RowsTotal = tp.RowsCopied
 			tp.Progress = 100
+			// While the runner works through its post-copy phases the table's
+			// interesting state is that phase (applying accumulated changes,
+			// verifying, cutting over), not the fact that its copy finished.
+			// Keep the runner phase so consumers can surface post-copy work;
+			// outside those phases the table is simply done copying while
+			// other tables copy.
+			if !spiritPostCopyPhase(spiritState) {
+				tp.State = "completed"
+			}
 		} else if st.RowsTotal > 0 {
+			// Clamp to 100 — concurrent inserts can push RowsCopied past the estimate.
+			tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
 			tp.ETASeconds = etaSeconds
+		}
+		if tp.RowsTotal > 0 {
+			tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
+				tp.RowsCopied, tp.RowsTotal, tp.Progress)
 		}
 		// Spirit reports a single runner-wide checksum estimate (rows verified so
 		// far / total to verify), populated only during the verify phase and zero
-		// otherwise. Surface it on the tables still in flight so consumers can
-		// render verify progress; completed tables keep zero.
-		if !st.IsComplete {
-			tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
-			tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
-		}
+		// otherwise. Every table copy is complete by the time the verify phase
+		// runs, so the estimate is stamped on all tables unconditionally.
+		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
+		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
 		tableProgress = append(tableProgress, tp)
 	}
 	return tableProgress
+}
+
+// spiritPostCopyPhase reports whether the runner is in one of the active
+// phases between finishing the row copy and finishing the cutover: applying
+// the accumulated changeset, restoring deferred indexes, analyzing, verifying
+// via checksum, or the cutover itself. During these phases the runner state is
+// the whole schema change's state, so it is surfaced per table instead of
+// "completed". Waiting states, the post-cutover reverse window, and teardown
+// are excluded — those are reported through the apply-level state.
+func spiritPostCopyPhase(s status.State) bool {
+	switch s {
+	case status.ApplyChangeset, status.RestoreSecondaryIndexes, status.AnalyzeTable,
+		status.Checksum, status.PostChecksum, status.CutOver:
+		return true
+	default:
+		return false
+	}
 }
 
 // progressState resolves the state reported for a progress poll. The tracked
