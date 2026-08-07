@@ -155,7 +155,7 @@ func TestE2EMergeGateRecordedOnApplyTerminalSuccess(t *testing.T) {
 	// transition, so it must be visible as soon as the apply is completed.
 	var gateReq *storage.MergeGateRequest
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		req, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), apply.ID)
+		req, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), apply.ID, storage.MergeGateKindSettle)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, req) {
 			return
 		}
@@ -228,7 +228,7 @@ func TestE2EMergeGateSweepBackfillsMissedApply(t *testing.T) {
 	h := newE2EHandler(t, svc, gh.NewClient(nil))
 	h.sweepMergeGateRequests(ctx)
 
-	gateReq, err := svc.Storage().MergeGateRequests().GetByApplyID(ctx, applyID)
+	gateReq, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(ctx, applyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, gateReq, "the sweep must backfill a refresh request for a completed apply that has none")
 	assert.Equal(t, apply.ApplyIdentifier, gateReq.ApplyIdentifier)
@@ -240,7 +240,7 @@ func TestE2EMergeGateSweepBackfillsMissedApply(t *testing.T) {
 	// Recording is idempotent per apply: a second sweep pass over the same
 	// window must not duplicate or reset the request.
 	h.sweepMergeGateRequests(ctx)
-	again, err := svc.Storage().MergeGateRequests().GetByApplyID(ctx, applyID)
+	again, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(ctx, applyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, again)
 	assert.Equal(t, gateReq.ID, again.ID)
@@ -285,6 +285,7 @@ func TestE2EMergeGateReplansSiblingPRAndSkipsOriginator(t *testing.T) {
 	applyIdentifier := fmt.Sprintf("apply_mergegate_fanout_%d", time.Now().UnixNano())
 	gateReq := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000001,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: applyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -318,7 +319,7 @@ func TestE2EMergeGateReplansSiblingPRAndSkipsOriginator(t *testing.T) {
 	assert.Empty(t, originatorAfter.BlockingReason)
 
 	// The request itself is terminal-successful.
-	finished, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), gateReq.ApplyID)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), gateReq.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
 	assert.Equal(t, storage.MergeGateCompleted, finished.State)
@@ -356,6 +357,7 @@ func TestE2EMergeGateReplanFailureFailsCheckClosed(t *testing.T) {
 	applyIdentifier := fmt.Sprintf("apply_mergegate_failclosed_%d", time.Now().UnixNano())
 	gateReq := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000002,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: applyIdentifier,
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -376,7 +378,7 @@ func TestE2EMergeGateReplanFailureFailsCheckClosed(t *testing.T) {
 	assert.Contains(t, blocked.ChangeSummary, "re-plan failed — see server logs")
 	assert.Contains(t, blocked.ChangeSummary, applyIdentifier)
 
-	finished, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), gateReq.ApplyID)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), gateReq.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
 	assert.Equal(t, storage.MergeGateCompleted, finished.State)
@@ -410,6 +412,7 @@ func TestE2EMergeGateLeavesInFlightApplyCheckUntouched(t *testing.T) {
 
 	gateReq := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000003,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: fmt.Sprintf("apply_mergegate_inflight_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -427,7 +430,7 @@ func TestE2EMergeGateLeavesInFlightApplyCheckUntouched(t *testing.T) {
 	assert.Equal(t, "apply in flight", untouched.ChangeSummary)
 	assert.Empty(t, untouched.BlockingReason)
 
-	finished, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), gateReq.ApplyID)
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), gateReq.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, finished)
 	assert.Equal(t, storage.MergeGateCompleted, finished.State)
@@ -454,6 +457,7 @@ func TestE2EMergeGateCoalescesPendingSiblingRequests(t *testing.T) {
 
 	first := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000004,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: fmt.Sprintf("apply_mergegate_coalesce_a_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -462,6 +466,7 @@ func TestE2EMergeGateCoalescesPendingSiblingRequests(t *testing.T) {
 	})
 	second := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000005,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: fmt.Sprintf("apply_mergegate_coalesce_b_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -471,13 +476,13 @@ func TestE2EMergeGateCoalescesPendingSiblingRequests(t *testing.T) {
 
 	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
 
-	driven, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), first.ApplyID)
+	driven, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), first.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, driven)
 	assert.Equal(t, storage.MergeGateCompleted, driven.State)
 	assert.Equal(t, 1, driven.Attempts, "the older request runs the fan-out")
 
-	coalesced, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), second.ApplyID)
+	coalesced, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), second.ApplyID, storage.MergeGateKindSettle)
 	require.NoError(t, err)
 	require.NotNil(t, coalesced)
 	assert.Equal(t, storage.MergeGateCompleted, coalesced.State)
@@ -511,6 +516,7 @@ func TestE2EMergeGateKickDrainsWithoutTick(t *testing.T) {
 	// ticker, so nothing but a kick can drain the next request.
 	sentinel := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000006,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: fmt.Sprintf("apply_mergegate_kick_sentinel_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -523,7 +529,7 @@ func TestE2EMergeGateKickDrainsWithoutTick(t *testing.T) {
 	t.Cleanup(h.StopMergeGateProcessor)
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		got, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), sentinel.ApplyID)
+		got, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), sentinel.ApplyID, storage.MergeGateKindSettle)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, got) {
 			return
 		}
@@ -533,6 +539,7 @@ func TestE2EMergeGateKickDrainsWithoutTick(t *testing.T) {
 
 	kicked := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
 		ApplyID:         91000007,
+		Kind:            storage.MergeGateKindSettle,
 		ApplyIdentifier: fmt.Sprintf("apply_mergegate_kick_%d", time.Now().UnixNano()),
 		Environment:     "staging",
 		DatabaseType:    "mysql",
@@ -543,7 +550,7 @@ func TestE2EMergeGateKickDrainsWithoutTick(t *testing.T) {
 	svc.OnMergeGateRecorded()
 
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		got, err := svc.Storage().MergeGateRequests().GetByApplyID(t.Context(), kicked.ApplyID)
+		got, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), kicked.ApplyID, storage.MergeGateKindSettle)
 		if !assert.NoError(collect, err) || !assert.NotNil(collect, got) {
 			return
 		}

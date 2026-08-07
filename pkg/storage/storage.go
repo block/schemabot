@@ -191,6 +191,17 @@ type CheckStore interface {
 	// lifecycle stays authoritative. Returns true when the row was flipped.
 	MarkBlockedForFailedRefresh(ctx context.Context, check *Check) (bool, error)
 
+	// MarkBlockedForApplyInFlight flips stored check state to a blocking
+	// conclusion because an apply on the same target is about to change the
+	// live schema: the check's verdict was computed against a schema that will
+	// not survive the apply, so a merge must not land on it while the apply
+	// runs. Same conditional-write contract as MarkBlockedForFailedRefresh
+	// (head-SHA optimistic concurrency, in-progress apply-owned rows are never
+	// touched), plus it skips rows already holding this blocking reason so a
+	// retried preflight fan-out reports flipped=false instead of re-flipping.
+	// Returns true when the row was flipped.
+	MarkBlockedForApplyInFlight(ctx context.Context, check *Check) (bool, error)
+
 	// Delete removes stored check state by ID.
 	Delete(ctx context.Context, id int64) error
 
@@ -308,19 +319,42 @@ type WebhookEventStore interface {
 }
 
 // MergeGateRequestStore manages durable merge gate requests. A request
-// records that an apply successfully changed a target's live schema, so stored
-// check state on every other open change against that target must be re-planned.
-// The row is behavioral state, not just audit: the merge gate processor
-// consumes pending rows to recover the fan-out after process restarts.
+// records that an apply is changing (preflight) or has changed (settle) a
+// target's live schema, so stored check state on every other open PR against
+// that target must be held or re-planned. The row is behavioral state, not
+// just audit: the merge gate processor consumes pending rows to recover
+// the fan-out after process restarts, and the operator's preflight gate waits
+// on the preflight row before starting an apply's engine work.
 type MergeGateRequestStore interface {
-	// Record records a pending merge gate request for a completed apply. Returns
-	// recorded=false when a request for the apply already exists (any state),
-	// so recording is idempotent across drive tails and the backfill sweep.
+	// Record records a pending merge gate request. Kind is required. Returns
+	// recorded=false when a request for the same apply and kind already exists
+	// (any state), so recording is idempotent across drive tails, the operator
+	// preflight gate, and the backfill sweeps.
 	Record(ctx context.Context, req *MergeGateRequest) (recorded bool, err error)
 
-	// GetByApplyID returns the request for an originating apply, or nil if not
-	// found.
-	GetByApplyID(ctx context.Context, applyID int64) (*MergeGateRequest, error)
+	// GetByApplyAndKind returns the request of one kind for an originating
+	// apply, or nil if not found. The operator preflight gate polls it while
+	// waiting for the preflight fan-out to complete.
+	GetByApplyAndKind(ctx context.Context, applyID int64, kind string) (*MergeGateRequest, error)
+
+	// ReopenForRetry re-arms a terminally failed request back to pending with a
+	// fresh attempt budget. The operator preflight gate uses it so an apply
+	// blocked on a preflight that exhausted its retries (for example during a
+	// long GitHub outage) becomes claimable again on the apply's next start
+	// attempt instead of staying blocked until manual intervention. Returns
+	// true when the row was re-armed; false when it was not terminally failed.
+	ReopenForRetry(ctx context.Context, id int64) (bool, error)
+
+	// ReopenTerminalPreflightsForActiveApplies re-arms every terminally failed
+	// preflight request whose apply is still non-terminal, returning the number
+	// re-armed. The gate may have started such an apply on stored holds while
+	// the code-host rendering kept failing (for example through a code-host
+	// outage); once the render exhausts its retries nothing else would retry it
+	// until the apply settles, leaving sibling changes' visible checks stale
+	// for the rest of the apply. This sweep keeps the render retrying for as
+	// long as the apply is active; the apply's settle re-plan covers the target
+	// after that.
+	ReopenTerminalPreflightsForActiveApplies(ctx context.Context) (int64, error)
 
 	// ClaimNext atomically claims one pending, retryable, or lease-expired
 	// request. The claim rotates lease_owner/lease_token, increments attempts,
@@ -330,12 +364,14 @@ type MergeGateRequestStore interface {
 	// Returns nil when no request is claimable.
 	ClaimNext(ctx context.Context, owner string, leaseDuration time.Duration) (*MergeGateRequest, error)
 
-	// PendingForTarget returns the pending requests for the same
+	// PendingForTarget returns the pending requests of one kind for the same
 	// (environment, database_type, database_name) target, excluding the given
 	// request id. The processor coalesces them: one fan-out covers every
-	// schema change recorded before it started, so the siblings complete
-	// together with the claimed request.
-	PendingForTarget(ctx context.Context, environment, databaseType, databaseName string, excludeID int64) ([]*MergeGateRequest, error)
+	// same-kind request recorded before it started, so the siblings complete
+	// together with the claimed request. Kind-scoped because a preflight
+	// fan-out (hold checks) does not do a settle's work (re-plan them), or
+	// vice versa.
+	PendingForTarget(ctx context.Context, environment, databaseType, databaseName, kind string, excludeID int64) ([]*MergeGateRequest, error)
 
 	// Heartbeat extends the lease on a claimed request so a fan-out that spans
 	// many PRs can outlive the initial lease without being reclaimed
@@ -346,6 +382,15 @@ type MergeGateRequestStore interface {
 	// MarkCompleted marks a claimed request terminal-successful. Returns
 	// ErrMergeGateLeaseLost when the lease token is stale.
 	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
+
+	// MarkPreflightHoldsRecorded records that a preflight fan-out has durably
+	// held every sibling change's stored check on the target. Set-once: the
+	// first write stamps holds_recorded_at and retries preserve it. The
+	// operator gate starts the apply on this stamp, so it must land as soon as
+	// the storage-only hold phase finishes — before the code-host rendering,
+	// which can outlast a code-host outage. Returns ErrMergeGateLeaseLost when
+	// the lease token is stale.
+	MarkPreflightHoldsRecorded(ctx context.Context, id int64, leaseToken string) error
 
 	// CompletePendingCoalesced marks a still-pending sibling request completed
 	// because a fan-out for the same target covered it. Returns true when the
@@ -359,11 +404,29 @@ type MergeGateRequestStore interface {
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
 
 	// FindCompletedAppliesMissingRequest returns applies that reached the
-	// completed state within the lookback window but have no merge gate request
+	// completed state within the lookback window but have no settle request
 	// row. The applies table is the outbox: a pod crash between an apply's
-	// terminal write and its merge gate recording loses the in-line record, and
+	// terminal write and its refresh recording loses the in-line record, and
 	// this sweep is how the processor backfills it.
 	FindCompletedAppliesMissingRequest(ctx context.Context, lookback time.Duration) ([]*Apply, error)
+
+	// HasActivePreflightedApplyOnTarget reports whether any non-terminal apply
+	// on the target has a recorded preflight request. The settle fan-out
+	// checks it before re-planning: while such an apply exists, re-planning
+	// would overwrite its holds with verdicts computed against a schema it is
+	// about to change, so the settle defers to that apply's own eventual
+	// settle instead.
+	HasActivePreflightedApplyOnTarget(ctx context.Context, environment, databaseType, databaseName string) (bool, error)
+
+	// FindTerminalAppliesWithPreflightMissingSettle returns applies that
+	// settled to any terminal state within the lookback window, have a
+	// preflight request row, but no settle row. A preflight holds sibling PR
+	// checks action-required, and only the settle fan-out re-plans them back
+	// to a live verdict — so every preflighted apply must eventually record a
+	// settle, even when it failed or was cancelled before changing the schema.
+	// This sweep backfills settles the drive tails missed so held checks
+	// cannot stay blocked forever.
+	FindTerminalAppliesWithPreflightMissingSettle(ctx context.Context, lookback time.Duration) ([]*Apply, error)
 
 	// TerminateStuckProcessing marks as terminally failed every processing row
 	// whose lease has expired and whose attempts have reached

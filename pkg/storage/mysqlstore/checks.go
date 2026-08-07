@@ -532,7 +532,37 @@ func (s *checkStore) GetByTarget(ctx context.Context, environment, dbType, datab
 // a newer commit does not match and is preserved. An in-progress apply-owned
 // row is never touched — the started apply's lifecycle stays authoritative.
 func (s *checkStore) MarkBlockedForFailedRefresh(ctx context.Context, check *storage.Check) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
+	flipped, err := s.markBlockedConditional(ctx, check, false)
+	if err != nil {
+		return false, fmt.Errorf("mark check blocked for failed refresh %s#%d %s/%s/%s (head %s): %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, check.HeadSHA, err)
+	}
+	return flipped, nil
+}
+
+// MarkBlockedForApplyInFlight flips stored check state to a blocking
+// conclusion while an apply on the same target runs. Same conditional-write
+// contract as MarkBlockedForFailedRefresh, plus rows already holding the same
+// blocking reason are skipped so a retried preflight fan-out reports
+// flipped=false instead of re-flipping (and re-announcing) the hold.
+func (s *checkStore) MarkBlockedForApplyInFlight(ctx context.Context, check *storage.Check) (bool, error) {
+	flipped, err := s.markBlockedConditional(ctx, check, true)
+	if err != nil {
+		return false, fmt.Errorf("mark check blocked for apply in flight %s#%d %s/%s/%s (head %s): %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, check.HeadSHA, err)
+	}
+	return flipped, nil
+}
+
+// markBlockedConditional is the shared conditional blocking flip: it writes
+// the caller's blocking conclusion only when the stored row still holds the
+// head SHA the caller read (a racing synchronize that re-planned a newer
+// commit wins) and is not an in-progress apply-owned row (a started apply's
+// lifecycle stays authoritative). With skipAlreadyHeld, rows whose
+// blocking_reason already equals the caller's are also left untouched, so
+// idempotent retries can distinguish "newly flipped" from "already held".
+func (s *checkStore) markBlockedConditional(ctx context.Context, check *storage.Check, skipAlreadyHeld bool) (bool, error) {
+	query := `
 		UPDATE checks
 		SET apply_id = NULL,
 		    has_changes = ?,
@@ -544,19 +574,23 @@ func (s *checkStore) MarkBlockedForFailedRefresh(ctx context.Context, check *sto
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND head_sha = ?
-		  AND NOT (status = ? AND apply_id IS NOT NULL)
-	`, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
+		  AND NOT (status = ? AND apply_id IS NOT NULL)`
+	args := []any{check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		check.HeadSHA,
-		checkStatusInProgress)
+		checkStatusInProgress}
+	if skipAlreadyHeld {
+		query += `
+		  AND (blocking_reason IS NULL OR blocking_reason != ?)`
+		args = append(args, check.BlockingReason)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
-		return false, fmt.Errorf("mark check blocked for failed refresh %s#%d %s/%s/%s (head %s): %w",
-			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, check.HeadSHA, err)
+		return false, err
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("rows affected marking check blocked for failed refresh %s#%d %s/%s/%s: %w",
-			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+		return false, fmt.Errorf("rows affected: %w", err)
 	}
 	return rows > 0, nil
 }

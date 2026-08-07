@@ -177,6 +177,7 @@ func (h *Handler) sweepMergeGateRequests(ctx context.Context) {
 	for _, apply := range applies {
 		recorded, err := store.Record(ctx, &storage.MergeGateRequest{
 			ApplyID:         apply.ID,
+			Kind:            storage.MergeGateKindSettle,
 			ApplyIdentifier: apply.ApplyIdentifier,
 			Environment:     apply.Environment,
 			DatabaseType:    apply.DatabaseType,
@@ -275,7 +276,7 @@ func (h *Handler) driveClaimedMergeGate(ctx context.Context, store storage.Merge
 	// re-plans against the live schema, so it covers every schema change
 	// recorded before it began. A request recorded mid-fan-out is not covered
 	// and stays pending for the next drain.
-	siblings, err := store.PendingForTarget(ctx, req.Environment, req.DatabaseType, req.DatabaseName, req.ID)
+	siblings, err := store.PendingForTarget(ctx, req.Environment, req.DatabaseType, req.DatabaseName, req.Kind, req.ID)
 	if err != nil {
 		// Coalescing is an optimization: without the sibling list each pending
 		// request runs its own fan-out, which re-plans the same PRs again —
