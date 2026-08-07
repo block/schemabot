@@ -743,6 +743,13 @@ func TestRespondToUnscoped(t *testing.T) {
 // so it must answer those usage errors and help anyway — otherwise no
 // deployment replies and the operator's command dies silently with no
 // PR-visible feedback.
+//
+// The environment cases are the ones an operator hits by typo: an -e value no
+// deployment in the fleet serves is a dead command whose only cure is the list
+// of environments that do exist. A command carrying no -e at all is a separate
+// question — plan resolves it across every configured environment rather than
+// treating it as an error, so only the commands that require a target reach
+// the missing-environment reply.
 func TestAggregateLeaderAnswersUsageErrorsDespiteUnscopedPolicy(t *testing.T) {
 	falseVal := false
 	for _, tc := range []struct {
@@ -752,16 +759,22 @@ func TestAggregateLeaderAnswersUsageErrorsDespiteUnscopedPolicy(t *testing.T) {
 		bodyContains string
 	}{
 		{
-			name:         "missing environment",
-			comment:      "schemabot apply",
-			message:      "missing environment flag",
-			bodyContains: "-e",
+			name:         "unknown environment on plan",
+			comment:      "schemabot plan -e bogusenv",
+			message:      "unknown environment",
+			bodyContains: "staging",
 		},
 		{
 			name:         "unknown environment",
 			comment:      "schemabot apply -e prod",
 			message:      "unknown environment",
 			bodyContains: "staging",
+		},
+		{
+			name:         "missing environment",
+			comment:      "schemabot apply",
+			message:      "missing environment flag",
+			bodyContains: "-e",
 		},
 		{
 			name:         "malformed environment",
