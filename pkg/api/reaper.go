@@ -208,9 +208,14 @@ func (s *Service) runStrandedReaperPass(ctx context.Context) (strandedReaperPass
 	}
 	if ctx.Err() != nil {
 		// A pass interrupted by shutdown is a routine deploy, not a fault, and
-		// must not tick the claim-failure counter operators alert on.
-		s.logger.Debug("operator: stranded-operation reaper pass interrupted by shutdown",
-			"reaped_before_shutdown", len(reaped), "error", err)
+		// must not tick the claim-failure counter operators alert on. The line
+		// reports the shutdown as the reason, since a pass that finished cleanly
+		// just as the context ended has no error of its own to name.
+		attrs := []any{"reaped_before_shutdown", len(reaped), "error", ctx.Err()}
+		if err != nil {
+			attrs = append(attrs, "pass_error", err)
+		}
+		s.logger.Debug("operator: stranded-operation reaper pass interrupted by shutdown", attrs...)
 		return strandedReaperPassRan, len(reaped)
 	}
 	if err != nil {
