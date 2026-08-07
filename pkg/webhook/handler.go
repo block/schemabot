@@ -363,11 +363,6 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 			return nil
 		}
 
-		// Wake the merge gate processor as soon as a drive tail records a
-		// request, so sibling PR checks re-plan without waiting for the next
-		// poll tick. The durable request row stays the source of truth: a
-		// kick lost to a pod boundary only costs poll latency.
-		service.OnMergeGateRecorded = h.KickMergeGate
 	}
 
 	return h

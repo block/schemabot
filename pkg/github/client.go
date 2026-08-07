@@ -637,6 +637,37 @@ func (ic *InstallationClient) CreateIssueComment(ctx context.Context, repo strin
 	return comment.GetID(), comment.GetNodeID(), nil
 }
 
+// HasIssueCommentWithMarker reports whether any of the PR's most recent
+// comments contains the given marker string. Callers use it to make
+// at-least-once comment posting idempotent: a hidden HTML marker in the body
+// identifies the comment, and a retry that finds the marker skips the
+// re-post. Only the newest page of comments is inspected — the markers
+// callers search for are posted moments before the search, so an older
+// occurrence beyond the page means a duplicate is possible but harmless.
+func (ic *InstallationClient) HasIssueCommentWithMarker(ctx context.Context, repo string, pr int, marker string) (bool, error) {
+	owner, repoName := splitRepo(repo)
+	comments, err := retryGitHubUnavailableRead(ctx, ic.logger, "list issue comments", []any{"repo", repo, "pr", pr}, func(ctx context.Context) ([]*gh.IssueComment, error) {
+		list, _, callErr := ic.client.Issues.ListComments(ctx, owner, repoName, pr, &gh.IssueListCommentsOptions{
+			Sort:        new("created"),
+			Direction:   new("desc"),
+			ListOptions: gh.ListOptions{PerPage: 100},
+		})
+		if callErr != nil {
+			return nil, classifyGitHubAPIError(callErr)
+		}
+		return list, nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("list issue comments for %s#%d: %w", repo, pr, err)
+	}
+	for _, comment := range comments {
+		if strings.Contains(comment.GetBody(), marker) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // GetIssueComment returns the current body of an existing PR/issue comment.
 func (ic *InstallationClient) GetIssueComment(ctx context.Context, repo string, commentID int64) (string, error) {
 	owner, repoName := splitRepo(repo)

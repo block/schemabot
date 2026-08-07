@@ -1520,6 +1520,10 @@ const (
 	// MergeGateSourceSweep marks a request recorded by the backstop sweep
 	// over recently completed applies.
 	MergeGateSourceSweep = "sweep"
+	// MergeGateSourceReleaseSweep marks a settle request backfilled by the
+	// sweep over terminal applies whose preflight held sibling checks but
+	// whose settle was never recorded.
+	MergeGateSourceReleaseSweep = "release_sweep"
 )
 
 // RecordMergeGateRecorded counts durable merge gate requests recorded
@@ -1600,5 +1604,16 @@ func RecordMergeGateEventOutcome(ctx context.Context, database, environment, out
 func RecordMergeGateTerminatedStuck(ctx context.Context, terminated int64) {
 	addCounterN(ctx, terminated, "schemabot.merge_gate.terminated_stuck_total",
 		"Total merge gate requests terminated by the stuck-processing sweep", "{request}",
+	)
+}
+
+// RecordMergeGatePreflightRearmed counts terminally failed preflight renders
+// re-armed because their apply is still active. A sustained rate means the
+// code host keeps rejecting the hold rendering (outage, auth failure) while
+// applies run on stored holds — sibling PRs' visible checks stay stale until
+// a render lands, so find the failing render in the merge gate logs.
+func RecordMergeGatePreflightRearmed(ctx context.Context, reopened int64) {
+	addCounterN(ctx, reopened, "schemabot.merge_gate.preflight_renders_rearmed_total",
+		"Total terminally failed preflight renders re-armed for still-active applies", "{request}",
 	)
 }

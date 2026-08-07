@@ -119,6 +119,17 @@ var schemaChangedReplanFailedBlock = checkBlockReason{
 	message:        "The live schema for this database changed after this plan was computed, and SchemaBot could not re-plan the PR against it. Re-run `schemabot plan` (or push a new commit) before this check can pass; see server logs for the re-plan failure.",
 }
 
+// applyInFlightBlock is used while an apply is running against a check's
+// target: the stored verdict was computed against the pre-apply live schema,
+// so a merge must not land on it before the apply finishes. The preflight
+// fan-out writes it before the apply's engine work starts, and the apply's
+// settle fan-out re-plans the check against the resulting schema, which
+// replaces this hold with a live verdict.
+var applyInFlightBlock = checkBlockReason{
+	blockingReason: "apply_in_flight_on_target",
+	message:        "An apply is currently changing this database's live schema, so this check is held until it finishes. SchemaBot then re-plans this PR against the resulting schema and refreshes this check automatically.",
+}
+
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
 // the server-configured environments for the database do not overlap this
 // service's allowed_environments. SchemaBot cannot safely plan the schema
