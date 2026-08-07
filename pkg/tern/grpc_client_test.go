@@ -1322,10 +1322,10 @@ func TestGRPCClient_ResumeApplyOperationDispatchesGroupFinalizerAsVSchemaOnly(t 
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-finalizer",
 			SchemaFiles: schema.SchemaFiles{
-				"commerce": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+				"commerce": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 			},
 			Namespaces: map[string]*storage.NamespacePlanData{
-				"commerce": {Artifacts: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 			},
 		}},
 		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
@@ -1420,10 +1420,10 @@ func TestGRPCClient_ResumeApplyOperationReflectsFinalizerTerminalStateOntoOperat
 					ID:             apply.PlanID,
 					PlanIdentifier: "plan-finalizer",
 					SchemaFiles: schema.SchemaFiles{
-						"commerce": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+						"commerce": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 					},
 					Namespaces: map[string]*storage.NamespacePlanData{
-						"commerce": {Artifacts: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+						"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 					},
 				}},
 				operations: operations,

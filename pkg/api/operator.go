@@ -1698,7 +1698,7 @@ func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, 
 		if err != nil {
 			return false, fmt.Errorf("load plan %d for task-less apply_operation %d (deployment %q): %w", apply.PlanID, op.ID, op.Deployment, err)
 		}
-		if plan != nil && op.OperationKind == storage.ApplyOperationKindWork && op.OperationKey == "" && len(plan.FlatDDLChanges()) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0 {
+		if op.IsTasklessVSchemaOnlyWork(plan) {
 			currentOp, getOpErr := s.storage.ApplyOperations().Get(ctx, op.ID)
 			if getOpErr != nil {
 				return false, fmt.Errorf("reload task-less apply_operation %d (deployment %q): %w", op.ID, op.Deployment, getOpErr)

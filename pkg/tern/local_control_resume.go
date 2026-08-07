@@ -1009,7 +1009,7 @@ func groupedResumeChanges(tasks []*storage.Task, plan *storage.Plan) []engine.Sc
 		}
 		sort.Strings(namespaces)
 		for _, ns := range namespaces {
-			if !namespaceHasVSchemaArtifact(plan.Namespaces[ns]) {
+			if !plan.Namespaces[ns].ChangesVSchema() {
 				continue
 			}
 			idx := ensureNamespace(ns)
@@ -1113,7 +1113,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 		if planErr != nil {
 			return fmt.Errorf("get plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, planErr)
 		}
-		if !isTasklessVSchemaOnlyPlan(tasks, plan) || op.OperationKind != storage.ApplyOperationKindWork || op.OperationKey != "" {
+		if !op.IsTasklessVSchemaOnlyWork(plan) {
 			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 		}
 		return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
@@ -1341,22 +1341,15 @@ func finalizerVSchemaChanges(plan *storage.Plan, namespace string) ([]engine.Sch
 		return engine.SchemaChange{Namespace: ns, Metadata: map[string]string{"vschema_changed": "true"}}
 	}
 	if namespace != "" {
-		nsData := plan.Namespaces[namespace]
-		if nsData == nil || !namespaceHasVSchemaArtifact(nsData) {
+		if !plan.Namespaces[namespace].ChangesVSchema() {
 			return nil, fmt.Errorf("plan %d has no VSchema artifact for namespace %q", plan.ID, namespace)
 		}
 		return []engine.SchemaChange{vschemaChange(namespace)}, nil
 	}
-	namespaces := make([]string, 0, len(plan.Namespaces))
-	for ns, nsData := range plan.Namespaces {
-		if namespaceHasVSchemaArtifact(nsData) {
-			namespaces = append(namespaces, ns)
-		}
-	}
+	namespaces := plan.VSchemaNamespaces()
 	if len(namespaces) == 0 {
 		return nil, fmt.Errorf("plan %d has no VSchema artifact for a deployment-scoped finalizer", plan.ID)
 	}
-	sort.Strings(namespaces)
 	changes := make([]engine.SchemaChange, 0, len(namespaces))
 	for _, ns := range namespaces {
 		changes = append(changes, vschemaChange(ns))
