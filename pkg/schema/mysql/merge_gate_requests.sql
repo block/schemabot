@@ -17,6 +17,7 @@ CREATE TABLE `merge_gate_requests` (
   `lease_expires_at` datetime(6) DEFAULT NULL,
   `retry_after` datetime DEFAULT NULL,
   `last_error` text,
+  `holds_recorded_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

@@ -542,6 +542,132 @@ func TestMergeGateStore_ReopenForRetry(t *testing.T) {
 	assert.Equal(t, req.ID, reclaimed.ID)
 }
 
+// Scenario: the preflight fan-out finishes its storage-only hold phase and
+// stamps holds_recorded_at so the operator gate can start the apply before
+// the code-host rendering lands. The stamp is set-once (render retries keep
+// the original), lease-guarded, and survives both a terminal render failure
+// and the re-arm that follows it.
+func TestMergeGateStore_MarkPreflightHoldsRecorded(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLockWithPR(t, store, "db_holds_lock", storage.DatabaseTypeMySQL, "staging", "org/repo", 141)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_holds_1", 0, state.Apply.Running, "staging")
+	req := recordTestMergeGateRequestForApply(t, store, apply, storage.MergeGateKindPreflight, "staging", storage.DatabaseTypeMySQL, "db_holds", "org/repo", 141)
+
+	claimed, err := store.MergeGateRequests().ClaimNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Nil(t, claimed.HoldsRecordedAt, "a fresh preflight has no holds recorded yet")
+
+	require.NoError(t, store.MergeGateRequests().MarkPreflightHoldsRecorded(ctx, claimed.ID, claimed.LeaseToken))
+	got, err := store.MergeGateRequests().GetByApplyAndKind(ctx, req.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	require.NotNil(t, got.HoldsRecordedAt)
+	assert.Equal(t, storage.MergeGateProcessing, got.State, "recording holds does not complete the request; the render phase remains")
+
+	// A retry after a partial render keeps the original stamp.
+	_, err = testDB.ExecContext(ctx, `UPDATE merge_gate_requests SET holds_recorded_at = NOW() - INTERVAL 1 HOUR WHERE id = ?`, claimed.ID)
+	require.NoError(t, err)
+	require.NoError(t, store.MergeGateRequests().MarkPreflightHoldsRecorded(ctx, claimed.ID, claimed.LeaseToken))
+	got, err = store.MergeGateRequests().GetByApplyAndKind(ctx, req.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	require.NotNil(t, got.HoldsRecordedAt)
+	assert.WithinDuration(t, time.Now().Add(-time.Hour), *got.HoldsRecordedAt, 5*time.Minute, "the first stamp is preserved")
+
+	err = store.MergeGateRequests().MarkPreflightHoldsRecorded(ctx, claimed.ID, "stale-token")
+	assert.ErrorIs(t, err, storage.ErrMergeGateLeaseLost)
+	err = store.MergeGateRequests().MarkPreflightHoldsRecorded(ctx, claimed.ID+9999, "any")
+	assert.ErrorIs(t, err, storage.ErrMergeGateNotFound)
+
+	// A terminal render failure and its re-arm both leave the stamp in place:
+	// the stored holds are real regardless of how the rendering fared.
+	require.NoError(t, store.MergeGateRequests().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "github unavailable", nil))
+	reopened, err := store.MergeGateRequests().ReopenForRetry(ctx, claimed.ID)
+	require.NoError(t, err)
+	require.True(t, reopened)
+	got, err = store.MergeGateRequests().GetByApplyAndKind(ctx, req.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	assert.NotNil(t, got.HoldsRecordedAt)
+	assert.Equal(t, storage.MergeGatePending, got.State)
+}
+
+// Scenario: the gate started an apply on stored holds while GitHub was down,
+// and the render phase then exhausted its retry budget. Nothing else would
+// retry the render until the apply settles, so the sweep re-arms terminally
+// failed preflights whose apply is still active — and only those: retryable
+// failures, settles, and preflights of settled applies keep their own
+// lifecycles.
+func TestMergeGateStore_ReopenTerminalPreflightsForActiveApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	makePreflight := func(name, dbName string, pr int, applyState string) *storage.MergeGateRequest {
+		lock := createTestLockWithPR(t, store, dbName, storage.DatabaseTypeMySQL, "staging", "org/repo", pr)
+		apply := createTestApplyWithStateAndEnv(t, store, lock, name, 0, applyState, "staging")
+		return recordTestMergeGateRequestForApply(t, store, apply, storage.MergeGateKindPreflight, "staging", storage.DatabaseTypeMySQL, dbName, "org/repo", pr)
+	}
+	failTerminally := func(req *storage.MergeGateRequest) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE merge_gate_requests
+			SET state = ?, attempts = 1, retry_after = NULL, last_error = 'github unavailable',
+				completed_at = NOW(), lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL
+			WHERE id = ?`, storage.MergeGateFailed, req.ID)
+		require.NoError(t, err)
+	}
+
+	// Terminal render failure on a running apply: re-armed.
+	rearm := makePreflight("apply_rearm_active", "db_rearm_1", 151, state.Apply.Running)
+	failTerminally(rearm)
+
+	// A settle in the same terminal-failed shape is not a render: not re-armed.
+	settleApply, err := store.Applies().Get(ctx, rearm.ApplyID)
+	require.NoError(t, err)
+	settleReq := recordTestMergeGateRequestForApply(t, store, settleApply, storage.MergeGateKindSettle, "staging", storage.DatabaseTypeMySQL, "db_rearm_1", "org/repo", 151)
+	failTerminally(settleReq)
+
+	// Terminal render failure on a settled apply: the settle re-plan covers it.
+	settled := makePreflight("apply_rearm_settled", "db_rearm_2", 152, state.Apply.Completed)
+	failTerminally(settled)
+
+	// Retryable failure on a running apply: still claimable on its own.
+	retryable := makePreflight("apply_rearm_retryable", "db_rearm_3", 153, state.Apply.Running)
+	future := time.Now().Add(time.Minute)
+	_, err = testDB.ExecContext(ctx, `UPDATE merge_gate_requests SET state = ?, attempts = 1, retry_after = ? WHERE id = ?`,
+		storage.MergeGateFailed, future, retryable.ID)
+	require.NoError(t, err)
+
+	reopened, err := store.MergeGateRequests().ReopenTerminalPreflightsForActiveApplies(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), reopened)
+
+	got, err := store.MergeGateRequests().GetByApplyAndKind(ctx, rearm.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	assert.Equal(t, storage.MergeGatePending, got.State)
+	assert.Equal(t, 0, got.Attempts)
+	assert.Nil(t, got.CompletedAt)
+
+	got, err = store.MergeGateRequests().GetByApplyAndKind(ctx, rearm.ApplyID, storage.MergeGateKindSettle)
+	require.NoError(t, err)
+	assert.Equal(t, storage.MergeGateFailed, got.State, "a terminally failed settle is not a render; not re-armed")
+
+	got, err = store.MergeGateRequests().GetByApplyAndKind(ctx, settled.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	assert.Equal(t, storage.MergeGateFailed, got.State, "a settled apply's preflight is not re-armed")
+
+	got, err = store.MergeGateRequests().GetByApplyAndKind(ctx, retryable.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	assert.Equal(t, storage.MergeGateFailed, got.State, "a retryable failure is not re-armed")
+	assert.Equal(t, 1, got.Attempts)
+
+	// A second pass finds nothing new.
+	reopened, err = store.MergeGateRequests().ReopenTerminalPreflightsForActiveApplies(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, reopened)
+}
+
 // Scenario: an apply that recorded a preflight held sibling PR checks, then
 // settled terminally without a settle request — for example it was cancelled
 // while queued, so the drive tail never ran. The release sweep must find

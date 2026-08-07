@@ -20,7 +20,7 @@ import (
 const mergeGateColumns = `id, apply_id, kind, apply_identifier, environment, database_type, database_name,
 	provider, repository, change_key, requested_by, state, attempts,
 	lease_owner, lease_token, lease_expires_at, retry_after, last_error,
-	completed_at, created_at, updated_at`
+	holds_recorded_at, completed_at, created_at, updated_at`
 
 type mergeGateRequestStore struct {
 	db       *sql.DB
@@ -104,6 +104,40 @@ func (s *mergeGateRequestStore) ReopenForRetry(ctx context.Context, id int64) (b
 		return false, fmt.Errorf("read reopened merge gate request %d rows affected: %w", id, err)
 	}
 	return rows > 0, nil
+}
+
+// ReopenTerminalPreflightsForActiveApplies re-arms terminally failed
+// preflight requests whose apply is still non-terminal, so a code-host
+// rendering that exhausted its retries (the stored holds themselves are
+// storage-only and cannot fail on the code host) keeps retrying for as long
+// as the apply runs. Terminal means unclaimable: no retry window, or attempts
+// at the cap. Requests for terminal applies are left alone — the apply's
+// settle re-plan supersedes the render.
+func (s *mergeGateRequestStore) ReopenTerminalPreflightsForActiveApplies(ctx context.Context) (int64, error) {
+	nonTerminal, nonTerminalArgs := nonTerminalApplyStatePredicate("a.state")
+	args := []any{
+		storage.MergeGatePending,
+		storage.MergeGateKindPreflight, storage.MergeGateFailed, storage.MaxMergeGateAttempts,
+	}
+	args = append(args, nonTerminalArgs...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE merge_gate_requests r
+		JOIN applies a ON a.id = r.apply_id
+		SET r.state = ?, r.attempts = 0, r.lease_owner = NULL, r.lease_token = NULL,
+			r.lease_expires_at = NULL, r.retry_after = NULL, r.completed_at = NULL,
+			r.updated_at = NOW()
+		WHERE r.kind = ? AND r.state = ?
+		  AND (r.retry_after IS NULL OR r.attempts >= ?)
+		  AND `+nonTerminal+`
+	`, args...)
+	if err != nil {
+		return 0, fmt.Errorf("reopen terminal preflight merge gate requests for active applies: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read reopened terminal preflight merge gate rows affected: %w", err)
+	}
+	return rows, nil
 }
 
 // mergeGateClaimablePredicate matches exactly the rows a processor would
@@ -260,6 +294,23 @@ func (s *mergeGateRequestStore) MarkCompleted(ctx context.Context, id int64, lea
 	`, storage.MergeGateCompleted, id, leaseToken)
 	if err != nil {
 		return fmt.Errorf("mark merge gate request %d completed: %w", id, err)
+	}
+	return s.mergeGateLeaseResult(ctx, result, id, leaseToken)
+}
+
+// MarkPreflightHoldsRecorded stamps holds_recorded_at on a claimed preflight
+// request once its storage-only hold phase has flipped every sibling change's
+// stored check. Set-once (COALESCE-preserved), so retries after a partial
+// render keep the original stamp. Idempotent for the same lease token, on the
+// same rationale as MarkCompleted.
+func (s *mergeGateRequestStore) MarkPreflightHoldsRecorded(ctx context.Context, id int64, leaseToken string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE merge_gate_requests
+		SET holds_recorded_at = COALESCE(holds_recorded_at, NOW()), updated_at = NOW()
+		WHERE id = ? AND lease_token = ?
+	`, id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("mark merge gate request %d preflight holds recorded: %w", id, err)
 	}
 	return s.mergeGateLeaseResult(ctx, result, id, leaseToken)
 }
@@ -446,12 +497,12 @@ func scanMergeGateRequest(row *sql.Row) (*storage.MergeGateRequest, error) {
 func scanMergeGateRequestInto(row scanner) (*storage.MergeGateRequest, error) {
 	var req storage.MergeGateRequest
 	var leaseOwner, leaseToken, lastError sql.NullString
-	var leaseExpiresAt, retryAfter, completedAt sql.NullTime
+	var leaseExpiresAt, retryAfter, holdsRecordedAt, completedAt sql.NullTime
 	err := row.Scan(
 		&req.ID, &req.ApplyID, &req.Kind, &req.ApplyIdentifier, &req.Environment, &req.DatabaseType, &req.DatabaseName,
 		&req.Provider, &req.Repository, &req.ChangeKey, &req.RequestedBy, &req.State, &req.Attempts,
 		&leaseOwner, &leaseToken, &leaseExpiresAt, &retryAfter, &lastError,
-		&completedAt, &req.CreatedAt, &req.UpdatedAt,
+		&holdsRecordedAt, &completedAt, &req.CreatedAt, &req.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -464,6 +515,9 @@ func scanMergeGateRequestInto(row scanner) (*storage.MergeGateRequest, error) {
 	}
 	if retryAfter.Valid {
 		req.RetryAfter = &retryAfter.Time
+	}
+	if holdsRecordedAt.Valid {
+		req.HoldsRecordedAt = &holdsRecordedAt.Time
 	}
 	if completedAt.Valid {
 		req.CompletedAt = &completedAt.Time

@@ -345,6 +345,17 @@ type MergeGateRequestStore interface {
 	// true when the row was re-armed; false when it was not terminally failed.
 	ReopenForRetry(ctx context.Context, id int64) (bool, error)
 
+	// ReopenTerminalPreflightsForActiveApplies re-arms every terminally failed
+	// preflight request whose apply is still non-terminal, returning the number
+	// re-armed. The gate may have started such an apply on stored holds while
+	// the code-host rendering kept failing (for example through a code-host
+	// outage); once the render exhausts its retries nothing else would retry it
+	// until the apply settles, leaving sibling changes' visible checks stale
+	// for the rest of the apply. This sweep keeps the render retrying for as
+	// long as the apply is active; the apply's settle re-plan covers the target
+	// after that.
+	ReopenTerminalPreflightsForActiveApplies(ctx context.Context) (int64, error)
+
 	// ClaimNext atomically claims one pending, retryable, or lease-expired
 	// request. The claim rotates lease_owner/lease_token, increments attempts,
 	// and sets a lease expiry in the same transaction. Retryable and
@@ -371,6 +382,15 @@ type MergeGateRequestStore interface {
 	// MarkCompleted marks a claimed request terminal-successful. Returns
 	// ErrMergeGateLeaseLost when the lease token is stale.
 	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
+
+	// MarkPreflightHoldsRecorded records that a preflight fan-out has durably
+	// held every sibling change's stored check on the target. Set-once: the
+	// first write stamps holds_recorded_at and retries preserve it. The
+	// operator gate starts the apply on this stamp, so it must land as soon as
+	// the storage-only hold phase finishes — before the code-host rendering,
+	// which can outlast a code-host outage. Returns ErrMergeGateLeaseLost when
+	// the lease token is stale.
+	MarkPreflightHoldsRecorded(ctx context.Context, id int64, leaseToken string) error
 
 	// CompletePendingCoalesced marks a still-pending sibling request completed
 	// because a fan-out for the same target covered it. Returns true when the

@@ -1430,9 +1430,16 @@ type MergeGateRequest struct {
 	LeaseExpiresAt *time.Time
 	RetryAfter     *time.Time
 	LastError      string
-	CompletedAt    *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// HoldsRecordedAt is set once by the preflight fan-out when every sibling
+	// change's stored check hold is durably in place. Stored holds are
+	// storage-only writes, so this lands even when the code host is
+	// unreachable; the operator gate starts the apply on it rather than on
+	// request completion, which additionally requires the code-host rendering
+	// (Check Run update and hold comment). Always nil for settle requests.
+	HoldsRecordedAt *time.Time
+	CompletedAt     *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // ChangeKeyForPullRequest renders a GitHub pull request number as a merge
