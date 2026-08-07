@@ -746,6 +746,13 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	}, httpStatus, nil
 }
 
+// tryImmediateStopAfterQueue asks the engine to settle a queued stop right away.
+// Its logs report the engine's own counts under engine_-prefixed keys: the
+// command's counts, logged one hop away under stopped_count/skipped_count, say
+// how many tasks the operator's request selected, while these say how many the
+// engine settled in this attempt — routinely zero when the engine defers to the
+// apply owner. Two identically-named counts a line apart in a triage read is how
+// an operator concludes a stop did nothing when it is simply still queued.
 func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, environment, caller string) {
 	// A multi-operation apply has no single data-plane apply id: each operation
 	// drives against its own deployment with its own remote apply. An apply-scoped
@@ -804,7 +811,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	if !resp.Accepted {
 		s.logger.Warn("immediate stop was not accepted; durable stop request remains pending for apply owner retry",
 			append(apply.LogAttrs(),
-				"tern_apply_id", ternApplyID, "requested_by", caller, "error_message", resp.ErrorMessage, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount)...)
+				"tern_apply_id", ternApplyID, "requested_by", caller, "error_message", resp.ErrorMessage, "engine_stopped_count", resp.StoppedCount, "engine_skipped_count", resp.SkippedCount)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			fmt.Sprintf("Immediate stop attempt was not accepted; durable stop request remains pending: %s", apply.OperatorFacingMessage(resp.ErrorMessage)))
 		return
@@ -813,7 +820,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	if err != nil {
 		s.logger.Warn("immediate stop accepted but durable stop request completion failed; durable stop request remains pending for apply owner retry",
 			append(apply.LogAttrs(),
-				"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount, "error", err)...)
+				"tern_apply_id", ternApplyID, "requested_by", caller, "engine_stopped_count", resp.StoppedCount, "engine_skipped_count", resp.SkippedCount, "error", err)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			fmt.Sprintf("Immediate stop accepted but durable stop request completion failed; durable stop request remains pending: %v", err))
 		return
@@ -821,14 +828,14 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	if !stopCompleted {
 		s.logger.Info("immediate stop accepted; durable apply owner will reconcile final stop state",
 			append(apply.LogAttrs(),
-				"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount)...)
+				"tern_apply_id", ternApplyID, "requested_by", caller, "engine_stopped_count", resp.StoppedCount, "engine_skipped_count", resp.SkippedCount)...)
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 			"Immediate stop accepted; durable apply owner will reconcile final stop state")
 		return
 	}
 	s.logger.Info("immediate stop accepted and durable stop request completed",
 		append(apply.LogAttrs(),
-			"tern_apply_id", ternApplyID, "requested_by", caller, "stopped_count", resp.StoppedCount, "skipped_count", resp.SkippedCount)...)
+			"tern_apply_id", ternApplyID, "requested_by", caller, "engine_stopped_count", resp.StoppedCount, "engine_skipped_count", resp.SkippedCount)...)
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested,
 		"Immediate stop accepted and durable stop request completed")
 }
@@ -983,6 +990,9 @@ func cancelResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (
 	return resp, nil
 }
 
+// tryImmediateCancel asks the engine to settle a queued cancel right away. Like
+// the stop path, its logs report the engine's own counts under engine_-prefixed
+// keys so they cannot be read as the command's task selection counts.
 func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) {
 	if multiOp, err := s.applyHasMultipleOperations(ctx, apply); err != nil {
 		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate cancel",
@@ -1024,11 +1034,11 @@ func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, ap
 	}
 	if !cancelCompleted {
 		s.logger.Info("immediate cancel accepted; durable apply owner will reconcile final cancel state",
-			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "cancelled_count", resp.CancelledCount, "skipped_count", resp.SkippedCount)...)
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "engine_cancelled_count", resp.CancelledCount, "engine_skipped_count", resp.SkippedCount)...)
 		return
 	}
 	s.logger.Info("immediate cancel accepted and durable cancel request completed",
-		append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "cancelled_count", resp.CancelledCount, "skipped_count", resp.SkippedCount)...)
+		append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "engine_cancelled_count", resp.CancelledCount, "engine_skipped_count", resp.SkippedCount)...)
 }
 
 func (s *Service) completeImmediateCancelRequestIfCancelled(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
