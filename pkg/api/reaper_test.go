@@ -116,3 +116,60 @@ func TestRunStrandedReaperPassRecordsNothingWhenAnotherInstanceIsReaping(t *test
 
 	assert.Empty(t, reapedDeployments(t, reader), "an unelected pass settles nothing")
 }
+
+// A reaper with nothing to settle writes nothing and elects nothing, so without a
+// heartbeat an operator cannot tell a healthy idle reaper from one that stopped
+// ticking. The heartbeat closes a window of passes with a single line that says
+// both that the reaper is alive and what its passes have done.
+func TestStrandedReaperHeartbeatSummarizesAWindowOfIdlePasses(t *testing.T) {
+	var heartbeat strandedReaperHeartbeat
+
+	for range strandedReaperHeartbeatPasses - 1 {
+		assert.Nil(t, heartbeat.observe(strandedReaperPassRan, 0), "the window is still filling")
+	}
+
+	summary := heartbeat.observe(strandedReaperPassRan, 0)
+	require.NotNil(t, summary, "a full window of idle passes must still report the reaper is alive")
+	assert.Equal(t, []any{
+		"passes", strandedReaperHeartbeatPasses,
+		"operations_settled", 0,
+		"passes_not_elected", 0,
+		"passes_failed", 0,
+	}, summary)
+}
+
+// The window's tally separates the three outcomes, so an operator seeing no
+// settlements can tell whether this instance was doing the work and found nothing
+// or was standing down for another instance that holds the election — and whether
+// the passes were failing outright.
+func TestStrandedReaperHeartbeatTalliesEachPassOutcome(t *testing.T) {
+	var heartbeat strandedReaperHeartbeat
+
+	heartbeat.observe(strandedReaperPassRan, 3)
+	heartbeat.observe(strandedReaperPassNotElected, 0)
+	heartbeat.observe(strandedReaperPassFailed, 1)
+	for range strandedReaperHeartbeatPasses - 4 {
+		heartbeat.observe(strandedReaperPassRan, 0)
+	}
+
+	summary := heartbeat.observe(strandedReaperPassRan, 0)
+	require.NotNil(t, summary)
+	assert.Equal(t, []any{
+		"passes", strandedReaperHeartbeatPasses,
+		"operations_settled", 4,
+		"passes_not_elected", 1,
+		"passes_failed", 1,
+	}, summary)
+
+	// The next window starts clean, so a settlement is never counted twice and a
+	// quiet window is not read as the previous one's activity.
+	for range strandedReaperHeartbeatPasses - 1 {
+		assert.Nil(t, heartbeat.observe(strandedReaperPassRan, 0))
+	}
+	assert.Equal(t, []any{
+		"passes", strandedReaperHeartbeatPasses,
+		"operations_settled", 0,
+		"passes_not_elected", 0,
+		"passes_failed", 0,
+	}, heartbeat.observe(strandedReaperPassRan, 0))
+}
