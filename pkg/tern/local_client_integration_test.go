@@ -4200,7 +4200,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	// When the operator claims this apply, retryable tasks are queued for the
 	// next dispatch attempt. Completed tasks stay completed so successful table
 	// work is not repeated.
-	client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks)
+	require.NoError(t, client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks))
 
 	preparedTasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
 	require.NoError(t, err)

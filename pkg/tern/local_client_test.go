@@ -2250,7 +2250,7 @@ func TestPrepareStoppedTasksForResumeQueuesOnlyStoppedTasks(t *testing.T) {
 
 			controlReq, err := pendingControlRequest(t.Context(), client.storage, apply, storage.ControlOperationStart)
 			require.NoError(t, err)
-			client.prepareStoppedTasksForResume(t.Context(), apply, []*storage.Task{stoppedTask, completedTask}, controlReq != nil)
+			require.NoError(t, client.prepareStoppedTasksForResume(t.Context(), apply, []*storage.Task{stoppedTask, completedTask}, controlReq != nil))
 
 			assert.Equal(t, state.Task.Pending, stoppedTask.State)
 			assert.Nil(t, stoppedTask.CompletedAt)
@@ -2275,7 +2275,7 @@ func TestPrepareStoppedTasksForResumeIgnoresApplyWithoutStartRequest(t *testing.
 		logger: slog.Default(),
 	}
 
-	client.prepareStoppedTasksForResume(t.Context(), &storage.Apply{ID: 123, State: state.Apply.Running}, []*storage.Task{task}, false)
+	require.NoError(t, client.prepareStoppedTasksForResume(t.Context(), &storage.Apply{ID: 123, State: state.Apply.Running}, []*storage.Task{task}, false))
 
 	assert.Equal(t, state.Task.Stopped, task.State)
 	assert.Equal(t, &completedAt, task.CompletedAt)

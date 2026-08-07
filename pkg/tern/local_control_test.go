@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -813,6 +814,108 @@ func TestLocalClient_CancelFailedRetryableCancelsDeployRequest(t *testing.T) {
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
+// Cancel must preserve an apply's recorded final outcome. Completed, failed,
+// and reverted describe engine work that already happened on the target, so a
+// late cancel must not rewrite them — a fully-applied change recorded as
+// cancelled would mislead the merge gate and operators. Cancelled is
+// re-writable (repeated cancel is idempotent) and stopped is terminal but
+// still cancellable, so neither is preserved.
+func TestCancelPreservesApplyOutcome(t *testing.T) {
+	assert.True(t, cancelPreservesApplyOutcome(state.Apply.Completed))
+	assert.True(t, cancelPreservesApplyOutcome(state.Apply.Failed))
+	assert.True(t, cancelPreservesApplyOutcome(state.Apply.Reverted))
+	assert.False(t, cancelPreservesApplyOutcome(state.Apply.Cancelled))
+	assert.False(t, cancelPreservesApplyOutcome(state.Apply.Stopped))
+	assert.False(t, cancelPreservesApplyOutcome(state.Apply.Running))
+	assert.False(t, cancelPreservesApplyOutcome(state.Apply.FailedRetryable))
+}
+
+// A cancel that arrives after the apply already reached a final outcome must
+// not rewrite the stored apply record. The schema change already ran (or
+// failed) on the target, so flipping the record to cancelled would tell the
+// merge gate and operators that a deployed change never happened. The cancel
+// is acknowledged with nothing left to cancel, the engine is not touched, and
+// the apply keeps its recorded state and completion time.
+func TestLocalClient_CancelAfterFinalOutcomePreservesApplyState(t *testing.T) {
+	testCases := []struct {
+		name       string
+		applyState string
+		taskState  string
+	}{
+		{name: "completed apply stays completed", applyState: state.Apply.Completed, taskState: state.Task.Completed},
+		{name: "failed apply stays failed", applyState: state.Apply.Failed, taskState: state.Task.Failed},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			completedAt := time.Now().Add(-time.Hour)
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-vitess-cancel-final",
+				State:           tc.applyState,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				Environment:     "staging",
+				CompletedAt:     &completedAt,
+			}
+			task := &storage.Task{
+				ID:             7,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-vitess-cancel-final",
+				Database:       "testdb",
+				Namespace:      "testdb",
+				State:          tc.taskState,
+			}
+			eng := &controlCaptureEngine{}
+			client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+
+			resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+			require.NoError(t, err)
+			assert.True(t, resp.Accepted)
+			assert.Equal(t, int64(0), resp.CancelledCount)
+			assert.Equal(t, int64(1), resp.SkippedCount)
+			assert.Nil(t, eng.cancelReq, "cancel of a finished apply must not touch the engine")
+			assert.Equal(t, tc.applyState, apply.State, "cancel must not rewrite the recorded final outcome")
+			assert.Equal(t, tc.taskState, task.State)
+			require.NotNil(t, apply.CompletedAt)
+			assert.Equal(t, completedAt, *apply.CompletedAt, "cancel must not restamp the completion time")
+		})
+	}
+}
+
+// Stopped is terminal but explicitly cancellable: an operator can cancel a
+// stopped apply to abandon its checkpoint permanently. Cancel must still move
+// the stopped apply and its stopped tasks to cancelled.
+func TestLocalClient_CancelStoppedApplyMarksCancelled(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-cancel-stopped",
+		State:           state.Apply.Stopped,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-cancel-stopped",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Stopped,
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.CancelledCount)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	require.NotNil(t, apply.CompletedAt)
+}
+
 // A task in the revert window has already cut over: the new schema is live.
 // Stop must reject rather than record it as cancelled, so an operator chooses
 // explicitly between reverting (undo) and skip-revert (finalize). The engine is
@@ -1021,6 +1124,222 @@ func TestSuppressParentApplyWrites(t *testing.T) {
 		ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{})
 		assert.False(t, suppressParentApplyWrites(ctx))
 	})
+}
+
+// controlTestFailingTaskStore serves tasks like controlTestTaskStore but
+// refuses every task write, simulating storage unavailability at the moment a
+// task state transition must be persisted.
+type controlTestFailingTaskStore struct {
+	controlTestTaskStore
+	updateErr error
+}
+
+func (s *controlTestFailingTaskStore) Update(context.Context, *storage.Task) error {
+	return s.updateErr
+}
+
+// applyAcceptingEngine accepts any apply request, standing in for an engine
+// that has already started the schema change when a later storage write fails.
+type applyAcceptingEngine struct {
+	controlCaptureEngine
+}
+
+func (e *applyAcceptingEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func newFailingTaskWriteClient(apply *storage.Apply, tasks []*storage.Task, eng engine.Engine, updateErr error) *LocalClient {
+	client := &LocalClient{
+		config: LocalConfig{
+			Database:  "testdb",
+			Type:      apply.DatabaseType,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		},
+		storage: &controlTestStorage{
+			applies: &controlTestApplyStore{apply: apply},
+			tasks: &controlTestFailingTaskStore{
+				controlTestTaskStore: controlTestTaskStore{tasks: tasks},
+				updateErr:            updateErr,
+			},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: &testControlRequestStore{},
+		},
+		logger: slog.Default(),
+	}
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		client.planetscaleEngine = eng
+	} else {
+		client.spiritEngine = eng
+	}
+	return client
+}
+
+// Stop reports success to the operator only once storage reflects it. When the
+// stopped task state cannot be persisted, the stop must fail so the operator
+// retries, rather than report a stop that left task rows active in storage.
+func TestLocalClient_StopFailsClosedWhenTaskWriteFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-task-write",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &controlCaptureEngine{}, updateErr)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, updateErr)
+	assert.ErrorContains(t, err, "persist stopped task state during stop")
+	assert.Equal(t, state.Apply.Running, apply.State, "stored apply must stay running when the stop could not be persisted")
+	assert.Nil(t, apply.CompletedAt)
+}
+
+// Cancel reports success to the operator only once storage reflects it. When
+// the cancelled task state cannot be persisted, the cancel must fail so the
+// operator retries, rather than report a cancel that left task rows active in
+// storage.
+func TestLocalClient_CancelFailsClosedWhenTaskWriteFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-cancel-task-write",
+		State:           state.Apply.Stopped,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-cancel-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Stopped,
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &controlCaptureEngine{}, updateErr)
+
+	_, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, updateErr)
+	assert.ErrorContains(t, err, "persist cancelled task state during cancel")
+	assert.Equal(t, state.Apply.Stopped, apply.State, "stored apply must stay stopped when the cancel could not be persisted")
+}
+
+// A sequential drive must not keep polling engine work against task rows that
+// storage never accepted. When the engine accepts a task but the running-state
+// write fails, the current apply owner exits (taskAbort) so operator recovery
+// re-drives from the authoritative stored state instead of in-memory state a
+// crash would lose.
+func TestLocalClient_RunEngineTaskAbortsWhenTaskWriteFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-run-task-write",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-run-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		TableName:      "t1",
+		DDL:            "ALTER TABLE `t1` ADD COLUMN `c` INT",
+		State:          state.Task.Pending,
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &applyAcceptingEngine{}, updateErr)
+
+	action := client.runEngineTask(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskAbort, action, "the drive must exit for operator retry when the running task state cannot be persisted")
+}
+
+// A failed task-state write must leave the in-memory task reflecting the
+// stored state. Callers log and branch on task.State after a failed write
+// (conflict checks, finalization loops), so a struct claiming a transition
+// storage never accepted would mislead both the code and the operator reading
+// its logs.
+func TestLocalClient_TransitionTaskStateRestoresTaskOnWriteFailure(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-transition-task-write",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	updatedAt := time.Now().Add(-time.Minute)
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-transition-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+		UpdatedAt:      updatedAt,
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &controlCaptureEngine{}, updateErr)
+
+	err := client.transitionTaskState(t.Context(), task, 0, state.Task.Stopped, "")
+
+	require.ErrorIs(t, err, updateErr)
+	assert.Equal(t, state.Task.Running, task.State, "in-memory task state must match the stored state after a refused write")
+	assert.Equal(t, updatedAt, task.UpdatedAt, "in-memory update time must match the stored row after a refused write")
+}
+
+// Once the engine has accepted a grouped apply, its schema change is in
+// flight, so a failed running task-state write must not record a failed
+// outcome — the engine may still complete the change on the target. The
+// current apply owner exits and the apply stays non-terminal so recovery
+// re-drives it from stored state.
+func TestLocalClient_GroupedApplyExitsWithoutTerminalizingWhenTaskWriteFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-grouped-task-write",
+		State:           state.Apply.Pending,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-grouped-task-write",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		TableName:      "t1",
+		DDL:            "ALTER TABLE `t1` ADD COLUMN `c` INT",
+		State:          state.Task.Pending,
+	}
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-mysql-grouped-task-write",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespaces:     map[string]*storage.NamespacePlanData{"testdb": {}},
+	}
+	updateErr := errors.New("storage write refused")
+	client := newFailingTaskWriteClient(apply, []*storage.Task{task}, &applyAcceptingEngine{}, updateErr)
+	client.heartbeatInterval = time.Hour
+
+	client.executeGroupedApply(t.Context(), apply, []*storage.Task{task}, plan, nil, false)
+
+	assert.Equal(t, state.Apply.Running, apply.State, "apply must stay non-terminal so recovery re-drives the in-flight engine work")
+	assert.Nil(t, apply.CompletedAt, "an apply that could not persist task state has no final outcome to stamp")
 }
 
 // Consuming a pending stop control request binds the apply's identity to the

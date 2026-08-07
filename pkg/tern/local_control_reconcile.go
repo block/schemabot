@@ -210,8 +210,10 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 			task.ErrorMessage = progress.ErrorMessage
 		}
 		task.CompletedAt = &now
-		c.transitionTaskState(ctx, task, task.ApplyID, taskState,
-			fmt.Sprintf("Task %s adopted the engine's %s outcome (the engine reached it before the pending command was consumed)", task.TaskIdentifier, taskState))
+		if err := c.transitionTaskState(ctx, task, task.ApplyID, taskState,
+			fmt.Sprintf("Task %s adopted the engine's %s outcome (the engine reached it before the pending command was consumed)", task.TaskIdentifier, taskState)); err != nil {
+			return fmt.Errorf("persist %s state for task %s while adopting the engine's terminal outcome: %w", taskState, task.TaskIdentifier, err)
+		}
 		settledCount++
 	}
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {

@@ -346,8 +346,12 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			now := time.Now()
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier))
+			if err := c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
+				c.logger.Error("failed to persist completed task state during sequential resume; current apply owner will exit for operator retry",
+					append(task.LogAttrs(), "error", err)...)
+				return
+			}
 			continue
 		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
 			// Live schema drifted since resume began: the DDL this shard now
@@ -355,7 +359,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			// apply unreviewed DDL.
 			logger.Error("resume aborting task: live schema drifted from the reviewed plan",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-			c.markTaskFailed(ctx, task, err.Error())
+			if c.markTaskFailed(ctx, task, err.Error()) == taskAbort {
+				return
+			}
 			failedTask = task
 			break
 		}
@@ -491,8 +497,10 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
+			if err := c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier)); err != nil {
+				return nil, fmt.Errorf("persist re-plan completion during resume: %w", err)
+			}
 			completedCount++
 		} else {
 			// Fail closed if the re-plan would apply DDL this task was not
@@ -567,9 +575,9 @@ func verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
 // prepareRetryableTasksForResume queues only the task work that previously
 // stopped on a retryable engine failure. Completed tasks remain completed, and
 // pending tasks remain queued behind the retried work.
-func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return
+		return nil
 	}
 	apply.ErrorMessage = ""
 	for _, task := range tasks {
@@ -579,27 +587,33 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 		task.Attempt++
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier))
+		if err := c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
+			return fmt.Errorf("queue retryable task for resume: %w", err)
+		}
 	}
+	return nil
 }
 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a driver crash can still be
 // recovered by another operator driver.
-func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) error {
 	if !startRequested {
-		return
+		return nil
 	}
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+		if err := c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
+			return fmt.Errorf("queue stopped task for start: %w", err)
+		}
 	}
+	return nil
 }
 
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
@@ -657,8 +671,10 @@ func (c *LocalClient) markApplyRecovering(ctx context.Context, apply *storage.Ap
 				"task_state", task.State)
 			continue
 		}
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Recovering,
-			fmt.Sprintf("Task %s is recovering after restart", task.TaskIdentifier))
+		if err := c.transitionTaskState(ctx, task, apply.ID, state.Task.Recovering,
+			fmt.Sprintf("Task %s is recovering after restart", task.TaskIdentifier)); err != nil {
+			return fmt.Errorf("mark task recovering after restart: %w", err)
+		}
 	}
 	apply.State = state.Apply.Recovering
 	apply.CompletedAt = nil
@@ -875,7 +891,9 @@ func (c *LocalClient) persistReattachedResumeStates(ctx context.Context, apply *
 		if recovering {
 			taskState = state.Task.Recovering
 		}
-		c.transitionTaskState(ctx, task, 0, taskState, "")
+		if err := c.transitionTaskState(ctx, task, 0, taskState, ""); err != nil {
+			return fmt.Errorf("mark resumed task %s for apply %s: %w", taskState, apply.ApplyIdentifier, err)
+		}
 	}
 
 	switch {
@@ -1597,8 +1615,12 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		return nil
 	}
 
-	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
-	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
+		return fmt.Errorf("prepare retryable tasks for resume of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested); err != nil {
+		return fmt.Errorf("prepare stopped tasks for resume of apply %s: %w", apply.ApplyIdentifier, err)
+	}
 
 	if c.usesGroupedApply(apply, options) {
 		resumeCtx, cancelResume := context.WithCancel(ctx)

@@ -24,7 +24,12 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 			task.ErrorMessage = errMsg
 		}
 		task.CompletedAt = &now
-		c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
+		// Best-effort finalization: each task is failed independently so one
+		// write failure does not leave the remaining tasks unmarked.
+		if err := c.transitionTaskState(ctx, task, 0, state.Task.Failed, ""); err != nil {
+			c.logger.Error("failed to persist failed task state while failing apply; stored task row keeps its previous state until operator recovery reconciles it",
+				append(task.LogAttrs(), "error", err)...)
+		}
 	}
 
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
@@ -60,7 +65,12 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 			task.ErrorMessage = errMsg
 		}
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
+		// Best-effort pause: each task is marked independently so one write
+		// failure does not leave the remaining tasks unmarked.
+		if err := c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, ""); err != nil {
+			c.logger.Error("failed to persist retryable task state while pausing apply; stored task row keeps its previous state until operator recovery reconciles it",
+				append(task.LogAttrs(), "error", err)...)
+		}
 	}
 
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
