@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -63,6 +64,13 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 
 	if req.Database == "" || req.DatabaseType == "" || req.Owner == "" {
 		s.writeError(w, http.StatusBadRequest, "database, database_type, and owner are required")
+		return
+	}
+
+	// A named lock is an operator control on the database itself (holding
+	// applies off), in the same family as stop/cancel, so a database's
+	// operator grant covers it. Locks have no environment dimension.
+	if !s.authorizeDirectDatabaseWrite(w, r, "lock_acquire", req.Database) {
 		return
 	}
 
@@ -127,6 +135,18 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Force release bypasses the lock ownership check, so it is an
+	// administrative override rather than an operator control on the caller's
+	// own database: a database operator grant does not cover it. Normal
+	// release keeps the ownership check, so the operator grant applies.
+	if req.Force {
+		if !s.authorizeDirectForceLockRelease(w, r, req.Database) {
+			return
+		}
+	} else if !s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database) {
+		return
+	}
+
 	ctx := r.Context()
 
 	if req.Force {
@@ -163,7 +183,7 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, storage.ErrLockNotOwned) {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
-		s.writeError(w, http.StatusForbidden, "lock is not owned by you")
+		s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeLockNotOwned, "lock is not owned by you")
 		return
 	}
 	if err != nil {

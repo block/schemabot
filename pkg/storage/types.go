@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -9,6 +10,22 @@ import (
 
 	"github.com/block/schemabot/pkg/schema"
 )
+
+// MaxRecoveryAttempts is the operator retry budget for failed_retryable
+// applies: how many automatic redispatches an interrupted apply gets before it
+// is terminalized as failed. The original apply attempt is separate. Surfaced
+// in operator-facing progress (the PR comment's retry counter) and enforced by
+// the storage claim/expiry paths.
+const MaxRecoveryAttempts = 10
+
+// MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
+// times FindNext will hand out a given delivery (each claim increments
+// attempts) before the row stops being claimable. It bounds the blast radius
+// of a poison event whose processing hard-kills drivers before MarkFailed can
+// run — without it, such a row's expired lease would be reclaimed forever,
+// ahead of every newer delivery. Rows that exhaust the budget without reaching
+// a terminal state are left for reconciliation/monitoring to surface.
+const MaxWebhookEventAttempts = 5
 
 // Cutover policies control how a multi-deployment rollout sequences the copy
 // and cutover phases of its deployments. The value is resolved from the
@@ -59,9 +76,11 @@ const (
 	// deployment instead of stopping at the first failure.
 	OnFailureContinue = "continue"
 
-	// OnFailurePause holds the rollout after a failure until a human releases
-	// it. It is a known value but not yet supported; config validation rejects
-	// it until the release machinery lands.
+	// OnFailurePause holds the rollout after a failure until a human releases it
+	// (via the release control op) so the remaining deployments proceed; to
+	// abort instead, use the separate stop/cancel control op. Until released,
+	// later deployments do not start and the apply reports the non-terminal
+	// paused state; the merge gate stays fail-closed on the failed deployment.
 	OnFailurePause = "pause"
 )
 
@@ -245,9 +264,10 @@ type Setting struct {
 
 // DatabaseType constants.
 const (
-	DatabaseTypeVitess = "vitess"
-	DatabaseTypeMySQL  = "mysql"
-	DatabaseTypeStrata = "strata"
+	DatabaseTypeVitess   = "vitess"
+	DatabaseTypeMySQL    = "mysql"
+	DatabaseTypeStrata   = "strata"
+	DatabaseTypePostgres = "postgres"
 )
 
 // Engine constants.
@@ -255,6 +275,7 @@ const (
 	EngineSpirit      = "spirit"
 	EnginePlanetScale = "planetscale"
 	EngineStrata      = "strata"
+	EnginePostgres    = "postgres"
 )
 
 // ApplyOperationKind constants classify operation rows by scheduling role.
@@ -263,6 +284,16 @@ const (
 	ApplyOperationKindGroupFinalizer = "group_finalizer"
 )
 
+// ShardOperationKey builds the operation key for one shard's work on one table
+// ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped
+// work operations: the control plane's sharded fan-out stamps it on each
+// per-shard apply_operation, a shard-scoped dispatch stamps it on the data
+// plane's operation row, and the task loaders match shard-tagged task rows
+// against it to distinguish drive tasks from reflected per-shard progress rows.
+func ShardOperationKey(namespace, shard, table string) string {
+	return namespace + "/" + shard + "/" + table
+}
+
 // EngineForType returns the engine name for a database type.
 func EngineForType(dbType string) string {
 	switch dbType {
@@ -270,6 +301,8 @@ func EngineForType(dbType string) string {
 		return EnginePlanetScale
 	case DatabaseTypeStrata:
 		return EngineStrata
+	case DatabaseTypePostgres:
+		return EnginePostgres
 	default:
 		return EngineSpirit
 	}
@@ -294,6 +327,17 @@ type TableChange struct {
 
 	// UnsafeReason records the planner's reason for unsafe changes.
 	UnsafeReason string `json:"unsafe_reason,omitempty"`
+
+	// ExecutionMode records the planner's execution-mode verdict. Empty means
+	// the engine's default path; "blocked" means the engine deterministically
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+
+	// ModeReason records the engine's reason for any non-empty ExecutionMode
+	// verdict.
+	ModeReason string `json:"mode_reason,omitempty"`
 }
 
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
@@ -483,6 +527,12 @@ type Apply struct {
 	// LockID points to locks.id.
 	LockID int64
 
+	// ExpectedLockOwner and ExpectedPendingPlanID are optional creation-time
+	// guards. When set, the apply store verifies the captured lock intent in
+	// the same transaction that makes the apply durable. They are not persisted.
+	ExpectedLockOwner     string
+	ExpectedPendingPlanID string
+
 	// PlanID points to plans.id.
 	PlanID int64
 
@@ -583,6 +633,19 @@ func (a *Apply) Lease() ApplyLease {
 		Owner:   a.LeaseOwner,
 		Token:   a.LeaseToken,
 	}
+}
+
+// HasFreshLease reports whether a driver holds this apply's lease with a
+// heartbeat newer than ApplyLeaseStaleAfter. A fresh lease means a live driver
+// owns the apply and its work right now; a stale or absent lease means no
+// driver is heartbeating and the apply is eligible for stale-claim recovery.
+// This mirrors the claim queries' staleness bound: drivers refresh UpdatedAt on
+// every heartbeat, so the row's last write is the liveness signal.
+func (a *Apply) HasFreshLease(now time.Time) bool {
+	if a == nil || a.LeaseOwner == "" {
+		return false
+	}
+	return now.Sub(a.UpdatedAt) < ApplyLeaseStaleAfter
 }
 
 // IsRollback reports whether this apply reverts a previously applied schema
@@ -796,7 +859,59 @@ const (
 	// 'start': 'start' resumes stopped work and carries no claim-ordering
 	// clause, so it cannot release a paused rollout.
 	ControlOperationRelease ControlOperation = "release"
+	// ControlOperationVolume adjusts the speed/concurrency of a running schema
+	// change. Durable because only the instance driving the apply holds the
+	// engine state for the running schema change, and a volume RPC can land on
+	// any instance sharing the route's storage. The desired level travels in
+	// the request metadata (see VolumeControlRequestMetadata); the driver
+	// retunes the engine at its next progress tick.
+	ControlOperationVolume ControlOperation = "volume"
 )
+
+// MinVolume and MaxVolume bound the volume scale shared by every engine:
+// 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
+const (
+	MinVolume int32 = 1
+	MaxVolume int32 = 11
+)
+
+// VolumeControlRequestMetadata is the JSON payload stored on a volume control
+// request. The row carries the desired level so the driving instance can
+// retune the engine without a synchronous exchange with the requester.
+type VolumeControlRequestMetadata struct {
+	Volume int32 `json:"volume"`
+}
+
+// EncodeVolumeControlRequestMetadata serializes the desired volume level for
+// storage on a volume control request, rejecting out-of-range levels so an
+// invalid request is refused at write time rather than discovered by the
+// driver.
+func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
+	if volume < MinVolume || volume > MaxVolume {
+		return nil, fmt.Errorf("volume %d is out of range: must be between %d and %d", volume, MinVolume, MaxVolume)
+	}
+	data, err := json.Marshal(VolumeControlRequestMetadata{Volume: volume})
+	if err != nil {
+		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
+	}
+	return data, nil
+}
+
+// DecodeVolumeControlRequestMetadata parses the desired volume level from a
+// volume control request's metadata, validating the shared volume range.
+func DecodeVolumeControlRequestMetadata(metadata []byte) (int32, error) {
+	if len(metadata) == 0 {
+		return 0, fmt.Errorf("volume control request metadata is empty")
+	}
+	var payload VolumeControlRequestMetadata
+	if err := json.Unmarshal(metadata, &payload); err != nil {
+		return 0, fmt.Errorf("decode volume control request metadata: %w", err)
+	}
+	if payload.Volume < MinVolume || payload.Volume > MaxVolume {
+		return 0, fmt.Errorf("volume %d in control request metadata is out of range: must be between %d and %d", payload.Volume, MinVolume, MaxVolume)
+	}
+	return payload.Volume, nil
+}
 
 // ControlRequestStatus is the durable processing status for a control request.
 type ControlRequestStatus string
@@ -1005,7 +1120,6 @@ type Task struct {
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
-	ReadyToComplete   bool   // Row copy done, waiting for cutover
 	EngineMigrationID string // Engine-specific migration ID
 
 	// Timestamps
@@ -1037,6 +1151,31 @@ type ApplyComment struct {
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
 
+	// PostedVolume records the apply's volume level at the moment a progress
+	// comment was posted. The observer compares it against the apply's current
+	// level to detect an applied volume change and rotate in a fresh progress
+	// comment. Nil for comment states where the level is not meaningful and
+	// for rows that predate volume tracking — nil never triggers a rotation.
+	PostedVolume *int
+
+	// PostedPhase records the control-operation phase the apply was in when a
+	// progress comment was posted (e.g. reverting, skipping revert, the
+	// post-cutover revert window) — empty when the apply was in no such phase.
+	// An apply in a control phase whose tracked progress comment records a
+	// different phase predates that phase, so the observer rotates in a fresh
+	// comment to track it. Nil (a comment state where the phase is not
+	// meaningful, or a row predating phase tracking) is treated the same as
+	// empty: the comment still predates whatever phase the apply is in now.
+	PostedPhase *string
+
+	// PendingFreezeCommentID records the GitHub comment ID of a progress
+	// comment this row's comment superseded whose frozen rendering has not yet
+	// landed on GitHub. It is written in the same upsert that tracks the
+	// successor, so a failed freeze edit (or a pod dying before it) leaves a
+	// durable marker any later observer can reconcile; it is cleared once the
+	// freeze lands. Nil means no freeze is owed.
+	PendingFreezeCommentID *int64
+
 	// EditCount tracks how many times this comment was edited.
 	EditCount int
 
@@ -1056,6 +1195,55 @@ type ApplyComment struct {
 	UpdatedAt time.Time
 }
 
+// PlanComment tracks a plan comment posted on a PR so a newer plan comment for
+// the same database can minimize it on GitHub. Rows are written only when a
+// comment is actually posted — a plan whose comment was suppressed leaves no
+// row. The GitHub comment itself is never edited or deleted through this
+// record; minimizing collapses it in the PR timeline while keeping it
+// expandable as the record of what was shown.
+type PlanComment struct {
+	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
+	ID int64
+
+	// Repository is the "owner/name" repository the comment was posted on.
+	Repository string
+
+	// PullRequest is the PR number the comment was posted on.
+	PullRequest int
+
+	// DatabaseName and DatabaseType identify the database the plan comment
+	// describes. Together with Repository and PullRequest they form the slot a
+	// newer plan comment supersedes.
+	DatabaseName string
+	DatabaseType string
+
+	// EnvironmentScope names the environments the comment covers, sorted and
+	// comma-joined (e.g. "production,staging" for a multi-environment comment,
+	// "staging" for a single-environment one).
+	EnvironmentScope string
+
+	// HeadSHA is the PR head commit the plan was computed against.
+	HeadSHA string
+
+	// GitHubCommentID is the REST comment ID, kept for triage and reconciliation.
+	GitHubCommentID int64
+
+	// GitHubNodeID is the GraphQL node ID required by the minimizeComment
+	// mutation.
+	GitHubNodeID string
+
+	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
+	// means the comment is still expanded on the PR — including after a failed
+	// minimize, so the next supersede retries it.
+	MinimizedAt *time.Time
+
+	// CreatedAt is when the comment was posted.
+	CreatedAt time.Time
+
+	// UpdatedAt is when this record last changed.
+	UpdatedAt time.Time
+}
+
 // ApplyLogLevel constants for log entry severity.
 const (
 	LogLevelDebug = "debug"
@@ -1072,6 +1260,7 @@ const (
 	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
 	LogEventReleaseRequested    = "release_requested"
+	LogEventVolumeRequested     = "volume_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"
@@ -1137,4 +1326,73 @@ type EngineResumeState struct {
 	ApplyOperationID int64
 	MigrationContext string
 	Metadata         string
+}
+
+// Durable webhook event providers.
+const (
+	WebhookProviderGitHub = "github"
+)
+
+// Durable webhook event states.
+const (
+	WebhookEventPending         = "pending"
+	WebhookEventProcessing      = "processing"
+	WebhookEventCompleted       = "completed"
+	WebhookEventFailedRetryable = "failed_retryable"
+	WebhookEventFailed          = "failed"
+)
+
+// WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
+// earliest to terminal. Use it to enumerate states for metrics and stats so a
+// series is always present even when a state is momentarily empty.
+var WebhookEventStatesAll = []string{
+	WebhookEventPending,
+	WebhookEventProcessing,
+	WebhookEventFailedRetryable,
+	WebhookEventCompleted,
+	WebhookEventFailed,
+}
+
+// WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox
+// used for steady-state observability.
+type WebhookInboxStats struct {
+	// CountsByState is the number of rows in each state. Every canonical state
+	// is present, defaulting to 0, so a gauge series never disappears when a
+	// state momentarily empties.
+	CountsByState map[string]int64
+
+	// OldestClaimableAge is how long the oldest ready-to-claim-but-unclaimed row
+	// (pending, or retryable with an elapsed retry window) has been waiting. It
+	// is the inbox's backlog latency; zero when nothing is waiting.
+	OldestClaimableAge time.Duration
+
+	// StuckProcessing is the number of rows wedged in processing with an expired
+	// lease at the attempt cap — deliveries a driver can no longer reclaim.
+	StuckProcessing int64
+}
+
+// WebhookEvent is a durable inbox row for one SCM/webhook delivery.
+type WebhookEvent struct {
+	ID             int64
+	Provider       string
+	DeliveryID     string
+	Event          string
+	Action         string
+	Repository     string
+	PullRequest    int
+	HeadSHA        string
+	TenantID       string
+	Payload        []byte
+	State          string
+	Attempts       int
+	LeaseOwner     string
+	LeaseToken     string
+	LeaseExpiresAt *time.Time
+	RetryAfter     *time.Time
+	LastError      string
+	ReceivedAt     time.Time
+	StartedAt      *time.Time
+	CompletedAt    *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }

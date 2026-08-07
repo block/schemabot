@@ -47,16 +47,24 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 
 // completePendingRequestsForTerminalApply completes the pending control
 // requests that a terminal apply moots: a pending stop is settled (the apply
-// can no longer be stopped), and a pending revert or skip-revert can no longer
-// act because the revert window is gone. Sweeping all three keeps a request
-// issued moments before the apply settled — or one that lost to a contradictory
-// command — from lingering pending forever.
+// can no longer be stopped), a pending revert or skip-revert can no longer
+// act because the revert window is gone, and a pending volume adjustment has
+// no running copy left to retune. A pending cancel is mooted by every terminal
+// state except stopped — a stopped apply remains cancellable, so its pending
+// cancel stays deliverable for the next drive. Sweeping the mooted requests
+// keeps a request issued moments before the apply settled — or one that lost
+// to a contradictory command — from lingering pending forever.
 func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	for _, op := range []storage.ControlOperation{
+	ops := []storage.ControlOperation{
 		storage.ControlOperationStop,
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
-	} {
+		storage.ControlOperationVolume,
+	}
+	if !state.IsState(apply.State, state.Apply.Stopped) {
+		ops = append(ops, storage.ControlOperationCancel)
+	}
+	for _, op := range ops {
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}
@@ -68,10 +76,19 @@ func completePendingRequestsForTerminalApply(ctx context.Context, store storage.
 // operation terminally failed. A failed request is no longer pending, so the
 // operator-owned retry loop stops re-running the operation instead of spinning
 // on a permanent rejection.
-func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string) error {
+//
+// The stored message is rewritten for the operator before it is persisted, so a
+// rejection reads the same whether it arrived on the API's immediate attempt or
+// on this retry — the durable record must not spell the schema change
+// differently depending on which path reached the data plane. remoteIDs are the
+// remote identifiers the caller addressed; a remote caller passes the id it sent
+// the RPC to, and a local caller passes none because its identifiers are already
+// operator-facing.
+func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string, remoteIDs ...string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
 	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, operation); err != nil {
 		return err
 	}
@@ -190,8 +207,5 @@ func controlRequestCaller(req *storage.ApplyControlRequest) string {
 }
 
 func callerApplyLogSuffix(caller string) string {
-	if caller == "" {
-		caller = "unknown"
-	}
-	return fmt.Sprintf(" (caller: %s)", caller)
+	return fmt.Sprintf(" (caller: %s)", storage.ApplyLogCaller(caller))
 }

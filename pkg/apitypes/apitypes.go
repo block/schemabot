@@ -3,7 +3,58 @@
 // This package has zero dependencies — import it freely from any package.
 package apitypes
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+	"time"
+)
+
+type LogEntry struct {
+	ID        int64           `json:"id"`
+	ApplyID   string          `json:"apply_id"`
+	TaskID    *int64          `json:"task_id,omitempty"`
+	Level     string          `json:"level"`
+	EventType string          `json:"event_type"`
+	Source    string          `json:"source,omitempty"`
+	Message   string          `json:"message"`
+	OldState  string          `json:"old_state,omitempty"`
+	NewState  string          `json:"new_state,omitempty"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+type LogsResponse struct {
+	ApplyID string      `json:"apply_id,omitempty"`
+	Logs    []*LogEntry `json:"logs"`
+}
+
+type DeploymentLogsResponse struct {
+	ApplyID    string                 `json:"apply_id"`
+	Deployment string                 `json:"deployment"`
+	Sources    []*DeploymentLogSource `json:"sources"`
+	Errors     []*DeploymentLogError  `json:"errors"`
+}
+
+type DeploymentLogSource struct {
+	ExternalID string                    `json:"external_id"`
+	Operations []*LogOperationProvenance `json:"operations"`
+	Logs       []*LogEntry               `json:"logs"`
+}
+
+type LogOperationProvenance struct {
+	OperationKey  string `json:"operation_key,omitempty"`
+	Target        string `json:"target,omitempty"`
+	OperationKind string `json:"operation_kind,omitempty"`
+}
+
+type DeploymentLogError struct {
+	ExternalID string                    `json:"external_id,omitempty"`
+	Target     string                    `json:"target,omitempty"`
+	Operations []*LogOperationProvenance `json:"operations"`
+	Code       string                    `json:"code"`
+	Reason     string                    `json:"reason"`
+	Message    string                    `json:"message"`
+}
 
 // =============================================================================
 // Error Codes
@@ -23,6 +74,7 @@ const (
 	ErrCodeStateSyncFailed      = "state_sync_failed"      // Operation succeeded but local state sync failed
 	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
+	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -43,6 +95,184 @@ func IsRetryableErrorCode(code string) bool {
 type ErrorResponse struct {
 	Error     string `json:"error"`
 	ErrorCode string `json:"error_code"`
+}
+
+type WebhookRedriveRequest struct {
+	WindowStart string `json:"window_start"`
+	WindowEnd   string `json:"window_end"`
+	App         string `json:"app,omitempty"`
+	Repo        string `json:"repo,omitempty"`
+	PR          int    `json:"pr,omitempty"`
+	MaxPages    int    `json:"max_pages"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	// Cursor continues a previous request's listing for one App. Each request
+	// processes a bounded number of pages so it finishes well within any
+	// intermediary HTTP timeout; the caller loops until next_cursor is empty.
+	Cursor string `json:"cursor,omitempty"`
+	// DeliveryIDs redelivers exactly these deliveries for App, skipping the
+	// window listing entirely — for callers that already identified the
+	// failed deliveries (for example a checks backfill classification pass).
+	DeliveryIDs []int64 `json:"delivery_ids,omitempty"`
+}
+
+type WebhookRedriveResponse struct {
+	Results []WebhookRedriveResult `json:"results"`
+}
+
+type WebhookRedriveResult struct {
+	AppName            string `json:"app_name"`
+	DryRun             bool   `json:"dry_run"`
+	Fetched            int    `json:"fetched"`
+	Pages              int    `json:"pages"`
+	OldestFetched      string `json:"oldest_fetched,omitempty"`
+	ReachedWindowStart bool   `json:"reached_window_start"`
+	// HistoryExhausted is true when GitHub's retained delivery history ended
+	// before the window start was reached: older deliveries no longer exist.
+	HistoryExhausted bool `json:"history_exhausted,omitempty"`
+	// NextCursor continues the listing in a follow-up request (with app set);
+	// empty when the window is covered or history is exhausted.
+	NextCursor string                    `json:"next_cursor,omitempty"`
+	Selected   []WebhookRedriveSelection `json:"selected"`
+	// Skipped counts in-window eligible deliveries whose detail could not be
+	// resolved for repo/PR filtering; they are left out of Selected rather
+	// than aborting the crawl.
+	Skipped     int `json:"skipped,omitempty"`
+	Redelivered int `json:"redelivered"`
+	Failed      int `json:"failed"`
+}
+
+type WebhookRedriveSelection struct {
+	ID          int64  `json:"id"`
+	DeliveredAt string `json:"delivered_at"`
+	Event       string `json:"event"`
+	Action      string `json:"action"`
+	Status      string `json:"status"`
+	StatusCode  int    `json:"status_code"`
+	Repo        string `json:"repo,omitempty"`
+	PR          int    `json:"pr,omitempty"`
+}
+
+type ChecksScanRequest struct {
+	Repo        string `json:"repo"`
+	Environment string `json:"environment,omitempty"`
+	CheckName   string `json:"check_name,omitempty"`
+	// Page selects one bounded page of open PRs (1-based; 0 means the first
+	// page). Each request scans a single page so it finishes well within any
+	// intermediary HTTP timeout; the caller loops until next_page is 0.
+	Page int `json:"page,omitempty"`
+	// UpdatedSince, when set (RFC3339), scans only PRs updated at or after
+	// this instant. The open-PR listing is ordered newest-updated first, so
+	// the scan stops paging as soon as it crosses the cutoff — bounding an
+	// incident-window sweep by the window instead of the repo's PR count.
+	UpdatedSince string `json:"updated_since,omitempty"`
+}
+
+type ChecksScanResponse struct {
+	Repo       string   `json:"repo"`
+	CheckNames []string `json:"check_names"`
+	Scanned    int      `json:"scanned"`
+	NextPage   int      `json:"next_page,omitempty"`
+	// ChecksDisabled reports that this repository has Check Run publishing
+	// turned off (enable_checks: false), so the scan was skipped: every open
+	// PR would trivially be missing a check the server refuses to create.
+	// When set, no PRs were scanned and the other fields are zero.
+	ChecksDisabled bool `json:"checks_disabled,omitempty"`
+	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
+	// reports it for this page's listing — an upper bound while more pages
+	// remain, exact on the final page. Recomputed every page so the caller
+	// can render a progress denominator that stays honest across a long scan.
+	EstimatedOpenPRs int              `json:"estimated_open_prs,omitempty"`
+	Missing          []MissingCheckPR `json:"missing"`
+	// Stuck lists open PRs whose expected Check Run exists but has not
+	// completed. The server reports the raw status and start time; the caller
+	// decides how old is old enough to call stuck, because an uncompleted
+	// check is legitimate while an apply or plan is genuinely in flight.
+	Stuck []StuckCheckPR `json:"stuck,omitempty"`
+	// RateLimit reports the GitHub budget left on the installation that
+	// served this page, so the caller can pace itself instead of starving
+	// the live webhook path that shares the same budget. Nil when the rate
+	// state could not be read (advisory only; the scan itself succeeded).
+	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+}
+
+// GitHubRateLimit is a point-in-time snapshot of a GitHub installation's
+// core REST budget.
+type GitHubRateLimit struct {
+	Remaining int `json:"remaining"`
+	Limit     int `json:"limit"`
+	// ResetAt is RFC3339; when the budget replenishes.
+	ResetAt string `json:"reset_at"`
+}
+
+// ChecksReposResponse lists the repositories declared in the server's repos
+// config — the inventory a fleet-wide scan iterates.
+type ChecksReposResponse struct {
+	// Repos are the declared repositories with Check Run publishing enabled —
+	// the ones a checks scan or backfill can act on.
+	Repos []string `json:"repos"`
+	// Disabled are declared repositories with Check Run publishing turned off
+	// (enable_checks: false). A scan of these would report every open PR as
+	// missing a check that the server refuses to create; callers skip them
+	// and report the skip to the operator.
+	Disabled []string `json:"disabled,omitempty"`
+}
+
+// ChecksSynthesizeRequest asks the server to recreate missing Check Runs for
+// specific PRs by replaying the auto-plan flow, as if the check-creating
+// webhook delivery had arrived. Used for PRs with no delivery to redrive
+// (for example PRs opened before check enablement).
+type ChecksSynthesizeRequest struct {
+	Repo string `json:"repo"`
+	PRs  []int  `json:"prs"`
+}
+
+type ChecksSynthesizeResponse struct {
+	Repo    string                   `json:"repo"`
+	Results []ChecksSynthesizeResult `json:"results"`
+	// RateLimit mirrors ChecksScanResponse.RateLimit: the installation's
+	// remaining GitHub budget after this batch, for caller-side pacing.
+	RateLimit *GitHubRateLimit `json:"rate_limit,omitempty"`
+}
+
+type ChecksSynthesizeResult struct {
+	PR      int    `json:"pr"`
+	Outcome string `json:"outcome"`
+	Error   string `json:"error,omitempty"`
+}
+
+type MissingCheckPR struct {
+	Number       int      `json:"number"`
+	URL          string   `json:"url"`
+	Title        string   `json:"title"`
+	HeadSHA      string   `json:"head_sha"`
+	HeadRef      string   `json:"head_ref"`
+	MissingNames []string `json:"missing_check_names"`
+	// UntrustedConflictNames are missing check names for which a same-named
+	// Check Run already exists but was created by an untrusted app. Backfill
+	// still recreates the trusted check, but the operator likely also needs to
+	// remove/rename the conflicting check or adjust the trusted-app config.
+	UntrustedConflictNames []string `json:"untrusted_conflict_check_names,omitempty"`
+}
+
+// StuckCheckPR is an open PR carrying at least one expected SchemaBot Check
+// Run that exists but has not reached a conclusion.
+type StuckCheckPR struct {
+	Number  int                  `json:"number"`
+	URL     string               `json:"url"`
+	Title   string               `json:"title"`
+	HeadSHA string               `json:"head_sha"`
+	HeadRef string               `json:"head_ref"`
+	Checks  []IncompleteCheckRun `json:"checks"`
+}
+
+// IncompleteCheckRun describes one Check Run that exists on the PR head but
+// has not completed.
+type IncompleteCheckRun struct {
+	Name       string `json:"name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	// StartedAt is RFC3339; empty when GitHub did not report a start time.
+	StartedAt string `json:"started_at,omitempty"`
 }
 
 // =============================================================================
@@ -267,6 +497,94 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	return result
 }
 
+// HasBlockedChanges reports whether any planned change carries the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before it starts.
+func (r *PlanResponse) HasBlockedChanges() bool {
+	if r == nil {
+		return false
+	}
+	for _, t := range r.FlatTables() {
+		if t.EngineBlocked() {
+			return true
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.EngineBlocked() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// DirectChanges returns all table changes the planner routed to direct
+// execution, across namespace-level and per-shard changes.
+func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*TableChangeResponse
+	for _, t := range r.FlatTables() {
+		if t.DirectExecution() {
+			result = append(result, t)
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t.DirectExecution() {
+				result = append(result, t)
+			}
+		}
+	}
+	return result
+}
+
+// AllChangesDirect reports whether every planned change is a direct-execution
+// change (and at least one exists). Options that only affect engine-driven
+// statements — like a deferred cutover — have nothing to act on in such a
+// plan, so their commands are rejected rather than silently ignored.
+func (r *PlanResponse) AllChangesDirect() bool {
+	if r == nil {
+		return false
+	}
+	total := 0
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if sc.HasVSchemaChange() {
+			return false
+		}
+		total += len(sc.TableChanges)
+		for _, t := range sc.TableChanges {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	for _, sp := range r.Shards {
+		if sp == nil {
+			continue
+		}
+		total += len(sp.Changes)
+		for _, t := range sp.Changes {
+			if !t.DirectExecution() {
+				return false
+			}
+		}
+	}
+	return total > 0
+}
+
 // LintWarnings returns lint results with warning severity.
 func (r *PlanResponse) LintWarnings() []LintViolationResponse {
 	var result []LintViolationResponse
@@ -309,9 +627,28 @@ func (r *PlanResponse) LintErrors() []LintViolationResponse {
 func (r *PlanResponse) FlatTables() []*TableChangeResponse {
 	var tables []*TableChangeResponse
 	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
 		tables = append(tables, sc.TableChanges...)
 	}
 	return tables
+}
+
+// HasChanges reports whether the plan carries any work an apply would execute:
+// table DDL in any namespace, or a VSchema update. Gates that decide whether a
+// plan is actionable must use this rather than counting table changes alone —
+// a VSchema-only plan has zero table changes but still requires an apply.
+func (r *PlanResponse) HasChanges() bool {
+	for _, sc := range r.Changes {
+		if sc == nil {
+			continue
+		}
+		if len(sc.TableChanges) > 0 || sc.HasVSchemaChange() {
+			return true
+		}
+	}
+	return false
 }
 
 // SchemaChangeResponse groups changes for a single namespace.
@@ -329,10 +666,40 @@ type TableChangeResponse struct {
 	ChangeType   string `json:"change_type"`
 	IsUnsafe     bool   `json:"is_unsafe,omitempty"`
 	UnsafeReason string `json:"unsafe_reason,omitempty"`
+	// ExecutionMode is the planner's execution-mode verdict. Empty means the
+	// engine's default path; "blocked" means the engine deterministically
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+	// ModeReason is the engine's reason for any non-empty ExecutionMode
+	// verdict.
+	ModeReason string `json:"mode_reason,omitempty"`
 }
+
+// Execution-mode verdicts a planner records on a table change. These mirror
+// the engine-side constants (pkg/engine); apitypes keeps its own copies so
+// this package stays dependency-free.
+const (
+	executionModeBlocked = "blocked"
+	executionModeDirect  = "direct"
+)
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
 func (t *TableChangeResponse) GetTableName() string { return t.TableName }
+
+// EngineBlocked reports whether the planner's execution-mode verdict says the
+// engine deterministically refuses this change: an apply will fail on it.
+func (t *TableChangeResponse) EngineBlocked() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeBlocked)
+}
+
+// DirectExecution reports whether the planner's execution-mode verdict routes
+// this change to direct execution: it runs as native MySQL DDL — synchronous,
+// blocking writes to the table while it runs, and not revertible.
+func (t *TableChangeResponse) DirectExecution() bool {
+	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
+}
 
 // UnsafeChange returns the unsafe-change view for table changes that require
 // explicit operator opt-in. Engines should mark unsafe table changes directly;
@@ -560,10 +927,20 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int                    `json:"active_count"`
-	Limit        int                    `json:"limit,omitempty"`
-	MaxLimit     int                    `json:"max_limit,omitempty"`
-	HasMore      bool                   `json:"has_more,omitempty"`
-	FailuresOnly bool                   `json:"failures_only,omitempty"`
-	Applies      []*ActiveApplyResponse `json:"applies"`
+	ActiveCount  int  `json:"active_count"`
+	Limit        int  `json:"limit,omitempty"`
+	MaxLimit     int  `json:"max_limit,omitempty"`
+	HasMore      bool `json:"has_more,omitempty"`
+	FailuresOnly bool `json:"failures_only,omitempty"`
+	// Last echoes the window bounding the list to applies updated within it;
+	// empty means the list is bounded by limit alone.
+	Last string `json:"last,omitempty"`
+	// State echoes the canonical form of the state filter restricting the
+	// list; empty means no state filter.
+	State string `json:"state,omitempty"`
+	// StateCounts tallies every apply matching the request's filters by state,
+	// unbounded by limit — the applies list may be a truncated page, but these
+	// counts never are.
+	StateCounts map[string]int         `json:"state_counts,omitempty"`
+	Applies     []*ActiveApplyResponse `json:"applies"`
 }

@@ -25,6 +25,7 @@ func TestCommandSpecs_CoverEveryDispatcherAction(t *testing.T) {
 		action.Revert,
 		action.SkipRevert,
 		action.Cutover,
+		action.Volume,
 		action.Rollback,
 		action.RollbackConfirm,
 	}
@@ -49,6 +50,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		supportsDefer       bool
 		supportsAllowUnsafe bool
 		supportsForce       bool
+		supportsVolumeLevel bool
 	}{
 		{name: action.Help},
 		{name: action.Plan, requiresEnv: true, supportsDB: true},
@@ -66,6 +68,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.Revert, requiresEnv: true, hasApplyID: true},
 		{name: action.SkipRevert, requiresEnv: true, hasApplyID: true},
 		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
+		{name: action.Volume, requiresEnv: true, hasApplyID: true, supportsVolumeLevel: true},
 		{name: action.Rollback, requiresEnv: true, hasApplyID: true},
 		{name: action.RollbackConfirm, requiresEnv: true, supportsDefer: true},
 	}
@@ -81,6 +84,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			assert.Equal(t, tc.supportsDefer, spec.SupportsDeferCutover, "SupportsDeferCutover")
 			assert.Equal(t, tc.supportsAllowUnsafe, spec.SupportsAllowUnsafe, "SupportsAllowUnsafe")
 			assert.Equal(t, tc.supportsForce, spec.SupportsForce, "SupportsForce")
+			assert.Equal(t, tc.supportsVolumeLevel, spec.SupportsVolumeLevel, "SupportsVolumeLevel")
 		})
 	}
 }
@@ -242,6 +246,154 @@ func TestParseTenantFlag(t *testing.T) {
 	}
 }
 
+// TestParseVolumeCommand verifies the volume command parses its apply id,
+// environment, and numeric -v/--volume level, and that a present-but-unusable
+// level is flagged via VolumeLevelError so the dispatcher can post usage help
+// instead of silently dropping the command. Range validation is deliberately
+// left to the dispatcher, so out-of-range numbers parse cleanly here.
+func TestParseVolumeCommand(t *testing.T) {
+	parser := NewCommandParser()
+
+	tests := []struct {
+		name     string
+		body     string
+		expected CommandResult
+	}{
+		{
+			name: "volume with level",
+			body: "schemabot volume apply_abc123 -e staging -v 8",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				VolumeLevel: 8,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "volume with long flag",
+			body: "schemabot volume apply_abc123 -e production --volume 11",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "production",
+				VolumeLevel: 11,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "volume missing -v flag",
+			body: "schemabot volume apply_abc123 -e staging",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "volume with -v but no value",
+			body: "schemabot volume apply_abc123 -e staging -v",
+			expected: CommandResult{
+				Action:           action.Volume,
+				ApplyID:          "apply_abc123",
+				Environment:      "staging",
+				VolumeLevelError: true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "volume with non-numeric level",
+			body: "schemabot volume apply_abc123 -e staging -v fast",
+			expected: CommandResult{
+				Action:           action.Volume,
+				ApplyID:          "apply_abc123",
+				Environment:      "staging",
+				VolumeLevelError: true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "volume with out-of-range level parses for dispatcher validation",
+			body: "schemabot volume apply_abc123 -e staging -v 15",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				VolumeLevel: 15,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "volume missing environment",
+			body: "schemabot volume apply_abc123 -v 8",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				VolumeLevel: 8,
+				MissingEnv:  true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "volume missing apply id",
+			body: "schemabot volume -e staging -v 8",
+			expected: CommandResult{
+				Action:      action.Volume,
+				Environment: "staging",
+				VolumeLevel: 8,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "flag prefix of a longer flag is not a volume flag",
+			body: "schemabot volume apply_abc123 -e staging --volume-level 5",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "word starting with -v is not a volume flag",
+			body: "schemabot volume apply_abc123 -e staging -verbose",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "level attached to the flag without a space is not parsed",
+			body: "schemabot volume apply_abc123 -e staging -v8",
+			expected: CommandResult{
+				Action:      action.Volume,
+				ApplyID:     "apply_abc123",
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, parser.ParseCommand(tc.body))
+		})
+	}
+}
+
 func TestCommandSupportsDatabaseFlag(t *testing.T) {
 	assert.True(t, commandSupportsDatabaseFlag(action.Plan))
 	assert.True(t, commandSupportsDatabaseFlag(action.Apply))
@@ -306,6 +458,47 @@ func TestParseCommand(t *testing.T) {
 				Tenant:     "alpha",
 				MissingEnv: true,
 				IsMention:  true,
+			},
+		},
+		{
+			name: "flag glued onto the environment value is invalid, not reinterpreted",
+			body: "schemabot apply -e production--allow-unsafe",
+			expected: CommandResult{
+				Action:           "apply",
+				EnvironmentError: true,
+				AllowUnsafe:      true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "environment value with a trailing dash is invalid",
+			body: "schemabot apply -e staging-",
+			expected: CommandResult{
+				Action:           "apply",
+				EnvironmentError: true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "plan with an invalid environment value is not a multi-env plan",
+			body: "schemabot plan -e production--allow-unsafe",
+			expected: CommandResult{
+				Action:           "plan",
+				EnvironmentError: true,
+				Found:            true,
+				IsMention:        true,
+			},
+		},
+		{
+			name: "environment value with single dashes is valid",
+			body: "schemabot apply -e prod-us-east",
+			expected: CommandResult{
+				Action:      "apply",
+				Environment: "prod-us-east",
+				Found:       true,
+				IsMention:   true,
 			},
 		},
 		{

@@ -63,7 +63,8 @@ func TestUpdateCheckRecordForApplyStartRefusesDriftBlock(t *testing.T) {
 		Type:     "mysql",
 	}
 
-	err := h.updateCheckRecordForApplyStart(t.Context(), nil, "octocat/hello-world", 1, schema, "production", 42)
+	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-drift42"}
+	err := h.updateCheckRecordForApplyStart(t.Context(), nil, "octocat/hello-world", 1, schema, "production", apply)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "review-time deployment drift block present")

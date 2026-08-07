@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -70,8 +71,23 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
+		// Both resolvers below decide based on the task's parent apply — its
+		// state and its lease ownership. Any uncertainty (a storage failure or a
+		// missing apply row) means the task cannot be proven resolvable, so it
+		// keeps blocking (fail closed).
+		apply, ok := c.applyForConflictCheck(ctx, t)
+		if !ok {
+			return t.TaskIdentifier
+		}
+
+		// A pending task of a terminal apply can never start; cancel it so it
+		// stops blocking the database as phantom active work.
+		if c.tryResolveOrphanedPendingTask(ctx, t, apply) {
+			continue
+		}
+
 		// Storage says non-terminal — verify with engine before blocking.
-		if c.tryResolveStaleTask(ctx, t, plan.Database) {
+		if c.tryResolveStaleTask(ctx, t, apply, plan.Database) {
 			continue // Task was stale; engine confirmed it's done.
 		}
 
@@ -81,18 +97,102 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 	return ""
 }
 
+// applyForConflictCheck loads the parent apply the conflict-check resolvers
+// decide on. Returns ok=false when the apply cannot be loaded or the row is
+// missing — the caller must keep the task blocking, because without the apply
+// neither the task's orphan status nor its lease ownership can be proven.
+func (c *LocalClient) applyForConflictCheck(ctx context.Context, t *storage.Task) (*storage.Apply, bool) {
+	apply, err := c.storage.Applies().Get(ctx, t.ApplyID)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to load the task's apply; the task keeps blocking the database",
+			append(t.LogAttrs(), "error", err)...)
+		return nil, false
+	}
+	if apply == nil {
+		c.logger.Warn("conflict check: task's apply row is missing; the task keeps blocking the database",
+			t.LogAttrs()...)
+		return nil, false
+	}
+	return apply, true
+}
+
+// tryResolveOrphanedPendingTask cancels a pending task whose parent apply has
+// already reached a terminal state. Such a task can never start: a terminal
+// apply is not claimable, so no drive will ever pick the task up, and pending
+// means no engine work or checkpoint exists to preserve. Left alone the task
+// would block every later apply targeting its database as phantom active work.
+// A non-pending state leaves the task untouched so it stays with the
+// engine-backed checks.
+// Returns true if the task was cancelled and no longer blocks.
+func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *storage.Task, apply *storage.Apply) bool {
+	if !state.IsState(t.State, state.Task.Pending) {
+		// Only a pending task is provably unstarted; every other state may own
+		// engine work or a checkpoint and stays with the engine-backed checks.
+		return false
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("conflict check: pending task's apply is still active; the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return false
+	}
+	c.logger.Info("conflict check: cancelling orphaned pending task; its apply is terminal so the task can never start",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+	previousState := t.State
+	now := time.Now()
+	t.State = state.Task.Cancelled
+	t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task started"
+	t.CompletedAt = &now
+	t.UpdatedAt = now
+	// The task only stops blocking once the cancellation is durably written:
+	// reporting it resolved on a failed write would admit the new apply while
+	// storage still records the orphan as active work.
+	if err := c.storage.Tasks().Update(ctx, t); err != nil {
+		t.State = previousState
+		t.ErrorMessage = ""
+		t.CompletedAt = nil
+		c.logger.Error("conflict check: failed to persist orphaned task cancellation; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		return false
+	}
+	taskID := t.ID
+	c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
+		previousState, state.Task.Cancelled)
+	return true
+}
+
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
 // If the engine reports a terminal state, or reports no active work for a task that
 // storage believes is in-flight, the task is updated in storage and no longer blocks.
 // Resting tasks (Stopped, FailedRetryable) are left untouched.
+//
+// The engine probe is in-memory and database-scoped: it reports this process's
+// last run on the database, not the task's actual cross-process state. The
+// task's parent apply lease decides whether that memory is authoritative — a
+// fresh lease means a live driver owns the work and the task keeps blocking,
+// and a terminal report is only trusted when the last lease belongs to this
+// process (the completing process's own report).
 // Returns true if the task was resolved (no longer blocking).
-func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, database string) bool {
+func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, apply *storage.Apply, database string) bool {
 	eng := c.getEngine()
 	if eng == nil {
 		c.logger.Error("tryResolveStaleTask: engine is nil", t.LogAttrs()...)
 		return false
 	}
 
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: task's apply is actively driven; the task keeps blocking until its lease owner settles it",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_lease")
+		return false
+	}
+
+	// The raw target credentials (no namespace mapping) are safe here only
+	// because Spirit's Progress is purely in-memory and never queries by
+	// request database or connection schema. An engine whose Progress inspects
+	// the database must resolve credentials per task (credentialsForTask)
+	// before this probe, or under schema overrides it would address the
+	// canonical name instead of the physical schema.
 	result, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    database,
 		Credentials: c.credentials(),
@@ -102,13 +202,25 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		c.logger.Warn("conflict check: engine progress failed", append(t.LogAttrs(), "err", err)...)
 		return false
 	}
-	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "message", result.Message)
+	c.logger.Debug("conflict check: engine progress", "task_id", t.TaskIdentifier, "engine_state", result.State, "engine_message", result.Message)
 
 	// Engine says terminal — update storage and unblock.
 	// IMPORTANT: Only trust terminal states, NOT "No active schema change".
 	// "No active schema change" just means Spirit has no runningSchemaChange,
 	// which could mean completed, never started, or crashed.
 	if result.State.IsTerminal() {
+		// A terminal report for work last leased to another process is this
+		// process's memory of an older run on the same database, not the
+		// completing driver's own report — stamping it would mark someone
+		// else's task done with state that says nothing about it. Leave the
+		// task blocking until driver stale-claim recovery settles it.
+		if apply.LeaseOwner != "" && !storage.LeaseOwnedByThisProcess(apply.LeaseOwner) {
+			c.logger.Warn("conflict check: engine reports terminal state, but the apply's last lease belongs to another process; the task keeps blocking until driver recovery settles it",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner,
+					"engine_state", result.State, "engine_message", result.Message)...)
+			metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "foreign_terminal_report")
+			return false
+		}
 		c.logger.Info("conflict check: engine reports terminal state",
 			"task_id", t.TaskIdentifier, "engine_state", result.State,
 			"engine_message", result.Message, "storage_state", t.State)
@@ -157,29 +269,32 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 		CreatedAt: time.Now(),
 	}
 	if err := c.storage.ApplyLogs().Append(ctx, log); err != nil {
-		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "message", message)
+		c.logger.Warn("failed to log apply event", "error", err, "event", eventType, "event_message", message)
 	}
 }
 
 // setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
-// Builds a table-name-to-task lookup so each log line is attributed to the correct task.
 // Returns a cleanup function that must be deferred.
 func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func() {
 	spiritEng, ok := c.spiritEngine.(*spirit.Engine)
 	if !ok {
 		return func() {}
 	}
+	spiritEng.SetLogCallback(c.spiritApplyLogFunc(ctx, apply, tasks))
+	return func() { spiritEng.SetLogCallback(nil) }
+}
 
+// spiritApplyLogFunc builds the callback that records one Spirit log line in
+// the apply log stream. It attributes each line to its task by table name and
+// embeds the table in the stored message so operators can tell interleaved
+// lines apart during multi-table applies.
+func (c *LocalClient) spiritApplyLogFunc(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func(level slog.Level, tableName, msg string) {
 	taskByTable := make(map[string]*storage.Task)
-	var firstTask *storage.Task
 	for _, task := range tasks {
 		taskByTable[task.TableName] = task
-		if firstTask == nil {
-			firstTask = task
-		}
 	}
 
-	spiritEng.SetLogCallback(func(level slog.Level, tableName, msg string) {
+	return func(level slog.Level, tableName, msg string) {
 		logLevel := storage.LogLevelInfo
 		if level >= slog.LevelWarn {
 			logLevel = storage.LogLevelWarn
@@ -187,18 +302,22 @@ func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.App
 		if level >= slog.LevelError {
 			logLevel = storage.LogLevelError
 		}
-		task := taskByTable[tableName]
-		if task == nil {
-			task = firstTask
+		// Embed the table in the stored message so it survives every log
+		// surface — CLI output, deployment log fetches, and PR comment log
+		// folds render the message text only.
+		if tableName != "" {
+			msg = fmt.Sprintf("[%s] %s", tableName, msg)
 		}
+		// Run-level lines (or lines spanning several tables) carry no single
+		// task's table name; attribute those to the apply, not to an
+		// arbitrary task.
 		var taskID *int64
-		if task != nil {
+		if task := taskByTable[tableName]; task != nil {
 			id := task.ID
 			taskID = &id
 		}
 		c.logApplyEvent(ctx, apply.ID, taskID, logLevel, storage.LogEventInfo, storage.LogSourceSpirit, msg, "", "")
-	})
-	return func() { spiritEng.SetLogCallback(nil) }
+	}
 }
 
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
@@ -207,6 +326,14 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
+	// An ETA is only meaningful while an engine is actively driving the task
+	// and refreshing the estimate. Clear it when the task comes to rest
+	// (terminal, stopped, retryable, pending) so the stored row never carries
+	// a frozen estimate; a resumed or retried task gets a fresh figure from
+	// the first engine poll.
+	if !state.IsInFlightTaskState(newState) {
+		task.ETASeconds = 0
+	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
 		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
 	}
@@ -411,6 +538,8 @@ func deriveApplyPhase(event engine.ApplyEvent) string {
 // Skips the write if the state hasn't changed. On DB write failure, rolls back
 // the in-memory state so the next event with the same NewState retries.
 // Returns the new state if a transition occurred, or empty string if skipped.
+// The logger is expected to carry the apply's identity attributes already
+// bound, so the failure line appends only the mutable snapshot.
 func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, updateFn func(*storage.Apply) error, logger *slog.Logger) string {
 	oldState := apply.State
 	newState := deriveApplyPhase(event)
@@ -420,7 +549,7 @@ func applyEventStateTransition(apply *storage.Apply, event engine.ApplyEvent, up
 	apply.State = newState
 	apply.UpdatedAt = time.Now()
 	if err := updateFn(apply); err != nil {
-		logger.Error("failed to update apply phase", append(apply.LogAttrs(), "error", err)...)
+		logger.Error("failed to update apply phase", append(apply.MutableLogAttrs(), "error", err)...)
 		apply.State = oldState
 		return ""
 	}

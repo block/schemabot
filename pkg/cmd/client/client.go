@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -55,18 +56,59 @@ func GetEnvironments(endpoint, database string) ([]string, error) {
 // ListDatabasesOptions controls database list request fields.
 type ListDatabasesOptions struct {
 	Type string
+	// Name keeps only databases whose name contains it, case-insensitively.
+	Name string
 }
 
 // ListDatabases fetches the configured databases known to the server.
 func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.DatabaseListResponse, error) {
 	requestPath := "/api/databases"
+	values := url.Values{}
 	if opts.Type != "" {
-		values := url.Values{}
 		values.Set("type", opts.Type)
-		requestPath += "?" + values.Encode()
+	}
+	if opts.Name != "" {
+		values.Set("name", opts.Name)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
 	}
 	var result apitypes.DatabaseListResponse
 	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func RedriveWebhooks(ctx context.Context, endpoint string, req apitypes.WebhookRedriveRequest) (*apitypes.WebhookRedriveResponse, error) {
+	var result apitypes.WebhookRedriveResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/webhooks/redrive", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func ChecksScan(ctx context.Context, endpoint string, req apitypes.ChecksScanRequest) (*apitypes.ChecksScanResponse, error) {
+	var result apitypes.ChecksScanResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/scan", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func ChecksSynthesize(ctx context.Context, endpoint string, req apitypes.ChecksSynthesizeRequest) (*apitypes.ChecksSynthesizeResponse, error) {
+	var result apitypes.ChecksSynthesizeResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/synthesize", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// ChecksRepos lists the repositories declared in the server's repos config —
+// the inventory a fleet-wide checks scan iterates.
+func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposResponse, error) {
+	var result apitypes.ChecksReposResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/checks/repos", struct{}{}, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -218,6 +260,11 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 	query := url.Values{}
 	query.Set("environment", environment)
 	query.Set("limit", "1000")
+	// Ask only for applies still holding a target. This runs on every apply and
+	// rollback preflight, and the answer never depends on settled history, so
+	// scanning it would make every schema change pay for the environment's whole
+	// past to learn whether one database is busy.
+	query.Set("active", "true")
 	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
 		return nil, err
 	}
@@ -226,6 +273,8 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		if apply.Database != database || apply.Environment != environment {
 			continue
 		}
+		// The server already excluded terminal states; re-checking here keeps the
+		// answer correct if this ever reads a response that was not filtered.
 		if state.IsTerminalApplyState(apply.State) {
 			continue
 		}
@@ -380,8 +429,8 @@ type LockInfo struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// GenerateCLIOwner generates an owner identifier for CLI-based locks.
-// Format: "cli:username@hostname"
+// GenerateCLIOwner generates an owner identifier for CLI-based locks and the
+// caller attribution on CLI-driven requests: "cli:<user>@<host>".
 func GenerateCLIOwner() string {
 	username := "unknown"
 	if u, err := user.Current(); err == nil {
@@ -393,7 +442,7 @@ func GenerateCLIOwner() string {
 		hostname = h
 	}
 
-	return fmt.Sprintf("cli:%s@%s", username, hostname)
+	return caller.FormatCLI(username, hostname)
 }
 
 // AcquireLock attempts to acquire a lock on a database.
@@ -468,7 +517,10 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.Status == http.StatusForbidden {
+			// A 403 can also be an authorization denial naming the groups
+			// that would grant access, so only the ownership error code maps
+			// to ErrLockNotOwned; other denials surface the server's message.
+			if apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned {
 				return ErrLockNotOwned
 			}
 			if apiErr.Status == http.StatusNotFound {
@@ -531,7 +583,16 @@ type StatusOptions struct {
 	Limit       int
 	Environment string
 	Deployment  string
-	Failed      bool
+	// State restricts the list to one apply state; empty means all states.
+	State  string
+	Failed bool
+	// Last bounds the list to applies whose latest activity — on the apply or any
+	// of its operations — falls within this window; zero means unbounded.
+	Last time.Duration
+	// Active restricts the list to applies that have not reached a terminal
+	// state, so a caller asking whether a target is busy does not page through
+	// settled history.
+	Active bool
 }
 
 // GetStatus fetches recent schema changes.
@@ -549,8 +610,17 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		if opts[0].Deployment != "" {
 			values.Set("deployment", opts[0].Deployment)
 		}
+		if opts[0].State != "" {
+			values.Set("state", opts[0].State)
+		}
 		if opts[0].Failed {
 			values.Set("failed", "true")
+		}
+		if opts[0].Last > 0 {
+			values.Set("last", opts[0].Last.String())
+		}
+		if opts[0].Active {
+			values.Set("active", "true")
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded
@@ -562,18 +632,7 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 	return &result, nil
 }
 
-// LogEntry represents a single log entry from the apply logs.
-type LogEntry struct {
-	ID        int64     `json:"id"`
-	ApplyID   string    `json:"apply_id"`
-	TaskID    *int64    `json:"task_id,omitempty"`
-	Level     string    `json:"level"`
-	EventType string    `json:"event_type"`
-	Message   string    `json:"message"`
-	OldState  string    `json:"old_state,omitempty"`
-	NewState  string    `json:"new_state,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-}
+type LogEntry = apitypes.LogEntry
 
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
@@ -583,19 +642,23 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
 
-	var path string
-	if database == "" && applyID != "" {
-		path = fmt.Sprintf("/api/logs?apply_id=%s", applyID)
-	} else {
-		path = fmt.Sprintf("/api/logs/%s?", database)
-		if applyID != "" {
-			path += fmt.Sprintf("apply_id=%s", applyID)
-		} else if environment != "" {
-			path += fmt.Sprintf("environment=%s", environment)
-		}
+	values := url.Values{}
+	if applyID != "" {
+		values.Set("apply_id", applyID)
+	} else if environment != "" {
+		values.Set("environment", environment)
 	}
 	if limit > 0 {
-		path += fmt.Sprintf("&limit=%d", limit)
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var path string
+	if database == "" && applyID != "" {
+		path = "/api/logs"
+	} else {
+		path = "/api/logs/" + url.PathEscape(database)
+	}
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
 	}
 
 	var result struct {
@@ -605,6 +668,20 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		return nil, err
 	}
 	return result.Logs, nil
+}
+
+func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {
+	values := url.Values{}
+	values.Set("apply_id", applyID)
+	values.Set("deployment", deployment)
+	if limit > 0 {
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	var result apitypes.DeploymentLogsResponse
+	if err := doGetInto(endpoint, "/api/logs?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // Setting represents a key-value setting.

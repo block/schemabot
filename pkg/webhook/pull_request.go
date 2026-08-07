@@ -3,14 +3,18 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"sync"
 	"time"
 
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // pullRequestPayload represents the relevant fields from a GitHub pull_request webhook.
@@ -18,7 +22,8 @@ type pullRequestPayload struct {
 	Action      string `json:"action"`
 	Before      string `json:"before"`
 	PullRequest struct {
-		Number int `json:"number"`
+		Number int  `json:"number"`
+		Merged bool `json:"merged"`
 		Head   struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
@@ -35,9 +40,22 @@ type pullRequestPayload struct {
 	} `json:"installation"`
 }
 
+// isAutoPlannablePullRequestAction reports whether a pull_request action
+// triggers auto-plan. The HTTP enqueue path and the durable dispatcher must
+// share this predicate: the dispatcher re-validates fail-closed, so an action
+// added to only one side would either never enqueue or — worse — enqueue rows
+// the dispatcher silently completes without planning.
+func isAutoPlannablePullRequestAction(action string) bool {
+	switch action {
+	case "opened", "synchronize", "reopened":
+		return true
+	}
+	return false
+}
+
 // handlePullRequest processes GitHub pull_request webhook events.
 // On PR open/synchronize/reopen, it auto-plans all databases with schema changes.
-func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte) {
+func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload pullRequestPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
@@ -49,12 +67,44 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
 
 	// Route PR actions
-	switch payload.Action {
-	case "opened", "synchronize", "reopened":
+	switch {
+	case isAutoPlannablePullRequestAction(payload.Action):
 		// proceed to auto-plan below
-	case "closed":
+	case payload.Action == "closed":
+		if h.durableWebhookDispatch {
+			// Enqueue and ACK fast; a leased driver runs cleanup with retries so
+			// a process restart mid-cleanup cannot drop the delivery and leave a
+			// lock held or stale check state behind.
+			inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+			if err != nil {
+				h.logger.Error("failed to enqueue durable PR close cleanup",
+					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number,
+					"delivery_id", deliveryID, "error", err)
+				metrics.RecordWebhookEvent(ctx, metricApp, "pull_request", payload.Action, payload.Repository.FullName, "durable_enqueue_failed")
+				h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+				return
+			}
+			if !inserted {
+				h.logger.Info("durable PR close cleanup already queued",
+					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "delivery_id", deliveryID)
+				h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup already queued"})
+				return
+			}
+			h.logger.Info("durable PR close cleanup queued",
+				"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup queued"})
+			return
+		}
 		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
-			h.handlePRClosed(payload.Repository.FullName, payload.PullRequest.Number, installationID)
+			// One-shot: a failure here (including a lock lookup/release error,
+			// which also skips the check-state delete) is logged and not
+			// retried. That direction is fail-closed — retained locks and
+			// check state block until an operator or a reopen reconciles;
+			// nothing is wrongly unblocked. The durable path retries instead.
+			if err := h.runPRCloseCleanup(context.Background(), payload.Repository.FullName, payload.PullRequest.Number, payload.PullRequest.Merged); err != nil {
+				h.logger.Error("PR close cleanup failed",
+					"repo", payload.Repository.FullName, "pr", payload.PullRequest.Number, "error", err)
+			}
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup started"})
 		return
@@ -94,22 +144,82 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		"repo", repo,
 		"pr", pr,
 		"head_sha", headSHA,
+		"delivery_id", deliveryID,
 	)
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
-	if err != nil {
-		h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
-		h.writeError(w, http.StatusInternalServerError, "failed to initialize GitHub client")
+	if h.durableWebhookDispatch {
+		// Enqueue failure is a deliberate 500 with no in-process fallback: it
+		// fails loudly (metric below + a red delivery in GitHub's webhook UI)
+		// rather than silently, but GitHub never auto-retries, so the delivery
+		// stays lost until an operator hits "Redeliver" (which re-opens a
+		// terminal row — failed or completed) or a new push arrives.
+		inserted, err := h.enqueueDurablePullRequest(ctx, payload, body, deliveryID, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable pull_request auto-plan",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+				"error", err,
+			)
+			metrics.RecordWebhookEvent(ctx, metricApp, "pull_request", payload.Action, repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable pull_request delivery already queued",
+				"action", payload.Action,
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"delivery_id", deliveryID,
+			)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan already queued"})
+			return
+		}
+		h.logger.Info("durable pull_request auto-plan queued",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"delivery_id", deliveryID,
+		)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan queued"})
 		return
 	}
-	defer cancel()
 
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before)
-	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
+	h.goSafe(repo, pr, installationID, func() {
+		ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
+		if err != nil {
+			metrics.RecordWebhookEvent(context.Background(), metricApp, "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
+			h.logger.Error("failed to bootstrap auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
+			return
+		}
+		defer cancel()
+		// The discovery error is logged and best-effort posted as a failing check
+		// inside runAutoPlanForPR (the post itself re-verifies the head SHA and
+		// can no-op during a GitHub outage); the fire-and-forget request path has
+		// no durable row to retry, so the error is intentionally dropped here.
+		message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, deliveryID)
+		h.logger.Info("auto-plan dispatched",
+			"action", payload.Action,
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"delivery_id", deliveryID,
+			"outcome", message,
+		)
+	})
+	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
 }
 
-func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// autoPlanBootstrap derives a bounded work context from parent and resolves the
+// GitHub client for repo. Request-path callers pass context.Background() so the
+// work is detached from the HTTP request lifetime; the durable webhook driver
+// passes its run context so lease loss and shutdown cancel in-flight work.
+func (h *Handler) autoPlanBootstrap(parent context.Context, repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	// Dedupe FetchPullRequest calls within this webhook delivery.
 	ctx = ghclient.WithPRInfoCache(ctx)
 
@@ -121,7 +231,7 @@ func (h *Handler) autoPlanBootstrap(repo string, installationID int64) (context.
 	return ctx, cancel, client, nil
 }
 
-func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string) bool {
+func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclient.InstallationClient, action, repo string, pr int, beforeSHA, headSHA string, configs []ghclient.DiscoveredConfig) bool {
 	if action != "synchronize" {
 		return true
 	}
@@ -139,27 +249,91 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	if ghclient.HasSchemaInputFiles(files) {
 		return true
 	}
-	h.logger.Info("auto-plan will refresh checks without posting a plan comment because synchronize changed no schema inputs",
+
+	// The synchronize range was just proven schema-neutral. Reuse that result
+	// when the visible plan was rendered at the immediately preceding head.
+	comparedHeads := map[string]bool{beforeSHA: true}
+	for _, cfg := range configs {
+		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because the expected environment scope could not be resolved",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
+			return true
+		}
+		expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
+		comments, err := h.service.Storage().PlanComments().ListUnminimizedForSlot(ctx,
+			repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because prior plan comment state could not be read",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA, "error", err)
+			return true
+		}
+		var prior *storage.PlanComment
+		for _, v := range slices.Backward(comments) {
+			if v.EnvironmentScope == expectedScope {
+				prior = v
+				break
+			}
+		}
+		if prior == nil {
+			h.logger.Info("auto-plan will post plan comment because no prior visible plan comment is tracked",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "environment_scope", expectedScope,
+				"head_sha", headSHA)
+			return true
+		}
+
+		planHeadSHA := prior.HeadSHA
+		if planHeadSHA == headSHA || comparedHeads[planHeadSHA] {
+			continue
+		}
+		filesSincePlan, err := client.FetchChangedFilesBetween(ctx, repo, planHeadSHA, headSHA)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because plan freshness could not be compared",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "plan_head_sha", planHeadSHA,
+				"head_sha", headSHA, "error", err)
+			return true
+		}
+		if ghclient.HasSchemaInputFiles(filesSincePlan) {
+			h.logger.Info("auto-plan will post plan comment because the visible plan predates schema input changes",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "plan_head_sha", planHeadSHA,
+				"head_sha", headSHA)
+			return true
+		}
+		comparedHeads[planHeadSHA] = true
+	}
+	h.logger.Info("auto-plan will refresh checks without posting a plan comment because the visible plan covers the current schema inputs",
 		"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA)
 	return false
 }
 
-func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string) string {
+// runAutoPlanForPR discovers schema configs for the PR and launches auto-plan
+// work. The returned message describes the dispatch outcome. The returned error
+// is non-nil only for discovery failures (typically transient GitHub API
+// errors), so durable callers can retry the delivery; request-path callers may
+// ignore it because the failure is logged and best-effort posted as a failing
+// check here (the post re-verifies the head SHA and can no-op during a GitHub
+// outage).
+func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
 	files, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		return "config discovery failed"
+		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
 	}
 
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
 	if err != nil {
-		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "error", err)
+		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		return "config discovery failed"
+		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
 	}
 
 	// Fail closed when the PR changes schema files under a directory the server
@@ -168,10 +342,25 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// not silently unmanage a server-owned schema directory.
 	if unmanaged := h.unmanagedServerManagedSchemaChanges(repo, files, configs); len(unmanaged) > 0 {
 		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, unmanaged)
-		return "schema change under managed directory has no config"
+		return "schema change under managed directory has no config", nil
 	}
 
+	discovered := slices.Clone(configs)
 	configs = h.filterManagedDiscoveredConfigs(ctx, repo, pr, headSHA, source, configs)
+	// On synchronize the comment cadence compares changed files between SHAs —
+	// a GitHub compare call. The unmanaged-config notice and the plan comments
+	// follow the same cadence, so the decision is memoized and computed at most
+	// once per delivery, only when a caller needs it.
+	shouldPostComment := sync.OnceValue(func() bool {
+		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
+	})
+	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
+
+	// Config discovery and the managed-directory guard just re-verified this
+	// commit, and the clear re-checks allowed-environment coverage for every
+	// discovered database. Together those cover every condition that records
+	// an aggregate blocking reason, so a stored block can now be released.
+	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
 
 	// Collect database names from discovered configs
 	affectedDatabases := make(map[string]bool)
@@ -186,7 +375,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	})
 
 	if len(configs) == 0 {
-		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 		// An aggregate participant does not own the required check for the repo —
 		// the leader does — so on a PR that touches none of this deployment's
 		// schema it has nothing to report and stays silent, rather than posting a
@@ -196,13 +385,13 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// protection (its check is non-required by the aggregate contract).
 		if h.isAggregateParticipant(repo) {
 			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 				Operation:  "aggregate_participant_skip",
 				Repository: repo,
 				Status:     "skipped",
 			})
-			return "no schema files in PR (aggregate participant, staying silent)"
+			return "no schema files in PR (aggregate participant, staying silent)", nil
 		}
 		// A PR with no leader-managed schema can still touch schema owned by
 		// expected participant deployments. The leader's aggregate is the
@@ -213,19 +402,19 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// Check Run events arrive, converging to passing once they succeed.
 		if h.leaderExpectsParticipantsForPR(repo, files) {
 			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
-				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source)
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			h.goSafe(repo, pr, installationID, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				c, err := h.clientForRepo(repo, installationID)
 				if err != nil {
 					h.logger.Error("failed to create GitHub client for participant-gated aggregate",
-						"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+						"repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 					return
 				}
 				h.updateAggregateCheck(ctx, c, repo, pr, headSHA)
 			})
-			return "no schema files in PR (aggregate folds expected participants)"
+			return "no schema files in PR (aggregate folds expected participants)", nil
 		}
 		// Post passing aggregates on the current HEAD SHA so branch protection
 		// isn't blocked on PRs that don't touch schema files. Always post —
@@ -238,14 +427,14 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			defer cancel()
 			c, err := h.clientForRepo(repo, installationID)
 			if err != nil {
-				h.logger.Error("failed to create GitHub client for passing aggregate", "error", err)
+				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 				return
 			}
 			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
 		})
-		return "no schema files in PR"
+		return "no schema files in PR", nil
 	}
-	postPlanComment := h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA)
+	postPlanComment := shouldPostComment()
 
 	// Launch auto-plan for each discovered config
 	tenant := ""
@@ -259,7 +448,64 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 	}
 
-	return "auto-plan started"
+	return "auto-plan started", nil
+}
+
+// notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
+// discovery dropped schema configs this deployment is not configured to
+// manage. On a repo with no aggregate role this deployment is the only
+// responder, so without the notice the drop is invisible on the PR — no plan
+// comment and no check row cover the dropped config, and the author can merge
+// a schema change nothing will ever apply. On an aggregate-role repo (leader
+// or participant) a dropped config is routine cross-deployment fan-out — the
+// owning deployment plans it and posts its own comment and check — so the
+// notice stays a log line there.
+func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
+	dropped := droppedDiscoveredConfigs(discovered, managed)
+	if len(dropped) == 0 {
+		return
+	}
+	if config, ok := h.serverConfig(); ok && config.AggregateRoleForRepo(repo) != "" {
+		h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"unmanaged_configs", len(dropped))
+		return
+	}
+	// Match the plan-comment cadence: a synchronize push that changed no
+	// schema inputs re-verifies checks without re-posting comments, and the
+	// notice follows suit so an active PR is not re-noticed on every push.
+	if !shouldPostComment() {
+		h.logger.Info("unmanaged schema config notice suppressed by comment cadence; PR was already noticed on an earlier commit",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"unmanaged_configs", len(dropped))
+		return
+	}
+	notice := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
+	for _, cfg := range dropped {
+		notice = append(notice, templates.UnmanagedSchemaConfigNoticeData{
+			Database:   cfg.Config.Database,
+			SchemaPath: cfg.SchemaDir,
+		})
+	}
+	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(notice))
+}
+
+// droppedDiscoveredConfigs returns the discovered configs the managed filter
+// removed. Configs with no parsed config are excluded: the filter already
+// warns about them, and they carry no database identity to report.
+func droppedDiscoveredConfigs(discovered, managed []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
+	managedDirs := make(map[string]bool, len(managed))
+	for _, cfg := range managed {
+		managedDirs[cfg.SchemaDir] = true
+	}
+	var dropped []ghclient.DiscoveredConfig
+	for _, cfg := range discovered {
+		if cfg.Config == nil || managedDirs[cfg.SchemaDir] {
+			continue
+		}
+		dropped = append(dropped, cfg)
+	}
+	return dropped
 }
 
 func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo string, pr int, headSHA, source string, configs []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
@@ -314,17 +560,32 @@ func (h *Handler) aggregateMessagesForAllEnvironments(message string) map[string
 	return messages
 }
 
-// handlePRClosed cleans up resources when a PR is closed (merged or unmerged):
-// it releases locks held by this PR and deletes its stored check state.
+// runPRCloseCleanup cleans up resources when a PR is closed (merged or
+// unmerged): it releases locks held by this PR and deletes its stored check
+// state.
 //
 // Cleanup only covers finished work. While any apply for the PR is
 // non-terminal, that apply's database lock is retained so another PR cannot
 // acquire the database mid-apply, and the PR's stored check state is retained
 // so a close-and-reopen cannot convert in-flight apply state into a passing
-// check. If apply state cannot be read, cleanup fails closed and nothing is
-// released or deleted.
-func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// check. Apply-owned check state that reached a terminal state without
+// concluding successfully is also retained, so a close-and-reopen cannot
+// bypass a block that requires operator reconciliation. On a close without
+// merge, apply-owned check state that concluded successfully is retained too:
+// the stored success may predate a commit that removed the applied change,
+// and only reopen-time cleanup can re-verify it against the PR contents. If
+// apply state cannot be read, cleanup fails closed and nothing is released
+// or deleted.
+//
+// It takes a context so the durable driver can bound it to the delivery lease
+// (shutdown or lease loss cancels it) while the legacy request path passes a
+// detached context. Every failure is returned so a caller with a retry
+// mechanism (the durable driver) can retry: each step — the applies read, the
+// list-then-release lock pass, and the check delete — is safe to re-run, so
+// re-running the whole cleanup after a partial failure reconciles rather than
+// double-acts.
+func (h *Handler) runPRCloseCleanup(ctx context.Context, repo string, pr int, merged bool) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	// A closed PR gets no more scheduled re-folds; drop its budget entry so the
@@ -343,37 +604,52 @@ func (h *Handler) handlePRClosed(repo string, pr int, _ int64) {
 		})
 		h.logger.Error("PR close cleanup skipped: cannot verify apply state; all locks and check state are retained",
 			"repo", repo, "pr", pr, "error", err)
-		return
+		return fmt.Errorf("read applies for closed PR %s#%d: %w", repo, pr, err)
 	}
 
 	inFlight := h.inFlightAppliesForClosedPR(ctx, repo, pr, applies)
 
-	h.releaseLocksForClosedPR(ctx, repo, pr, inFlight)
+	if err := h.releaseLocksForClosedPR(ctx, repo, pr, inFlight); err != nil {
+		return fmt.Errorf("release locks for closed PR %s#%d: %w", repo, pr, err)
+	}
 
 	if len(inFlight) > 0 {
 		h.logger.Info("check state retained for closed PR until all applies reach a terminal state",
 			"repo", repo, "pr", pr, "in_flight_databases", len(inFlight))
-		return
+		return nil
 	}
 
-	// Delete stored check state for this PR. Rows owned by an in-flight apply
-	// survive the delete at the storage layer even if the applies table missed
-	// the in-flight work above.
-	if err := h.service.Storage().Checks().DeleteByPRExcludingApplyOwned(ctx, repo, pr); err != nil {
+	// Delete stored check state for this PR. Apply-owned rows that still block
+	// survive the delete at the storage layer: in-flight rows (even if the
+	// applies table missed the in-flight work above) and terminal rows whose
+	// conclusion is not success, such as a schema change removed from the PR
+	// after its apply started. Those blocks require operator reconciliation
+	// and must persist across a close and reopen. On an unmerged close,
+	// apply-owned rows that concluded successfully survive too: the stored
+	// success may predate a commit that removed the applied change, so
+	// reopen-time cleanup must re-verify it before the row can stop blocking.
+	if err := h.service.Storage().Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, repo, pr, merged); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "pr_close_cleanup",
 			Repository: repo,
 			Status:     "error",
 		})
-		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "error", err)
-	} else {
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:  "pr_close_cleanup",
-			Repository: repo,
-			Status:     "success",
-		})
-		h.logger.Info("deleted checks for closed PR", "repo", repo, "pr", pr)
+		h.logger.Error("failed to delete checks for closed PR", "repo", repo, "pr", pr, "merged", merged, "error", err)
+		return fmt.Errorf("delete checks for closed PR %s#%d (merged=%t): %w", repo, pr, merged, err)
 	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  "pr_close_cleanup",
+		Repository: repo,
+		Status:     "success",
+	})
+	if merged {
+		h.logger.Info("deleted checks for merged PR; apply-owned rows that still block are retained",
+			"repo", repo, "pr", pr)
+	} else {
+		h.logger.Info("deleted plan-only checks for unmerged closed PR; all apply-owned rows are retained",
+			"repo", repo, "pr", pr)
+	}
+	return nil
 }
 
 // closedPRDatabase identifies the database lock an apply holds.
@@ -413,13 +689,23 @@ func (h *Handler) inFlightAppliesForClosedPR(ctx context.Context, repo string, p
 }
 
 // releaseLocksForClosedPR releases the closed PR's locks, except locks on
-// databases that still have an in-flight apply.
-func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) {
+// databases that still have an in-flight apply. Every release is attempted even
+// if an earlier one fails, and the failures are joined and returned so a caller
+// with a retry mechanism re-attempts the still-held locks. Release itself is
+// not idempotent — a missing row returns storage.ErrLockNotFound and a
+// re-acquired lock returns storage.ErrLockNotOwned — so re-running converges
+// only because each attempt re-lists the PR's locks first and a released
+// lock's row is deleted, never reappearing in a later attempt. A concurrent
+// manual unlock between the list and the release surfaces as a spurious
+// ErrLockNotFound that fails that attempt; the next retry no longer sees the
+// row and converges.
+func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr int, inFlight map[closedPRDatabase]bool) error {
 	locks, err := h.service.Storage().Locks().GetByPR(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to look up locks for closed PR; no locks released", "repo", repo, "pr", pr, "error", err)
-		return
+		return fmt.Errorf("look up locks for closed PR %s#%d: %w", repo, pr, err)
 	}
+	var releaseErrs []error
 	for _, lock := range locks {
 		if inFlight[closedPRDatabase{database: lock.DatabaseName, databaseType: lock.DatabaseType}] {
 			h.logger.Info("lock retained on PR close because an apply is in flight",
@@ -429,11 +715,13 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 		if err := h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner); err != nil {
 			h.logger.Error("failed to release lock on PR close",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-		} else {
-			h.logger.Info("released lock on PR close",
-				"repo", repo, "pr", pr, "database", lock.DatabaseName)
+			releaseErrs = append(releaseErrs, fmt.Errorf("release lock on %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err))
+			continue
 		}
+		h.logger.Info("released lock on PR close",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName)
 	}
+	return errors.Join(releaseErrs...)
 }
 
 // cleanupStaleChecks updates checks for databases no longer in the PR.

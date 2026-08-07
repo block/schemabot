@@ -100,9 +100,9 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type != "" {
 		switch req.Type {
-		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		default:
-			s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", or "+storage.DatabaseTypeStrata)
+			s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", "+storage.DatabaseTypeStrata+", or "+storage.DatabaseTypePostgres)
 			return
 		}
 	}
@@ -338,6 +338,10 @@ type ApplyRequest struct {
 	Options        map[string]string `json:"options,omitempty"`
 	Caller         string            `json:"caller,omitempty"`          // Identity of the caller (e.g., "cli:user@host")
 	InstallationID int64             `json:"installation_id,omitempty"` // GitHub App installation ID (for PR comment tracking)
+	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
+	// direct API callers cannot assert a lock intent through JSON.
+	ExpectedLockOwner     string `json:"-"`
+	ExpectedPendingPlanID string `json:"-"`
 }
 
 // handlePlan handles POST /api/plan requests.
@@ -359,9 +363,9 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Type {
-	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 	default:
-		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", or "+storage.DatabaseTypeStrata)
+		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", "+storage.DatabaseTypeStrata+", or "+storage.DatabaseTypePostgres)
 		return
 	}
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
@@ -369,6 +373,12 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if warning != "" {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
+	}
+
+	// Planning stages a change against a specific database and reads its live
+	// schema, so it takes the same per-database authorization as apply.
+	if !s.authorizeDirectWrite(w, r, "plan", req.Database, req.Environment) {
+		return
 	}
 
 	resp, err := s.ExecutePlan(r.Context(), req)
@@ -643,6 +653,10 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Environment == "" {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
+		return
+	}
+
+	if !s.authorizeDirectWriteForStoredPlan(w, r, "apply", req.PlanID, req.Environment) {
 		return
 	}
 
@@ -961,22 +975,24 @@ func (s *Service) createStoredApply(
 	caller := resolveCaller(ctx, req.Caller)
 
 	apply := &storage.Apply{
-		ApplyIdentifier: applyIdentifier,
-		LockID:          lockID,
-		PlanID:          plan.ID,
-		Database:        plan.Database,
-		DatabaseType:    plan.DatabaseType,
-		Repository:      plan.Repository,
-		PullRequest:     plan.PullRequest,
-		Environment:     req.Environment,
-		Deployment:      targets[0].Deployment,
-		Caller:          caller,
-		InstallationID:  req.InstallationID,
-		Engine:          storage.EngineForType(plan.DatabaseType),
-		State:           state.Apply.Pending,
-		Options:         storage.MarshalApplyOptions(applyOpts),
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ApplyIdentifier:       applyIdentifier,
+		LockID:                lockID,
+		ExpectedLockOwner:     req.ExpectedLockOwner,
+		ExpectedPendingPlanID: req.ExpectedPendingPlanID,
+		PlanID:                plan.ID,
+		Database:              plan.Database,
+		DatabaseType:          plan.DatabaseType,
+		Repository:            plan.Repository,
+		PullRequest:           plan.PullRequest,
+		Environment:           req.Environment,
+		Deployment:            targets[0].Deployment,
+		Caller:                caller,
+		InstallationID:        req.InstallationID,
+		Engine:                storage.EngineForType(plan.DatabaseType),
+		State:                 state.Apply.Pending,
+		Options:               storage.MarshalApplyOptions(applyOpts),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	taskChanges := applyTaskChanges(plan)
@@ -1130,7 +1146,7 @@ func buildShardedApplyOperationGroups(
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}
-					operationKey := shardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					operationKey := storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table)
 					if len(operationKey) > applyOperationKeyMaxLen {
 						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
 					}
@@ -1223,10 +1239,6 @@ func changingShardsByNamespace(shards []storage.ShardPlan) map[string][]storage.
 		})
 	}
 	return shardsByNamespace
-}
-
-func shardOperationKey(namespace, shard, table string) string {
-	return namespace + "/" + shard + "/" + table
 }
 
 func finalizerOperationKey(namespace string) string {

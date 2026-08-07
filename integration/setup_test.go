@@ -304,12 +304,13 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	cleanupFuncs = append(cleanupFuncs, func() { _ = localClient.Close() })
 
 	// A dispatch queues the apply in Tern storage for the data plane's own
-	// operator; without this loop a dispatched apply would sit pending forever.
-	// The harness terns share one Tern storage database, so the claim loop
-	// routes each claim to the registered client for its deployment.
-	registerRemoteTern(databaseName, localClient)
-	stopOperator := startRemoteTernOperator(storage, logger, "remote-tern-"+databaseName)
-	cleanupFuncs = append(cleanupFuncs, stopOperator)
+	// operator; without an operator a dispatched apply would sit pending
+	// forever. The shared remote-tern operator claims queued work and routes
+	// each drive to the client registered for its deployment.
+	if err := registerRemoteTern(storage, logger, databaseName, localClient); err != nil {
+		return "", fmt.Errorf("register remote tern %s: %w", databaseName, err)
+	}
+	cleanupFuncs = append(cleanupFuncs, stopRemoteTernOperator)
 
 	// Wrap LocalClient in gRPC server (simulates remote Tern)
 	grpcSrv := grpc.NewServer()

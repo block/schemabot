@@ -49,13 +49,16 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 	if state.IsState(curState, state.Apply.Failed) {
 		return fmt.Errorf("schema change failed - cannot adjust volume")
 	}
-	if !state.IsState(curState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.CuttingOver, state.Apply.WaitingForCutover, state.Apply.Stopped) {
+	if state.IsState(curState, state.Apply.Stopped) {
+		return fmt.Errorf("schema change is stopped - start it first, then adjust volume")
+	}
+	if !state.IsState(curState, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.CuttingOver, state.Apply.WaitingForCutover) {
 		return fmt.Errorf("cannot adjust volume in state: %s", curState)
 	}
 
 	// Call volume API
 	var volumeResult *apitypes.VolumeResponse
-	err = withLoading("Updating schema change volume...", true, func() error {
+	err = withLoading("Queueing schema change volume adjustment...", true, func() error {
 		var volumeErr error
 		volumeResult, volumeErr = client.CallVolumeAPI(ep, cmd.Environment, cmd.ApplyID, cmd.Volume)
 		return volumeErr
@@ -68,7 +71,7 @@ func (cmd *VolumeCmd) Run(g *Globals) error {
 		return err
 	}
 
-	fmt.Printf("Volume adjusted: %d → %d\n", int(volumeResult.PreviousVolume), int(volumeResult.NewVolume))
+	fmt.Printf("Volume change to %d queued; the driver applies it at its next progress check.\n", int(volumeResult.NewVolume))
 
 	if !cmd.Watch {
 		printWatchInstructions(cmd.ApplyID, cmd.Database, cmd.Environment)

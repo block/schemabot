@@ -29,3 +29,35 @@ func TestRenderPRCommandNotAuthorizedListsPrincipals(t *testing.T) {
 	require.Contains(t, fallback, "A configured SchemaBot admin/database operator must run this command.")
 	require.NotContains(t, fallback, "Who can run this command")
 }
+
+func TestRenderBaseSchemaFreshnessRejection(t *testing.T) {
+	t.Run("stale schema path", func(t *testing.T) {
+		out := RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+			RequestedBy: "alice",
+			Database:    "orders",
+			Environment: "production",
+			SchemaPath:  "schema/orders",
+		})
+
+		require.Contains(t, out, "Apply rejected — base schema is newer")
+		require.Contains(t, out, "`schema/orders`")
+		require.Contains(t, out, "newer changes")
+		require.Contains(t, out, "not included in this PR")
+		require.Contains(t, out, "could revert those changes")
+		require.Contains(t, out, "Merge or rebase")
+		require.Contains(t, out, "@alice")
+	})
+
+	t.Run("verification failure is sanitized", func(t *testing.T) {
+		out := RenderBaseSchemaFreshnessRejection(BaseSchemaFreshnessRejectionData{
+			Database:          "orders",
+			Environment:       "production",
+			SchemaPath:        "schema/orders",
+			VerificationError: true,
+		})
+
+		require.Contains(t, out, "could not verify")
+		require.Contains(t, out, "apply was rejected")
+		require.NotContains(t, out, "schema/orders")
+	})
+}

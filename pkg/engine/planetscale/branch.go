@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/vschema"
 )
 
 // verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
@@ -257,18 +258,28 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			Keyspace:     ks,
 		})
 		if fetchErr != nil {
-			return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			var psErr *ps.Error
+			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
+				return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			}
+			// Keyspace has no VSchema on this branch yet — either it has
+			// never had one, or the API has not converged after a recent
+			// write. Treat as empty so the desired VSchema appears as a
+			// change; validation callers absorb convergence lag through
+			// the VSchema staleness retry.
+			e.logger.Warn("VSchema not found for keyspace, treating as empty",
+				"keyspace", ks, "branch", branch)
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
 		}
-		vschemaChanged = VSchemaChanged(currentVSchemaRaw, content)
+		vschemaChanged = vschema.Changed(currentVSchemaRaw, content)
 		if vschemaChanged {
 			e.logger.Info("diffKeyspace: VSchema mismatch detected",
 				"keyspace", ks,
 				"branch", branch,
-				"current_normalized", normalizeVSchemaJSON(currentVSchemaRaw),
-				"desired_normalized", normalizeVSchemaJSON(content),
+				"current_normalized", vschema.Normalize(currentVSchemaRaw),
+				"desired_normalized", vschema.Normalize(content),
 			)
 		}
 	}
@@ -500,13 +511,18 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	}
 }
 
-func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoCutover, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+	// AutoCutover stays off so SchemaBot is the sole cutover actor: the deploy
+	// request parks at pending_cutover and the driver completes it via Cutover
+	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
+	// over on its own would race the driver's cutover call and move the schema
+	// without SchemaBot's involvement or caller attribution.
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
 		Branch:           branchName,
 		IntoBranch:       intoBranch,
-		AutoCutover:      autoCutover,
+		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
 }
@@ -517,6 +533,73 @@ func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient,
 		Database:     database,
 		Number:       number,
 	})
+}
+
+// deployDeployRequest starts a deploy request's schema change, absorbing the
+// rejections that clear on their own. PlanetScale keeps rejecting the deploy
+// while the deploy request's pre-deploy safety validation is still running —
+// a not-ready condition, not a failure — so that rejection polls on its own
+// bounded budget (deployValidationWait) instead of counting toward the
+// transient-error retry bound, which validation routinely outlives. Transient
+// API errors retry with backoff up to maxRetries. Any other rejection fails
+// immediately.
+func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool) (*ps.DeployRequest, error) {
+	var validationDeadline time.Time
+	validationWaitLogged := false
+	transientAttempts := 0
+	for {
+		dr, err := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+			Organization: org,
+			Database:     database,
+			Number:       number,
+			InstantDDL:   instantDDL,
+		})
+		if err == nil {
+			return dr, nil
+		}
+		if strings.Contains(err.Error(), "approved") {
+			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", number)
+		}
+		switch {
+		case isDeployStillValidatingError(err):
+			// The budget starts at the first validating rejection, not at the
+			// first deploy attempt, so transient retries never eat into it.
+			if validationDeadline.IsZero() {
+				validationDeadline = time.Now().Add(deployValidationWait)
+			}
+			if time.Now().After(validationDeadline) {
+				return nil, fmt.Errorf("deploy deploy request #%d: PlanetScale was still validating the deploy request after waiting %s: %w", number, deployValidationWait, err)
+			}
+			if !validationWaitLogged {
+				e.logger.Info("deploy rejected because the deploy request is still validating; deploy will be retried until validation completes",
+					"database", database, "deploy_request", number, "poll_interval", deployValidationPollInterval, "wait_bound", deployValidationWait)
+				validationWaitLogged = true
+			} else {
+				e.logger.Debug("deploy request still validating; retrying deploy",
+					"database", database, "deploy_request", number)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled waiting for deploy request #%d to finish validating: %w", number, ctx.Err())
+			case <-time.After(deployValidationPollInterval):
+			}
+		case isRetryablePSError(err):
+			transientAttempts++
+			if transientAttempts >= maxRetries {
+				return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err)
+			}
+			delay := retryDelay(transientAttempts, err)
+			e.logger.Warn("retrying deploy request",
+				"database", database, "deploy_request", number, "attempt", transientAttempts+1, "delay", delay.Round(time.Millisecond), "error", err)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled retrying deploy request #%d: %w", number, ctx.Err())
+			case <-time.After(delay):
+			}
+		default:
+			return nil, fmt.Errorf("deploy deploy request #%d: %w", number, err)
+		}
+	}
 }
 
 // waitForDeployRequestPending polls a deploy request until PlanetScale finishes

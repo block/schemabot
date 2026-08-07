@@ -210,10 +210,10 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Collect VSchema changes from metadata
 	var vschemaChanges []templates.VSchemaChange
 	for _, sc := range result.Changes {
-		if diff, ok := sc.Metadata["vschema"]; ok && diff != "" {
+		if sc.HasVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
-				Diff:     diff,
+				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
 			})
 		}
 	}
@@ -302,18 +302,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 
 // hasResultChanges returns true if the result has schema changes (DDL or VSchema).
 func hasResultChanges(result *apitypes.PlanResponse) bool {
-	if result == nil {
-		return false
-	}
-	if len(result.FlatTables()) > 0 {
-		return true
-	}
-	for _, sc := range result.Changes {
-		if sc.Metadata["vschema"] != "" {
-			return true
-		}
-	}
-	return false
+	return result != nil && result.HasChanges()
 }
 
 // sortEnvironments sorts environments with staging first, production second, then alphabetically.
@@ -339,7 +328,7 @@ func sortEnvironments(envs []string) {
 }
 
 // planFingerprint creates a string fingerprint of a plan result for deduplication.
-// Plans with identical DDL statements are considered the same.
+// Plans with identical DDL statements and VSchema updates are considered the same.
 func planFingerprint(result *apitypes.PlanResponse) string {
 	// Check for errors first
 	if len(result.Errors) > 0 {
@@ -347,22 +336,28 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		return "errors:" + string(data)
 	}
 
-	// Get DDL statements
-	tables := result.FlatTables()
-	if len(tables) == 0 {
+	var ddls []string
+	for _, tbl := range result.FlatTables() {
+		ddls = append(ddls, tbl.DDL)
+	}
+	var vschemas []string
+	for _, sc := range result.Changes {
+		if sc.HasVSchemaChange() {
+			vschemas = append(vschemas, sc.Namespace+":"+sc.Metadata[apitypes.VSchemaDiffMetadataKey])
+		}
+	}
+	if len(ddls) == 0 && len(vschemas) == 0 {
 		return "no-changes"
 	}
 
-	// Build fingerprint from DDL statements
-	var ddls []string
-	for _, tbl := range tables {
-		ddls = append(ddls, tbl.DDL)
-	}
-
-	// Sort DDLs to make fingerprint order-independent
+	// Sort to make the fingerprint order-independent
 	sort.Strings(ddls)
+	sort.Strings(vschemas)
 
-	data, _ := json.Marshal(ddls)
+	data, _ := json.Marshal(struct {
+		DDLs     []string `json:"ddls"`
+		VSchemas []string `json:"vschemas"`
+	}{ddls, vschemas})
 	return string(data)
 }
 

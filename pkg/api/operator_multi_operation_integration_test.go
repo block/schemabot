@@ -658,8 +658,7 @@ func stalenessBackdate(t *testing.T, ctx context.Context, db *sql.DB, applyID in
 func newMatrixService(t *testing.T, stor storage.Storage, clients map[string]tern.Client) *matrixService {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := &ServerConfig{OperatorClaimOperations: new(true)}
-	svc := New(stor, cfg, clients, logger)
+	svc := New(stor, &ServerConfig{}, clients, logger)
 
 	summary := &matrixSummaryRecorder{}
 	svc.OnApplyTerminalSummary = func(_ context.Context, apply *storage.Apply, tasks []*storage.Task) error {

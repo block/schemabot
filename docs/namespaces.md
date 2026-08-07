@@ -10,9 +10,12 @@
   - [MySQL — Different databases entirely](#mysql-different-databases-entirely)
   - [Vitess — Multiple keyspaces](#vitess-multiple-keyspaces)
   - [Vitess — VSchema changes](#vitess-vschema-changes)
+- [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
 - [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
   - [Example](#example)
   - [Rules](#rules)
+- [Per-Target Schema Overrides](#per-target-schema-overrides)
+  - [Rules](#rules-1)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
 
@@ -127,6 +130,62 @@ SchemaBot plans all keyspaces together — a single plan can contain changes acr
 
 A plan can have DDL-only changes, VSchema-only changes, or both.
 
+## Where to Put the Schema Directory
+
+SchemaBot is location-agnostic: config discovery finds `schemabot.yaml` anywhere
+in the repository — the directory containing it *is* the schema directory.
+Namespaces come from directory names in either layout: with the config at the
+schema root, each subdirectory is a namespace (as below); with the config
+inside a single namespace directory next to its `.sql` files (flat layout),
+that directory's basename is the namespace. Nothing in SchemaBot forces a
+particular path, so placement is a repository-semantics choice. For greenfield
+repositories, a repository-root `schema/` directory is the recommended layout:
+
+```
+myapp/
+├── schema/
+│   ├── schemabot.yaml
+│   └── myapp/
+│       ├── users.sql
+│       └── orders.sql
+├── service-a/
+└── service-b/
+```
+
+- **Prefer to keep schema files out of build-tool resource directories**
+  (Maven/Gradle `src/main/resources`, embedded asset dirs). Those paths mean
+  "packaged into the application artifact" — but the application never reads
+  these files. Only SchemaBot does, from GitHub, at PR time. Placing them
+  there ships dead weight in every build and implies runtime semantics the
+  files don't have.
+- **Keep visible distance from imperative tools during coexistence.** If the
+  repository still carries Flyway or Liquibase versioned change scripts while
+  SchemaBot takes over, keep the two mechanisms in visibly different places.
+  Those scripts live in `resources/` because the app executes them from the
+  classpath at startup; SchemaBot is the opposite model — declarative desired
+  state, applied out-of-band. Side by side in one resources tree, "which file
+  do I edit?" becomes a coin flip.
+- **The schema is a repository-level concern.** The database usually spans
+  application modules (domain tables, framework tables such as Spring Batch's
+  `BATCH_*`, history tables), so its desired state belongs at the top level,
+  not nested inside one module.
+- **Short stable paths keep operations simple.** A server-side
+  `allowed_dirs: [schema]` allowlist (matched against the directory containing
+  `schemabot.yaml` and its descendants), CODEOWNERS scoping, and PR review
+  path filters all stay trivial with a root path, and the
+  directory-name-is-the-namespace contract stays visible at a glance.
+
+A module-root directory outside `src/` (e.g. `my-data-module/schema/`) also
+works and avoids the packaging problem — reasonable when one module clearly
+owns the database, but most schemas span modules.
+
+For existing (brownfield) repositories, treat the root `schema/` layout as a
+nice-to-have, not a requirement. SchemaBot behaves identically wherever the
+config lives, so adopting it does not require moving files that already have
+an established home. Relocating is worth it only if the points above start to
+bite — packaging dead weight, confusion next to imperative change scripts, or
+allowlist/CODEOWNERS churn — and can be done later as a follow-up.
+
 ## `$ENV` Substitution in Namespace Names
 
 Some infrastructure names schemas with an environment suffix: `bikeshare_staging` in staging, `bikeshare_production` in production. Rather than maintaining separate directories for each environment, you can use `$ENV` in the directory name. When an environment is specified (via `-e`), `$ENV` is replaced with the environment value.
@@ -161,6 +220,33 @@ schemabot plan -s myapp/schema -e production
 - You can mix `$ENV` directories with regular directories in the subdirectory layout.
 - When creating the directory from a shell, quote the name to prevent shell expansion: `mkdir 'bikeshare_$ENV'`
 
+## Per-Target Schema Overrides
+
+`$ENV` substitution handles physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
+
+Instead, keep one canonical directory (`bikeshare/`) and map the canonical namespace to each deployment's physical schema on the data-plane target:
+
+```yaml
+target_resolver:
+  targets:
+    eu-bikeshare-qa:
+      type: mysql
+      schema_overrides:
+        bikeshare: bikeshare_eu_qa
+      dsn_from:
+        # namespace-free endpoint/credentials
+```
+
+The canonical namespace stays the name everywhere SchemaBot stores or shows it — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where MySQL is actually addressed: the connection schema in the DSN and `information_schema` predicates.
+
+### Rules
+
+- MySQL only, and currently exactly one mapping per target.
+- The target DSN must be namespace-free; a DSN that already names a database is rejected at config load.
+- A non-empty map is a strict allowlist: a requested namespace without a mapping fails rather than falling back to the canonical name, so a misrouted request cannot land in the wrong physical schema.
+- An empty/omitted map preserves the default behavior: the requested namespace is the physical schema.
+- Schema names must be unquoted-identifier-safe (`[a-zA-Z0-9_$]`, at most 64 characters).
+
 ## Summary
 
 | Scenario | schemabot.yaml | Namespaces | Example |
@@ -170,6 +256,7 @@ schemabot plan -s myapp/schema -e production
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
 | Environment-specific namespace | 1 | 1 per env | `bikeshare_$ENV/` |
+| Deployment-specific physical schema | 1 | 1 canonical | `bikeshare/` + per-target `schema_overrides` |
 
 ## How Namespaces Flow Through the System
 

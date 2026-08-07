@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+
+	"github.com/block/schemabot/pkg/metrics"
 )
 
 type checkRunPayload struct {
@@ -26,7 +28,7 @@ type checkRunPayload struct {
 	} `json:"installation"`
 }
 
-func (h *Handler) handleCheckRun(ctx context.Context, w http.ResponseWriter, body []byte) {
+func (h *Handler) handleCheckRun(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload checkRunPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		h.writeError(w, http.StatusBadRequest, "invalid check_run payload")
@@ -35,9 +37,9 @@ func (h *Handler) handleCheckRun(ctx context.Context, w http.ResponseWriter, bod
 
 	switch payload.Action {
 	case "rerequested":
-		h.handleCheckRunRerequest(ctx, w, payload)
+		h.handleCheckRunRerequest(ctx, metricApp, w, payload, body, deliveryID)
 	case "completed":
-		h.handleParticipantCheckCompleted(ctx, w, payload)
+		h.handleParticipantCheckCompleted(ctx, metricApp, w, payload, body, deliveryID)
 	default:
 		h.logger.Debug("check_run action ignored",
 			"action", payload.Action,
@@ -54,7 +56,7 @@ func (h *Handler) handleCheckRun(ctx context.Context, w http.ResponseWriter, bod
 // every participant's state via the trusted FindCheckRunByName path, so reacting
 // to any completed check on a led repo is safe. The leader's own aggregate check
 // is skipped so its own writes do not trigger a self-loop.
-func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, w http.ResponseWriter, payload checkRunPayload) {
+func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, metricApp string, w http.ResponseWriter, payload checkRunPayload, body []byte, deliveryID string) {
 	repo := payload.Repository.FullName
 
 	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
@@ -99,7 +101,40 @@ func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, w http.Re
 		return
 	}
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+	if h.durableWebhookDispatch {
+		// Enqueue the re-fold as a durable row and ack fast: a deploy mid-fold
+		// would otherwise drop the leader's aggregate re-fold, leaving the
+		// aggregate stale until an unrelated event re-folds it. Enqueue failure
+		// is a deliberate 500 (metric below + a red delivery in GitHub's webhook
+		// UI); GitHub does not auto-retry, so the delivery stays lost until an
+		// operator redelivers or another participant completion re-triggers it.
+		inserted, err := h.enqueueDurableCheckRun(ctx, payload, body, deliveryID, pr, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable check_run completion",
+				"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+				"installation_id", installationID, "check_run_id", payload.CheckRun.ID,
+				"check_name", payload.CheckRun.Name, "delivery_id", deliveryID, "error", err)
+			metrics.RecordWebhookEvent(ctx, metricApp, "check_run", payload.Action, repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable check_run completion already queued",
+				"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+				"installation_id", installationID, "check_run_id", payload.CheckRun.ID,
+				"check_name", payload.CheckRun.Name, "delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run completion already queued"})
+			return
+		}
+		h.logger.Info("durable check_run completion queued",
+			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
+			"installation_id", installationID, "check_run_id", payload.CheckRun.ID,
+			"check_name", payload.CheckRun.Name, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run completion queued"})
+		return
+	}
+
+	ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to bootstrap participant check completion re-fold",
 			"repo", repo, "pr", pr, "head_sha", payload.CheckRun.HeadSHA,
@@ -121,7 +156,7 @@ func (h *Handler) handleParticipantCheckCompleted(ctx context.Context, w http.Re
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "aggregate re-folded on participant check completion"})
 }
 
-func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWriter, payload checkRunPayload) {
+func (h *Handler) handleCheckRunRerequest(ctx context.Context, metricApp string, w http.ResponseWriter, payload checkRunPayload, body []byte, deliveryID string) {
 	installationID := h.effectiveInstallationID(ctx, payload.Installation.ID)
 	if installationID == 0 {
 		h.writeError(w, http.StatusBadRequest, "missing installation ID in webhook payload")
@@ -135,7 +170,8 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 			"repo", repo,
 			"check_run_id", payload.CheckRun.ID,
 			"check_name", payload.CheckRun.Name,
-			"head_sha", payload.CheckRun.HeadSHA)
+			"head_sha", payload.CheckRun.HeadSHA,
+			"delivery_id", deliveryID)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored without pull request"})
 		return
 	}
@@ -148,7 +184,8 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 			"pr", pr,
 			"installation_id", installationID,
 			"check_run_id", payload.CheckRun.ID,
-			"check_name", payload.CheckRun.Name)
+			"check_name", payload.CheckRun.Name,
+			"delivery_id", deliveryID)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "repository not registered"})
 		return
 	}
@@ -159,7 +196,8 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 			"pr", pr,
 			"check_run_id", payload.CheckRun.ID,
 			"check_name", payload.CheckRun.Name,
-			"head_sha", payload.CheckRun.HeadSHA)
+			"head_sha", payload.CheckRun.HeadSHA,
+			"delivery_id", deliveryID)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest ignored for non-SchemaBot check"})
 		return
 	}
@@ -169,7 +207,53 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 		return
 	}
 
-	ctx, cancel, client, err := h.autoPlanBootstrap(repo, installationID)
+	if h.durableWebhookDispatch {
+		// Enqueue failure is a deliberate 500 with no in-process fallback: it
+		// fails loudly (metric below + a red delivery in GitHub's webhook UI)
+		// rather than silently, but GitHub never auto-retries a check_run
+		// rerequest, so the delivery stays lost until an operator hits
+		// "Redeliver" (which re-creates the row, or reopens it if a terminal
+		// row exists) or re-triggers the check.
+		inserted, err := h.enqueueDurableCheckRun(ctx, payload, body, deliveryID, pr, installationID)
+		if err != nil {
+			h.logger.Error("failed to enqueue durable check_run rerequest",
+				"repo", repo,
+				"pr", pr,
+				"head_sha", payload.CheckRun.HeadSHA,
+				"installation_id", installationID,
+				"check_run_id", payload.CheckRun.ID,
+				"check_name", payload.CheckRun.Name,
+				"delivery_id", deliveryID,
+				"error", err)
+			metrics.RecordWebhookEvent(ctx, metricApp, "check_run", payload.Action, repo, "durable_enqueue_failed")
+			h.writeError(w, http.StatusInternalServerError, "failed to enqueue webhook delivery")
+			return
+		}
+		if !inserted {
+			h.logger.Info("durable check_run rerequest already queued",
+				"repo", repo,
+				"pr", pr,
+				"head_sha", payload.CheckRun.HeadSHA,
+				"installation_id", installationID,
+				"check_run_id", payload.CheckRun.ID,
+				"check_name", payload.CheckRun.Name,
+				"delivery_id", deliveryID)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest already queued"})
+			return
+		}
+		h.logger.Info("durable check_run rerequest queued",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", payload.CheckRun.HeadSHA,
+			"installation_id", installationID,
+			"check_run_id", payload.CheckRun.ID,
+			"check_name", payload.CheckRun.Name,
+			"delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_run rerequest queued"})
+		return
+	}
+
+	ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to bootstrap check_run rerequest",
 			"repo", repo,
@@ -197,7 +281,9 @@ func (h *Handler) handleCheckRunRerequest(ctx context.Context, w http.ResponseWr
 		"check_run_id", payload.CheckRun.ID,
 		"check_name", payload.CheckRun.Name)
 
-	message := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "")
+	// Discovery failures are already logged and posted as a failing check
+	// inside runAutoPlanForPR; the rerequest path has no retry mechanism.
+	message, _ := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", "")
 
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": message})
 }

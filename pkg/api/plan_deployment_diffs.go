@@ -46,19 +46,21 @@ type DeploymentPlanDiff struct {
 // spurious primary-vs-primary mismatch.
 //
 // Per-deployment failures are captured in each result's Err so one unreachable
-// deployment neither hides the others nor aborts the rollup; only a
-// request-level failure (target resolution) returns an error. Results are
+// deployment neither hides the others nor aborts the rollup. Results are
 // returned in rollout order, primary first.
+//
+// targets is the resolved deployment set in rollout order (primary first),
+// supplied by the caller so a database/environment is resolved once per rollup
+// rather than re-resolved here. It must be non-empty.
 //
 // primaryDeployment is the deployment the reviewed primaryPlan was created
 // against (rollout index 0 at plan time). When a primaryPlan is reused, it is
 // checked against targets[0] here so a deployment-order change between plan and
 // rollup — which would map the reviewed baseline onto a different deployment —
 // fails closed rather than being compared against the wrong live schema.
-func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) ([]DeploymentPlanDiff, error) {
-	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		return nil, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
+func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string, targets []routing.ExecutionTarget) ([]DeploymentPlanDiff, error) {
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no deployment targets for %s/%s", req.Database, req.Environment)
 	}
 
 	// Reusing primaryPlan for the primary member assumes it was created against

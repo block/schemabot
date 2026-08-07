@@ -169,8 +169,9 @@ error. Uncertainty is never converted into a passing check. A check run belongs
 to one commit SHA, so stale work from an older commit can never satisfy branch
 protection for a newer PR head.
 
-**Environment ordering.** PR comment applies follow the server-owned promotion
-order (`environment_order`, default staging before production). Production
+**Environment ordering.** PR comment applies follow the database's effective
+promotion order (its `environment_order` override when set, otherwise the
+server-wide `environment_order`; default staging before production). Production
 applies are blocked until the prior environment's check state is `success`. When
 another SchemaBot deployment owns the prior environment, the gate reads that
 environment's aggregate check run from GitHub — check runs are the shared
@@ -663,6 +664,8 @@ In a multi-pod deployment, every SchemaBot pod runs its own operator. Each opera
 
 The storage arrows represent operator coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
+**An idle SchemaBot is never query-idle.** Polling is how drivers find work: every pod's drivers scan storage on each poll tick — claim queries with `FOR UPDATE SKIP LOCKED`, plus pending-stop and ordered-cutover precedence checks — whether or not any applies exist. The result is a steady baseline of query traffic against the storage database that scales with pods × drivers, even when no schema change is running. This is expected claim-loop traffic, not a leak or a stuck apply. To check whether a deployment is actually busy, look for non-terminal applies (`schemabot status`) rather than storage query volume. If the idle baseline ever matters, replica count and `drivers` are the knobs.
+
 A **claim** is an atomic storage operation: it selects one apply that needs work,
 refreshes its `updated_at` heartbeat, and rotates an apply lease token in the
 same transaction. The heartbeat timestamp decides when another driver may try to
@@ -722,13 +725,13 @@ store pending apply + tasks
 best-effort operator wake
       |
       v
-driver calls FindNextApply()
+driver calls FindNextApplyOperation()
       |
       v
-claim row + refresh heartbeat
+claim operation row + parent apply lease
       |
       v
-TernClient.ResumeApply()
+TernClient.ResumeApplyOperation()
       |
       v
 dispatch through LocalClient or GRPCClient

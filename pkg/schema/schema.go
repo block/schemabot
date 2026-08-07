@@ -1,13 +1,6 @@
 // Package schema provides embedded SQL schema files and shared schema types
-// for SchemaBot storage.
-//
-// Tables:
-//   - locks: Deployment locks
-//   - checks: Schema check tracking
-//   - settings: Runtime settings
-//   - plans: Schema change plans
-//   - tasks: Schema change tasks
-//   - apply_operations: Per-(apply, deployment) child rows for multi-deployment applies
+// for SchemaBot storage. Each storage table has one file per dialect
+// directory; see mysql/ and postgres/.
 package schema
 
 import "embed"
@@ -17,6 +10,19 @@ import "embed"
 //
 //go:embed mysql/*.sql
 var MySQLFS embed.FS
+
+// PostgresFS contains the embedded SQL schema files for SchemaBot's own
+// storage tables on PostgreSQL. Each file holds one CREATE TABLE statement
+// followed by its CREATE INDEX statements, separated by semicolons — plain
+// statements only, with no comments, dollar-quoted blocks, or E-strings (the
+// schema lint tests pin this, and the statement-level lints in this package
+// parse the files line-by-line assuming it). The files mirror the MySQL
+// schema table-for-table and column-for-column; updated_at stamping is the
+// application's responsibility on PostgreSQL (there is no
+// ON UPDATE CURRENT_TIMESTAMP equivalent and no trigger is installed).
+//
+//go:embed postgres/*.sql
+var PostgresFS embed.FS
 
 // SchemaFiles maps namespace names to their file contents.
 // The namespace key is engine-specific:

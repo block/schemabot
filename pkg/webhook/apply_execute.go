@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -23,7 +24,7 @@ func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
-	result CommandResult, storedPlan *storage.Plan,
+	result CommandResult, storedPlan *storage.Plan, expectedPendingPlanID string,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -49,16 +50,50 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// No changes — release lock and notify. Use owner-scoped Release so we
-	// can't clobber a lock that has changed ownership since this handler
-	// acquired it; ErrLockNotFound / ErrLockNotOwned are expected.
-	if len(planResp.FlatTables()) == 0 {
-		lockOwner := fmt.Sprintf("%s#%d", repo, pr)
-		relErr := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner)
-		if relErr != nil && !errors.Is(relErr, storage.ErrLockNotFound) && !errors.Is(relErr, storage.ErrLockNotOwned) {
-			h.logger.Error("failed to release lock after no-changes confirm",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "error", relErr)
-		}
+	// Revalidate the PR before interpreting the re-plan. The earlier handler
+	// checks provide fast rejection, but the re-plan can be retried and the
+	// base branch or PR HEAD can advance while it runs. A stale snapshot must
+	// be rejected before any plan-derived response — the "no changes" release,
+	// the drift downgrade, and especially the unsafe-change prompt would all
+	// misread DDL that is only an artifact of the stale branch.
+	actionName := action.ApplyConfirm
+	if storedPlan != nil {
+		actionName = action.Apply
+	}
+	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("apply rejected: failed final PR freshness fetch",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "action", actionName, "error", err)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final PR freshness fetch failure")
+		return
+	}
+	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, freshPRInfo.HeadSHA, environment, requestedBy, actionName); rejected {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
+		return
+	}
+	// executeApply runs past the durable hand-off boundary, so a verification
+	// failure and a verified-stale rejection both stop the apply here and
+	// release the observed lock intent; the gate has already logged and
+	// posted the distinction, and the user's recovery is re-issuing the
+	// command.
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	if freshnessErr != nil {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
+		return
+	}
+	if rejected {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
+		return
+	}
+
+	// No changes (neither table DDL nor a VSchema update) — release the lock
+	// (keyed on the pending intent this handler observed, so a lock re-pinned by
+	// a newer plan is preserved) and notify.
+	if !planResp.HasChanges() {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
 		// the schema check reflects that the target is up to date, the same as the
@@ -73,15 +108,54 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// Engine-blocked changes reject the apply outright — the re-plan may have
+	// resolved a change to blocked even if the reviewed plan had none (e.g.
+	// the direct execution policy changed, or the table grew past its bound).
+	// Release the lock: no retry of this command can succeed, so holding it
+	// would only force a manual unlock after the schema is rewritten.
+	if planResp.HasBlockedChanges() {
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+		return
+	}
+
 	// Automatic apply DDL drift check: if the re-plan DDL differs from the stored auto-plan,
 	// downgrade to manual confirmation so the user reviews the new plan.
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-		commentData.IsLocked = true
-		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Schema changes differ from auto-plan — review and confirm manually")
+		return
+	}
+
+	// Direct-execution changes never run from the automatic apply path: the
+	// operator must confirm the blocking, non-revertible native DDL against
+	// the locked plan comment that discloses it, so downgrade to manual
+	// confirmation.
+	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
+		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Plan contains direct-execution changes — review the disclosure and confirm manually")
+		return
+	}
+
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// plan has no cutover to defer, so reject the flag instead of silently
+	// ignoring it. Only apply-confirm reaches this gate (the apply command
+	// rejects the flag before locking, and an automatic apply whose re-plan
+	// carries direct changes downgrades above), so keep the lock: it still
+	// pins the plan the operator confirmed against, and re-running
+	// apply-confirm without the flag executes it.
+	if result.DeferCutover && planResp.AllChangesDirect() {
+		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
 		return
 	}
 
@@ -128,67 +202,45 @@ func (h *Handler) executeApply(
 		InstallationID: installationID,
 		DeferCutover:   options["defer_cutover"] == "true",
 		SupportChannel: h.supportChannel(),
+		Tenant:         h.deploymentTenant(),
 		Logger:         h.logger,
 		OnTerminalHook: func(apply *storage.Apply) {
-			updated, err := h.updateCheckRecordForApplyResult(context.Background(), repo, pr, apply)
-			if err != nil {
-				h.logger.Error("observer: failed to update check record",
-					append(apply.LogAttrs(), "error", err)...)
-				return
-			}
-			if !updated {
-				h.logger.Debug("observer: skipping aggregate check update, apply no longer owns check state",
-					"repo", repo, "pr", pr, "apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-				return
-			}
-			ghInstClient, err := factory.ForInstallation(installationID)
-			if err != nil {
-				h.logger.Error("observer: failed to create GitHub client",
-					append(apply.LogAttrs(),
-						"installation_id", installationID, "error", err)...)
-				return
-			}
-			checkRecord, err := h.service.Storage().Checks().Get(context.Background(), repo, pr, apply.Environment, apply.DatabaseType, apply.Database)
-			if err != nil {
-				h.logger.Error("observer: failed to load check record for aggregate update",
-					"repo", repo, "pr", pr, "database", apply.Database,
-					"database_type", apply.DatabaseType, "environment", apply.Environment,
-					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier,
-					"error", err)
-				return
-			}
-			if checkRecord == nil {
-				h.logger.Warn("observer: check record missing for aggregate update",
-					"repo", repo, "pr", pr, "database", apply.Database,
-					"database_type", apply.DatabaseType, "environment", apply.Environment,
-					"apply_id", apply.ID, "apply_identifier", apply.ApplyIdentifier)
-				return
-			}
-			h.updateAggregateCheck(context.Background(), ghInstClient, repo, pr, checkRecord.HeadSHA)
+			// refreshChecksForTerminalApply routes a completed rollback straight
+			// to action_required. The observer registered here can be consumed by
+			// a rollback apply (pending observers share a per-target key), so the
+			// terminal ordering must honor the rollback intent from the durable
+			// apply, not from the command that registered the observer.
+			h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
 		},
 	})
 	h.service.SetPendingObserver(database, "", environment, observer)
 
 	applyReq := api.ApplyRequest{
-		PlanID:         planResp.PlanID,
-		Environment:    environment,
-		Options:        options,
-		Caller:         caller,
-		InstallationID: installationID,
+		PlanID:                planResp.PlanID,
+		Environment:           environment,
+		Options:               options,
+		Caller:                caller,
+		InstallationID:        installationID,
+		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
+		ExpectedPendingPlanID: expectedPendingPlanID,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to execute apply: "+err.Error())
+		message := "Failed to execute apply. See SchemaBot server logs for details."
+		if errors.Is(err, storage.ErrLockIntentChanged) {
+			message = "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
+		}
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
 		return
 	}
 
 	if !applyResp.Accepted {
 		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Info("apply rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was not accepted: "+applyResp.ErrorMessage)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, "The apply was not accepted. See SchemaBot server logs for details.")
 		return
 	}
 
@@ -209,14 +261,14 @@ func (h *Handler) executeApply(
 		h.logger.Error("failed to load apply after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			"apply_id", applyResp.ApplyID, "error", err)
 		return
 	}
 	if apply == nil {
 		h.logger.Error("apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID)
+			"apply_id", applyResp.ApplyID)
 		return
 	}
 
@@ -232,41 +284,136 @@ func (h *Handler) executeApply(
 		State:       apply.State,
 		Engine:      schemaResult.Type,
 	})
-	h.postInitialProgressComment(ctx, repo, pr, installationID, applyID, progressBody)
+	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, applyID); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
-			"repo", repo, "pr", pr, "database", database,
-			"database_type", schemaResult.Type, "environment", environment,
-			"apply_id", applyID, "error", err)
+			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
 }
 
-// ddlMatchesStoredPlan compares the re-plan DDL against a previously stored plan.
-// Uses order-independent comparison since FlatTables() and FlatDDLChanges() may
-// return statements in different order.
-func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) bool {
-	newDDL := planResp.FlatTables()
-	storedDDL := storedPlan.FlatDDLChanges()
+// postAutoConfirmDowngrade posts the locked plan comment that pauses an
+// automatic apply for manual confirmation. It carries the original command's
+// flags and the lock owner so the coached apply-confirm command re-issues the
+// operator's full intent and the comment shows who holds the lock.
+func (h *Handler) postAutoConfirmDowngrade(
+	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
+) {
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+	commentData.IsLocked = true
+	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
+	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeferCutover = result.DeferCutover
+	commentData.SkipRevert = result.SkipRevert
+	commentData.AutoConfirmDowngradeReason = reason
+	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+}
 
-	if len(newDDL) != len(storedDDL) {
+// releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a
+// pre-execution gate rejected (or obviated) the apply, but only while the lock
+// still carries the exact pending intent the rejecting handler observed. A lock
+// whose pending plan has since changed — e.g. a rollback plan re-pinned it while
+// the gate ran — belongs to that newer intent and is preserved. The reason names
+// the gate that triggered the release so logs distinguish the call sites.
+func (h *Handler) releaseApplyLockIfIntentUnchanged(ctx context.Context, repo string, pr int, database, dbType, environment, expectedPendingPlanID, reason string) {
+	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
+	released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, expectedPendingPlanID)
+	if relErr != nil {
+		h.logger.Error("failed to release apply lock after pre-execution rejection",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "reason", reason, "error", relErr)
+		return
+	}
+	if !released {
+		h.logger.Info("preserved apply lock after pre-execution rejection because its pending intent changed",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "reason", reason,
+			"expected_pending_plan_id", expectedPendingPlanID)
+	}
+}
+
+// planChangeIdentity is the drift-comparison key for a single table change. A
+// bare DDL string is not enough: the same DDL text can move between namespaces,
+// tables, or operations (e.g. one keyspace dropping a table and another creating
+// it), which a DDL-only multiset would treat as unchanged and auto-apply. The
+// full identity is what the operator reviewed, so drift must be judged on it.
+type planChangeIdentity struct {
+	namespace string
+	table     string
+	operation string
+	ddl       string
+}
+
+// ddlMatchesStoredPlan reports whether the re-plan describes the same set of
+// table changes the operator reviewed in storedPlan. Comparison is
+// order-independent (the flattening helpers may emit changes in different order)
+// and keyed on the full change identity, not DDL text alone. Any mismatch means
+// drift, and the caller downgrades an automatic apply to manual confirmation —
+// so this errs toward requiring re-review, never toward silently applying a
+// changed plan.
+func ddlMatchesStoredPlan(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) bool {
+	newChanges := responsePlanIdentities(planResp)
+	storedChanges := storedPlanIdentities(storedPlan)
+
+	if len(newChanges) != len(storedChanges) {
 		return false
 	}
 
-	// Build a set of DDL strings from the stored plan
-	storedSet := make(map[string]int, len(storedDDL))
-	for _, s := range storedDDL {
-		storedSet[s.DDL]++
-	}
-
-	for _, n := range newDDL {
-		if storedSet[n.DDL] <= 0 {
+	for identity, count := range newChanges {
+		if storedChanges[identity] != count {
 			return false
 		}
-		storedSet[n.DDL]--
 	}
 	return true
+}
+
+// responsePlanIdentities builds the change-identity multiset from a re-plan
+// response. Namespace comes from the SchemaChangeResponse grouping (the
+// authoritative source; FlatTables() does not carry it onto each change) and is
+// normalized the same way the stored plan is — an empty namespace becomes
+// "default" — so the two multisets are keyed identically.
+func responsePlanIdentities(planResp *apitypes.PlanResponse) map[planChangeIdentity]int {
+	identities := make(map[planChangeIdentity]int)
+	for _, sc := range planResp.Changes {
+		namespace := normalizePlanNamespace(sc.Namespace)
+		for _, tc := range sc.TableChanges {
+			identities[planChangeIdentity{
+				namespace: namespace,
+				table:     tc.TableName,
+				operation: strings.ToLower(tc.ChangeType),
+				ddl:       tc.DDL,
+			}]++
+		}
+	}
+	return identities
+}
+
+// storedPlanIdentities builds the change-identity multiset from a stored plan.
+// FlatDDLChanges backfills each change's namespace from its map key, which the
+// store already normalized (empty → "default"), so it matches the response side.
+func storedPlanIdentities(storedPlan *storage.Plan) map[planChangeIdentity]int {
+	identities := make(map[planChangeIdentity]int)
+	for _, tc := range storedPlan.FlatDDLChanges() {
+		identities[planChangeIdentity{
+			namespace: normalizePlanNamespace(tc.Namespace),
+			table:     tc.Table,
+			operation: strings.ToLower(tc.Operation),
+			ddl:       tc.DDL,
+		}]++
+	}
+	return identities
+}
+
+// normalizePlanNamespace mirrors the store's namespace handling so a plan whose
+// proto namespace is empty (persisted as "default") compares equal to the
+// re-plan response that still carries the empty grouping namespace.
+func normalizePlanNamespace(namespace string) string {
+	if namespace == "" {
+		return "default"
+	}
+	return namespace
 }

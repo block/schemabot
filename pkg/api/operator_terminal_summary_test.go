@@ -72,18 +72,16 @@ type recordedTerminalSummary struct {
 	tasks []*storage.Task
 }
 
-// TestPublishTerminalSummaryIfWon_Gating verifies the publisher only fires for a
-// multi-operation apply that just won the non-terminal→terminal projection CAS,
-// and is an inert no-op for single-operation applies and non-terminal results so
-// the legacy per-driver observer path is never disturbed.
+// TestPublishTerminalSummaryIfWon_Gating verifies the publisher only fires when
+// this drive won the non-terminal→terminal projection CAS: a result that did not
+// terminalize the parent is an inert no-op, whatever the operation count.
 func TestPublishTerminalSummaryIfWon_Gating(t *testing.T) {
 	cases := []struct {
 		name   string
 		result applyProjectionResult
 	}{
-		{"not terminal", applyProjectionResult{BecameTerminal: false, OperationCount: 2}},
-		{"single operation", applyProjectionResult{BecameTerminal: true, OperationCount: 1}},
-		{"zero operations", applyProjectionResult{BecameTerminal: true, OperationCount: 0}},
+		{"not terminal multi operation", applyProjectionResult{BecameTerminal: false, OperationCount: 2}},
+		{"not terminal single operation", applyProjectionResult{BecameTerminal: false, OperationCount: 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -104,6 +102,33 @@ func TestPublishTerminalSummaryIfWon_Gating(t *testing.T) {
 			assert.False(t, taskStore.called, "must not reload tasks for a gated case")
 		})
 	}
+}
+
+// TestPublishTerminalSummaryIfWon_SingleOperationStopped verifies the CAS winner
+// publishes for a single-operation apply that settled stopped — the stop
+// reconciliation path, where no live per-driver observer remains to post the
+// stopped summary. The publisher receives the reloaded stopped apply.
+func TestPublishTerminalSummaryIfWon_SingleOperationStopped(t *testing.T) {
+	stoppedApply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-x", Database: "db", Environment: "staging", State: state.Apply.Stopped}
+	tasks := []*storage.Task{{ID: 1, ApplyID: 7, TableName: "users", State: state.Task.Stopped}}
+	applyStore := &terminalSummaryApplyStore{apply: stoppedApply}
+	taskStore := &terminalSummaryTaskStore{tasks: tasks}
+	svc := newTerminalSummaryTestService(applyStore, taskStore)
+
+	var recorded []recordedTerminalSummary
+	svc.OnApplyTerminalSummary = func(_ context.Context, a *storage.Apply, ts []*storage.Task) error {
+		recorded = append(recorded, recordedTerminalSummary{apply: a, tasks: ts})
+		return nil
+	}
+
+	preCAS := &storage.Apply{ID: 7, ApplyIdentifier: "apply-x", State: state.Apply.Pending}
+	svc.publishTerminalSummaryIfWon(t.Context(), 1, preCAS,
+		applyProjectionResult{BecameTerminal: true, OperationCount: 1, DerivedState: state.Apply.Stopped})
+
+	require.Len(t, recorded, 1, "publisher must fire exactly once for a stopped single-operation apply")
+	assert.Same(t, stoppedApply, recorded[0].apply, "publisher receives the reloaded stopped apply")
+	assert.Equal(t, state.Apply.Stopped, recorded[0].apply.State)
+	assert.Len(t, recorded[0].tasks, 1)
 }
 
 // TestPublishTerminalSummaryIfWon_NilCallback verifies a missing publisher is a

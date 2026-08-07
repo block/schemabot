@@ -33,10 +33,14 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
+| `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
 | `schemabot.operator.claim_duration_seconds` | Histogram | database, environment, previous_state | Operator claim and resume duration |
+| `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
+| `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
+| `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |
 | `schemabot.pending_drops.cleanup_skipped_total` | Counter | database, environment | Quarantined tables skipped by the cleaner due to unparseable names |
@@ -44,6 +48,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.pending_drops.cleanup_errors_total` | Counter | database, environment, reason | Pending drops cleanup failures (retried on the next pass) |
 
 > **Deprecated aliases:** the `schemabot.scheduler.*` series (`resumed_total`, `resume_failures_total`, `claim_failures_total`, `claim_duration_seconds`) is still emitted alongside the `schemabot.operator.*` series for one release so dashboards and alerts can migrate. The scheduler-named series will be removed afterward.
+
+> **`stuck_pending_applies` is per-pod, not fleet-wide:** every pod running the server runs the stuck-pending monitor (there is no leader election, matching the inbox-depth and health monitors), so each pod reports the same DB-wide count as its own series. Aggregate with `max()`/`avg()`, not `sum()`, and expect the paired WARN log to fire from every pod each scan while anything is stuck.
 
 ### Attribute Values
 
@@ -95,7 +101,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `unknown`
 
-**reason** (operator claim failures): `storage_error`, `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_lease_release_error`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 
@@ -238,6 +244,41 @@ Operation values:
 |---|---|
 | `acquire` | Try to acquire the database lock for a plan/apply workflow. |
 | `release` | Try to release the database lock, either by owner or administrative override. |
+
+### Direct Write Authorization
+
+`schemabot.direct_write_authorization.total` tracks per-database direct-write
+(CLI/API) authorization decisions made at the handler layer, after the
+forward-auth middleware has admitted the caller to the write tier. A spike in
+`status=denied` means scoped operators are attempting operations outside their
+grant — the `reason` attribute says whether the target database, the
+environment, or the group membership mismatched.
+
+Status values: `allowed`, `denied`, and `skipped` (the decision could not reach
+an authorization outcome — for example the stored plan lookup failed — and the
+request was rejected by the operation's own error path instead).
+
+Reason values:
+
+| Reason | Meaning |
+|---|---|
+| `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `admin_allow` | Allowed via deployment `write_groups` membership. |
+| `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
+| `missing_identity` | No authenticated user in the request context. |
+| `not_admin` | Caller is not in `write_groups` (and, for admin-only operations, has no other path). |
+| `not_database_operator` | Caller's groups do not match the target database's `operator_groups`. |
+| `environment_not_allowed` | Target environment is outside `operator_environments`. |
+| `missing_database_config` | The target database is not configured. |
+
+Operation names mirror the mutating endpoints (`plan`, `apply`, control
+operations, `lock_acquire`/`lock_release`/`lock_force_release`, and the
+admin-only `checks_*`, `webhook_redrive`, `settings_set`). Unrecognized
+operation, status, or reason values are recorded as `unknown` to keep
+cardinality bounded. `database` and `environment` use the `unknown` sentinel
+when the operation has no such dimension (admin-only operations have no single
+target database; lock operations have no environment) or when the request
+failed before the target resolved.
 
 ## HTTP Server Metrics
 

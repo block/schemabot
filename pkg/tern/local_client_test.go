@@ -2,18 +2,20 @@ package tern
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
@@ -31,6 +33,39 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
+
+func TestLocalClientLogsValidationAndConversion(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{storage: &mockStorage{applies: &mockApplyStore{}, logs: logs}}
+
+	_, err := client.Logs(t.Context(), nil)
+	require.EqualError(t, err, "logs request is required")
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{})
+	require.EqualError(t, err, "apply_id is required")
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "missing"})
+	require.ErrorIs(t, err, storage.ErrApplyNotFound)
+
+	taskID := int64(42)
+	createdAt := time.Date(2026, 7, 17, 1, 2, 3, 4, time.FixedZone("offset", 3600))
+	logs.logs = []*storage.ApplyLog{{ID: 7, TaskID: &taskID, Level: "info", EventType: "state", Source: "driver", Message: "ready", OldState: "pending", NewState: "running", Metadata: json.RawMessage(`{"shard":"-80"}`), CreatedAt: createdAt}}
+	client.storage = &mockStorage{applies: &mockApplyStore{apply: &storage.Apply{ID: 9}}, logs: logs}
+
+	resp, err := client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a"})
+	require.NoError(t, err)
+	assert.Equal(t, 50, logs.recentLimit)
+	require.Len(t, resp.Logs, 1)
+	assert.Equal(t, int64(7), resp.Logs[0].Id)
+	assert.Equal(t, &taskID, resp.Logs[0].TaskId)
+	assert.Equal(t, []byte(`{"shard":"-80"}`), resp.Logs[0].MetadataJson)
+	assert.Equal(t, createdAt.UTC().Format(time.RFC3339Nano), resp.Logs[0].CreatedAt)
+	assert.Equal(t, "driver", resp.Logs[0].Source)
+	assert.Equal(t, "pending", resp.Logs[0].OldState)
+	assert.Equal(t, "running", resp.Logs[0].NewState)
+
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: maxLogsLimit + 1})
+	require.NoError(t, err)
+	assert.Equal(t, maxLogsLimit, logs.recentLimit)
 }
 
 type pullSchemaPSClient struct {
@@ -345,9 +380,12 @@ func (s *exactProgressTaskStore) GetShardProgressByApplyOperationID(_ context.Co
 type fakeControlEngine struct {
 	engine.Engine
 	stopCount               int
+	stopErr                 error
 	cancelCount             int
+	cancelErr               error
 	startCount              int
 	cutoverCount            int
+	volumeCount             int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
 	progressReq             *engine.ProgressRequest
@@ -392,11 +430,17 @@ func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequ
 
 func (e *fakeControlEngine) Stop(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.stopCount++
+	if e.stopErr != nil {
+		return nil, e.stopErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.cancelCount++
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -422,6 +466,7 @@ func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) 
 }
 
 func (e *fakeControlEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	e.volumeCount++
 	return &engine.VolumeResult{Accepted: true}, nil
 }
 
@@ -432,10 +477,12 @@ type exactProgressStorage struct {
 	logs            storage.ApplyLogStore
 	controlRequests storage.ControlRequestStore
 	applyOperations storage.ApplyOperationStore
+	plans           storage.PlanStore
 }
 
 func (s *exactProgressStorage) Applies() storage.ApplyStore { return s.applies }
 func (s *exactProgressStorage) Tasks() storage.TaskStore    { return s.tasks }
+func (s *exactProgressStorage) Plans() storage.PlanStore    { return s.plans }
 func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	if s.logs != nil {
 		return s.logs
@@ -785,6 +832,33 @@ func TestGroupedResumeStateRequiresApplyOperationForVitess(t *testing.T) {
 	assert.Empty(t, resumeState.Metadata)
 }
 
+// A Vitess apply dwelling in a revert phase has engine work in flight by
+// definition, so absent persisted resume state cannot mean "start fresh" —
+// a fresh engine apply would re-deploy the reviewed schema change on top of
+// the revert. The resume must fail closed so recovery retries against intact
+// storage instead of re-applying reverted DDL.
+func TestGroupedResumeStateFailsClosedForRevertPhaseVitessApply(t *testing.T) {
+	operationID := int64(11)
+	for _, applyState := range []string{state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert} {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              4,
+				ApplyIdentifier: "apply-revert-phase",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				State:           applyState,
+			}
+			tasks := []*storage.Task{{TaskIdentifier: "task-a", ApplyOperationID: &operationID}}
+			client := groupedResumeStateClient(storage.DatabaseTypeVitess, &exactProgressApplyOperationStore{})
+
+			_, err := client.groupedResumeState(t.Context(), apply, tasks)
+			require.ErrorIs(t, err, errGroupedResumeStateUnavailable)
+			assert.ErrorContains(t, err, "apply-revert-phase")
+			assert.ErrorContains(t, err, applyState)
+		})
+	}
+}
+
 // reattachResumeFixture builds a Vitess apply that has already reattached to an
 // in-flight deploy request: the engine accepts the grouped resume, so the apply
 // owner must not write terminal failure when post-accept resume-state handling
@@ -902,6 +976,87 @@ func TestLaunchAtomicResumeMissingMetadataStaysRecoverable(t *testing.T) {
 	assert.NotEqual(t, state.Apply.Failed, applyStore.apply.State)
 }
 
+// A resumed apply whose tasks all reached reverted has no remaining engine
+// work, so the resume terminalizes it directly. The terminal state must be
+// derived from the task states — an apply whose schema changes were rolled
+// back finishes as reverted, never as a false completed success.
+func TestLaunchAtomicResumeAllRevertedTasksTerminalizeAsReverted(t *testing.T) {
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(&exactProgressApplyOperationStore{}, nil)
+	apply.State = state.Apply.Reverting
+	tasks[0].State = state.Task.Reverted
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", false, false, false)
+
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Reverted, applyStore.apply.State)
+	require.NotNil(t, applyStore.apply.CompletedAt)
+	assert.Equal(t, state.Task.Reverted, tasks[0].State, "terminal task state must not be rewritten by the resume")
+}
+
+// After the engine accepts a grouped Vitess apply, a deploy request is live on
+// the provider. A failure to persist the engine resume state is storage
+// uncertainty, not a failed schema change: the apply pauses for operator retry
+// so the resume path reattaches to the in-flight deploy request instead of
+// permanently failing an apply whose remote work is still running.
+func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-grouped-save-failure",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Engine:          storage.EnginePlanetScale,
+		State:           state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-grouped-save-failure",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeVitess,
+		Namespace:        "commerce",
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:        "alter",
+		State:            state.Task.Pending,
+	}}
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-grouped-save-failure",
+		Namespaces:     map[string]*storage.NamespacePlanData{"commerce": {}},
+	}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{saveErr: errors.New("storage unavailable")},
+		},
+		planetscaleEngine: &fakeControlEngine{applyResult: &engine.ApplyResult{
+			Accepted: true,
+			ResumeState: &engine.ResumeState{
+				MigrationContext: "ctx-grouped",
+				Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+			},
+		}},
+		heartbeatInterval: time.Hour,
+		logger:            slog.Default(),
+	}
+
+	client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false)
+
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.FailedRetryable),
+		"apply must pause for operator retry, got %s", applyStore.apply.State)
+	assert.Nil(t, applyStore.apply.CompletedAt)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "failed to save engine resume state")
+	for _, task := range tasks {
+		assert.True(t, state.IsState(task.State, state.Task.FailedRetryable),
+			"task must pause for operator retry, got %s", task.State)
+	}
+}
+
 // Rebuilt resume changes must preserve each task's namespace and table so
 // engines key per-table progress on the same identity the stored tasks carry.
 func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
@@ -918,15 +1073,15 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 	require.Len(t, changes[0].TableChanges, 2)
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[0].TableChanges[0].Operation)
 	assert.Equal(t, "orders", changes[0].TableChanges[1].Table)
 	assert.Equal(t, tasks[1].DDL, changes[0].TableChanges[1].DDL)
-	assert.Equal(t, statement.StatementCreateTable, changes[0].TableChanges[1].Operation)
+	assert.Equal(t, ddl.StatementCreateTable, changes[0].TableChanges[1].Operation)
 	assert.Equal(t, "billing", changes[1].Namespace)
 	require.Len(t, changes[1].TableChanges, 1)
 	assert.Equal(t, "invoices", changes[1].TableChanges[0].Table)
 	assert.Equal(t, tasks[2].DDL, changes[1].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[1].TableChanges[0].Operation)
 }
 
 // A resumed grouped apply rebuilds the engine changes from the stored DDL
@@ -944,7 +1099,7 @@ func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 	require.Len(t, changes[0].TableChanges, 1)
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[0].TableChanges[0].Operation)
 	for _, tc := range changes[0].TableChanges {
 		assert.NotEmpty(t, tc.DDL, "resume changes must not contain an empty-DDL table change")
 	}
@@ -967,11 +1122,11 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 	require.Len(t, commerce.TableChanges, 1)
 	assert.Equal(t, "users", commerce.TableChanges[0].Table)
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", commerce.TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, commerce.TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, commerce.TableChanges[0].Operation)
 	routing := byNamespace["routing"]
 	require.Len(t, routing.TableChanges, 1)
 	assert.Equal(t, "lookup", routing.TableChanges[0].Table)
-	assert.Equal(t, statement.StatementAlterTable, routing.TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, routing.TableChanges[0].Operation)
 }
 
 func TestTaskTargetShardsReturnsSortedUniqueShardSelector(t *testing.T) {
@@ -1093,6 +1248,135 @@ func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel requested: 1 tasks cancelled, 0 skipped (caller: cli:alice)"))
+}
+
+// A pending cancel can be consumed after the engine's schema change has
+// already reached its completed terminal state — the change landed before the
+// cancel arrived. The engine rejects the cancel as already-completed, and the
+// drive must settle the apply and its tasks to completed (the authoritative
+// engine outcome) and complete the durable cancel request. Leaving the request
+// pending would have the operator re-claim the apply and re-run the doomed
+// cancel on every poll forever.
+func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              321,
+		ApplyIdentifier: "apply-cancel-completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             654,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-completed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		cancelErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.cancelCount)
+	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not cancelled")
+	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the apply must adopt the engine's completed outcome, not cancelled")
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable cancel request must complete so the operator stops re-running the cancel")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
+}
+
+// The stop counterpart: a pending stop consumed after the engine's schema
+// change already completed settles the apply and its tasks to completed and
+// completes the durable stop request, instead of recording a landed change as
+// stopped or retrying a rejection that can never succeed.
+func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              322,
+		ApplyIdentifier: "apply-stop-completed",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             655,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-completed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		stopErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fakeEngine.stopCount)
+	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not stopped")
+	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
+	require.NotNil(t, task.CompletedAt)
+	assert.Equal(t, state.Apply.Completed, apply.State, "the apply must adopt the engine's completed outcome, not stopped")
+	require.NotNil(t, apply.CompletedAt)
+	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "the durable stop request must complete so the operator stops re-running the stop")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Stop arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
 }
 
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
@@ -1641,6 +1925,239 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
 	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
+}
+
+// A cutover request that the engine backend rejects because it has not yet
+// staged the cutover must stay pending: the drive retries it on the next
+// progress tick and the operator's command takes effect without being
+// re-issued. The rejected attempt records neither a trigger nor a failure in
+// the user-visible timeline — only the accepted attempt does.
+func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotReady(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              131,
+		ApplyIdentifier: "apply-cutover-not-ready-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             464,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-not-ready-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{cutoverErr: engine.NewNotReadyError("changes have not been staged")}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply))
+	assert.Equal(t, 1, fakeEngine.cutoverCount)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "a not-ready rejection must keep the cutover request pending for the next tick")
+	assert.Equal(t, storage.ControlRequestPending, pending.Status)
+	assert.False(t, hasLogMessageContaining(logs.logs, "Cutover failed"), "a not-ready rejection must not record a failure in the timeline")
+	assert.False(t, hasLogMessageContaining(logs.logs, "Cutover triggered"), "a rejected attempt must not record a trigger in the timeline")
+
+	// The backend finishes staging: the still-pending request is accepted on
+	// the next tick and completes.
+	fakeEngine.cutoverErr = nil
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply))
+	assert.Equal(t, 2, fakeEngine.cutoverCount)
+	pending, err = controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the accepted cutover must complete the pending request")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
+}
+
+// The drive's auto-cutover records one trigger in the timeline per drive and
+// retries quietly while the engine backend stages the cutover. A rejection
+// that outlives the staging window records a one-time timeline error and
+// escalates to Error logging on every further tick, so a backend that never
+// stages the cutover is visible to operators instead of idling; the retry
+// loop itself never stops, and an accepted cutover resets the escalation.
+func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              132,
+		ApplyIdentifier: "apply-auto-cutover-escalate",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	fakeEngine := &fakeControlEngine{cutoverErr: engine.NewNotReadyError("changes have not been staged")}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			logs:    logs,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+	controlReq := &engine.ControlRequest{Database: apply.Database}
+	pollState := &atomicPollState{}
+	start := time.Now()
+
+	// Within the staging window: retries stay quiet and the trigger event is
+	// recorded exactly once.
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start)
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(time.Second))
+	assert.Equal(t, 2, fakeEngine.cutoverCount)
+	assert.Equal(t, 1, countLogMessagesContaining(logs.logs, "Auto-triggering cutover"), "retries must not duplicate the trigger event")
+	assert.False(t, hasLogMessageContaining(logs.logs, "has not been accepted by the engine backend"), "no escalation within the staging window")
+
+	// Beyond the staging window: the timeline records the stall exactly once
+	// while the drive keeps retrying every tick.
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter))
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+time.Second))
+	assert.Equal(t, 4, fakeEngine.cutoverCount, "escalation must not stop the retry loop")
+	assert.Equal(t, 1, countLogMessagesContaining(logs.logs, "has not been accepted by the engine backend"), "the escalation event is recorded once")
+	for _, log := range logs.logs {
+		if strings.Contains(log.Message, "has not been accepted by the engine backend") {
+			assert.Equal(t, storage.LogLevelError, log.Level, "the escalation event must be operator-visible at Error level")
+		}
+	}
+
+	// The backend accepts: the not-ready tracking resets so a later staging
+	// window escalates on its own clock.
+	fakeEngine.cutoverErr = nil
+	client.autoTriggerCutover(t.Context(), fakeEngine, apply, nil, controlReq, pollState, start.Add(cutoverNotReadyEscalationAfter+2*time.Second))
+	assert.True(t, pollState.cutoverNotReadySince.IsZero(), "an accepted cutover must clear the not-ready clock")
+	assert.False(t, pollState.cutoverNotReadyEscalated, "an accepted cutover must re-arm the escalation event")
+	assert.Zero(t, pollState.consecutiveCutoverFailures, "not-ready rejections must not count as hard cutover failures")
+}
+
+// The drive is the sole cutover actor, so a cutover the backend keeps
+// rejecting with a hard error (revoked cutover permission, persistent API
+// rejection) cannot retry forever — that would pin the apply at
+// waiting_for_cutover holding the database's deploy queue and lock until a
+// human cancels. After the consecutive-failure bound the drive settles the
+// apply as failed and this owner exits, so the check gate stays closed and an
+// operator gets a settled apply to act on instead of a silent spin.
+func TestLocalClient_AutoTriggerCutoverFailsApplyAfterRepeatedHardRejections(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              133,
+		ApplyIdentifier: "apply-auto-cutover-hard-fail",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             465,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-auto-cutover-hard-fail",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	fakeEngine := &fakeControlEngine{cutoverErr: errors.New("apply deploy request: 403 cutover not permitted")}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:    logs,
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+	controlReq := &engine.ControlRequest{Database: apply.Database}
+	pollState := &atomicPollState{}
+	now := time.Now()
+
+	for i := 1; i < maxConsecutiveCutoverFailures; i++ {
+		require.False(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+			"the drive must keep retrying below the consecutive-failure bound (attempt %d)", i)
+		assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+	}
+
+	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+		"the drive owner must exit once the apply is settled")
+	assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
+	assert.Equal(t, state.Apply.Failed, apply.State, "repeated hard rejections must settle the apply as failed")
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, apply.ErrorMessage, "cutover failed after 10 consecutive attempts")
+	assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
+}
+
+// A cutover rejection the engine classifies as permanent (the deploy request
+// no longer exists) can never succeed on retry, so the drive fails the apply
+// on the first rejection instead of burning the consecutive-failure bound.
+func TestLocalClient_AutoTriggerCutoverFailsApplyImmediatelyOnPermanentError(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              134,
+		ApplyIdentifier: "apply-auto-cutover-permanent",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             466,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-auto-cutover-permanent",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	fakeEngine := &fakeControlEngine{cutoverErr: engine.NewPermanentError("deploy request not found")}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:    &mockApplyLogStore{},
+		},
+		planetscaleEngine: fakeEngine,
+		logger:            slog.Default(),
+	}
+
+	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, &engine.ControlRequest{Database: apply.Database}, &atomicPollState{}, time.Now()),
+		"a permanent rejection must settle the apply on the first attempt")
+	assert.Equal(t, 1, fakeEngine.cutoverCount)
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Equal(t, state.Task.Failed, task.State)
+	assert.Contains(t, apply.ErrorMessage, "deploy request not found")
+}
+
+func countLogMessagesContaining(logs []*storage.ApplyLog, want string) int {
+	count := 0
+	for _, log := range logs {
+		if strings.Contains(log.Message, want) {
+			count++
+		}
+	}
+	return count
 }
 
 func TestLocalClient_StopRejectsVitessCancelledApply(t *testing.T) {
@@ -2568,15 +3085,20 @@ type capturedLog struct {
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
-// tests can assert on level, message, and attributes.
+// tests can assert on level, message, and attributes — including attrs bound
+// with Logger.With, so tests can prove bound-logger inheritance.
 type captureHandler struct {
 	records *[]capturedLog
+	bound   []slog.Attr
 }
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
-	attrs := make(map[string]any, r.NumAttrs())
+	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	for _, a := range h.bound {
+		attrs[a.Key] = a.Value.Any()
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
 		return true
@@ -2585,8 +3107,24 @@ func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+func (h captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.bound = append(slices.Clip(h.bound), attrs...)
+	return h
+}
+func (h captureHandler) WithGroup(string) slog.Handler { return h }
+
+// requireCapturedLog returns the first captured record with the given message,
+// failing the test when none exists.
+func requireCapturedLog(t *testing.T, records []capturedLog, msg string) capturedLog {
+	t.Helper()
+	for _, rec := range records {
+		if rec.msg == msg {
+			return rec
+		}
+	}
+	t.Fatalf("expected a log record with message %q; got %d records", msg, len(records))
+	return capturedLog{}
+}
 
 // A canonical, positive revert_window_duration in metadata is honored, while an
 // empty value falls back to the engine default. A malformed or non-positive
@@ -2619,7 +3157,7 @@ func TestLocalClient_RevertWindowDuration(t *testing.T) {
 				logger: slog.New(captureHandler{records: &records}),
 			}
 
-			got := client.revertWindowDuration()
+			got := client.revertWindowDuration(client.logger.With("database", client.config.Database))
 			assert.Equal(t, tc.want, got)
 
 			var warnings []capturedLog
@@ -2682,11 +3220,12 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 			TargetDSN: "root@tcp(localhost:3306)/orders_schema",
 		}, logger: slog.Default()}
 
-		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		creds, physical, err := c.credentialsForMySQLPullNamespace("orders_schema")
 		require.NoError(t, err)
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+		assert.Equal(t, "orders_schema", physical)
 
-		_, err = c.credentialsForMySQLPullNamespace("audit_schema")
+		_, _, err = c.credentialsForMySQLPullNamespace("audit_schema")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "does not match requested namespace")
 	})
@@ -2697,9 +3236,10 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 			TargetDSN: "root@tcp(localhost:3306)/",
 		}, logger: slog.Default()}
 
-		creds, err := c.credentialsForMySQLPullNamespace("orders_schema")
+		creds, physical, err := c.credentialsForMySQLPullNamespace("orders_schema")
 		require.NoError(t, err)
 		assert.Equal(t, "root@tcp(localhost:3306)/orders_schema", creds.DSN)
+		assert.Equal(t, "orders_schema", physical)
 	})
 
 	t.Run("namespace-free DSN without a namespace is an error", func(t *testing.T) {
@@ -2765,6 +3305,172 @@ func TestLocalClient_CredentialsNamespaceResolution(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "vtgate-dsn", creds.DSN)
 		assert.Equal(t, "acme", creds.Metadata["organization"])
+	})
+}
+
+// recordingSignalChecker records the deferred cutover signal request so tests
+// can assert the request database stays canonical while the credentials DSN
+// carries the physical schema.
+type recordingSignalChecker struct {
+	engine.Engine
+	req *engine.DeferredCutoverSignalRequest
+}
+
+func (e *recordingSignalChecker) DeferredCutoverSignalExists(_ context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {
+	e.req = req
+	return true, nil
+}
+
+// Per-deployment schema overrides map a requested (canonical) MySQL namespace
+// to the physical schema name at the data-plane seam: the canonical name stays
+// in requests, plans, tasks, and pull responses; the physical name only enters
+// the connection schema. A non-empty map is a strict allowlist and requires a
+// namespace-free target DSN.
+func TestLocalClient_SchemaOverrides(t *testing.T) {
+	overrides := map[string]string{"bikeshare": "bikeshare_eu_qa"}
+	newClient := func() *LocalClient {
+		return &LocalClient{config: LocalConfig{
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: overrides,
+		}, logger: slog.Default()}
+	}
+
+	t.Run("credentials inject the mapped physical schema", func(t *testing.T) {
+		creds, err := newClient().credentialsForMySQLNamespace("bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("unmapped canonical namespace fails closed", func(t *testing.T) {
+		_, err := newClient().credentialsForMySQLNamespace("orders")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not authorize MySQL namespace")
+	})
+
+	t.Run("pull credentials inject the mapped physical schema", func(t *testing.T) {
+		creds, physical, err := newClient().credentialsForMySQLPullNamespace("bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+		assert.Equal(t, "bikeshare_eu_qa", physical)
+	})
+
+	t.Run("task credentials map the persisted canonical namespace", func(t *testing.T) {
+		creds, err := newClient().credentialsForTask(&storage.Task{Namespace: "bikeshare"})
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("grouped apply credentials map the plan namespace", func(t *testing.T) {
+		creds, err := newClient().credentialsForGroupedApply(&storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{"bikeshare": {}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", creds.DSN)
+	})
+
+	t.Run("namespace discovery returns canonical keys, not physical names", func(t *testing.T) {
+		namespaces, err := newClient().discoverPullNamespaces(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, []string{"bikeshare"}, namespaces)
+	})
+
+	t.Run("no overrides preserves identity mapping", func(t *testing.T) {
+		c := &LocalClient{config: LocalConfig{
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		}, logger: slog.Default()}
+
+		creds, err := c.credentialsForMySQLNamespace("bikeshare")
+		require.NoError(t, err)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare", creds.DSN)
+	})
+
+	t.Run("deferred cutover signal lookup sends physical DSN with canonical database", func(t *testing.T) {
+		checker := &recordingSignalChecker{}
+		c := &LocalClient{
+			config: LocalConfig{
+				Type:            storage.DatabaseTypeMySQL,
+				TargetDSN:       "root@tcp(localhost:3306)/",
+				SchemaOverrides: overrides,
+			},
+			spiritEngine: checker,
+			logger:       slog.Default(),
+		}
+
+		exists, supported, err := c.deferredCutoverSignalExists(t.Context(),
+			&storage.Apply{ApplyIdentifier: "apply-1", Database: "bikeshare"},
+			[]*storage.Task{{Namespace: "bikeshare"}},
+		)
+		require.NoError(t, err)
+		assert.True(t, supported)
+		assert.True(t, exists)
+		require.NotNil(t, checker.req)
+		assert.Equal(t, "bikeshare", checker.req.Database)
+		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", checker.req.Credentials.DSN)
+	})
+
+	t.Run("NewLocalClient rejects overrides for non-MySQL targets", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeVitess,
+			SchemaOverrides: overrides,
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "only supported for mysql")
+	})
+
+	t.Run("NewLocalClient rejects more than one mapping", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:  "bikeshare",
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{
+				"bikeshare": "bikeshare_eu_qa",
+				"orders":    "orders_eu_qa",
+			},
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "exactly one mapping")
+	})
+
+	t.Run("NewLocalClient rejects an empty physical schema name", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": ""},
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "must not be empty")
+	})
+
+	t.Run("NewLocalClient rejects an unsafe physical schema name", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": "bikeshare-eu-qa"},
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "unsupported character")
+	})
+
+	t.Run("NewLocalClient rejects overrides with a database-bearing DSN", func(t *testing.T) {
+		_, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/bikeshare_eu_qa",
+			SchemaOverrides: overrides,
+		}, nil, slog.Default())
+		require.ErrorContains(t, err, "namespace-free")
+	})
+
+	t.Run("NewLocalClient accepts overrides with a namespace-free DSN", func(t *testing.T) {
+		client, err := NewLocalClient(LocalConfig{
+			Database:        "bikeshare",
+			Type:            storage.DatabaseTypeMySQL,
+			TargetDSN:       "root@tcp(localhost:3306)/",
+			SchemaOverrides: overrides,
+		}, nil, slog.Default())
+		require.NoError(t, err)
+		require.NotNil(t, client)
 	})
 }
 
@@ -2948,4 +3654,116 @@ func TestLocalClient_VitessProgressRendersShardsFromStored(t *testing.T) {
 	for _, sh := range shards {
 		assert.NotEqual(t, "live-only", sh.Shard, "stored rows are preferred over the live engine result")
 	}
+}
+
+// Progress renders a non-sharded table's headline figures — rows, percent,
+// checksum progress, and ETA — from the stored task row the operator drive
+// maintains, so a running MySQL apply shows the same copy estimate on the CLI
+// and PR progress surfaces that the data plane computed.
+func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-nonsharded-eta",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:                  7,
+		ApplyID:             apply.ID,
+		TaskIdentifier:      "task-users",
+		Database:            "testdb",
+		DatabaseType:        storage.DatabaseTypeMySQL,
+		Engine:              storage.EngineSpirit,
+		TableName:           "users",
+		State:               state.Task.Running,
+		DDLAction:           "alter",
+		RowsCopied:          400,
+		RowsTotal:           1000,
+		ProgressPercent:     40,
+		ETASeconds:          90,
+		ChecksumRowsChecked: 10,
+		ChecksumRowsTotal:   1000,
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 1)
+
+	tp := progress.Tables[0]
+	assert.Equal(t, "users", tp.TableName)
+	assert.Equal(t, int32(40), tp.PercentComplete)
+	assert.Equal(t, int64(400), tp.RowsCopied)
+	assert.Equal(t, int64(1000), tp.RowsTotal)
+	assert.Equal(t, int64(90), tp.EtaSeconds, "ETA comes from the stored task row")
+	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
+	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
+	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
+}
+
+// Progress serves each table's own failure reason from its stored task row, so
+// a multi-table apply where one table failed (for example an engine preflight
+// rejection) reports the error on exactly that table — the control plane and
+// the PR comment can attribute the failure to the right table instead of
+// showing a bare failed row.
+func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-table-error",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+	}
+	failedTask := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-users",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "users",
+		State:          state.Task.Failed,
+		DDLAction:      "alter",
+		ErrorMessage:   "engine preflight: enumReorder check failed for table users",
+	}
+	completedTask := &storage.Task{
+		ID:             9,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-orders",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "orders",
+		State:          state.Task.Completed,
+		DDLAction:      "alter",
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 2)
+
+	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
+	for _, tp := range progress.Tables {
+		byTable[tp.TableName] = tp
+	}
+	require.Contains(t, byTable, "users")
+	require.Contains(t, byTable, "orders")
+	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
+	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
 }

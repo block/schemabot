@@ -5,13 +5,12 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 const vSchemaArtifactName = "vschema.json"
@@ -164,6 +163,23 @@ func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apityp
 	return result
 }
 
+// tableChangeResponseFromProto converts a proto table change to its HTTP API
+// form. This is the single proto→apitypes hop for table changes: every field —
+// identity, unsafe, and execution-mode annotations — is mapped here so a new
+// field crosses the boundary with one edit.
+func tableChangeResponseFromProto(t *ternv1.TableChange) *apitypes.TableChangeResponse {
+	return &apitypes.TableChangeResponse{
+		TableName:     t.TableName,
+		Namespace:     t.Namespace,
+		DDL:           t.Ddl,
+		ChangeType:    protoChangeTypeToOperation(t.ChangeType),
+		IsUnsafe:      t.IsUnsafe,
+		UnsafeReason:  t.UnsafeReason,
+		ExecutionMode: t.ExecutionMode,
+		ModeReason:    t.ModeReason,
+	}
+}
+
 // planResponseFromProto converts a protobuf PlanResponse to an HTTP PlanResponse.
 func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 	httpResp := &apitypes.PlanResponse{
@@ -184,14 +200,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 			Metadata:  sc.Metadata,
 		}
 		for _, t := range sc.TableChanges {
-			apiSC.TableChanges = append(apiSC.TableChanges, &apitypes.TableChangeResponse{
-				TableName:    t.TableName,
-				Namespace:    t.Namespace,
-				DDL:          t.Ddl,
-				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-			})
+			apiSC.TableChanges = append(apiSC.TableChanges, tableChangeResponseFromProto(t))
 		}
 		httpResp.Changes = append(httpResp.Changes, apiSC)
 	}
@@ -219,14 +228,7 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 			if t == nil {
 				continue
 			}
-			apiSP.Changes = append(apiSP.Changes, &apitypes.TableChangeResponse{
-				TableName:    t.TableName,
-				Namespace:    t.Namespace,
-				DDL:          t.Ddl,
-				ChangeType:   protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-			})
+			apiSP.Changes = append(apiSP.Changes, tableChangeResponseFromProto(t))
 		}
 		// An empty shard plan is a shard that already matches the desired schema
 		// while sibling shards change (a partially-applied keyspace). Keep it so the
@@ -257,13 +259,7 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 		}
 		nsData := &storage.NamespacePlanData{}
 		for _, t := range sc.TableChanges {
-			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:        t.TableName,
-				DDL:          t.Ddl,
-				Operation:    protoChangeTypeToOperation(t.ChangeType),
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-			})
+			nsData.Tables = append(nsData.Tables, tern.StorageTableChangeFromProto(t, "", t.TableName, t.Ddl, protoChangeTypeToOperation(t.ChangeType)))
 		}
 		if len(sc.OriginalFiles) > 0 {
 			nsData.OriginalFiles = sc.OriginalFiles
@@ -332,14 +328,7 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 			if cn := strings.TrimSpace(ch.Namespace); cn != "" && cn != namespace {
 				return nil, fmt.Errorf("shard plan %d shard %q change %d (table %q) namespace %q disagrees with shard namespace %q", i, shardName, j, table, cn, namespace)
 			}
-			sp.Changes = append(sp.Changes, storage.TableChange{
-				Namespace:    namespace,
-				Table:        table,
-				DDL:          changeDDL,
-				Operation:    protoChangeTypeToOperation(ch.ChangeType),
-				IsUnsafe:     ch.IsUnsafe,
-				UnsafeReason: ch.UnsafeReason,
-			})
+			sp.Changes = append(sp.Changes, tern.StorageTableChangeFromProto(ch, namespace, table, changeDDL, protoChangeTypeToOperation(ch.ChangeType)))
 		}
 		out = append(out, sp)
 	}
@@ -350,11 +339,11 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 	switch ct {
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
@@ -368,11 +357,11 @@ func changeTypeToProto(op string) ternv1.ChangeType {
 		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
 	}
 	switch ddl.OpToStatementType(op) {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
+	case ddl.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER

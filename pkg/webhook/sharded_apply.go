@@ -76,12 +76,12 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
 // (VSchema) operations are not shard work and are omitted from the shard view;
 // their outcome is still reflected in the aggregate headline state.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task) templates.ShardedApplyData {
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
-	// Tasks arrive in created_at DESC order with no id tiebreaker. Sort each
-	// operation's tasks by id so the joined DDL (and the change signature derived
-	// from it) is deterministic. In practice a (shard, table) operation has a
-	// single task — multiple statements for one table are combined into one ALTER
+	// Sort each operation's tasks by id so the joined DDL (and the change
+	// signature derived from it) is deterministic without depending on the
+	// loader's ordering. In practice a (shard, table) operation has a single
+	// task — multiple statements for one table are combined into one ALTER
 	// upstream — but this keeps the rendering stable regardless.
 	for _, ts := range tasksByOp {
 		sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
@@ -128,6 +128,8 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		RequestedBy: actorFromCaller(apply.Caller),
 		Shards:      shardStatuses(shardOrder, opsByShard, released, tasksByOp),
 		Cells:       cells,
+		Tenant:      tenant,
+		Rollback:    apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

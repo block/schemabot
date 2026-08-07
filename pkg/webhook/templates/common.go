@@ -3,8 +3,10 @@ package templates
 import (
 	"fmt"
 	"html"
+	"regexp"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // capitalizeFirst capitalizes the first letter of a string.
@@ -68,6 +70,54 @@ func currentTimestamp() string {
 	return TimestampFunc()
 }
 
+// supportChannelOfferMarker flags a rendered comment as reporting a problem
+// the author may need help resolving. GitHub never renders HTML comments, so
+// the marker is invisible on the PR. Render functions declare footer
+// eligibility explicitly with offerSupportChannel/writeSupportChannelOffer;
+// the webhook layer appends the support-channel footer to any comment that
+// carries the marker, without inspecting human-visible copy.
+const supportChannelOfferMarker = "<!-- schemabot:offer-support-channel -->"
+
+// OffersSupportChannel reports whether a rendered comment declared itself
+// eligible for the support-channel footer. Embedded sections keep their
+// marker, so an aggregate comment containing a failed per-deployment section
+// offers support just like the standalone comment would.
+func OffersSupportChannel(body string) bool {
+	return containsSupportChannelMarkerLine(body)
+}
+
+// containsSupportChannelMarkerLine matches the marker only as a standalone
+// line, the way offerSupportChannel and writeSupportChannelOffer emit it.
+// User-controlled content rendered into a comment (DDL, error detail) that
+// happens to contain the marker text mid-line neither triggers the footer
+// nor suppresses a render function's own declaration.
+func containsSupportChannelMarkerLine(body string) bool {
+	return strings.HasPrefix(body, supportChannelOfferMarker+"\n") ||
+		strings.Contains(body, "\n"+supportChannelOfferMarker+"\n") ||
+		strings.HasSuffix(body, "\n"+supportChannelOfferMarker)
+}
+
+// offerSupportChannel appends the support marker to a rendered comment body.
+func offerSupportChannel(body string) string {
+	if containsSupportChannelMarkerLine(body) {
+		return body
+	}
+	return strings.TrimRight(body, "\n") + "\n" + supportChannelOfferMarker + "\n"
+}
+
+// writeSupportChannelOffer writes the support marker into a comment being
+// composed, for builders that decide eligibility mid-composition (e.g. on a
+// failed status line). At most one marker is written per comment.
+func writeSupportChannelOffer(sb *strings.Builder) {
+	if containsSupportChannelMarkerLine(sb.String()) {
+		return
+	}
+	if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+		sb.WriteString("\n")
+	}
+	sb.WriteString(supportChannelOfferMarker + "\n")
+}
+
 // RenderSupportChannelFooter appends a support-channel footer to a rendered PR comment.
 func RenderSupportChannelFooter(body string, support SupportChannelData) string {
 	if support.Name == "" || support.URL == "" {
@@ -85,17 +135,100 @@ func escapeMarkdownLinkText(text string) string {
 	return strings.ReplaceAll(text, "]", "\\]")
 }
 
+// maxCommentErrorLen bounds an error message rendered into a PR comment so a
+// pathological engine error cannot flood the comment. Genuine engine errors,
+// such as a Spirit preflight check reason, are a few hundred characters and
+// render intact; anything longer is clamped with a truncation marker.
+const maxCommentErrorLen = 500
+
+var (
+	// dsnFragmentRe matches Go MySQL driver DSN fragments such as
+	// user:pass@tcp(host:3306)/db, which leak credentials and endpoints.
+	dsnFragmentRe = regexp.MustCompile(`\S*@tcp\([^)]*\)\S*`)
+	// hostPortRe matches hostnames carrying an explicit port: dotted names
+	// such as db.internal.example.com:3306 and single-label service names
+	// such as mysql-primary:3306, which are common in dial errors. Requiring
+	// the port avoids matching schema-qualified identifiers like db.table;
+	// the single-label form additionally requires a leading letter and a
+	// multi-digit port so line:column references and similar numeric pairs
+	// are not redacted.
+	hostPortRe = regexp.MustCompile(`\b(?:(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*:\d{1,5}|[A-Za-z][A-Za-z0-9-]*:\d{2,5})\b`)
+	// ipEndpointRe matches IPv4 addresses with an optional port.
+	ipEndpointRe = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b`)
+	// ansiEscapeRe matches ANSI terminal escape sequences (colors, cursor
+	// movement) that some tools embed in their error output.
+	ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+)
+
+// sanitizeCommentError makes an untrusted engine or task error safe to render
+// in a public PR comment: it normalizes line endings, strips control and
+// format characters (including bidi overrides usable for visual spoofing),
+// redacts connection endpoints (DSN fragments, host:port pairs,
+// IP addresses) that leak internal infrastructure, trims surrounding
+// whitespace, and clamps the length by rune count. The raw error remains
+// available server-side in the apply logs, so nothing is lost for triage.
+func sanitizeCommentError(msg string) string {
+	msg = strings.ReplaceAll(msg, "\r\n", "\n")
+	msg = strings.ReplaceAll(msg, "\r", "\n")
+	msg = ansiEscapeRe.ReplaceAllString(msg, "")
+	msg = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, msg)
+	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = strings.TrimSpace(msg)
+	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
+		msg = string(runes[:maxCommentErrorLen-1]) + "…"
+	}
+	return msg
+}
+
+// quoteBlockLines keeps a multi-line message inside a Markdown blockquote by
+// prefixing continuation lines with the quote marker, so engine errors cannot
+// escape into the surrounding comment structure.
+func quoteBlockLines(msg string) string {
+	return strings.ReplaceAll(msg, "\n", "\n> ")
+}
+
 // writeErrorBlock writes an error message as a blockquote with warning emoji.
+// The message is sanitized before rendering; a message that sanitizes to
+// empty writes nothing.
 func writeErrorBlock(sb *strings.Builder, msg string) {
-	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", msg)
+	sanitized := sanitizeCommentError(msg)
+	if sanitized == "" {
+		return
+	}
+	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", quoteBlockLines(sanitized))
 }
 
 // writeTableErrorLine writes a task's last error as a blockquote below its
-// progress line. Newlines are quoted so multi-line engine errors stay inside
-// the quote instead of escaping into the surrounding comment structure.
+// progress line. The message is sanitized before rendering; a message that
+// sanitizes to empty writes nothing.
 func writeTableErrorLine(sb *strings.Builder, msg string) {
-	quoted := strings.ReplaceAll(msg, "\n", "\n> ")
-	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoted)
+	sanitized := sanitizeCommentError(msg)
+	if sanitized == "" {
+		return
+	}
+	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoteBlockLines(sanitized))
+}
+
+// taskErrorAddsDetail reports whether a failed table's own error message adds
+// information beyond the apply-level error block rendered elsewhere in the
+// comment. The apply's failure reason is promoted from its first failed task,
+// so for the common single-table failure the two messages are identical and
+// repeating the text below the row would only add noise. Both messages are
+// compared in their sanitized form — the representation actually rendered —
+// so differences that sanitization erases cannot defeat the suppression.
+func taskErrorAddsDetail(taskError, applyError string) bool {
+	sanitized := sanitizeCommentError(taskError)
+	return sanitized != "" && sanitized != sanitizeCommentError(applyError)
 }
 
 // writeSuccessBlock writes a success message as a blockquote.

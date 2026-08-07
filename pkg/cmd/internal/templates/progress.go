@@ -7,9 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -24,9 +23,9 @@ const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspac
 // progressSymbol returns a Terraform-style prefix for the change type.
 func progressSymbol(changeType string) string {
 	switch ddl.OpToStatementType(changeType) {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return "+ "
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return "- "
 	default:
 		return "~ "
@@ -231,7 +230,7 @@ func FormatNamespacedTables(tables []TableProgress) string {
 // FormatNamespacedTablesWithActivityBar returns tables grouped by keyspace using
 // the provided activity bar when row-copy progress has exceeded its estimate.
 func FormatNamespacedTablesWithActivityBar(tables []TableProgress, activityBar string) string {
-	return FormatNamespacedTablesWithActivity(tables, activityBar, "Active")
+	return FormatNamespacedTablesWithActivity(tables, activityBar, "Finalizing copy")
 }
 
 // FormatNamespacedTablesWithActivity returns tables grouped by keyspace using
@@ -391,9 +390,17 @@ func FormatProgressState(s string) string {
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
-		return ANSIYellow + "⏸️  Stopped" + ANSIReset
+		return ANSIOrange + "⏸️  Stopped" + ANSIReset
 	case state.Apply.Cancelled:
-		return ANSIRed + "🚫 Cancelled" + ANSIReset
+		return ANSIOrange + "🚫 Cancelled" + ANSIReset
+	case state.Apply.RevertWindow:
+		return ANSIYellow + "🟨 Revert window open" + ANSIReset
+	case state.Apply.SkippingRevert:
+		return ANSICyan + "🔄 Finalizing (closing revert window)..." + ANSIReset
+	case state.Apply.Reverting:
+		return ANSIYellow + "↩️ Reverting" + ANSIReset
+	case state.Apply.Reverted:
+		return ANSIOrange + "↩️ Reverted" + ANSIReset
 	default:
 		return s
 	}
@@ -411,7 +418,7 @@ func FormatTableProgress(t TableProgress) string {
 // FormatTableProgressWithActivityBar returns progress for a single table using
 // the provided activity bar when row-copy progress has exceeded its estimate.
 func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) string {
-	return FormatTableProgressWithActivity(t, activityBar, "Active")
+	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
 // FormatTableProgressWithActivity returns progress for a single table using the
@@ -510,7 +517,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
 		label := "Cutting over..."
 		op := ddl.OpToStatementType(t.ChangeType)
-		if op == statement.StatementCreateTable || op == statement.StatementDropTable {
+		if op == ddl.StatementCreateTable || op == ddl.StatementDropTable {
 			label = "Applying..."
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
@@ -545,7 +552,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		return b.String()
 	case state.Apply.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (pending revert)\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Complete (revert window open)\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -570,10 +577,22 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.Reverted:
+		// The change was applied, then undone at operator request — a
+		// successful revert, not a failure. Full orange bar: terminal,
+		// change not in effect.
+		bar := ui.ProgressBar(100, ui.ColorOrange)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverted\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-			bar := ui.ProgressBarFailed(cancelledPercent)
+			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
@@ -677,7 +696,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		switch {
 		case t.IsInstant:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
-		case op == statement.StatementCreateTable || op == statement.StatementDropTable:
+		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...\n", t.TableName, bar)
 		default:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...\n", t.TableName, bar)
@@ -758,7 +777,7 @@ type CancelData struct {
 
 // WriteCancelSuccess writes the cancel command success output.
 func WriteCancelSuccess(data CancelData) {
-	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIRed, ANSIReset)
+	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIOrange, ANSIReset)
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)
@@ -854,18 +873,76 @@ type StatusListData struct {
 	MaxLimit       int
 	HasMore        bool
 	FailuresOnly   bool
+	Last           string
+	StateFilter    string
+	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
 	Applies        []ActiveApplyData
 }
 
+// statusWindowSuffix renders the active list filters (--state, --last) as a
+// header suffix, or empty when the list is unfiltered.
+func statusWindowSuffix(data StatusListData) string {
+	parts := statusFilterPhrases(data)
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" %s(%s)%s", ANSIDim, strings.Join(parts, ", "), ANSIReset)
+}
+
+// statusFilterPhrases returns one human-readable phrase per active list
+// filter, shared by the header suffix and the empty-state message.
+func statusFilterPhrases(data StatusListData) []string {
+	var parts []string
+	if data.StateFilter != "" {
+		parts = append(parts, fmt.Sprintf("in state %s", state.Label(data.StateFilter)))
+	}
+	if data.Last != "" {
+		parts = append(parts, fmt.Sprintf("updated in the last %s", data.Last))
+	}
+	return parts
+}
+
+// writeStatusStateSummary renders one line tallying every apply matching the
+// request's filters by state. The counts come from the server unbounded by
+// limit, so the line stays truthful when the table below it is a truncated
+// page. Ordered by count descending (ties by state name) so the dominant
+// outcome reads first.
+func writeStatusStateSummary(counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	states := make([]string, 0, len(counts))
+	total := 0
+	for s, n := range counts {
+		states = append(states, s)
+		total += n
+	}
+	sort.Slice(states, func(i, j int) bool {
+		if counts[states[i]] != counts[states[j]] {
+			return counts[states[i]] > counts[states[j]]
+		}
+		return states[i] < states[j]
+	})
+	parts := make([]string, 0, len(states))
+	for _, s := range states {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[s], state.Label(s)))
+	}
+	fmt.Printf("%s%d total: %s%s\n", ANSIDim, total, strings.Join(parts, " · "), ANSIReset)
+}
+
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
 	if len(data.Applies) == 0 {
+		filters := ""
+		if parts := statusFilterPhrases(data); len(parts) > 0 {
+			filters = " " + strings.Join(parts, ", ")
+		}
 		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s\n", ANSIDim, ANSIReset)
+			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 		} else {
-			fmt.Printf("%sNo recent schema changes%s\n", ANSIDim, ANSIReset)
+			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 		}
 		return
 	}
@@ -877,13 +954,14 @@ func WriteStatusList(data StatusListData) {
 	// Header
 	if data.ActiveCount > 0 {
 		if data.ActiveCount == 1 {
-			fmt.Printf("%s1 active schema change%s\n", ANSIBold, ANSIReset)
+			fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 		} else {
-			fmt.Printf("%s%d active schema changes%s\n", ANSIBold, data.ActiveCount, ANSIReset)
+			fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, data.ActiveCount, ANSIReset, statusWindowSuffix(data))
 		}
 	} else {
-		fmt.Printf("%sRecent schema changes%s\n", ANSIBold, ANSIReset)
+		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
+	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
 	// Calculate column widths from data
@@ -977,7 +1055,7 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		case data.ShowExternalID:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -986,7 +1064,7 @@ func WriteStatusList(data StatusListData) {
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		case showDeployment:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -995,7 +1073,7 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		default:
 			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1003,11 +1081,22 @@ func WriteStatusList(data StatusListData) {
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				shortCaller(a.Caller))
+				caller.Short(a.Caller))
 		}
 	}
 
 	writeStatusListFooter(data)
+}
+
+// writeStatusListTruncation says how much of the history a truncated page holds,
+// and how to see more of it — or that the server will not serve more, when the
+// page is already at the cap.
+func writeStatusListTruncation(data StatusListData, item string) {
+	if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
+		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+		return
+	}
+	fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
 }
 
 func writeStatusListFooter(data StatusListData) {
@@ -1017,17 +1106,14 @@ func writeStatusListFooter(data StatusListData) {
 		if data.FailuresOnly {
 			item = "failed schema changes"
 		}
-		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
-		} else {
-			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
-		}
+		writeStatusListTruncation(data, item)
 	}
 	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
 }
 
 func writeFailedStatusList(data StatusListData) {
-	fmt.Printf("%sRecent failed schema changes%s\n", ANSIBold, ANSIReset)
+	fmt.Printf("%sRecent failed schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
 	for i, a := range data.Applies {
@@ -1046,12 +1132,7 @@ func writeFailedStatusList(data StatusListData) {
 
 	if data.HasMore && data.Limit > 0 {
 		fmt.Println()
-		item := "failed schema changes"
-		if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-			fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
-		} else {
-			fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
-		}
+		writeStatusListTruncation(data, "failed schema changes")
 	}
 }
 
@@ -1088,11 +1169,11 @@ func statusListShowsDeployment(data StatusListData) bool {
 }
 
 func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
-	caller := shortCaller(a.Caller)
+	actor := caller.Short(a.Caller)
 	if !showExternalID {
-		return caller
+		return actor
 	}
-	return caller + "; external_id=" + statusExternalID(StatusListData{}, a)
+	return actor + "; external_id=" + statusExternalID(StatusListData{}, a)
 }
 
 func formatFailureTimestamp(a ActiveApplyData) string {
@@ -1206,7 +1287,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 			coloredState,
 			maxStarted, formatStartedAt(a.StartedAt),
 			maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
-			shortCaller(a.Caller))
+			caller.Short(a.Caller))
 	}
 
 	fmt.Println()
@@ -1214,6 +1295,12 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 }
 
 // stateColorFunc returns an ANSI color function for the given state.
+//
+// Color semantics: red is reserved for Failed — the only state that means
+// something broke and needs remediation. Operator-initiated terminal states
+// (Stopped, Cancelled, Reverted) are orange: the change is not in effect,
+// but nothing went wrong. Yellow marks states awaiting attention or an
+// external event, cyan marks active work, green marks success.
 func stateColorFunc(s string) func(string) string {
 	switch s {
 	case state.Apply.Completed:
@@ -1224,18 +1311,20 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIYellow)
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering:
 		return colorWrap(ANSIYellow)
+	case state.Apply.CuttingOver:
+		return colorWrap(ANSICyan) // active work, matches the blue "Cutting over..." table bar
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)
 	case state.Apply.Cancelled:
-		return colorWrap(ANSIRed)
+		return colorWrap(ANSIOrange)
 	case state.Apply.Pending:
 		return colorWrap(ANSIDim)
 	case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.ValidatingBranch, state.Apply.CreatingDeployRequest, state.Apply.ValidatingDeployRequest:
 		return colorWrap(ANSICyan)
 	case state.Apply.Reverted:
-		return colorWrap(ANSIRed)
+		return colorWrap(ANSIOrange)
 	case state.Apply.RevertWindow:
 		return colorWrap(ANSIYellow)
 	case state.Apply.SkippingRevert:
@@ -1245,15 +1334,6 @@ func stateColorFunc(s string) func(string) string {
 	default:
 		return nil
 	}
-}
-
-// shortCaller strips the hostname from a caller string for compact display.
-// "cli:armand@macbook.local" -> "cli:armand"
-func shortCaller(caller string) string {
-	if before, _, found := strings.Cut(caller, "@"); found {
-		return before
-	}
-	return caller
 }
 
 // formatApplyDuration returns a human-readable duration between started and completed.

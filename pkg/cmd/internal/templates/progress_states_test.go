@@ -88,6 +88,88 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 	assert.NotContains(t, output, "Use --limit N to show more.")
 }
 
+func TestWriteStatusListStateSummary(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 1,
+			Limit:       20,
+			StateCounts: map[string]int{
+				state.Apply.Completed: 12,
+				state.Apply.Failed:    2,
+				state.Apply.Running:   1,
+			},
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Running,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "15 total: 12 Completed · 2 Failed · 1 Running")
+}
+
+func TestWriteStatusListStateFilterSuffix(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			StateFilter: state.Apply.FailedRetryable,
+			Last:        "6h",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.FailedRetryable,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "(in state Retrying, updated in the last 6h)")
+}
+
+func TestWriteStatusListEmptyWithStateFilter(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			Limit:       20,
+			StateFilter: state.Apply.Running,
+		})
+	})
+
+	assert.Contains(t, output, "No recent schema changes in state Running")
+}
+
+func TestWriteStatusListNoStateSummaryWhenEmpty(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-example",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.NotContains(t, output, "total:")
+}
+
 func TestWriteStatusListExternalID(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{
@@ -404,7 +486,7 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Active")
+		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
 		assert.Contains(t, output, "Rows copied: 145,000 so far")
 		assert.Contains(t, output, ui.EstimateExceededTooltip)
 		assert.NotContains(t, output, "145%")
@@ -421,7 +503,7 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Active")
+		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
 		assert.Contains(t, output, "Rows copied: 145,000 so far")
 		assert.NotContains(t, output, "100%")
 	})
@@ -462,4 +544,94 @@ func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 		fn := stateColorFunc(s)
 		assert.NotNil(t, fn, "expected color function for state %q", s)
 	}
+}
+
+// Red means "something broke, go fix it" — an operator scanning a status list
+// should be able to trust that red marks a real failure. Operator-initiated
+// terminal states (stopped, cancelled, reverted) are deliberate outcomes and
+// render orange instead, so a routine revert never reads as a failure.
+func TestStateColorsReserveRedForFailure(t *testing.T) {
+	allStates := []string{
+		state.Apply.Pending,
+		state.Apply.Running,
+		state.Apply.RunningDegraded,
+		state.Apply.WaitingForDeploy,
+		state.Apply.WaitingForCutover,
+		state.Apply.Recovering,
+		state.Apply.CuttingOver,
+		state.Apply.RevertWindow,
+		state.Apply.SkippingRevert,
+		state.Apply.Reverting,
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.FailedRetryable,
+		state.Apply.Stopped,
+		state.Apply.Cancelled,
+		state.Apply.Reverted,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest,
+	}
+	for _, s := range allStates {
+		if fn := stateColorFunc(s); fn != nil {
+			colored := fn(state.Label(s))
+			if s == state.Apply.Failed {
+				assert.Contains(t, colored, ANSIRed, "Failed must render red")
+			} else {
+				assert.NotContains(t, colored, ANSIRed, "state %q must not render red — red is reserved for Failed", s)
+			}
+		}
+		formatted := FormatProgressState(s)
+		if s == state.Apply.Failed {
+			assert.Contains(t, formatted, ANSIRed, "FormatProgressState(Failed) must render red")
+		} else {
+			assert.NotContains(t, formatted, ANSIRed, "FormatProgressState(%q) must not render red", s)
+		}
+	}
+
+	for _, s := range []string{state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted} {
+		fn := stateColorFunc(s)
+		require.NotNil(t, fn, "expected color function for state %q", s)
+		assert.Contains(t, fn(state.Label(s)), ANSIOrange, "operator-halted state %q must render orange", s)
+	}
+}
+
+// A reverted table shows a terminal orange bar with the revert label; a
+// cancelled mid-copy table shows its progress in orange. Neither uses the red
+// failure bar, which is reserved for tables that actually failed.
+func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
+	reverted := FormatTableProgress(TableProgress{
+		TableName:  "users",
+		ChangeType: "alter",
+		Status:     state.Apply.Reverted,
+		DDL:        "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255)",
+	})
+	assert.Contains(t, reverted, "↩️ Reverted")
+	assert.Contains(t, reverted, ui.ColorOrange)
+	assert.NotContains(t, reverted, ui.ColorRed)
+
+	cancelled := FormatTableProgress(TableProgress{
+		TableName:       "orders",
+		ChangeType:      "alter",
+		Status:          state.Apply.Cancelled,
+		PercentComplete: 30,
+		RowsCopied:      300,
+		RowsTotal:       1000,
+	})
+	assert.Contains(t, cancelled, "⊘ Cancelled at 30%")
+	assert.Contains(t, cancelled, ui.ColorOrange)
+	assert.NotContains(t, cancelled, ui.ColorRed)
+
+	failed := FormatTableProgress(TableProgress{
+		TableName:       "payments",
+		ChangeType:      "alter",
+		Status:          state.Apply.Failed,
+		PercentComplete: 30,
+		RowsCopied:      300,
+		RowsTotal:       1000,
+	})
+	assert.Contains(t, failed, "❌ Failed")
+	assert.Contains(t, failed, ui.ColorRed)
 }

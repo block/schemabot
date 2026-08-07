@@ -364,6 +364,7 @@ test-e2e-local-down: ## Tear down e2e local environment
 #        Tern-Staging-HTTP=15380, Tern-Staging-gRPC=15390, Tern-Production-HTTP=15382, Tern-Production-gRPC=15392
 E2E_GRPC_ENV := SCHEMABOT_PORT=15370 \
 	SCHEMABOT_MYSQL_PORT=15371 \
+	SCHEMABOT_METRICS_PORT=15376 \
 	TERN_STAGING_MYSQL_PORT=15372 \
 	TERN_PRODUCTION_MYSQL_PORT=15373 \
 	TERN_STAGING_PORT=15380 \
@@ -394,11 +395,17 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	done
 	@echo "Running gRPC e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:15370 \
+	E2E_SCHEMABOT_METRICS_URL=http://localhost:15376 \
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_PRODUCTION_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
 	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
+	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
+		echo "Capturing gRPC e2e container logs before teardown..."; \
+		mkdir -p e2e-logs; \
+		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps > e2e-logs/grpc-containers.log 2>&1 || true; \
+	fi; \
 	echo "Tearing down gRPC e2e environment..."; \
 	$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 	exit $$TEST_EXIT_CODE
@@ -412,6 +419,7 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 #        EU-HTTP=15380, EU-gRPC=15390, US-HTTP=15382, US-gRPC=15392
 E2E_GRPC_MD_ENV := SCHEMABOT_PORT=15370 \
 	SCHEMABOT_MYSQL_PORT=15371 \
+	SCHEMABOT_METRICS_PORT=15376 \
 	TERN_EU_MYSQL_PORT=15372 \
 	TERN_US_MYSQL_PORT=15373 \
 	TERN_EU_PORT=15380 \
@@ -444,11 +452,17 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 	@echo "Running multi-deployment gRPC e2e tests..."
 	@E2E_MULTIDEPLOY=1 \
 	E2E_SCHEMABOT_URL=http://localhost:15370 \
+	E2E_SCHEMABOT_METRICS_URL=http://localhost:15376 \
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_EU_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_US_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
 	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
+	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
+		echo "Capturing multi-deployment gRPC e2e container logs before teardown..."; \
+		mkdir -p e2e-logs; \
+		$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps > e2e-logs/grpc-multideploy-containers.log 2>&1 || true; \
+	fi; \
 	echo "Tearing down multi-deployment gRPC e2e environment..."; \
 	$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 	exit $$TEST_EXIT_CODE

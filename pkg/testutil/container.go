@@ -47,8 +47,8 @@ func ContainerEndpoint(ctx context.Context, c testcontainers.Container, proto st
 	})
 }
 
-// ContainerConnectionString returns the connection string for a MySQL container,
-// retrying on transient Docker failures.
+// ContainerConnectionString returns the connection string for a database
+// container, retrying on transient Docker failures.
 func ContainerConnectionString(ctx context.Context, c interface {
 	ConnectionString(context.Context, ...string) (string, error)
 }, args ...string) (string, error) {

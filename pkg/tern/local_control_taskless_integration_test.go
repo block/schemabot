@@ -28,8 +28,9 @@ import (
 type invocationTrackingEngine struct {
 	engine.Engine
 
-	mu    sync.Mutex
-	calls []string
+	mu        sync.Mutex
+	calls     []string
+	cancelErr error
 }
 
 func (e *invocationTrackingEngine) record(call string) {
@@ -68,6 +69,9 @@ func (e *invocationTrackingEngine) Stop(context.Context, *engine.ControlRequest)
 
 func (e *invocationTrackingEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.record("Cancel")
+	if e.cancelErr != nil {
+		return nil, e.cancelErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -175,7 +179,7 @@ func TestLocalClient_CancelQueuedTasklessApplySettlesCancelled(t *testing.T) {
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
 
 	engineCallsBeforeDrive := eng.recorded()
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -196,7 +200,7 @@ func TestLocalClient_CancelQueuedTasklessApplySettlesCancelled(t *testing.T) {
 	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
 		"settling a task-less cancel must never invoke the engine")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-reclaim-"+t.Name())
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a cancelled apply must not be claimable again")
 }
@@ -230,7 +234,7 @@ func TestLocalClient_StopQueuedTasklessApplySettlesStopped(t *testing.T) {
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestPending)
 
 	engineCallsBeforeDrive := eng.recorded()
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -250,7 +254,7 @@ func TestLocalClient_StopQueuedTasklessApplySettlesStopped(t *testing.T) {
 	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
 		"settling a task-less stop must never invoke the engine")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-reclaim-"+t.Name())
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a stopped apply with no pending start must not be claimable again")
 }
@@ -291,7 +295,7 @@ func TestLocalClient_CancelQueuedApplyWithTasksSettlesViaTaskPath(t *testing.T) 
 	require.NoError(t, err)
 	require.True(t, cancelResp.Accepted)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
