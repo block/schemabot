@@ -884,8 +884,8 @@ func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *s
 func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, operatorGroups []string, logger *slog.Logger) (auth.Authorizer, error) {
 	switch cfg.Type {
 	case "", "none":
-		logger.Info("API authentication disabled — all requests allowed")
-		return auth.NoneAuthorizer{}, nil
+		logger.Info("API authentication disabled — all requests allowed; write operations will be logged and counted so unauthenticated mutating traffic stays visible")
+		return auth.NoneAuthorizer{Logger: logger}, nil
 	case "oidc":
 		logger.Info("initializing OIDC authentication", "issuer", cfg.Issuer, "admin_groups", len(adminGroups))
 		authz, err := auth.NewOIDCAuthorizer(ctx, auth.OIDCConfig{

@@ -565,8 +565,9 @@ func RecordDirectWriteAuthorization(ctx context.Context, operation, database, en
 }
 
 // RecordAuthDecision increments the counter for API auth decisions on the
-// direct request path (the OIDC and forward-auth authorizers). Labels are
-// inherently low-cardinality: tier is read/write, decision is allow/deny,
+// direct request path (every API authorizer, including the allow-all one, so
+// unauthenticated deployments still have an alertable write signal). Labels
+// are inherently low-cardinality: tier is read/write, decision is allow/deny,
 // reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
