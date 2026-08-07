@@ -390,9 +390,17 @@ func FormatProgressState(s string) string {
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
-		return ANSIYellow + "⏸️  Stopped" + ANSIReset
+		return ANSIOrange + "⏸️  Stopped" + ANSIReset
 	case state.Apply.Cancelled:
-		return ANSIRed + "🚫 Cancelled" + ANSIReset
+		return ANSIOrange + "🚫 Cancelled" + ANSIReset
+	case state.Apply.RevertWindow:
+		return ANSIYellow + "🟨 Revert window open" + ANSIReset
+	case state.Apply.SkippingRevert:
+		return ANSICyan + "🔄 Finalizing (closing revert window)..." + ANSIReset
+	case state.Apply.Reverting:
+		return ANSIYellow + "↩️ Reverting" + ANSIReset
+	case state.Apply.Reverted:
+		return ANSIOrange + "↩️ Reverted" + ANSIReset
 	default:
 		return s
 	}
@@ -569,10 +577,22 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.Reverted:
+		// The change was applied, then undone at operator request — a
+		// successful revert, not a failure. Full orange bar: terminal,
+		// change not in effect.
+		bar := ui.ProgressBar(100, ui.ColorOrange)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverted\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-			bar := ui.ProgressBarFailed(cancelledPercent)
+			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
@@ -757,7 +777,7 @@ type CancelData struct {
 
 // WriteCancelSuccess writes the cancel command success output.
 func WriteCancelSuccess(data CancelData) {
-	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIRed, ANSIReset)
+	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIOrange, ANSIReset)
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)
@@ -1275,6 +1295,12 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 }
 
 // stateColorFunc returns an ANSI color function for the given state.
+//
+// Color semantics: red is reserved for Failed — the only state that means
+// something broke and needs remediation. Operator-initiated terminal states
+// (Stopped, Cancelled, Reverted) are orange: the change is not in effect,
+// but nothing went wrong. Yellow marks states awaiting attention or an
+// external event, cyan marks active work, green marks success.
 func stateColorFunc(s string) func(string) string {
 	switch s {
 	case state.Apply.Completed:
@@ -1285,18 +1311,20 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIYellow)
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering:
 		return colorWrap(ANSIYellow)
+	case state.Apply.CuttingOver:
+		return colorWrap(ANSICyan) // active work, matches the blue "Cutting over..." table bar
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)
 	case state.Apply.Cancelled:
-		return colorWrap(ANSIRed)
+		return colorWrap(ANSIOrange)
 	case state.Apply.Pending:
 		return colorWrap(ANSIDim)
 	case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.ValidatingBranch, state.Apply.CreatingDeployRequest, state.Apply.ValidatingDeployRequest:
 		return colorWrap(ANSICyan)
 	case state.Apply.Reverted:
-		return colorWrap(ANSIRed)
+		return colorWrap(ANSIOrange)
 	case state.Apply.RevertWindow:
 		return colorWrap(ANSIYellow)
 	case state.Apply.SkippingRevert:
