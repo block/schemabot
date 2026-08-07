@@ -489,14 +489,16 @@ func (e *Engine) setSchemaChangeCompleted() {
 	}
 }
 
-// setSchemaChangeFailed sets the state to failed with an error message.
+// setSchemaChangeFailed sets the state to failed with an error message. The
+// message is reported as the reason the schema change failed, so it leaves in
+// SchemaBot's vocabulary even when the cause came back from Spirit in Spirit's.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.runningSchemaChange != nil {
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
-			e.runningSchemaChange.errorMessage = err.Error()
+			e.runningSchemaChange.errorMessage = operatorText(err.Error())
 		}
 	}
 }

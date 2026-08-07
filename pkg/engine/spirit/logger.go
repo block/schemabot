@@ -52,7 +52,10 @@ func (f *spiritLogFilter) Handle(ctx context.Context, r slog.Record) error {
 		if errorMsg != "" {
 			msg = fmt.Sprintf("%s: %s", r.Message, errorMsg)
 		}
-		(*f.onLogRef)(r.Level, tableName, msg)
+		// This callback is the line's crossing into the apply log stream an
+		// operator reads, so it leaves in SchemaBot's vocabulary. The handler
+		// below still receives Spirit's own wording for the server-side log.
+		(*f.onLogRef)(r.Level, tableName, operatorText(msg))
 	}
 
 	return f.handler.Handle(ctx, r)

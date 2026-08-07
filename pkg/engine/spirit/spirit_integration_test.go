@@ -1809,8 +1809,8 @@ func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T
 
 	mu.Lock()
 	defer mu.Unlock()
-	assert.Contains(t, captured, "Starting spirit migration",
-		"Spirit's run-start log line was not routed through the engine log callback")
+	assert.Contains(t, captured, "Starting schema change",
+		"Spirit's run-start log line was not routed through the engine log callback in SchemaBot's vocabulary")
 	assert.Contains(t, captured, "apply complete",
 		"Spirit's completion log line was not routed through the engine log callback")
 	// Every routed line must carry the table so operators can attribute
