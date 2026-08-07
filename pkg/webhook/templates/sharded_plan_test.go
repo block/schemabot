@@ -23,7 +23,7 @@ func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚠️ **Lint Warnings**:", "the plan comment surfaces lint for review")
+	assert.Contains(t, plan, "🎯 **Lint Warnings**:", "the plan comment surfaces lint for review")
 	assert.Contains(t, plan, "Column added without DEFAULT value")
 
 	data.IsLocked = true

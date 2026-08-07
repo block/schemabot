@@ -586,6 +586,41 @@ func sampleLintWarnings() []LintViolationData {
 	}
 }
 
+// PreviewCommentPlanManyLintWarnings renders a plan whose lint findings exceed
+// the fold threshold, exercising the collapsed details block grouped by table.
+func PreviewCommentPlanManyLintWarnings() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP INDEX `idx_legacy_status`;",
+					"ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;",
+				},
+			},
+		},
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "Index 'idx_legacy_status' should be made invisible before dropping to ensure it's not needed"},
+			{Table: "order_events", Reason: "Index 'idx_events_archived' should be made invisible before dropping to ensure it's not needed"},
+		},
+		LintViolations: []LintViolationData{
+			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "pk_type"},
+			{Message: `Index "idx_status_created" has DATETIME column "created_at" in position 3 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
+			{Message: `Index "idx_region_created" has DATETIME column "created_at" in position 4 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
+			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "pk_type"},
+			{Message: `Index 'idx_status_created' on columns (status, region, created_at, event_id, order_pk) has a redundant PRIMARY KEY suffix (order_pk) - a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (order_pk, event_id) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.`, Table: "order_events", LinterName: "redundant_indexes"},
+			{Message: `Column "event_id" in table "order_events" has type "mediumint(9)" but 2 other table(s) use type "int(11)" (e.g. shipments, invoices)`, Table: "order_events", LinterName: "column_type_consistency"},
+		},
+	})
+}
+
 // PreviewCommentUnsafeBlocked renders a sample "unsafe changes blocked" comment.
 func PreviewCommentUnsafeBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{

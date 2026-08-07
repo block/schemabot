@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -238,4 +239,22 @@ func cleanSingleLintReason(reason string) string {
 		}
 	}
 	return reason
+}
+
+// Lint and safety messages quote SQL identifiers and types with single or
+// double quotes ('idx_category', "varchar"). The token pattern is restricted
+// to identifier and type characters so prose in quotes ("should not be
+// dropped") is left alone.
+var (
+	singleQuotedIdentifier = regexp.MustCompile(`'([A-Za-z0-9_$.()]+)'`)
+	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.()]+)"`)
+)
+
+// CodeQuoteIdentifiers rewrites quoted SQL identifiers and types in a
+// human-authored message to markdown inline code, so index, column, and type
+// names read as code on markdown surfaces. Best-effort display formatting:
+// tokens that don't look like identifiers keep their original quotes.
+func CodeQuoteIdentifiers(message string) string {
+	message = singleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	return doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
 }
