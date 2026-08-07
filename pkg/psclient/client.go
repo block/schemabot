@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
+	"strings"
+	"unicode"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 )
@@ -44,10 +48,11 @@ type PSClient interface {
 	// ListDeployRequests lists all deploy requests for a database.
 	ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error)
 
-	// ThrottleDeployRequest sets the throttle ratio for a running deploy request.
+	// ThrottleDeployRequest sets the throttler ratio for a running deploy request.
 	// This controls the speed of the online DDL copy phase (0.0 = full speed,
-	// 0.95 = max throttle). The PlanetScale API supports this endpoint but the
-	// Go SDK (planetscale-go) does not expose it, so we use raw HTTP via baseURL.
+	// 0.95 = max throttle) across every keyspace the deploy request touches. The
+	// PlanetScale API supports this endpoint but the Go SDK (planetscale-go) does
+	// not expose it, so we use raw HTTP via baseURL.
 	// Requires NewPSClientWithBaseURL; returns an error if baseURL is not set.
 	ThrottleDeployRequest(ctx context.Context, req *ThrottleDeployRequestRequest) error
 }
@@ -182,31 +187,81 @@ func (w *psClientWrapper) ListDeployRequests(ctx context.Context, req *ps.ListDe
 	return w.client.DeployRequests.List(ctx, req)
 }
 
-// ThrottleDeployRequest sets the throttle ratio via a raw HTTP PUT.
+// ThrottleDeployRequest sets the throttler ratio via a raw HTTP PATCH.
 // Not yet available in the PlanetScale SDK.
+//
+// The API expresses the ratio as a whole percentage (0-95) on the wire, while
+// SchemaBot carries it as a fraction; the conversion happens here so the rest of
+// the codebase speaks one unit.
 func (w *psClientWrapper) ThrottleDeployRequest(ctx context.Context, req *ThrottleDeployRequestRequest) error {
 	if w.baseURL == "" {
 		return fmt.Errorf("throttle not supported without base URL")
 	}
-	url := fmt.Sprintf("%s/v1/organizations/%s/databases/%s/deploy-requests/%d/throttle",
+	url := fmt.Sprintf("%s/v1/organizations/%s/databases/%s/deploy-requests/%d/throttler",
 		w.baseURL, req.Organization, req.Database, req.Number)
-	body, err := json.Marshal(map[string]float64{"throttle_ratio": req.ThrottleRatio})
+	body, err := json.Marshal(map[string]int{"ratio": throttleRatioPercent(req.ThrottleRatio)})
 	if err != nil {
-		return fmt.Errorf("marshal throttle payload: %w", err)
+		return fmt.Errorf("marshal throttler payload: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("create throttle request: %w", err)
+		return fmt.Errorf("create throttler request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", w.tokenName+":"+w.tokenValue)
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		return fmt.Errorf("throttle deploy request: %w", err)
+		return fmt.Errorf("throttle deploy request %d (%s/%s): %w", req.Number, req.Organization, req.Database, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("throttle request failed: %s", resp.Status)
+		// The status alone does not say why — a 404 on a moved path and a 404 on
+		// a deleted deploy request read identically. Carry a bounded, sanitized
+		// excerpt of the body so the cause survives to the logs. Callers must not
+		// render this into PR markdown.
+		return fmt.Errorf("throttle deploy request %d (%s/%s) failed: %s: %s",
+			req.Number, req.Organization, req.Database, resp.Status, sanitizeResponseExcerpt(resp.Body))
 	}
 	return nil
+}
+
+// throttleRatioPercent converts SchemaBot's fractional throttle ratio to the
+// whole percentage the PlanetScale API expects. Out-of-range values are passed
+// through so the API's own validation reports them rather than being silently
+// clamped into a ratio the caller did not ask for.
+func throttleRatioPercent(ratio float64) int {
+	return int(math.Round(ratio * 100))
+}
+
+// maxResponseExcerptLen bounds how much of an error response body is carried in
+// a wrapped error.
+const maxResponseExcerptLen = 200
+
+// sanitizeResponseExcerpt reads a bounded prefix of an error response body and
+// makes it safe to embed in an error string: newlines collapse to spaces and
+// non-printable runes are dropped, so the excerpt cannot break log or table
+// formatting downstream.
+func sanitizeResponseExcerpt(body io.Reader) string {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseExcerptLen*4))
+	if err != nil {
+		return "<response body unreadable>"
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		if !unicode.IsPrint(r) {
+			return -1
+		}
+		return r
+	}, string(raw))
+	cleaned = strings.TrimSpace(strings.Join(strings.Fields(cleaned), " "))
+	if cleaned == "" {
+		return "<empty response body>"
+	}
+	runes := []rune(cleaned)
+	if len(runes) > maxResponseExcerptLen {
+		return string(runes[:maxResponseExcerptLen-1]) + "…"
+	}
+	return cleaned
 }

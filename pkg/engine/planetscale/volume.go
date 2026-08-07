@@ -46,7 +46,7 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 
 	return &engine.VolumeResult{
 		Accepted:       true,
-		PreviousVolume: 0, // Unknown — PlanetScale has no query API for current ratio
+		PreviousVolume: 0, // Unknown — the engine does not track the deploy request's prior ratio
 		NewVolume:      req.Volume,
 		Message:        fmt.Sprintf("Throttle ratio set to %.0f%%", ratio*100),
 	}, nil
