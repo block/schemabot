@@ -14,7 +14,7 @@
 - [Tern Layer (Orchestrator)](#tern-layer-orchestrator)
   - [Plan](#plan)
   - [Apply](#apply)
-  - [Apply vs Task](#apply-vs-task)
+  - [Apply vs Operation vs Task](#apply-vs-operation-vs-task)
   - [Progress Flow And Observers](#progress-flow-and-observers)
   - [Operator](#operator)
   - [Execution Modes](#execution-modes)
@@ -396,7 +396,9 @@ This plan has 2 DDL changes in one namespace. Applying it creates 2 tasks (one p
 
 ### Apply
 
-An **apply** executes a previously created plan. One apply can have multiple **tasks**.
+An **apply** executes a previously created plan. An apply fans out into one or
+more **operations** — the per-deployment units of work a driver claims — and
+each operation owns **tasks**, one per DDL statement.
 
 ```
 schemabot apply (after confirming plan)
@@ -405,28 +407,45 @@ CLI → API → Tern.Apply(PlanID)
                │
                ├─ looks up Plan from storage
                ├─ creates Apply record (links to Plan)
+               ├─ creates Operation records (one per deployment)
                ├─ creates Task records (one per DDL statement)
                └─ starts execution (mode depends on engine and flags)
 ```
 
-### Apply vs Task
+### Apply vs Operation vs Task
 
-| | Apply | Task |
-|---|---|---|
-| **What** | The overall schema change operation | One DDL statement within an apply |
-| **Granularity** | 1 per `schemabot apply` invocation | 1 per table being changed |
-| **Example** | "Apply plan-123 to staging" | "ALTER TABLE users ADD COLUMN email" |
-| **State** | pending → running → completed | pending → running → completed |
-| **Storage** | `applies` table | `tasks` table |
+| | Apply | Operation | Task |
+|---|---|---|---|
+| **What** | The overall schema change | The slice of an apply a driver claims and drives | One DDL statement within an operation |
+| **Granularity** | 1 per `schemabot apply` invocation | 1 per deployment (1 per shard/table on sharded targets) | 1 per table being changed |
+| **Example** | "Apply plan-123 to staging" | "Drive plan-123's work on region-a" | "ALTER TABLE users ADD COLUMN email" |
+| **State** | Derived from its operations' tasks | pending → running → completed | pending → running → completed |
+| **Storage** | `applies` table | `apply_operations` table | `tasks` table |
 
-Example: A plan with 3 DDL changes creates 1 apply and 3 tasks:
+The operation row is what a driver actually claims (`FindNextApplyOperation()`).
+It carries the state a drive needs that is scoped narrower than the whole apply:
+the Tern deployment and resolved target it runs against, the remote data plane's
+apply identifier for that slice, and the engine resume state used to recover
+after a restart. A multi-deployment parent apply has no single authoritative
+remote identifier — each operation does.
+
+Example: A plan with 3 DDL changes on a single-deployment target creates 1
+apply, 1 operation, and 3 tasks:
 
 ```
 Apply: apply-456 (state: running)
-  ├─ Task 1: ALTER TABLE users ADD COLUMN email     (state: completed)
-  ├─ Task 2: ALTER TABLE orders ADD INDEX idx_status (state: running)
-  └─ Task 3: CREATE TABLE audit_log                 (state: pending)
+  └─ Operation: region-a (claimed by a driver; holds the remote apply ID)
+       ├─ Task 1: ALTER TABLE users ADD COLUMN email      (state: completed)
+       ├─ Task 2: ALTER TABLE orders ADD INDEX idx_status (state: running)
+       └─ Task 3: CREATE TABLE audit_log                  (state: pending)
 ```
+
+Targets that fan out wider — multiple deployments, or sharded keyspaces where
+each shard's work is its own operation — create parallel operation rows under
+the same apply. Each is claimed by whichever driver gets there first (on the
+same pod or different ones) and drives independently; the apply's state is
+derived from all of them. See [Apply Lifecycle](apply-lifecycle.md) for the
+full record tree and how it behaves during recovery.
 
 ### Progress Flow And Observers
 
@@ -939,3 +958,5 @@ The engine is a stateless executor. It diffs schemas, executes DDL, and reports 
 ## State Machine
 
 See [pkg/state/README.md](../pkg/state/README.md) for the full state machine documentation, including apply states, task states, and how engine states map to SchemaBot states.
+
+For an operator- and agent-facing guide to the apply lifecycle — the record tree, active vs terminal states, the retry budget for transient failures, and how to recover from a failed apply — see [Apply Lifecycle](apply-lifecycle.md).
