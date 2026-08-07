@@ -393,6 +393,12 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			checkFields()...)
 		return
 	}
+	// Folding on a superseded commit only re-publishes the blocking placeholder
+	// that commit's row already contributes, so the re-plan takes the fold's
+	// place: it records results for the current commit and folds on that.
+	if h.replanAfterTerminalApplyOnSupersededHead(ctx, ghInstClient, a, checkRecord.HeadSHA) {
+		return
+	}
 	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
 }
 
