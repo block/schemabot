@@ -8,7 +8,7 @@ const (
 	ColorBlue   = "🟦" // In progress (copying rows)
 	ColorYellow = "🟨" // Waiting for cutover
 	ColorGreen  = "🟩" // Complete
-	ColorOrange = "🟧" // Stopped
+	ColorOrange = "🟧" // Operator-halted (stopped, cancelled, reverted)
 	ColorRed    = "🟥" // Failed
 	ColorEmpty  = "⬜" // Unfilled
 )
