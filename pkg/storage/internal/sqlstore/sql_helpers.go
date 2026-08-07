@@ -11,7 +11,7 @@ import (
 // rollbackTx rolls back tx, logging a warning if the rollback fails for a
 // reason other than the transaction already being finished. operation is
 // included in the log to identify the originating call site.
-func rollbackTx(ctx context.Context, tx *sql.Tx, operation string) {
+func rollbackTx(ctx context.Context, tx *rebindTx, operation string) {
 	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 		slog.WarnContext(ctx, "failed to roll back transaction", "operation", operation, "error", err)
 	}
