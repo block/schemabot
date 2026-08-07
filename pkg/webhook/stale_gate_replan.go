@@ -66,14 +66,6 @@ func (h *Handler) replanAfterTerminalApplyOnSupersededHead(ctx context.Context, 
 		}
 	}
 
-	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-		Operation:    "aggregate_superseded_head_replan",
-		Repository:   a.Repository,
-		Database:     a.Database,
-		DatabaseType: a.DatabaseType,
-		Environment:  a.Environment,
-		Status:       "success",
-	})
 	h.logger.Info("re-planning on the current commit so the merge gate re-opens: a terminal apply left its stored check state pinned to a superseded commit",
 		append(a.LogAttrs(), "stored_head_sha", storedHeadSHA, "current_head_sha", prInfo.HeadSHA)...)
 
@@ -84,10 +76,29 @@ func (h *Handler) replanAfterTerminalApplyOnSupersededHead(ctx context.Context, 
 	defer cancel()
 	planCtx = ghclient.WithPRInfoCache(planCtx)
 
-	// Discovery failures are already logged and posted as a failing check inside
-	// runAutoPlanForPR, which leaves the gate blocking either way.
-	message, _ := h.runAutoPlanForPR(planCtx, client, a.Repository, a.PullRequest, prInfo.HeadSHA,
+	message, err := h.runAutoPlanForPR(planCtx, client, a.Repository, a.PullRequest, prInfo.HeadSHA,
 		a.InstallationID, replanSourceSupersededHead, replanSourceSupersededHead, "", "")
+
+	// The metric reports whether the gate actually got a fresh plan, not whether
+	// one was attempted: a re-plan that fails leaves the gate blocking on the
+	// superseded commit, which is the condition an operator is alerted on.
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:    "aggregate_superseded_head_replan",
+		Repository:   a.Repository,
+		Database:     a.Database,
+		DatabaseType: a.DatabaseType,
+		Environment:  a.Environment,
+		Status:       status,
+	})
+	if err != nil {
+		h.logger.Error("re-plan for a superseded commit failed; the merge gate stays blocked until the next plan",
+			append(a.LogAttrs(), "current_head_sha", prInfo.HeadSHA, "result", message, "error", err)...)
+		return true
+	}
 	h.logger.Info("re-plan for a superseded commit finished",
 		append(a.LogAttrs(), "current_head_sha", prInfo.HeadSHA, "result", message)...)
 	return true
