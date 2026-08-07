@@ -8,11 +8,6 @@ import (
 	"time"
 )
 
-// ReapplyFailureFreshnessDays bounds deliberate reapply of terminal failed
-// applies. Older failures should be handled by creating a fresh apply from a
-// fresh plan so stale execution context is not reactivated unexpectedly.
-const ReapplyFailureFreshnessDays = 1
-
 // ApplyLeaseStaleAfter is how long an apply or apply_operation lease heartbeat
 // (updated_at) may go unrefreshed before peer drivers treat the lease as
 // expired and reclaim the row for crash recovery. The claim queries in
@@ -491,14 +486,6 @@ type ApplyStore interface {
 	// retry budget or recovery freshness window to permanent failed. Returns the
 	// applies updated.
 	ExpireRetryable(ctx context.Context) ([]*RetryableApplyExpiration, error)
-
-	// ReapplyFailed transitions a recent permanently failed apply back onto the
-	// retryable recovery path. Completed work remains completed; failed tasks and
-	// operation rows become failed_retryable so operator drivers can claim and
-	// drive only the remaining work. The transition re-checks active-apply
-	// exclusivity under the apply target lock because it makes a terminal apply
-	// active again.
-	ReapplyFailed(ctx context.Context, applyID int64) (*Apply, error)
 
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
