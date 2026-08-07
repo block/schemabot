@@ -1114,12 +1114,12 @@ func (s *Service) recordMergeGateIfApplyResolved(ctx context.Context, driverID i
 
 const (
 	// checkPreflightGateTimeout bounds how long one drive attempt waits for
-	// the preflight fan-out to hold sibling change checks before the apply's
-	// engine work may start. It exceeds the merge gate processor's poll
-	// interval so a wake-up kick lost across pods still completes within one
-	// wait. On expiry the drive attempt is abandoned and the apply stays
-	// claimable — fail closed: engine work never starts before the holds are
-	// confirmed.
+	// the preflight fan-out to record sibling change check holds before the
+	// apply's engine work may start. It exceeds the merge gate processor's
+	// poll interval so a wake-up kick lost across pods still completes within
+	// one wait. On expiry the drive attempt is abandoned and the apply stays
+	// claimable — fail closed: engine work never starts before the stored
+	// holds are recorded.
 	checkPreflightGateTimeout = 90 * time.Second
 
 	// checkPreflightGatePollInterval is the cadence at which the gate re-reads
@@ -1129,15 +1129,17 @@ const (
 
 // gateApplyStartOnCheckPreflight blocks an apply's engine work until the
 // preflight merge gate fan-out has durably held every sibling change's
-// stored check on the apply's target action-required (with a comment on the
-// change explaining the hold). Merges must not land on check verdicts this
-// apply is about to invalidate, so the holds are a hard precondition of the
-// drive: a nil return means the holds are confirmed (or the gate does not
-// apply — no merge gate consumer, or a task-less apply that cannot change
-// the schema). An error
-// means the holds could not be confirmed; the caller abandons the drive
-// attempt and the apply stays claimable, so the start is retried on a later
-// poll and the apply never runs un-preflighted.
+// stored check on the apply's target action-required. Merges must not land
+// on check verdicts this apply is about to invalidate, so the stored holds
+// are a hard precondition of the drive: a nil return means they are recorded
+// (or the gate does not apply — no merge gate consumer, or a task-less apply
+// that cannot change the schema). The gate waits only on the stored holds —
+// storage-only writes — never on the code-host rendering of them (Check Run
+// update and hold comment), which retries separately: the code host being
+// unreachable must never block an apply, least of all one mitigating an
+// incident. An error means the stored holds could not be confirmed; the
+// caller abandons the drive attempt and the apply stays claimable, so the
+// start is retried on a later poll and the apply never runs un-preflighted.
 //
 // The gate is idempotent across drive attempts, lease handovers, and resumes:
 // the preflight request is unique per apply, and a completed request passes
@@ -1157,10 +1159,10 @@ func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID i
 		metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "error")
 		return fmt.Errorf("load preflight merge gate request: %w", err)
 	}
-	if req != nil && req.State == storage.MergeGateCompleted {
-		// The common resume/cutover fast path: holds were confirmed on an
+	if req != nil && preflightHoldsConfirmed(req) {
+		// The common resume/cutover fast path: holds were recorded on an
 		// earlier drive attempt.
-		s.logger.Debug("operator: check preflight already completed; apply may start",
+		s.logger.Debug("operator: check preflight holds already recorded; apply may start",
 			append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
 		return nil
 	}
@@ -1206,12 +1208,23 @@ func (s *Service) gateApplyStartOnCheckPreflight(ctx context.Context, driverID i
 	return s.waitForCheckPreflight(ctx, driverID, apply, deployment)
 }
 
-// waitForCheckPreflight polls the apply's preflight request until the fan-out
-// completes, the gate deadline expires, or the drive context ends. A
-// terminally failed request is re-armed to pending with a fresh attempt
-// budget so a long outage (for example the code host unavailable past the
-// retry cap) blocks the apply only until the cause clears, not until manual
-// intervention.
+// preflightHoldsConfirmed reports whether an apply's preflight request has
+// durably held every sibling change's stored check on the target, which is
+// the gate's start condition. True once the storage-only hold phase stamps
+// HoldsRecordedAt, and for completed requests without a stamp — a pending
+// preflight coalesced into a same-target sibling's fan-out completes without
+// running its own hold phase, covered by the holds that fan-out recorded.
+func preflightHoldsConfirmed(req *storage.MergeGateRequest) bool {
+	return req.State == storage.MergeGateCompleted || req.HoldsRecordedAt != nil
+}
+
+// waitForCheckPreflight polls the apply's preflight request until its stored
+// holds are recorded, the gate deadline expires, or the drive context ends.
+// The stored holds are the storage-only half of the fan-out — the code-host
+// rendering retries on its own and never blocks the apply. A terminally
+// failed request is re-armed to pending with a fresh attempt budget so a
+// storage failure past the retry cap blocks the apply only until the cause
+// clears, not until manual intervention.
 func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply *storage.Apply, deployment string) error {
 	store := s.storage.MergeGateRequests()
 	deadline := time.Now().Add(checkPreflightGateTimeout)
@@ -1231,6 +1244,12 @@ func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "passed")
 			return nil
 		}
+		if req.HoldsRecordedAt != nil {
+			s.logger.Info("operator: check preflight stored holds recorded; the apply may start while the code-host rendering of the holds keeps retrying",
+				append(apply.LogAttrs(), "driver", driverID, "operation_deployment", deployment)...)
+			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "passed_render_pending")
+			return nil
+		}
 		if req.State == storage.MergeGateFailed && req.RetryAfter == nil {
 			reopened, err := store.ReopenForRetry(ctx, req.ID)
 			if err != nil {
@@ -1245,7 +1264,7 @@ func (s *Service) waitForCheckPreflight(ctx context.Context, driverID int, apply
 		}
 		if time.Now().After(deadline) {
 			metrics.RecordCheckPreflightGateOutcome(ctx, apply.Database, apply.Environment, "timeout")
-			return fmt.Errorf("preflight holds for apply %s not confirmed within %s (request state %s, attempts %d): apply start stays blocked until the merge gate processor confirms them",
+			return fmt.Errorf("preflight stored holds for apply %s not recorded within %s (request state %s, attempts %d): apply start stays blocked until the merge gate processor records them",
 				apply.ApplyIdentifier, checkPreflightGateTimeout, req.State, req.Attempts)
 		}
 		select {

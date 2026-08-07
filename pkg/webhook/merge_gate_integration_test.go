@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -801,6 +802,109 @@ func TestE2ECheckPreflightStoredHoldsLandDuringGitHubOutage(t *testing.T) {
 	assert.Equal(t, storage.MergeGateFailed, req.State, "the render failure keeps the request in its retry lifecycle")
 	assert.NotNil(t, req.RetryAfter, "the render failure is retryable, not terminal")
 	assert.Contains(t, req.LastError, "verify PR state for check preflight")
+}
+
+// TestE2ECheckPreflightGateStartsApplyDuringGitHubOutage drives a real apply
+// end to end while every GitHub call fails, proving the two halves of the
+// outage contract together: the preflight's storage-only hold phase still
+// lands (the sibling PR's green stored check flips action-required, so a
+// merge cannot ride the outage past a verdict the apply invalidates), and
+// the operator gate starts the apply on the stored holds without waiting
+// for the unreachable code-host rendering — a GitHub outage must never
+// block an apply, least of all one mitigating an incident.
+func TestE2ECheckPreflightGateStartsApplyDuringGitHubOutage(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_outage_apply"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Every GitHub call fails: the API is down for the whole apply lifecycle.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "github unavailable", http.StatusServiceUnavailable)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// The sibling PR's green check is the merge-vulnerable state the hold
+	// exists for.
+	seedRefreshTargetCheck(t, svc, 1, "staging", dbName,
+		checkStatusCompleted, checkConclusionSuccess, "no changes")
+
+	// The processor runs as the server runs it: the gate's kick must reach it
+	// so the hold phase drains without a poll tick.
+	newE2EHandler(t, svc, client)
+
+	// The apply enters through the direct service API — the path a CLI apply
+	// takes during an incident, which never touches GitHub for discovery.
+	schema := "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	planResp, err := svc.ExecutePlan(ctx, api.PlanRequest{
+		Database:    dbName,
+		Environment: "staging",
+		Type:        "mysql",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			dbName: {Files: map[string]string{"users.sql": schema}},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.Changes, "expected DDL changes")
+
+	applyResp, applyID, err := svc.ExecuteApply(ctx, api.ApplyRequest{
+		PlanID:      planResp.PlanID,
+		Environment: "staging",
+		Caller:      "cli:sev-operator@host",
+	})
+	require.NoError(t, err)
+	require.True(t, applyResp.Accepted)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	// The operator gate records the preflight, the processor's hold phase
+	// flips the sibling stored check, and the apply drives to terminal
+	// success — all without a single successful GitHub call.
+	var apply *storage.Apply
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		a, err := svc.Storage().Applies().Get(t.Context(), applyID)
+		if !assert.NoError(collect, err) || !assert.NotNil(collect, a) {
+			return
+		}
+		assert.True(collect, state.IsState(a.State, state.Apply.Completed),
+			"apply state %s is not completed yet", a.State)
+		apply = a
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
+
+	// The stamp the gate started the apply on is durable, while the render
+	// could not have completed against a dead GitHub — the request stays in
+	// its retry lifecycle for when GitHub recovers.
+	preflight, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(ctx, applyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	require.NotNil(t, preflight, "the gate records a preflight request before the apply starts")
+	assert.NotNil(t, preflight.HoldsRecordedAt, "the apply started, so the stored holds must have been recorded")
+	assert.NotEqual(t, storage.MergeGateCompleted, preflight.State,
+		"the code-host rendering cannot complete while GitHub is down")
+
+	// The sibling's stored check never went back to green: the hold landed
+	// before the apply started, and once the apply settles the re-plan fails
+	// closed against the dead GitHub. Either way the merge stays blocked.
+	held, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, held)
+	assert.Equal(t, checkConclusionActionRequired, held.Conclusion)
+	assert.Contains(t, held.ChangeSummary, apply.ApplyIdentifier,
+		"the blocked check attributes its state to the apply that caused it")
+
+	// The drive tail still records the settle, so the siblings are re-planned
+	// once GitHub recovers.
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		settle, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), applyID, storage.MergeGateKindSettle)
+		if !assert.NoError(collect, err) {
+			return
+		}
+		assert.NotNil(collect, settle, "the drive tail records a settle for the completed apply")
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
 }
 
 // TestE2ECheckReleaseSweepSettlesFailedPreflightedApply verifies holds always

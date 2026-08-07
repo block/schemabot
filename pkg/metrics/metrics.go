@@ -1602,12 +1602,19 @@ func RecordMergeGateEventOutcome(ctx context.Context, database, environment, out
 // RecordCheckPreflightGateOutcome counts outcomes of the operator gate that
 // blocks an apply's engine work until sibling changes' stored checks on its
 // target are held action-required. Outcomes:
-//   - "passed": the preflight fan-out confirmed the holds; the apply started.
-//   - "timeout": the holds were not confirmed within the gate deadline; the
-//     drive attempt was abandoned and the apply stays claimable. A sustained
-//     rate means the merge gate processor is failing to drain preflight
-//     requests — check its logs; applies on servers with a merge gate
-//     consumer will not start until it recovers.
+//   - "passed": the preflight request completed (stored holds and code-host
+//     rendering both done); the apply started.
+//   - "passed_render_pending": the stored holds are recorded and the apply
+//     started, while the code-host rendering is still retrying — the normal
+//     shape during a code-host outage. A sustained rate with the code host
+//     healthy means renders are failing for another reason; check the merge
+//     gate logs.
+//   - "timeout": the stored holds were not recorded within the gate deadline;
+//     the drive attempt was abandoned and the apply stays claimable. The
+//     hold phase is storage-only, so a sustained rate means the merge gate
+//     processor is not draining preflights or storage writes are failing —
+//     applies on servers with a merge gate consumer will not start until it
+//     recovers.
 //   - "error": the gate could not read or record the preflight request
 //     (storage failure); the drive attempt was abandoned, fail closed.
 func RecordCheckPreflightGateOutcome(ctx context.Context, database, environment, outcome string) {

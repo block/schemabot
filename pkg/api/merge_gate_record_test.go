@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -77,6 +78,16 @@ func (s *capturingMergeGateStore) setRowState(kind, st string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rows[kind].State = st
+}
+
+// setRowHoldsRecorded stamps a stored row the way the processor's hold phase
+// would: holds recorded while the request itself is still being driven.
+func (s *capturingMergeGateStore) setRowHoldsRecorded(kind string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.rows[kind].State = storage.MergeGateProcessing
+	s.rows[kind].HoldsRecordedAt = &now
 }
 
 func (s *capturingMergeGateStore) recordedCount() int {
@@ -286,6 +297,41 @@ func TestGateApplyStartOnCheckPreflight(t *testing.T) {
 		require.NoError(t, err)
 		assert.Zero(t, gateStore.recordedCount(),
 			"a resume or cutover drive pays one read, not a new request")
+	})
+
+	t.Run("stored holds pass the gate while the render is still retrying", func(t *testing.T) {
+		svc, gateStore := newMergeGateTestService(state.Apply.Pending, 1)
+		svc.OnMergeGateRecorded = func() {
+			// Stand in for the processor's hold phase: the stored holds land
+			// but the code-host rendering has not completed — the shape of a
+			// code-host outage. The gate must start the apply on the holds
+			// alone.
+			gateStore.setRowHoldsRecorded(storage.MergeGateKindPreflight)
+		}
+
+		err := svc.gateApplyStartOnCheckPreflight(t.Context(), 0, apply, "default")
+
+		require.NoError(t, err, "a code-host outage must never block an apply on the rendering of its own holds")
+	})
+
+	t.Run("holds recorded on an earlier drive pass without recording", func(t *testing.T) {
+		svc, gateStore := newMergeGateTestService(state.Apply.Pending, 1)
+		svc.OnMergeGateRecorded = func() {}
+		_, err := gateStore.Record(t.Context(), &storage.MergeGateRequest{
+			ApplyID: 7,
+			Kind:    storage.MergeGateKindPreflight,
+		})
+		require.NoError(t, err)
+		gateStore.setRowHoldsRecorded(storage.MergeGateKindPreflight)
+		gateStore.mu.Lock()
+		gateStore.recorded = nil
+		gateStore.mu.Unlock()
+
+		err = svc.gateApplyStartOnCheckPreflight(t.Context(), 0, apply, "default")
+
+		require.NoError(t, err)
+		assert.Zero(t, gateStore.recordedCount(),
+			"a resume drive pays one read against the recorded holds, not a new request")
 	})
 
 	t.Run("terminally failed preflight is re-armed and the gate keeps waiting", func(t *testing.T) {
