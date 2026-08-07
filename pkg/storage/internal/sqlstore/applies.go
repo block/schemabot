@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -243,7 +242,7 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 	}
 
 	lockName := applyTargetLockName(database, dbType, environment)
-	acquired, err := locker.Acquire(ctx, conn.raw(), lockName, applyTargetLockWait)
+	acquired, err := locker.Acquire(ctx, conn.lockerConn(), lockName, applyTargetLockWait)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to acquire apply target lock",
 			"database", database,
@@ -276,7 +275,7 @@ func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, co
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
 	defer cancel()
 
-	released, err := locker.Release(releaseCtx, conn.raw(), lockName)
+	released, err := locker.Release(releaseCtx, conn.lockerConn(), lockName)
 	switch {
 	case err != nil:
 		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
@@ -298,21 +297,25 @@ func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, co
 // destroys it instead of reusing a session whose advisory-lock state is
 // uncertain.
 func discardApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+	if err := conn.discardBadConn(); err != nil {
 		slog.WarnContext(ctx, "failed to discard apply target lock connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", rawErr)
-	}
-}
-
-func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if err := conn.Close(); err != nil {
-		slog.WarnContext(ctx, "failed to close apply target lock connection",
 			"operation", operation,
 			"lock", lockName,
 			"error", err)
 	}
+}
+
+func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
+	err := conn.Close()
+	if err == nil || errors.Is(err, sql.ErrConnDone) {
+		// ErrConnDone means the session was already retired by a preceding
+		// discard; there is nothing left to release.
+		return
+	}
+	slog.WarnContext(ctx, "failed to close apply target lock connection",
+		"operation", operation,
+		"lock", lockName,
+		"error", err)
 }
 
 // dedupeDeployments returns the input deployments as a sorted, de-duplicated
