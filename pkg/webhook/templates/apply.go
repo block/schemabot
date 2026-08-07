@@ -744,7 +744,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		// The verify passed and the engine is draining the changes that
 		// accumulated on the source while it ran. Named separately from the
 		// pre-checksum catch-up so the row doesn't rewind to an earlier phase.
-		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Applying changes accumulated during verify...\n", table.TableName, ui.ProgressBarRowCopy(100))
+		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Data verified, applying final changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
 		writeDDLLine(sb, table.DDL)
 		if table.RowsCopied > 0 {
 			fmt.Fprintf(sb, "Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))

@@ -362,7 +362,7 @@ func TestFormatTableProgress_PostChecksum(t *testing.T) {
 		RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100,
 	})
 	assert.Contains(t, output, "orders: ")
-	assert.Contains(t, output, "⏩ Applying changes accumulated during verify...")
+	assert.Contains(t, output, "⏩ Data verified, applying final changes...")
 	assert.Contains(t, output, "Rows copied: 1,466,232")
 	assert.NotContains(t, output, "Checksumming to verify data")
 }

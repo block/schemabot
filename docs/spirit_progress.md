@@ -136,7 +136,7 @@ canonical task states:
 | `initial`, `copyRows`, `restoreSecondaryIndexes`, `analyzeTable`, `errCleanup` | `running` | Row-copy progress bar |
 | `applyChangeset` | `catching_up` | "⏩ Catching up on accumulated changes..." |
 | `checksum` | `checksumming` | "🔍 Checksumming to verify data (N%)" |
-| `postChecksum` | `post_checksum` | "⏩ Applying changes accumulated during verify..." |
+| `postChecksum` | `post_checksum` | "⏩ Data verified, applying final changes..." |
 | `waitingOnSentinelTable` | `waiting_for_cutover` | "Waiting for cutover" |
 | `cutOver` | `cutting_over` | "🔄 Cutting over..." |
 | `close` | `completed` | "✓ Complete" |
@@ -320,7 +320,7 @@ Defined in `pkg/cmd/internal/templates/progress.go`.
 
 **Post-checksum** — blue bar at 100% with the second-drain label:
 ```
-  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Applying changes accumulated during verify...
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
        • Rows copied: 1,466,232
 ```

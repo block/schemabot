@@ -494,7 +494,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// The verify passed and the engine is applying the changes that
 		// accumulated while it ran. Named separately from the pre-checksum
 		// catch-up so the display doesn't rewind to an earlier phase.
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Applying changes accumulated during verify...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Data verified, applying final changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}

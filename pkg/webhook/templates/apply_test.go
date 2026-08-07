@@ -188,7 +188,7 @@ func TestRenderApplyStatusComment_CatchingUp(t *testing.T) {
 func TestRenderApplyStatusComment_DrainPhasesFromRawSpiritState(t *testing.T) {
 	for raw, wantLine := range map[string]string{
 		"applyChangeset": "⏩ Catching up on accumulated changes...",
-		"postChecksum":   "⏩ Applying changes accumulated during verify...",
+		"postChecksum":   "⏩ Data verified, applying final changes...",
 	} {
 		data := ApplyStatusCommentData{
 			Database:    "testapp",
@@ -228,7 +228,7 @@ func TestRenderApplyStatusComment_PostChecksum(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; the post-checksum drain is table-level")
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "⏩ Applying changes accumulated during verify...")
+	assert.Contains(t, result, "⏩ Data verified, applying final changes...")
 	assert.Contains(t, result, "Rows copied: 1,466,232")
 	assert.Contains(t, result, "1 catching up")
 	assert.NotContains(t, result, "Checksumming to verify data")

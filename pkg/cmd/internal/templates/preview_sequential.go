@@ -123,7 +123,7 @@ func previewSeqCatchingUpOutput() {
 }
 
 func previewSeqPostChecksumOutput() {
-	fmt.Println("Sequential mode: First complete, second applying changes accumulated during verify")
+	fmt.Println("Sequential mode: First complete, second verified and applying final changes")
 	fmt.Println()
 
 	data := ProgressData{

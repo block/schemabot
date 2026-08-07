@@ -2794,7 +2794,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Applying changes accumulated during verify...
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -4851,7 +4851,7 @@ Sequential mode: First complete, second checksumming
 
 ```
 
-Sequential mode: First complete, second applying changes accumulated during verify
+Sequential mode: First complete, second verified and applying final changes
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
@@ -4861,7 +4861,7 @@ Sequential mode: First complete, second applying changes accumulated during veri
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Applying changes accumulated during verify...
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows copied: 5,000,000
 
