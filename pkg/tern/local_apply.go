@@ -476,6 +476,12 @@ func deriveOverallState(tasks []*storage.Task) string {
 		case state.Task.Running:
 			hasRunning = true
 			runningState = state.Task.Running
+		case state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum:
+			// Table-level post-copy phases: the apply as a whole is still
+			// running while a table drains its accumulated changeset or
+			// verifies its copied data.
+			hasRunning = true
+			runningState = state.Task.Running
 		case state.Task.WaitingForCutover:
 			hasRunning = true
 			runningState = state.Task.WaitingForCutover

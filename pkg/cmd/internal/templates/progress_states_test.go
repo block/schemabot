@@ -340,6 +340,33 @@ func TestFormatTableProgress_StartingCopy(t *testing.T) {
 	}
 }
 
+// A table applying its accumulated changes names the catch-up phase rather
+// than rendering a bare full bar — its copy is done but the engine is still
+// draining the changes that piled up on the source, which can run for hours on
+// a busy table.
+func TestFormatTableProgress_CatchingUp(t *testing.T) {
+	output := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.CatchingUp,
+		RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100,
+	})
+	assert.Contains(t, output, "orders: ")
+	assert.Contains(t, output, "⏩ Catching up on accumulated changes...")
+	assert.Contains(t, output, "Rows copied: 1,466,232")
+}
+
+// A table draining the changes that accumulated during the verify names the
+// post-checksum phase — never an indeterminate checksum that already finished.
+func TestFormatTableProgress_PostChecksum(t *testing.T) {
+	output := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.PostChecksum,
+		RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100,
+	})
+	assert.Contains(t, output, "orders: ")
+	assert.Contains(t, output, "⏩ Applying changes accumulated during verify...")
+	assert.Contains(t, output, "Rows copied: 1,466,232")
+	assert.NotContains(t, output, "Checksumming to verify data")
+}
+
 // A checksumming table renders its verify progress rather than a row-copy
 // percent — its copy is done and the engine is now verifying the data, which
 // can run for hours on a large table.

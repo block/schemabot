@@ -1089,6 +1089,19 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplyCatchingUp renders an apply comment where a table has
+// finished copying and is draining the changes that accumulated during the copy.
+func PreviewCommentApplyCatchingUp() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.CatchingUp
+	tables[1].RowsCopied = 1466232
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 100
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyChecksumming renders an apply comment where a table has
 // finished copying and entered the checksum phase to verify the copied data.
 func PreviewCommentApplyChecksumming() string {
@@ -1097,6 +1110,19 @@ func PreviewCommentApplyChecksumming() string {
 	tables[1].Status = state.Task.Checksumming
 	tables[1].ChecksumRowsChecked = 321450
 	tables[1].ChecksumRowsTotal = 1466232
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
+// PreviewCommentApplyPostChecksum renders an apply comment where a table has
+// passed the checksum and is draining the changes that accumulated during it.
+func PreviewCommentApplyPostChecksum() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.PostChecksum
+	tables[1].RowsCopied = 1466232
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 100
 	tables[2].Status = state.Task.Pending
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }

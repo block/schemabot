@@ -454,6 +454,21 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Task.CatchingUp:
+		// Row copy is done; the engine is applying the changes that accumulated
+		// from live traffic during the copy. On a busy source this catch-up can
+		// run for a long time, so name the phase instead of showing a serene
+		// full bar that looks finished.
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Catching up on accumulated changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		if t.RowsCopied > 0 {
+			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data against the
 		// source. On a large table this can run for hours, so show how far the
@@ -471,6 +486,20 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
+	case state.Task.PostChecksum:
+		// The verify passed and the engine is applying the changes that
+		// accumulated while it ran. Named separately from the pre-checksum
+		// catch-up so the display doesn't rewind to an earlier phase.
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Applying changes accumulated during verify...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		if t.RowsCopied > 0 {
+			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))

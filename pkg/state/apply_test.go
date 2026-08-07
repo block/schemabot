@@ -103,15 +103,24 @@ func TestDeriveApplyState_AnyRunning(t *testing.T) {
 	}
 }
 
-// Checksumming is a table-level state, not an apply state: while tables verify
-// their copied data the apply as a whole is still running, so it derives to
+// CatchingUp, Checksumming, and PostChecksum are table-level states, not
+// apply states: while tables drain the accumulated binlog changeset or verify
+// their copied data the apply as a whole is still running, so they derive to
 // RUNNING rather than a distinct apply state.
-func TestDeriveApplyState_ChecksummingDerivesRunning(t *testing.T) {
+func TestDeriveApplyState_TablePhasesDeriveRunning(t *testing.T) {
 	testCases := [][]string{
 		{"checksumming"},
 		{"CHECKSUMMING"},
 		{"RUNNING", "checksumming"},
 		{"COMPLETED", "checksumming", "PENDING"},
+		{"catching_up"},
+		{"CATCHING_UP"},
+		{"RUNNING", "catching_up"},
+		{"COMPLETED", "catching_up", "PENDING"},
+		{"post_checksum"},
+		{"POST_CHECKSUM"},
+		{"RUNNING", "post_checksum"},
+		{"COMPLETED", "post_checksum", "PENDING"},
 	}
 
 	for _, states := range testCases {
