@@ -676,13 +676,18 @@ func isUnlockRejection(err error) bool {
 //     still protecting the lock, or a command that predates every lock it
 //     matched).
 //
-// issuedAt bounds the release targets: a lock acquired after the command was
-// received is never released. The command's intent covered the locks that
-// existed when it was issued; on the durable path a re-drive can run minutes
-// later — or arbitrarily later via redelivery — by which time a matched lock
-// may be protecting a fresh apply awaiting confirmation or another session's
-// work. The synchronous wrapper passes time.Now(); the durable driver passes
-// the delivery's received-at.
+// issuedAt bounds the release targets: a lock acquired after issuedAt is
+// never released. On the durable path issuedAt is the delivery's received-at,
+// so a re-drive minutes later still releases only the locks the command
+// covered when it arrived — not a lock acquired since, which may be
+// protecting a fresh apply awaiting confirmation or another session's work.
+// The bound is per delivery receipt, not per original comment: a GitHub
+// Redeliver reopens the stored delivery with a fresh received-at, so a
+// redelivered command may release locks acquired after the original comment,
+// as long as they predate the redelivery. That is deliberate — Redeliver is
+// an operator action to re-run the command now, and the authorization and
+// active-apply gates re-evaluate against current state. The synchronous
+// wrapper passes time.Now().
 //
 // A terminal rejection is a per-delivery decision: it is deterministic for
 // the PR head this delivery read, and a later push can change the answer.
@@ -735,7 +740,10 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// Release only locks that existed when the command was received. A lock
 	// acquired afterwards was never covered by the command's intent and may be
 	// protecting newer work — a fresh apply awaiting confirmation, or another
-	// session's CLI lock on a force unlock.
+	// session's CLI lock on a force unlock. The comparison spans two clocks
+	// (lock.CreatedAt is the storage DB's clock, issuedAt the webhook pod's);
+	// skew fails safe — a wrongly skipped lock gets the stale-command answer
+	// prompting a fresh comment, never a wrongful release.
 	fresh := make([]*storage.Lock, 0, len(locks))
 	var skippedNewer int
 	for _, lock := range locks {
@@ -821,6 +829,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// make the delivery retryable, and a re-drive only sees the locks that are
 	// still held.
 	var releaseErrs []error
+	var released, alreadyGone int
 	for _, lock := range locks {
 		var err error
 		if result.Force {
@@ -834,6 +843,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			// first. The lock this command targeted is gone, which is the
 			// command's goal, so this is not a failure to retry; skip the
 			// success comment too, since this command did not do the releasing.
+			alreadyGone++
 			h.logger.Info("unlock target already released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
 				"owner", lock.Owner, "force", result.Force, "error", err)
@@ -847,11 +857,21 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			continue
 		}
 
+		released++
 		h.postComment(repo, pr, installationID, templates.RenderUnlockSuccess(
 			lock.DatabaseName, "", requestedBy))
 	}
 	if len(releaseErrs) > 0 {
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
+	}
+	if released == 0 && alreadyGone > 0 {
+		// Every matched lock was released by a concurrent operation before this
+		// command could act. The per-lock skips stay silent, so without an
+		// aggregate answer the acked command would end without any comment;
+		// an acknowledged command must always answer.
+		h.logger.Info("unlock: every matched lock was already released concurrently",
+			"repo", repo, "pr", pr, "already_gone", alreadyGone)
+		h.postComment(repo, pr, installationID, templates.RenderLocksAlreadyReleased())
 	}
 	return false, nil
 }

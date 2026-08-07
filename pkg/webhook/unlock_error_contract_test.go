@@ -356,6 +356,35 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "billing", "the success comment names only the lock this command released")
 	})
 
+	// When every matched lock lost the race to a concurrent releaser, the
+	// per-lock skips post nothing — but the command was acknowledged, so it
+	// must still answer with an aggregate comment instead of ending silently.
+	t.Run("every matched lock released concurrently still answers", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		ordersLock := prOwnedOrdersLock()
+		billingLock := prOwnedOrdersLock()
+		billingLock.DatabaseName = "billing"
+		lockStore := &unlockTestLockStore{
+			locks: []*storage.Lock{ordersLock, billingLock},
+			releaseErrs: map[string]error{
+				"orders":  storage.ErrLockNotFound,
+				"billing": storage.ErrLockNotOwned,
+			},
+		}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "locks already gone converge with the command's goal; re-driving would find nothing")
+		assert.Empty(t, lockStore.released, "this command released nothing")
+		body := requireComment(t, comments, "aggregate already-released answer")
+		assert.Contains(t, body, "Locks Already Released")
+		assert.Contains(t, body, "already been released by a concurrent operation")
+	})
+
 	// A lock acquired after the command was received is outside the command's
 	// intent: a delayed re-drive must not release it, only the locks that
 	// existed when the command was issued.
