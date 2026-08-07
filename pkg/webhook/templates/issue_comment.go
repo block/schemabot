@@ -129,13 +129,14 @@ type ControlApplyCandidate struct {
 // read back a list already in front of them is noise.
 func RenderControlAmbiguousApplyID(command, environment string, candidates []ControlApplyCandidate) string {
 	var body strings.Builder
-	body.WriteString(fmt.Sprintf("## Which Schema Change?\n\n"+
+	fmt.Fprintf(&body, "## Which Schema Change?\n\n"+
 		"This PR has more than one schema change in `%s`, so `schemabot %s` needs to be told which one.\n\n"+
-		"| Apply | Database | State |\n|---|---|---|\n", environment, command))
+		"| Apply | Database | State |\n|---|---|---|\n", environment, command)
 	for _, c := range candidates {
-		body.WriteString(fmt.Sprintf("| `%s` | `%s` | %s |\n", c.ApplyID, c.Database, c.State))
+		fmt.Fprintf(&body, "| `%s` | `%s` | %s |\n", c.ApplyID, c.Database, c.State)
 	}
-	return body.String() + fmt.Sprintf("\nUsage: `%s`\n", controlCommandUsage(command, environment))
+	fmt.Fprintf(&body, "\nUsage: `%s`\n", controlCommandUsage(command, environment))
+	return body.String()
 }
 
 // RenderVolumeInvalidLevel renders the message posted when a volume command
