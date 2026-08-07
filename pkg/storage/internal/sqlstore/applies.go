@@ -114,6 +114,9 @@ func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
 		state.Apply.RunningDegraded,
+		state.Apply.CatchingUp,
+		state.Apply.Checksumming,
+		state.Apply.PostChecksum,
 		state.Apply.Resuming,
 		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,

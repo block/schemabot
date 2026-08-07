@@ -162,9 +162,16 @@ displayed phase walks the lifecycle strictly forward — mirroring Spirit's own
 enum order. Terminal states and operator-owned states (`stopped`,
 `failed_retryable`) are handled by separate policies before the rank applies.
 
-The phase states stay table-level: `deriveOverallState` folds `catching_up`,
-`checksumming`, and `post_checksum` into a running apply, so apply-level state
-machines (control gates, schedulers, check runs) are unaffected.
+The phases are also first-class apply states: `deriveOverallState` (and
+`state.DeriveApplyState`) surface the **least-advanced active phase** at the
+apply level — while any table still copies rows the apply is `running`; once
+every active table is draining or verifying, the apply names that phase
+(`catching_up`, `checksumming`, `post_checksum`). All three are
+running-family: `state.IsRunningApplyState` matches them, so control gates
+(stop, start, volume, cutover readiness), the driver claim list, and check
+aggregation treat them exactly like `running`. On the wire they are the
+`STATE_CATCHING_UP` / `STATE_CHECKSUMMING` / `STATE_POST_CHECKSUM` proto
+values.
 
 ## Tern layer — drive writes, readers read stored
 

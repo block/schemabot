@@ -109,7 +109,7 @@ func previewSeqCatchingUpOutput() {
 	fmt.Println()
 
 	data := ProgressData{
-		State:     state.Apply.Running,
+		State:     state.Apply.CatchingUp,
 		Engine:    "Spirit",
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
@@ -127,7 +127,7 @@ func previewSeqPostChecksumOutput() {
 	fmt.Println()
 
 	data := ProgressData{
-		State:     state.Apply.Running,
+		State:     state.Apply.PostChecksum,
 		Engine:    "Spirit",
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-30 * time.Minute).Format(time.RFC3339),
@@ -145,7 +145,7 @@ func previewSeqChecksummingOutput() {
 	fmt.Println()
 
 	data := ProgressData{
-		State:     state.Apply.Running,
+		State:     state.Apply.Checksumming,
 		Engine:    "Spirit",
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),

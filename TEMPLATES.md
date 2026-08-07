@@ -2694,7 +2694,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**Status**: In Progress
+**Status**: Catching Up
 
 📊 1/3 complete · 1 catching up · 1 queued
 
@@ -2741,7 +2741,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**Status**: In Progress
+**Status**: Checksumming
 
 📊 1/3 complete · 1 checksumming · 1 queued
 
@@ -2788,7 +2788,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**Status**: In Progress
+**Status**: Applying Final Changes
 
 📊 1/3 complete · 1 catching up · 1 queued
 
@@ -4797,7 +4797,7 @@ Sequential mode: First complete, second catching up on accumulated changes
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
-│  State:     Running              │
+│  State:     Catching up          │
 │  Started:   Jan 15 14:05:00 UTC  │
 │  Duration:  25m                  │
 └──────────────────────────────────┘
@@ -4826,7 +4826,7 @@ Sequential mode: First complete, second checksumming
 
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
-│  State:     Running              │
+│  State:     Checksumming         │
 │  Started:   Jan 15 14:05:00 UTC  │
 │  Duration:  25m                  │
 └──────────────────────────────────┘
@@ -4853,12 +4853,12 @@ Sequential mode: First complete, second checksumming
 
 Sequential mode: First complete, second verified and applying final changes
 
-┌──────────────────────────────────┐
-│  Apply ID:  apply-a1b2c3d4e5f6   │
-│  State:     Running              │
-│  Started:   Jan 15 14:00:00 UTC  │
-│  Duration:  30m                  │
-└──────────────────────────────────┘
+┌─────────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6      │
+│  State:     Applying final changes  │
+│  Started:   Jan 15 14:00:00 UTC     │
+│  Duration:  30m                     │
+└─────────────────────────────────────┘
 
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...

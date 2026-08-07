@@ -375,6 +375,12 @@ func FormatProgressState(s string) string {
 		return ANSICyan + "🔄 Running" + ANSIReset
 	case state.Apply.RunningDegraded:
 		return ANSICyan + "🔄 Running (degraded)" + ANSIReset
+	case state.Apply.CatchingUp:
+		return ANSICyan + "⏩ Catching up" + ANSIReset
+	case state.Apply.Checksumming:
+		return ANSICyan + "🔍 Checksumming" + ANSIReset
+	case state.Apply.PostChecksum:
+		return ANSICyan + "⏩ Applying final changes" + ANSIReset
 	case state.Apply.WaitingForDeploy:
 		return ANSIYellow + "🟨 Waiting for deploy" + ANSIReset
 	case state.Apply.WaitingForCutover:
@@ -1312,7 +1318,8 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.FailedRetryable:
 		return colorWrap(ANSIYellow)
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Running, state.Apply.RunningDegraded,
+		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		return colorWrap(ANSICyan)
 	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
 		return colorWrap(ANSIYellow)

@@ -457,37 +457,36 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 
 // deriveOverallState determines the overall state from a list of tasks.
 // Priority order:
-// 1. RUNNING/WAITING_FOR_CUTOVER/CUTTING_OVER - active work in progress
-// 2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
-// 3. FAILED_RETRYABLE - operator recovery may retry failed task work
-// 4. PENDING - more work queued
-// 5. STOPPED - apply was stopped (even if some tasks completed)
-// 6. COMPLETED - all tasks completed successfully
+//  1. Active work: CUTTING_OVER, then the least-advanced active phase
+//     (RUNNING, CATCHING_UP, CHECKSUMMING, POST_CHECKSUM), then
+//     WAITING_FOR_CUTOVER once nothing is still working
+//  2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
+//  3. FAILED_RETRYABLE - operator recovery may retry failed task work
+//  4. PENDING - more work queued
+//  5. STOPPED - apply was stopped (even if some tasks completed)
+//  6. COMPLETED - all tasks completed successfully
 func deriveOverallState(tasks []*storage.Task) string {
 	if len(tasks) == 0 {
 		return state.Task.Pending
 	}
 
-	var hasRunning, hasPending, hasStopped, hasFailed, hasRetryableFailed, hasCancelled, hasCompleted, hasRevertWindow bool
-	var runningState string
+	var hasRunning, hasCatchingUp, hasChecksumming, hasPostChecksum, hasWaitingForCutover, hasCuttingOver bool
+	var hasPending, hasStopped, hasFailed, hasRetryableFailed, hasCancelled, hasCompleted, hasRevertWindow bool
 
 	for _, t := range tasks {
 		switch t.State {
 		case state.Task.Running:
 			hasRunning = true
-			runningState = state.Task.Running
-		case state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum:
-			// Table-level post-copy phases: the apply as a whole is still
-			// running while a table drains its accumulated changeset or
-			// verifies its copied data.
-			hasRunning = true
-			runningState = state.Task.Running
+		case state.Task.CatchingUp:
+			hasCatchingUp = true
+		case state.Task.Checksumming:
+			hasChecksumming = true
+		case state.Task.PostChecksum:
+			hasPostChecksum = true
 		case state.Task.WaitingForCutover:
-			hasRunning = true
-			runningState = state.Task.WaitingForCutover
+			hasWaitingForCutover = true
 		case state.Task.CuttingOver:
-			hasRunning = true
-			runningState = state.Task.CuttingOver
+			hasCuttingOver = true
 		case state.Task.Pending:
 			hasPending = true
 		case state.Task.Stopped:
@@ -505,9 +504,25 @@ func deriveOverallState(tasks []*storage.Task) string {
 		}
 	}
 
-	// Priority order
-	if hasRunning {
-		return runningState
+	// Active work, mirroring state.DeriveApplyState: once any table starts
+	// its cutover the apply is transitioning; otherwise surface the
+	// least-advanced active phase — while any table still copies rows the
+	// apply is running, the post-copy phases surface only when every active
+	// table is draining or verifying, and waiting_for_cutover only when
+	// nothing is still working.
+	switch {
+	case hasCuttingOver:
+		return state.Task.CuttingOver
+	case hasRunning:
+		return state.Task.Running
+	case hasCatchingUp:
+		return state.Task.CatchingUp
+	case hasChecksumming:
+		return state.Task.Checksumming
+	case hasPostChecksum:
+		return state.Task.PostChecksum
+	case hasWaitingForCutover:
+		return state.Task.WaitingForCutover
 	}
 	if hasFailed || hasCancelled {
 		// Cancelled implies a prior task failed (sequential mode), so overall is failed.

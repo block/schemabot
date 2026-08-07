@@ -103,7 +103,7 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 }
 
 func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	if !state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Running) {
+	if !state.IsState(apply.State, state.Apply.WaitingForCutover) && !state.IsRunningApplyState(apply.State) {
 		return nil
 	}
 	if store == nil {
@@ -128,7 +128,7 @@ func applyReadyForCutoverRequest(ctx context.Context, store storage.Storage, app
 	if state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.CuttingOver) {
 		return true, nil
 	}
-	if !state.IsState(apply.State, state.Apply.Running) {
+	if !state.IsRunningApplyState(apply.State) {
 		return false, nil
 	}
 	if store == nil {

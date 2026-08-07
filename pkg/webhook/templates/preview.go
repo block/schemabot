@@ -1099,7 +1099,7 @@ func PreviewCommentApplyCatchingUp() string {
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 100
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.CatchingUp, tables))
 }
 
 // PreviewCommentApplyChecksumming renders an apply comment where a table has
@@ -1111,7 +1111,7 @@ func PreviewCommentApplyChecksumming() string {
 	tables[1].ChecksumRowsChecked = 321450
 	tables[1].ChecksumRowsTotal = 1466232
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Checksumming, tables))
 }
 
 // PreviewCommentApplyPostChecksum renders an apply comment where a table has
@@ -1124,7 +1124,7 @@ func PreviewCommentApplyPostChecksum() string {
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 100
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.PostChecksum, tables))
 }
 
 // PreviewCommentApplyEstimateExceeded renders an apply comment where the active row copy has exceeded MySQL's initial estimate.

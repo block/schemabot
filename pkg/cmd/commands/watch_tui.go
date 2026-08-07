@@ -204,7 +204,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if state.IsState(m.state, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) && !m.stopTriggered {
+			if (state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)) && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}

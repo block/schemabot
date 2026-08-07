@@ -299,10 +299,11 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 			detail += " | " + countdown
 		}
 	}
-	// The volume level only matters while the engine is actively copying; on
-	// other states (stopped, waiting for cutover, terminal) it carries no
-	// signal, so the status line stays quiet.
-	if data.Volume > 0 && state.IsState(data.State, state.Apply.Running, state.Apply.RunningDegraded) {
+	// The volume level only matters while the engine is actively working
+	// (copying, draining, or verifying — volume stays adjustable through the
+	// post-copy phases); on other states (stopped, waiting for cutover,
+	// terminal) it carries no signal, so the status line stays quiet.
+	if data.Volume > 0 && state.IsRunningApplyState(data.State) {
 		detail += fmt.Sprintf(" | Volume: %d/%d", data.Volume, storage.MaxVolume)
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
@@ -332,6 +333,12 @@ func applyStatusDetail(applyState string) string {
 		return "Starting"
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return "In Progress"
+	case state.Apply.CatchingUp:
+		return "Catching Up"
+	case state.Apply.Checksumming:
+		return "Checksumming"
+	case state.Apply.PostChecksum:
+		return "Applying Final Changes"
 	case state.Apply.FailedRetryable:
 		return "Retrying"
 	case state.Apply.WaitingForDeploy:
@@ -1068,7 +1075,8 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Running, state.Apply.RunningDegraded,
+		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
