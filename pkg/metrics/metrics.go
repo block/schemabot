@@ -1520,6 +1520,9 @@ const (
 	// MergeGateSourceSweep marks a request recorded by the backstop sweep
 	// over recently completed applies.
 	MergeGateSourceSweep = "sweep"
+	// MergeGateSourcePreflightGate marks a preflight request recorded by
+	// the operator gate before an apply's engine work starts.
+	MergeGateSourcePreflightGate = "preflight_gate"
 	// MergeGateSourceReleaseSweep marks a settle request backfilled by the
 	// sweep over terminal applies whose preflight held sibling checks but
 	// whose settle was never recorded.
@@ -1590,6 +1593,33 @@ func RecordMergeGatePROutcome(ctx context.Context, repository, database, environ
 func RecordMergeGateEventOutcome(ctx context.Context, database, environment, outcome string) {
 	addCounter(ctx, "schemabot.merge_gate.events_total",
 		"Total terminal outcomes of driving durable merge gate requests", "{event}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordCheckPreflightGateOutcome counts outcomes of the operator gate that
+// blocks an apply's engine work until sibling changes' stored checks on its
+// target are held action-required. Outcomes:
+//   - "passed": the preflight request completed (stored holds and code-host
+//     rendering both done); the apply started.
+//   - "passed_render_pending": the stored holds are recorded and the apply
+//     started, while the code-host rendering is still retrying — the normal
+//     shape during a code-host outage. A sustained rate with the code host
+//     healthy means renders are failing for another reason; check the merge
+//     gate logs.
+//   - "timeout": the stored holds were not recorded within the gate deadline;
+//     the drive attempt was abandoned and the apply stays claimable. The
+//     hold phase is storage-only, so a sustained rate means the merge gate
+//     processor is not draining preflights or storage writes are failing —
+//     applies on servers with a merge gate consumer will not start until it
+//     recovers.
+//   - "error": the gate could not read or record the preflight request
+//     (storage failure); the drive attempt was abandoned, fail closed.
+func RecordCheckPreflightGateOutcome(ctx context.Context, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.merge_gate.preflight_gate_total",
+		"Total operator preflight gate outcomes before apply engine work starts", "{gate}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),

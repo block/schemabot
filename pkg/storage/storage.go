@@ -340,7 +340,7 @@ type MergeGateRequestStore interface {
 	// ReopenForRetry re-arms a terminally failed request back to pending with a
 	// fresh attempt budget. The operator preflight gate uses it so an apply
 	// blocked on a preflight that exhausted its retries (for example during a
-	// long GitHub outage) becomes claimable again on the apply's next start
+	// long code-host outage) becomes claimable again on the apply's next start
 	// attempt instead of staying blocked until manual intervention. Returns
 	// true when the row was re-armed; false when it was not terminally failed.
 	ReopenForRetry(ctx context.Context, id int64) (bool, error)
@@ -420,7 +420,7 @@ type MergeGateRequestStore interface {
 
 	// FindTerminalAppliesWithPreflightMissingSettle returns applies that
 	// settled to any terminal state within the lookback window, have a
-	// preflight request row, but no settle row. A preflight holds sibling PR
+	// preflight request row, but no settle row. A preflight holds sibling change
 	// checks action-required, and only the settle fan-out re-plans them back
 	// to a live verdict — so every preflighted apply must eventually record a
 	// settle, even when it failed or was cancelled before changing the schema.

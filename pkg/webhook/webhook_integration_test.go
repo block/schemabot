@@ -274,9 +274,24 @@ func seedCheck(t *testing.T, svc *api.Service, dbName, env, conclusion string) {
 	require.NoError(t, err)
 }
 
-// newTestHandler creates a Handler wired to the given service and GitHub client,
-// with an error-level logger to reduce test noise.
+// newE2EHandler creates a Handler wired to the given service and GitHub
+// client, with the merge gate processor running as the server runs it.
+// The check preflight gate blocks every claimed apply until the processor
+// confirms sibling PR check holds, so any test that drives a real apply
+// needs the processor alive.
 func newE2EHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
+	t.Helper()
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
+	h.StartMergeGateProcessor(t.Context())
+	t.Cleanup(h.StopMergeGateProcessor)
+	return h
+}
+
+// newE2EHandlerWithoutMergeGateProcessor creates a Handler with an error-level
+// logger and no background merge gate processor, for tests that drive the
+// refresh request lifecycle by hand (manual sweeps and drains) and must not
+// race a background pass.
+func newE2EHandlerWithoutMergeGateProcessor(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
