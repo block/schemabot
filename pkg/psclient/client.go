@@ -44,6 +44,19 @@ type PSClient interface {
 	// ListDeployRequests lists all deploy requests for a database.
 	ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error)
 
+	// DisableAutoApply turns off auto-apply on a deploy request so it parks at
+	// pending_cutover once the copy finishes, leaving SchemaBot as the sole
+	// cutover actor.
+	//
+	// This is a separate call rather than a field on CreateDeployRequest because
+	// the SDK tags CreateDeployRequestRequest.AutoCutover `omitempty`: false is
+	// the zero value, so "auto-cutover off" and "unspecified" serialize
+	// identically and the deploy request inherits the database's own auto-apply
+	// default, which PlanetScale remembers per database and may have set to on.
+	// The auto-apply endpoint sends its flag unconditionally, so it is the only
+	// way to state the intent.
+	DisableAutoApply(ctx context.Context, org, database string, number uint64) error
+
 	// ThrottleDeployRequest sets the throttle ratio for a running deploy request.
 	// This controls the speed of the online DDL copy phase (0.0 = full speed,
 	// 0.95 = max throttle). The PlanetScale API supports this endpoint but the
@@ -180,6 +193,19 @@ func (w *psClientWrapper) SkipRevertDeployRequest(ctx context.Context, req *ps.S
 
 func (w *psClientWrapper) ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error) {
 	return w.client.DeployRequests.List(ctx, req)
+}
+
+func (w *psClientWrapper) DisableAutoApply(ctx context.Context, org, database string, number uint64) error {
+	_, err := w.client.DeployRequests.AutoApplyDeploy(ctx, &ps.AutoApplyDeployRequestRequest{
+		Organization: org,
+		Database:     database,
+		Number:       number,
+		Enable:       false,
+	})
+	if err != nil {
+		return fmt.Errorf("disable auto-apply on deploy request %d (%s/%s): %w", number, org, database, err)
+	}
+	return nil
 }
 
 // ThrottleDeployRequest sets the throttle ratio via a raw HTTP PUT.

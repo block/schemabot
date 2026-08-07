@@ -511,13 +511,27 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	}
 }
 
+// createDeployRequest opens the deploy request that carries the branch's changes
+// into the target branch, with auto-apply turned off so SchemaBot is the sole
+// cutover actor: the deploy request parks at pending_cutover and the driver
+// completes it via Cutover (or an operator does, when cutover is deferred).
+// Letting PlanetScale cut over on its own would race the driver's cutover call
+// and move the schema without SchemaBot's involvement or caller attribution —
+// and on a deferred apply it would swap while the operator is told the swap is
+// being held for them.
+//
+// Turning it off takes a second call. AutoCutover on the create request cannot
+// express it: the SDK tags the field `omitempty`, so false — the zero value — is
+// dropped from the request body and the deploy request silently inherits the
+// database's remembered auto-apply default, which may be on. The auto-apply
+// endpoint sends its flag unconditionally. The field is still set here so the
+// request states the intent even where it does not survive serialization.
+//
+// A deploy request whose auto-apply could not be turned off is not usable: the
+// swap it guards could happen without SchemaBot. Fail rather than proceed with
+// a cutover gate that may not hold.
 func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
-	// AutoCutover stays off so SchemaBot is the sole cutover actor: the deploy
-	// request parks at pending_cutover and the driver completes it via Cutover
-	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
-	// over on its own would race the driver's cutover call and move the schema
-	// without SchemaBot's involvement or caller attribution.
-	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
+	dr, err := client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
 		Branch:           branchName,
@@ -525,6 +539,15 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if err := client.DisableAutoApply(ctx, org, database, dr.Number); err != nil {
+		return nil, fmt.Errorf("deploy request %d was created but auto-apply could not be turned off, so PlanetScale may cut over without SchemaBot: %w", dr.Number, err)
+	}
+	e.logger.Info("auto-apply disabled on deploy request; the drive is the sole cutover actor",
+		"organization", org, "database", database, "deploy_request", dr.Number, "branch", branchName)
+	return dr, nil
 }
 
 func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (*ps.DeployRequest, error) {

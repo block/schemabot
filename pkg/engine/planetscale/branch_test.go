@@ -156,11 +156,14 @@ func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 	})
 }
 
-// deployRequestRecorderClient captures the deploy-request creation payload so
-// tests can assert on the options the engine sends to the PlanetScale API.
+// deployRequestRecorderClient captures the deploy-request creation payload and
+// the auto-apply calls that follow it, so tests can assert on what the engine
+// asks the PlanetScale API for.
 type deployRequestRecorderClient struct {
 	psclient.PSClient
-	created *ps.CreateDeployRequestRequest
+	created             *ps.CreateDeployRequestRequest
+	autoApplyDisabled   []uint64
+	disableAutoApplyErr error
 }
 
 func (c *deployRequestRecorderClient) CreateDeployRequest(_ context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
@@ -168,21 +171,48 @@ func (c *deployRequestRecorderClient) CreateDeployRequest(_ context.Context, req
 	return &ps.DeployRequest{Number: 1}, nil
 }
 
-// SchemaBot is the sole cutover actor: deploy requests are created with
-// PlanetScale's auto-cutover disabled so they park at pending_cutover until
-// the driver (or a deferred-cutover operator) completes the cutover. If
-// PlanetScale cut over on its own, the schema could move without SchemaBot's
-// involvement or caller attribution.
+func (c *deployRequestRecorderClient) DisableAutoApply(_ context.Context, _, _ string, number uint64) error {
+	if c.disableAutoApplyErr != nil {
+		return c.disableAutoApplyErr
+	}
+	c.autoApplyDisabled = append(c.autoApplyDisabled, number)
+	return nil
+}
+
+// SchemaBot is the sole cutover actor: a deploy request must park at
+// pending_cutover until the driver (or a deferred-cutover operator) completes
+// the cutover. If PlanetScale cut over on its own, the schema could move
+// without SchemaBot's involvement or caller attribution — and a deferred apply
+// would swap while the operator is told the swap is being held.
+//
+// Turning auto-apply off has to happen on the auto-apply endpoint. The
+// create request's AutoCutover field cannot carry a false, so asserting on that
+// field alone would pass while the deploy request cuts over unattended.
 func TestCreateDeployRequest_DisablesPlanetScaleAutoCutover(t *testing.T) {
-	e := &Engine{logger: slog.New(slog.NewTextHandler(os.Stdout, nil))}
-	client := &deployRequestRecorderClient{}
+	newEngine := func() *Engine {
+		return &Engine{logger: slog.New(slog.NewTextHandler(os.Stdout, nil))}
+	}
 
-	_, err := e.createDeployRequest(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "main", true)
+	t.Run("auto-apply is turned off on the created deploy request", func(t *testing.T) {
+		client := &deployRequestRecorderClient{}
 
-	require.NoError(t, err)
-	require.NotNil(t, client.created)
-	assert.False(t, client.created.AutoCutover)
-	assert.True(t, client.created.AutoDeleteBranch)
-	assert.Equal(t, "schemabot-mydb-abc", client.created.Branch)
-	assert.Equal(t, "main", client.created.IntoBranch)
+		dr, err := newEngine().createDeployRequest(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "main", true)
+
+		require.NoError(t, err)
+		assert.Equal(t, []uint64{dr.Number}, client.autoApplyDisabled)
+		require.NotNil(t, client.created)
+		assert.True(t, client.created.AutoDeleteBranch)
+		assert.Equal(t, "schemabot-mydb-abc", client.created.Branch)
+		assert.Equal(t, "main", client.created.IntoBranch)
+	})
+
+	t.Run("a deploy request whose auto-apply could not be turned off is refused", func(t *testing.T) {
+		client := &deployRequestRecorderClient{disableAutoApplyErr: errors.New("api unavailable")}
+
+		_, err := newEngine().createDeployRequest(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "main", true)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "auto-apply could not be turned off")
+		assert.Contains(t, err.Error(), "api unavailable")
+	})
 }
