@@ -326,6 +326,18 @@ func RenderNoLocksFound() string {
 	return sb.String()
 }
 
+// RenderLocksAlreadyReleased renders a comment when every lock matched by an
+// unlock command was already released by a concurrent operation, so the
+// command had nothing left to do.
+func RenderLocksAlreadyReleased() string {
+	var sb strings.Builder
+
+	sb.WriteString("## 🔓 Locks Already Released\n\n")
+	sb.WriteString("Every lock matched by this unlock command had already been released by a concurrent operation. Nothing left to unlock.\n")
+
+	return sb.String()
+}
+
 // RenderCannotUnlock renders a comment when unlock is blocked by an active apply.
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
