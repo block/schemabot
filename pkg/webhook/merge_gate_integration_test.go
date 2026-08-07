@@ -725,6 +725,71 @@ func TestE2ECheckPreflightHoldsSiblingChecksAndComments(t *testing.T) {
 	assert.Equal(t, applyInFlightBlock.blockingReason, stillHeld.BlockingReason)
 }
 
+// TestE2ECheckPreflightStoredHoldsLandDuringGitHubOutage exercises the
+// preflight fan-out against a fully unavailable GitHub API. The hold phase is
+// storage-only, so the sibling PR's green stored check still flips
+// action-required and holds_recorded_at — the signal the operator gate starts
+// the apply on — still lands; the render phase fails and keeps the request
+// retryable for when GitHub recovers. A GitHub outage must never leave a
+// sibling's green stored check standing, and must never block the apply on
+// the rendering of its own holds.
+func TestE2ECheckPreflightStoredHoldsLandDuringGitHubOutage(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_outage"
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
+
+	// Every GitHub call fails: the API is down for the whole fan-out.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "github unavailable", http.StatusServiceUnavailable)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// The sibling PR's green check is the merge-vulnerable state the hold
+	// exists for.
+	seedRefreshTargetCheck(t, svc, 1, "staging", dbName,
+		checkStatusCompleted, checkConclusionSuccess, "no changes")
+
+	h := newE2EHandler(t, svc, client)
+
+	applyIdentifier := fmt.Sprintf("apply_mergegate_outage_%d", time.Now().UnixNano())
+	preflight := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
+		ApplyID:         91000012,
+		Kind:            storage.MergeGateKindPreflight,
+		ApplyIdentifier: applyIdentifier,
+		Environment:     "staging",
+		DatabaseType:    "mysql",
+		DatabaseName:    dbName,
+		Repository:      "octocat/hello-world",
+		ChangeKey:       "2",
+		RequestedBy:     "cli:preflighter@host",
+	})
+
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
+
+	// The stored hold landed despite the outage.
+	held, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, held)
+	assert.Equal(t, checkStatusCompleted, held.Status)
+	assert.Equal(t, checkConclusionActionRequired, held.Conclusion)
+	assert.Equal(t, applyInFlightBlock.blockingReason, held.BlockingReason)
+	assert.Contains(t, held.ChangeSummary, "held: apply "+applyIdentifier)
+
+	// The stamp the operator gate waits on is set, while the request itself
+	// stays retryable so the render lands once GitHub recovers.
+	req, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	require.NotNil(t, req)
+	assert.NotNil(t, req.HoldsRecordedAt, "the hold phase must stamp holds_recorded_at even when GitHub is down")
+	assert.Equal(t, storage.MergeGateFailed, req.State, "the render failure keeps the request in its retry lifecycle")
+	assert.NotNil(t, req.RetryAfter, "the render failure is retryable, not terminal")
+	assert.Contains(t, req.LastError, "verify PR state for check preflight")
+}
+
 // TestE2ECheckReleaseSweepSettlesFailedPreflightedApply verifies holds always
 // release: an apply that held sibling PR checks and then failed — its drive
 // tail may never run, for example when it is cancelled while queued — is

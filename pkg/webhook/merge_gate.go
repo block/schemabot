@@ -179,7 +179,30 @@ func (h *Handler) runMergeGatePass(ctx context.Context, owner string) {
 	h.sweepMergeGateRequests(ctx)
 	h.sweepPreflightedAppliesMissingSettle(ctx)
 	h.terminateStuckMergeGateRequests(ctx)
+	h.rearmPreflightRendersForActiveApplies(ctx)
 	h.drainMergeGateRequests(ctx, owner)
+}
+
+// rearmPreflightRendersForActiveApplies re-arms terminally failed preflight
+// requests whose apply is still active. The operator gate starts applies on
+// stored holds, so a code-host rendering that exhausted its retries (for
+// example through a code-host outage) has nothing else retrying it until the
+// apply settles — and once the code host recovers, sibling PRs' visible
+// Check Runs would sit stale-green for the rest of the apply. Re-arming
+// keeps the render retrying while the apply runs; the settle re-plan
+// supersedes it after that.
+func (h *Handler) rearmPreflightRendersForActiveApplies(ctx context.Context) {
+	reopened, err := h.mergeGateStore().ReopenTerminalPreflightsForActiveApplies(ctx)
+	if err != nil {
+		h.logger.Error("merge gate re-arm sweep failed; terminally failed preflight renders stay unretried until the next pass", "error", err)
+		return
+	}
+	if reopened == 0 {
+		return
+	}
+	h.logger.Warn("merge gate re-armed terminally failed preflight renders for still-active applies; their sibling PRs' visible checks stay unrendered until a render succeeds",
+		"reopened", reopened)
+	metrics.RecordMergeGatePreflightRearmed(ctx, reopened)
 }
 
 // sweepMergeGateRequests backfills merge gate requests for completed applies
@@ -573,23 +596,21 @@ type prTargetKey struct {
 }
 
 // fanOutCheckPreflight holds every sibling PR's stored check on the target
-// action-required before the originating apply's engine work starts, and
-// posts one comment per PR explaining the hold. The operator gate blocks the
-// apply until this fan-out completes, so a returned error means at least one
-// sibling was neither held nor safely skipped — the request is retried and
-// the apply stays blocked. Every step is idempotent (conditional flips, an
+// action-required before the originating apply's engine work starts, in two
+// phases. The hold phase flips the stored checks and stamps
+// holds_recorded_at — storage-only writes, which is what the operator gate
+// waits on: the code host being unreachable must never block an apply on the
+// rendering of its own holds. The render phase then surfaces the holds on
+// the code host (the aggregate Check Run recompute and one hold comment per
+// PR); a render failure keeps the request retryable without re-blocking the
+// apply, and while the code host is fully down its merge surface is down
+// with it. Every step is idempotent (conditional flips, a set-once stamp, an
 // aggregate recompute, and a marker-deduplicated comment), so retries
 // converge without duplicate comments.
 func (h *Handler) fanOutCheckPreflight(ctx context.Context, req *storage.MergeGateRequest) error {
 	targets, err := h.siblingChecksForTarget(ctx, req)
 	if err != nil {
 		return err
-	}
-	if len(targets) == 0 {
-		h.logger.Info("check preflight found no sibling PR check state to hold for the target",
-			"apply_id", req.ApplyIdentifier, "environment", req.Environment,
-			"database_type", req.DatabaseType, "database", req.DatabaseName)
-		return nil
 	}
 
 	byPR := make(map[prTargetKey][]*storage.Check)
@@ -598,10 +619,22 @@ func (h *Handler) fanOutCheckPreflight(ctx context.Context, req *storage.MergeGa
 		byPR[key] = append(byPR[key], check)
 	}
 
-	h.logger.Info("merge gate preflight holding sibling PR checks before the apply starts",
-		"apply_id", req.ApplyIdentifier, "environment", req.Environment,
-		"database_type", req.DatabaseType, "database", req.DatabaseName,
-		"requested_by", req.RequestedBy, "sibling_prs", len(byPR))
+	if req.HoldsRecordedAt == nil {
+		if err := h.recordPreflightHolds(ctx, req, byPR); err != nil {
+			return err
+		}
+	} else {
+		h.logger.Debug("check preflight stored holds already recorded; resuming the code-host rendering",
+			"apply_id", req.ApplyIdentifier, "environment", req.Environment,
+			"database_type", req.DatabaseType, "database", req.DatabaseName)
+	}
+
+	if len(byPR) == 0 {
+		h.logger.Info("check preflight found no sibling PR check state to hold for the target",
+			"apply_id", req.ApplyIdentifier, "environment", req.Environment,
+			"database_type", req.DatabaseType, "database", req.DatabaseName)
+		return nil
+	}
 
 	sem := make(chan struct{}, mergeGatePRConcurrency)
 	var wg sync.WaitGroup
@@ -611,7 +644,7 @@ func (h *Handler) fanOutCheckPreflight(ctx context.Context, req *storage.MergeGa
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := h.holdPRChecksForPreflight(ctx, req, key.repo, key.pr, checks); err != nil {
+			if err := h.renderCheckHoldOnPR(ctx, req, key.repo, key.pr, checks); err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
@@ -622,28 +655,126 @@ func (h *Handler) fanOutCheckPreflight(ctx context.Context, req *storage.MergeGa
 	return errors.Join(errs...)
 }
 
-// holdPRChecksForPreflight holds one sibling PR's stored checks on the target
-// and announces the hold on the PR. In-flight apply-owned rows are skipped —
-// they already block the aggregate and their apply's lifecycle stays
-// authoritative. A flip refused by the head-SHA condition means a racing
-// synchronize re-planned a newer head against the pre-apply schema; the hold
-// yields to it (logged and counted — the settle re-plans that head when the
-// apply finishes).
-func (h *Handler) holdPRChecksForPreflight(ctx context.Context, req *storage.MergeGateRequest, repo string, pr int, checks []*storage.Check) error {
+// recordPreflightHolds is the storage-only hold phase: it flips every
+// actionable sibling stored check on the target action-required, then stamps
+// holds_recorded_at on the request. No code-host call happens here, so the
+// phase — and the operator gate waiting on the stamp — succeeds or fails on
+// storage alone.
+func (h *Handler) recordPreflightHolds(ctx context.Context, req *storage.MergeGateRequest, byPR map[prTargetKey][]*storage.Check) error {
+	h.logger.Info("merge gate preflight holding sibling PR stored checks before the apply starts",
+		"apply_id", req.ApplyIdentifier, "environment", req.Environment,
+		"database_type", req.DatabaseType, "database", req.DatabaseName,
+		"requested_by", req.RequestedBy, "sibling_prs", len(byPR))
+
+	for key, checks := range byPR {
+		if err := h.holdStoredPRChecks(ctx, req, key.repo, key.pr, checks); err != nil {
+			return err
+		}
+	}
+	if err := h.mergeGateStore().MarkPreflightHoldsRecorded(ctx, req.ID, req.LeaseToken); err != nil {
+		return fmt.Errorf("record preflight holds for apply %s (target %s/%s in %s): %w",
+			req.ApplyIdentifier, req.DatabaseType, req.DatabaseName, req.Environment, err)
+	}
+	now := time.Now()
+	req.HoldsRecordedAt = &now
+	h.logger.Info("check preflight stored holds recorded; the apply may start while the code-host rendering completes",
+		"apply_id", req.ApplyIdentifier, "environment", req.Environment,
+		"database_type", req.DatabaseType, "database", req.DatabaseName,
+		"sibling_prs", len(byPR))
+	return nil
+}
+
+// preflightActionableChecks filters one PR's checks to the rows a preflight
+// acts on. In-flight apply-owned rows are excluded — they already block the
+// aggregate and their apply's lifecycle stays authoritative — and logged
+// only when the exclusion decides the hold (logSkips true, the hold phase),
+// not again during the render.
+func (h *Handler) preflightActionableChecks(ctx context.Context, req *storage.MergeGateRequest, repo string, pr int, checks []*storage.Check, logSkips bool) []*storage.Check {
 	actionable := make([]*storage.Check, 0, len(checks))
 	for _, check := range checks {
 		if check.Status == checkStatusInProgress {
-			h.logger.Info("check preflight leaving in-flight apply-owned check state untouched; it already blocks the PR",
-				"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
-				"environment", req.Environment, "database_type", req.DatabaseType,
-				"database", req.DatabaseName, "check_apply_id", check.ApplyID,
-				"check_head_sha", check.HeadSHA)
-			metrics.RecordMergeGatePROutcome(ctx, repo, req.DatabaseName, req.Environment, mergeGateOutcomeSkippedInFlight)
+			if logSkips {
+				h.logger.Info("check preflight leaving in-flight apply-owned check state untouched; it already blocks the PR",
+					"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+					"environment", req.Environment, "database_type", req.DatabaseType,
+					"database", req.DatabaseName, "check_apply_id", check.ApplyID,
+					"check_head_sha", check.HeadSHA)
+				metrics.RecordMergeGatePROutcome(ctx, repo, req.DatabaseName, req.Environment, mergeGateOutcomeSkippedInFlight)
+			}
 			continue
 		}
 		actionable = append(actionable, check)
 	}
+	return actionable
+}
+
+// holdStoredPRChecks flips one sibling PR's stored checks on the target
+// action-required. Storage-only — the code-host rendering happens separately
+// in renderCheckHoldOnPR. A flip refused by the head-SHA condition means a
+// racing synchronize re-planned a newer head against the pre-apply schema;
+// the hold yields to it (logged and counted — the settle re-plans that head
+// when the apply finishes).
+func (h *Handler) holdStoredPRChecks(ctx context.Context, req *storage.MergeGateRequest, repo string, pr int, checks []*storage.Check) error {
+	actionable := h.preflightActionableChecks(ctx, req, repo, pr, checks, true)
 	if len(actionable) == 0 {
+		return nil
+	}
+
+	held := 0
+	for _, check := range actionable {
+		hold := *check
+		hold.Status = checkStatusCompleted
+		hold.Conclusion = checkConclusionActionRequired
+		hold.BlockingReason = applyInFlightBlock.blockingReason
+		hold.ErrorMessage = applyInFlightBlock.message
+		hold.ChangeSummary = clampDriftSummary(fmt.Sprintf("held: apply %s by %s is changing %s in %s",
+			req.ApplyIdentifier, req.RequestedBy, req.DatabaseName, req.Environment))
+		flipped, err := h.service.Storage().Checks().MarkBlockedForApplyInFlight(ctx, &hold)
+		if err != nil {
+			return fmt.Errorf("hold stored check for %s#%d (target %s/%s in %s, apply %s): %w",
+				repo, pr, req.DatabaseType, req.DatabaseName, req.Environment, req.ApplyIdentifier, err)
+		}
+		if !flipped {
+			// Already held (an idempotent retry or an overlapping apply's
+			// preflight), or superseded by a racing write on a newer head. The
+			// distinction does not change this fan-out's behavior — the row is
+			// either blocking already or owned by a newer verdict the settle
+			// will re-plan — but it matters for triage, so log and count it.
+			h.logger.Warn("check preflight did not flip a stored check; it is already held or a racing write on a newer head superseded the hold",
+				"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+				"environment", req.Environment, "database_type", req.DatabaseType,
+				"database", req.DatabaseName, "check_head_sha", check.HeadSHA,
+				"check_blocking_reason", check.BlockingReason)
+			metrics.RecordMergeGatePROutcome(ctx, repo, req.DatabaseName, req.Environment, mergeGateOutcomeHoldSuperseded)
+			continue
+		}
+		held++
+		metrics.RecordMergeGatePROutcome(ctx, repo, req.DatabaseName, req.Environment, mergeGateOutcomeHeld)
+	}
+
+	h.logger.Info("merge gate preflight held sibling PR stored checks for the target",
+		"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+		"environment", req.Environment, "database_type", req.DatabaseType,
+		"database", req.DatabaseName, "requested_by", req.RequestedBy,
+		"held", held, "rows", len(actionable))
+	return nil
+}
+
+// renderCheckHoldOnPR surfaces one sibling PR's already-durable hold on the
+// code host: it recomputes the visible aggregate Check Run from the stored
+// rows so the hold blocks the merge button, and posts the
+// marker-deduplicated comment explaining the hold. A failure here keeps the
+// request retryable but never re-blocks the apply — the stored holds are in
+// place, and while the code host is fully down its merge surface is down
+// with it; the re-arm sweep keeps the render retrying for as long as the
+// apply runs.
+func (h *Handler) renderCheckHoldOnPR(ctx context.Context, req *storage.MergeGateRequest, repo string, pr int, checks []*storage.Check) error {
+	actionable := h.preflightActionableChecks(ctx, req, repo, pr, checks, false)
+	if len(actionable) == 0 {
+		h.logger.Debug("check preflight has nothing to render for the PR; only in-flight apply-owned rows, which already block it",
+			"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+			"environment", req.Environment, "database_type", req.DatabaseType,
+			"database", req.DatabaseName)
 		return nil
 	}
 
@@ -667,7 +798,7 @@ func (h *Handler) holdPRChecksForPreflight(ctx context.Context, req *storage.Mer
 			repo, pr, req.DatabaseType, req.DatabaseName, req.Environment, req.ApplyIdentifier, err)
 	}
 	if prInfo.IsClosed() {
-		h.logger.Info("check preflight skipping closed PR; its stored checks no longer gate a merge",
+		h.logger.Info("check preflight skipping closed PR; its held stored checks no longer gate a merge, so the hold needs no rendering",
 			"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
 			"environment", req.Environment, "database_type", req.DatabaseType,
 			"database", req.DatabaseName, "merged", prInfo.Merged)
@@ -675,53 +806,19 @@ func (h *Handler) holdPRChecksForPreflight(ctx context.Context, req *storage.Mer
 		return nil
 	}
 
-	held := 0
-	for _, check := range actionable {
-		hold := *check
-		hold.Status = checkStatusCompleted
-		hold.Conclusion = checkConclusionActionRequired
-		hold.BlockingReason = applyInFlightBlock.blockingReason
-		hold.ErrorMessage = applyInFlightBlock.message
-		hold.ChangeSummary = clampDriftSummary(fmt.Sprintf("held: apply %s by %s is changing %s in %s",
-			req.ApplyIdentifier, req.RequestedBy, req.DatabaseName, req.Environment))
-		flipped, err := h.service.Storage().Checks().MarkBlockedForApplyInFlight(prCtx, &hold)
-		if err != nil {
-			return fmt.Errorf("hold stored check for %s#%d (target %s/%s in %s, apply %s): %w",
-				repo, pr, req.DatabaseType, req.DatabaseName, req.Environment, req.ApplyIdentifier, err)
-		}
-		if !flipped {
-			// Already held (an idempotent retry or an overlapping apply's
-			// preflight), or superseded by a racing write on a newer head. The
-			// distinction does not change this fan-out's behavior — the row is
-			// either blocking already or owned by a newer verdict the settle
-			// will re-plan — but it matters for triage, so log and count it.
-			h.logger.Warn("check preflight did not flip a stored check; it is already held or a racing write on a newer head superseded the hold",
-				"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
-				"environment", req.Environment, "database_type", req.DatabaseType,
-				"database", req.DatabaseName, "check_head_sha", check.HeadSHA,
-				"check_blocking_reason", check.BlockingReason)
-			metrics.RecordMergeGatePROutcome(prCtx, repo, req.DatabaseName, req.Environment, mergeGateOutcomeHoldSuperseded)
-			continue
-		}
-		held++
-		metrics.RecordMergeGatePROutcome(prCtx, repo, req.DatabaseName, req.Environment, mergeGateOutcomeHeld)
-	}
-
 	// Recompute the PR's visible aggregate Check Run from the stored rows so
 	// the hold blocks the merge button, not just the database record.
-	// Idempotent, so retries that flipped nothing still converge the Check
-	// Run.
+	// Idempotent, so retries converge the Check Run.
 	h.updateAggregateCheck(prCtx, client, repo, pr, actionable[0].HeadSHA)
 
 	if err := h.ensureCheckHoldComment(prCtx, client, req, repo, pr); err != nil {
 		return err
 	}
 
-	h.logger.Info("merge gate preflight held sibling PR checks for the target",
+	h.logger.Info("merge gate preflight rendered the hold on the sibling PR",
 		"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
 		"environment", req.Environment, "database_type", req.DatabaseType,
-		"database", req.DatabaseName, "requested_by", req.RequestedBy,
-		"held", held, "rows", len(actionable))
+		"database", req.DatabaseName, "requested_by", req.RequestedBy)
 	return nil
 }
 
