@@ -546,7 +546,8 @@ func (s *Server) Start(ctx context.Context) {
 // Close releases the resources the Server owns and returns all cleanup errors
 // encountered, joined together. It stops the pending-drops cleaner, stops the
 // operator (before closing the gRPC client it built, see below), shuts down
-// telemetry, closes that gRPC fallback client, and closes the service. svc.Close
+// telemetry (best-effort: flush failures are logged, not returned), closes
+// that gRPC fallback client, and closes the service. svc.Close
 // stops the health monitor and closes the service's clients and storage (the
 // database pool); it repeats StopOperator, which is idempotent, so that is a
 // no-op. It does not stop any gRPC server the embedder owns. Safe to call once
@@ -575,8 +576,13 @@ func (s *Server) Close() error {
 	var errs []error
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Telemetry shutdown is best-effort: a failure here means the final
+	// metrics/traces flush was dropped (e.g. the collector is unreachable or
+	// rejects the export), which is not worth failing the close over —
+	// embedders treat a Close error as a fatal exit, so returning it would
+	// turn a routine SIGTERM rotation into a reported crash.
 	if err := s.telemetry.Shutdown(shutdownCtx); err != nil {
-		errs = append(errs, fmt.Errorf("telemetry shutdown: %w", err))
+		s.logger.Warn("telemetry shutdown failed; final metrics and traces were not exported", "error", err)
 	}
 	if s.grpcClient != nil {
 		if err := s.grpcClient.Close(); err != nil {
