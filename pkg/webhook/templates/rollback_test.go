@@ -345,3 +345,51 @@ func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 			"%s body should not start with whitespace", name)
 	}
 }
+
+// A rollback plan whose reverse statement routes to direct execution renders
+// the same ⚙️ disclosure the apply flow uses, with the consent sentence naming
+// rollback confirmation — rollback-confirm consents against this comment.
+func TestRenderRollbackPlanComment_DirectDisclosure(t *testing.T) {
+	rendered := RenderRollbackPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		ApplyID: "apply_a1b2c3d4e5f6",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`)"},
+		}},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+		},
+	})
+
+	assert.Contains(t, rendered, "## Schema Rollback Plan")
+	assert.Contains(t, rendered, "⚙️ **Direct execution**: **1** change will run as native MySQL DDL")
+	assert.Contains(t, rendered, "`users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows")
+	assert.Contains(t, rendered, "the change is **not revertible**")
+	assert.Contains(t, rendered, "Confirming the rollback consents to this.")
+	assert.Contains(t, rendered, "schemabot rollback-confirm -e staging")
+}
+
+// A rollback whose reverse plan contains engine-blocked statements is rejected
+// with a comment that shows the reverse plan, names each blocked table and
+// reason, and coaches reconciliation instead of a confirmation that can never
+// succeed.
+func TestRenderBlockedChangesRollbackRejected(t *testing.T) {
+	rendered := RenderBlockedChangesRollbackRejected(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`)"},
+		}},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
+		},
+	})
+
+	assert.Contains(t, rendered, "## Schema Rollback Plan")
+	assert.Contains(t, rendered, "**⛔ Rollback rejected**: **1** planned change not supported by the schema-change engine")
+	assert.Contains(t, rendered, "`users`: dropping primary key is not supported")
+	assert.Contains(t, rendered, "Reconcile the target schema with a follow-up schema change PR instead")
+	assert.NotContains(t, rendered, "schemabot rollback-confirm",
+		"a rejected rollback must not coach a confirmation that can never succeed")
+}

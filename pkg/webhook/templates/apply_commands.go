@@ -158,11 +158,27 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 // through, so the comment carries no retry instructions — the guidance is to
 // rewrite the change or contact the operators.
 func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
+	return renderBlockedChangesRejected(data, "Schema Change Plan", "Apply rejected",
+		"Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.")
+}
+
+// RenderBlockedChangesRollbackRejected renders the rejection comment for a
+// rollback whose reverse plan contains statements the schema-change engine
+// refuses. A blocked change guarantees the rollback apply would fail, so the
+// rollback is rejected before a plan is pinned for confirmation — there is
+// nothing to confirm, and the target must be reconciled another way.
+func RenderBlockedChangesRollbackRejected(data PlanCommentData) string {
+	return renderBlockedChangesRejected(data, "Schema Rollback Plan", "Rollback rejected",
+		"Reconcile the target schema with a follow-up schema change PR instead, or contact your SchemaBot operators for help.")
+}
+
+// renderBlockedChangesRejected renders the full plan (DDL, summary) so the
+// user can see what was planned — but without a lock or confirm footer — then
+// the engine-blocked changes that reject the command outright.
+func renderBlockedChangesRejected(data PlanCommentData, title, rejection, guidance string) string {
 	var sb strings.Builder
 
-	// Render the full plan first (DDL, summary) so the user can see what was
-	// planned — but without a lock or confirm footer.
-	writeEnvironmentTitle(&sb, "Schema Change Plan", data.Environment)
+	writeEnvironmentTitle(&sb, title, data.Environment)
 
 	writePlanMetadata(&sb, data)
 	writePlanAttribution(&sb, data)
@@ -177,7 +193,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
-	fmt.Fprintf(&sb, "**⛔ Apply rejected**: **%d** planned %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(&sb, "**⛔ %s**: **%d** planned %s not supported by the schema-change engine\n", rejection, n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -189,7 +205,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 			fmt.Fprintf(&sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nRewrite these statements as a supported schema change, or contact your SchemaBot operators for help.\n")
+	fmt.Fprintf(&sb, "\n%s\n", guidance)
 
 	return sb.String()
 }
@@ -350,6 +366,19 @@ func RenderCannotUnlock(database, environment, applyID, applyState string) strin
 	sb.WriteString("Wait for it to complete or stop it first.\n")
 
 	return sb.String()
+}
+
+// RenderDeferCutoverAllDirectConfirm rejects --defer-cutover at confirm time
+// on a plan whose every change the policy routes to direct execution: a
+// direct statement has no cutover to defer, so the flag is refused instead of
+// silently ignored. The rejection preserves the pending confirmation — the
+// lock still pins the plan the operator confirmed against — so the recovery
+// is re-running apply-confirm without the flag, not restarting from apply.
+// Tenant is the deployment's own tenant; when set, the coached command
+// carries it so pasting the hint addresses this deployment.
+func RenderDeferCutoverAllDirectConfirm(environment, tenant string) string {
+	return fmt.Sprintf("`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `%s` without the flag.",
+		tenantCommand("schemabot apply-confirm", environment, tenant))
 }
 
 // RenderApplyConfirmNoChanges renders a comment when apply-confirm finds no changes.

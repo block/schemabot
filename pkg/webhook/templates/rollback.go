@@ -32,6 +32,14 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
 
+	// Direct-execution changes — statements the policy routes to native DDL.
+	// rollback-confirm is the operator's consent to their blocking,
+	// non-revertible semantics, so the disclosure must sit on the comment the
+	// confirmation acts on.
+	if len(data.DirectChanges) > 0 {
+		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, directRollbackConsent)
+	}
+
 	// Unsafe warning — rollback typically produces DROP operations
 	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
 
@@ -95,6 +103,39 @@ func RenderRollbackMissingApplyID(tenant string) string {
 		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
 		fmt.Sprintf("or by running `%s`.", appendTenantFlag("schemabot status", tenant)))
+}
+
+// RenderRollbackConfirmBlockedPlan rejects rollback-confirm when the pinned
+// rollback plan carries engine-blocked changes: the rollback apply is
+// guaranteed to fail, so there is nothing that can be confirmed. Tenant is
+// the deployment's own tenant; when set, the coached command carries it so
+// pasting the hint addresses this deployment.
+func RenderRollbackConfirmBlockedPlan(environment, tenant string) string {
+	return fmt.Sprintf("The pinned rollback plan contains changes the schema-change engine does not support, so this rollback cannot execute. The lock has been released — re-run `%s` to generate a fresh plan, or contact your SchemaBot operators for help.",
+		tenantCommand("schemabot rollback <apply-id>", environment, tenant))
+}
+
+// RenderRollbackConfirmBlockedPlanLockHeld is the variant posted when the
+// lock release itself failed: the operator must unlock before anything else
+// can run on the database. Tenant is the deployment's own tenant; when set,
+// the coached commands carry it so pasting a hint addresses this deployment.
+func RenderRollbackConfirmBlockedPlanLockHeld(environment, tenant string) string {
+	return fmt.Sprintf("The pinned rollback plan contains changes the schema-change engine does not support, so this rollback cannot execute. SchemaBot failed to release the database lock — release it with `%s`, then re-run `%s` to generate a fresh plan, or contact your SchemaBot operators for help.",
+		appendTenantFlag("schemabot unlock", tenant),
+		tenantCommand("schemabot rollback <apply-id>", environment, tenant))
+}
+
+// RenderDeferCutoverAllDirectRollbackConfirm rejects --defer-cutover at
+// rollback confirmation on an all-direct rollback plan: a direct statement
+// has no cutover to defer, so the flag is refused instead of silently
+// ignored. The rejection preserves the pending rollback — the lock still pins
+// the plan the operator confirmed against — so the recovery is re-running
+// rollback-confirm without the flag. Tenant is the deployment's own tenant;
+// when set, the coached command carries it so pasting the hint addresses
+// this deployment.
+func RenderDeferCutoverAllDirectRollbackConfirm(environment, tenant string) string {
+	return fmt.Sprintf("`--defer-cutover` has no effect on this rollback: every change runs directly as native DDL, which has no cutover to defer. The pending rollback is preserved — re-run `%s` without the flag.",
+		tenantCommand("schemabot rollback-confirm", environment, tenant))
 }
 
 // RenderRollbackApplyNotFound renders the message posted when the supplied apply ID

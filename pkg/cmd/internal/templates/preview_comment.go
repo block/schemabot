@@ -106,6 +106,8 @@ func previewCommentAllOutput() {
 		{"SUMMARY: MULTI-NAMESPACE COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceCompleted()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackPlanDirect()) }},
+		{"ROLLBACK REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackBlockedRejected()) }},
 	}
 
 	for i, s := range sections {
@@ -283,6 +285,8 @@ func previewCommentApplyFlowAllOutput() {
 		{"SUMMARY: MULTI-NAMESPACE COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceCompleted()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackPlanDirect()) }},
+		{"ROLLBACK REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackBlockedRejected()) }},
 	}
 	printSections(sections)
 }

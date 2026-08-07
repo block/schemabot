@@ -139,6 +139,55 @@ func PreviewCommentApplyBlockedRejected() string {
 	})
 }
 
+// PreviewCommentRollbackPlanDirect renders a sample rollback plan whose
+// reverse statement the direct execution policy routes to native MySQL DDL,
+// showing the disclosure the operator consents to with rollback-confirm.
+func PreviewCommentRollbackPlanDirect() string {
+	return RenderRollbackPlanComment(PlanCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  previewRequestedBy,
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		ApplyID:      "apply_a1b2c3d4e5f6",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`)",
+				},
+			},
+		},
+		DirectChanges: []DirectChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
+		},
+	})
+}
+
+// PreviewCommentRollbackBlockedRejected renders a sample rollback rejection
+// for a reverse plan containing statements the engine refuses.
+func PreviewCommentRollbackBlockedRejected() string {
+	return RenderBlockedChangesRollbackRejected(PlanCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  previewRequestedBy,
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		ApplyID:      "apply_a1b2c3d4e5f6",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`)",
+				},
+			},
+		},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000"},
+		},
+	})
+}
+
 // PreviewCommentPlanTenant renders a tenant-targeted plan comment.
 func PreviewCommentPlanTenant() string {
 	return RenderPlanComment(PlanCommentData{

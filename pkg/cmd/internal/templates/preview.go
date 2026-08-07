@@ -114,6 +114,8 @@ const (
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
 	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
+	PreviewCommentRollbackPlanDirect           PreviewType = "comment_rollback_plan_direct"            // Rollback plan with a reverse statement routed to direct execution
+	PreviewCommentRollbackBlockedRejected      PreviewType = "comment_rollback_blocked_rejected"       // Rollback rejected: reverse plan contains engine-blocked statements
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes
 	PreviewCommentNoManagedSchema              PreviewType = "comment_no_managed_schema"               // No managed schema changes in current PR

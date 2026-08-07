@@ -360,6 +360,27 @@ func (tc TableChange) UnsafeOptInReason() string {
 	return "unsafe schema change requires explicit opt-in"
 }
 
+// Execution-mode verdict values a stored plan carries per table change. The
+// canonical vocabulary lives with the engines; storage keeps its own copies so
+// this package stays dependency-free.
+const (
+	executionModeBlocked = "blocked"
+	executionModeDirect  = "direct"
+)
+
+// EngineBlocked reports whether the planner recorded that the engine
+// deterministically refuses this change. A blocked change guarantees the
+// apply fails, so gates on stored plans reject them instead of executing.
+func (tc TableChange) EngineBlocked() bool {
+	return strings.EqualFold(tc.ExecutionMode, executionModeBlocked)
+}
+
+// DirectExecution reports whether the planner routed this change to direct
+// execution as native DDL on the target.
+func (tc TableChange) DirectExecution() bool {
+	return strings.EqualFold(tc.ExecutionMode, executionModeDirect)
+}
+
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
 // captured once for the namespace and applies to every table/artifact change in
 // Tables and Artifacts.
