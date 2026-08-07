@@ -1015,4 +1015,17 @@ type ControlRequestStore interface {
 	// FailPending marks the pending request for an apply operation failed with an
 	// operator-visible reason.
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
+
+	// ListSettled returns every control request for an apply that has reached a
+	// terminal status, so the plane that accepted a control RPC can learn
+	// whether the operation took effect: accepting a request only queues it.
+	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
+
+	// RecordRemoteFailure records the terminal failure another plane reported
+	// for a control request, whatever status the local row carries — a locally
+	// completed row means the request was queued there, which a later rejection
+	// overtakes — and creates the row when the local plane never held one. It
+	// reports whether the stored row changed, so a caller polling the same
+	// rejection every tick surfaces it exactly once.
+	RecordRemoteFailure(ctx context.Context, req *ApplyControlRequest) (bool, error)
 }

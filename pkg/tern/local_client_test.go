@@ -490,7 +490,10 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	return &mockApplyLogStore{}
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
-	return s.controlRequests
+	if s.controlRequests != nil {
+		return s.controlRequests
+	}
+	return &testControlRequestStore{}
 }
 func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
@@ -616,6 +619,17 @@ func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int6
 		}
 	}
 	return nil, nil
+}
+
+func (s *testControlRequestStore) ListSettled(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	var settled []*storage.ApplyControlRequest
+	for _, req := range s.requests {
+		if req.ApplyID != applyID || req.Status == storage.ControlRequestPending {
+			continue
+		}
+		settled = append(settled, cloneTestControlRequest(req))
+	}
+	return settled, nil
 }
 
 func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {

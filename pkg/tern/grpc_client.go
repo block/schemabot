@@ -1658,6 +1658,87 @@ func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume 
 	return true
 }
 
+// mirrorRemoteControlRejections records, on the control plane, the control
+// requests the data plane accepted and then failed. Accepting a control RPC
+// only means the request was queued: the engine call happens later on the data
+// plane's own driver tick, and until it is mirrored here a rejection lives
+// solely in the data plane's storage and logs — the operator who issued the
+// command is told it succeeded and never learns the effect did not land.
+//
+// The data plane reports the same settled request on every poll until the
+// operator retries the operation, so a mirror that fails is retried on the next
+// tick rather than aborting the drive, and a mirror that succeeds is surfaced
+// exactly once (RecordRemoteFailure reports whether the stored row changed).
+func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *storage.Apply, settled []*ternv1.SettledControlRequest) {
+	if c.storage == nil || apply == nil || len(settled) == 0 {
+		return
+	}
+	logger := c.applyLogger(apply)
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		logger.Warn("control request store is not available; remote control rejections will not reach the operator",
+			apply.MutableLogAttrs()...)
+		return
+	}
+	for _, entry := range settled {
+		if entry == nil || entry.Status != string(storage.ControlRequestFailed) {
+			continue
+		}
+		operation := storage.ControlOperation(entry.Operation)
+		if !operation.Valid() {
+			logger.Warn("data plane reported a rejection for an unrecognized control operation; it will not reach the operator",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation)...)
+			continue
+		}
+		message := remoteControlRejectionMessage(entry)
+		changed, err := controlStore.RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
+			ApplyID:      apply.ID,
+			Operation:    operation,
+			ErrorMessage: apply.OperatorFacingMessage(message),
+			RequestedBy:  entry.RequestedBy,
+		})
+		if err != nil {
+			logger.Warn("failed to record remote control rejection; the operator will not see it until a later poll mirrors it",
+				append(apply.MutableLogAttrs(),
+					"operation", entry.Operation,
+					"settled_at", entry.SettledAt,
+					"error", err)...)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		logger.Warn("data plane rejected an accepted control command",
+			append(apply.MutableLogAttrs(),
+				"operation", entry.Operation,
+				"requested_by", entry.RequestedBy,
+				"settled_at", entry.SettledAt,
+				"error_message", message)...)
+		metrics.RecordRemoteControlRequestRejected(ctx, entry.Operation, apply.Engine, apply.Database, apply.Deployment, apply.Environment)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
+			fmt.Sprintf("%s was accepted but not applied: %s%s", remoteControlOperationLabel(operation), message,
+				callerApplyLogSuffix(entry.RequestedBy)), "", "")
+	}
+}
+
+// remoteControlRejectionMessage renders the reason the data plane gave, falling
+// back to a fixed line so a rejection is never recorded without one.
+func remoteControlRejectionMessage(entry *ternv1.SettledControlRequest) string {
+	if entry.ErrorMessage != "" {
+		return entry.ErrorMessage
+	}
+	return "the data plane reported no reason; see the data plane logs"
+}
+
+// remoteControlOperationLabel renders a control operation for an operator-facing
+// apply log line.
+func remoteControlOperationLabel(operation storage.ControlOperation) string {
+	if operation == "" {
+		return "Control command"
+	}
+	return strings.ToUpper(string(operation)[:1]) + strings.ReplaceAll(string(operation)[1:], "_", "-")
+}
+
 // operationForDisplayMirror loads the apply_operation whose
 // engine_resume_metadata should carry the display projection. An
 // operation-scoped drive already knows its operation id; a whole-apply
@@ -3766,6 +3847,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				logger.Info("mirrored remote volume level onto control-plane apply options",
 					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
 			}
+			c.mirrorRemoteControlRejections(ctx, apply, resp.SettledControlRequests)
 
 			terminal := isTerminalProtoState(resp.State)
 			if terminal {

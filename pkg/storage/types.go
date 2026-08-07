@@ -951,6 +951,19 @@ const (
 	ControlOperationVolume ControlOperation = "volume"
 )
 
+// Valid reports whether the operation is one SchemaBot recognizes. Control
+// operations cross the control-plane / data-plane boundary as strings, so a
+// value read off the wire is checked here before it reaches storage.
+func (o ControlOperation) Valid() bool {
+	switch o {
+	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+		ControlOperationRelease, ControlOperationVolume:
+		return true
+	}
+	return false
+}
+
 // MinVolume and MaxVolume bound the volume scale shared by every engine:
 // 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
 const (

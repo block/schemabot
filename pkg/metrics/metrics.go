@@ -779,6 +779,26 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	)
 }
 
+// RecordRemoteControlRequestRejected counts control requests the data plane
+// accepted and its own driver then failed — the operator was told the command
+// was queued and the effect never landed. A non-zero rate names the operation
+// and engine that is refusing operator commands: chart it by operation to see
+// which control surface is unsupported or broken on that engine, and read the
+// apply log entry recorded alongside it for the engine's own reason.
+func RecordRemoteControlRequestRejected(ctx context.Context, operation, engine, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_control_requests.rejected_total",
+		"Total remote control requests the data plane accepted and then failed", "{rejection}",
+		attribute.String("operation", operation),
+		attribute.String("engine", engine),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordEngineTerminalTruthReconcile counts drive claims that read the
 // engine's authoritative state before consuming a pending stop/cancel control
 // request. Outcomes:

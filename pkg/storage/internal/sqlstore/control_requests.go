@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/utils"
 )
 
 const controlRequestColumns = `id, apply_id, operation, status,
@@ -204,6 +205,89 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 		return err
 	}
 	return nil
+}
+
+func (s *controlRequestStore) ListSettled(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+controlRequestColumns+`
+		FROM apply_control_requests
+		WHERE apply_id = ? AND status IN (?, ?)
+		ORDER BY operation
+	`, applyID, storage.ControlRequestCompleted, storage.ControlRequestFailed)
+	if err != nil {
+		return nil, fmt.Errorf("list settled control requests for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var requests []*storage.ApplyControlRequest
+	for rows.Next() {
+		req, err := scanControlRequest(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan settled control request for apply %d: %w", applyID, err)
+		}
+		requests = append(requests, req)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read settled control requests for apply %d: %w", applyID, err)
+	}
+	return requests, nil
+}
+
+func (s *controlRequestStore) RecordRemoteFailure(ctx context.Context, req *storage.ApplyControlRequest) (bool, error) {
+	var changed bool
+	op := fmt.Sprintf("record remote failure for apply %d operation %s", req.ApplyID, req.Operation)
+	err := withLockRetry(ctx, op, func() error {
+		var attemptErr error
+		changed, attemptErr = s.recordRemoteFailure(ctx, req)
+		return attemptErr
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *storage.ApplyControlRequest) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin remote failure transaction for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	}
+	defer rollbackTx(ctx, tx, "record remote failure")
+
+	existing, err := s.getByApplyOperationForUpdate(ctx, tx, req.ApplyID, req.Operation)
+	if err != nil {
+		return false, err
+	}
+	// The same rejection is reported on every poll until the operator retries
+	// the operation, so an unchanged row means the failure is already recorded.
+	if existing != nil && existing.Status == storage.ControlRequestFailed && existing.ErrorMessage == req.ErrorMessage {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit unchanged remote failure read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+		}
+		return false, nil
+	}
+	if existing != nil {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, error_message = ?, completed_at = NOW(), updated_at = NOW()
+			WHERE id = ?
+		`, storage.ControlRequestFailed, nullString(req.ErrorMessage), existing.ID); err != nil {
+			return false, fmt.Errorf("record remote failure on control request %d for apply %d operation %s: %w", existing.ID, req.ApplyID, req.Operation, err)
+		}
+	} else if _, err := s.identity.InsertID(ctx, tx, `
+		INSERT INTO apply_control_requests (
+			apply_id, operation, status, requested_by, error_message, metadata, completed_at
+		) VALUES (?, ?, ?, ?, ?, ?, NOW())
+	`,
+		req.ApplyID, req.Operation, storage.ControlRequestFailed,
+		req.RequestedBy, nullString(req.ErrorMessage), nullJSON(req.Metadata),
+	); err != nil {
+		return false, fmt.Errorf("create failed control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit remote failure for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	}
+	return true, nil
 }
 
 func (s *controlRequestStore) getByIDForUpdate(ctx context.Context, tx *rebindTx, id int64) (*storage.ApplyControlRequest, error) {
