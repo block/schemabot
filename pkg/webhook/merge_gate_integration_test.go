@@ -22,9 +22,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +37,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1052,4 +1056,90 @@ func TestE2ECheckSettleDefersToActivePreflightedApply(t *testing.T) {
 	assert.Equal(t, checkConclusionActionRequired, stillHeld.Conclusion)
 	assert.Equal(t, applyInFlightBlock.blockingReason, stillHeld.BlockingReason,
 		"the active apply's holds must survive an earlier apply's settle")
+}
+
+// TestE2ECheckPlanBornHeldDuringActivePreflightedApply verifies plan-time
+// merge gate awareness: while a preflighted apply is changing a target, a
+// sibling change that plans against that target must not mint a fresh
+// passing check — the preflight fan-out already held the checks that existed
+// when the apply started, and a new plan (a pushed commit or a manual plan
+// command) would otherwise sidestep those holds. A plan whose verdict would
+// pass is stored born held with the apply-in-flight blocking reason instead,
+// and the apply's settle fan-out re-plans it like any other held check. The
+// plan comment still posts normally: the hold changes the stored verdict,
+// not the plan UX.
+func TestE2ECheckPlanBornHeldDuringActivePreflightedApply(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_bornheld"
+	svc := setupE2EService(t, dbName)
+
+	// The target already matches the PR schema, so the plan finds no changes
+	// and its verdict would pass.
+	ctx := t.Context()
+	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
+	db, err := sql.Open("mysql", appDSN)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_ = db.Close()
+
+	// Another change's apply is mid-flight on the target with a recorded
+	// preflight, meaning its holds are (or are about to be) in force.
+	apply := seedApplyWithLock(t, svc, dbName, state.Apply.Running, 2)
+	recordRefreshRequest(t, svc, &storage.MergeGateRequest{
+		ApplyID:         apply.ID,
+		Kind:            storage.MergeGateKindPreflight,
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Environment:     "staging",
+		DatabaseType:    "mysql",
+		DatabaseName:    dbName,
+		Repository:      "octocat/hello-world",
+		ChangeKey:       "2",
+		RequestedBy:     apply.Caller,
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The plan comment posts as usual.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No schema changes detected")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+
+	// The stored check is born held, not passing.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "expected a stored check record for the plan")
+	assert.False(t, check.HasChanges)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
+	assert.Equal(t, applyInFlightBlock.blockingReason, check.BlockingReason)
+	assert.Contains(t, check.ChangeSummary, "held: an apply in flight is changing "+dbName+" in staging")
 }

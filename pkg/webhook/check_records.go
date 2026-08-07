@@ -209,6 +209,45 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		blockingReason = reviewTimeDeploymentDriftBlock.blockingReason
 	}
 
+	// A preflighted apply changing this target right now means the schema this
+	// plan was computed against is mid-change, so a passing verdict cannot
+	// prove the schema the merge would land on. Storing it would reopen the
+	// merge gate the preflight fan-out closed: the check is born held instead,
+	// and the apply's settle fan-out re-plans it against the settled schema,
+	// releasing the hold. Verdicts that already block (changes, plan errors,
+	// drift) keep their more specific reason. A storage failure fails closed
+	// by failing the write — never by assuming the target is quiet.
+	errorMessage := ""
+	if conclusion == checkConclusionSuccess {
+		activeHold, err := h.service.Storage().MergeGateRequests().HasActivePreflightedApplyOnTarget(ctx, environment, schema.Type, schema.Database)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:    "plan_check_recorded",
+				Repository:   repo,
+				Database:     schema.Database,
+				DatabaseType: schema.Type,
+				Environment:  environment,
+				Status:       "error",
+			})
+			return headSHA, nil, fmt.Errorf("check for an active preflighted apply before storing plan check state repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, environment, schema.Type, schema.Database, err)
+		}
+		if activeHold {
+			conclusion = checkConclusionActionRequired
+			blockingReason = applyInFlightBlock.blockingReason
+			errorMessage = applyInFlightBlock.message
+			changeSummary = clampDriftSummary(fmt.Sprintf("held: an apply in flight is changing %s in %s", schema.Database, environment))
+			h.logger.Info("plan check born held: an active preflighted apply is changing the target; the apply's settle fan-out will re-plan this check when it settles",
+				"repo", repo,
+				"pr", pr,
+				"head_sha", headSHA,
+				"environment", environment,
+				"database_type", schema.Type,
+				"database", schema.Database)
+			metrics.RecordMergeGatePlanTimeHold(ctx, schema.Database, environment)
+		}
+	}
+
 	check := &storage.Check{
 		Repository:     repo,
 		PullRequest:    pr,
@@ -220,6 +259,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		Status:         checkStatusCompleted,
 		Conclusion:     conclusion,
 		BlockingReason: blockingReason,
+		ErrorMessage:   errorMessage,
 		ChangeSummary:  changeSummary,
 	}
 	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState()); err != nil {
