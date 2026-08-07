@@ -25,7 +25,7 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 
 // applyCommandCore generates a plan, acquires a lock, and applies automatically
 // unless safety rechecks require a manual confirmation. It returns a durability
-// disposition for a future durable issue_comment driver:
+// disposition for the durable issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (command
 //     bootstrap, a GitHub read, or a storage operation) that a durable driver
@@ -415,7 +415,7 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 
 // applyConfirmCommandCore verifies lock ownership, re-plans for drift detection,
 // executes the apply, and watches progress. It returns a durability disposition
-// for a future durable issue_comment driver:
+// for the durable issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (command
 //     bootstrap, a GitHub read, or a storage operation) that a durable driver
@@ -639,7 +639,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 // the durability disposition, which only a durable issue_comment driver
 // consumes.
 func (h *Handler) handleUnlockCommand(repo string, pr int, installationID int64, requestedBy string, result CommandResult) {
-	_, _ = h.unlockCommandCore(repo, pr, installationID, requestedBy, result)
+	_, _ = h.unlockCommandCore(context.Background(), time.Now(), repo, pr, installationID, requestedBy, result)
 }
 
 // unlockRejectionError marks a deterministic unlock rejection: the message is
@@ -662,8 +662,8 @@ func isUnlockRejection(err error) bool {
 // `--force`, it can also release a CLI-owned lock for the database inferred
 // from this PR's SchemaBot config; `-d <database>` disambiguates multi-database
 // PRs. This lets a PR author clear a stale local-session lock from the PR
-// workflow that it is blocking. It returns a durability disposition for a
-// future durable issue_comment driver:
+// workflow that it is blocking. It returns a durability disposition for the
+// durable issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (a GitHub
 //     read during database inference, a storage lock lookup, the active-apply
@@ -672,8 +672,22 @@ func isUnlockRejection(err error) bool {
 //     locks that remain.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (a completed release, a deterministic inference or lookup rejection, no
-//     locks found, an authorization block on the merits, or an active apply
-//     still protecting the lock).
+//     locks found, an authorization block on the merits, an active apply
+//     still protecting the lock, or a command that predates every lock it
+//     matched).
+//
+// issuedAt bounds the release targets: a lock acquired after issuedAt is
+// never released. On the durable path issuedAt is the delivery's received-at,
+// so a re-drive minutes later still releases only the locks the command
+// covered when it arrived — not a lock acquired since, which may be
+// protecting a fresh apply awaiting confirmation or another session's work.
+// The bound is per delivery receipt, not per original comment: a GitHub
+// Redeliver reopens the stored delivery with a fresh received-at, so a
+// redelivered command may release locks acquired after the original comment,
+// as long as they predate the redelivery. That is deliberate — Redeliver is
+// an operator action to re-run the command now, and the authorization and
+// active-apply gates re-evaluate against current state. The synchronous
+// wrapper passes time.Now().
 //
 // A terminal rejection is a per-delivery decision: it is deterministic for
 // the PR head this delivery read, and a later push can change the answer.
@@ -690,11 +704,15 @@ func isUnlockRejection(err error) bool {
 // post best-effort error comments too, so a durable driver re-driving one may
 // post the same comment again.
 //
+// The parent context scopes the command beyond its own timeout: the
+// synchronous wrapper passes context.Background(), while the durable driver
+// passes its run context so lease loss or shutdown cancels in-flight work.
+//
 // Every failure is logged where it is classified — by the core at its own
 // exits, and by the authorization gates for gate outcomes — so the synchronous
 // wrapper can discard the result without losing observability.
-func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
-	ctx, cancel := h.commandContext(context.Background(), 30*time.Second)
+func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, repo string, pr int, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	ctx, cancel := h.commandContext(parent, 30*time.Second)
 	defer cancel()
 	if result.Force && result.Database == "" {
 		database, err := h.inferUnlockDatabase(ctx, repo, pr, installationID)
@@ -717,6 +735,33 @@ func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, r
 			return false, nil
 		}
 		return true, fmt.Errorf("unlock command lock lookup %s#%d: %w", repo, pr, err)
+	}
+
+	// Release only locks that existed when the command was received. A lock
+	// acquired afterwards was never covered by the command's intent and may be
+	// protecting newer work — a fresh apply awaiting confirmation, or another
+	// session's CLI lock on a force unlock. The comparison spans two clocks
+	// (lock.CreatedAt is the storage DB's clock, issuedAt the webhook pod's);
+	// skew fails safe — a wrongly skipped lock gets the stale-command answer
+	// prompting a fresh comment, never a wrongful release.
+	fresh := make([]*storage.Lock, 0, len(locks))
+	var skippedNewer int
+	for _, lock := range locks {
+		if lock.CreatedAt.After(issuedAt) {
+			skippedNewer++
+			h.logger.Warn("unlock will not release a lock acquired after the command was received",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "lock_created_at", lock.CreatedAt, "command_received_at", issuedAt)
+			continue
+		}
+		fresh = append(fresh, lock)
+	}
+	locks = fresh
+	if len(locks) == 0 && skippedNewer > 0 {
+		h.logger.Info("unlock released nothing because every matched lock postdates the command", "repo", repo, "pr", pr)
+		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
+			"Every lock matched by this unlock command was acquired after the command was received, so nothing was released. Comment `schemabot unlock` again to release the current locks.")
+		return false, nil
 	}
 
 	if len(locks) == 0 {
@@ -784,12 +829,25 @@ func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, r
 	// make the delivery retryable, and a re-drive only sees the locks that are
 	// still held.
 	var releaseErrs []error
+	var released, alreadyGone int
 	for _, lock := range locks {
 		var err error
 		if result.Force {
 			err = h.service.Storage().Locks().ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType)
 		} else {
 			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		}
+		if errors.Is(err, storage.ErrLockNotFound) || errors.Is(err, storage.ErrLockNotOwned) {
+			// The lock vanished (or changed owner) between lookup and release —
+			// a concurrent unlock or apply's own stale-lock cleanup got there
+			// first. The lock this command targeted is gone, which is the
+			// command's goal, so this is not a failure to retry; skip the
+			// success comment too, since this command did not do the releasing.
+			alreadyGone++
+			h.logger.Info("unlock target already released",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "force", result.Force, "error", err)
+			continue
 		}
 		if err != nil {
 			h.logger.Error("failed to release lock",
@@ -799,11 +857,21 @@ func (h *Handler) unlockCommandCore(repo string, pr int, installationID int64, r
 			continue
 		}
 
+		released++
 		h.postComment(repo, pr, installationID, templates.RenderUnlockSuccess(
 			lock.DatabaseName, "", requestedBy))
 	}
 	if len(releaseErrs) > 0 {
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
+	}
+	if released == 0 && alreadyGone > 0 {
+		// Every matched lock was released by a concurrent operation before this
+		// command could act. The per-lock skips stay silent, so without an
+		// aggregate answer the acked command would end without any comment;
+		// an acknowledged command must always answer.
+		h.logger.Info("unlock: every matched lock was already released concurrently",
+			"repo", repo, "pr", pr, "already_gone", alreadyGone)
+		h.postComment(repo, pr, installationID, templates.RenderLocksAlreadyReleased())
 	}
 	return false, nil
 }
