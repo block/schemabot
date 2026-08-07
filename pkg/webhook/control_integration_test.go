@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -1104,6 +1105,125 @@ func postRevertCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "revert started")
+}
+
+// captureCommentsAndReactions routes the PR comment and reaction endpoints into
+// channels the caller reads, so a test can assert on what a command answered.
+func captureCommentsAndReactions(t *testing.T, mux *http.ServeMux) (chan string, chan string) {
+	t.Helper()
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	return comments, reactions
+}
+
+// seedTerminalControlApply seeds a control-command apply already settled in the
+// given terminal state, so a command asking for that same state has nothing left
+// to do.
+func seedTerminalControlApply(t *testing.T, store storage.Storage, db *sql.DB, applyIdentifier, database, applyState string) int64 {
+	t.Helper()
+	cleanupStopCommandTestRows(t, db, applyIdentifier, database)
+	t.Cleanup(func() { cleanupStopCommandTestRows(t, db, applyIdentifier, database) })
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	stored, err := store.Applies().GetByApplyIdentifier(t.Context(), applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	stored.State = applyState
+	stored.UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Applies().Update(t.Context(), stored))
+	return applyID
+}
+
+// Reissuing a control command is how an operator confirms the first one landed,
+// so the second one must not read as a failure. A cancel on an already-cancelled
+// schema change, and a stop on an already-stopped one, get the outcome they
+// asked for: an informational reply with no support-channel escalation, and no
+// second durable control request.
+func TestE2ERepeatControlCommandOnSettledApplyAnswersInformationally(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
+	store := mysqlstore.New(schemabotDB)
+
+	tests := []struct {
+		name       string
+		applyState string
+		database   string
+		identifier string
+		operation  storage.ControlOperation
+		post       func(t *testing.T, h *Handler, applyIdentifier, user string)
+		wantDetail string
+	}{
+		{
+			name:       "cancel on a cancelled schema change",
+			applyState: state.Apply.Cancelled,
+			database:   "cancel_pr_comments_settled_db",
+			identifier: "apply_ca11e0ed",
+			operation:  storage.ControlOperationCancel,
+			post:       postCancelCommand,
+			wantDetail: "the schema change is already cancelled",
+		},
+		{
+			name:       "stop on a stopped schema change",
+			applyState: state.Apply.Stopped,
+			database:   "stop_pr_comments_settled_db",
+			identifier: "apply_5709bed0",
+			operation:  storage.ControlOperationStop,
+			post:       postStopCommand,
+			wantDetail: "the schema change is already stopped",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applyID := seedTerminalControlApply(t, store, schemabotDB, tt.identifier, tt.database, tt.applyState)
+
+			client, mux := setupGitHubServer(t)
+			comments, reactions := captureCommentsAndReactions(t, mux)
+
+			service := apiServiceForStopCommandTest(t, store, tt.database)
+			service.RegisterTernClient(tt.database, "staging", &stopCommandTernClient{})
+			h := &Handler{
+				service:   service,
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+				logger:    testLogger(),
+			}
+
+			tt.post(t, h, tt.identifier, "alice")
+			comment := readComment(t, comments)
+			assert.Contains(t, comment, "Nothing to "+tt.operation)
+			assert.Contains(t, comment, tt.wantDetail)
+			assert.Contains(t, comment, "`"+tt.identifier+"`")
+			assert.NotContains(t, comment, "Failed")
+			assert.False(t, templates.OffersSupportChannel(comment),
+				"a command that got the operator what they asked for must not route them to support")
+
+			pending, err := store.ControlRequests().GetPending(ctx, applyID, tt.operation)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "a settled schema change must not accrue another control request")
+			assertReactionEventually(t, reactions)
+		})
+	}
 }
 
 func readComment(t *testing.T, comments chan string) string {

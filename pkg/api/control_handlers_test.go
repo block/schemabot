@@ -43,6 +43,26 @@ func TestIsInternalControlError(t *testing.T) {
 	})
 }
 
+// A control request the apply's state already satisfies is distinguishable from
+// a rejection the operator must act on, so callers can answer it informationally
+// instead of escalating a command that got them what they asked for. It keeps
+// the conflict status either way: the request still cannot proceed.
+func TestIsControlOperationSatisfied(t *testing.T) {
+	satisfied := controlSatisfiedf("the schema change is already cancelled")
+	assert.True(t, IsControlOperationSatisfied(satisfied))
+	assert.False(t, IsInternalControlError(satisfied))
+	assert.Equal(t, http.StatusConflict, ControlOperationHTTPStatus(satisfied))
+	assert.Equal(t, "satisfied", controlErrorMetricStatus(satisfied))
+
+	assert.True(t, IsControlOperationSatisfied(fmt.Errorf("execute cancel: %w", satisfied)),
+		"a wrapped satisfied intent is still satisfied")
+
+	conflict := controlConflictf("schema change is already terminal (current state: %s)", "completed")
+	assert.False(t, IsControlOperationSatisfied(conflict))
+	assert.Equal(t, "rejected", controlErrorMetricStatus(conflict))
+	assert.Equal(t, "error", controlErrorMetricStatus(errors.New("storage unavailable")))
+}
+
 // A failed control operation is triaged from logs alone, so the failure line
 // must carry the apply's full triage attributes — including external_id, the
 // join key to the data plane's logs — alongside the error itself.
