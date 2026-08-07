@@ -330,8 +330,10 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 		if requestFromLoopback(r) {
 			reason = reasonLoopbackSource
 			if tier == TierWrite {
+				// The subject is caller-supplied header input on this path —
+				// clamp it like the other untrusted values this file logs.
 				a.logger.Warn("forward-auth write admitted with identity headers from a loopback source; the forwarded identity is caller-supplied, not proxy-verified (direct-to-pod break-glass)",
-					"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "subject", user, "proxy", proxyID)
+					"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "subject", clampLoggedHeaderValue(user), "proxy", proxyID)
 			}
 		}
 		authDecision(r, tier, "allow", reason)
