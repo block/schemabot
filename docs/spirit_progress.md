@@ -123,10 +123,11 @@ message `"No active schema change"`.
 ## How Spirit phases surface as task states
 
 The operator's lease-held drive polls the engine and refines the stored task
-state from the per-table engine phase (`syncAtomicTaskProgress` →
-`tablePhaseTaskState` in `pkg/tern/local_apply_grouped.go`). The stored task is
-the single render surface: the CLI and the PR comment both name the phase from
-it.
+state from the per-table engine phase via `tablePhaseTaskState`
+(`pkg/tern/local_apply_grouped.go`) — the atomic drive in
+`syncAtomicTaskProgress`, the sequential drive in `pollTaskToCompletion`. The
+stored task is the single render surface: the CLI and the PR comment both name
+the phase from it.
 
 `state.NormalizeTaskStatus` (`pkg/state/task.go`) maps engine strings to
 canonical task states:
@@ -238,7 +239,8 @@ One Spirit runner handles all DDLs together. `pollForCompletionAtomic` polls eve
 ### Sequential mode (default)
 
 One Spirit runner per table, processed in order. `pollTaskToCompletion` polls every 500ms:
-- Updates the single active task with engine progress.
+- Updates the single active task with engine progress, refining a running task
+  into its engine-reported post-copy phase the same way the atomic sync does.
 - Re-fetches task state from storage each tick to detect external Stop signals.
 - When the task reaches a terminal state, returns. The outer loop (`executeApplySequential`) then starts the next table.
 
