@@ -44,6 +44,14 @@ func TestPostCopyPhaseStateConversions(t *testing.T) {
 	}
 }
 
+// The engine's verify pass converts to the checksumming task state, so the
+// phase the proto boundary already carries is populated from Spirit rather than
+// flattening into a generic running task.
+func TestChecksummingStateConversions(t *testing.T) {
+	assert.Equal(t, state.Task.Checksumming, engineStateToStorage(engine.StateChecksumming))
+	assert.False(t, engine.StateChecksumming.IsTerminal(), "the verify pass is in-flight, not terminal")
+}
+
 // A null namespace value in the proto map (e.g. JSON `{"default": null}`)
 // converts to an empty namespace rather than dereferencing a nil pointer.
 func TestProtoToSchemaFiles_NilNamespaceValue(t *testing.T) {
