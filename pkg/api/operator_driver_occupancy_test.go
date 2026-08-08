@@ -14,10 +14,10 @@ import (
 )
 
 // The driver-occupancy gauges answer how much claim capacity remains: each
-// successful claim marks a driver busy until its drive returns, so total minus
-// busy — summed across processes — is the number of drivers still free to pick
-// up queued work. This verifies overlapping claims stack in the busy gauge and
-// each release frees exactly one slot.
+// successful claim marks a driver busy until its drive returns, so pool size
+// minus busy — summed across processes — is the number of drivers still free
+// to pick up queued work. This verifies overlapping claims stack in the busy
+// gauge and each release frees exactly one slot.
 func TestMarkDriverBusyTracksHeldClaims(t *testing.T) {
 	reader := newStuckPendingMetricReader(t)
 	svc := newOperatorTestService(nil)
@@ -72,8 +72,8 @@ func TestRecoverApplyPendingStopReleasesBusySlotOnInvalidLease(t *testing.T) {
 }
 
 // Starting the operator seeds both occupancy gauges so the pool's capacity is
-// visible before any claim: drivers_total reports the configured pool size and
-// drivers_busy starts at zero.
+// visible before any claim: driver_pool_size reports the configured pool size
+// and drivers_busy starts at zero.
 func TestStartOperatorSeedsDriverPoolGauges(t *testing.T) {
 	reader := newStuckPendingMetricReader(t)
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
@@ -82,6 +82,6 @@ func TestStartOperatorSeedsDriverPoolGauges(t *testing.T) {
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
 
-	assert.Equal(t, int64(3), gaugeValue(t, reader, "schemabot.operator.drivers_total"))
+	assert.Equal(t, int64(3), gaugeValue(t, reader, "schemabot.operator.driver_pool_size"))
 	assert.Equal(t, int64(0), gaugeValue(t, reader, "schemabot.operator.drivers_busy"))
 }

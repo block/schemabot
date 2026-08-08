@@ -993,13 +993,13 @@ func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
 	)
 }
 
-// RecordOperatorDriversTotal records the size of this process's operator
+// RecordOperatorDriverPoolSize records the size of this process's operator
 // driver pool — how many drives it can hold at once. Together with
 // schemabot.operator.drivers_busy it answers how much claim capacity remains:
-// summed across processes, total minus busy is the number of drivers still
-// free to claim queued work.
-func RecordOperatorDriversTotal(ctx context.Context, total int64) {
-	recordGauge(ctx, "schemabot.operator.drivers_total", total,
+// summed across processes, pool size minus busy is the number of drivers
+// still free to claim queued work.
+func RecordOperatorDriverPoolSize(ctx context.Context, size int64) {
+	recordGauge(ctx, "schemabot.operator.driver_pool_size", size,
 		"Size of the operator driver pool in this process", "{driver}",
 		EnvironmentAttribute(""),
 	)
@@ -1008,8 +1008,8 @@ func RecordOperatorDriversTotal(ctx context.Context, total int64) {
 // RecordOperatorDriversBusy records how many operator drivers in this process
 // currently hold claimed work. A driver is busy from the moment its claim
 // succeeds until the drive returns, so a long-running apply holds a driver for
-// its full duration. When busy reaches total on every process, newly queued
-// applies wait for a drive to finish, and the stuck-pending gauge is the alarm
+// its full duration. When busy reaches the pool size on every process, newly
+// queued applies wait for a drive to finish, and the stuck-pending gauge is the alarm
 // that they waited too long. The count is process-local on purpose: a busy
 // driver's occupancy dies with its process, and a peer recovers the work
 // through stale-lease claims, so there is no durable truth to sample.

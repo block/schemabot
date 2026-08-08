@@ -74,9 +74,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.operatorMu.Unlock()
 
 	// Seed both occupancy gauges before any driver claims so the pool's
-	// capacity is visible from startup: total minus busy, summed across
+	// capacity is visible from startup: pool size minus busy, summed across
 	// processes, is the claim capacity that remains.
-	metrics.RecordOperatorDriversTotal(ctx, int64(driverCount))
+	metrics.RecordOperatorDriverPoolSize(ctx, int64(driverCount))
 	metrics.RecordOperatorDriversBusy(ctx, s.driversBusy.Load())
 
 	for i := range driverCount {
