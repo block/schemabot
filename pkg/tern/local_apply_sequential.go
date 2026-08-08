@@ -291,6 +291,11 @@ type atomicPollState struct {
 	// user-visible timeline with duplicate triggers.
 	cutoverTriggerLogged bool
 
+	// deferredCutoverViolationLogged is set once a deferred apply has been
+	// reported as cut over by the backend, so the violation is stated once per
+	// drive rather than on every remaining progress tick.
+	deferredCutoverViolationLogged bool
+
 	// cutoverNotReadySince is when the engine backend first rejected an
 	// auto-cutover as not ready; cleared when a cutover is accepted. Used to
 	// escalate when the normally seconds-long staging window persists.

@@ -1013,6 +1013,26 @@ func RecordOperatorOperationProjectionRepair(ctx context.Context, database, depl
 	)
 }
 
+// RecordDeferredCutoverViolation counts applies whose schema was swapped by the
+// engine backend even though the operator asked to hold the cutover.
+//
+// This must be zero. A non-zero value means a deferred apply cut over without
+// the operator who deferred it, so the expected action is to treat the named
+// database's engine as unable to honor a hold: check whether the backend's own
+// auto-cutover setting is off for that database, and stop scheduling deferred
+// cutovers there until it is. The apply itself has already swapped by the time
+// this fires — the counter reports a safety gate that did not hold, not one
+// that is about to.
+func RecordDeferredCutoverViolation(ctx context.Context, database, deployment, environment, engineState string) {
+	addCounter(ctx, "schemabot.operator.deferred_cutover_violations_total",
+		"Total number of applies the engine backend cut over despite a deferred cutover", "{apply}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+		attribute.String("engine_state", engineState),
+	)
+}
+
 var knownOperatorTerminalSummaryFailureReasons = map[string]bool{
 	"reload_apply_error":           true,
 	"apply_missing":                true,

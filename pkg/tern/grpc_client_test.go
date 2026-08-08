@@ -829,6 +829,23 @@ func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit i
 	return m.logs, nil
 }
 
+func (m *mockApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
+	var matched []*storage.ApplyLog
+	for _, entry := range m.logs {
+		if filter.Level != "" && entry.Level != filter.Level {
+			continue
+		}
+		if filter.EventType != "" && entry.EventType != filter.EventType {
+			continue
+		}
+		matched = append(matched, entry)
+		if filter.Limit > 0 && len(matched) == filter.Limit {
+			break
+		}
+	}
+	return matched, nil
+}
+
 type mockPlanStore struct {
 	storage.PlanStore
 	plan *storage.Plan

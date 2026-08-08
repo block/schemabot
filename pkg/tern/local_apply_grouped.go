@@ -791,6 +791,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
+	// The branch above holds a deferred cutover by declining to trigger it,
+	// which only holds anything while the engine parks at the gate. This reports
+	// the deferred applies it did not hold.
+	c.detectDeferredCutoverViolation(ctx, apply, opts.DeferCutover, result.State, ps)
+
 	// Timeout: cancel the apply if waiting for manual deploy too long.
 	if result.State == engine.StateWaitingForDeploy && opts.DeferDeploy &&
 		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForManualActionTimeout {
