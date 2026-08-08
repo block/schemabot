@@ -197,6 +197,22 @@ func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string)
 	return false
 }
 
+// blockingChecksForEnvironment returns the stored rows that block a passing
+// aggregate for the environment. Callers list them on operator-facing
+// surfaces so a block names the databases behind it.
+func blockingChecksForEnvironment(checks []*storage.Check, environment string) []*storage.Check {
+	var blocking []*storage.Check
+	for _, c := range checks {
+		if environment != aggregateSentinel && c.Environment != environment {
+			continue
+		}
+		if checkBlocksPassingAggregate(c) {
+			blocking = append(blocking, c)
+		}
+	}
+	return blocking
+}
+
 // awaitingCurrentCommitTitle is the aggregate title shown when only results
 // recorded for another commit hold the aggregate open — nothing is running for
 // the commit the Check Run is published on, and the current commit's own plan

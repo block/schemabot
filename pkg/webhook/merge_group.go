@@ -13,6 +13,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // mergeGroupPayload is the subset of the GitHub merge_group webhook payload
@@ -261,7 +262,7 @@ func (h *Handler) postMergeGroupAdmissionChecks(ctx context.Context, client *ghc
 		return fmt.Errorf("load stored check state for merge group admission of %s#%d@%s: %w", repo, pr, headSHA, err)
 	}
 
-	blockedTargets := 0
+	var blockingRows []*storage.Check
 	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
 		if !hasBlockingCheckForEnvironment(checks, target.environment) {
 			if err := h.postAggregateCheck(ctx, client, repo, headSHA, target, mergeGroupPassContent(), checkConclusionSuccess); err != nil {
@@ -269,7 +270,7 @@ func (h *Handler) postMergeGroupAdmissionChecks(ctx context.Context, client *ghc
 			}
 			continue
 		}
-		blockedTargets++
+		blockingRows = append(blockingRows, blockingChecksForEnvironment(checks, target.environment)...)
 		h.logger.Warn("merge group admission blocked: the queued pull request's stored check state turned blocking after queue entry; the admission check will remove it from the queue",
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"environment", target.environment, "check_name", target.name)
@@ -282,10 +283,66 @@ func (h *Handler) postMergeGroupAdmissionChecks(ctx context.Context, client *ghc
 			return err
 		}
 	}
-	if blockedTargets == 0 {
+	if len(blockingRows) == 0 {
 		h.logger.Info("merge group admission passed: nothing in the queued pull request's stored check state blocks",
 			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
 	}
+	return h.ensureMergeQueueEjectedComment(ctx, client, repo, pr, headSHA, blockingRows)
+}
+
+// mergeQueueEjectedCommentMarker makes the ejection comment idempotent per
+// queue attempt: the merge-group head SHA identifies one queue entry, so a
+// webhook redelivery finds the marker and skips the re-post, while a later
+// re-queue produces a new merge-group commit and gets a fresh comment at the
+// bottom of the PR timeline. The SHA comes from GitHub's payload, not user
+// input, so the marker needs no sanitization.
+func mergeQueueEjectedCommentMarker(mergeGroupHeadSHA string) string {
+	return fmt.Sprintf("<!-- schemabot:merge-queue-ejected:%s -->", mergeGroupHeadSHA)
+}
+
+// ensureMergeQueueEjectedComment posts the guidance comment on a pull request
+// the admission check just removed from the merge queue. The blocking Check
+// Run lives on the synthetic merge-group commit — invisible from the PR page —
+// and the queue never re-adds a pull request on its own, so without this
+// comment the author sees their merge silently vanish with no next step. The
+// comment is part of the admission contract: a posting failure returns an
+// error so the delivery retries (the already-posted checks reconcile
+// idempotently on the retry).
+func (h *Handler) ensureMergeQueueEjectedComment(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, mergeGroupHeadSHA string, blocking []*storage.Check) error {
+	marker := mergeQueueEjectedCommentMarker(mergeGroupHeadSHA)
+	exists, err := client.HasIssueCommentWithMarker(ctx, repo, pr, marker)
+	if err != nil {
+		return fmt.Errorf("search for existing merge-queue ejection comment on %s#%d (merge group %s): %w",
+			repo, pr, mergeGroupHeadSHA, err)
+	}
+	if exists {
+		h.logger.Debug("merge-queue ejection comment already posted",
+			"repo", repo, "pr", pr, "merge_group_head_sha", mergeGroupHeadSHA)
+		return nil
+	}
+
+	data := templates.MergeQueueEjectedData{}
+	seen := make(map[string]bool, len(blocking))
+	for _, c := range blocking {
+		key := c.DatabaseName + "\x00" + c.Environment
+		if c.DatabaseName == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		data.Blocking = append(data.Blocking, templates.MergeQueueBlockedTarget{
+			Database:    c.DatabaseName,
+			Environment: c.Environment,
+		})
+	}
+	body := h.renderPRComment(templates.RenderMergeQueueEjected(data)) + "\n" + marker
+	if _, _, err := client.CreateIssueComment(ctx, repo, pr, body); err != nil {
+		return fmt.Errorf("post merge-queue ejection comment on %s#%d (merge group %s): %w",
+			repo, pr, mergeGroupHeadSHA, err)
+	}
+	h.logger.Info("merge-queue ejection comment posted",
+		"repo", repo, "pr", pr, "merge_group_head_sha", mergeGroupHeadSHA,
+		"blocking_targets", len(data.Blocking))
 	return nil
 }
 

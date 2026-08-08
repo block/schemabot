@@ -223,12 +223,25 @@ func newDurableMergeGroupDriverHandler(t *testing.T, store storage.WebhookEventS
 func TestDurableMergeGroupDriverBlocksOnStoredHold(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	created := make(chan checkRunCapture, 10)
+	comments := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 556})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var c struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
+		comments <- c.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 777})
 	})
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 
@@ -258,6 +271,14 @@ func TestDurableMergeGroupDriverBlocksOnStoredHold(t *testing.T) {
 		assert.Equal(t, "action_required", c.Conclusion)
 	case <-time.After(durableWebhookTestDeadline):
 		t.Fatal("expected the driver to post a blocking merge_group check")
+	}
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Removed From Merge Queue")
+		assert.Contains(t, body, "`widgets` in `production`")
+		assert.Contains(t, body, mergeQueueEjectedCommentMarker("mergesha123"))
+	case <-time.After(durableWebhookTestDeadline):
+		t.Fatal("expected the driver to post the ejection guidance comment")
 	}
 	select {
 	case <-store.completed:

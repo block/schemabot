@@ -58,16 +58,29 @@ func buildMergeGroupWebhookRequest(t *testing.T, action, headSHA string, secret 
 	return req
 }
 
-func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig, storedChecks ...*storage.Check) (*Handler, chan checkRunCapture) {
+func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig, storedChecks ...*storage.Check) (*Handler, chan checkRunCapture, chan string) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
 	created := make(chan checkRunCapture, 10)
+	comments := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 555})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var c struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
+		comments <- c.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 777})
 	})
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
@@ -81,7 +94,7 @@ func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:    testLogger(),
 	}
-	return h, created
+	return h, created, comments
 }
 
 // A merge queue evaluates the same required checks against the queue's
@@ -91,7 +104,7 @@ func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map
 // the same names as the PR-head aggregates — so a required SchemaBot check does
 // not block the merge queue forever.
 func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"staging", "production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 	)
@@ -125,7 +138,7 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 // GitHub fires merge_group with "destroyed" when a PR leaves the queue. That
 // action needs no check run on any commit, so SchemaBot ignores it.
 func TestWebhookMergeGroupIgnoresNonChecksRequested(t *testing.T) {
-	h, created := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h, created, _ := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"octocat/hello-world": {}})
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "destroyed", "mergesha123", nil))
@@ -143,7 +156,7 @@ func TestWebhookMergeGroupIgnoresNonChecksRequested(t *testing.T) {
 // A merge_group event for a repository SchemaBot does not manage gets no check:
 // SchemaBot's check is not required on that repo, so there is nothing to unblock.
 func TestWebhookMergeGroupRejectsUnregisteredRepo(t *testing.T) {
-	h, created := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"org/allowed-repo": {}})
+	h, created, _ := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"org/allowed-repo": {}})
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
@@ -218,7 +231,7 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 // With no environment scoping configured, SchemaBot publishes a single
 // non-environment-scoped aggregate check on the merge-group head SHA.
 func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
-	h, created := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h, created, _ := mergeGroupTestHandler(t, nil, map[string]api.RepoConfig{"octocat/hello-world": {}})
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
@@ -246,7 +259,7 @@ func TestWebhookMergeGroupSingleAggregateWhenNoEnvScoping(t *testing.T) {
 // Without this silence, every queue entry would re-grow the per-tenant check
 // rows the aggregate removes from PR heads.
 func TestWebhookMergeGroupParticipantStaysSilent(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {
 			Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant},
@@ -269,7 +282,7 @@ func TestWebhookMergeGroupParticipantStaysSilent(t *testing.T) {
 // The aggregate leader keeps posting its required checks on merge-group
 // commits — silence is participant-only, so the queue never wedges.
 func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {
 			Aggregate: &api.AggregateConfig{
@@ -298,9 +311,12 @@ func TestWebhookMergeGroupLeaderStillPosts(t *testing.T) {
 // queue — a preflight hold from a sibling change's in-flight apply on a shared
 // target — must not merge on the verdict it queued with. The admission check
 // re-folds the PR's stored state on the merge-group commit and blocks, so the
-// queue removes the PR instead of merging it mid-apply.
+// queue removes the PR instead of merging it mid-apply. Because the blocking
+// run lives on the synthetic merge-group commit and the queue never re-adds a
+// PR by itself, the block also posts a guidance comment on the PR naming the
+// blocked database and the re-queue step.
 func TestWebhookMergeGroupBlocksWhenStoredCheckHolds(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, comments := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 		&storage.Check{
@@ -328,13 +344,79 @@ func TestWebhookMergeGroupBlocksWhenStoredCheckHolds(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the blocking merge_group check run")
 	}
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Removed From Merge Queue")
+		assert.Contains(t, body, "`widgets` in `production`")
+		assert.Contains(t, body, "add it to the merge queue again")
+		assert.Contains(t, body, mergeQueueEjectedCommentMarker("mergesha123"))
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the ejection guidance comment")
+	}
+}
+
+// A redelivered merge_group event finds the ejection comment it already posted
+// (identified by the merge-group head SHA marker) and does not post a
+// duplicate; the blocking check still reconciles idempotently.
+func TestWebhookMergeGroupEjectionCommentDeduplicatesRedelivery(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	created := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var c checkRunCapture
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
+		created <- c
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 555})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": 777, "body": "guidance\n" + mergeQueueEjectedCommentMarker("mergesha123")},
+		})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("redelivery must not post a duplicate ejection comment")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 778})
+	})
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	service := api.New(&foldStorage{checks: &foldCheckStore{byPR: []*storage.Check{{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "prhead123",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "widgets",
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}}}}, &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}, nil, testLogger())
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    testLogger(),
+	}
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildMergeGroupWebhookRequest(t, "checks_requested", "mergesha123", nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case c := <-created:
+		assert.Equal(t, "action_required", c.Conclusion)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the blocking merge_group check run")
+	}
 }
 
 // A queued PR with an apply currently running from its own head must not merge
 // until the apply settles: an in-progress apply-owned stored row blocks the
 // admission fold the same way it blocks the PR-head aggregate.
 func TestWebhookMergeGroupBlocksWhenOwnApplyInFlight(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 		&storage.Check{
@@ -365,7 +447,7 @@ func TestWebhookMergeGroupBlocksWhenOwnApplyInFlight(t *testing.T) {
 // check state consulted, so admission fails closed: the check posts blocking
 // rather than guessing that nothing blocks.
 func TestWebhookMergeGroupFailsClosedOnUnidentifiablePR(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 	)
