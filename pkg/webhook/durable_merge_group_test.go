@@ -21,7 +21,7 @@ import (
 func durableMergeGroupEvent() *storage.WebhookEvent {
 	payload := []byte(`{
 		"action": "checks_requested",
-		"merge_group": {"head_sha": "mergesha123"},
+		"merge_group": {"head_sha": "mergesha123", "head_ref": "refs/heads/gh-readonly-queue/main/pr-1-mergesha123"},
 		"repository": {"full_name": "octocat/hello-world"},
 		"installation": {"id": 12345}
 	}`)
@@ -189,6 +189,132 @@ func TestDurableMergeGroupDriverParticipantStaysSilent(t *testing.T) {
 		t.Fatal("participant must not create a GitHub client for a merge_group check")
 	default:
 	}
+}
+
+// durableMergeGroupStorage layers a scripted check store over the durable
+// webhook harness so driver tests can seed stored check state for the
+// admission fold.
+type durableMergeGroupStorage struct {
+	durableWebhookTestStorage
+	checks storage.CheckStore
+}
+
+func (s *durableMergeGroupStorage) Checks() storage.CheckStore {
+	return s.checks
+}
+
+func newDurableMergeGroupDriverHandler(t *testing.T, store storage.WebhookEventStore, checks storage.CheckStore, config *api.ServerConfig, factory *fakeClientFactory) *Handler {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableMergeGroupStorage{
+		durableWebhookTestStorage: durableWebhookTestStorage{webhookEvents: store},
+		checks:                    checks,
+	}, config, nil, logger)
+	if factory == nil {
+		factory = &fakeClientFactory{}
+	}
+	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+}
+
+// When the queued PR's stored check state blocks — a sibling apply's preflight
+// hold landed after the PR entered the queue — the driver posts a blocking
+// admission check on the merge-group head instead of the pass the PR queued
+// with, and the delivery still completes: the verdict was delivered.
+func TestDurableMergeGroupDriverBlocksOnStoredHold(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	created := make(chan checkRunCapture, 10)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var c checkRunCapture
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
+		created <- c
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 556})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var c struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
+		comments <- c.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 777})
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+
+	store := newScriptedWebhookEventStore(durableMergeGroupEvent())
+	checks := &foldCheckStore{byPR: []*storage.Check{{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "prhead123",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		DatabaseName: "widgets",
+		Status:       "completed",
+		Conclusion:   "action_required",
+	}}}
+	config := &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}
+	h := newDurableMergeGroupDriverHandler(t, store, checks, config, &fakeClientFactory{client: installClient})
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case c := <-created:
+		assert.Equal(t, "SchemaBot (production)", c.Name)
+		assert.Equal(t, "mergesha123", c.HeadSHA)
+		assert.Equal(t, "action_required", c.Conclusion)
+	case <-time.After(durableWebhookTestDeadline):
+		t.Fatal("expected the driver to post a blocking merge_group check")
+	}
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Removed From Merge Queue")
+		assert.Contains(t, body, "`widgets` in `production`")
+		assert.Contains(t, body, mergeQueueEjectedCommentMarker("mergesha123"))
+	case <-time.After(durableWebhookTestDeadline):
+		t.Fatal("expected the driver to post the ejection guidance comment")
+	}
+	select {
+	case <-store.completed:
+	case <-time.After(durableWebhookTestDeadline):
+		t.Fatal("expected the delivery to be marked completed")
+	}
+	require.Empty(t, store.failed)
+}
+
+// A storage read failure during the admission fold is retryable: the verdict
+// cannot be computed from unknown state, so the delivery is retried rather
+// than completed with a guessed check.
+func TestDurableMergeGroupDriverRetriesStorageFailure(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+
+	store := newScriptedWebhookEventStore(durableMergeGroupEvent())
+	checks := &foldCheckStore{byPRErr: errors.New("storage unavailable")}
+	config := &api.ServerConfig{
+		AllowedEnvironments: []string{"production"},
+		Repos:               map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}
+	h := newDurableMergeGroupDriverHandler(t, store, checks, config, &fakeClientFactory{client: installClient})
+
+	before := time.Now()
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.NotNil(t, failure.retryAfter, "storage failure must stay retryable")
+		require.True(t, failure.retryAfter.After(before), "retry must be scheduled in the future")
+		require.Contains(t, failure.errMsg, "storage unavailable")
+	default:
+		t.Fatal("expected storage failure to be marked failed")
+	}
+	require.Empty(t, store.completed)
 }
 
 // A GitHub client failure while posting the check is retryable: the merge queue

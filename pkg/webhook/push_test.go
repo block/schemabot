@@ -46,7 +46,7 @@ func buildPushWebhookRequest(t *testing.T, ref, after string, deleted bool) *htt
 // App selectable as a pinned required-check source — one check per gated
 // environment, with the same names as the PR-head aggregates.
 func TestWebhookPushPostsPassingChecksOnDefaultBranch(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"staging", "production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 	)
@@ -81,7 +81,7 @@ func TestWebhookPushPostsPassingChecksOnDefaultBranch(t *testing.T) {
 // the PR and merge-queue check paths; only the default branch needs the
 // check-source seed.
 func TestWebhookPushIgnoresNonDefaultBranch(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 	)
@@ -101,7 +101,7 @@ func TestWebhookPushIgnoresNonDefaultBranch(t *testing.T) {
 
 // A branch deletion push has no commit to publish a check on.
 func TestWebhookPushIgnoresBranchDeletion(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {}},
 	)
@@ -123,7 +123,7 @@ func TestWebhookPushIgnoresBranchDeletion(t *testing.T) {
 // required aggregate — so a participant stays silent on default-branch pushes
 // rather than seeding an informational check on every landed commit.
 func TestWebhookPushParticipantStaysSilent(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {
 			Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant},
@@ -147,7 +147,7 @@ func TestWebhookPushParticipantStaysSilent(t *testing.T) {
 // default-branch pushes — silence is participant-only, so the leader App
 // stays selectable as a pinned required-check source.
 func TestWebhookPushLeaderStillPosts(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"octocat/hello-world": {
 			Aggregate: &api.AggregateConfig{
@@ -175,7 +175,7 @@ func TestWebhookPushLeaderStillPosts(t *testing.T) {
 // A push on a repository SchemaBot does not manage gets no check: SchemaBot's
 // check is not required there, so there is no check source to maintain.
 func TestWebhookPushRejectsUnregisteredRepo(t *testing.T) {
-	h, created := mergeGroupTestHandler(t,
+	h, created, _ := mergeGroupTestHandler(t,
 		[]string{"production"},
 		map[string]api.RepoConfig{"org/allowed-repo": {}},
 	)
