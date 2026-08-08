@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -45,7 +44,6 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 	}
-	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 }
 
 // markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
@@ -81,7 +79,6 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 	}
-	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	if obs := c.getObserver(apply.ID); obs != nil {
 		obs.OnProgress(apply, tasks)
 	}

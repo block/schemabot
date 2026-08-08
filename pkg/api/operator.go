@@ -1274,10 +1274,6 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		s.OnApplyRecovered(apply)
 	}
 
-	retryableClaim := previousState == state.Apply.FailedRetryable
-	if retryableClaim {
-		metrics.AdjustActiveApplies(ctx, 1, apply.Database, deployment, apply.Environment)
-	}
 	// The operation-claim path scopes the drive to the single deployment it
 	// leased so sibling deployments are unaffected; ResumeApplyOperation fails
 	// closed when no tasks scope to the operation. The cutover variant drives a
@@ -1319,9 +1315,6 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 				"lease_owner", lease.Owner,
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_presumed_lost")
-			if retryableClaim {
-				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-			}
 			return false, err
 		}
 		if errors.Is(err, storage.ErrApplyLeaseLost) {
@@ -1329,9 +1322,6 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 				"lease_owner", lease.Owner,
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_lost")
-			if retryableClaim {
-				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-			}
 			return false, err
 		}
 		if errors.Is(err, tern.ErrNoTasksForApplyOperation) {
@@ -1343,9 +1333,6 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 				"apply_operation_id", applyOperationID,
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "operation_no_tasks")
-			if retryableClaim {
-				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-			}
 			return false, err
 		}
 		if errors.Is(err, tern.ErrApplyTasksNotLoaded) {
@@ -1358,25 +1345,16 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			logger.Error("operator: apply owns task rows the drive did not load; refusing task-less completion and leaving the apply claimable",
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_tasks_not_loaded")
-			if retryableClaim {
-				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-			}
 			return false, err
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			logger.Debug("operator: stopped while running claimed apply",
 				"error", err)
-			if retryableClaim {
-				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-			}
 			return false, err
 		}
 		logger.Error("operator: failed to resume apply",
 			"error", err)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "resume_error")
-		if retryableClaim {
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-		}
 		return false, err
 	}
 
@@ -1514,9 +1492,6 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
 		return false
 	}
-	// The failed transition releases the active-apply gauge the same way an
-	// engine-driven failure would have.
-	metrics.AdjustActiveApplies(ctx, -1, fresh.Database, deployment, fresh.Environment)
 	s.logApplyDrivePanicFailure(ctx, driverID, fresh, previousState, errMsg)
 	return true
 }
@@ -1996,23 +1971,6 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		append(apply.LogAttrs(),
 			"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
-
-	// Own the active-apply gauge for multi-operation applies. The enqueue-time
-	// increment is keyed to the parent's primary deployment, and operation-scoped
-	// drives suppress the parent-level metric, so the projection that wins the
-	// parent transition is the single point that must release it: -1 when the
-	// rollout first reaches a terminal state, and +1 if a continuable failure
-	// reopens the parent to keep it running, so the gauge tracks whether the
-	// apply is still in flight. Single-operation applies keep decrementing in
-	// their direct drive and are left untouched here.
-	if len(ops) > 1 {
-		switch {
-		case !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived):
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		case state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived):
-			metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
-		}
-	}
 
 	return applyProjectionResult{
 		Swapped:        true,

@@ -254,7 +254,8 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	metrics.RecordSourcePolicyBlock(t.Context(), "plan", "mydb", "staging", "unauthorized_repo")
 	metrics.RecordPRCommandActorAuthorization(t.Context(), "apply", "mydb", "staging", "org/repo", "allowed", "allowed_admin_user")
 	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "pie", "staging")
-	metrics.AdjustActiveApplies(t.Context(), 1, "mydb", "pie", "staging")
+	metrics.RecordActiveApplies(t.Context(), 1, "mydb", "pie", "staging")
+	metrics.RecordActiveAppliesScanFailure(t.Context())
 	metrics.RecordControlOperation(t.Context(), "stop", "mydb", "pie", "staging", "success")
 	metrics.RecordRemoteDeploymentHealth(t.Context(), "pie", "staging", true)
 	metrics.RecordRemoteDeploymentHealthCheck(t.Context(), "pie", "staging", "success", "healthy")
@@ -312,7 +313,7 @@ func metricHasDeploymentAttribute(metricName string) bool {
 		"schemabot.applies.total",
 		"schemabot.apply.duration_seconds",
 		"schemabot.check_ownership_misses_total",
-		"schemabot.active_applies",
+		"schemabot.applies.active",
 		"schemabot.control_operations_total",
 		"schemabot.remote_deployment.health",
 		"schemabot.remote_deployment.health_checks_total",

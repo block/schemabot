@@ -58,21 +58,6 @@ func addCounterN(ctx context.Context, n int64, name, description, unit string, a
 	counter.Add(ctx, n, otelmetric.WithAttributes(attrs...))
 }
 
-// addUpDownCounter adjusts a named Int64UpDownCounter by delta with the given
-// attributes, logging and skipping if the instrument cannot be created.
-func addUpDownCounter(ctx context.Context, name string, delta int64, description, unit string, attrs ...attribute.KeyValue) {
-	meter := otel.Meter(meterName)
-	counter, err := meter.Int64UpDownCounter(name,
-		otelmetric.WithDescription(description),
-		otelmetric.WithUnit(unit),
-	)
-	if err != nil {
-		slog.Warn("failed to create up/down counter", "metric", name, "error", err)
-		return
-	}
-	counter.Add(ctx, delta, otelmetric.WithAttributes(attrs...))
-}
-
 // recordHistogram records value into a named Float64Histogram with the given
 // attributes, logging and skipping if the instrument cannot be created.
 func recordHistogram(ctx context.Context, name string, value float64, description, unit string, attrs ...attribute.KeyValue) {
@@ -700,14 +685,31 @@ func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, 
 	)
 }
 
-// AdjustActiveApplies increments or decrements the active applies gauge.
-// Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
-func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
-	addUpDownCounter(ctx, "schemabot.active_applies", delta,
-		"Number of currently in-progress applies", "{apply}",
+// RecordActiveApplies records how many applies for one
+// database/deployment/environment are currently in a non-terminal state. The
+// value is sampled from storage by a background monitor rather than adjusted
+// in-process, so a pod restart or lease handover cannot zero out applies that
+// are still running. It is a last-value instrument: the monitor records 0 once
+// for a target whose last active apply finished, so the series does not freeze
+// at its final nonzero count.
+func RecordActiveApplies(ctx context.Context, count int64, database, deployment, environment string) {
+	recordGauge(ctx, "schemabot.applies.active", count,
+		"Number of applies in a non-terminal state, sampled from storage", "{apply}",
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordActiveAppliesScanFailure counts failed active-applies storage scans.
+// The active-applies gauge is a last-value instrument, so a failed scan leaves
+// every target frozen at its last-good value — indistinguishable from a stable
+// population. This counter is the liveness signal for the gauge: a nonzero
+// rate means the active-applies values are stale and must not be trusted.
+func RecordActiveAppliesScanFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.applies.active_scan_failures",
+		"Total number of failed active-applies storage scans", "{failure}",
+		EnvironmentAttribute(""),
 	)
 }
 

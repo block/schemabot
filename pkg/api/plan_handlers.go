@@ -902,7 +902,6 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 
 	span.SetAttributes(attribute.String("apply_id", applyIdentifier), attribute.Bool("accepted", true))
 	recordApplyResult("success")
-	metrics.AdjustActiveApplies(ctx, 1, plan.Database, plan.Deployment, req.Environment)
 	s.wakeOperator(applyIdentifier, plan.Database, req.Environment)
 
 	return &apitypes.ApplyResponse{

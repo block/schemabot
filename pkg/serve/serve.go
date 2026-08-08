@@ -525,8 +525,9 @@ func (s *Server) MetricsHandler() http.Handler {
 // Start launches the server's background work: the operator driver pool
 // (dispatches queued applies and recovers stale ones), the remote-deployment
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
-// metrics), and the pending-drops cleaner — all of which run until ctx is
-// canceled or Close is called. It also kicks off a one-shot missing-summary
+// metrics), the storage-sampled gauge monitors (stuck-pending and
+// active-applies), and the pending-drops cleaner — all of which run until ctx
+// is canceled or Close is called. It also kicks off a one-shot missing-summary
 // reconciliation that, once started, runs to completion independently of ctx (it
 // repairs interrupted terminal comments and must not be cut short by a request
 // context); it runs before the operator so recovered applies attach observers
@@ -540,6 +541,7 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartRemoteDeploymentHealthMonitor(ctx)
 	s.svc.StartWebhookInboxMonitor(ctx)
 	s.svc.StartOperatorStuckPendingMonitor(ctx)
+	s.svc.StartActiveAppliesMonitor(ctx)
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 

@@ -1171,6 +1171,41 @@ func (s *applyStore) FindStuckPendingApplies(ctx context.Context, olderThan time
 	return scanApplies(rows)
 }
 
+// CountActiveApplies returns the non-terminal apply population grouped by
+// database, deployment, and environment. It is a read-only observability
+// probe (no lease, no FOR UPDATE) backing the storage-sampled active-applies
+// gauge, so the reported population survives pod restarts and lease
+// handovers. The predicate is "not terminal" rather than a list of live
+// states so an unknown state counts as active.
+func (s *applyStore) CountActiveApplies(ctx context.Context) ([]storage.ActiveApplyCount, error) {
+	predicate, args := nonTerminalApplyStatePredicate("state")
+	query := `
+		SELECT database_name, deployment, environment, COUNT(*)
+		FROM applies
+		WHERE ` + predicate + `
+		GROUP BY database_name, deployment, environment
+		ORDER BY database_name, deployment, environment`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("count active applies by target: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var counts []storage.ActiveApplyCount
+	for rows.Next() {
+		var count storage.ActiveApplyCount
+		if err := rows.Scan(&count.Database, &count.Deployment, &count.Environment, &count.Count); err != nil {
+			return nil, fmt.Errorf("scan active apply count: %w", err)
+		}
+		counts = append(counts, count)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active apply counts: %w", err)
+	}
+	return counts, nil
+}
+
 // recentAppliesWhere builds the WHERE predicates and args shared by the
 // recent-apply list and count queries, so both views agree on which applies a
 // filter selects.

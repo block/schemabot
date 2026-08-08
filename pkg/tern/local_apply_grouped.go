@@ -271,7 +271,6 @@ func (c *LocalClient) completeTasklessGroupedApply(ctx context.Context, apply *s
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		message, state.Apply.Running, state.Apply.Completed)
-	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	c.notifyTerminalObserver(apply, nil)
 	return nil
 }
@@ -1020,7 +1019,6 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				"error", err)
 			return true
 		}
-		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
 			logger.Warn("apply paused for operator retry",

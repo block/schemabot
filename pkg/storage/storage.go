@@ -421,6 +421,16 @@ type ApplyStore interface {
 	// nothing is stuck. A non-positive limit means no cap.
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
+	// CountActiveApplies returns how many applies are in a non-terminal state,
+	// grouped by database, deployment, and environment. It is a read-only
+	// observability probe (no lease, no FOR UPDATE) that backs the
+	// storage-sampled active-applies gauge, so the reported population survives
+	// pod restarts and lease handovers. Targets with no active applies are
+	// absent from the result. Membership is expressed as "not terminal" rather
+	// than a list of live states so an unknown state counts as active — an
+	// in-flight apply must never be invisible because a state was missed.
+	CountActiveApplies(ctx context.Context) ([]ActiveApplyCount, error)
+
 	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
 	// driver (pending with child rows, stale active state, retryable within
 	// budget, or a pending start control request). On a
@@ -513,6 +523,16 @@ type ApplyStore interface {
 
 	// DeleteByPR removes all applies for a PR (cleanup on PR close/merge).
 	DeleteByPR(ctx context.Context, repo string, pr int) error
+}
+
+// ActiveApplyCount is one target's share of the in-flight apply population:
+// how many applies for a database/deployment/environment have not reached a
+// terminal state.
+type ActiveApplyCount struct {
+	Database    string
+	Deployment  string
+	Environment string
+	Count       int64
 }
 
 // ApplyOperationWithTasks groups one apply_operations row with the task rows it owns.

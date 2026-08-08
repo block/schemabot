@@ -35,22 +35,22 @@ func (f *fakeStuckApplyStore) FindStuckPendingApplies(context.Context, time.Dura
 	return f.stuck, f.err
 }
 
-// stuckPendingMockStorage wires a fake ApplyStore into the mock storage so the
+// monitorMockStorage wires a fake ApplyStore into the mock storage so the
 // monitor can read it.
-type stuckPendingMockStorage struct {
+type monitorMockStorage struct {
 	mockStorage
 	applies storage.ApplyStore
 }
 
-func (m *stuckPendingMockStorage) Applies() storage.ApplyStore { return m.applies }
+func (m *monitorMockStorage) Applies() storage.ApplyStore { return m.applies }
 
-func newStuckPendingTestService(t *testing.T, applies storage.ApplyStore) *Service {
+func newMonitorTestService(t *testing.T, applies storage.ApplyStore) *Service {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	return New(&stuckPendingMockStorage{applies: applies}, &ServerConfig{}, nil, logger)
+	return New(&monitorMockStorage{applies: applies}, &ServerConfig{}, nil, logger)
 }
 
-func newStuckPendingMetricReader(t *testing.T) sdkmetric.Reader {
+func newMonitorMetricReader(t *testing.T) sdkmetric.Reader {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -102,13 +102,13 @@ func metricNames(t *testing.T, reader sdkmetric.Reader) map[string]bool {
 // the monitor records their count as the stuck-pending gauge for an operator to
 // alert on.
 func TestCollectOperatorStuckPendingMetricsRecordsGauge(t *testing.T) {
-	reader := newStuckPendingMetricReader(t)
+	reader := newMonitorMetricReader(t)
 
 	store := &fakeStuckApplyStore{stuck: []*storage.Apply{
 		{ApplyIdentifier: "apply_oldest", Database: "db1", Environment: "staging", CreatedAt: time.Now().Add(-40 * time.Minute)},
 		{ApplyIdentifier: "apply_old", Database: "db2", Environment: "staging", CreatedAt: time.Now().Add(-20 * time.Minute)},
 	}}
-	svc := newStuckPendingTestService(t, store)
+	svc := newMonitorTestService(t, store)
 
 	svc.CollectOperatorStuckPendingMetrics(t.Context())
 
@@ -122,9 +122,9 @@ func TestCollectOperatorStuckPendingMetricsRecordsGauge(t *testing.T) {
 // instrument, so skipping the record when the backlog clears would freeze it at
 // its last nonzero value and show a phantom stuck population forever.
 func TestCollectOperatorStuckPendingMetricsRecordsZeroWhenHealthy(t *testing.T) {
-	reader := newStuckPendingMetricReader(t)
+	reader := newMonitorMetricReader(t)
 
-	svc := newStuckPendingTestService(t, &fakeStuckApplyStore{stuck: nil})
+	svc := newMonitorTestService(t, &fakeStuckApplyStore{stuck: nil})
 
 	svc.CollectOperatorStuckPendingMetrics(t.Context())
 
@@ -136,9 +136,9 @@ func TestCollectOperatorStuckPendingMetricsRecordsZeroWhenHealthy(t *testing.T) 
 // operator. Instead it increments the scan-failure counter — the liveness signal
 // that the gauge is stale — and must not panic the monitor loop.
 func TestCollectOperatorStuckPendingMetricsCountsFailureOnStoreError(t *testing.T) {
-	reader := newStuckPendingMetricReader(t)
+	reader := newMonitorMetricReader(t)
 
-	svc := newStuckPendingTestService(t, &fakeStuckApplyStore{err: errors.New("db down")})
+	svc := newMonitorTestService(t, &fakeStuckApplyStore{err: errors.New("db down")})
 
 	svc.CollectOperatorStuckPendingMetrics(t.Context())
 
@@ -152,11 +152,11 @@ func TestCollectOperatorStuckPendingMetricsCountsFailureOnStoreError(t *testing.
 // a routine deploy must not tick the scan-failure counter (the "gauge must not
 // be trusted" liveness signal) or log the failure WARN.
 func TestCollectOperatorStuckPendingMetricsIgnoresShutdownMidScan(t *testing.T) {
-	reader := newStuckPendingMetricReader(t)
+	reader := newMonitorMetricReader(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	store := &fakeStuckApplyStore{err: context.Canceled, onScan: cancel}
-	svc := newStuckPendingTestService(t, store)
+	svc := newMonitorTestService(t, store)
 
 	svc.CollectOperatorStuckPendingMetrics(ctx)
 
@@ -170,9 +170,9 @@ func TestCollectOperatorStuckPendingMetricsIgnoresShutdownMidScan(t *testing.T) 
 // The monitor is a no-op when apply storage is unavailable: there is nothing to
 // scan, so it must neither emit the gauge nor panic.
 func TestCollectOperatorStuckPendingMetricsNoOpWhenStorageUnavailable(t *testing.T) {
-	reader := newStuckPendingMetricReader(t)
+	reader := newMonitorMetricReader(t)
 
-	svc := newStuckPendingTestService(t, nil)
+	svc := newMonitorTestService(t, nil)
 
 	svc.CollectOperatorStuckPendingMetrics(t.Context())
 

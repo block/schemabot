@@ -2832,6 +2832,59 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	})
 }
 
+// CountActiveApplies backs the storage-sampled active-applies gauge: it must
+// group the non-terminal apply population by database, deployment, and
+// environment and exclude terminal applies entirely, so a restarted pod
+// re-reports long-running work instead of forgetting it.
+func TestApplyStore_CountActiveApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	mysqlAlpha := createTestLock(t, store, "db_alpha", storage.DatabaseTypeMySQL, "staging")
+	vitessAlpha := createTestLock(t, store, "db_alpha", storage.DatabaseTypeVitess, "staging")
+	beta := createTestLock(t, store, "db_beta", storage.DatabaseTypeMySQL, "production")
+	gamma := createTestLock(t, store, "db_gamma", storage.DatabaseTypeMySQL, "staging")
+
+	// Two active applies for the same database on different database types
+	// share one gauge target: the gauge is grouped by database, deployment,
+	// and environment only.
+	createTestApplyWithStateEnvDeployment(t, store, mysqlAlpha, "apply_alpha_running", 9101, state.Apply.Running, "staging", "pie")
+	createTestApplyWithStateEnvDeployment(t, store, vitessAlpha, "apply_alpha_pending", 9102, state.Apply.Pending, "staging", "pie")
+	// The same database on another deployment and environment is its own target.
+	createTestApplyWithStateEnvDeployment(t, store, mysqlAlpha, "apply_alpha_gap", 9103, state.Apply.Running, "production", "gap")
+	// failed_retryable has not reached a terminal state, so it still counts.
+	createTestApplyWithStateEnvDeployment(t, store, beta, "apply_beta_retryable", 9104, state.Apply.FailedRetryable, "production", "pie")
+	// Terminal applies must not be counted; a target with only terminal
+	// applies is absent from the result.
+	createTestApplyWithStateEnvDeployment(t, store, gamma, "apply_gamma_completed", 9105, state.Apply.Completed, "staging", "pie")
+	createTestApplyWithStateEnvDeployment(t, store, gamma, "apply_gamma_stopped", 9106, state.Apply.Stopped, "staging", "pie")
+
+	counts, err := store.Applies().CountActiveApplies(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.ActiveApplyCount{
+		{Database: "db_alpha", Deployment: "gap", Environment: "production", Count: 1},
+		{Database: "db_alpha", Deployment: "pie", Environment: "staging", Count: 2},
+		{Database: "db_beta", Deployment: "pie", Environment: "production", Count: 1},
+	}, counts)
+}
+
+// With every apply terminal there is no active population: the count must be
+// empty rather than reporting zero-count rows for settled targets.
+func TestApplyStore_CountActiveApplies_AllTerminal(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "db_settled", storage.DatabaseTypeMySQL, "staging")
+	createTestApplyWithStateEnvDeployment(t, store, lock, "apply_settled_completed", 9111, state.Apply.Completed, "staging", "pie")
+	createTestApplyWithStateEnvDeployment(t, store, lock, "apply_settled_failed", 9112, state.Apply.Failed, "staging", "pie")
+
+	counts, err := store.Applies().CountActiveApplies(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, counts)
+}
+
 // A VSchema-only apply carries an apply_operations row but no tasks — the
 // VSchema application is the whole apply. Its dual-written operation row proves
 // the create committed fully, so the pending claim must accept it; gating the

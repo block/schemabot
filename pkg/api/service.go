@@ -167,6 +167,15 @@ type Service struct {
 	stuckPendingCancel context.CancelFunc
 	stuckPendingWg     sync.WaitGroup
 
+	// Active-applies gauge monitor loop management. activeAppliesSeen remembers
+	// the targets the last successful scan emitted, so a target whose last
+	// active apply finished gets one final zero record instead of a series
+	// frozen at its final nonzero count.
+	activeAppliesMu     sync.Mutex
+	activeAppliesCancel context.CancelFunc
+	activeAppliesWg     sync.WaitGroup
+	activeAppliesSeen   map[activeAppliesTarget]struct{}
+
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
 	pendingDropsCancel context.CancelFunc
@@ -790,6 +799,7 @@ func (s *Service) Close() error {
 	s.StopRemoteDeploymentHealthMonitor()
 	s.StopWebhookInboxMonitor()
 	s.StopOperatorStuckPendingMonitor()
+	s.StopActiveAppliesMonitor()
 
 	s.ternMu.Lock()
 	var errs []error
