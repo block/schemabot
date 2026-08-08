@@ -61,6 +61,7 @@ func previewSeqSecondRunOutput() {
 		Engine:    "Spirit",
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-12 * time.Minute).Format(time.RFC3339),
+		Volume:    3,
 		Tables: []TableProgress{
 			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
 			{

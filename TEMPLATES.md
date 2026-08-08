@@ -4769,6 +4769,7 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
+│  Volume:    3/11                 │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
@@ -7114,6 +7115,7 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
+│  Volume:    3/11                 │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
