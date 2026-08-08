@@ -686,10 +686,13 @@ jobs:
       - name: "Pod logs on failure"
         if: failure()
         run: |
+          # The operator's per-tick debug lines and the suite's progress polling
+          # fill a short tail on their own, so a deeper window is what keeps the
+          # drive that dispatched the work — the part worth reading — in the dump.
           echo "=== Control Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=3000 2>/dev/null || true
           echo "=== Data Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=1000 2>/dev/null || true
           echo "=== Etre ==="
           kubectl logs -n schemabot-e2e-vitess -l app=etre --tail=100 2>/dev/null || true
           echo "=== LocalScale ==="
