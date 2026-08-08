@@ -534,6 +534,59 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 	})
 }
 
+// A deferred cutover is only as good as the setting the backend actually holds.
+// The setting is settled when the deploy request is created and no later call can
+// change it, so SchemaBot reads it back before deploying a deferred change and
+// refuses when it reads auto-cutover on or cannot read it at all. That read is
+// only meaningful if the deploy request reports the setting, so LocalScale has to
+// report it the way the PlanetScale API does: nested under the deployment.
+func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+
+	tests := []struct {
+		name        string
+		autoCutover bool
+	}{
+		{name: "cutover held for the operator", autoCutover: false},
+		{name: "cutover left automatic", autoCutover: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+
+			branchName := createBranchWithDDL(t, ctx, "cutover-setting",
+				map[string][]string{
+					"testapp_sharded": {"ALTER TABLE users ADD COLUMN cutover_setting_col VARCHAR(50) NULL"},
+				},
+				nil,
+			)
+
+			dr, err := testClient.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Branch:       branchName,
+				IntoBranch:   "main",
+				AutoCutover:  tt.autoCutover,
+			})
+			require.NoError(t, err, "CreateDeployRequest")
+			t.Cleanup(func() {
+				_, _ = testClient.CancelDeployRequest(t.Context(), &ps.CancelDeployRequestRequest{
+					Organization: testOrg,
+					Database:     testDB,
+					Number:       dr.Number,
+				})
+			})
+
+			autoCutover, err := testClient.DeployRequestAutoCutover(ctx, testOrg, testDB, dr.Number)
+			require.NoError(t, err, "DeployRequestAutoCutover")
+			assert.Equal(t, tt.autoCutover, autoCutover,
+				"deploy request should report the cutover setting it was created with")
+		})
+	}
+}
+
 // TestDeployRequestPendingToNoChanges verifies that CreateDeployRequest returns "pending"
 // and transitions to "no_changes" when branch matches main.
 func TestDeployRequestPendingToNoChanges(t *testing.T) {
