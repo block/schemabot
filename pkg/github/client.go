@@ -752,6 +752,82 @@ func (ic *InstallationClient) MinimizeComment(ctx context.Context, repo, nodeID 
 	return nil
 }
 
+// MergeQueueEntry describes a pull request's live merge-queue membership.
+// HeadSHA is the synthetic merge-group commit the queue is currently testing
+// for this entry — the commit SchemaBot's admission checks are posted on. It
+// is empty while the queue has accepted the entry but not built its merge
+// group yet.
+type MergeQueueEntry struct {
+	HeadSHA string
+}
+
+// FetchMergeQueueEntry returns the pull request's current merge-queue entry,
+// or nil when the pull request is not queued. GitHub exposes merge-queue
+// membership only through the GraphQL API.
+func (ic *InstallationClient) FetchMergeQueueEntry(ctx context.Context, repo string, pr int) (*MergeQueueEntry, error) {
+	owner, repoName := splitRepo(repo)
+	payload, err := json.Marshal(map[string]any{
+		"query": `query($owner: String!, $name: String!, $number: Int!) {
+			repository(owner: $owner, name: $name) {
+				pullRequest(number: $number) {
+					mergeQueueEntry { headCommit { oid } }
+				}
+			}
+		}`,
+		"variables": map[string]any{"owner": owner, "name": repoName, "number": pr},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: marshal GraphQL request: %w", repo, pr, err)
+	}
+
+	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationGraphQLMergeQueueEntry, repo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ic.graphQLURL(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: build GraphQL request: %w", repo, pr, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ic.client.Client().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: %w", repo, pr, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: GraphQL endpoint returned %s", repo, pr, resp.Status)
+	}
+
+	var result struct {
+		Data struct {
+			Repository struct {
+				PullRequest *struct {
+					MergeQueueEntry *struct {
+						HeadCommit struct {
+							OID string `json:"oid"`
+						} `json:"headCommit"`
+					} `json:"mergeQueueEntry"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: decode GraphQL response: %w", repo, pr, err)
+	}
+	if len(result.Errors) > 0 {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: GraphQL error: %s", repo, pr, result.Errors[0].Message)
+	}
+	prNode := result.Data.Repository.PullRequest
+	if prNode == nil {
+		return nil, fmt.Errorf("fetch merge queue entry for %s#%d: pull request not found", repo, pr)
+	}
+	if prNode.MergeQueueEntry == nil {
+		return nil, nil
+	}
+	return &MergeQueueEntry{HeadSHA: prNode.MergeQueueEntry.HeadCommit.OID}, nil
+}
+
 // graphQLURL derives the GraphQL endpoint from the configured REST base URL.
 // github.com serves GraphQL at /graphql on the API host, while GitHub
 // Enterprise Server serves REST under /api/v3/ and GraphQL at /api/graphql on

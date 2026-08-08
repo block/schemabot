@@ -691,7 +691,7 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 	insertPlanCommentRow(t, svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_stale_prior")
 
 	minimized := make(chan string, 4)
-	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+	minimizeHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var gql struct {
 			Variables map[string]string `json:"variables"`
 		}
@@ -705,6 +705,7 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 			},
 		})
 	})
+	result.GraphQLFallback.Store(&minimizeHandler)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)

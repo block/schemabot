@@ -60,12 +60,14 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -349,6 +351,20 @@ type planFlowResult struct {
 	// branch advancing after the PR diverged install a provider returning
 	// the moved tip and register comparison fixtures for it.
 	BaseTip atomic.Pointer[func() string]
+
+	// MergeQueueHeadSHA drives the GraphQL merge-queue-entry response for the
+	// PR. Nil (the default) reports the PR as not queued; tests that simulate
+	// the PR sitting in the merge queue set the synthetic merge-group commit
+	// SHA the queue is testing for it.
+	MergeQueueHeadSHA atomic.Pointer[string]
+
+	// GraphQLFallback handles GraphQL requests other than the merge-queue
+	// entry query, which the fake answers from MergeQueueHeadSHA. Tests that
+	// exercise other GraphQL operations (comment minimize mutations) install
+	// a handler here instead of registering their own POST /graphql route,
+	// which would collide with the fake's. Nil answers with an empty data
+	// object.
+	GraphQLFallback atomic.Pointer[http.HandlerFunc]
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -701,6 +717,38 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		}
 		return nil
 	}, checkRunState)
+
+	// GraphQL. The fake answers the merge-queue-entry query itself, from
+	// result.MergeQueueHeadSHA (nil = the PR is not queued). Every other
+	// operation is delegated to result.GraphQLFallback so tests can serve
+	// their own mutations without registering a colliding /graphql route.
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read graphql request body", http.StatusInternalServerError)
+			return
+		}
+		if bytes.Contains(body, []byte("mergeQueueEntry")) {
+			var entry any
+			if sha := result.MergeQueueHeadSHA.Load(); sha != nil {
+				entry = map[string]any{"headCommit": map[string]any{"oid": *sha}}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{"mergeQueueEntry": entry},
+					},
+				},
+			})
+			return
+		}
+		if fallback := result.GraphQLFallback.Load(); fallback != nil {
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			(*fallback)(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{}})
+	})
 
 	return result
 }

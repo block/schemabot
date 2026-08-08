@@ -64,7 +64,7 @@ Under **Repository permissions**, grant:
 | **Commit statuses** | Read | Read legacy commit statuses for the `require_passing_checks` gate |
 | **Contents** | Read | Read `schemabot.yaml`, schema files, CODEOWNERS, and commit refs |
 | **Issues** | Read & Write | Post PR comments and add reactions |
-| **Merge queues** | Read | Receive `merge_group` events so SchemaBot can publish its checks on merge-queue commits (only needed if a repo uses a merge queue) |
+| **Merge queues** | Read | Receive `merge_group` events so SchemaBot can publish its checks on merge-queue commits, and read a PR's merge-queue membership so an apply's preflight can eject a queued sibling PR (only needed if a repo uses a merge queue) |
 | **Metadata** | Read | Required (granted automatically) |
 | **Pull requests** | Read & Write | Fetch PR info, changed files, and reviews |
 

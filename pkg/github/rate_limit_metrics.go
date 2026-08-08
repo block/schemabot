@@ -370,6 +370,7 @@ func gitHubRequestCategory(operation string) string {
 		metrics.GitHubOperationFetchPullRequest,
 		metrics.GitHubOperationGetCombinedStatus,
 		metrics.GitHubOperationGetTeamMembership,
+		metrics.GitHubOperationGraphQLMergeQueueEntry,
 		metrics.GitHubOperationGraphQLStatusCheckRollup,
 		metrics.GitHubOperationListCheckRunsForRef,
 		metrics.GitHubOperationListPRFiles,

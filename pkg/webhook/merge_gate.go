@@ -815,11 +815,85 @@ func (h *Handler) renderCheckHoldOnPR(ctx context.Context, req *storage.MergeGat
 		return err
 	}
 
+	if err := h.flipQueuedSiblingAdmission(prCtx, client, req, repo, pr, actionable); err != nil {
+		return err
+	}
+
 	h.logger.Info("merge gate preflight rendered the hold on the sibling PR",
 		"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
 		"environment", req.Environment, "database_type", req.DatabaseType,
 		"database", req.DatabaseName, "requested_by", req.RequestedBy)
 	return nil
+}
+
+// flipQueuedSiblingAdmission ejects a queued sibling PR from the merge queue
+// by flipping SchemaBot's admission check on its merge-group commit. The
+// admission verdict recorded when the PR entered the queue said nothing
+// blocked; this apply's hold makes that verdict stale — and the queue watches
+// only the merge-group commit, so the PR-head flip alone cannot stop the
+// queued merge. Turning the recorded admission check action-required makes
+// GitHub remove the PR from the queue mid-test, and the ejection guidance
+// comment tells its author to queue again once the checks settle green. A
+// sibling that is not queued needs nothing here; a GitHub failure keeps the
+// render retryable — while GitHub is fully down its merge queue cannot merge
+// the sibling either, so the window this flip closes stays closed.
+func (h *Handler) flipQueuedSiblingAdmission(ctx context.Context, client *ghclient.InstallationClient, req *storage.MergeGateRequest, repo string, pr int, actionable []*storage.Check) error {
+	entry, err := client.FetchMergeQueueEntry(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("fetch merge queue entry for check preflight of %s#%d (target %s/%s in %s, apply %s): %w",
+			repo, pr, req.DatabaseType, req.DatabaseName, req.Environment, req.ApplyIdentifier, err)
+	}
+	if entry == nil {
+		h.logger.Debug("check preflight sibling PR is not in the merge queue; no admission check to flip",
+			"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+			"environment", req.Environment, "database_type", req.DatabaseType,
+			"database", req.DatabaseName)
+		return nil
+	}
+	if entry.HeadSHA == "" {
+		// Queued, but the queue has not built this entry's merge group yet, so
+		// there is no commit to flip a check on. The stored holds are already in
+		// place, so the admission re-fold will block the group when the queue
+		// requests checks for it.
+		h.logger.Info("check preflight sibling PR is queued without a merge group yet; the admission check will block it when the queue requests checks",
+			"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+			"environment", req.Environment, "database_type", req.DatabaseType,
+			"database", req.DatabaseName)
+		return nil
+	}
+
+	flipped := 0
+	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		if target.environment != aggregateSentinel && target.environment != req.Environment {
+			continue
+		}
+		if err := h.postAggregateCheck(ctx, client, repo, entry.HeadSHA, target, passingAggregateCheckContent{
+			operation: "merge_group_hold_flip",
+			title:     mergeGroupBlockedTitle,
+			summary:   mergeGroupBlockedSummary,
+		}, checkConclusionActionRequired); err != nil {
+			return err
+		}
+		flipped++
+		metrics.RecordMergeGroupRenderFlip(ctx, repo, target.environment)
+	}
+	if flipped == 0 {
+		// The hold's environment has no aggregate target on this repo, so no
+		// admission check gates it and there is nothing to flip. The stored hold
+		// still blocks the PR-head aggregate for the environments that are gated.
+		h.logger.Warn("check preflight found no aggregate target for the held environment; the queued sibling's merge group has no admission check to flip",
+			"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+			"environment", req.Environment, "database_type", req.DatabaseType,
+			"database", req.DatabaseName, "merge_group_head_sha", entry.HeadSHA)
+		return nil
+	}
+
+	h.logger.Info("check preflight flipped the queued sibling's merge-group admission check; the queue will remove the PR until its checks settle green",
+		"apply_id", req.ApplyIdentifier, "repo", repo, "pr", pr,
+		"environment", req.Environment, "database_type", req.DatabaseType,
+		"database", req.DatabaseName, "merge_group_head_sha", entry.HeadSHA,
+		"flipped_checks", flipped)
+	return h.ensureMergeQueueEjectedComment(ctx, client, repo, pr, entry.HeadSHA, actionable)
 }
 
 // checkHoldCommentMarker is the hidden marker that makes the hold comment

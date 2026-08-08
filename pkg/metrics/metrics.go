@@ -977,6 +977,7 @@ const (
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
 	GitHubOperationGetCombinedStatus             = "get_combined_status"
 	GitHubOperationGetTeamMembership             = "get_team_membership"
+	GitHubOperationGraphQLMergeQueueEntry        = "graphql_merge_queue_entry"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
@@ -1149,6 +1150,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationFetchPullRequest,
 		GitHubOperationGetCombinedStatus,
 		GitHubOperationGetTeamMembership,
+		GitHubOperationGraphQLMergeQueueEntry,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationListCheckRunsForRef,
@@ -1650,6 +1652,21 @@ func RecordMergeGatePlanTimeHold(ctx context.Context, database, environment stri
 func RecordMergeGroupAdmissionBlocked(ctx context.Context, repository, environment string) {
 	addCounter(ctx, "schemabot.merge_gate.merge_group_admission_blocked_total",
 		"Total merge-queue admission checks posted blocking because the queued PR's stored check state blocks", "{check}",
+		attribute.String("repository", repository),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordMergeGroupRenderFlip counts admission checks flipped blocking on a
+// queued sibling PR's merge-group commit because an apply started on a
+// database that PR also changes. Each flip removes the PR from the merge
+// queue mid-test instead of letting it merge on the verdict it queued with.
+// An occasional count is the gate working; a sustained rate on one repository
+// means changes keep entering the queue against a database with long-running
+// applies — the authors need sequencing, not a SchemaBot fix.
+func RecordMergeGroupRenderFlip(ctx context.Context, repository, environment string) {
+	addCounter(ctx, "schemabot.merge_gate.merge_group_render_flips_total",
+		"Total merge-queue admission checks flipped blocking on queued sibling PRs by an apply's preflight render", "{check}",
 		attribute.String("repository", repository),
 		EnvironmentAttribute(environment),
 	)

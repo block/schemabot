@@ -743,6 +743,151 @@ func TestE2ECheckPreflightHoldsSiblingChecksAndComments(t *testing.T) {
 	assert.Equal(t, applyInFlightBlock.blockingReason, stillHeld.BlockingReason)
 }
 
+// TestE2ECheckPreflightFlipsQueuedSiblingMergeGroupCheck verifies the render
+// phase against a sibling PR that is already sitting in the merge queue: the
+// admission check recorded on its merge-group commit passed before this apply
+// existed, and the queue watches only that commit, so flipping the PR head
+// alone cannot stop the queued merge. The preflight must post an
+// action-required aggregate check on the merge-group commit — which makes
+// GitHub remove the PR from the queue mid-test — and post the ejection
+// guidance comment telling the author to queue again once the checks settle.
+// A retried fan-out converges: the merge-group check updates in place and the
+// marker suppresses a duplicate ejection comment.
+func TestE2ECheckPreflightFlipsQueuedSiblingMergeGroupCheck(t *testing.T) {
+	clearMergeGateRequests(t)
+	dbName := "webhook_mergegate_queue_flip"
+	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	// The sibling PR is queued and the queue has built its merge group: the
+	// merge-queue-entry query reports this synthetic merge-group commit.
+	mergeGroupSHA := "mergegroupflip001"
+	result.MergeQueueHeadSHA.Store(&mergeGroupSHA)
+
+	// Serve the PR's issue comments for the marker searches that make the hold
+	// and ejection comments idempotent; posted comments are fed back in.
+	var commentsMu sync.Mutex
+	var servedComments []string
+	mux.HandleFunc("GET /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		commentsMu.Lock()
+		defer commentsMu.Unlock()
+		comments := make([]*gh.IssueComment, 0, len(servedComments))
+		for i, body := range servedComments {
+			comments = append(comments, &gh.IssueComment{ID: new(int64(i + 1)), Body: new(body)})
+		}
+		_ = json.NewEncoder(w).Encode(comments)
+	})
+
+	// The queued sibling's green stored check is what the stale admission
+	// verdict was folded from.
+	seedRefreshTargetCheck(t, svc, 1, "staging", dbName,
+		checkStatusCompleted, checkConclusionSuccess, "no changes")
+
+	h := newE2EHandlerWithoutMergeGateProcessor(t, svc, client)
+
+	applyIdentifier := fmt.Sprintf("apply_mergegate_queue_flip_%d", time.Now().UnixNano())
+	preflight := recordRefreshRequest(t, svc, &storage.MergeGateRequest{
+		ApplyID:         91000010,
+		Kind:            storage.MergeGateKindPreflight,
+		ApplyIdentifier: applyIdentifier,
+		Environment:     "staging",
+		DatabaseType:    "mysql",
+		DatabaseName:    dbName,
+		Repository:      "octocat/hello-world",
+		ChangeKey:       "2",
+		RequestedBy:     "cli:preflighter@host",
+	})
+
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
+
+	// The queue watches the merge-group commit: the flip must land there,
+	// action-required, under the same aggregate check name the admission pass
+	// used.
+	var flips []checkRunCapture
+collect:
+	for {
+		select {
+		case run := <-result.checkRuns:
+			if run.HeadSHA == mergeGroupSHA {
+				flips = append(flips, run)
+			}
+		default:
+			break collect
+		}
+	}
+	require.Len(t, flips, 1, "the preflight must post exactly one admission flip on the merge-group commit")
+	assert.Equal(t, checkStatusCompleted, flips[0].Status)
+	assert.Equal(t, checkConclusionActionRequired, flips[0].Conclusion)
+	require.NotNil(t, flips[0].Output)
+	assert.Equal(t, mergeGroupBlockedTitle, flips[0].Output.Title)
+
+	// Two comments, in order: the hold explanation, then the ejection guidance
+	// pointing the author back at the queue.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Check On Hold")
+		assert.Contains(t, body, checkHoldCommentMarker(preflight))
+		commentsMu.Lock()
+		servedComments = append(servedComments, body)
+		commentsMu.Unlock()
+	default:
+		t.Fatal("the preflight fan-out must post the hold comment")
+	}
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Removed From Merge Queue")
+		assert.Contains(t, body, "`"+dbName+"` in `staging`")
+		assert.Contains(t, body, "add it to the merge queue again")
+		assert.Contains(t, body, mergeQueueEjectedCommentMarker(mergeGroupSHA))
+		commentsMu.Lock()
+		servedComments = append(servedComments, body)
+		commentsMu.Unlock()
+	default:
+		t.Fatal("the preflight fan-out must post the merge-queue ejection guidance comment")
+	}
+
+	finished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	require.NotNil(t, finished)
+	assert.Equal(t, storage.MergeGateCompleted, finished.State)
+
+	// A retried fan-out (for example after a lease handover) converges: the
+	// merge-group check updates in place rather than duplicating, and the
+	// marker search suppresses a second ejection comment.
+	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	_, err = db.ExecContext(t.Context(), `
+		UPDATE merge_gate_requests
+		SET state = 'pending', attempts = 0, lease_owner = NULL, lease_token = NULL,
+			lease_expires_at = NULL, completed_at = NULL
+		WHERE id = ?`, finished.ID)
+	require.NoError(t, err)
+
+	h.drainMergeGateRequests(t.Context(), mergeGateTestLeaseOwner)
+
+	refinished, err := svc.Storage().MergeGateRequests().GetByApplyAndKind(t.Context(), preflight.ApplyID, storage.MergeGateKindPreflight)
+	require.NoError(t, err)
+	assert.Equal(t, storage.MergeGateCompleted, refinished.State)
+	select {
+	case body := <-result.comments:
+		t.Fatalf("a retried preflight fan-out must not post duplicate comments, got: %s", body)
+	default:
+	}
+}
+
 // TestE2ECheckPreflightStoredHoldsLandDuringGitHubOutage exercises the
 // preflight fan-out against a fully unavailable GitHub API. The hold phase is
 // storage-only, so the sibling PR's green stored check still flips
