@@ -86,6 +86,8 @@ func TestK8sVitess_PlanApply_VSchemaOnly(t *testing.T) {
 	progress, err := testutil.FetchProgress(ep, applyID)
 	require.NoError(t, err)
 	assert.Empty(t, progress.Tables, "VSchema-only apply reported table work")
+
+	assertConverged(t, ep, "testapp_seq", schemaFiles)
 }
 
 // TestK8sVitess_PlanApply_VSchemaWithDDL covers the shape a sharded Vitess
@@ -131,6 +133,8 @@ func TestK8sVitess_PlanApply_VSchemaWithDDL(t *testing.T) {
 	assert.Equal(t, "testapp_sharded", table.Keyspace, "table work ran against the wrong keyspace")
 	assert.True(t, state.IsState(table.Status, state.Task.Completed),
 		"table work ended in %q", table.Status)
+
+	assertConverged(t, ep, "testapp_sharded", schemaFiles)
 }
 
 // unshardedTableDDL is the CREATE for a table that needs no vindex, so a plan
@@ -164,6 +168,38 @@ func vitessApplyAndWait(t *testing.T, endpoint, planID string) string {
 	require.True(t, resp.Accepted, "apply not accepted: %s", resp.ErrorMessage)
 	testutil.WaitForState(t, endpoint, resp.ApplyID, state.Apply.Completed, testutil.PollDeadline)
 	return resp.ApplyID
+}
+
+// assertConverged re-plans the desired state a completed apply just landed and
+// requires it to be empty. This is how a tenant learns their change took: the
+// same files that produced work now produce none. It holds for a VSchema as
+// firmly as for DDL, because the differ compares normalized VSchemas rather than
+// the raw JSON Vitess happens to store.
+func assertConverged(t *testing.T, endpoint, namespace string, files map[string]string) {
+	t.Helper()
+	replan := vitessPlan(t, endpoint, namespace, files)
+	assert.False(t, replan.HasChanges(),
+		"%s still plans changes after the apply completed: %s", namespace, planSummary(replan))
+}
+
+// planSummary renders a plan's namespaces, VSchema state and DDL for a failure
+// message, so a plan that should have been empty says what it still wants.
+func planSummary(resp *apitypes.PlanResponse) string {
+	var summary strings.Builder
+	for _, change := range resp.Changes {
+		if change == nil {
+			continue
+		}
+		fmt.Fprintf(&summary, "\n%s: vschema_change=%t table_changes=%d",
+			change.Namespace, change.HasVSchemaChange(), len(change.TableChanges))
+		if diff := change.Metadata[apitypes.VSchemaDiffMetadataKey]; diff != "" {
+			fmt.Fprintf(&summary, "\n  vschema diff: %s", diff)
+		}
+	}
+	if ddl := planDDL(resp); ddl != "" {
+		fmt.Fprintf(&summary, "\n  ddl: %s", ddl)
+	}
+	return summary.String()
 }
 
 // tableProgress returns the completed apply's entry for one table, failing when

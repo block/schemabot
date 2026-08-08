@@ -809,29 +809,44 @@ func validateBranchName(name string) error {
 	return nil
 }
 
+// onlineDDLReadyTimeout bounds how long the whole cluster gets to bring its
+// online DDL executors up. It covers every keyspace together rather than each in
+// turn, because vtcombo initializes them concurrently — a per-keyspace budget
+// would grant the last keyspace a fresh window it has already spent waiting. The
+// value is sized for the slowest shape, a sharded keyspace on a host with little
+// CPU to spare, whose executor comes up well behind an unsharded one.
+const onlineDDLReadyTimeout = 3 * time.Minute
+
 // waitForOnlineDDLReady polls each keyspace's sidecar database until Vitess's
 // online DDL executor is operational. The executor requires the per-shard sidecar
-// databases to be initialized before it can process migrations. Without this check,
+// databases to be initialized before it can process DDL. Without this check,
 // the first deploy request's DDL submission can hang waiting for a sidecar that
 // hasn't been created yet.
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
+	deadline := time.Now().Add(onlineDDLReadyTimeout)
 	for key, backend := range s.backends {
 		for keyspace, db := range backend.vtgateDBs {
-			deadline := time.Now().Add(60 * time.Second)
+			started := time.Now()
 			ready := false
+			var lastErr error
 			for time.Now().Before(deadline) {
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("online DDL readiness for %s/%s: %w", key.database, keyspace, err)
+				}
 				rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
 				if err == nil {
 					utils.CloseAndLog(rows)
-					s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace)
+					s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace, "waited", time.Since(started))
 					ready = true
 					break
 				}
+				lastErr = err
 				s.logger.Debug("waiting for online DDL readiness", "database", key.database, "keyspace", keyspace, "error", err)
 				time.Sleep(time.Second)
 			}
 			if !ready {
-				return fmt.Errorf("online DDL not ready after 60s for %s/%s", key.database, keyspace)
+				return fmt.Errorf("online DDL not ready for %s/%s after waiting %s of the cluster's %s budget: %w",
+					key.database, keyspace, time.Since(started).Round(time.Second), onlineDDLReadyTimeout, lastErr)
 			}
 		}
 	}
