@@ -2910,7 +2910,14 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	if err := c.stampRemoteApplyErrorOnFailedTasks(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
 		return err
 	}
-	return c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now, scope)
+	if err := c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now, scope); err != nil {
+		return err
+	}
+	// The schema change is finished, so the data plane's own record of it is
+	// complete: this is the one moment the states that came and went between
+	// polls can be recovered.
+	c.mirrorMissingRemoteTransitions(ctx, storedApply, scope.remoteApplyID(storedApply))
+	return nil
 }
 
 // stampRemoteApplyErrorOnFailedTasks copies a failed remote apply's error
