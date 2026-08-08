@@ -929,6 +929,23 @@ func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deploy
 	)
 }
 
+// RecordDataPlaneDriverHandover counts schema changes whose data-plane driver
+// lost its lease mid-run and was replaced by another.
+//
+// A handover is recoverable — the new driver resumes from the checkpoint — so a
+// rare one is noise. A rate that climbs, or clusters on one deployment, means
+// drivers there are dying or their leases are expiring under load, and the
+// expected action is to look at that deployment's driver pods before applies
+// start failing outright rather than merely changing hands.
+func RecordDataPlaneDriverHandover(ctx context.Context, database, deployment, environment string) {
+	addCounter(ctx, "schemabot.operator.data_plane_driver_handovers_total",
+		"Total number of schema changes re-claimed by a different data-plane driver mid-run", "{apply}",
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
 	"stranded_reaper_error":                    true,

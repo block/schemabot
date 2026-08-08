@@ -3414,6 +3414,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	loggedStoppedAfterStart := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
+	var lastDataPlaneDriver string
 	lastHeartbeatSuccess := time.Now()
 	for {
 		select {
@@ -3506,6 +3507,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// metadata runs in the data plane, so the control plane never sees it
 			// otherwise.
 			lastDisplayBlob = c.mirrorRemoteDisplayMetadata(ctx, apply, scope, resp.Metadata, lastDisplayBlob)
+			lastDataPlaneDriver = c.recordRemoteDriverChange(ctx, apply, resp.Metadata, lastDataPlaneDriver)
 
 			// Update apply state from the remote response. An exact apply-id poll
 			// must return a concrete state; unknown states are unsafe to reconcile.

@@ -2496,6 +2496,17 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			resp.Metadata["existing_branch"] = opts.Branch
 		}
 
+		// Name the driver holding this apply. A caller reading progress from
+		// another plane sees only that progress keeps arriving, so a lease that
+		// expired and was re-claimed by a different driver — the copy pausing,
+		// changing hands, and resuming from its checkpoint — looks identical to
+		// one uninterrupted drive. Reporting the holder lets that caller notice
+		// the handover it cannot otherwise see.
+		if apply.LeaseOwner != "" {
+			resp.Metadata = ensureMetadata(resp.Metadata)
+			resp.Metadata["driver"] = apply.LeaseOwner
+		}
+
 		// During branch setup phases, include the latest event message so the
 		// CLI can show what's happening instead of a static spinner.
 		if state.IsState(overallState, state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.CreatingDeployRequest) {
