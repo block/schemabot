@@ -65,7 +65,10 @@ func Open(dsn string, opts ...Option) (*sql.DB, error) {
 // once, so rotation is transparent and does not require a restart. reload
 // returns the raw DSN; transport settings and options are re-applied here. A
 // reload error keeps the current credentials so a transient resolve failure
-// cannot wedge the pool.
+// cannot wedge the pool, and starts a short cooldown during which further
+// failed dials skip the reload — the DSN may resolve through a remote secrets
+// backend, and an outage there must not turn every rejected dial into a
+// resolve call.
 //
 //	secret rotated ──► new conn ──► 28P01 invalid password
 //	                                      │
@@ -90,6 +93,12 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 	return sql.OpenDB(&reloadableConnector{cfg: cfg, reload: reload, opts: opts}), nil
 }
 
+// reloadCooldown bounds how often a failing reload is retried. After a reload
+// fails, further authentication-failed dials within this window surface their
+// dial error without invoking reload again, so a secrets-backend outage costs
+// at most one resolve attempt per window instead of one per rejected dial.
+const reloadCooldown = 30 * time.Second
+
 // reloadableConnector dials with the most recently resolved credentials and
 // refreshes them, at most once per failed attempt, when a dial is rejected as
 // unauthenticated. gen counts credential swaps so concurrent failed dials
@@ -98,10 +107,12 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 type reloadableConnector struct {
 	reload func() (string, error)
 	opts   []Option
+	now    func() time.Time // test seam; nil means time.Now
 
-	mu  sync.Mutex
-	cfg *pgx.ConnConfig
-	gen uint64
+	mu             sync.Mutex
+	cfg            *pgx.ConnConfig
+	gen            uint64
+	lastReloadFail time.Time
 }
 
 var _ driver.Connector = (*reloadableConnector)(nil)
@@ -132,25 +143,38 @@ func (c *reloadableConnector) snapshot() (*pgx.ConnConfig, uint64) {
 // was rejected as unauthenticated. When another dial already swapped the
 // config, the current one is returned without reloading again. A reload or
 // parse error keeps the current config and reports false, so a transient
-// resolve failure cannot wedge the pool.
+// resolve failure cannot wedge the pool; it also arms reloadCooldown so a
+// secrets-backend outage is retried once per window, not once per rejected
+// dial.
 func (c *reloadableConnector) refresh(failedGen uint64) (*pgx.ConnConfig, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.gen != failedGen {
 		return c.cfg, true
 	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	if !c.lastReloadFail.IsZero() && now().Sub(c.lastReloadFail) < reloadCooldown {
+		slog.Debug("skipping storage DSN reload during cooldown after a failed reload; surfacing the dial error")
+		return nil, false
+	}
 	rawDSN, err := c.reload()
 	if err != nil {
+		c.lastReloadFail = now()
 		slog.Error("reload storage DSN after authentication failure failed; keeping current credentials", "error", err)
 		return nil, false
 	}
 	cfg, err := connectionConfig(rawDSN, c.opts...)
 	if err != nil {
+		c.lastReloadFail = now()
 		slog.Error("parse reloaded storage DSN failed; keeping current credentials", "error", err)
 		return nil, false
 	}
 	c.cfg = cfg
 	c.gen++
+	c.lastReloadFail = time.Time{}
 	slog.Info("reloaded storage credentials after authentication failure")
 	return cfg, true
 }
@@ -168,6 +192,19 @@ func isAuthError(err error) bool {
 	return pgErr.Code == "28P01" || pgErr.Code == "28000"
 }
 
+// dsnParseError wraps a DSN parse failure without echoing the DSN itself.
+// A *url.Error in the chain reproduces the full URL — password included — in
+// its message, so only its underlying cause is kept; pgx's own
+// *pgconn.ParseConfigError already redacts the password in its message but
+// can carry a *url.Error inside, so the chain is checked either way.
+func dsnParseError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("parse PostgreSQL DSN: %w", ue.Err)
+	}
+	return fmt.Errorf("parse PostgreSQL DSN: %w", err)
+}
+
 // connectionConfig parses a normalized DSN (see ConnectionDSN) and applies
 // caller-supplied options to the resulting config.
 func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
@@ -177,7 +214,7 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	}
 	cfg, err := pgx.ParseConfig(normalized)
 	if err != nil {
-		return nil, fmt.Errorf("parse PostgreSQL DSN: %w", err)
+		return nil, dsnParseError(err)
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -194,7 +231,7 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 func ConnectionDSN(dsn string) (string, error) {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return "", fmt.Errorf("parse PostgreSQL DSN: %w", err)
+		return "", dsnParseError(err)
 	}
 	if !dbconn.IsRDSHost(cfg.Host) {
 		return dsn, nil
@@ -214,7 +251,7 @@ func isURLForm(dsn string) bool {
 func enhanceURLDSN(dsn string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return "", fmt.Errorf("parse PostgreSQL URL DSN: %w", err)
+		return "", dsnParseError(err)
 	}
 	q := u.Query()
 	if q.Has("sslmode") {

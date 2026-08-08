@@ -41,7 +41,7 @@ func TestOpenReloadableSurvivesPasswordRotation(t *testing.T) {
 	// safe to use after the rotation.
 	adminConn, err := adminDB.Conn(t.Context())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = adminConn.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(adminConn) })
 
 	rotatedDSN := withPassword(t, dsn, "rotated")
 	var reloads atomic.Int32

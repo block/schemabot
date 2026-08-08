@@ -183,6 +183,70 @@ func TestReloadableConnectorIgnoresNonAuthErrors(t *testing.T) {
 	assert.Equal(t, []string{"old"}, *passwords)
 }
 
+func TestReloadableConnectorReloadCooldown(t *testing.T) {
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+		reloads.Add(1)
+		if reloads.Load() < 3 {
+			return "", errors.New("secret backend unavailable")
+		}
+		return "postgres://schemabot:rotated@localhost:5432/app", nil
+	})
+	clock := time.Now()
+	c.now = func() time.Time { return clock }
+
+	// The first failed reload arms the cooldown.
+	_, ok := c.refresh(0)
+	require.False(t, ok)
+	require.Equal(t, int32(1), reloads.Load())
+
+	// Failed dials inside the window surface without reloading again.
+	_, ok = c.refresh(0)
+	require.False(t, ok)
+	assert.Equal(t, int32(1), reloads.Load(), "reload must not run during the cooldown")
+
+	// After the window elapses the reload is retried; another failure re-arms.
+	clock = clock.Add(reloadCooldown)
+	_, ok = c.refresh(0)
+	require.False(t, ok)
+	require.Equal(t, int32(2), reloads.Load())
+
+	// A successful reload swaps credentials and clears the cooldown.
+	clock = clock.Add(reloadCooldown)
+	cfg, ok := c.refresh(0)
+	require.True(t, ok)
+	assert.Equal(t, "rotated", cfg.Password)
+	require.Equal(t, int32(3), reloads.Load())
+	assert.True(t, c.lastReloadFail.IsZero(), "a successful reload must clear the cooldown")
+}
+
+func TestDSNParseErrorsRedactCredentials(t *testing.T) {
+	// A DSN whose URL fails to parse must not have its password echoed in the
+	// error: *url.Error reproduces the full URL, password included.
+	const password = "sup3r-secret"
+	badDSN := "postgres://schemabot:" + password + "@localhost:not-a-port/app"
+
+	t.Run("ConnectionDSN", func(t *testing.T) {
+		_, err := ConnectionDSN(badDSN)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password)
+	})
+
+	t.Run("Open", func(t *testing.T) {
+		_, err := Open(badDSN)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password)
+	})
+
+	t.Run("refresh with unparseable reloaded DSN", func(t *testing.T) {
+		c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+			return badDSN, nil
+		})
+		_, ok := c.refresh(0)
+		require.False(t, ok)
+	})
+}
+
 func TestReloadableConnectorRefreshDedupesConcurrentFailures(t *testing.T) {
 	var reloads atomic.Int32
 	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
