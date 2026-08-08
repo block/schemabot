@@ -517,6 +517,12 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
 	// over on its own would race the driver's cutover call and move the schema
 	// without SchemaBot's involvement or caller attribution.
+	//
+	// The client sends this setting explicitly rather than through the SDK's
+	// request struct, whose omitempty tag drops a false — see
+	// psclient.CreateDeployRequest. Saying it out loud is the whole point: it is
+	// the only chance to say it, since the API offers no way to change
+	// auto_cutover once the deploy request exists.
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,

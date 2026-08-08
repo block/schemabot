@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
@@ -150,8 +151,73 @@ func (w *psClientWrapper) UpdateKeyspaceVSchema(ctx context.Context, req *ps.Upd
 
 // Deploy request operations
 
+// CreateDeployRequest creates a deploy request via a raw HTTP POST so the
+// cutover setting is actually transmitted.
+//
+// The SDK's request struct tags auto_cutover and auto_delete_branch
+// `omitempty`, and both are plain bools, so the zero value — false — is dropped
+// from the body entirely. "Off" and "unspecified" serialize identically, and an
+// unspecified deploy request falls to whatever default the database carries.
+// For auto_cutover that default may be on, which would let PlanetScale swap the
+// schema on its own: exactly the outcome SchemaBot's cutover ownership exists to
+// prevent, and one no later call can undo, since the API exposes no way to
+// change auto_cutover after creation.
+//
+// Marshalling the body here is what makes false expressible. The response is
+// the deploy request object, the same shape the SDK decodes.
 func (w *psClientWrapper) CreateDeployRequest(ctx context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
-	return w.client.DeployRequests.Create(ctx, req)
+	if w.baseURL == "" {
+		// Falling back to the SDK here would silently drop the cutover setting
+		// and hand cutover control to the backend, so the deploy request is not
+		// created at all.
+		return nil, fmt.Errorf("create deploy request for %s/%s: cannot set auto_cutover without a PlanetScale API base URL", req.Organization, req.Database)
+	}
+	body, err := json.Marshal(map[string]any{
+		"branch":             req.Branch,
+		"into_branch":        req.IntoBranch,
+		"notes":              req.Notes,
+		"auto_cutover":       req.AutoCutover,
+		"auto_delete_branch": req.AutoDeleteBranch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal deploy request payload for %s/%s: %w", req.Organization, req.Database, err)
+	}
+	url := fmt.Sprintf("%s/v1/organizations/%s/databases/%s/deploy-requests", w.baseURL, req.Organization, req.Database)
+	respBody, err := w.doRawJSON(ctx, http.MethodPost, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("create deploy request for %s/%s from branch %s: %w", req.Organization, req.Database, req.Branch, err)
+	}
+	dr := &ps.DeployRequest{}
+	if err := json.Unmarshal(respBody, dr); err != nil {
+		return nil, fmt.Errorf("decode created deploy request for %s/%s: %w", req.Organization, req.Database, err)
+	}
+	return dr, nil
+}
+
+// doRawJSON sends a JSON request to an endpoint the SDK does not cover and
+// returns the response body. The SDK owns authentication for everything else,
+// so the service-token header is spelled out here in the one place these calls
+// are made.
+func (w *psClientWrapper) doRawJSON(ctx context.Context, method, url string, body []byte) ([]byte, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create %s request: %w", method, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", w.tokenName+":"+w.tokenValue)
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("send %s request: %w", method, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("request failed: %s: %s", resp.Status, string(respBody))
+	}
+	return respBody, nil
 }
 
 func (w *psClientWrapper) DeployDeployRequest(ctx context.Context, req *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
