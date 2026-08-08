@@ -1420,6 +1420,83 @@ func TestGRPCClient_ResumeApplyOperationDispatchesTasklessVSchemaOnlyWork(t *tes
 	assert.Contains(t, req.SchemaFiles, "commerce_sharded")
 }
 
+func TestGRPCClient_TasklessVSchemaOnlyWorkSettlesOnItsOperationRow(t *testing.T) {
+	// The operator claims an operation under an operation lease and no parent
+	// apply lease, whether or not the apply has siblings. Such a drive owns its
+	// operation row and nothing else: it records the remote apply id there so a
+	// later claim resumes the dispatch instead of repeating it, writes the
+	// terminal outcome there so the rollout projection can settle the parent, and
+	// never writes the parent applies row — a write storage refuses, which would
+	// end the drive and strand the apply non-terminal with its target blocked.
+	// A task-less operation makes the last part load-bearing: with no task rows,
+	// the operation row is the only place the outcome can land.
+	server := &capturingTernServer{remoteApplyID: "remote-vschema-only-settle"} // default Progress = COMPLETED
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              11,
+		ApplyIdentifier: "apply-vschema-only-settle",
+		PlanID:          79,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(63)
+	vschema := `{"sharded":true,"vindexes":{"xxhash":{"type":"xxhash"}}}`
+	// The stored row is a separate value from the one the drive carries, so a
+	// reload during the drive returns what storage holds rather than the drive's
+	// own in-memory progress.
+	storedApply := *apply
+	applies := &mockApplyStore{apply: &storedApply}
+	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {
+			ID:            operationID,
+			ApplyID:       apply.ID,
+			Deployment:    "commerce-deployment",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Pending,
+		},
+	}}
+	client.storage = &mockStorage{
+		applies: applies,
+		tasks:   &mockTaskStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-vschema-only-settle",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+		}},
+		operations: operations,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	ctx = storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: operationID,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	require.NotNil(t, server.getApplyRequest(), "expected the work operation to dispatch a VSchema apply to remote Tern")
+
+	op := operations.ops[operationID]
+	assert.Equal(t, "remote-vschema-only-settle", op.ExternalID,
+		"the remote apply id belongs on the operation row, or a later claim dispatches the work a second time")
+	assert.True(t, state.IsState(op.State, state.ApplyOperation.Completed),
+		"the operation row carries the terminal outcome, but is %q", op.State)
+	assert.Empty(t, applies.updates,
+		"the drive holds no parent apply lease, so the parent state is the rollout projection's to move")
+}
+
 func TestGRPCClient_ResumeApplyOperationFailsClosedOnTasklessWorkWithDDLPlan(t *testing.T) {
 	// The task-less dispatch is gated on the plan carrying nothing but VSchema. A
 	// work operation whose plan has DDL should have produced task rows, so an

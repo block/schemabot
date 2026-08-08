@@ -1337,6 +1337,20 @@ type applyTaskScope struct {
 	// operation of a multi-op apply shares apply.Deployment, so the operation
 	// count is the authoritative signal for routing the remote apply id per op.
 	multiOperation bool
+
+	// operationLeaseOnly is true when the drive was claimed under an operation
+	// lease with no parent apply lease, which is how the operator claims any
+	// operation — including the sole operation of a single-operation apply.
+	// Such a drive owns its operation row and nothing else: storage refuses a
+	// direct parent write from that context, and the rollout projection moves
+	// the parent state instead. Operation count cannot stand in for this, and a
+	// drive that assumes it can write the parent because it counted one
+	// operation loses every parent write to the storage guard.
+	operationLeaseOnly bool
+
+	// tasklessOperation is true when the claimed operation carries no task rows,
+	// so nothing derives its terminal state but this drive.
+	tasklessOperation bool
 }
 
 func wholeApplyTaskScope() applyTaskScope {
@@ -1347,46 +1361,60 @@ func (s applyTaskScope) isOperationScoped() bool {
 	return s.applyOperationID > 0
 }
 
-// usesOperationRemoteResume reports whether the remote apply id for this drive
-// lives on the claimed operation rather than the parent applies.external_id.
-// Only multi-operation drives do; single-operation and whole-apply drives keep
+// usesOperationRemoteResume reports whether this drive owns only its claimed
+// operation, so the remote apply id lives on that operation row rather than on
+// the parent applies.external_id. Every operation-lease-only drive does,
+// whatever the operation count: a drive that cannot write the parent cannot
+// persist a remote apply id there either, and one that tries loses the id and
+// dispatches the work a second time on the next claim. Whole-apply drives keep
 // using the parent external_id.
 func (s applyTaskScope) usesOperationRemoteResume() bool {
-	return s.multiOperation && s.operation != nil
+	return (s.multiOperation || s.operationLeaseOnly) && s.operation != nil
 }
 
 // suppressesDirectParentApplyWrites reports whether this drive must not write
 // the parent applies row (state, heartbeat) or run parent-level side effects
-// (parent stop-request completion, active-apply metrics). Multi-operation drives
-// own only their operation: the parent applies.state is moved solely by the
-// operation-authorized projection CAS in the operator. Single-operation and
-// whole-apply drives keep writing the parent directly.
+// (parent stop-request completion, active-apply metrics). An operation-scoped
+// drive owns only its operation: the parent applies.state is moved solely by the
+// operation-authorized projection CAS in the operator. Whole-apply drives keep
+// writing the parent directly.
 func (s applyTaskScope) suppressesDirectParentApplyWrites() bool {
 	return s.usesOperationRemoteResume()
 }
 
-// finalizerOperationScope reports whether this drive owns a task-less
-// group_finalizer operation. Such an operation has no task rows, so the
-// operator's task-derived operation→parent projection can never move its
-// operation row off pending: the terminal remote state (completion or failure)
-// would be lost. A finalizer drive must therefore persist its own operation
-// row's terminal state, mirroring LocalClient.driveGroupFinalizer.
-func (s applyTaskScope) finalizerOperationScope() bool {
-	return s.usesOperationRemoteResume() &&
-		s.operation != nil &&
-		s.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer
+// tasklessOperationScope reports whether this drive owns an operation with no
+// task rows: a group_finalizer, or a work operation whose plan changes only
+// VSchemas. The operator's task-derived operation→parent projection can never
+// move such an operation row off pending, so the terminal remote state
+// (completion or failure) would be lost and the parent would stay non-terminal
+// with its target blocked. A drive that owns one must therefore persist its own
+// operation row's terminal state, mirroring the local drive.
+func (s applyTaskScope) tasklessOperationScope() bool {
+	return s.isOperationScoped() && s.tasklessOperation
 }
 
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
-// Progress/Stop/Start/Cutover calls. Multi-operation drives read the claimed
-// operation's external_id (which may be empty before dispatch); everything
-// else reads the parent external_id.
+// Progress/Stop/Start/Cutover calls. Operation-owning drives read the claimed
+// operation's external_id (which may be empty before dispatch); whole-apply
+// drives read the parent external_id.
 func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 	if s.usesOperationRemoteResume() {
 		if s.operation.ExternalID != "" {
 			return s.operation.ExternalID
 		}
-		return s.operation.EngineResumeContext
+		if s.operation.EngineResumeContext != "" {
+			return s.operation.EngineResumeContext
+		}
+		// A sole operation's remote apply id is unambiguously its own, so a drive
+		// that finds one recorded on the parent resumes it rather than dispatching
+		// the work again. A multi-operation apply gets nothing here: the parent id
+		// there belongs to whichever deployment dispatched last, and polling a
+		// sibling's remote apply would report another deployment's outcome as this
+		// one's.
+		if !s.multiOperation {
+			return apply.ExternalID
+		}
+		return ""
 	}
 	return apply.ExternalID
 }
@@ -1439,10 +1467,24 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		return applyTaskScope{}, fmt.Errorf("apply_operation %d is not part of apply %s operation set", applyOperationID, apply.ApplyIdentifier)
 	}
 	return applyTaskScope{
-		applyOperationID: applyOperationID,
-		operation:        operation,
-		multiOperation:   len(ops) > 1,
+		applyOperationID:   applyOperationID,
+		operation:          operation,
+		multiOperation:     len(ops) > 1,
+		operationLeaseOnly: operationLeaseOnly(ctx),
 	}, nil
+}
+
+// operationLeaseOnly reports whether the calling drive holds an operation lease
+// and no parent apply lease, which is the storage rule for whether it may write
+// the parent applies row. Reading it from the lease context keeps the drive's
+// idea of what it owns identical to the one storage enforces, so a drive never
+// attempts a write that is guaranteed to come back as a lost lease.
+func operationLeaseOnly(ctx context.Context) bool {
+	if _, hasOperationLease := storage.OperationLeaseFromContext(ctx); !hasOperationLease {
+		return false
+	}
+	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
+	return !hasApplyLease
 }
 
 // remoteApplyIdempotencyKey derives the deduplication key the control plane
@@ -1675,6 +1717,7 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	// apply rather than failing closed on the empty task set, mirroring
 	// LocalClient.ResumeApplyOperation's finalizer branch.
 	if scope.operation != nil && scope.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		scope.tasklessOperation = true
 		return c.dispatchRemoteGroupFinalizer(ctx, apply, scope)
 	}
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
@@ -1700,6 +1743,7 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		if !scope.operation.IsTasklessVSchemaOnlyWork(plan) {
 			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 		}
+		scope.tasklessOperation = true
 		return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, plan.VSchemaNamespaces(), tasklessWorkDispatchKind)
 	}
 	return c.resumeApply(ctx, apply, scope)
@@ -2700,14 +2744,13 @@ func logSkippedRemoteApplyTransition(ctx context.Context, logger *slog.Logger, o
 }
 
 // completeApplyStartRequestForScope completes the apply-level start control
-// request unless this is an operation-scoped multi-op drive. In a multi-op
-// drive the start request is shared across sibling operations; one operation
-// starting must not complete the shared start request, or stopped siblings
-// would become unclaimable before they resume. The rollout projection completes
-// it once the aggregate settles.
+// request unless the drive owns only its operation. The start request lives on
+// the parent and is shared across sibling operations; one operation starting
+// must not complete it, or stopped siblings would become unclaimable before they
+// resume. The rollout projection completes it once the aggregate settles.
 func (c *GRPCClient) completeApplyStartRequestForScope(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	if scope.usesOperationRemoteResume() {
-		c.applyLogger(apply).DebugContext(ctx, "skipping apply-level start request completion during multi-operation drive; shared start request is owned by the rollout projection",
+		c.applyLogger(apply).DebugContext(ctx, "skipping apply-level start request completion during operation-scoped drive; parent start request is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
 			"operation_deployment", scope.operation.Deployment)
 		return nil
@@ -2715,14 +2758,14 @@ func (c *GRPCClient) completeApplyStartRequestForScope(ctx context.Context, appl
 	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart)
 }
 
-// persistParentApply writes the parent applies row unless the drive is a
-// multi-operation operation-only drive, in which case the parent state is owned
-// by the operator's projection CAS and the direct write is skipped. It reports
-// whether the write happened so callers can gate parent-level side effects
-// (state-transition logs, active-apply metrics) on an actual persist.
+// persistParentApply writes the parent applies row unless the drive owns only
+// its operation, in which case the parent state is owned by the operator's
+// projection CAS and the direct write is skipped. It reports whether the write
+// happened so callers can gate parent-level side effects (state-transition logs,
+// active-apply metrics) on an actual persist.
 func (c *GRPCClient) persistParentApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, action string) (bool, error) {
 	if scope.suppressesDirectParentApplyWrites() {
-		c.applyLogger(apply).DebugContext(ctx, "skipping direct parent apply write during multi-operation drive; parent state is owned by the rollout projection",
+		c.applyLogger(apply).DebugContext(ctx, "skipping direct parent apply write during operation-scoped drive; parent state is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
 			"operation_deployment", scope.operation.Deployment,
 			"action", action)
@@ -2734,8 +2777,8 @@ func (c *GRPCClient) persistParentApply(ctx context.Context, apply *storage.Appl
 	return true, nil
 }
 
-// heartbeatScopedDrive refreshes the lease keeping a long drive claimed. A
-// multi-operation drive heartbeats its own operation row (it holds no parent
+// heartbeatScopedDrive refreshes the lease keeping a long drive claimed. An
+// operation-scoped drive heartbeats its own operation row (it holds no parent
 // apply lease); every other drive heartbeats the parent applies row.
 func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	if scope.suppressesDirectParentApplyWrites() {
@@ -2828,22 +2871,22 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 		}
 	}
 
-	// A multi-operation drive records only its operation's task failures here.
+	// An operation-scoped drive records only its operation's task failures here.
 	// The operator derives the failed operation row from those tasks and moves
 	// the parent applies.state via the projection CAS; the driver must not write
 	// the parent failure or run its parent-level side effects.
 	if scope.suppressesDirectParentApplyWrites() {
-		// A task-less group_finalizer has no task rows to carry the failure, so the
+		// A task-less operation has no task rows to carry the failure, so the
 		// operator could never derive its failed operation row. Mark it failed
 		// directly on a non-retryable failure; a retryable failure is left
 		// non-terminal so the operator re-drives the operation (and re-polls the
 		// existing remote apply).
-		if scope.finalizerOperationScope() && !retryable {
+		if scope.tasklessOperationScope() && !retryable {
 			if err := c.storage.ApplyOperations().MarkFailed(ctx, scope.applyOperationID, message); err != nil {
-				return fmt.Errorf("mark group_finalizer apply_operation %d failed after remote apply failure: %w", scope.applyOperationID, err)
+				return fmt.Errorf("mark task-less apply_operation %d failed after remote apply failure: %w", scope.applyOperationID, err)
 			}
 		}
-		logger.DebugContext(ctx, "recorded operation task failures during multi-operation drive; parent failure is owned by the rollout projection",
+		logger.DebugContext(ctx, "recorded operation task failures during operation-scoped drive; parent failure is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
 			"operation_deployment", scope.operation.Deployment,
 			"failure_task_state", taskState)
@@ -2991,20 +3034,20 @@ func storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, remoteApply *sto
 }
 
 func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedApply, remoteApply *storage.Apply, now time.Time, scope applyTaskScope) error {
-	// A multi-operation drive owns only its operation. The terminal task states
+	// An operation-scoped drive owns only its operation. The terminal task states
 	// were already synced by the caller; the operation row is derived from those
 	// tasks by the operator, which then moves the parent applies.state via the
 	// projection CAS and completes any parent control requests. The driver must
 	// not write the parent row or run its parent-level side effects here.
 	if scope.suppressesDirectParentApplyWrites() {
-		// A task-less group_finalizer has no task rows for the operator to derive
-		// the operation row from, so persist its terminal state directly here.
-		if scope.finalizerOperationScope() {
-			if err := c.persistFinalizerOperationTerminalState(ctx, scope.applyOperationID, remoteApply.State, remoteApply.ErrorMessage); err != nil {
+		// A task-less operation has no task rows for the operator to derive the
+		// operation row from, so persist its terminal state directly here.
+		if scope.tasklessOperationScope() {
+			if err := c.persistTasklessOperationTerminalState(ctx, scope.applyOperationID, remoteApply.State, remoteApply.ErrorMessage); err != nil {
 				return err
 			}
 		}
-		c.applyLogger(storedApply).DebugContext(ctx, "skipping parent terminal write during multi-operation drive; operation tasks are resolved and parent state is owned by the rollout projection",
+		c.applyLogger(storedApply).DebugContext(ctx, "skipping parent terminal write during operation-scoped drive; operation tasks are resolved and parent state is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
 			"operation_deployment", scope.operation.Deployment,
 			"remote_state", remoteApply.State)
@@ -3037,22 +3080,22 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	return nil
 }
 
-// persistFinalizerOperationTerminalState reflects a remote terminal state onto a
-// task-less group_finalizer operation row. Because such an operation carries no
-// task rows, the operator's task-derived projection can never move it: the drive
-// owns its terminal transition, mirroring LocalClient.driveGroupFinalizer
-// (MarkCompleted on success, MarkFailed on failure). Non-completed/non-failed
-// terminal states (stopped/cancelled) stay owned by the operator's stop/cancel
-// handling, so the drive leaves the operation row untouched for those.
-func (c *GRPCClient) persistFinalizerOperationTerminalState(ctx context.Context, applyOperationID int64, terminalState, errMsg string) error {
+// persistTasklessOperationTerminalState reflects a remote terminal state onto a
+// task-less operation row. Because such an operation carries no task rows, the
+// operator's task-derived projection can never move it: the drive owns its
+// terminal transition, mirroring the local drive (MarkCompleted on success,
+// MarkFailed on failure). Non-completed/non-failed terminal states
+// (stopped/cancelled) stay owned by the operator's stop/cancel handling, so the
+// drive leaves the operation row untouched for those.
+func (c *GRPCClient) persistTasklessOperationTerminalState(ctx context.Context, applyOperationID int64, terminalState, errMsg string) error {
 	switch {
 	case state.IsState(terminalState, state.Apply.Completed):
 		if err := c.storage.ApplyOperations().MarkCompleted(ctx, applyOperationID); err != nil {
-			return fmt.Errorf("mark group_finalizer apply_operation %d completed from remote terminal state: %w", applyOperationID, err)
+			return fmt.Errorf("mark task-less apply_operation %d completed from remote terminal state: %w", applyOperationID, err)
 		}
 	case state.IsState(terminalState, state.Apply.Failed):
 		if err := c.storage.ApplyOperations().MarkFailed(ctx, applyOperationID, errMsg); err != nil {
-			return fmt.Errorf("mark group_finalizer apply_operation %d failed from remote terminal state: %w", applyOperationID, err)
+			return fmt.Errorf("mark task-less apply_operation %d failed from remote terminal state: %w", applyOperationID, err)
 		}
 	}
 	return nil
