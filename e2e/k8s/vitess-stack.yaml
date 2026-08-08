@@ -202,8 +202,8 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /config, readOnly: true }
             - { name: vtdataroot, mountPath: /vtdataroot }
-          # /health reports 200 only once every keyspace's online DDL executor
-          # answers, so this window has to outlast LocalScale's own budget for
+          # /health reports 200 only once every shard can accept a DDL
+          # submission, so this window has to outlast LocalScale's own budget for
           # that — otherwise the kubelet restarts the container out from under a
           # cluster that was still coming up, and the restart looks like a broken
           # stack rather than an impatient probe.

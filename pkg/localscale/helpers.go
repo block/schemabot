@@ -809,44 +809,87 @@ func validateBranchName(name string) error {
 	return nil
 }
 
-// onlineDDLReadyTimeout bounds how long the whole cluster gets to bring its
-// online DDL executors up. It covers every keyspace together rather than each in
-// turn, because vtcombo initializes them concurrently — a per-keyspace budget
-// would grant the last keyspace a fresh window it has already spent waiting. The
-// value is sized for the slowest shape, a sharded keyspace on a host with little
-// CPU to spare, whose executor comes up well behind an unsharded one.
+// onlineDDLReadyTimeout bounds how long the whole cluster gets to finish
+// creating the sidecar databases its online DDL executors run out of. It covers
+// every keyspace together rather than each in turn, because vtcombo initializes
+// them concurrently — a per-keyspace budget would grant the last keyspace a
+// fresh window it has already spent waiting.
 const onlineDDLReadyTimeout = 3 * time.Minute
 
-// waitForOnlineDDLReady polls each keyspace's sidecar database until Vitess's
-// online DDL executor is operational. The executor requires the per-shard sidecar
-// databases to be initialized before it can process DDL. Without this check,
-// the first deploy request's DDL submission can hang waiting for a sidecar that
-// hasn't been created yet.
+// onlineDDLSidecarTable is the bookkeeping table Vitess's online DDL executor
+// keeps in a shard's sidecar database. Its presence is what makes the shard able
+// to accept a DDL submission.
+const onlineDDLSidecarTable = "schema_migrations"
+
+// waitForOnlineDDLReady polls until every shard of every keyspace has an online
+// DDL executor that can accept work. Each shard gets its own sidecar database,
+// and until that database is populated a DDL submission hangs waiting for a
+// sidecar that does not exist yet.
+//
+// Readiness is read off the cluster's mysqld rather than asked of vtgate,
+// because vtgate answers for a keyspace and this question is per shard: a
+// keyspace-scoped query cannot describe a keyspace whose shards are still being
+// brought up, and on a sharded keyspace it does not describe one shard at all.
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
 	deadline := time.Now().Add(onlineDDLReadyTimeout)
 	for key, backend := range s.backends {
-		for keyspace, db := range backend.vtgateDBs {
+		db, err := sql.Open("mysql", backend.mysqlDSNBase)
+		if err != nil {
+			return fmt.Errorf("connect to mysqld for %s/%s: %w", key.org, key.database, err)
+		}
+		err = s.waitForBackendSidecars(ctx, key, backend, db, deadline)
+		utils.CloseAndLog(db)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitForBackendSidecars waits for one backend's shards, so the mysqld handle it
+// polls through is closed whether or not the wait succeeds.
+func (s *Server) waitForBackendSidecars(
+	ctx context.Context,
+	key backendKey,
+	backend *databaseBackend,
+	db *sql.DB,
+	deadline time.Time,
+) error {
+	for keyspace, shardCount := range backend.shardCounts {
+		for _, shard := range buildShards(shardCount) {
+			sidecar := shardSidecarDBName(keyspace, shard.Name)
 			started := time.Now()
 			ready := false
 			var lastErr error
 			for time.Now().Before(deadline) {
 				if err := ctx.Err(); err != nil {
-					return fmt.Errorf("online DDL readiness for %s/%s: %w", key.database, keyspace, err)
+					return fmt.Errorf("online DDL readiness for %s/%s shard %s: %w",
+						key.database, keyspace, shard.Name, err)
 				}
-				rows, err := db.QueryContext(ctx, "SHOW VITESS_MIGRATIONS")
-				if err == nil {
-					utils.CloseAndLog(rows)
-					s.logger.Info("online DDL ready", "database", key.database, "keyspace", keyspace, "waited", time.Since(started))
+				var found int
+				err := db.QueryRowContext(ctx,
+					"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+					sidecar, onlineDDLSidecarTable).Scan(&found)
+				if err == nil && found > 0 {
+					s.logger.Info("online DDL ready",
+						"database", key.database, "keyspace", keyspace, "shard", shard.Name,
+						"sidecar", sidecar, "waited", time.Since(started))
 					ready = true
 					break
 				}
-				lastErr = err
-				s.logger.Debug("waiting for online DDL readiness", "database", key.database, "keyspace", keyspace, "error", err)
+				if err != nil {
+					lastErr = err
+				} else {
+					lastErr = fmt.Errorf("sidecar database %s has no %s table yet", sidecar, onlineDDLSidecarTable)
+				}
+				s.logger.Debug("waiting for online DDL readiness",
+					"database", key.database, "keyspace", keyspace, "shard", shard.Name,
+					"sidecar", sidecar, "error", lastErr)
 				time.Sleep(time.Second)
 			}
 			if !ready {
-				return fmt.Errorf("online DDL not ready for %s/%s after waiting %s of the cluster's %s budget: %w",
-					key.database, keyspace, time.Since(started).Round(time.Second), onlineDDLReadyTimeout, lastErr)
+				return fmt.Errorf("online DDL not ready for %s/%s shard %s after waiting %s of the cluster's %s budget: %w",
+					key.database, keyspace, shard.Name, time.Since(started).Round(time.Second), onlineDDLReadyTimeout, lastErr)
 			}
 		}
 	}
