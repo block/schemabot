@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/vschema"
 )
 
@@ -531,6 +532,28 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
+}
+
+// deployRequestCreatedEvent states, on the operator's timeline, the cutover
+// ownership the deploy request was created with.
+//
+// The apply's log surface carries lifecycle events, not the engine's own log
+// lines, so a decision left in an engine logger is invisible to the operator
+// reading the schema change. This one is settled at creation and can never be
+// changed afterwards, and it is the fact an operator needs first when a schema
+// change swaps without them: either SchemaBot held the cutover, and the swap
+// was its call to make, or the deploy request was not created holding it.
+func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.ApplyEvent {
+	return engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d created with the cutover held by SchemaBot, validating...", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url": dr.HtmlURL,
+			"branch":             branchName,
+			"auto_cutover":       "false",
+		},
+		NewState: state.Apply.ValidatingDeployRequest,
+	}
 }
 
 func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (*ps.DeployRequest, error) {

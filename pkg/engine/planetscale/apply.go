@@ -280,15 +280,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
-	emitEvent(engine.ApplyEvent{
-		Message: fmt.Sprintf("Deploy request #%d created, validating...", dr.Number),
-		Metadata: map[string]string{
-			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-			"deploy_request_url": dr.HtmlURL,
-			"branch":             branchName,
-		},
-		NewState: state.Apply.ValidatingDeployRequest,
-	})
+	emitEvent(deployRequestCreatedEvent(dr, branchName))
 	persistState(&psMetadata{
 		BranchName:            branchName,
 		DeployRequestID:       dr.Number,

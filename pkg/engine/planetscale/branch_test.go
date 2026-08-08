@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -185,4 +186,20 @@ func TestCreateDeployRequest_DisablesPlanetScaleAutoCutover(t *testing.T) {
 	assert.True(t, client.created.AutoDeleteBranch)
 	assert.Equal(t, "schemabot-mydb-abc", client.created.Branch)
 	assert.Equal(t, "main", client.created.IntoBranch)
+}
+
+// Cutover ownership is settled when the deploy request is created and can never
+// be changed afterwards. The operator's timeline states it, because the apply's
+// log surface carries lifecycle events and not the engine's own log lines — so
+// a decision left in the engine logger cannot be read from the schema change.
+func TestDeployRequestCreatedEventStatesCutoverOwnership(t *testing.T) {
+	event := deployRequestCreatedEvent(&ps.DeployRequest{Number: 132, HtmlURL: "https://example.test/deploy-requests/132"}, "schema-change-branch")
+
+	assert.Contains(t, event.Message, "#132")
+	assert.Contains(t, event.Message, "cutover held by SchemaBot")
+	assert.Equal(t, "false", event.Metadata["auto_cutover"])
+	assert.Equal(t, "132", event.Metadata["deploy_request_id"])
+	assert.Equal(t, "https://example.test/deploy-requests/132", event.Metadata["deploy_request_url"])
+	assert.Equal(t, "schema-change-branch", event.Metadata["branch"])
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, event.NewState)
 }
