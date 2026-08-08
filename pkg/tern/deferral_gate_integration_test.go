@@ -67,6 +67,72 @@ func deferralViolationEntry(t *testing.T, stor storage.Storage, applyID int64) *
 	return nil
 }
 
+// deferralHoldEntries returns the apply's recorded deferred-hold announcements.
+func deferralHoldEntries(t *testing.T, stor storage.Storage, applyID int64) []*storage.ApplyLog {
+	t.Helper()
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), applyID)
+	require.NoError(t, err)
+	var held []*storage.ApplyLog
+	for _, entry := range logs {
+		if strings.Contains(entry.Message, "Waiting for an operator") {
+			held = append(held, entry)
+		}
+	}
+	return held
+}
+
+// A deferred apply parks silently, because holding is implemented as declining
+// to act. The operator's timeline says who the apply is waiting on and how long
+// the hold can last, once, when the gate is reached.
+func TestReportDeferredHold_AnnouncesEachGateOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	apply := deferredCutoverApply(t, stor, "hold-announced")
+	opts := storage.ApplyOptions{DeferCutover: true}
+	ps := &atomicPollState{}
+
+	client.reportDeferredHold(t.Context(), apply, opts, engine.StateWaitingForCutover, ps)
+	client.reportDeferredHold(t.Context(), apply, opts, engine.StateWaitingForCutover, ps)
+
+	entries := deferralHoldEntries(t, stor, apply.ID)
+	require.Len(t, entries, 1, "the hold is stated when it begins, not on every tick it lasts")
+	assert.Contains(t, entries[0].Message, "cut over")
+	assert.Contains(t, entries[0].Message, "defer_cutover set")
+	assert.Contains(t, entries[0].Message, waitingForManualActionTimeout.String())
+}
+
+// An apply that did not ask to hold is not holding: it is parked for a moment
+// on its way through the gate the drive is about to trigger.
+func TestReportDeferredHold_QuietWhenNothingWasDeferred(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	apply := deferredCutoverApply(t, stor, "hold-not-requested")
+	client.reportDeferredHold(t.Context(), apply, storage.ApplyOptions{}, engine.StateWaitingForCutover, &atomicPollState{})
+	assert.Empty(t, deferralHoldEntries(t, stor, apply.ID))
+
+	deferring := deferredCutoverApply(t, stor, "hold-other-gate")
+	client.reportDeferredHold(t.Context(), deferring, storage.ApplyOptions{DeferCutover: true}, engine.StateRunning, &atomicPollState{})
+	assert.Empty(t, deferralHoldEntries(t, stor, deferring.ID), "a copy still running has reached no gate to hold at")
+}
+
 // An operator who defers a cutover is promised the schema will not swap without
 // them. The drive keeps that promise by declining to trigger the cutover, which
 // holds nothing if the engine backend swaps on its own — the apply simply never
@@ -147,6 +213,30 @@ func TestDetectDeferredCutoverViolation_QuietOnApplesThatDidNotDefer(t *testing.
 	parked := deferredCutoverApply(t, stor, "parked")
 	client.detectDeferredCutoverViolation(t.Context(), parked, true, engine.StateWaitingForCutover, &atomicPollState{})
 	assert.Nil(t, deferralViolationEntry(t, stor, parked.ID), "parking at the gate is the deferral working")
+}
+
+// The transition into the swap is mirrored from the engine and says nothing
+// about whose decision it was. The timeline names the actor, so an unexpected
+// cutover can be attributed without reading the backend's own audit trail.
+func TestCutoverActorSuffix_NamesWhoSwappedTheSchema(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, _ := newTasklessControlClient(t, dsn, stor)
+
+	backend := deferredCutoverApply(t, stor, "actor-backend")
+	assert.Contains(t, client.cutoverActorSuffix(t.Context(), backend), "engine backend")
+
+	schemabot := deferredCutoverApply(t, stor, "actor-schemabot")
+	client.logApplyEvent(t.Context(), schemabot.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
+		storage.LogSourceSchemaBot, "Auto-triggering cutover (defer_cutover not set)", "", "")
+	assert.Contains(t, client.cutoverActorSuffix(t.Context(), schemabot), "triggered by SchemaBot")
 }
 
 // A failed apply did not swap the schema, so it is not a broken hold — it is a

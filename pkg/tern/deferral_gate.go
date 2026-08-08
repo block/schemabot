@@ -46,6 +46,35 @@ func cutoverGatePassed(state engine.State) bool {
 	return false
 }
 
+// reportDeferredHold states that the drive is holding at a gate the operator
+// deferred.
+//
+// The auto-trigger branches announce themselves on the timeline; the deferred
+// path says nothing, because holding is implemented as declining to act. An
+// operator reading a parked apply therefore sees the copy finish and then
+// silence, with no statement of who the apply is waiting on or how long the
+// wait may last. The hold is recorded once per gate per drive, on the tick the
+// gate is first observed.
+func (c *LocalClient) reportDeferredHold(ctx context.Context, apply *storage.Apply, opts storage.ApplyOptions, state engine.State, ps *atomicPollState) {
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	switch {
+	case state == engine.StateWaitingForDeploy && opts.DeferDeploy && !ps.deferredDeployHoldLogged:
+		ps.deferredDeployHoldLogged = true
+		logger.Info("holding at the deploy gate: deploy was deferred and waits for an operator",
+			append(apply.MutableLogAttrs(), "hold_expires_after", waitingForManualActionTimeout)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Waiting for an operator to start the deploy (defer_deploy set). Nothing advances until then, and the apply is cancelled if the hold lasts longer than %s.", waitingForManualActionTimeout),
+			"", "")
+	case state == engine.StateWaitingForCutover && opts.DeferCutover && !ps.deferredCutoverHoldLogged:
+		ps.deferredCutoverHoldLogged = true
+		logger.Info("holding at the cutover gate: cutover was deferred and waits for an operator",
+			append(apply.MutableLogAttrs(), "hold_expires_after", waitingForManualActionTimeout)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Waiting for an operator to cut over (defer_cutover set). The schema is not swapped until then, and the apply is cancelled if the hold lasts longer than %s.", waitingForManualActionTimeout),
+			"", "")
+	}
+}
+
 // detectDeferredCutoverViolation reports a deferred apply that the engine
 // backend cut over on its own.
 //
@@ -78,6 +107,32 @@ func (c *LocalClient) detectDeferredCutoverViolation(ctx context.Context, apply 
 		fmt.Sprintf("Cutover was deferred, but the engine cut over on its own (engine state: %s). The schema has already been swapped without an operator cutover.", state),
 		"", "")
 	metrics.RecordDeferredCutoverViolation(ctx, apply.Database, apply.Deployment, apply.Environment, string(state))
+}
+
+// cutoverActorSuffix names who moved the apply into the swap, for the timeline
+// entry that records the transition.
+//
+// The transition itself is mirrored from the engine, so on its own it says the
+// schema is being swapped without saying whose decision that was. That is the
+// question an operator asks first of any cutover they did not expect, and
+// answering it here means they do not have to reconstruct it from the backend's
+// own audit trail. The same trigger event the deferral check reads is the
+// evidence: SchemaBot records one whenever it triggers a cutover, automatically
+// or on an operator's command, so its absence at the swap means the backend
+// acted alone.
+//
+// An unreadable history yields no claim rather than a wrong one.
+func (c *LocalClient) cutoverActorSuffix(ctx context.Context, apply *storage.Apply) string {
+	triggered, err := c.cutoverTriggeredBySchemaBot(ctx, apply)
+	if err != nil {
+		c.logger.Warn("cannot attribute the cutover actor; the apply's cutover history is unreadable and the transition is recorded without an actor",
+			append(apply.LogAttrs(), "error", err)...)
+		return ""
+	}
+	if triggered {
+		return "; cutover triggered by SchemaBot"
+	}
+	return "; cutover performed by the engine backend, not SchemaBot"
 }
 
 // cutoverTriggeredBySchemaBot reports whether this apply's cutover came from

@@ -296,6 +296,12 @@ type atomicPollState struct {
 	// drive rather than on every remaining progress tick.
 	deferredCutoverViolationLogged bool
 
+	// deferredDeployHoldLogged and deferredCutoverHoldLogged are set once the
+	// drive has stated that it is holding at a gate the operator deferred, so
+	// the hold is announced when it begins rather than on every tick it lasts.
+	deferredDeployHoldLogged  bool
+	deferredCutoverHoldLogged bool
+
 	// cutoverNotReadySince is when the engine backend first rejected an
 	// auto-cutover as not ready; cleared when a cutover is accepted. Used to
 	// escalate when the normally seconds-long staging window persists.

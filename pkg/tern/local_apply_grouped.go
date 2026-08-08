@@ -716,6 +716,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if result.Message != "" {
 			msg = fmt.Sprintf("State changed to %s (%s)", newState, result.Message)
 		}
+		if state.IsState(newState, state.Task.CuttingOver) {
+			msg += c.cutoverActorSuffix(ctx, apply)
+		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			msg, ps.lastTaskState, newState)
 		ps.lastTaskState = newState
@@ -791,9 +794,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	// The branch above holds a deferred cutover by declining to trigger it,
-	// which only holds anything while the engine parks at the gate. This reports
-	// the deferred applies it did not hold.
+	// The auto-trigger branches above state what they did; a deferral is
+	// implemented as not acting, so it has to state itself.
+	c.reportDeferredHold(ctx, apply, opts, result.State, ps)
+
+	// Holding a deferred cutover by declining to trigger it only holds anything
+	// while the engine parks at the gate. This reports the deferred applies it
+	// did not hold.
 	c.detectDeferredCutoverViolation(ctx, apply, opts.DeferCutover, result.State, ps)
 
 	// Timeout: cancel the apply if waiting for manual deploy too long.
