@@ -1640,6 +1640,21 @@ func RecordMergeGatePlanTimeHold(ctx context.Context, database, environment stri
 	)
 }
 
+// RecordMergeGroupAdmissionBlocked counts merge-queue admission checks posted
+// blocking: a queued pull request's stored check state turned blocking after
+// it entered the queue — most often a preflight hold from a sibling change's
+// in-flight apply on a shared target. The blocked PR leaves the queue and its
+// author re-queues once its check re-plans green, so an occasional count is
+// the gate working; a sustained rate on one repository means changes keep
+// queueing against a busy target — check the target's apply activity.
+func RecordMergeGroupAdmissionBlocked(ctx context.Context, repository, environment string) {
+	addCounter(ctx, "schemabot.merge_gate.merge_group_admission_blocked_total",
+		"Total merge-queue admission checks posted blocking because the queued PR's stored check state blocks", "{check}",
+		attribute.String("repository", repository),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordMergeGateTerminatedStuck counts merge gate requests terminated
 // by the stuck-processing sweep: rows wedged past the attempt cap with an
 // expired lease (a driver hard-killed on its final attempt). Each terminated

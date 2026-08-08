@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -20,6 +22,7 @@ type mergeGroupPayload struct {
 	Action     string `json:"action"`
 	MergeGroup struct {
 		HeadSHA string `json:"head_sha"`
+		HeadRef string `json:"head_ref"`
 	} `json:"merge_group"`
 	Repository struct {
 		FullName string `json:"full_name"`
@@ -30,7 +33,7 @@ type mergeGroupPayload struct {
 }
 
 // handleMergeGroup responds to merge_group webhook events so SchemaBot's
-// required Check Runs do not wedge a repository's merge queue.
+// required Check Runs gate a repository's merge queue without wedging it.
 //
 // A merge queue tests queued pull requests combined, on a synthetic head
 // commit, before they land on the base branch. Branch protection re-evaluates
@@ -39,11 +42,14 @@ type mergeGroupPayload struct {
 // required SchemaBot check would never appear on the merge-group commit and the
 // queue entry would block indefinitely.
 //
-// Posting a passing check is correct: SchemaBot applies schema changes before a
-// PR merges, and branch protection already required the PR-head check to pass
-// before the PR could enter the queue. The merge group sits strictly downstream
-// of an already-completed, already-gated apply, so there is nothing left to
-// verify on the combined commit.
+// The check posted here is a merge-time revalidation, not an unconditional
+// pass. The PR-head check gated queue entry, but stored check state can turn
+// blocking after entry — most importantly when a sibling PR's apply starts
+// changing a target this PR's verdict was computed against and the preflight
+// holds this PR's stored checks. The queue no longer looks at the PR head, so
+// this admission check is the only surface where that hold can stop the
+// queued merge: it re-folds the PR's stored check state and passes only when
+// nothing blocks.
 func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload mergeGroupPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -143,7 +149,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		return
 	}
 
-	if err := h.postPassingAggregateChecks(postCtx, client, repo, headSHA, mergeGroupCheckContent()); err != nil {
+	if err := h.postMergeGroupAdmissionChecks(postCtx, client, repo, headSHA, payload.MergeGroup.HeadRef); err != nil {
 		// Return 500 so the delivery is recorded as failed and shows up in the
 		// App's delivery log for redelivery. The merge queue blocks until the
 		// check is posted, so the failure must be visible for retry, not
@@ -162,16 +168,125 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "merge_group checks posted"})
 }
 
-// mergeGroupCheckContent is the passing Check Run content published on a
-// merge-queue head. Both the request path and the durable driver use it so a
-// redelivery updates the same check with identical output.
-func mergeGroupCheckContent() passingAggregateCheckContent {
+// mergeGroupHeadRefPattern matches the tail segment of a merge-queue branch
+// ref, refs/heads/gh-readonly-queue/<base branch>/pr-<number>-<sha>. Only the
+// final path segment is matched so a base branch containing slashes cannot
+// shift the pull request number.
+var mergeGroupHeadRefPattern = regexp.MustCompile(`^pr-(\d+)-`)
+
+// mergeGroupPRNumber extracts the queued pull request's number from the
+// merge_group head ref. Each queue entry gets its own merge_group event whose
+// head ref names that entry's PR, so the ref identifies which PR's stored
+// check state this admission check must re-fold.
+func mergeGroupPRNumber(headRef string) (int, error) {
+	tail := headRef
+	if idx := strings.LastIndex(headRef, "/"); idx >= 0 {
+		tail = headRef[idx+1:]
+	}
+	m := mergeGroupHeadRefPattern.FindStringSubmatch(tail)
+	if m == nil {
+		return 0, fmt.Errorf("merge group head ref %q does not name a pull request", headRef)
+	}
+	pr, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, fmt.Errorf("parse pull request number from merge group head ref %q: %w", headRef, err)
+	}
+	return pr, nil
+}
+
+// mergeGroupPassContent is the passing Check Run content published on a
+// merge-queue head when the queued PR's stored check state blocks nothing.
+// Both the request path and the durable driver use it so a redelivery updates
+// the same check with identical output.
+func mergeGroupPassContent() passingAggregateCheckContent {
 	return passingAggregateCheckContent{
 		operation: "merge_group_check",
 		title:     "Schema changes verified before merge queue",
 		summary: "Schema changes in queued pull requests are applied and verified by SchemaBot before " +
-			"they enter the merge queue, so no additional verification is required for this merge group.",
+			"they enter the merge queue, and nothing is blocking this pull request's schema checks now, " +
+			"so no additional verification is required for this merge group.",
 	}
+}
+
+// mergeGroupBlockedSummary is the Check Run output published on a merge-queue
+// head when the queued PR's stored check state blocks admission. The blocked
+// PR leaves the queue; the summary tells its author where to look and when to
+// re-queue.
+const (
+	mergeGroupBlockedTitle   = "Schema checks are blocking this pull request"
+	mergeGroupBlockedSummary = "This pull request's SchemaBot check state turned blocking after it entered the " +
+		"merge queue — most often because another change's apply is in flight on a database this pull request " +
+		"also changes, which invalidates the verdict it queued with. Check this pull request's SchemaBot check " +
+		"for the reason, and re-queue once it is green again (held checks re-plan automatically when the " +
+		"in-flight apply settles)."
+)
+
+// mergeGroupUnidentifiedSummary is the fail-closed Check Run output published
+// when the queued PR cannot be identified from the merge group ref. Stored
+// check state cannot be consulted for a PR that cannot be named, and admission
+// must never pass on uncertainty.
+const (
+	mergeGroupUnidentifiedTitle   = "SchemaBot could not identify the queued pull request"
+	mergeGroupUnidentifiedSummary = "SchemaBot could not determine which pull request this merge group tests, " +
+		"so it cannot verify the pull request's schema check state and fails closed. See the server logs for " +
+		"the merge group ref that could not be parsed."
+)
+
+// postMergeGroupAdmissionChecks publishes the admission Check Runs on a
+// merge-queue head: a re-fold of the queued PR's stored check state at
+// admission time. Every aggregate target this instance gates gets a run —
+// passing when nothing in the PR's stored state blocks, action_required when
+// something does (a preflight hold, a failed apply, a fail-closed re-plan) or
+// when the queued PR cannot be identified. A storage read failure returns an
+// error so the delivery retries; uncertainty never admits a merge.
+func (h *Handler) postMergeGroupAdmissionChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA, headRef string) error {
+	pr, prErr := mergeGroupPRNumber(headRef)
+	if prErr != nil {
+		h.logger.Error("merge group admission failing closed: queued pull request could not be identified; the admission check will block this merge group",
+			"repo", repo, "head_sha", headSHA, "head_ref", headRef, "error", prErr)
+		return h.postAggregateChecks(ctx, client, repo, headSHA, passingAggregateCheckContent{
+			operation: "merge_group_check",
+			title:     mergeGroupUnidentifiedTitle,
+			summary:   mergeGroupUnidentifiedSummary,
+		}, checkConclusionActionRequired, func(environment string) {
+			metrics.RecordMergeGroupAdmissionBlocked(ctx, repo, environment)
+		})
+	}
+
+	if h.service == nil || h.service.Storage() == nil {
+		return fmt.Errorf("storage unavailable for merge group admission of %s#%d@%s", repo, pr, headSHA)
+	}
+	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("load stored check state for merge group admission of %s#%d@%s: %w", repo, pr, headSHA, err)
+	}
+
+	blockedTargets := 0
+	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+		if !hasBlockingCheckForEnvironment(checks, target.environment) {
+			if err := h.postAggregateCheck(ctx, client, repo, headSHA, target, mergeGroupPassContent(), checkConclusionSuccess); err != nil {
+				return err
+			}
+			continue
+		}
+		blockedTargets++
+		h.logger.Warn("merge group admission blocked: the queued pull request's stored check state turned blocking after queue entry; the admission check will remove it from the queue",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"environment", target.environment, "check_name", target.name)
+		metrics.RecordMergeGroupAdmissionBlocked(ctx, repo, target.environment)
+		if err := h.postAggregateCheck(ctx, client, repo, headSHA, target, passingAggregateCheckContent{
+			operation: "merge_group_check",
+			title:     mergeGroupBlockedTitle,
+			summary:   mergeGroupBlockedSummary,
+		}, checkConclusionActionRequired); err != nil {
+			return err
+		}
+	}
+	if blockedTargets == 0 {
+		h.logger.Info("merge group admission passed: nothing in the queued pull request's stored check state blocks",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+	}
+	return nil
 }
 
 // enqueueDurableMergeGroup persists a merge_group delivery in the inbox. The
@@ -190,13 +305,13 @@ func (h *Handler) enqueueDurableMergeGroup(ctx context.Context, payload mergeGro
 	})
 }
 
-// processDurableMergeGroup posts the passing merge-queue check for a claimed
+// processDurableMergeGroup posts the merge-queue admission check for a claimed
 // merge_group delivery. It re-validates every enqueue-time guard fail-closed —
 // config can change between enqueue and drive, and rows can arrive via replay —
 // so a now-ignored delivery completes as a no-op rather than posting a check
-// the current config would not. GitHub client and post failures are retryable;
-// posting is idempotent (the check is looked up by name and updated in place),
-// so a retry after a partial post reconciles rather than duplicates.
+// the current config would not. GitHub client, storage, and post failures are
+// retryable; posting is idempotent (the check is looked up by name and updated
+// in place), so a retry after a partial post reconciles rather than duplicates.
 func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload mergeGroupPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -255,7 +370,7 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return true, fmt.Errorf("create GitHub client for durable merge_group %s@%s: %w", repo, headSHA, err)
 	}
 
-	if err := h.postPassingAggregateChecks(ctx, client, repo, headSHA, mergeGroupCheckContent()); err != nil {
+	if err := h.postMergeGroupAdmissionChecks(ctx, client, repo, headSHA, payload.MergeGroup.HeadRef); err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "merge_group_check",
 			Repository: repo,
@@ -270,8 +385,8 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 }
 
 // passingAggregateCheckContent carries the operation name and Check Run output
-// for a passing aggregate published outside the PR-head path (merge-queue
-// heads, default-branch pushes).
+// for an aggregate published outside the PR-head path (merge-queue heads,
+// default-branch pushes).
 type passingAggregateCheckContent struct {
 	operation string
 	title     string
@@ -283,46 +398,67 @@ type passingAggregateCheckContent struct {
 // names as the PR-head aggregates so branch protection's required checks
 // always match.
 func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, content passingAggregateCheckContent) error {
+	return h.postAggregateChecks(ctx, client, repo, headSHA, content, checkConclusionSuccess, nil)
+}
+
+// postAggregateChecks publishes one aggregate Check Run per gated environment
+// on headSHA with the given conclusion. onEach, when non-nil, runs once per
+// environment before its check posts (for per-environment metrics).
+func (h *Handler) postAggregateChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, content passingAggregateCheckContent, conclusion string, onEach func(environment string)) error {
 	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
-		opts := ghclient.CheckRunOptions{
-			Name:       target.name,
-			Status:     checkStatusCompleted,
-			Conclusion: checkConclusionSuccess,
-			Output: &ghclient.CheckRunOutput{
-				Title:   content.title,
-				Summary: content.summary,
-			},
+		if onEach != nil {
+			onEach(target.environment)
 		}
-		// Reuse an existing run for this name on the SHA so a webhook
-		// redelivery updates it rather than creating a duplicate Check Run.
-		// The lookup errors when the App slug is unknown; on any lookup error
-		// fall back to creating a new run — a duplicate Check Run is the safe
-		// outcome, a missing one is not.
-		existing, _, findErr := client.FindCheckRunByName(ctx, repo, headSHA, target.name)
-		if findErr != nil {
-			h.logger.Warn("could not look up existing check; creating a new one",
-				"repo", repo, "head_sha", headSHA, "check_name", target.name,
-				"operation", content.operation, "error", findErr)
+		if err := h.postAggregateCheck(ctx, client, repo, headSHA, target, content, conclusion); err != nil {
+			return err
 		}
-		switch {
-		case findErr == nil && existing != nil:
-			if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
-				return fmt.Errorf("update %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
-			}
-		default:
-			if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
-				return fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
-			}
-		}
-		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-			Operation:   content.operation,
-			Repository:  repo,
-			Environment: target.environment,
-			Status:      "success",
-		})
-		h.logger.Info("passing aggregate check posted",
-			"repo", repo, "head_sha", headSHA, "check_name", target.name,
-			"environment", target.environment, "operation", content.operation)
 	}
+	return nil
+}
+
+// postAggregateCheck publishes a single aggregate Check Run on headSHA for one
+// aggregate target with the given conclusion, reusing the PR-head aggregate's
+// check name so branch protection's required-check names always match.
+func (h *Handler) postAggregateCheck(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, target aggregateCheckTarget, content passingAggregateCheckContent, conclusion string) error {
+	opts := ghclient.CheckRunOptions{
+		Name:       target.name,
+		Status:     checkStatusCompleted,
+		Conclusion: conclusion,
+		Output: &ghclient.CheckRunOutput{
+			Title:   content.title,
+			Summary: content.summary,
+		},
+	}
+	// Reuse an existing run for this name on the SHA so a webhook
+	// redelivery updates it rather than creating a duplicate Check Run.
+	// The lookup errors when the App slug is unknown; on any lookup error
+	// fall back to creating a new run — a duplicate Check Run is the safe
+	// outcome, a missing one is not.
+	existing, _, findErr := client.FindCheckRunByName(ctx, repo, headSHA, target.name)
+	if findErr != nil {
+		h.logger.Warn("could not look up existing check; creating a new one",
+			"repo", repo, "head_sha", headSHA, "check_name", target.name,
+			"operation", content.operation, "error", findErr)
+	}
+	switch {
+	case findErr == nil && existing != nil:
+		if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
+			return fmt.Errorf("update %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
+		}
+	default:
+		if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
+			return fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
+		}
+	}
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:   content.operation,
+		Repository:  repo,
+		Environment: target.environment,
+		Status:      conclusion,
+	})
+	h.logger.Info("aggregate check posted",
+		"repo", repo, "head_sha", headSHA, "check_name", target.name,
+		"environment", target.environment, "operation", content.operation,
+		"conclusion", conclusion)
 	return nil
 }
