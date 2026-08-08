@@ -203,3 +203,17 @@ func TestDeployRequestCreatedEventStatesCutoverOwnership(t *testing.T) {
 	assert.Equal(t, "schema-change-branch", event.Metadata["branch"])
 	assert.Equal(t, state.Apply.ValidatingDeployRequest, event.NewState)
 }
+
+// Instant DDL swaps the schema in the same step that runs the deploy, so there
+// is no pending_cutover for a deferred cutover to park at. An operator who held
+// the cutover kept that decision for themselves, so an eligible change is
+// deployed with a row copy instead — slower, but it stops at the gate.
+func TestUseInstantDDL(t *testing.T) {
+	eligible := &ps.DeployRequest{Deployment: &ps.Deployment{InstantDDLEligible: true}}
+	ineligible := &ps.DeployRequest{Deployment: &ps.Deployment{InstantDDLEligible: false}}
+
+	assert.True(t, useInstantDDL(eligible, false), "an eligible change with no held cutover deploys instantly")
+	assert.False(t, useInstantDDL(eligible, true), "a held cutover needs a gate, so instant DDL is declined")
+	assert.False(t, useInstantDDL(ineligible, false))
+	assert.False(t, useInstantDDL(&ps.DeployRequest{}, false), "a deploy request with no deployment is not eligible")
+}

@@ -556,6 +556,24 @@ func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.A
 	}
 }
 
+// useInstantDDL decides whether to run an eligible schema change as instant DDL.
+//
+// Instant DDL rewrites metadata only: the deploy executes and the schema is
+// swapped in a single step, with nothing in between. That makes it the right
+// way to run an eligible change — except when the operator asked to hold the
+// cutover. A held cutover is a decision the operator kept for themselves, and
+// instant DDL takes it: there is no pending_cutover to park at, so the schema
+// swaps the moment the deploy runs and the operator is told afterwards. The
+// row-copy path parks at the gate, so a deferred cutover is deployed that way
+// instead, trading the speed of an eligible change for the gate that was asked
+// for.
+func useInstantDDL(dr *ps.DeployRequest, deferCutover bool) bool {
+	if dr.Deployment == nil || !dr.Deployment.InstantDDLEligible {
+		return false
+	}
+	return !deferCutover
+}
+
 func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (*ps.DeployRequest, error) {
 	return client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
 		Organization: org,

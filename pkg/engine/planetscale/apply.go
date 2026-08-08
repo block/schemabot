@@ -311,10 +311,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
 	// it as eligible — instant DDL modifies metadata only (no row copy), so it
 	// completes immediately and has no revert window regardless of skip_revert.
-	// Instant DDL is orthogonal to defer flags — the mechanism (instant vs row copy)
-	// is independent of when the deploy executes.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	useInstant := useInstantDDL(dr, deferCutover)
 
 	// Log the raw deploy request fields for debugging instant DDL detection.
 	if dr.Deployment != nil {
@@ -342,14 +340,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"deploy_state", dr.DeploymentState,
 	)
 
-	// Log when --defer-cutover has no effect for instant DDL
-	if deferCutover && useInstant {
-		e.logger.Info("--defer-cutover has no effect for instant DDL",
+	// State the trade the deferral bought, since the operator sees only that an
+	// eligible change took the slow path.
+	if instantEligible && !useInstant {
+		e.logger.Info("declining instant DDL so the deferred cutover has a gate to hold",
 			"database", req.Database,
 			"deploy_request", dr.Number,
 		)
 		emitEvent(engine.ApplyEvent{
-			Message: "Note: --defer-cutover has no effect for instant DDL",
+			Message: "Deploying with a row copy rather than instant DDL: instant DDL swaps the schema as soon as the deploy runs, and this cutover was deferred.",
 		})
 	}
 
@@ -755,6 +754,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Create deploy request
 	main := mainBranch(req.Credentials)
 	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
 
 	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, true)
 	if err != nil {
@@ -772,8 +772,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 
 	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
-	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	useInstant := useInstantDDL(dr, deferCutover)
 
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
