@@ -139,3 +139,74 @@ func TestCreateDeployRequestSendsServiceToken(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "token-name:token-value", auth)
 }
+
+// autoCutoverServer serves the deploy-request read endpoint with a fixed body.
+func autoCutoverServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/organizations/block/databases/orders/deploy-requests/132", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The cutover setting cannot be changed once a deploy request exists, so the
+// only way to know the one SchemaBot asked for is the one being honoured is to
+// read it back. PlanetScale carries it on the deployment rather than on the
+// deploy request itself.
+func TestDeployRequestAutoCutoverReadsTheDeploymentSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"held for the operator", `{"number":132,"deployment":{"auto_cutover":false}}`, false},
+		{"performed by the backend", `{"number":132,"deployment":{"auto_cutover":true}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", autoCutoverServer(t, tc.body).URL)
+			require.NoError(t, err)
+
+			autoCutover, err := client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, autoCutover)
+		})
+	}
+}
+
+// A caller reads this setting precisely because it cannot assume one, so a
+// response that omits it is an error rather than a default.
+func TestDeployRequestAutoCutoverRefusesAnUnreportedSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"no deployment yet", `{"number":132}`},
+		{"deployment without the setting", `{"number":132,"deployment":{"state":"ready"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", autoCutoverServer(t, tc.body).URL)
+			require.NoError(t, err)
+
+			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "reports no auto_cutover setting")
+			assert.Contains(t, err.Error(), "orders")
+		})
+	}
+}
+
+func TestDeployRequestAutoCutoverRefusesWithoutBaseURL(t *testing.T) {
+	client, err := NewPSClient("token-name", "token-value")
+	require.NoError(t, err)
+	client.(*psClientWrapper).baseURL = ""
+
+	_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no PlanetScale API base URL")
+}

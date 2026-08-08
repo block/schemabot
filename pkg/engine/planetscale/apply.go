@@ -366,6 +366,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		},
 	})
 
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
 	// Deferred deploy: don't call DeployDeployRequest yet. The user will review
 	// the deploy request diff on PlanetScale and trigger via `schemabot cutover`.
 	if deferDeploy {
@@ -769,6 +775,12 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 	if dr.DeploymentState == deployState.NoChanges {
 		return noChangesApplyResult("no changes detected on resume"), nil
+	}
+
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
 	}
 
 	// Deploy — prefer instant when eligible (no row copy, no revert window needed).

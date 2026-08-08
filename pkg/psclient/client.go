@@ -45,6 +45,14 @@ type PSClient interface {
 	// ListDeployRequests lists all deploy requests for a database.
 	ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error)
 
+	// DeployRequestAutoCutover reports the cutover setting the backend actually
+	// holds for a deploy request. The setting is settled when the deploy request
+	// is created and no later call can change it, so reading it back is the only
+	// way to know the request that was sent is the one being honoured. The SDK
+	// models auto_cutover on the create request but on neither response, so this
+	// uses raw HTTP via baseURL; it returns an error if baseURL is not set.
+	DeployRequestAutoCutover(ctx context.Context, org, database string, number uint64) (bool, error)
+
 	// ThrottleDeployRequest sets the throttle ratio for a running deploy request.
 	// This controls the speed of the online DDL copy phase (0.0 = full speed,
 	// 0.95 = max throttle). The PlanetScale API supports this endpoint but the
@@ -192,6 +200,37 @@ func (w *psClientWrapper) CreateDeployRequest(ctx context.Context, req *ps.Creat
 		return nil, fmt.Errorf("decode created deploy request for %s/%s: %w", req.Organization, req.Database, err)
 	}
 	return dr, nil
+}
+
+// DeployRequestAutoCutover reads back the cutover setting the backend holds for
+// a deploy request.
+//
+// The setting is carried on the deployment rather than the deploy request
+// itself, and the SDK models it on neither, so the response is decoded here
+// against the one field this answer needs. A backend that reports no setting is
+// an error rather than a default: the caller is asking precisely because it
+// cannot assume one.
+func (w *psClientWrapper) DeployRequestAutoCutover(ctx context.Context, org, database string, number uint64) (bool, error) {
+	if w.baseURL == "" {
+		return false, fmt.Errorf("read auto_cutover for %s/%s deploy request #%d: no PlanetScale API base URL", org, database, number)
+	}
+	url := fmt.Sprintf("%s/v1/organizations/%s/databases/%s/deploy-requests/%d", w.baseURL, org, database, number)
+	respBody, err := w.doRawJSON(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("read auto_cutover for %s/%s deploy request #%d: %w", org, database, number, err)
+	}
+	var payload struct {
+		Deployment *struct {
+			AutoCutover *bool `json:"auto_cutover"`
+		} `json:"deployment"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return false, fmt.Errorf("decode auto_cutover for %s/%s deploy request #%d: %w", org, database, number, err)
+	}
+	if payload.Deployment == nil || payload.Deployment.AutoCutover == nil {
+		return false, fmt.Errorf("%s/%s deploy request #%d reports no auto_cutover setting", org, database, number)
+	}
+	return *payload.Deployment.AutoCutover, nil
 }
 
 // doRawJSON sends a JSON request to an endpoint the SDK does not cover and

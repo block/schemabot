@@ -556,6 +556,33 @@ func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.A
 	}
 }
 
+// verifyCutoverHeld checks that the backend is holding the cutover of a deploy
+// request whose cutover the operator deferred.
+//
+// auto_cutover is settled when the deploy request is created and no later call
+// can change it, so the create request is the only thing standing between a
+// deferred cutover and a schema that swaps seconds after the deploy goes ready.
+// A create request that did not arrive as sent leaves no trace on any surface
+// the operator reads: the deploy request looks ordinary right up to the moment
+// it cuts itself over. Reading the setting back is the only way to know the
+// deferral took.
+//
+// Fails closed, including when the setting cannot be read — the deploy has not
+// started, so refusing costs a re-run, while proceeding costs the decision the
+// operator kept for themselves.
+func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient, org, database string, number uint64) error {
+	autoCutover, err := client.DeployRequestAutoCutover(ctx, org, database, number)
+	if err != nil {
+		return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, err)
+	}
+	if autoCutover {
+		return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
+	}
+	e.logger.Info("the deploy request holds the cutover for the operator",
+		"database", database, "deploy_request", number)
+	return nil
+}
+
 // useInstantDDL decides whether to run an eligible schema change as instant DDL.
 //
 // Instant DDL rewrites metadata only: the deploy executes and the schema is
