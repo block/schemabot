@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver for the storage database
 
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -47,7 +47,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return err
 	}
 
-	db, err := sql.Open("pgx", dsn)
+	db, err := postgresconn.Open(dsn)
 	if err != nil {
 		return fmt.Errorf("open storage database: %w", err)
 	}
@@ -226,7 +226,7 @@ func createPostgresTable(ctx context.Context, db *sql.DB, table, content string,
 // the underlying session and releases the advisory lock — returning the
 // connection to a shared pool would leave the session (and the lock) alive.
 func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
-	db, err := sql.Open("pgx", dsn)
+	db, err := postgresconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
