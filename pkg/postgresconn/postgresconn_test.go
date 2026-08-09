@@ -228,7 +228,7 @@ func TestReloadableConnectorReloadReappliesOptionsAndNormalization(t *testing.T)
 		return "postgres://schemabot:rotated@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", nil
 	}}
 
-	fresh, ok := c.refresh(0)
+	fresh, ok := c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", fresh.Password)
 	assert.Equal(t, 7*time.Second, fresh.ConnectTimeout, "options must flow through the reload path")
@@ -247,7 +247,7 @@ func TestReloadableConnectorRefreshConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			cfg, ok := c.refresh(0)
+			cfg, ok := c.refresh(t.Context(), 0)
 			assert.True(t, ok)
 			assert.Equal(t, "rotated", cfg.Password)
 		})
@@ -269,24 +269,24 @@ func TestReloadableConnectorReloadCooldown(t *testing.T) {
 	c.now = func() time.Time { return clock }
 
 	// The first failed reload arms the cooldown.
-	_, ok := c.refresh(0)
+	_, ok := c.refresh(t.Context(), 0)
 	require.False(t, ok)
 	require.Equal(t, int32(1), reloads.Load())
 
 	// Failed dials inside the window surface without reloading again.
-	_, ok = c.refresh(0)
+	_, ok = c.refresh(t.Context(), 0)
 	require.False(t, ok)
 	assert.Equal(t, int32(1), reloads.Load(), "reload must not run during the cooldown")
 
 	// After the window elapses the reload is retried; another failure re-arms.
 	clock = clock.Add(reloadCooldown)
-	_, ok = c.refresh(0)
+	_, ok = c.refresh(t.Context(), 0)
 	require.False(t, ok)
 	require.Equal(t, int32(2), reloads.Load())
 
 	// A successful reload swaps credentials and clears the cooldown.
 	clock = clock.Add(reloadCooldown)
-	cfg, ok := c.refresh(0)
+	cfg, ok := c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", cfg.Password)
 	require.Equal(t, int32(3), reloads.Load())
@@ -315,7 +315,7 @@ func TestDSNParseErrorsRedactCredentials(t *testing.T) {
 		c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
 			return badDSN, nil
 		})
-		_, ok := c.refresh(0)
+		_, ok := c.refresh(t.Context(), 0)
 		require.False(t, ok)
 	})
 }
@@ -327,17 +327,164 @@ func TestReloadableConnectorRefreshDedupesConcurrentFailures(t *testing.T) {
 		return "postgres://schemabot:rotated@localhost:5432/app", nil
 	})
 
-	cfg, ok := c.refresh(0)
+	cfg, ok := c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", cfg.Password)
 	require.Equal(t, int32(1), reloads.Load())
 
 	// A dial that failed against the already-superseded generation reuses the
 	// swapped config instead of reloading again.
-	cfg, ok = c.refresh(0)
+	cfg, ok = c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", cfg.Password)
 	assert.Equal(t, int32(1), reloads.Load(), "stale-generation refresh must not reload")
+}
+
+// waitClosed fails the test when ch does not close within a bounded deadline.
+func waitClosed(t *testing.T, ch <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal(msg)
+	}
+}
+
+// hungReload returns a reload callback that signals started, then blocks
+// until release closes before returning result and err.
+func hungReload(started, release chan struct{}, reloads *atomic.Int32, result string, err error) func() (string, error) {
+	return func() (string, error) {
+		reloads.Add(1)
+		close(started)
+		<-release
+		return result, err
+	}
+}
+
+func TestReloadableConnectorSnapshotNotBlockedByHungReload(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app",
+		hungReload(started, release, &reloads, "postgres://schemabot:rotated@localhost:5432/app", nil))
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		cfg, ok := c.refresh(t.Context(), 0)
+		assert.True(t, ok)
+		assert.Equal(t, "rotated", cfg.Password)
+	})
+	waitClosed(t, started, "reload never started")
+
+	// The hung reload must not hold the connector mutex: healthy dials keep
+	// snapshotting the current config while credentials resolve.
+	snapshotDone := make(chan struct{})
+	go func() {
+		defer close(snapshotDone)
+		cfg, gen := c.snapshot()
+		assert.Equal(t, "old", cfg.Password)
+		assert.Equal(t, uint64(0), gen)
+	}()
+	waitClosed(t, snapshotDone, "snapshot blocked behind an in-flight reload")
+
+	close(release)
+	wg.Wait()
+	assert.Equal(t, int32(1), reloads.Load())
+}
+
+func TestReloadableConnectorConnectNotBlockedByHungReload(t *testing.T) {
+	passwords := fakeDial(t, []error{authError(), nil, nil})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app",
+		hungReload(started, release, &reloads, "postgres://schemabot:rotated@localhost:5432/app", nil))
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		conn, err := c.Connect(t.Context())
+		assert.NoError(t, err)
+		assert.NotNil(t, conn)
+	})
+	waitClosed(t, started, "reload never started")
+
+	// A dial that authenticates with the current credentials completes while
+	// the rejected dial's reload hangs on secret resolution.
+	connected := make(chan struct{})
+	go func() {
+		defer close(connected)
+		conn, err := c.Connect(t.Context())
+		assert.NoError(t, err)
+		assert.NotNil(t, conn)
+	}()
+	waitClosed(t, connected, "healthy dial blocked behind an in-flight reload")
+
+	close(release)
+	wg.Wait()
+	assert.Equal(t, []string{"old", "old", "rotated"}, *passwords)
+	assert.Equal(t, int32(1), reloads.Load())
+}
+
+func TestReloadableConnectorRefreshWaiterRespectsDialContext(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app",
+		hungReload(started, release, &reloads, "postgres://schemabot:rotated@localhost:5432/app", nil))
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		cfg, ok := c.refresh(t.Context(), 0)
+		assert.True(t, ok)
+		assert.Equal(t, "rotated", cfg.Password)
+	})
+	waitClosed(t, started, "reload never started")
+
+	// A waiter whose dial context ends while the leader's reload hangs gives
+	// up and surfaces its dial error instead of blocking indefinitely.
+	ctx, cancel := context.WithCancel(t.Context())
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		cfg, ok := c.refresh(ctx, 0)
+		assert.False(t, ok)
+		assert.Nil(t, cfg)
+	}()
+	cancel()
+	waitClosed(t, waiterDone, "waiter did not honor its dial context")
+
+	close(release)
+	wg.Wait()
+	assert.Equal(t, int32(1), reloads.Load(), "the canceled waiter must not trigger its own reload")
+}
+
+func TestReloadableConnectorRefreshWaiterObservesLeaderFailure(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app",
+		hungReload(started, release, &reloads, "", errors.New("secret backend unavailable")))
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		_, ok := c.refresh(t.Context(), 0)
+		assert.False(t, ok)
+	})
+	waitClosed(t, started, "reload never started")
+
+	// A same-generation waiter observes the leader's failed reload through
+	// the armed cooldown and reports failure without reloading again.
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		cfg, ok := c.refresh(t.Context(), 0)
+		assert.False(t, ok)
+		assert.Nil(t, cfg)
+	}()
+	close(release)
+	wg.Wait()
+	waitClosed(t, waiterDone, "waiter did not observe the leader's failed reload")
+	assert.Equal(t, int32(1), reloads.Load(), "the waiter must not reload during the cooldown the failure armed")
 }
 
 func TestIsAuthError(t *testing.T) {
