@@ -19,7 +19,7 @@ const defaultName = "schemabot"
 // flagName is the global flag a wrapper uses to pass its invocation.
 const flagName = "--cli-name"
 
-var name atomic.Value
+var name atomic.Pointer[string]
 
 // Set records the tool name command hints render, typically a wrapper
 // invocation such as "sq schemabot". An empty name is ignored so an absent
@@ -28,13 +28,13 @@ func Set(n string) {
 	if n == "" {
 		return
 	}
-	name.Store(n)
+	name.Store(&n)
 }
 
 // Name returns the tool name to render at the start of CLI command hints.
 func Name() string {
-	if v, ok := name.Load().(string); ok {
-		return v
+	if p := name.Load(); p != nil {
+		return *p
 	}
 	return defaultName
 }

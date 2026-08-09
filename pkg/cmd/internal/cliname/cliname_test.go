@@ -8,8 +8,13 @@ import (
 
 // TestName covers the full lifecycle in one test because the name is
 // process-global: the default before any Set, an empty Set leaving the
-// default in place, and a wrapper-passed name taking effect.
+// default in place, and a wrapper-passed name taking effect. The global is
+// reset to its unset state around the test so ordering against other tests
+// in the package cannot change the outcome.
 func TestName(t *testing.T) {
+	name.Store(nil)
+	t.Cleanup(func() { name.Store(nil) })
+
 	assert.Equal(t, "schemabot", Name(), "default before any Set")
 
 	Set("")
