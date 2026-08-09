@@ -30,10 +30,6 @@ type TableProgressData struct {
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
 	IsInstant           bool
-	// ReadyToComplete marks the table as ready for the operator to cut over.
-	// Producers must derive it with TaskStatusReadyForCutover so every render
-	// path agrees on what "ready" means.
-	ReadyToComplete bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying or
@@ -52,10 +48,9 @@ type TableProgressData struct {
 // finished its copy and verification phases — the remaining binlog catch-up
 // happens under cutover itself — so the barrier state is what makes the table
 // ready. Engines fold any internal readiness signal into the task status they
-// report, so this is the single predicate every TableProgressData producer
-// derives ReadyToComplete from. Accepts raw engine statuses (Spirit
-// "waitingOnSentinelTable", Vitess "ready_to_complete") as well as canonical
-// task states.
+// report, so this is the single predicate every render path uses to decide
+// readiness. Accepts raw engine statuses (Spirit "waitingOnSentinelTable",
+// Vitess "ready_to_complete") as well as canonical task states.
 func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
@@ -417,12 +412,12 @@ func revertWindowCountdown(revertExpiresAt string) string {
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
-// showing how many tables are ready to complete vs still catching up.
+// showing how many tables are ready for cutover vs not yet ready.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := 0
 	total := len(tables)
 	for _, t := range tables {
-		if t.ReadyToComplete {
+		if TaskStatusReadyForCutover(t.Status) {
 			ready++
 		}
 	}
@@ -446,7 +441,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, readyForCutover, waiting, recovering, cutting, cancelled int
+	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -471,14 +466,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		case state.Task.Pending:
 			queued++
 		case state.Task.WaitingForCutover:
-			// The summary must agree with the per-table rows: a task the
-			// projection marks ready renders as "Ready for cutover", so it
-			// counts as ready here, not as still waiting.
-			if t.ReadyToComplete {
-				readyForCutover++
-			} else {
-				waiting++
-			}
+			waiting++
 		case state.Task.Recovering:
 			recovering++
 		case state.Task.CuttingOver:
@@ -530,13 +518,6 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 	if queued > 0 && multi {
 		parts = append(parts, fmt.Sprintf("%d queued", queued))
-	}
-	if readyForCutover > 0 {
-		if multi {
-			parts = append(parts, fmt.Sprintf("%d ready for cutover", readyForCutover))
-		} else {
-			parts = append(parts, "ready for cutover")
-		}
 	}
 	if waiting > 0 {
 		if multi {
@@ -758,12 +739,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		}
 
 	case state.Task.WaitingForCutover:
-		bar := ui.ProgressBarWaitingCutover()
-		if table.ReadyToComplete {
-			fmt.Fprintf(sb, "**`%s`**: %s \u2705 Ready for cutover\n", table.TableName, bar)
-		} else {
-			fmt.Fprintf(sb, "**`%s`**: %s Waiting for cutover\n", table.TableName, bar)
-		}
+		fmt.Fprintf(sb, "**`%s`**: %s Waiting for cutover\n", table.TableName, ui.ProgressBarWaitingCutover())
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Recovering:
@@ -1585,7 +1561,6 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 			PercentComplete: int(t.PercentComplete),
 			ETASeconds:      t.ETASeconds,
 			IsInstant:       t.IsInstant,
-			ReadyToComplete: TaskStatusReadyForCutover(t.Status),
 		})
 	}
 
