@@ -299,10 +299,11 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 			detail += " | " + countdown
 		}
 	}
-	// The volume level only matters while the engine is actively copying; on
-	// other states (stopped, waiting for cutover, terminal) it carries no
-	// signal, so the status line stays quiet.
-	if data.Volume > 0 && state.IsState(data.State, state.Apply.Running, state.Apply.RunningDegraded) {
+	// The volume level only matters while the engine is actively working
+	// (copying, draining, or verifying — volume stays adjustable through the
+	// post-copy phases); on other states (stopped, waiting for cutover,
+	// terminal) it carries no signal, so the status line stays quiet.
+	if data.Volume > 0 && state.IsRunningApplyState(data.State) {
 		detail += fmt.Sprintf(" | Volume: %d/%d", data.Volume, storage.MaxVolume)
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
@@ -332,6 +333,12 @@ func applyStatusDetail(applyState string) string {
 		return "Starting"
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return "In Progress"
+	case state.Apply.CatchingUp:
+		return "Catching Up"
+	case state.Apply.Checksumming:
+		return "Checksumming"
+	case state.Apply.PostChecksum:
+		return "Applying Final Changes"
 	case state.Apply.FailedRetryable:
 		return "Retrying"
 	case state.Apply.WaitingForDeploy:
@@ -439,7 +446,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, checksumming, queued, failed, retrying, stopped, readyForCutover, waiting, recovering, cutting, cancelled int
+	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, readyForCutover, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -454,6 +461,11 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			} else {
 				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			}
+		case state.Task.CatchingUp, state.Task.PostChecksum:
+			// Both binlog drains (before and after the verify) read as
+			// "catching up" in the compact summary; the per-table rows
+			// distinguish them.
+			catchingUp++
 		case state.Task.Checksumming:
 			checksumming++
 		case state.Task.Pending:
@@ -501,6 +513,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			label += fmt.Sprintf(" (%d%%)", runningPct)
 		}
 		parts = append(parts, label)
+	}
+	if catchingUp > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d catching up", catchingUp))
+		} else {
+			parts = append(parts, "catching up")
+		}
 	}
 	if checksumming > 0 {
 		if multi {
@@ -702,6 +721,17 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		fmt.Fprintf(sb, "**`%s`**: %s \u2705 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
+	case state.Task.CatchingUp:
+		// Row copy is complete; the engine is draining the changes that
+		// accumulated on the source while the copy ran. On a busy table this
+		// catch-up can run for hours, so name the phase instead of rendering a
+		// serene completed copy.
+		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Catching up on accumulated changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
+		writeDDLLine(sb, table.DDL)
+		if table.RowsCopied > 0 {
+			fmt.Fprintf(sb, "Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
+		}
+
 	case state.Task.Checksumming:
 		// Row copy is complete; the engine is verifying the copied data against
 		// the source before cutover. On a large table this can run for hours, so
@@ -715,6 +745,16 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		} else {
 			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
 			writeDDLLine(sb, table.DDL)
+		}
+
+	case state.Task.PostChecksum:
+		// The verify passed and the engine is draining the changes that
+		// accumulated on the source while it ran. Named separately from the
+		// pre-checksum catch-up so the row doesn't rewind to an earlier phase.
+		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Data verified, applying final changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
+		writeDDLLine(sb, table.DDL)
+		if table.RowsCopied > 0 {
+			fmt.Fprintf(sb, "Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
 		}
 
 	case state.Task.WaitingForCutover:
@@ -812,7 +852,7 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	switch state.NormalizeTaskStatus(table.Status) {
-	case state.Task.Running, state.Task.Checksumming, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
 		// in flight — a breakdown adds signal
 	default:
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
@@ -1035,7 +1075,8 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Running, state.Apply.RunningDegraded,
+		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,

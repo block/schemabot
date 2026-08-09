@@ -16,6 +16,12 @@ func previewStatesOutput() {
 		"STATE_CUTTING_OVER",
 		state.Apply.Completed,
 		state.Apply.Failed,
+		state.Apply.Stopped,
+		state.Apply.Cancelled,
+		state.Apply.RevertWindow,
+		state.Apply.SkippingRevert,
+		state.Apply.Reverting,
+		state.Apply.Reverted,
 		"STATE_IDLE",
 		"STATE_NO_ACTIVE_CHANGE",
 	}

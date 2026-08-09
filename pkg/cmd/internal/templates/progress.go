@@ -375,6 +375,12 @@ func FormatProgressState(s string) string {
 		return ANSICyan + "🔄 Running" + ANSIReset
 	case state.Apply.RunningDegraded:
 		return ANSICyan + "🔄 Running (degraded)" + ANSIReset
+	case state.Apply.CatchingUp:
+		return ANSICyan + "⏩ Catching up" + ANSIReset
+	case state.Apply.Checksumming:
+		return ANSICyan + "🔍 Checksumming" + ANSIReset
+	case state.Apply.PostChecksum:
+		return ANSICyan + "⏩ Applying final changes" + ANSIReset
 	case state.Apply.WaitingForDeploy:
 		return ANSIYellow + "🟨 Waiting for deploy" + ANSIReset
 	case state.Apply.WaitingForCutover:
@@ -390,9 +396,17 @@ func FormatProgressState(s string) string {
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
-		return ANSIYellow + "⏸️  Stopped" + ANSIReset
+		return ANSIOrange + "⏸️  Stopped" + ANSIReset
 	case state.Apply.Cancelled:
-		return ANSIRed + "🚫 Cancelled" + ANSIReset
+		return ANSIOrange + "🚫 Cancelled" + ANSIReset
+	case state.Apply.RevertWindow:
+		return ANSIYellow + "🟨 Revert window open" + ANSIReset
+	case state.Apply.SkippingRevert:
+		return ANSICyan + "🔄 Finalizing (closing revert window)..." + ANSIReset
+	case state.Apply.Reverting:
+		return ANSIYellow + "↩️ Reverting" + ANSIReset
+	case state.Apply.Reverted:
+		return ANSIOrange + "↩️ Reverted" + ANSIReset
 	default:
 		return s
 	}
@@ -454,6 +468,21 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Task.CatchingUp:
+		// Row copy is done; the engine is applying the changes that accumulated
+		// from live traffic during the copy. On a busy source this catch-up can
+		// run for a long time, so name the phase instead of showing a serene
+		// full bar that looks finished.
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Catching up on accumulated changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		if t.RowsCopied > 0 {
+			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data against the
 		// source. On a large table this can run for hours, so show how far the
@@ -471,6 +500,20 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
+	case state.Task.PostChecksum:
+		// The verify passed and the engine is applying the changes that
+		// accumulated while it ran. Named separately from the pre-checksum
+		// catch-up so the display doesn't rewind to an earlier phase.
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Data verified, applying final changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		if t.RowsCopied > 0 {
+			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -569,10 +612,22 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
+	case state.Apply.Reverted:
+		// The change was applied, then undone at operator request — a
+		// successful revert, not a failure. Full orange bar: terminal,
+		// change not in effect.
+		bar := ui.ProgressBar(100, ui.ColorOrange)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverted\n", t.TableName, bar)
+		if t.DDL != "" {
+			b.WriteString(formatProgressDDL(t.DDL))
+		}
+		b.WriteString("\n")
+		b.WriteString(FormatShardProgress(t.Shards))
+		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-			bar := ui.ProgressBarFailed(cancelledPercent)
+			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
@@ -757,7 +812,7 @@ type CancelData struct {
 
 // WriteCancelSuccess writes the cancel command success output.
 func WriteCancelSuccess(data CancelData) {
-	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIRed, ANSIReset)
+	fmt.Printf("%s%s✖ Schema change cancelled%s\n", ANSIBold, ANSIOrange, ANSIReset)
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)
@@ -1275,6 +1330,12 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 }
 
 // stateColorFunc returns an ANSI color function for the given state.
+//
+// Color semantics: red is reserved for Failed — the only state that means
+// something broke and needs remediation. Operator-initiated terminal states
+// (Stopped, Cancelled, Reverted) are orange: the change is not in effect,
+// but nothing went wrong. Yellow marks states awaiting attention or an
+// external event, cyan marks active work, green marks success.
 func stateColorFunc(s string) func(string) string {
 	switch s {
 	case state.Apply.Completed:
@@ -1283,20 +1344,23 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSIRed)
 	case state.Apply.FailedRetryable:
 		return colorWrap(ANSIYellow)
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Running, state.Apply.RunningDegraded,
+		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		return colorWrap(ANSICyan)
-	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering, state.Apply.CuttingOver:
+	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering:
 		return colorWrap(ANSIYellow)
+	case state.Apply.CuttingOver:
+		return colorWrap(ANSICyan) // active work, matches the blue "Cutting over..." table bar
 	case state.Apply.Stopped:
 		return colorWrap(ANSIOrange)
 	case state.Apply.Cancelled:
-		return colorWrap(ANSIRed)
+		return colorWrap(ANSIOrange)
 	case state.Apply.Pending:
 		return colorWrap(ANSIDim)
 	case state.Apply.PreparingBranch, state.Apply.ApplyingBranchChanges, state.Apply.ValidatingBranch, state.Apply.CreatingDeployRequest, state.Apply.ValidatingDeployRequest:
 		return colorWrap(ANSICyan)
 	case state.Apply.Reverted:
-		return colorWrap(ANSIRed)
+		return colorWrap(ANSIOrange)
 	case state.Apply.RevertWindow:
 		return colorWrap(ANSIYellow)
 	case state.Apply.SkippingRevert:

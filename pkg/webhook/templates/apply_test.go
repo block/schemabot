@@ -155,6 +155,85 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 	}
 }
 
+// A table that has finished copying drains the changes that accumulated on the
+// source during the copy. It is a table-level state: the apply header stays
+// "In Progress" while the per-table line and summary name the catch-up phase,
+// since on a busy table it can run for hours — a plain full bar would read as
+// a copy that is quietly done.
+func TestRenderApplyStatusComment_CatchingUp(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "catching_up", RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; catching up is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏩ Catching up on accumulated changes...")
+	assert.Contains(t, result, "Rows copied: 1,466,232")
+	assert.Contains(t, result, "1 catching up")
+}
+
+// The raw Spirit phase names reach the renderer when a stored task predates
+// normalization; each drain renders its own named phase, not an unknown
+// state.
+func TestRenderApplyStatusComment_DrainPhasesFromRawSpiritState(t *testing.T) {
+	for raw, wantLine := range map[string]string{
+		"applyChangeset": "⏩ Catching up on accumulated changes...",
+		"postChecksum":   "⏩ Data verified, applying final changes...",
+	} {
+		data := ApplyStatusCommentData{
+			Database:    "testapp",
+			Environment: "staging",
+			RequestedBy: "aparajon",
+			State:       "running",
+			Engine:      "Spirit",
+			Tables: []TableProgressData{
+				{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: raw, RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			},
+		}
+
+		result := RenderApplyStatusComment(data)
+
+		assert.Contains(t, result, wantLine, "raw state %q should render its drain phase", raw)
+	}
+}
+
+// After the checksum passes, the engine drains the changes that accumulated
+// during the verify. It is a table-level state: the apply header stays
+// "In Progress" while the per-table line names the post-checksum drain — and
+// never rewinds to an indeterminate checksum that already finished.
+func TestRenderApplyStatusComment_PostChecksum(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "post_checksum", RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; the post-checksum drain is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏩ Data verified, applying final changes...")
+	assert.Contains(t, result, "Rows copied: 1,466,232")
+	assert.Contains(t, result, "1 catching up")
+	assert.NotContains(t, result, "Checksumming to verify data")
+}
+
 // A table that has finished copying enters the checksum phase, where the engine
 // verifies the copied data before cutover. It is a table-level state: the apply
 // header stays "In Progress" while the per-table line and summary report

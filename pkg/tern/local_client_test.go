@@ -2331,6 +2331,36 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			expected:         state.Task.Completed,
 		},
 		{
+			name:             "catch-up advances a running table",
+			storedTaskState:  state.Task.Running,
+			engineTableState: state.Task.CatchingUp,
+			expected:         state.Task.CatchingUp,
+		},
+		{
+			name:             "checksum advances the catch-up phase",
+			storedTaskState:  state.Task.CatchingUp,
+			engineTableState: state.Task.Checksumming,
+			expected:         state.Task.Checksumming,
+		},
+		{
+			name:             "stale catch-up poll does not regress a checksummed table",
+			storedTaskState:  state.Task.Checksumming,
+			engineTableState: state.Task.CatchingUp,
+			expected:         state.Task.Checksumming,
+		},
+		{
+			name:             "post-checksum drain advances the checksum phase",
+			storedTaskState:  state.Task.Checksumming,
+			engineTableState: state.Task.PostChecksum,
+			expected:         state.Task.PostChecksum,
+		},
+		{
+			name:             "stale checksum poll does not regress a post-checksum table",
+			storedTaskState:  state.Task.PostChecksum,
+			engineTableState: state.Task.Checksumming,
+			expected:         state.Task.PostChecksum,
+		},
+		{
 			name:             "stopped engine state can advance active stored state",
 			storedTaskState:  state.Task.Running,
 			engineTableState: state.Task.Stopped,
@@ -2377,6 +2407,36 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.expected, taskStateWithNoBackwardProgress(tc.storedTaskState, tc.engineTableState))
+		})
+	}
+}
+
+// Per-table engine states refine a generic running task into the post-copy
+// phase they represent, so the stored task — the single render surface for the
+// CLI and the PR comment — names the phase instead of a serene complete copy.
+// "completed" must never refine the task: for Spirit it means only that the
+// table's row copy finished, not that the table cut over.
+func TestTablePhaseTaskState(t *testing.T) {
+	tests := []struct {
+		name       string
+		tableState string
+		wantPhase  string
+		wantOK     bool
+	}{
+		{name: "applyChangeset", tableState: "applyChangeset", wantPhase: state.Task.CatchingUp, wantOK: true},
+		{name: "postChecksum", tableState: "postChecksum", wantPhase: state.Task.PostChecksum, wantOK: true},
+		{name: "checksum", tableState: "checksum", wantPhase: state.Task.Checksumming, wantOK: true},
+		{name: "cutOver", tableState: "cutOver", wantPhase: state.Task.CuttingOver, wantOK: true},
+		{name: "already normalized", tableState: state.Task.CatchingUp, wantPhase: state.Task.CatchingUp, wantOK: true},
+		{name: "copyRows", tableState: "copyRows", wantOK: false},
+		{name: "completed", tableState: "completed", wantOK: false},
+		{name: "empty", tableState: "", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			phase, ok := tablePhaseTaskState(tc.tableState)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.wantPhase, phase)
 		})
 	}
 }

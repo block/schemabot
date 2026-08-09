@@ -24,6 +24,26 @@ func TestRevertingStateConversions(t *testing.T) {
 	assert.False(t, isTerminalProtoState(ternv1.State_STATE_REVERTING), "reverting is in-flight, not terminal")
 }
 
+// The post-copy phases round-trip across the task and proto boundaries so a
+// drain or verify in progress is reported end-to-end as its phase rather than
+// collapsing to pending on the wire.
+func TestPostCopyPhaseStateConversions(t *testing.T) {
+	cases := []struct {
+		task  string
+		apply string
+		proto ternv1.State
+	}{
+		{state.Task.CatchingUp, state.Apply.CatchingUp, ternv1.State_STATE_CATCHING_UP},
+		{state.Task.Checksumming, state.Apply.Checksumming, ternv1.State_STATE_CHECKSUMMING},
+		{state.Task.PostChecksum, state.Apply.PostChecksum, ternv1.State_STATE_POST_CHECKSUM},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.proto, storageStateToProto(tc.task))
+		assert.Equal(t, tc.apply, ProtoStateToStorage(tc.proto))
+		assert.False(t, isTerminalProtoState(tc.proto), "%s is in-flight, not terminal", tc.task)
+	}
+}
+
 // A null namespace value in the proto map (e.g. JSON `{"default": null}`)
 // converts to an empty namespace rather than dereferencing a nil pointer.
 func TestProtoToSchemaFiles_NilNamespaceValue(t *testing.T) {

@@ -4514,16 +4514,6 @@ func setApplyErrorMessage(t *testing.T, applyID int64, message string) {
 	require.NoError(t, err)
 }
 
-// setApplyCompletedAt ages a parent apply's completion time, which is what bounds
-// how long a failed apply stays reappliable.
-func setApplyCompletedAt(t *testing.T, applyID int64, age time.Duration) {
-	t.Helper()
-	_, err := testDB.ExecContext(t.Context(),
-		"UPDATE applies SET completed_at = NOW() - INTERVAL ? SECOND WHERE id = ?",
-		int64(age.Seconds()), applyID)
-	require.NoError(t, err)
-}
-
 func leaseApplyOperation(t *testing.T, operationID int64, owner string) {
 	t.Helper()
 	_, err := testDB.ExecContext(t.Context(),
@@ -4548,10 +4538,6 @@ func insertPendingOperation(t *testing.T, store *Storage, applyID int64, deploym
 // hidden behind harmless history. Parents that are only paused — stopped or
 // failed_retryable — are resumable, so their pending rows belong to the resume
 // path and are left alone, as are the rows of a parent that is still active.
-//
-// The failed parents here carry no completion time, which is what makes them
-// unreappliable and so settled for good; a failed apply still inside its reapply
-// window is covered on its own.
 func TestApplyOperationStore_ReapStranded_MirrorsSettledParentOutcome(t *testing.T) {
 	const parentError = "target rejected the schema change"
 
@@ -4723,50 +4709,9 @@ func TestApplyOperationStore_ReapStranded_SkipsRowThatLeftPending(t *testing.T) 
 	assertApplyOperationState(t, store, op.ID, state.ApplyOperation.Running)
 }
 
-// reapplyFreshness is how long a failed apply stays reappliable after it
-// completed, expressed as a duration for backdating in tests.
-const reapplyFreshness = time.Duration(storage.ReapplyFailureFreshnessDays) * 24 * time.Hour
-
-// A failed apply is the one settled outcome with a way back: a reapply within the
-// freshness window turns it and its failed operation rows retryable, and the
-// retry claim carries no deployment-order gate because it exists for rows that
-// already ran. Mirroring failed onto a row that never ran would hand that reapply
-// a row it treats as already-attempted, so the sweep waits until no reapply can
-// reach the parent before settling its stranded rows.
-func TestApplyOperationStore_ReapStranded_WaitsOutTheReapplyWindowForFailedParents(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := New(testDB)
-
-	lock := createTestLock(t, store, "stranded_reapply_db", "mysql", "staging")
-	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_stranded_reapply", 1, state.Apply.Failed, "staging")
-	setApplyCompletedAt(t, parent.ID, time.Minute)
-	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
-
-	op := insertPendingOperation(t, store, parent.ID, "region-b")
-
-	settled, err := store.applyOperations.reapStranded(ctx, 10)
-	require.NoError(t, err)
-	assert.Empty(t, settled, "a failed apply an operator can still reapply keeps its never-started rows")
-	assertApplyOperationState(t, store, op.ID, state.ApplyOperation.Pending)
-
-	// Writing completed_at refreshes updated_at, so restore the quiescence the
-	// sweep also requires and leave the reapply window as the only thing that
-	// changed.
-	setApplyCompletedAt(t, parent.ID, reapplyFreshness+time.Hour)
-	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
-
-	settled, err = store.applyOperations.reapStranded(ctx, 10)
-	require.NoError(t, err)
-	require.Len(t, settled, 1, "once no reapply can reach the parent, its stranded row settles")
-	assert.Equal(t, op.ID, settled[0].Operation.ID)
-	assertApplyOperationState(t, store, op.ID, state.Apply.Failed)
-}
-
 // The parent's state is re-asserted by the write, not just by the sweep that
-// chose the row. A reapply committing in between brings the rollout back to life,
-// and settling one of its deployments then would drop that deployment's work from
-// the retry.
+// chose the row: settling a child under a parent that has left the settled set
+// would drop that deployment's work from a rollout that is live again.
 func TestApplyOperationStore_ReapStranded_SkipsParentThatLeftTheSettledSet(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -4780,9 +4725,9 @@ func TestApplyOperationStore_ReapStranded_SkipsParentThatLeftTheSettledSet(t *te
 	stranded, err := store.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)
 
-	// The parent advances after selection: a reapply turned the failed rollout
-	// retryable, so it is live again. Its quiescence is restored so the state it
-	// moved to is the only thing the guarded write can object to.
+	// The parent leaves the settled set after selection. Its quiescence is
+	// restored so the state it moved to is the only thing the guarded write can
+	// object to.
 	_, err = testDB.ExecContext(ctx, `UPDATE applies SET state = ? WHERE id = ?`, state.Apply.FailedRetryable, parent.ID)
 	require.NoError(t, err)
 	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)

@@ -13,9 +13,19 @@ import "strings"
 // to its lifecycle. Consumers (CLI, TUI, PR templates) handle all states via
 // switch/case with a default fallback for unknown states.
 var Apply = struct {
-	Pending           string
-	Running           string
-	RunningDegraded   string
+	Pending         string
+	Running         string
+	RunningDegraded string
+
+	// Post-copy phases (Spirit): the row copy is done and the engine is
+	// draining its accumulated changeset or verifying the copied data.
+	// These mirror the Task states of the same name so the apply-level
+	// state names the phase the whole apply is in once no table is still
+	// copying rows. All three are running-family (IsRunningApplyState).
+	CatchingUp   string
+	Checksumming string
+	PostChecksum string
+
 	Paused            string
 	Resuming          string
 	WaitingForDeploy  string
@@ -41,9 +51,14 @@ var Apply = struct {
 	CreatingDeployRequest   string
 	ValidatingDeployRequest string
 }{
-	Pending:           "pending",
-	Running:           "running",
-	RunningDegraded:   "running_degraded",
+	Pending:         "pending",
+	Running:         "running",
+	RunningDegraded: "running_degraded",
+
+	CatchingUp:   "catching_up",
+	Checksumming: "checksumming",
+	PostChecksum: "post_checksum",
+
 	Paused:            "paused",
 	Resuming:          "resuming",
 	WaitingForDeploy:  "waiting_for_deploy",
@@ -81,7 +96,14 @@ var Apply = struct {
 //  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
 //  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
 //  11. Any task RUNNING → Apply RUNNING
-//  12. Otherwise → Apply PENDING
+//  12. Any task CATCHING_UP → Apply CATCHING_UP
+//  13. Any task CHECKSUMMING → Apply CHECKSUMMING
+//  14. Any task POST_CHECKSUM → Apply POST_CHECKSUM
+//  15. Otherwise → Apply PENDING
+//
+// The post-copy phases (11–14) surface the least-advanced active phase:
+// while any table is still copying rows the apply is Running; once every
+// active table is draining or verifying, the apply names that phase.
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -136,6 +158,15 @@ func DeriveApplyState(taskStates []string) string {
 	}
 	if counts[Apply.Running] > 0 {
 		return Apply.Running
+	}
+	if counts[Apply.CatchingUp] > 0 {
+		return Apply.CatchingUp
+	}
+	if counts[Apply.Checksumming] > 0 {
+		return Apply.Checksumming
+	}
+	if counts[Apply.PostChecksum] > 0 {
+		return Apply.PostChecksum
 	}
 	return Apply.Pending
 }
@@ -282,11 +313,12 @@ func normalizeApplyState(raw string) string {
 		return Apply.Pending
 	case "RUNNING":
 		return Apply.Running
-	// Checksumming is a table-level (task) state, not an apply state: while one
-	// or more tables verify their copied data, the apply as a whole is still
-	// running. Fold it into Running for the aggregate derivation.
+	case "CATCHING_UP":
+		return Apply.CatchingUp
 	case "CHECKSUMMING":
-		return Apply.Running
+		return Apply.Checksumming
+	case "POST_CHECKSUM":
+		return Apply.PostChecksum
 	case "RUNNING_DEGRADED":
 		return Apply.RunningDegraded
 	case "PAUSED":
@@ -349,15 +381,19 @@ func IsTerminalApplyState(s string) bool {
 }
 
 // IsRunningApplyState reports whether an apply is in a running-family state:
-// running, or running_degraded (a continue rollout still in flight after a
-// sibling deployment failed). Control gates that mean "the apply is actively
-// running" — cutover readiness, start reconciliation, stop/volume eligibility —
-// must use this so a degraded rollout is not mistaken for a non-running apply.
+// running, running_degraded (a continue rollout still in flight after a
+// sibling deployment failed), or one of the post-copy phases (catching_up,
+// checksumming, post_checksum) where the engine is still actively working the
+// change. Control gates that mean "the apply is actively running" — cutover
+// readiness, start reconciliation, stop/volume eligibility — must use this so
+// a degraded rollout or a table draining its changeset is not mistaken for a
+// non-running apply.
 // This is narrower than "active" (non-terminal): pending, waiting_for_cutover,
 // recovering, and other non-terminal states are not running-family.
 // Accepts any format (proto, uppercase, or canonical lowercase).
 func IsRunningApplyState(s string) bool {
-	return IsState(s, Apply.Running, Apply.RunningDegraded)
+	return IsState(s, Apply.Running, Apply.RunningDegraded,
+		Apply.CatchingUp, Apply.Checksumming, Apply.PostChecksum)
 }
 
 // IsSetupPhase returns true if the apply state is an engine-lifecycle phase
