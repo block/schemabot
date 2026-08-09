@@ -5,6 +5,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
 
@@ -18,7 +19,7 @@ type ProgressCmd struct {
 // Run executes the progress command.
 func (cmd *ProgressCmd) Run(g *Globals) error {
 	if cmd.ApplyID == "" {
-		return fmt.Errorf("apply_id is required (use 'schemabot status -d <database>' to find active applies)")
+		return fmt.Errorf("apply_id is required (use '%s status -d <database>' to find active applies)", cliname.Name())
 	}
 
 	ep, err := g.Resolve()

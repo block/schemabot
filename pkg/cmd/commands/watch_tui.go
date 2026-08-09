@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -462,7 +463,7 @@ func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("schemabot progress %s", applyID)
+	cmd := fmt.Sprintf("%s progress %s", cliname.Name(), applyID)
 	if environment != "" {
 		cmd += " -e " + environment
 	}

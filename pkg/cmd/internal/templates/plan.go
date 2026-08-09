@@ -10,6 +10,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/internal/cliname"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -478,7 +479,7 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, sc
 	}
 	fmt.Println("🚨 To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  schemabot apply -s %s -e %s --allow-unsafe\n", schemaDir, environment)
+	fmt.Printf("  %s apply -s %s -e %s --allow-unsafe\n", cliname.Name(), schemaDir, environment)
 	fmt.Println()
 }
 

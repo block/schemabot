@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/cmd/internal/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -796,9 +797,9 @@ func WriteStopSuccess(data StopData) {
 	}
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sCheckpoint saved. Use 'schemabot start -e %s %s' to resume.%s\n", ANSIDim, data.Environment, data.ApplyID, ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use '%s start -e %s %s' to resume.%s\n", ANSIDim, cliname.Name(), data.Environment, data.ApplyID, ANSIReset)
 	} else {
-		fmt.Printf("%sCheckpoint saved. Use 'schemabot start' to resume from where you left off.%s\n", ANSIDim, ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use '%s start' to resume from where you left off.%s\n", ANSIDim, cliname.Name(), ANSIReset)
 	}
 }
 
@@ -856,9 +857,9 @@ func WriteStartNoWatch(applyID, database, environment string) {
 	fmt.Printf("%s%s▶️  Schema change resumed%s\n", ANSIBold, ANSIGreen, ANSIReset)
 	fmt.Println()
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
+		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
 	} else {
-		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
 	}
 }
 
@@ -877,7 +878,7 @@ func WriteReleaseSuccess(data ReleaseData) {
 	fmt.Printf("Environment: %s\n", data.Environment)
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sHeld deployments will resume. Use 'schemabot progress %s' to follow them.%s\n", ANSIDim, data.ApplyID, ANSIReset)
+		fmt.Printf("%sHeld deployments will resume. Use '%s progress %s' to follow them.%s\n", ANSIDim, cliname.Name(), data.ApplyID, ANSIReset)
 	} else {
 		fmt.Printf("%sHeld deployments will resume.%s\n", ANSIDim, ANSIReset)
 	}
@@ -1143,7 +1144,7 @@ func writeStatusListFooter(data StatusListData) {
 		}
 		writeStatusListTruncation(data, item)
 	}
-	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
+	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
 }
 
 func writeFailedStatusList(data StatusListData) {
@@ -1162,7 +1163,7 @@ func writeFailedStatusList(data StatusListData) {
 			statusFailureActor(a, data.ShowExternalID),
 			formatFailureTimestamp(a),
 			compactStatusFailureReason(a.ErrorMessage))
-		fmt.Printf("schemabot status %s\n", a.ApplyID)
+		fmt.Printf("%s status %s\n", cliname.Name(), a.ApplyID)
 	}
 
 	if data.HasMore && data.Limit > 0 {
@@ -1326,7 +1327,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 	}
 
 	fmt.Println()
-	fmt.Printf("%sUse 'schemabot status <apply_id>' to view details%s\n", ANSIDim, ANSIReset)
+	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
 }
 
 // stateColorFunc returns an ANSI color function for the given state.

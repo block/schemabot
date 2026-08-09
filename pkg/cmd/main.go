@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/commands"
+	"github.com/block/schemabot/pkg/cmd/internal/cliname"
 )
 
 // Set by ldflags at build time.
@@ -59,9 +60,15 @@ type CLI struct {
 }
 
 func main() {
+	// Render command hints — and kong's own usage text — with the tool name a
+	// wrapper passes via --cli-name, so wrapper-invoked runs print commands
+	// that work as pasted. Scanned from the raw args because kong's usage name
+	// must be fixed before kong parses; an absent flag keeps the default.
+	cliname.Set(cliname.FromArgs(os.Args[1:]))
+
 	var cli CLI
 	ctx := kong.Parse(&cli,
-		kong.Name("schemabot"),
+		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
 		kong.Vars{"version": fmt.Sprintf("%s (commit: %s)", version, commit)},
