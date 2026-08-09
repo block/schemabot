@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -228,6 +229,9 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 // explicit sslmode — including disable — always wins, and non-RDS hosts are
 // left untouched. Both DSN forms are handled: URL
 // (postgres://user:pass@host/db) and keyword/value (host=... user=...).
+// RDS detection considers only the DSN's first host: a multi-host DSN whose
+// RDS host is a fallback gets no injection, so spell out sslmode explicitly
+// in multi-host DSNs.
 func ConnectionDSN(dsn string) (string, error) {
 	cfg, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -262,18 +266,20 @@ func enhanceURLDSN(dsn string) (string, error) {
 	return u.String(), nil
 }
 
+// keywordSSLMode matches an sslmode keyword in a keyword/value DSN. The
+// keyword parser accepts whitespace around '=', so `sslmode = disable` is a
+// legal, explicit setting and must be detected as such.
+var keywordSSLMode = regexp.MustCompile(`(^|\s)sslmode\s*=`)
+
 // enhanceKeywordDSN appends sslmode=require to a keyword/value DSN unless a
 // sslmode keyword is already present. In the keyword form a repeated keyword's
 // last occurrence wins, so appending is only safe when absent — an explicit
-// sslmode is never overridden. Presence is detected on whitespace-split
-// fields; a quoted value that itself contains " sslmode=" would be a false
-// positive, which fails open to pgx's own defaults rather than overriding the
-// caller.
+// sslmode is never overridden. A quoted value that itself contains " sslmode="
+// would be a false positive, which fails open to pgx's own defaults rather
+// than overriding the caller.
 func enhanceKeywordDSN(dsn string) string {
-	for field := range strings.FieldsSeq(dsn) {
-		if strings.HasPrefix(field, "sslmode=") {
-			return dsn
-		}
+	if keywordSSLMode.MatchString(dsn) {
+		return dsn
 	}
 	return dsn + " sslmode=require"
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,6 +47,21 @@ func TestConnectionDSN(t *testing.T) {
 			name: "RDS keyword host with explicit sslmode is unchanged",
 			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode=disable",
 			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode=disable",
+		},
+		{
+			name: "RDS keyword host with sslmode = disable (spaces around =) is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = disable",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = disable",
+		},
+		{
+			name: "RDS keyword host with sslmode = verify-full (spaces around =) is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = verify-full",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode = verify-full",
+		},
+		{
+			name: "RDS keyword host with sslmode =disable (space before =) is unchanged",
+			dsn:  "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode =disable",
+			want: "host=database.cluster-abc123.us-west-2.rds.amazonaws.com user=schemabot password=secret dbname=app sslmode =disable",
 		},
 		{
 			name: "non-RDS URL host is unchanged",
@@ -181,6 +197,63 @@ func TestReloadableConnectorIgnoresNonAuthErrors(t *testing.T) {
 	require.ErrorIs(t, err, dialErr)
 	assert.False(t, reloadCalled, "a non-authentication failure must not trigger a reload")
 	assert.Equal(t, []string{"old"}, *passwords)
+}
+
+func TestReloadableConnectorSurfacesRetryFailure(t *testing.T) {
+	passwords := fakeDial(t, []error{authError(), authError()})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+		reloads.Add(1)
+		return "postgres://schemabot:rotated@localhost:5432/app", nil
+	})
+
+	// The reload succeeds but the retry dial is also rejected — for example a
+	// reloaded secret that is itself stale. The retry's error surfaces and the
+	// reload runs exactly once for the failed attempt.
+	conn, err := c.Connect(t.Context())
+	require.Error(t, err)
+	assert.Nil(t, conn)
+	assert.Contains(t, err.Error(), "password authentication failed")
+	assert.Equal(t, []string{"old", "rotated"}, *passwords, "the retry dials with the reloaded credentials")
+	assert.Equal(t, int32(1), reloads.Load())
+}
+
+func TestReloadableConnectorReloadReappliesOptionsAndNormalization(t *testing.T) {
+	// The reloaded raw DSN gets the same treatment as the boot DSN: caller
+	// options are re-applied and an RDS host gets TLS injected.
+	opts := []Option{WithConnectTimeout(7 * time.Second)}
+	cfg, err := connectionConfig("postgres://schemabot:old@localhost:5432/app", opts...)
+	require.NoError(t, err)
+	c := &reloadableConnector{cfg: cfg, opts: opts, reload: func() (string, error) {
+		return "postgres://schemabot:rotated@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", nil
+	}}
+
+	fresh, ok := c.refresh(0)
+	require.True(t, ok)
+	assert.Equal(t, "rotated", fresh.Password)
+	assert.Equal(t, 7*time.Second, fresh.ConnectTimeout, "options must flow through the reload path")
+	assert.NotNil(t, fresh.TLSConfig, "a reloaded RDS DSN must get sslmode=require injected")
+}
+
+func TestReloadableConnectorRefreshConcurrent(t *testing.T) {
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+		reloads.Add(1)
+		return "postgres://schemabot:rotated@localhost:5432/app", nil
+	})
+
+	// Concurrent dials that failed on the same generation trigger exactly one
+	// reload; the rest reuse the swapped config.
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			cfg, ok := c.refresh(0)
+			assert.True(t, ok)
+			assert.Equal(t, "rotated", cfg.Password)
+		})
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), reloads.Load(), "concurrent same-generation failures must reload once")
 }
 
 func TestReloadableConnectorReloadCooldown(t *testing.T) {
