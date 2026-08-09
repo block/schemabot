@@ -412,7 +412,7 @@ func revertWindowCountdown(revertExpiresAt string) string {
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
-// showing how many tables are ready to complete vs still catching up.
+// showing how many tables are ready for cutover vs not yet ready.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := 0
 	total := len(tables)

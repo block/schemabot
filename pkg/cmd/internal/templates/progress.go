@@ -518,7 +518,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
-	case state.Apply.WaitingForCutover:
+	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)
 		if t.DDL != "" {
