@@ -452,7 +452,7 @@ func TestDurableIssueCommentDriverAnswersApplyThroughCore(t *testing.T) {
 	}
 	require.Empty(t, store.failed)
 	body := requireComment(t, comments, "environment-not-configured apply answer")
-	require.Contains(t, body, `database "orders" environment "staging" is not configured on this server`)
+	require.Contains(t, body, `database &#34;orders&#34; environment &#34;staging&#34; is not configured on this server`)
 }
 
 // durableUnlockDriverStorage augments the durable-driver storage with the

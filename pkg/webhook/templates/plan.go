@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
@@ -733,9 +734,18 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 }
 
 func writeErrors(sb *strings.Builder, errors []string) {
-	sb.WriteString("**Errors**:\n")
+	var msgs []string
 	for _, errMsg := range errors {
-		fmt.Fprintf(sb, "- %s\n", errMsg)
+		if msg := sanitizeInlineError(errMsg); msg != "" {
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	sb.WriteString("**Errors**:\n")
+	for _, msg := range msgs {
+		fmt.Fprintf(sb, "- %s\n", html.EscapeString(msg))
 	}
 	sb.WriteString("\n")
 }

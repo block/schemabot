@@ -135,3 +135,25 @@ func TestRenderShardedApplyComment_Rollback(t *testing.T) {
 	assert.Contains(t, out, "## Rollback Status")
 	assert.NotContains(t, out, "Schema Change Status")
 }
+
+// A failed shard's raw engine error can carry internal endpoints, newlines, and
+// table-cell separators. Both places it renders — the lifted first-failure line
+// and the shard's status cell — must redact endpoints and keep the message on
+// one Markdown line so it cannot break the comment layout.
+func TestRenderShardedApplyComment_FailedErrorSanitized(t *testing.T) {
+	const failErr = "dial tcp db-primary.internal:3306: connect refused\nretry | later"
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — dial tcp [endpoint redacted]: connect refused retry | later\n",
+		"the first-failure line stays on one line")
+	assert.Contains(t, out, "| `-40` | ❌ failed — dial tcp [endpoint redacted]: connect refused retry / later |",
+		"the status cell neutralizes the cell separator")
+}

@@ -161,11 +161,12 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 		return
 	}
 	name := html.EscapeString(failure.Deployment)
-	if failure.Error == "" {
+	msg := sanitizeInlineError(failure.Error)
+	if msg == "" {
 		fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code>\n", name)
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(failure.Error))
+	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived

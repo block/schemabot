@@ -128,3 +128,22 @@ func TestRenderBlockedChangesApplyRejected(t *testing.T) {
 	assert.NotContains(t, out, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	assert.NotContains(t, out, "retry", "no retry of this command can succeed")
 }
+
+// An engine refusal reason is untrusted error text: endpoints are redacted,
+// the reason stays on one line, and HTML is escaped so it cannot inject markup.
+func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
+	out := RenderBlockedChangesApplyRejected(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY"},
+		}},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "users", Reason: "refused by db-primary.internal:3306\n<details> & more"},
+		},
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "`users`: refused by [endpoint redacted] &lt;details&gt; &amp; more\n",
+		"the reason stays on one line with HTML escaped")
+}

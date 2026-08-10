@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 	"time"
 
@@ -183,8 +184,8 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
-		if c.Reason != "" {
-			fmt.Fprintf(&sb, "- %s: %s\n", table, c.Reason)
+		if reason := sanitizeInlineError(c.Reason); reason != "" {
+			fmt.Fprintf(&sb, "- %s: %s\n", table, html.EscapeString(reason))
 		} else {
 			fmt.Fprintf(&sb, "- %s\n", table)
 		}
