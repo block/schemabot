@@ -378,7 +378,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		e.logger.Info("deferring deploy — user must trigger via cutover",
 			"database", req.Database,
 			"deploy_request", dr.Number,
-			"instant_eligible", useInstant,
+			"use_instant", useInstant,
 		)
 		meta, encErr := encodePSMetadata(&psMetadata{
 			BranchName:            branchName,
