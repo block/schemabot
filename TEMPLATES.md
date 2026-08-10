@@ -42,7 +42,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-🎯 **Lint Warnings**: **2** advisory findings
+💡 **Lint Warnings**: **2** advisory findings
 - `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
 - `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
@@ -75,7 +75,7 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 ```
 
 <details>
-<summary>🎯 <b>Lint Warnings</b>: <b>6</b> advisory findings</summary>
+<summary>💡 <b>Lint Warnings</b>: <b>6</b> advisory findings</summary>
 
 **`orders`**
 - Primary key column `order_ref` has type `varchar`
@@ -825,7 +825,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
-🎯 **Lint Warnings**: **2** advisory findings
+💡 **Lint Warnings**: **2** advisory findings
 - `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
 - `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
@@ -1281,7 +1281,7 @@ That command wasn't recognized. Available commands:
      ~ products
        ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
-🎯 Lint Warnings (2):
+💡 Lint Warnings (2):
   • orders: has_float: New column uses floating-point data type
   • users: no_default: Column added without DEFAULT value
 
@@ -1482,7 +1482,7 @@ Production
      ~ products
        ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
-🎯 Lint Warnings (2):
+💡 Lint Warnings (2):
   • orders: has_float: New column uses floating-point data type
   • users: no_default: Column added without DEFAULT value
 
@@ -7400,7 +7400,7 @@ Tables are being renamed atomically...
 
 Lint violations: Non-blocking warnings during plan/apply
 
-🎯 Lint Warnings (2):
+💡 Lint Warnings (2):
   • orders: has_float: New column uses floating-point data type
   • users: no_default: Column added without DEFAULT value
 

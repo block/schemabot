@@ -734,7 +734,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	n := len(warnings)
 
 	if n <= lintWarningsFoldThreshold {
-		fmt.Fprintf(sb, "\U0001f3af **Lint Warnings**: **%d** advisory %s\n", n, pluralize("finding", n))
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: **%d** advisory %s\n", n, pluralize("finding", n))
 		for _, w := range warnings {
 			message := ui.CodeQuoteIdentifiers(w.Message)
 			if w.Table != "" {
@@ -749,7 +749,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary>\U0001f3af <b>Lint Warnings</b>: <b>%d</b> advisory %s</summary>\n\n", n, pluralize("finding", n))
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: <b>%d</b> advisory %s</summary>\n\n", n, pluralize("finding", n))
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**`%s`**\n", group.table)

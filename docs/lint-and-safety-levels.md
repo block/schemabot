@@ -27,7 +27,7 @@ From most to least severe:
 | ⛔ | **Cannot apply** | The schema-change engine refuses the statement outright | Always — the apply would fail | None. Rewrite the change |
 | ⚠️ | **Issues** | Unsafe (destructive) changes detected | Yes, until acknowledged | `--allow-unsafe` |
 | ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema-change engine | No — it is a consent disclosure | Confirming the apply consents |
-| 🎯 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |
+| 💡 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |
 
 The first two are safety gates. Direct execution is not a severity — it is a
 disclosure of *how* certain statements will run (blocking, non-revertible; see
@@ -49,7 +49,7 @@ severities:
   position, a redundant index.
 - **info** — informational observations about the schema.
 
-Warning- and info-severity findings render together in the 🎯 **Lint Warnings**
+Warning- and info-severity findings render together in the 💡 **Lint Warnings**
 section. There is deliberately no "lint errors" section on the plan comment:
 an error-severity finding *is* an unsafe change, so it surfaces through the
 Issues section and its gate instead of being listed twice.
@@ -59,7 +59,7 @@ lint finding
     │
     ├─ severity=error ──────▶ ⚠️ Issues (unsafe change; gate: --allow-unsafe)
     │
-    └─ severity=warning/info ▶ 🎯 Lint Warnings (advisory; never gates)
+    └─ severity=warning/info ▶ 💡 Lint Warnings (advisory; never gates)
 ```
 
 ## What "unsafe" means
@@ -121,7 +121,7 @@ rejected up front while they are present.
 | ⚠️ | Plan comment (**Issues**) | Caution: unsafe changes to review before applying |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
-| 🎯 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
+| 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
 | ✅ | Plan comment | No schema changes detected |
 
 Presentation notes:
