@@ -1585,6 +1585,19 @@ func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 		attribute.String("repository", repo))
 }
 
+// RecordWebhookReconcileSynthesizedEvent counts inbox deliveries the webhook
+// reconciler synthesized for open PR heads whose organic delivery never
+// reached the inbox. Each synthesized delivery re-plans the PR through the
+// durable dispatch path, so a nonzero rate means lost deliveries are being
+// recovered automatically — investigate the upstream loss (edge auth, GitHub
+// send failures) rather than the recovery.
+func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_synthesized_events_total",
+		"Total number of webhook inbox deliveries synthesized for open PR heads missing one", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
 // RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
 // reconciler terminated because they were parked in processing with an expired
 // lease at the attempt cap — a driver hard-killed on its final attempt. A

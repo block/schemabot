@@ -167,11 +167,12 @@ type Handler struct {
 	// the count to zero. Nil when no drain is waiting.
 	inProcessWebhookDrained chan struct{}
 
-	webhookReconciler        bool
-	webhookReconcileInterval time.Duration
-	webhookReconcileLookback time.Duration
-	webhookReconcileGrace    time.Duration
-	webhookReconcileMaxPages int
+	webhookReconciler         bool
+	webhookReconcileSynthesis bool
+	webhookReconcileInterval  time.Duration
+	webhookReconcileLookback  time.Duration
+	webhookReconcileGrace     time.Duration
+	webhookReconcileMaxPages  int
 
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
@@ -205,14 +206,26 @@ func WithDurableWebhookDispatch() HandlerOption {
 // WithWebhookReconciler enables the webhook reconciliation loop. It does two
 // things per pass: (1) an active stuck-processing sweep that terminalizes inbox
 // rows wedged past the attempt cap so they emit failures and become
-// redeliverable, and (2) a report-only scan of recently updated open PRs in
-// registered repositories that reports PR heads with no corresponding inbox
-// delivery (no rows are synthesized). Only the missing-delivery scan is
-// report-only. It takes effect alongside WithDurableWebhookDispatch, whose
+// redeliverable, and (2) a scan of recently updated open PRs in registered
+// repositories that detects PR heads with no corresponding inbox delivery. The
+// missing-delivery scan is report-only unless WithWebhookReconcileSynthesis is
+// also set. It takes effect alongside WithDurableWebhookDispatch, whose
 // lifecycle it shares.
 func WithWebhookReconciler() HandlerOption {
 	return func(h *Handler) {
 		h.webhookReconciler = true
+	}
+}
+
+// WithWebhookReconcileSynthesis makes the reconciler's missing-delivery scan
+// enforcing: for each open PR head with no inbox delivery it synthesizes a
+// pull_request-equivalent inbox row (delivery GUID "recon:<repo>#<pr>@<sha>",
+// naturally deduped) that the durable dispatcher plans through the ordinary
+// auto-plan flow. Without this option the scan only reports misses. It takes
+// effect only alongside WithWebhookReconciler.
+func WithWebhookReconcileSynthesis() HandlerOption {
+	return func(h *Handler) {
+		h.webhookReconcileSynthesis = true
 	}
 }
 
