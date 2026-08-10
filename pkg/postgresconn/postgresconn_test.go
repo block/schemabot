@@ -69,6 +69,14 @@ func TestConnectionDSN(t *testing.T) {
 			want: "postgres://schemabot:secret@localhost:5432/app",
 		},
 		{
+			// RDS detection considers only the first host, so a multi-host
+			// DSN whose RDS host is a fallback gets no injection — spell out
+			// sslmode explicitly for multi-host DSNs.
+			name: "multi-host DSN with RDS fallback host gets no injection",
+			dsn:  "postgres://schemabot:secret@localhost:5432,database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app",
+			want: "postgres://schemabot:secret@localhost:5432,database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app",
+		},
+		{
 			name: "non-RDS keyword host is unchanged",
 			dsn:  "host=localhost user=schemabot password=secret dbname=app",
 			want: "host=localhost user=schemabot password=secret dbname=app",
@@ -233,6 +241,9 @@ func TestReloadableConnectorReloadReappliesOptionsAndNormalization(t *testing.T)
 	assert.Equal(t, "rotated", fresh.Password)
 	assert.Equal(t, 7*time.Second, fresh.ConnectTimeout, "options must flow through the reload path")
 	assert.NotNil(t, fresh.TLSConfig, "a reloaded RDS DSN must get sslmode=require injected")
+	// sslmode=prefer would also set TLSConfig but keep a plaintext fallback;
+	// require is distinguished by that fallback's absence.
+	assert.Empty(t, fresh.Fallbacks, "sslmode=require must not leave a plaintext fallback")
 }
 
 func TestReloadableConnectorRefreshConcurrent(t *testing.T) {
@@ -254,6 +265,42 @@ func TestReloadableConnectorRefreshConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 	assert.Equal(t, int32(1), reloads.Load(), "concurrent same-generation failures must reload once")
+}
+
+// A reload that succeeds but returns credentials the server still rejects
+// arms the cooldown too: without it, each rejected dial advances the
+// generation and triggers a fresh resolve — one per new connection — for as
+// long as the secret store keeps answering with a refused credential.
+func TestReloadableConnectorArmsCooldownWhenReloadedCredentialsRejected(t *testing.T) {
+	passwords := fakeDial(t, []error{authError(), authError(), authError(), authError(), authError()})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+		reloads.Add(1)
+		return "postgres://schemabot:stale@localhost:5432/app", nil
+	})
+	clock := time.Now()
+	c.now = func() time.Time { return clock }
+
+	// The dial fails, the reload succeeds, and the retry is rejected too:
+	// the cooldown arms.
+	_, err := c.Connect(t.Context())
+	require.Error(t, err)
+	require.Equal(t, int32(1), reloads.Load())
+	assert.Equal(t, []string{"old", "stale"}, *passwords)
+
+	// The next rejected dial surfaces without another resolve.
+	_, err = c.Connect(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, int32(1), reloads.Load(), "a rejected reloaded credential must not cost one resolve per connection")
+	assert.Equal(t, []string{"old", "stale", "stale"}, *passwords)
+
+	// After the window elapses the reload is retried; another rejected retry
+	// re-arms the cooldown.
+	clock = clock.Add(reloadCooldown)
+	_, err = c.Connect(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, int32(2), reloads.Load())
+	assert.Equal(t, []string{"old", "stale", "stale", "stale", "stale"}, *passwords)
 }
 
 func TestReloadableConnectorReloadCooldown(t *testing.T) {

@@ -98,6 +98,11 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 // fails, further authentication-failed dials within this window surface their
 // dial error without invoking reload again, so a secrets-backend outage costs
 // at most one resolve attempt per window instead of one per rejected dial.
+// The window is also armed when a reload succeeds but the dial retrying with
+// the reloaded credentials is rejected too — a backend that keeps answering
+// with a credential the server refuses (stale secret sync, dropped role,
+// pg_hba mismatch) likewise costs one resolve per window, not one per
+// connection.
 const reloadCooldown = 30 * time.Second
 
 // reloadableConnector dials with the most recently resolved credentials and
@@ -130,7 +135,25 @@ func (c *reloadableConnector) Connect(ctx context.Context) (driver.Conn, error) 
 		// Reload failed; surface the authentication error that triggered it.
 		return nil, err
 	}
-	return connectConfig(ctx, *fresh)
+	conn, err = connectConfig(ctx, *fresh)
+	if err != nil && isAuthError(err) {
+		// The freshly resolved credentials are no better: the secret store
+		// keeps answering with a credential the server refuses. Arm the
+		// cooldown so subsequent rejected dials back off instead of
+		// resolving once per connection.
+		c.armReloadCooldown()
+		slog.Warn("dial with reloaded storage credentials was also rejected; backing off further reloads", "error", err)
+	}
+	return conn, err
+}
+
+// armReloadCooldown starts a reloadCooldown window as if a reload had failed,
+// bounding resolve traffic when reloads succeed but the credentials they
+// return keep being rejected.
+func (c *reloadableConnector) armReloadCooldown() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastReloadFail = c.clock()
 }
 
 func (c *reloadableConnector) Driver() driver.Driver { return stdlib.GetDefaultDriver() }
