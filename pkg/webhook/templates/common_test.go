@@ -88,6 +88,32 @@ func TestSanitizeCommentError(t *testing.T) {
 	})
 }
 
+func TestSanitizeInlineError(t *testing.T) {
+	t.Run("newlines collapse so the error cannot escape its line", func(t *testing.T) {
+		assert.Equal(t, "line one line two", sanitizeInlineError("line one\nline two"))
+	})
+
+	t.Run("endpoints are redacted", func(t *testing.T) {
+		got := sanitizeInlineError("dial tcp db-primary.internal:3306: connection refused")
+		assert.NotContains(t, got, "db-primary.internal")
+		assert.Contains(t, got, "[endpoint redacted]")
+	})
+
+	t.Run("whitespace-only input is empty", func(t *testing.T) {
+		assert.Empty(t, sanitizeInlineError(" \n\t "))
+	})
+}
+
+func TestSanitizeCellError(t *testing.T) {
+	t.Run("cell separators are neutralized", func(t *testing.T) {
+		assert.Equal(t, "left / right", sanitizeCellError("left | right"))
+	})
+
+	t.Run("newlines collapse so the error cannot break the table row", func(t *testing.T) {
+		assert.Equal(t, "a b", sanitizeCellError("a\nb"))
+	})
+}
+
 func TestWriteErrorBlock(t *testing.T) {
 	t.Run("multi-line error stays inside the blockquote", func(t *testing.T) {
 		var sb strings.Builder

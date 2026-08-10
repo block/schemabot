@@ -345,3 +345,13 @@ func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 			"%s body should not start with whitespace", name)
 	}
 }
+
+// The rollback-rejection reason can carry raw engine error text with internal
+// endpoints and newlines; the rendered comment must redact endpoints and keep
+// the reason on one line.
+func TestRenderRollbackNotAcceptedSanitizesError(t *testing.T) {
+	rendered := RenderRollbackNotAccepted("testapp", "staging",
+		"dial tcp db-primary.internal:3306: refused\nsecond line")
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "The rollback was not accepted: dial tcp [endpoint redacted]: refused second line")
+}

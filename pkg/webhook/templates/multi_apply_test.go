@@ -586,3 +586,22 @@ func TestRenderMultiDeploymentApplyComment_Rollback(t *testing.T) {
 	assert.Contains(t, summary, "## ⏪ Rollback Complete")
 	assert.NotContains(t, summary, "Schema Change Applied")
 }
+
+// A failed deployment's raw engine error can carry internal endpoints and
+// newlines. The lifted first-failure line must redact endpoints and stay on one
+// Markdown line so the error cannot escape the blockquote.
+func TestRenderMultiDeploymentApplyComment_FirstFailureErrorSanitized(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		firstFailingOp("us", so.Failed, "dial tcp db-primary.internal:3306: refused\nsecond line"),
+		continuingOp("eu", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — dial tcp [endpoint redacted]: refused second line\n",
+		"the first-failure line stays on one line")
+}

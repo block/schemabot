@@ -735,7 +735,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 func writeErrors(sb *strings.Builder, errors []string) {
 	sb.WriteString("**Errors**:\n")
 	for _, errMsg := range errors {
-		fmt.Fprintf(sb, "- %s\n", errMsg)
+		fmt.Fprintf(sb, "- %s\n", sanitizeInlineError(errMsg))
 	}
 	sb.WriteString("\n")
 }

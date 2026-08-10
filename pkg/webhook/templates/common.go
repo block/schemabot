@@ -190,6 +190,21 @@ func sanitizeCommentError(msg string) string {
 	return msg
 }
 
+// sanitizeInlineError makes an untrusted error safe for a single-line comment
+// context — a list item or an inline "— …" suffix: full comment sanitization
+// plus collapsing whitespace runs (including line breaks) so the message
+// cannot escape the enclosing Markdown line.
+func sanitizeInlineError(msg string) string {
+	return strings.Join(strings.Fields(sanitizeCommentError(msg)), " ")
+}
+
+// sanitizeCellError makes an untrusted error safe for a Markdown table cell:
+// single-line sanitization plus neutralizing the cell separator so the error
+// cannot break the table layout.
+func sanitizeCellError(msg string) string {
+	return strings.ReplaceAll(sanitizeInlineError(msg), "|", "/")
+}
+
 // quoteBlockLines keeps a multi-line message inside a Markdown blockquote by
 // prefixing continuation lines with the quote marker, so engine errors cannot
 // escape into the surrounding comment structure.

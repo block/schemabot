@@ -176,3 +176,21 @@ func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
 	assert.Contains(t, out, "`mutes` (shard `40-80`)", "the unsafe change names the shard it applies to")
 	assert.Contains(t, out, "DROP COLUMN `x`", "the drop is shown in that shard's combined ALTER")
 }
+
+// Plan errors can carry raw engine text with internal endpoints and newlines.
+// Each rendered error bullet must redact endpoints and stay on one Markdown
+// line so an error cannot escape its list item.
+func TestRenderPlanComment_ErrorsSanitized(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{"dial tcp db-primary.internal:3306: refused\nsecond line"},
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "- dial tcp [endpoint redacted]: refused second line\n",
+		"the error bullet stays on one line")
+}

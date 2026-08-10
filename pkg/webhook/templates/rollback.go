@@ -225,5 +225,5 @@ func RenderRollbackNotAccepted(database, environment, errorMessage string) strin
 	return fmt.Sprintf("## Rollback Not Accepted\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+
 		"The rollback was not accepted: %s",
-		database, environment, errorMessage)
+		database, environment, sanitizeInlineError(errorMessage))
 }

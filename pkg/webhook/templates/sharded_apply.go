@@ -241,10 +241,10 @@ func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
 			continue
 		}
 		shard := html.EscapeString(s.Shard)
-		if s.Error == "" {
+		if msg := sanitizeInlineError(s.Error); msg == "" {
 			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code>\n", shard)
 		} else {
-			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(s.Error))
+			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))
 		}
 		return
 	}
@@ -268,8 +268,10 @@ func shardStatusCell(s ShardStatus) string {
 	if s.Emoji != "" {
 		cell = fmt.Sprintf("%s %s", s.Emoji, cell)
 	}
-	if isShardFailureState(s.State) && s.Error != "" {
-		cell = fmt.Sprintf("%s — %s", cell, html.EscapeString(s.Error))
+	if isShardFailureState(s.State) {
+		if msg := sanitizeCellError(s.Error); msg != "" {
+			cell = fmt.Sprintf("%s — %s", cell, html.EscapeString(msg))
+		}
 	}
 	return cell
 }
