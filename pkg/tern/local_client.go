@@ -261,7 +261,15 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	var psEngine engine.Engine
 	var psClientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)
 	if cfg.Type == storage.DatabaseTypeVitess {
+		// api_url is optional in a database's configuration and names a private or
+		// emulated endpoint when it is set. Absent, the database is a real
+		// PlanetScale one, so fall back to the public endpoint the way the
+		// inventory-resolved path does — the client needs a base URL to address
+		// the API directly, and leaving it empty would refuse every apply.
 		apiURL := cfg.Metadata["api_url"]
+		if apiURL == "" {
+			apiURL = inventory.DefaultPlanetScaleAPIURL
+		}
 		psClientFunc = func(tokenName, tokenValue string) (psclient.PSClient, error) {
 			return psclient.NewPSClientWithBaseURL(tokenName, tokenValue, apiURL)
 		}
