@@ -575,17 +575,43 @@ func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.A
 // Fails closed, including when the setting cannot be read — the deploy has not
 // started, so refusing costs a re-run, while proceeding costs the decision the
 // operator kept for themselves.
+//
+// A read that does not answer is read again before it is treated as a refusal.
+// Auto-cutover on is an answer and stops the deploy immediately; anything else —
+// a request that did not arrive, a response carrying no deployment, a body that
+// did not decode — leaves the question open, and none of those can be told apart
+// from a moment's lag from here. Seconds of re-reading is cheap next to failing
+// an apply that would have been fine, and a gate that refuses at random is one
+// operators learn to re-run past, which is how a gate stops being one.
 func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient, org, database string, number uint64) error {
-	autoCutover, err := client.DeployRequestAutoCutover(ctx, org, database, number)
-	if err != nil {
-		return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, err)
+	const maxAttempts = 3
+	const pollInterval = 2 * time.Second
+
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and reading the cutover setting was interrupted: %w", number, ctx.Err())
+			case <-time.After(pollInterval):
+			}
+		}
+
+		autoCutover, err := client.DeployRequestAutoCutover(ctx, org, database, number)
+		if err != nil {
+			lastErr = err
+			e.logger.Warn("could not read the deploy request's cutover setting, reading again before refusing the deploy",
+				"database", database, "deploy_request", number, "attempt", attempt+1, "error", err)
+			continue
+		}
+		if autoCutover {
+			return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
+		}
+		e.logger.Info("the deploy request holds the cutover for the operator",
+			"database", database, "deploy_request", number, "attempts", attempt+1)
+		return nil
 	}
-	if autoCutover {
-		return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
-	}
-	e.logger.Info("the deploy request holds the cutover for the operator",
-		"database", database, "deploy_request", number)
-	return nil
+	return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, lastErr)
 }
 
 // useInstantDDL decides whether to run an eligible schema change as instant DDL.

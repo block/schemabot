@@ -170,15 +170,23 @@ func (c *deployRequestRecorderClient) CreateDeployRequest(_ context.Context, req
 }
 
 // autoCutoverReportingClient answers what the backend holds for a deploy
-// request, or fails to answer at all.
+// request. When err is set it is returned instead of an answer: for the first
+// failures reads when failures is positive, and for every read otherwise. reads
+// counts every read it was asked for.
 type autoCutoverReportingClient struct {
 	psclient.PSClient
 	autoCutover bool
 	err         error
+	failures    int
+	reads       int
 }
 
 func (c *autoCutoverReportingClient) DeployRequestAutoCutover(_ context.Context, _, _ string, _ uint64) (bool, error) {
-	return c.autoCutover, c.err
+	c.reads++
+	if c.err != nil && (c.failures <= 0 || c.reads <= c.failures) {
+		return false, c.err
+	}
+	return c.autoCutover, nil
 }
 
 // SchemaBot is the sole cutover actor: deploy requests are created with
@@ -237,19 +245,54 @@ func TestVerifyCutoverHeld(t *testing.T) {
 	})
 
 	t.Run("a backend that would cut over on its own stops the deploy", func(t *testing.T) {
-		err := e.verifyCutoverHeld(t.Context(), &autoCutoverReportingClient{autoCutover: true}, "org", "mydb", 132)
+		client := &autoCutoverReportingClient{autoCutover: true}
+
+		err := e.verifyCutoverHeld(t.Context(), client, "org", "mydb", 132)
+
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "#132 was not deployed")
 		assert.Contains(t, err.Error(), "swap the schema on its own")
 		assert.Contains(t, err.Error(), "re-run the schema change")
+		assert.Equal(t, 1, client.reads, "auto-cutover on is an answer, so it is not read again")
 	})
 
 	t.Run("an unreadable setting stops the deploy", func(t *testing.T) {
-		err := e.verifyCutoverHeld(t.Context(), &autoCutoverReportingClient{err: errors.New("deploy request read timed out")}, "org", "mydb", 132)
+		client := &autoCutoverReportingClient{err: errors.New("deploy request read timed out")}
+
+		err := e.verifyCutoverHeld(t.Context(), client, "org", "mydb", 132)
+
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "#132 was not deployed")
 		assert.Contains(t, err.Error(), "could not confirm the cutover is held")
 		assert.Contains(t, err.Error(), "deploy request read timed out")
+		assert.Greater(t, client.reads, 1, "a read that does not answer is read again before it refuses")
+	})
+
+	// A read that answers on a later attempt is an answer. Refusing on the first
+	// one would fail an apply whose cutover was held all along, and a gate that
+	// refuses at random is one operators learn to re-run past.
+	t.Run("a setting that reads on a retry deploys", func(t *testing.T) {
+		client := &autoCutoverReportingClient{
+			autoCutover: false,
+			err:         psclient.ErrDeploymentNotReported,
+			failures:    1,
+		}
+
+		err := e.verifyCutoverHeld(t.Context(), client, "org", "mydb", 132)
+
+		require.NoError(t, err)
+		assert.Equal(t, 2, client.reads)
+	})
+
+	t.Run("a cancelled context stops the deploy", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		err := e.verifyCutoverHeld(ctx, &autoCutoverReportingClient{err: errors.New("deploy request read timed out")}, "org", "mydb", 132)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "#132 was not deployed")
+		assert.ErrorIs(t, err, context.Canceled)
 	})
 }
 

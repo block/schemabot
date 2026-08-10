@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -265,6 +266,19 @@ func (w *psClientWrapper) CreateDeployRequest(ctx context.Context, req *ps.Creat
 	return dr, nil
 }
 
+// ErrDeploymentNotReported is returned when a deploy request carries no
+// deployment object, so there is no cutover setting to read at all. A read that
+// arrived before the backend filled the deployment in, or came back partial,
+// looks like this.
+var ErrDeploymentNotReported = errors.New("deploy request reports no deployment")
+
+// ErrAutoCutoverNotReported is returned when a deploy request carries a
+// deployment that does not report the cutover setting. The backend answered and
+// the field this package reads was not in the answer, which is a different thing
+// from having nothing to read: the shape being decoded no longer matches what
+// the API sends.
+var ErrAutoCutoverNotReported = errors.New("deployment reports no auto_cutover setting")
+
 // DeployRequestAutoCutover reads back the cutover setting the backend holds for
 // a deploy request.
 //
@@ -290,8 +304,11 @@ func (w *psClientWrapper) DeployRequestAutoCutover(ctx context.Context, org, dat
 	if err := json.Unmarshal(respBody, &payload); err != nil {
 		return false, fmt.Errorf("decode auto_cutover for %s/%s deploy request #%d: %w", org, database, number, err)
 	}
-	if payload.Deployment == nil || payload.Deployment.AutoCutover == nil {
-		return false, fmt.Errorf("%s/%s deploy request #%d reports no auto_cutover setting", org, database, number)
+	if payload.Deployment == nil {
+		return false, fmt.Errorf("read auto_cutover for %s/%s deploy request #%d: %w", org, database, number, ErrDeploymentNotReported)
+	}
+	if payload.Deployment.AutoCutover == nil {
+		return false, fmt.Errorf("read auto_cutover for %s/%s deploy request #%d: %w", org, database, number, ErrAutoCutoverNotReported)
 	}
 	return *payload.Deployment.AutoCutover, nil
 }

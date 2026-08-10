@@ -178,14 +178,19 @@ func TestDeployRequestAutoCutoverReadsTheDeploymentSetting(t *testing.T) {
 }
 
 // A caller reads this setting precisely because it cannot assume one, so a
-// response that omits it is an error rather than a default.
+// response that omits it is an error rather than a default. Having no deployment
+// to read and having a deployment that does not report the setting are separate
+// causes: the first is a read with nothing in it yet, the second is the API
+// answering in a shape this no longer matches, and an operator triaging a
+// refused deploy needs to know which one they are looking at.
 func TestDeployRequestAutoCutoverRefusesAnUnreportedSetting(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		body string
+		want error
 	}{
-		{"no deployment yet", `{"number":132}`},
-		{"deployment without the setting", `{"number":132,"deployment":{"state":"ready"}}`},
+		{"no deployment to read", `{"number":132}`, ErrDeploymentNotReported},
+		{"deployment without the setting", `{"number":132,"deployment":{"state":"ready"}}`, ErrAutoCutoverNotReported},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client, err := NewPSClientWithBaseURL("token-name", "token-value", autoCutoverServer(t, tc.body).URL)
@@ -194,8 +199,9 @@ func TestDeployRequestAutoCutoverRefusesAnUnreportedSetting(t *testing.T) {
 			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
 
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "reports no auto_cutover setting")
+			assert.ErrorIs(t, err, tc.want)
 			assert.Contains(t, err.Error(), "orders")
+			assert.Contains(t, err.Error(), "#132")
 		})
 	}
 }
