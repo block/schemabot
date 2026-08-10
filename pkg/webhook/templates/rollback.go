@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
@@ -139,12 +140,11 @@ func RenderRollbackRejected(data RollbackRejectedData) string {
 	return sb.String()
 }
 
+// sanitizedRollbackRejectionReason makes an untrusted rejection reason safe
+// inside the `**Reason**: `...“ code span: full inline sanitization plus
+// neutralizing backticks so the reason cannot close the span.
 func sanitizedRollbackRejectionReason(reason string) string {
-	fields := strings.Fields(reason)
-	if len(fields) == 0 {
-		return ""
-	}
-	return strings.ReplaceAll(strings.Join(fields, " "), "`", "'")
+	return strings.ReplaceAll(sanitizeInlineError(reason), "`", "'")
 }
 
 // RenderRollbackBlockedByLock renders the message posted when a rollback cannot
@@ -222,8 +222,10 @@ func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, t
 // RenderRollbackNotAccepted renders the message posted when the apply service
 // rejects a rollback request (e.g. plan not found, validation error).
 func RenderRollbackNotAccepted(database, environment, errorMessage string) string {
-	return fmt.Sprintf("## Rollback Not Accepted\n\n"+
-		"**Database**: `%s` | **Environment**: `%s`\n\n"+
-		"The rollback was not accepted: %s",
-		database, environment, sanitizeInlineError(errorMessage))
+	header := fmt.Sprintf("## Rollback Not Accepted\n\n"+
+		"**Database**: `%s` | **Environment**: `%s`\n\n", database, environment)
+	if msg := sanitizeInlineError(errorMessage); msg != "" {
+		return header + "The rollback was not accepted: " + html.EscapeString(msg)
+	}
+	return header + "The rollback was not accepted."
 }

@@ -194,3 +194,42 @@ func TestRenderPlanComment_ErrorsSanitized(t *testing.T) {
 	assert.Contains(t, out, "- dial tcp [endpoint redacted]: refused second line\n",
 		"the error bullet stays on one line")
 }
+
+// An error entry that sanitizes to nothing renders no bullet, and a plan whose
+// errors all sanitize to nothing renders no Errors section at all.
+func TestRenderPlanComment_EmptyErrorsRenderNothing(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{" \n\t ", "real failure"},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "- real failure\n")
+	assert.NotContains(t, out, "- \n", "a whitespace-only error renders no bullet")
+
+	data.Errors = []string{" \n\t "}
+	out = RenderPlanComment(data)
+	assert.NotContains(t, out, "**Errors**:", "an all-empty errors list renders no section")
+}
+
+// HTML in an error is escaped after sanitization, so a message quoting markup
+// (e.g. a parse error echoing a <details> tag) renders as text instead of
+// folding the rest of the comment into an unlabeled collapse.
+func TestRenderPlanComment_ErrorsEscapeHTML(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{"read <nil> & retry"},
+	})
+
+	assert.Contains(t, out, "- read &lt;nil&gt; &amp; retry\n",
+		"HTML metacharacters are escaped after sanitization")
+	assert.NotContains(t, out, "<nil>")
+}

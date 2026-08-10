@@ -148,3 +148,16 @@ func TestRenderRecentFailureLogsTruncatesSingleOversizedLine(t *testing.T) {
 	assert.Contains(t, rendered, "…", "the truncated line ends with an ellipsis")
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(rendered), "</details>"), "the fold still closes cleanly")
 }
+
+// Engine log lines rendered in the failure fold carry the same raw dial
+// errors the error block above redacts, so the fold redacts endpoints too —
+// otherwise it would reveal exactly what the error block hides.
+func TestRenderRecentFailureLogsRedactsEndpoints(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	rendered := RenderRecentFailureLogs([]LogEntryData{
+		{CreatedAt: at, Level: "error", Message: "dial tcp db-primary.internal:3306: connection refused"},
+	}, GitHubIssueCommentMaxChars, false)
+
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "[ERR] dial tcp [endpoint redacted]: connection refused")
+}

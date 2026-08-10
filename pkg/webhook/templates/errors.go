@@ -278,6 +278,10 @@ func RenderMultipleConfigs(data SchemaErrorData) string {
 func RenderGenericError(data SchemaErrorData) string {
 	// Capitalize command name for header
 	data.CommandName = capitalizeFirst(data.CommandName)
+	// The error detail is untrusted engine or infrastructure error text:
+	// sanitize it and keep a multi-line message inside the blockquote so it
+	// cannot leak endpoints or escape into the surrounding comment structure.
+	data.ErrorDetail = quoteBlockLines(sanitizeCommentError(data.ErrorDetail))
 	return offerSupportChannel(renderTemplate(tmplGenericError, data))
 }
 

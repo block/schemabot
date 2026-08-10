@@ -355,3 +355,26 @@ func TestRenderRollbackNotAcceptedSanitizesError(t *testing.T) {
 	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
 	assert.Contains(t, rendered, "The rollback was not accepted: dial tcp [endpoint redacted]: refused second line")
 }
+
+// A rejection reason that sanitizes to nothing renders the short form instead
+// of a dangling "not accepted: " suffix, and HTML in the reason is escaped so
+// it cannot inject markup into the comment.
+func TestRenderRollbackNotAcceptedEmptyAndHTMLError(t *testing.T) {
+	rendered := RenderRollbackNotAccepted("testapp", "staging", " \n\t ")
+	assert.Contains(t, rendered, "The rollback was not accepted.")
+	assert.NotContains(t, rendered, "not accepted: ")
+
+	rendered = RenderRollbackNotAccepted("testapp", "staging", "boom <details> & more")
+	assert.Contains(t, rendered, "The rollback was not accepted: boom &lt;details&gt; &amp; more")
+}
+
+// The rollback-not-allowed reason renders inside a code span; endpoints in the
+// reason are redacted like every other rendered error.
+func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
+	rendered := RenderRollbackRejected(RollbackRejectedData{
+		ApplyID: "apply-abc123",
+		Reason:  "dial tcp db-primary.internal:3306: connection refused",
+	})
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "**Reason**: `dial tcp [endpoint redacted]: connection refused`")
+}

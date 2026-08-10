@@ -198,11 +198,20 @@ func sanitizeInlineError(msg string) string {
 	return strings.Join(strings.Fields(sanitizeCommentError(msg)), " ")
 }
 
+// maxCellErrorLen clamps an error rendered inside a Markdown table cell so a
+// long message cannot make the table scroll horizontally. Tighter than the
+// comment-wide clamp because a cell shares its row with other columns.
+const maxCellErrorLen = 255
+
 // sanitizeCellError makes an untrusted error safe for a Markdown table cell:
 // single-line sanitization plus neutralizing the cell separator so the error
-// cannot break the table layout.
+// cannot break the table layout, clamped to the column width.
 func sanitizeCellError(msg string) string {
-	return strings.ReplaceAll(sanitizeInlineError(msg), "|", "/")
+	msg = strings.ReplaceAll(sanitizeInlineError(msg), "|", "/")
+	if runes := []rune(msg); len(runes) > maxCellErrorLen {
+		msg = string(runes[:maxCellErrorLen-1]) + "…"
+	}
+	return msg
 }
 
 // quoteBlockLines keeps a multi-line message inside a Markdown blockquote by

@@ -112,6 +112,12 @@ func TestSanitizeCellError(t *testing.T) {
 	t.Run("newlines collapse so the error cannot break the table row", func(t *testing.T) {
 		assert.Equal(t, "a b", sanitizeCellError("a\nb"))
 	})
+
+	t.Run("long messages are clamped to the column width", func(t *testing.T) {
+		got := sanitizeCellError(strings.Repeat("x", maxCellErrorLen+100))
+		assert.Len(t, []rune(got), maxCellErrorLen)
+		assert.True(t, strings.HasSuffix(got, "…"), "clamped message ends with a truncation marker")
+	})
 }
 
 func TestWriteErrorBlock(t *testing.T) {
