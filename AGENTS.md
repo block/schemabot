@@ -164,13 +164,13 @@ Every operator control operation (stop, start, cutover, cancel, volume, revert, 
 
 **Instant DDL terminology:** In MySQL, "instant DDL" has a specific meaning — `ALTER TABLE` operations that only modify metadata (e.g., adding a column with `ALGORITHM=INSTANT`). `CREATE TABLE` and `DROP TABLE` are **not** instant DDL even though they complete quickly. Don't describe them as instant in code or comments.
 
-### SQL Parsing: TiDB Parser Requirement
+### SQL Parsing: Real-Parser Requirement
 
-All SQL statements processed by SchemaBot **must be parseable by the TiDB parser** (via Spirit's `statement.New()` and `statement.ParseCreateTable()`). This is a hard requirement, not a best-effort behavior.
+All SQL statements processed by SchemaBot **must be parseable by the dialect's real parser**. For the MySQL family (MySQL/Vitess/Strata) that is the TiDB parser (via Spirit's `statement.New()` and `statement.ParseCreateTable()`); for PostgreSQL it is libpg_query (via the `pkg/ddl` `StatementParser` obtained from `ParserForDialect`). This is a hard requirement, not a best-effort behavior, and the same discipline applies to both grammars.
 
-- **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the TiDB parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
+- **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
-- Schema files are expected to contain valid MySQL DDL. If the TiDB parser cannot handle a valid MySQL construct, that is a bug to fix in the parser or Spirit, not something to work around with string splitting.
+- Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
 
 ## AWS Infrastructure
 

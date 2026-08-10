@@ -17,9 +17,9 @@ import (
 type postgresStatementParser struct{}
 
 // Split implements StatementParser. It parses the full content with the
-// Postgres grammar and recovers each statement's original text from the parse
-// tree's source offsets, so the returned statements are the caller's bytes,
-// not a reconstruction.
+// Postgres grammar and slices each statement's text out of the input using
+// the parse tree's source offsets — verbatim source rather than a deparse —
+// with surrounding whitespace trimmed from the input and from each statement.
 func (postgresStatementParser) Split(content string) ([]string, error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -78,7 +78,7 @@ func (postgresStatementParser) Classify(stmt string) (StatementType, string, err
 	}
 	if len(stmts) > 1 {
 		return StatementUnknown, "", fmt.Errorf(
-			"expected a single statement but %q parsed as %d statements; split with SplitStatements before classifying",
+			"expected a single statement but %q parsed as %d statements; split with the parser's Split before classifying",
 			statementPreview(stmt), len(stmts),
 		)
 	}

@@ -122,7 +122,7 @@ func TestPostgresParserClassify(t *testing.T) {
 	t.Run("rejects multi-statement input", func(t *testing.T) {
 		_, _, err := p.Classify("DROP TABLE users; CREATE TABLE users (id INT)")
 		require.ErrorContains(t, err, "expected a single statement")
-		require.ErrorContains(t, err, "split with SplitStatements before classifying")
+		require.ErrorContains(t, err, "split with the parser's Split before classifying")
 	})
 
 	t.Run("invalid SQL surfaces a bounded parse error", func(t *testing.T) {
