@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIsRetryableLockError(t *testing.T) {
+func TestMySQLErrorClassifier_IsRetryableConflict(t *testing.T) {
 	classifier := NewMySQLErrorClassifier()
 	tests := []struct {
 		name string

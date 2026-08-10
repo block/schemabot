@@ -9,9 +9,18 @@ import (
 )
 
 const (
+	// InnoDB rolls back deadlock victims and failed lock-wait statements, so
+	// callers can safely retry these transient conflicts.
 	mysqlErrDeadlock        = 1213
 	mysqlErrLockWaitTimeout = 1205
 	mysqlErrDuplicateKey    = 1062
+
+	// PostgreSQL rolls back the failed transaction for deadlocks and
+	// serialization failures. Lock-not-available reports an unacquired lock.
+	postgresErrDeadlock             = "40P01"
+	postgresErrSerializationFailure = "40001"
+	postgresErrLockNotAvailable     = "55P03"
+	postgresErrUniqueViolation      = "23505"
 )
 
 // ErrorClassifier identifies database errors that affect shared storage flow.
@@ -55,10 +64,12 @@ func (postgresErrorClassifier) IsRetryableConflict(err error) bool {
 	if !errors.As(err, &pgErr) {
 		return false
 	}
-	return pgErr.Code == "40P01" || pgErr.Code == "40001" || pgErr.Code == "55P03"
+	return pgErr.Code == postgresErrDeadlock ||
+		pgErr.Code == postgresErrSerializationFailure ||
+		pgErr.Code == postgresErrLockNotAvailable
 }
 
 func (postgresErrorClassifier) IsDuplicateKey(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	return errors.As(err, &pgErr) && pgErr.Code == postgresErrUniqueViolation
 }

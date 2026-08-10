@@ -37,7 +37,9 @@ func New(db *sql.DB) *Storage {
 	return NewWithDependencies(db, dialect, dialect, dialect, namedlock.MySQL{}, NewMySQLErrorClassifier())
 }
 
-// NewWithDependencies creates a storage instance with database-specific dependencies.
+// NewWithDependencies creates a storage instance with partially parameterized
+// database dependencies. Stores that have not yet been parameterized retain
+// MySQL behavior.
 func NewWithDependencies(db *sql.DB, binder binder, dialect Dialect, identity identityInserter, locker namedlock.Locker, classifier ErrorClassifier) *Storage {
 	rdb := newRebindDB(db, binder)
 	return &Storage{
