@@ -1,10 +1,25 @@
 package api
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// The bootstrapper opens its pool through postgresconn, which parses the DSN
+// eagerly: a malformed DSN must fail at open, before any dial or ping is
+// attempted, so a misconfigured deployment fails startup with a parse error
+// rather than a confusing connection failure.
+func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "open storage database")
+}
 
 // The embedded PostgreSQL schema files are the source of truth for the
 // storage tables the bootstrapper converges: reading them must yield one
