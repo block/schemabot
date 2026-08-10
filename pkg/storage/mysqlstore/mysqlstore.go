@@ -6,6 +6,7 @@ package mysqlstore
 import (
 	"database/sql"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/internal/sqlstore"
 )
@@ -17,5 +18,6 @@ var _ storage.Storage = (*Storage)(nil)
 
 // New creates a new MySQL storage instance.
 func New(db *sql.DB) *Storage {
-	return sqlstore.New(db)
+	dialect := sqlstore.MySQLDialect{}
+	return sqlstore.NewWithDependencies(db, dialect, dialect, dialect, namedlock.MySQL{}, sqlstore.NewMySQLErrorClassifier())
 }

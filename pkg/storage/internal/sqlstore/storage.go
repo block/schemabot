@@ -31,23 +31,29 @@ type Storage struct {
 
 var _ storage.Storage = (*Storage)(nil)
 
-// New creates a new MySQL storage instance.
+// New creates a MySQL storage instance.
 func New(db *sql.DB) *Storage {
-	rdb := newRebindDB(db, MySQLDialect{})
+	dialect := MySQLDialect{}
+	return NewWithDependencies(db, dialect, dialect, dialect, namedlock.MySQL{}, NewMySQLErrorClassifier())
+}
+
+// NewWithDependencies creates a storage instance with database-specific dependencies.
+func NewWithDependencies(db *sql.DB, binder binder, dialect Dialect, identity identityInserter, locker namedlock.Locker, classifier ErrorClassifier) *Storage {
+	rdb := newRebindDB(db, binder)
 	return &Storage{
 		db:              rdb,
-		locks:           &lockStore{db: rdb},
-		plans:           &planStore{db: rdb, identity: MySQLDialect{}},
-		applies:         &applyStore{db: rdb, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
+		locks:           &lockStore{db: rdb, classifier: classifier},
+		plans:           &planStore{db: rdb, identity: identity, classifier: classifier},
+		applies:         &applyStore{db: rdb, dialect: dialect, identity: identity, locker: locker, classifier: classifier},
 		tasks:           &taskStore{db: rdb, identity: MySQLDialect{}},
 		applyLogs:       &applyLogStore{db: rdb, identity: MySQLDialect{}},
-		controlRequests: &controlRequestStore{db: rdb, identity: MySQLDialect{}},
+		controlRequests: &controlRequestStore{db: rdb, identity: identity, classifier: classifier},
 		applyComments:   &applyCommentStore{db: rdb, dialect: MySQLDialect{}},
 		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}},
-		applyOperations: &applyOperationStore{db: rdb, dialect: MySQLDialect{}, identity: MySQLDialect{}, locker: namedlock.MySQL{}},
-		checks:          &checkStore{db: rdb, dialect: MySQLDialect{}},
+		applyOperations: &applyOperationStore{db: rdb, dialect: dialect, identity: identity, locker: locker, classifier: classifier},
+		checks:          &checkStore{db: rdb, dialect: dialect, classifier: classifier},
 		settings:        &settingsStore{db: rdb, dialect: MySQLDialect{}},
-		webhookEvents:   &webhookEventStore{db: rdb, dialect: MySQLDialect{}, identity: MySQLDialect{}},
+		webhookEvents:   &webhookEventStore{db: rdb, dialect: dialect, identity: identity, classifier: classifier},
 	}
 }
 

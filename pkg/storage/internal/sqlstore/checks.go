@@ -24,8 +24,9 @@ const (
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
-	db      *rebindDB
-	dialect Dialect
+	db         *rebindDB
+	dialect    Dialect
+	classifier ErrorClassifier
 }
 
 // Upsert creates or updates stored check state.
@@ -56,7 +57,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
 		},
 	)
-	return withLockRetry(ctx, op, func() error {
+	return withLockRetry(ctx, s.classifier, op, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO checks (
 				repository, pull_request, head_sha,
@@ -86,7 +87,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 
 	op := fmt.Sprintf("upsert plan check result for %s#%d %s/%s/%s",
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
-	return withLockRetry(ctx, op, func() error {
+	return withLockRetry(ctx, s.classifier, op, func() error {
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO checks (
 				repository, pull_request, head_sha,
@@ -103,7 +104,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 		if err == nil {
 			return nil
 		}
-		if !isDuplicateKeyError(err) {
+		if !s.classifier.IsDuplicateKey(err) {
 			return err
 		}
 
