@@ -133,7 +133,12 @@ func fakeDial(t *testing.T, results []error) *[]string {
 	t.Cleanup(func() { connectConfig = original })
 	connectConfig = func(_ context.Context, cfg pgx.ConnConfig) (driver.Conn, error) {
 		passwords = append(passwords, cfg.Password)
-		require.Less(t, len(passwords)-1, len(results), "unexpected extra dial attempt")
+		// assert (not require): this seam runs on the dialing goroutine, and
+		// testify's FailNow is only valid on the test goroutine. The error
+		// return fails the dial cleanly instead.
+		if !assert.Less(t, len(passwords)-1, len(results), "unexpected extra dial attempt") {
+			return nil, errors.New("unexpected extra dial attempt")
+		}
 		if err := results[len(passwords)-1]; err != nil {
 			return nil, err
 		}
@@ -236,7 +241,7 @@ func TestReloadableConnectorReloadReappliesOptionsAndNormalization(t *testing.T)
 		return "postgres://schemabot:rotated@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", nil
 	}}
 
-	fresh, ok := c.refresh(t.Context(), 0)
+	fresh, _, ok := c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", fresh.Password)
 	assert.Equal(t, 7*time.Second, fresh.ConnectTimeout, "options must flow through the reload path")
@@ -258,7 +263,7 @@ func TestReloadableConnectorRefreshConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			cfg, ok := c.refresh(t.Context(), 0)
+			cfg, _, ok := c.refresh(t.Context(), 0)
 			assert.True(t, ok)
 			assert.Equal(t, "rotated", cfg.Password)
 		})
@@ -316,24 +321,24 @@ func TestReloadableConnectorReloadCooldown(t *testing.T) {
 	c.now = func() time.Time { return clock }
 
 	// The first failed reload arms the cooldown.
-	_, ok := c.refresh(t.Context(), 0)
+	_, _, ok := c.refresh(t.Context(), 0)
 	require.False(t, ok)
 	require.Equal(t, int32(1), reloads.Load())
 
 	// Failed dials inside the window surface without reloading again.
-	_, ok = c.refresh(t.Context(), 0)
+	_, _, ok = c.refresh(t.Context(), 0)
 	require.False(t, ok)
 	assert.Equal(t, int32(1), reloads.Load(), "reload must not run during the cooldown")
 
 	// After the window elapses the reload is retried; another failure re-arms.
 	clock = clock.Add(reloadCooldown)
-	_, ok = c.refresh(t.Context(), 0)
+	_, _, ok = c.refresh(t.Context(), 0)
 	require.False(t, ok)
 	require.Equal(t, int32(2), reloads.Load())
 
 	// A successful reload swaps credentials and clears the cooldown.
 	clock = clock.Add(reloadCooldown)
-	cfg, ok := c.refresh(t.Context(), 0)
+	cfg, _, ok := c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", cfg.Password)
 	require.Equal(t, int32(3), reloads.Load())
@@ -362,7 +367,7 @@ func TestDSNParseErrorsRedactCredentials(t *testing.T) {
 		c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
 			return badDSN, nil
 		})
-		_, ok := c.refresh(t.Context(), 0)
+		_, _, ok := c.refresh(t.Context(), 0)
 		require.False(t, ok)
 	})
 }
@@ -374,14 +379,14 @@ func TestReloadableConnectorRefreshDedupesConcurrentFailures(t *testing.T) {
 		return "postgres://schemabot:rotated@localhost:5432/app", nil
 	})
 
-	cfg, ok := c.refresh(t.Context(), 0)
+	cfg, _, ok := c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", cfg.Password)
 	require.Equal(t, int32(1), reloads.Load())
 
 	// A dial that failed against the already-superseded generation reuses the
 	// swapped config instead of reloading again.
-	cfg, ok = c.refresh(t.Context(), 0)
+	cfg, _, ok = c.refresh(t.Context(), 0)
 	require.True(t, ok)
 	assert.Equal(t, "rotated", cfg.Password)
 	assert.Equal(t, int32(1), reloads.Load(), "stale-generation refresh must not reload")
@@ -417,7 +422,7 @@ func TestReloadableConnectorSnapshotNotBlockedByHungReload(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		cfg, ok := c.refresh(t.Context(), 0)
+		cfg, _, ok := c.refresh(t.Context(), 0)
 		assert.True(t, ok)
 		assert.Equal(t, "rotated", cfg.Password)
 	})
@@ -481,7 +486,7 @@ func TestReloadableConnectorRefreshWaiterRespectsDialContext(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		cfg, ok := c.refresh(t.Context(), 0)
+		cfg, _, ok := c.refresh(t.Context(), 0)
 		assert.True(t, ok)
 		assert.Equal(t, "rotated", cfg.Password)
 	})
@@ -493,7 +498,7 @@ func TestReloadableConnectorRefreshWaiterRespectsDialContext(t *testing.T) {
 	waiterDone := make(chan struct{})
 	go func() {
 		defer close(waiterDone)
-		cfg, ok := c.refresh(ctx, 0)
+		cfg, _, ok := c.refresh(ctx, 0)
 		assert.False(t, ok)
 		assert.Nil(t, cfg)
 	}()
@@ -512,9 +517,25 @@ func TestReloadableConnectorRefreshWaiterObservesLeaderFailure(t *testing.T) {
 	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app",
 		hungReload(started, release, &reloads, "", errors.New("secret backend unavailable")))
 
+	// The clock seam doubles as an entered-refresh gate: an expired cooldown
+	// stamp makes every refresh iteration consult the clock under the mutex,
+	// so the second consult is the waiter's. Once past it, the waiter can
+	// only reach the select on the leader's done channel — releasing the
+	// leader after that pins the wake-then-recheck path instead of leaving
+	// it to the scheduler.
+	c.lastReloadFail = time.Now().Add(-2 * reloadCooldown)
+	var clockCalls atomic.Int32
+	waiterEntered := make(chan struct{})
+	c.now = func() time.Time {
+		if clockCalls.Add(1) == 2 {
+			close(waiterEntered)
+		}
+		return time.Now()
+	}
+
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		_, ok := c.refresh(t.Context(), 0)
+		_, _, ok := c.refresh(t.Context(), 0)
 		assert.False(t, ok)
 	})
 	waitClosed(t, started, "reload never started")
@@ -524,14 +545,101 @@ func TestReloadableConnectorRefreshWaiterObservesLeaderFailure(t *testing.T) {
 	waiterDone := make(chan struct{})
 	go func() {
 		defer close(waiterDone)
-		cfg, ok := c.refresh(t.Context(), 0)
+		cfg, _, ok := c.refresh(t.Context(), 0)
+		assert.False(t, ok)
+		assert.Nil(t, cfg)
+	}()
+	waitClosed(t, waiterEntered, "waiter never entered refresh")
+	close(release)
+	wg.Wait()
+	waitClosed(t, waiterDone, "waiter did not observe the leader's failed reload")
+	assert.Equal(t, int32(1), reloads.Load(), "the waiter must not reload during the cooldown the failure armed")
+}
+
+// A reload callback that panics must not wedge the connector: the publish
+// defer releases the reloading guard, unblocks waiters, and arms the
+// cooldown before the panic propagates to the leader's caller.
+func TestReloadableConnectorReloadPanicUnblocksWaiters(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+		reloads.Add(1)
+		close(started)
+		<-release
+		panic("secret backend panicked")
+	})
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		defer func() {
+			assert.Equal(t, "secret backend panicked", recover(), "refresh must propagate the reload panic")
+		}()
+		_, _, _ = c.refresh(t.Context(), 0)
+		assert.Fail(t, "refresh must not return normally from a panicking reload")
+	})
+	waitClosed(t, started, "reload never started")
+
+	// A same-generation waiter blocked on the leader's outcome is unblocked
+	// by the publish defer and observes the armed cooldown.
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		cfg, _, ok := c.refresh(t.Context(), 0)
 		assert.False(t, ok)
 		assert.Nil(t, cfg)
 	}()
 	close(release)
 	wg.Wait()
-	waitClosed(t, waiterDone, "waiter did not observe the leader's failed reload")
-	assert.Equal(t, int32(1), reloads.Load(), "the waiter must not reload during the cooldown the failure armed")
+	waitClosed(t, waiterDone, "waiter was not unblocked by the panicking reload")
+
+	// The guard is released and the cooldown armed: a later same-generation
+	// refresh backs off without reloading rather than deadlocking on a stale
+	// guard.
+	_, _, ok := c.refresh(t.Context(), 0)
+	assert.False(t, ok)
+	assert.Equal(t, int32(1), reloads.Load(), "the panicked reload must arm the cooldown; no further reloads")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.Nil(t, c.reloading, "the reloading guard must be released after a panic")
+}
+
+// A rejection verdict on superseded credentials must not arm the cooldown:
+// while a retry dial is in flight, another rotation can swap in newer
+// credentials, and stamping the late rejection onto that newer generation
+// would suppress its legitimate reloads for a full window.
+func TestReloadableConnectorStaleRejectionDoesNotArmCooldown(t *testing.T) {
+	var c *reloadableConnector
+	original := connectConfig
+	t.Cleanup(func() { connectConfig = original })
+	var dials atomic.Int32
+	connectConfig = func(_ context.Context, _ pgx.ConnConfig) (driver.Conn, error) {
+		switch dials.Add(1) {
+		case 1:
+			// The initial dial is rejected, triggering the reload.
+			return nil, authError()
+		case 2:
+			// While the retry with reloaded credentials is in flight, a
+			// concurrent rotation advances the generation; the retry then
+			// comes back rejected — a verdict on already-superseded
+			// credentials.
+			c.mu.Lock()
+			c.gen++
+			c.mu.Unlock()
+			return nil, authError()
+		default:
+			return stubConn{}, nil
+		}
+	}
+	c = newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app", func() (string, error) {
+		return "postgres://schemabot:rotated@localhost:5432/app", nil
+	})
+
+	_, err := c.Connect(t.Context())
+	require.Error(t, err)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	assert.True(t, c.lastReloadFail.IsZero(), "a stale rejection must not arm the cooldown against the newer generation")
 }
 
 func TestIsAuthError(t *testing.T) {
