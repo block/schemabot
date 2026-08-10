@@ -125,7 +125,7 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	if state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return apply, 1, 0, nil
 	}
-	if !state.IsState(apply.State, state.Apply.Stopped, state.Apply.Running) {
+	if !state.IsState(apply.State, state.Apply.Stopped) && !state.IsRunningApplyState(apply.State) {
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
 

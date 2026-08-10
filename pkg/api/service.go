@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
@@ -151,6 +152,9 @@ type Service struct {
 	recoveryWg           sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
+	// driversBusy counts this process's operator drivers that currently hold
+	// claimed work; it backs the drivers-busy gauge.
+	driversBusy          atomic.Int64
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
 	remoteHealthWg       sync.WaitGroup

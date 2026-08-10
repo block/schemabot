@@ -1512,40 +1512,24 @@ const strandedReaperLockName = "schemabot_stranded_reaper"
 // SELECT and the guarded per-row UPDATE assert it, so the write re-verifies the
 // parent it was chosen for rather than trusting a read that may be seconds old.
 //
-// Three conditions, each for its own reason:
+// Two conditions, each for its own reason:
 //   - settled state: the rollout has a verdict, so a pending child describes
 //     work that will never run.
 //   - quiescent: the apply's own paths — stop reconciliation, terminal
 //     derivation — may still be writing sibling rows just after it terminalized.
-//   - not revivable: failed is the one settled state with a documented way back,
-//     since a reapply within the freshness window turns it and its failed rows
-//     retryable. Mirroring failed onto a row that never ran would hand that
-//     reapply a row it treats as already-attempted, and the retry claim carries
-//     no deployment-order gate because it exists for rows that did run. Waiting
-//     out the window keeps a reaped row beyond any reapply's reach. A failed
-//     apply with no completion time is already unreappliable, so it needs no
-//     wait.
 func (s *applyOperationStore) strandedParentGate(correlation string) (string, []any) {
 	parentStates := settledApplyStates()
 	quiescentBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(strandedParentQuiescence.Microseconds())), IntervalMicrosecond)
-	revivableUntil := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64((time.Duration(storage.ReapplyFailureFreshnessDays) * 24 * time.Hour).Microseconds())), IntervalMicrosecond)
 
 	args := stringArgs(parentStates)
-	args = append(args, state.Apply.Failed)
 	return fmt.Sprintf(`EXISTS (
 			SELECT 1
 			FROM applies a
 			WHERE a.id = %s
 				AND a.state IN (%s)
 				AND a.updated_at < %s
-				AND (
-					a.state <> ?
-					OR a.completed_at IS NULL
-					OR a.completed_at < %s
-				)
-		)`, correlation, placeholders(len(parentStates)), quiescentBefore, revivableUntil), args
+		)`, correlation, placeholders(len(parentStates)), quiescentBefore), args
 }
 
 // ReapStranded elects one reaper per pass and reaps under the lock. See
@@ -1563,7 +1547,7 @@ func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*s
 
 	// Do not wait for the lock: whoever holds it is doing this pass's work, and
 	// this instance's next tick is soon enough.
-	acquired, err := s.locker.Acquire(ctx, conn.raw(), strandedReaperLockName, 0)
+	acquired, err := s.locker.Acquire(ctx, conn.lockerConn(), strandedReaperLockName, 0)
 	if err != nil {
 		return nil, fmt.Errorf("acquire stranded reaper lock: %w", err)
 	}
@@ -1574,7 +1558,7 @@ func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*s
 		// A held lock parks every instance's reaper until this session is
 		// retired, so the two ways it can survive the pass are reported apart:
 		// the release errored, or it ran and reported the lock was not held.
-		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.raw(), strandedReaperLockName)
+		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.lockerConn(), strandedReaperLockName)
 		if err != nil {
 			slog.WarnContext(ctx, "failed to release the stranded reaper lock; reapers stay blocked until this session is retired",
 				"lock", strandedReaperLockName, "error", err)
@@ -1700,10 +1684,9 @@ func (s *applyOperationStore) loadStrandedParents(ctx context.Context, stranded 
 // non-resumable, so completed_at is stamped, and error_message is mirrored only
 // for a failed parent — the state that owns an explanation.
 //
-// The write re-asserts the parent gate rather than trusting the sweep's read: a
-// parent can leave the settled set between the two (a reapply turning a failed
-// apply retryable), and settling a child under a rollout that has come back to
-// life would drop that deployment's work from it.
+// The write re-asserts the parent gate rather than trusting the sweep's read:
+// the guarded UPDATE re-verifies the parent it was chosen for, so a write never
+// lands on the strength of a read that may be seconds old.
 func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *storage.ApplyOperation, parent *storage.Apply) (bool, error) {
 	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()"
 	args := []any{parent.State}

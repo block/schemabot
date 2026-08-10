@@ -48,7 +48,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 	const maxCopyingShown = 5
 
 	// Always show failed shards (they need attention). Limit other non-copying
-	// shards to avoid a wall of identical "ready for cutover" lines.
+	// shards to avoid a wall of identical "waiting for cutover" lines.
 	const maxNonCopyingShown = 3
 	for _, s := range shards {
 		if s.Status == state.Task.Failed {
@@ -71,7 +71,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 		}
 	}
 	if waitingCount > maxNonCopyingShown {
-		fmt.Fprintf(&b, indentShardMore+"%s... %d more ready for cutover%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more waiting for cutover%s\n",
 			ANSIDim, waitingCount-maxNonCopyingShown, ANSIReset)
 	}
 	if cuttingCount > maxNonCopyingShown {
@@ -132,7 +132,7 @@ func formatShardLine(s ShardProgress) string {
 		}
 		return fmt.Sprintf(indentShardLine+"%s◉ %s%s: %s\n", ANSICyan, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover:
-		return fmt.Sprintf(indentShardLine+"%s● %s%s: ready for cutover\n", ANSIYellow, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s● %s%s: waiting for cutover\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.CuttingOver:
 		return fmt.Sprintf(indentShardLine+"%s● %s%s: cutting over\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.Pending:
@@ -176,7 +176,7 @@ func FormatShardSummaryParts(c ShardCounts, compact bool) []string {
 		parts = append(parts, fmt.Sprintf("%d complete", c.Complete))
 	}
 	if c.WaitingForCutover > 0 {
-		parts = append(parts, fmt.Sprintf("%d ready for cutover", c.WaitingForCutover))
+		parts = append(parts, fmt.Sprintf("%d waiting for cutover", c.WaitingForCutover))
 	}
 	if c.CuttingOver > 0 {
 		parts = append(parts, fmt.Sprintf("%d cutting over", c.CuttingOver))

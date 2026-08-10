@@ -1192,6 +1192,9 @@ func (c *LocalClient) applyRevertPhaseBlock(ctx context.Context, apply *storage.
 func hasLiveEngineWork(taskState string) bool {
 	return state.IsState(taskState,
 		state.Task.Running,
+		state.Task.CatchingUp,
+		state.Task.Checksumming,
+		state.Task.PostChecksum,
 		state.Task.WaitingForCutover,
 		state.Task.CuttingOver,
 		state.Task.Recovering,

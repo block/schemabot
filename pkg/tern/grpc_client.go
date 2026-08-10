@@ -3370,16 +3370,22 @@ func applyProgressRank(applyState string) int {
 		return 6
 	case state.Apply.Running:
 		return 7
-	case state.Apply.WaitingForCutover:
+	case state.Apply.CatchingUp:
 		return 8
-	case state.Apply.CuttingOver:
+	case state.Apply.Checksumming:
 		return 9
-	case state.Apply.RevertWindow:
+	case state.Apply.PostChecksum:
 		return 10
-	case state.Apply.SkippingRevert:
+	case state.Apply.WaitingForCutover:
 		return 11
-	case state.Apply.Reverting:
+	case state.Apply.CuttingOver:
 		return 12
+	case state.Apply.RevertWindow:
+		return 13
+	case state.Apply.SkippingRevert:
+		return 14
+	case state.Apply.Reverting:
+		return 15
 	default:
 		return 0
 	}

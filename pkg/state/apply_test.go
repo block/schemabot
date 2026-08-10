@@ -103,19 +103,38 @@ func TestDeriveApplyState_AnyRunning(t *testing.T) {
 	}
 }
 
-// Checksumming is a table-level state, not an apply state: while tables verify
-// their copied data the apply as a whole is still running, so it derives to
-// RUNNING rather than a distinct apply state.
-func TestDeriveApplyState_ChecksummingDerivesRunning(t *testing.T) {
-	testCases := [][]string{
-		{"checksumming"},
-		{"CHECKSUMMING"},
-		{"RUNNING", "checksumming"},
-		{"COMPLETED", "checksumming", "PENDING"},
+// The post-copy phases surface at the apply level as the least-advanced
+// active phase: while any table is still copying rows the apply is Running;
+// once every active table is draining or verifying, the apply names that
+// phase. Any table still copying dominates a more-advanced sibling's phase.
+func TestDeriveApplyState_PostCopyPhases(t *testing.T) {
+	testCases := []struct {
+		states   []string
+		expected string
+	}{
+		{[]string{"catching_up"}, Apply.CatchingUp},
+		{[]string{"CATCHING_UP"}, Apply.CatchingUp},
+		{[]string{"checksumming"}, Apply.Checksumming},
+		{[]string{"CHECKSUMMING"}, Apply.Checksumming},
+		{[]string{"post_checksum"}, Apply.PostChecksum},
+		{[]string{"POST_CHECKSUM"}, Apply.PostChecksum},
+		// A table still copying dominates any sibling's post-copy phase.
+		{[]string{"RUNNING", "catching_up"}, Apply.Running},
+		{[]string{"RUNNING", "checksumming"}, Apply.Running},
+		{[]string{"RUNNING", "post_checksum"}, Apply.Running},
+		// The least-advanced phase wins across mixed drains.
+		{[]string{"catching_up", "checksumming"}, Apply.CatchingUp},
+		{[]string{"checksumming", "post_checksum"}, Apply.Checksumming},
+		// Completed and pending siblings do not mask the active phase.
+		{[]string{"COMPLETED", "checksumming", "PENDING"}, Apply.Checksumming},
+		{[]string{"COMPLETED", "catching_up", "PENDING"}, Apply.CatchingUp},
+		{[]string{"COMPLETED", "post_checksum", "PENDING"}, Apply.PostChecksum},
+		// A table already cutting over outranks a sibling's drain.
+		{[]string{"CUTTING_OVER", "post_checksum"}, Apply.CuttingOver},
 	}
 
-	for _, states := range testCases {
-		assert.Equal(t, Apply.Running, DeriveApplyState(states), "input: %v", states)
+	for _, tc := range testCases {
+		assert.Equal(t, tc.expected, DeriveApplyState(tc.states), "input: %v", tc.states)
 	}
 }
 
@@ -235,10 +254,14 @@ func TestIsTerminalApplyState(t *testing.T) {
 }
 
 // TestIsRunningApplyState pins the running-family set that control gates key
-// off: running and running_degraded are running-family; other non-terminal
-// states (pending, waiting_for_cutover, recovering) are not.
+// off: running, running_degraded, and the post-copy phases (catching_up,
+// checksumming, post_checksum) are running-family; other non-terminal states
+// (pending, waiting_for_cutover, recovering) are not.
 func TestIsRunningApplyState(t *testing.T) {
-	for _, s := range []string{Apply.Running, Apply.RunningDegraded, "RUNNING", "STATE_RUNNING_DEGRADED", "running_degraded"} {
+	for _, s := range []string{
+		Apply.Running, Apply.RunningDegraded, "RUNNING", "STATE_RUNNING_DEGRADED", "running_degraded",
+		Apply.CatchingUp, Apply.Checksumming, Apply.PostChecksum, "CATCHING_UP", "STATE_POST_CHECKSUM",
+	} {
 		assert.Truef(t, IsRunningApplyState(s), "%s should be running-family", s)
 	}
 	for _, s := range []string{
@@ -364,6 +387,9 @@ func TestIsSetupPhase(t *testing.T) {
 func TestNormalizeApplyState_NewStates(t *testing.T) {
 	assert.Equal(t, Apply.ValidatingBranch, normalizeApplyState("VALIDATING_BRANCH"))
 	assert.Equal(t, Apply.ValidatingDeployRequest, normalizeApplyState("VALIDATING_DEPLOY_REQUEST"))
+	assert.Equal(t, Apply.CatchingUp, normalizeApplyState("CATCHING_UP"))
+	assert.Equal(t, Apply.Checksumming, normalizeApplyState("CHECKSUMMING"))
+	assert.Equal(t, Apply.PostChecksum, normalizeApplyState("POST_CHECKSUM"))
 }
 
 func TestInitialActiveApplyState(t *testing.T) {

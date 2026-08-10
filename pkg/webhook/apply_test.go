@@ -91,9 +91,9 @@ func TestCommentObserverShouldDeferCutoverUsesPersistedApplyOption(t *testing.T)
 
 // A defer-cutover apply parks its tasks at the cutover barrier with only the
 // task state to show for it — the driver persists no separate readiness flag.
-// The barrier state alone must mark every parked table ready, so the readiness
-// count agrees with the header and the cutover hint instead of telling the
-// operator the apply is still waiting.
+// Each parked table renders a "Waiting for cutover" row, and the readiness
+// summary counts every parked table as ready so the operator can see the
+// cutover is unblocked.
 func TestFormatProgressCommentCutoverState(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-abc123",
@@ -115,10 +115,8 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 	assert.Contains(t, body, "`orders`")
 	assert.Contains(t, body, "**2/2** table(s) ready for cutover")
 	assert.NotContains(t, body, "waiting on")
-	assert.Contains(t, body, "✅ Ready for cutover")
-	assert.NotContains(t, body, "Waiting for cutover", "a parked table must render as ready, not waiting")
-	assert.Contains(t, body, "📊 2 ready for cutover", "the progress summary must agree with the per-table rows")
-	assert.NotContains(t, body, "waiting for cutover", "no line on the comment may call a parked table waiting")
+	assert.Contains(t, body, "Waiting for cutover")
+	assert.Contains(t, body, "📊 2 waiting for cutover", "the progress summary must agree with the per-table rows")
 }
 
 // While one table is still copying, the readiness summary counts only the
@@ -140,8 +138,8 @@ func TestFormatProgressCommentCutoverReadinessCountsOnlyParkedTables(t *testing.
 	body := formatProgressComment(apply, tasks, nil, "")
 
 	assert.Contains(t, body, "**1/2** table(s) ready for cutover — waiting on 1")
-	assert.Contains(t, body, "✅ Ready for cutover")
-	assert.Contains(t, body, "1 ready for cutover", "the progress summary must count the parked table as ready")
+	assert.Contains(t, body, "Waiting for cutover")
+	assert.Contains(t, body, "1 waiting for cutover", "the progress summary must count the parked table")
 	assert.Contains(t, body, "1 running", "the progress summary must show the table the cutover is waiting on")
 }
 

@@ -326,10 +326,41 @@ func (a *ForwardAuthAuthorizer) Middleware(next http.Handler) http.Handler {
 			}
 		}
 
-		authDecision(r, tier, "allow", "")
+		reason := ""
+		if requestFromLoopback(r) {
+			reason = reasonLoopbackSource
+			if tier == TierWrite {
+				// The subject is caller-supplied header input on this path —
+				// clamp it like the other untrusted values this file logs.
+				a.logger.Warn("forward-auth write admitted with identity headers from a loopback source; the forwarded identity is caller-supplied, not proxy-verified (direct-to-pod break-glass)",
+					"method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr, "subject", clampLoggedHeaderValue(user), "proxy", proxyID)
+			}
+		}
+		authDecision(r, tier, "allow", reason)
 		ctx := WithUser(r.Context(), &User{Subject: user, Groups: groups})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// reasonLoopbackSource marks an allowed request whose source address is
+// loopback. Such a request did not arrive through the network path the
+// authenticating proxy uses — on a pod that means a direct connection such as
+// a kubectl port-forward — so its identity headers were supplied by the local
+// caller, not verified by the proxy. The reason lets operators alert on
+// break-glass usage that would otherwise be indistinguishable from proxied
+// traffic.
+const reasonLoopbackSource = "loopback_source"
+
+// requestFromLoopback reports whether the request's source address is a
+// loopback IP (see reasonLoopbackSource for why that matters to the trust
+// decision's audit trail).
+func requestFromLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	return ip != nil && ip.IsLoopback()
 }
 
 // authorizeGatewayCaller handles the service-caller lane: a caller-forwarding
@@ -392,7 +423,11 @@ func (a *ForwardAuthAuthorizer) authorizeGatewayCaller(w http.ResponseWriter, r 
 		return nil, true
 	}
 
-	authDecision(r, tier, "allow", "")
+	reason := ""
+	if requestFromLoopback(r) {
+		reason = reasonLoopbackSource
+	}
+	authDecision(r, tier, "allow", reason)
 	return &User{Subject: caller}, true
 }
 

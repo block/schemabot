@@ -73,6 +73,12 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.operatorWake = wake
 	s.operatorMu.Unlock()
 
+	// Seed both occupancy gauges before any driver claims so the pool's
+	// capacity is visible from startup: pool size minus busy, summed across
+	// processes, is the claim capacity that remains.
+	metrics.RecordOperatorDriverPoolSize(ctx, int64(driverCount))
+	metrics.RecordOperatorDriversBusy(ctx, s.driversBusy.Load())
+
 	for i := range driverCount {
 		driverID := i
 		s.recoveryWg.Go(func() {
@@ -235,6 +241,18 @@ func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 	}
 }
 
+// markDriverBusy records that a driver's claim succeeded and it now holds
+// work, and returns the function that marks the driver idle again when the
+// drive returns. Callers defer the returned function immediately after a
+// successful claim so every exit path — a completed drive, an invalid lease,
+// or a mid-drive error — releases the slot in the busy gauge.
+func (s *Service) markDriverBusy(ctx context.Context) func() {
+	metrics.RecordOperatorDriversBusy(ctx, s.driversBusy.Add(1))
+	return func() {
+		metrics.RecordOperatorDriversBusy(ctx, s.driversBusy.Add(-1))
+	}
+}
+
 // recoverApplies claims and resumes work that needs attention. Each call
 // claims at most one unit — a pending-stop reconciliation, a barrier-parked
 // cutover, or an apply operation — to keep the drive loop responsive.
@@ -293,6 +311,7 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		s.logger.Debug("operator: no apply_operation to claim", "driver", driverID)
 		return
 	}
+	defer s.markDriverBusy(ctx)()
 
 	// The claim rotated a fresh operation lease onto the row. It is the
 	// capability that guards this operation's own writes — its state
@@ -755,6 +774,7 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 		s.logger.Debug("operator: no apply_operation to cut over", "driver", driverID)
 		return false
 	}
+	defer s.markDriverBusy(ctx)()
 
 	// The claim rotated a fresh operation lease onto the row; it is the
 	// capability that guards this operation's writes, so fail closed if missing.
@@ -823,6 +843,7 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 		s.logger.Debug("operator: no apply needs stop reconciliation", "driver", driverID)
 		return false
 	}
+	defer s.markDriverBusy(ctx)()
 
 	lease := apply.Lease()
 	if !lease.Valid() {
@@ -937,6 +958,7 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 		s.logger.Debug("operator: no apply needs operation projection", "driver", driverID)
 		return false
 	}
+	defer s.markDriverBusy(ctx)()
 
 	lease := apply.Lease()
 	if !lease.Valid() {

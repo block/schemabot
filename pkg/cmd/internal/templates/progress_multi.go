@@ -55,6 +55,9 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", model.Label})
+	if row, ok := volumeBoxRow(data.Volume, model.State); ok {
+		rows = append(rows, row)
+	}
 	if data.Caller != "" {
 		rows = append(rows, BoxRow{"Caller", data.Caller})
 	}

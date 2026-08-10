@@ -238,7 +238,8 @@ All SQL statements processed by SchemaBot **must be parseable by the dialect's r
 ### Database Connections
 
 - Use `mysqlconn.Open()` from `github.com/block/schemabot/pkg/mysqlconn` for SchemaBot-managed MySQL connections. It centralizes DSN normalization, including required TLS settings for RDS targets. Use raw `sql.Open("mysql", ...)` only for local test/dev infrastructure (for example LocalScale) or engine-specific connection paths that intentionally manage their own TLS config (for example PlanetScale/Vitess mTLS).
-- After opening a database with `mysqlconn.Open()` or raw `sql.Open("mysql", ...)`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections).
+- Use `postgresconn.Open()` from `github.com/block/schemabot/pkg/postgresconn` for SchemaBot-managed PostgreSQL connections — it is the Postgres counterpart of `mysqlconn` (DSN normalization, required `sslmode` for RDS targets). Reserve `postgresconn.OpenReloadable()` for the single long-lived storage pool. Do not open Postgres connections with raw `sql.Open("pgx", ...)` outside local test/dev infrastructure.
+- After opening a database with `mysqlconn.Open()`, `postgresconn.Open()`, or raw `sql.Open(...)`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections).
 - Always backtick-quote SQL identifiers: `` USE `db` ``, `` SHOW CREATE TABLE `tbl` ``.
 - **Never manipulate DSN strings with `strings.Replace`.** Use `mysql.ParseDSN()` / `cfg.FormatDSN()` from `github.com/go-sql-driver/mysql` to parse, modify fields, and re-serialize. String manipulation is fragile and breaks on DSNs with passwords containing `/` or other special characters.
 

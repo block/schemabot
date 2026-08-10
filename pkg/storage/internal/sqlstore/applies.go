@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -114,6 +113,9 @@ func claimableApplyStates() []string {
 	return []string{
 		state.Apply.Running,
 		state.Apply.RunningDegraded,
+		state.Apply.CatchingUp,
+		state.Apply.Checksumming,
+		state.Apply.PostChecksum,
 		state.Apply.Resuming,
 		state.Apply.WaitingForDeploy,
 		state.Apply.WaitingForCutover,
@@ -243,7 +245,7 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 	}
 
 	lockName := applyTargetLockName(database, dbType, environment)
-	acquired, err := locker.Acquire(ctx, conn.raw(), lockName, applyTargetLockWait)
+	acquired, err := locker.Acquire(ctx, conn.lockerConn(), lockName, applyTargetLockWait)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to acquire apply target lock",
 			"database", database,
@@ -276,7 +278,7 @@ func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, co
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
 	defer cancel()
 
-	released, err := locker.Release(releaseCtx, conn.raw(), lockName)
+	released, err := locker.Release(releaseCtx, conn.lockerConn(), lockName)
 	switch {
 	case err != nil:
 		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
@@ -298,21 +300,25 @@ func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, co
 // destroys it instead of reusing a session whose advisory-lock state is
 // uncertain.
 func discardApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
+	if err := conn.discardBadConn(); err != nil {
 		slog.WarnContext(ctx, "failed to discard apply target lock connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", rawErr)
-	}
-}
-
-func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if err := conn.Close(); err != nil {
-		slog.WarnContext(ctx, "failed to close apply target lock connection",
 			"operation", operation,
 			"lock", lockName,
 			"error", err)
 	}
+}
+
+func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
+	err := conn.Close()
+	if err == nil || errors.Is(err, sql.ErrConnDone) {
+		// ErrConnDone means the session was already retired by a preceding
+		// discard; there is nothing left to release.
+		return
+	}
+	slog.WarnContext(ctx, "failed to close apply target lock connection",
+		"operation", operation,
+		"lock", lockName,
+		"error", err)
 }
 
 // dedupeDeployments returns the input deployments as a sorted, de-duplicated
@@ -2083,135 +2089,6 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 		apply.UpdatedAt = now
 	}
 	return expirations, nil
-}
-
-// ReapplyFailed transitions a recent permanently failed apply back onto the
-// retryable recovery path so operator drivers can claim and drive the
-// remaining failed work.
-func (s *applyStore) ReapplyFailed(ctx context.Context, applyID int64) (*storage.Apply, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-	if err != nil {
-		return nil, fmt.Errorf("begin reapply failed apply %d transaction: %w", applyID, err)
-	}
-	defer rollbackTx(ctx, tx, "reapply failed apply")
-
-	row := tx.QueryRowContext(ctx, `
-		SELECT `+applyColumns+`
-		FROM applies
-		WHERE id = ?
-		FOR UPDATE
-	`, applyID)
-	apply, err := scanApply(row)
-	if err != nil {
-		return nil, fmt.Errorf("load apply %d for reapply: %w", applyID, err)
-	}
-	if apply == nil {
-		return nil, storage.ErrApplyNotFound
-	}
-	if !state.IsState(apply.State, state.Apply.Failed) {
-		return nil, fmt.Errorf("apply %s is %s; only failed applies can be reapplied: %w", apply.ApplyIdentifier, apply.State, storage.ErrApplyNotReappliable)
-	}
-	if apply.CompletedAt == nil {
-		return nil, fmt.Errorf("apply %s has no failure completion time; create a new apply instead: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
-	}
-	if apply.CompletedAt.Before(time.Now().AddDate(0, 0, -storage.ReapplyFailureFreshnessDays)) {
-		return nil, fmt.Errorf("apply %s failed more than %d day(s) ago; create a new apply instead: %w", apply.ApplyIdentifier, storage.ReapplyFailureFreshnessDays, storage.ErrApplyNotReappliable)
-	}
-
-	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
-	if !hasApplyTarget(database, dbType, environment) || deployment == "" {
-		database, dbType, environment, deployment, err = applyTargetForUpdate(ctx, tx, apply)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if !hasApplyTarget(database, dbType, environment) || deployment == "" {
-		return nil, fmt.Errorf("apply %s is missing target metadata for reapply: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
-	}
-
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "reapply failed apply")
-
-	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
-	if err != nil {
-		return nil, err
-	}
-	deployments = append(deployments, deployment)
-	if err := checkNoActiveApplyForTargets(ctx, tx, database, dbType, environment, deployments, apply.ID); err != nil {
-		return nil, err
-	}
-	if err := rejectNonReappliableOperations(ctx, tx, apply); err != nil {
-		return nil, err
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE tasks t
-		LEFT JOIN apply_operations ao ON ao.id = t.apply_operation_id AND ao.apply_id = t.apply_id
-		SET t.state = ?, t.error_message = NULL, t.completed_at = NULL, t.updated_at = NOW()
-		WHERE t.apply_id = ?
-			AND t.state IN (?, ?)
-			AND (t.apply_operation_id IS NULL OR ao.state = ?)
-	`, state.Task.FailedRetryable, apply.ID, state.Task.Failed, state.Task.Cancelled, state.ApplyOperation.Failed); err != nil {
-		return nil, fmt.Errorf("mark failed tasks retryable for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE apply_operations
-		SET state = ?, error_message = NULL, completed_at = NULL, updated_at = NOW(),
-		    lease_owner = '', lease_token = '', lease_acquired_at = NULL
-		WHERE apply_id = ? AND state = ?
-	`, state.ApplyOperation.FailedRetryable, apply.ID, state.ApplyOperation.Failed); err != nil {
-		return nil, fmt.Errorf("mark failed operations retryable for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-
-	result, err := tx.ExecContext(ctx, `
-		UPDATE applies
-		SET state = ?, error_message = '', attempt = 0, completed_at = NULL, updated_at = NOW(),
-		    lease_owner = '', lease_token = '', lease_acquired_at = NULL
-		WHERE id = ? AND state = ?
-	`, state.Apply.FailedRetryable, apply.ID, state.Apply.Failed)
-	if err != nil {
-		return nil, fmt.Errorf("mark apply %s retryable for reapply: %w", apply.ApplyIdentifier, err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return nil, fmt.Errorf("read reapply rows affected for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	if rows == 0 {
-		return nil, fmt.Errorf("apply %s changed before reapply: %w", apply.ApplyIdentifier, storage.ErrApplyNotReappliable)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit reapply failed apply %s: %w", apply.ApplyIdentifier, err)
-	}
-
-	apply.State = state.Apply.FailedRetryable
-	apply.ErrorMessage = ""
-	apply.Attempt = 0
-	apply.CompletedAt = nil
-	apply.UpdatedAt = time.Now()
-	apply.LeaseOwner = ""
-	apply.LeaseToken = ""
-	apply.LeaseAcquiredAt = nil
-	return apply, nil
-}
-
-func rejectNonReappliableOperations(ctx context.Context, tx *rebindTx, apply *storage.Apply) error {
-	var count int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM apply_operations
-		WHERE apply_id = ? AND state IN (?, ?, ?)
-	`, apply.ID, state.ApplyOperation.Stopped, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted).Scan(&count); err != nil {
-		return fmt.Errorf("check non-reappliable operations for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	if count > 0 {
-		return fmt.Errorf("apply %s has %d stopped, cancelled, or reverted operation(s); create a new apply instead: %w", apply.ApplyIdentifier, count, storage.ErrApplyNotReappliable)
-	}
-	return nil
 }
 
 func retryableExpirationReason(apply *storage.Apply) storage.RetryableExpirationReason {

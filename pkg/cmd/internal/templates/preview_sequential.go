@@ -61,6 +61,7 @@ func previewSeqSecondRunOutput() {
 		Engine:    "Spirit",
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-12 * time.Minute).Format(time.RFC3339),
+		Volume:    3,
 		Tables: []TableProgress{
 			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
 			{
@@ -104,12 +105,48 @@ func previewSeqThirdRunOutput() {
 	WriteProgress(data)
 }
 
+func previewSeqCatchingUpOutput() {
+	fmt.Println("Sequential mode: First complete, second catching up on accumulated changes")
+	fmt.Println()
+
+	data := ProgressData{
+		State:     state.Apply.CatchingUp,
+		Engine:    "Spirit",
+		ApplyID:   "apply-a1b2c3d4e5f6",
+		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
+		Tables: []TableProgress{
+			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.CatchingUp, RowsCopied: 5000000, RowsTotal: 5000000, PercentComplete: 100},
+			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+		},
+	}
+	WriteProgress(data)
+}
+
+func previewSeqPostChecksumOutput() {
+	fmt.Println("Sequential mode: First complete, second verified and applying final changes")
+	fmt.Println()
+
+	data := ProgressData{
+		State:     state.Apply.PostChecksum,
+		Engine:    "Spirit",
+		ApplyID:   "apply-a1b2c3d4e5f6",
+		StartedAt: previewTime.Add(-30 * time.Minute).Format(time.RFC3339),
+		Tables: []TableProgress{
+			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.PostChecksum, RowsCopied: 5000000, RowsTotal: 5000000, PercentComplete: 100},
+			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewSeqChecksummingOutput() {
 	fmt.Println("Sequential mode: First complete, second checksumming")
 	fmt.Println()
 
 	data := ProgressData{
-		State:     state.Apply.Running,
+		State:     state.Apply.Checksumming,
 		Engine:    "Spirit",
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),

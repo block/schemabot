@@ -71,10 +71,10 @@ func TestFormatShardSummaryParts_CopyingNotRunning(t *testing.T) {
 	}
 }
 
-func TestFormatShardSummaryParts_ReadyForCutover(t *testing.T) {
+func TestFormatShardSummaryParts_WaitingForCutover(t *testing.T) {
 	c := ShardCounts{WaitingForCutover: 5}
 	parts := FormatShardSummaryParts(c, false)
-	assert.Contains(t, parts, "5 ready for cutover")
+	assert.Contains(t, parts, "5 waiting for cutover")
 }
 
 func TestFormatShardSummaryParts_CuttingOver(t *testing.T) {
@@ -88,7 +88,7 @@ func TestFormatShardSummaryParts_Mixed(t *testing.T) {
 	parts := FormatShardSummaryParts(c, false)
 	assert.Equal(t, 3, len(parts))
 	assert.Equal(t, "10 complete", parts[0])
-	assert.Equal(t, "2 ready for cutover", parts[1])
+	assert.Equal(t, "2 waiting for cutover", parts[1])
 	assert.Equal(t, "20 copying", parts[2])
 }
 

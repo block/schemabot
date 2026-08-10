@@ -565,8 +565,9 @@ func RecordDirectWriteAuthorization(ctx context.Context, operation, database, en
 }
 
 // RecordAuthDecision increments the counter for API auth decisions on the
-// direct request path (the OIDC and forward-auth authorizers). Labels are
-// inherently low-cardinality: tier is read/write, decision is allow/deny,
+// direct request path (every API authorizer, including the allow-all one, so
+// unauthenticated deployments still have an alertable write signal). Labels
+// are inherently low-cardinality: tier is read/write, decision is allow/deny,
 // reason is a fixed set.
 func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	addCounter(ctx, "schemabot.auth_decisions.total",
@@ -988,6 +989,33 @@ func RecordOperatorStuckPendingApplies(ctx context.Context, count int64) {
 func RecordOperatorStuckPendingScanFailure(ctx context.Context) {
 	addCounter(ctx, "schemabot.operator.stuck_pending_scan_failures",
 		"Total number of failed operator stuck-pending apply scans", "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorDriverPoolSize records the size of this process's operator
+// driver pool — how many drives it can hold at once. Together with
+// schemabot.operator.drivers_busy it answers how much claim capacity remains:
+// summed across processes, pool size minus busy is the number of drivers
+// still free to claim queued work.
+func RecordOperatorDriverPoolSize(ctx context.Context, size int64) {
+	recordGauge(ctx, "schemabot.operator.driver_pool_size", size,
+		"Size of the operator driver pool in this process", "{driver}",
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordOperatorDriversBusy records how many operator drivers in this process
+// currently hold claimed work. A driver is busy from the moment its claim
+// succeeds until the drive returns, so a long-running apply holds a driver for
+// its full duration. When busy reaches the pool size on every process, newly
+// queued applies wait for a drive to finish, and the stuck-pending gauge is the alarm
+// that they waited too long. The count is process-local on purpose: a busy
+// driver's occupancy dies with its process, and a peer recovers the work
+// through stale-lease claims, so there is no durable truth to sample.
+func RecordOperatorDriversBusy(ctx context.Context, busy int64) {
+	recordGauge(ctx, "schemabot.operator.drivers_busy", busy,
+		"Number of operator drivers currently holding claimed work", "{driver}",
 		EnvironmentAttribute(""),
 	)
 }
