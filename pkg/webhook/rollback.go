@@ -33,16 +33,16 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 // issue_comment driver:
 //
 //   - retry=true, err!=nil — a transient infrastructure failure (command
-//     bootstrap, a storage read, lock acquisition, plan generation, or plan
-//     pinning) that a durable driver should re-drive; the same window may
-//     succeed on a later attempt.
+//     bootstrap, a storage read, lock acquisition, remote-deployment
+//     unavailability during plan generation, or plan pinning) that a durable
+//     driver should re-drive; the same window may succeed on a later attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (a missing apply ID, an apply not found, a non-owned environment, a gate
 //     block on the merits, a source-apply guardrail rejection, a lock held by
-//     another PR, no completed apply to roll back, nothing to do, or a posted
-//     rollback plan). A source-apply validation failure is terminal only when
-//     it is a deterministic rejection; an internal failure there stays
-//     retryable.
+//     another PR, a plan-generation failure other than remote-deployment
+//     unavailability, nothing to do, or a posted rollback plan). A
+//     source-apply validation failure is terminal only when it is a
+//     deterministic rejection; an internal failure there stays retryable.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -209,16 +209,20 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		RequirePullRequestScope: true,
 	}); err != nil {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		// The released lock lets a re-drive start over, so an internal
+		// validation failure stays retryable; a deterministic guardrail
+		// rejection is the command's answer.
+		if api.IsInternalControlError(err) {
+			h.logger.Error("rollback source revalidation failed after lock acquisition",
+				"repo", repo, "pr", pr, "apply_id", applyID,
+				"environment", result.Environment, "database", database, "error", err)
+			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+			return true, fmt.Errorf("rollback command revalidate source apply %s#%d apply %s: %w", repo, pr, applyID, err)
+		}
 		h.logger.Warn("rollback rejected by source apply guardrails after lock acquisition",
 			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", result.Environment, "database", database, "error", err)
 		h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, database, err.Error())
-		// The released lock lets a re-drive start over, so an internal
-		// validation failure stays retryable; a deterministic guardrail
-		// rejection is the command's answer.
-		if api.ControlOperationHTTPStatus(err) >= http.StatusInternalServerError {
-			return true, fmt.Errorf("rollback command revalidate source apply %s#%d apply %s: %w", repo, pr, applyID, err)
-		}
 		return false, nil
 	}
 
@@ -228,14 +232,17 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
 	if err != nil {
 		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "no completed") {
-			h.postComment(repo, pr, installationID, templates.RenderRollbackNoCompletedApply(database, environment))
-			return false, nil
-		}
 		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, errMsg)
-		return true, fmt.Errorf("rollback command plan %s#%d apply %s: %w", repo, pr, applyID, err)
+		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+		if isTransientRemotePlanError(err) {
+			return true, fmt.Errorf("rollback command plan %s#%d apply %s: %w", repo, pr, applyID, err)
+		}
+		// Failures other than remote-deployment unavailability are treated
+		// as deterministic: the posted error is the command's answer. Some
+		// of them are not truly deterministic (plan generation reads storage
+		// and a live target), so recovery for those is the user re-issuing
+		// the command.
+		return false, nil
 	}
 
 	if planResp == nil || !planResp.HasChanges() {
@@ -306,12 +313,11 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 // and a guardrail rejection are deterministic answers, while an internal
 // validation failure stays retryable for a durable driver.
 func (h *Handler) handleRollbackSourceError(repo string, pr int, installationID int64, requestedBy string, apply *storage.Apply, applyID, environment string, err error) (bool, error) {
-	status := api.ControlOperationHTTPStatus(err)
-	if status == http.StatusNotFound {
+	if api.ControlOperationHTTPStatus(err) == http.StatusNotFound {
 		h.postComment(repo, pr, installationID, templates.RenderRollbackApplyNotFound(applyID))
 		return false, nil
 	}
-	if status >= http.StatusInternalServerError {
+	if api.IsInternalControlError(err) {
 		h.logger.Error("rollback source validation failed",
 			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", environment, "error", err)

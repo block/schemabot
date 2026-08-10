@@ -20,12 +20,11 @@ import (
 // future durable issue_comment driver consumes. The synchronous goSafe wrapper
 // discards it, so these tests pin the contract directly on the core.
 //
-// The plan-generation dispositions (a "no completed" answer, an infrastructure
-// failure inside ExecuteRollbackPlanForApply, a nothing-to-do plan, and a
-// failed plan pin) are not exercised here: they require a concrete *api.Service
-// plan pipeline with a live engine, which this layer fakes at the storage
-// boundary. The storage-boundary cases below pin the same classification rule
-// those branches follow — deterministic answers are terminal, infrastructure
+// The retryable plan-generation disposition (remote-deployment unavailability
+// inside ExecuteRollbackPlanForApply) is not exercised here: producing it
+// requires a live remote gRPC target, which this layer fakes at the storage
+// boundary. The deterministic plan-generation rejection, and every other exit
+// site, are pinned below — deterministic answers are terminal, infrastructure
 // failures are retryable.
 
 // rollbackTestStorage serves the stores the rollback command core touches:
@@ -72,6 +71,58 @@ type rollbackTestTaskStore struct {
 
 func (s *rollbackTestTaskStore) GetByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
 	return s.tasks, s.err
+}
+
+// rollbackVanishingApplyStore serves the apply on the first lookup and nil on
+// every later one, modeling an apply deleted between the command's own lookup
+// and the source-apply validation's re-read.
+type rollbackVanishingApplyStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
+	calls int
+}
+
+func (s *rollbackVanishingApplyStore) GetByApplyIdentifier(_ context.Context, _ string) (*storage.Apply, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.apply, nil
+	}
+	return nil, nil
+}
+
+// rollbackFlakyPlanStore serves the plan for the first failAfter reads and
+// fails afterwards, reaching the validation sites that re-read the plan later
+// in the command.
+type rollbackFlakyPlanStore struct {
+	storage.PlanStore
+	plan      *storage.Plan
+	failAfter int
+	calls     int
+}
+
+func (s *rollbackFlakyPlanStore) GetByID(_ context.Context, _ int64) (*storage.Plan, error) {
+	s.calls++
+	if s.calls > s.failAfter {
+		return nil, errors.New("storage read failed")
+	}
+	return s.plan, nil
+}
+
+// rollbackShrinkingTaskStore serves the tasks on the first read and an empty
+// set afterwards, modeling a concurrent apply changing which schema change the
+// rollback planner would select between validation and revalidation.
+type rollbackShrinkingTaskStore struct {
+	storage.TaskStore
+	tasks []*storage.Task
+	calls int
+}
+
+func (s *rollbackShrinkingTaskStore) GetByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.tasks, nil
+	}
+	return nil, nil
 }
 
 type rollbackTestLockStore struct {
@@ -194,6 +245,30 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.Contains(t, body, "load source plan")
 	})
 
+	// The source apply is revalidated after lock acquisition; an internal
+	// failure there is not a verdict on the rollback either, so the lock is
+	// released and the delivery stays retryable.
+	t.Run("internal revalidation failure after lock acquisition is retryable", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackFlakyPlanStore{plan: capturedSourcePlan(), failAfter: 1},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.Error(t, err)
+		assert.True(t, retry, "an internal revalidation failure must stay retryable, not become the command's answer")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
+		body := requireComment(t, comments, "revalidation failure comment")
+		assert.Contains(t, body, "load source plan")
+	})
+
 	t.Run("lock status read failure is retryable", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := recordComments(t, mux)
@@ -287,6 +362,45 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "apply-123")
 	})
 
+	// The source-apply validation re-reads the apply; one that vanished between
+	// the command's own lookup and the validation gets the same not-found
+	// answer on every re-drive.
+	t.Run("apply vanished before validation is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		st := &rollbackTestStorage{
+			applies: &rollbackVanishingApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackTestPlanStore{plan: capturedSourcePlan()},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a not-found validation answer is the command's answer; a re-drive cannot conjure the apply")
+		body := requireComment(t, comments, "apply not found comment")
+		assert.Contains(t, body, "Apply Not Found")
+		assert.Contains(t, body, "apply-123")
+	})
+
+	// On an aggregate repo an unscoped rollback fans out to every deployment,
+	// but the apply lives in exactly one tenant's storage; a deployment that
+	// doesn't have it stays silent so only the owning deployment answers — a
+	// deliberate silent no-op, not a failure.
+	t.Run("unowned unscoped fan-out is terminal and silent", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		st := &rollbackTestStorage{applies: &rollbackTestApplyStore{}}
+		h := actorAuthStorageTestHandler(aggregateLeaderConfig(), st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a non-owning fan-out skip is the command's terminal answer, not a retryable failure")
+		assert.Empty(t, comments, "the terminal skip must stay silent")
+	})
+
 	// Another instance owns the apply's environment; that instance answers, so
 	// this one must stay silent and never re-drive.
 	t.Run("non-allowed environment is terminal and silent", func(t *testing.T) {
@@ -325,6 +439,62 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		body := requireComment(t, comments, "guardrail rejection comment")
 		assert.Contains(t, body, "Rollback Not Allowed")
 		assert.Contains(t, body, "rollback requires a completed apply")
+	})
+
+	// A concurrent apply can change which schema change the rollback planner
+	// would select between validation and the post-lock revalidation. The
+	// revalidation's guardrail rejection is deterministic for the re-driven
+	// command, so the lock is released and the posted rejection is the answer.
+	t.Run("guardrail rejection at post-lock revalidation is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackTestPlanStore{plan: capturedSourcePlan()},
+			tasks:   &rollbackShrinkingTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a deterministic revalidation rejection is the command's answer; re-driving would re-reject")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the rejection")
+		body := requireComment(t, comments, "revalidation rejection comment")
+		assert.Contains(t, body, "Rollback Not Allowed")
+		assert.Contains(t, body, "no completed schema change task found")
+	})
+
+	// A rollback plan cannot be generated for a source plan that predates
+	// stored routing metadata; the posted error is the command's answer, and a
+	// re-drive against the same stored plan would only re-post it.
+	t.Run("deterministic plan-generation failure is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		apply := completedSourceApply()
+		apply.Deployment = "tenant-a"
+		plan := capturedSourcePlan()
+		plan.Database = apply.Database
+		plan.DatabaseType = apply.DatabaseType
+		plan.Environment = apply.Environment
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: apply},
+			plans:   &rollbackTestPlanStore{plan: plan},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a deterministic plan-generation failure is the command's answer; re-driving would re-post the same error")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
+		body := requireComment(t, comments, "plan-generation failure comment")
+		assert.Contains(t, body, "missing server-side routing metadata")
 	})
 
 	t.Run("lock held by another PR is terminal", func(t *testing.T) {

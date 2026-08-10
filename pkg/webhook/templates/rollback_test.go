@@ -150,14 +150,6 @@ func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 	assert.Contains(t, rendered, "[users] Dropping index may impact queries")
 }
 
-func TestRenderRollbackNoCompletedApply(t *testing.T) {
-	rendered := RenderRollbackNoCompletedApply("testapp", "staging")
-	assert.Contains(t, rendered, "## ℹ️ No Completed Schema Change to Rollback")
-	assert.Contains(t, rendered, "`testapp`")
-	assert.Contains(t, rendered, "`staging`")
-	assert.Contains(t, rendered, "no completed schema change")
-}
-
 func TestRenderRollbackConfirmNoLock(t *testing.T) {
 	rendered := RenderRollbackConfirmNoLock("testapp", "staging", "")
 	assert.Contains(t, rendered, "## 🔒 No Lock Found")

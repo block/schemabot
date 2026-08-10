@@ -59,16 +59,6 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	return sb.String()
 }
 
-// RenderRollbackNoCompletedApply renders a message when there is no completed
-// schema change to roll back.
-func RenderRollbackNoCompletedApply(database, environment string) string {
-	return fmt.Sprintf("## ℹ️ No Completed Schema Change to Rollback\n\n"+
-		"**Database**: `%s` | **Environment**: `%s`\n\n"+
-		"There is no completed schema change with stored original schema to roll back to.\n"+
-		"Rollback requires a previous `apply` that completed successfully.",
-		database, environment)
-}
-
 // RenderRollbackConfirmNoLock renders a message when rollback-confirm is run
 // without a held lock. Tenant is the deployment's own tenant; when set, the
 // suggested command carries it so pasting the hint addresses this deployment.
