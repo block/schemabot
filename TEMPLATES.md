@@ -1534,7 +1534,7 @@ Another schema change is in progress for this database.
 
 Options:
   • Wait for the current schema change to complete
-  • Ask the lock owner to release: schemabot unlock
+  • Ask the lock owner to release: schemabot unlock -d testapp
   • Force unlock: schemabot unlock -d testapp --force
 
 
@@ -1559,7 +1559,7 @@ Another schema change is in progress for this database.
 
 Options:
   • Wait for the current schema change to complete
-  • Ask the lock owner to release: schemabot unlock
+  • Ask the lock owner to release: schemabot unlock -d testapp
   • Force unlock: schemabot unlock -d testapp --force
 
 
@@ -3171,7 +3171,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** Error 1061: Duplicate key name 'idx_user_id'
+> ⚠️ **Error:** Error 1061: Duplicate key name &#39;idx_user_id&#39;
 
 ---
 
@@ -4033,7 +4033,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value
+> ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field &#39;name&#39; doesn&#39;t have a default value
 
 1 of 3 tables completed before failure.
 
@@ -4282,7 +4282,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 *Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
 
-> ⚠️ **Error:** Error 1062: Duplicate entry '12345' for key 'addresses.idx_user_id'
+> ⚠️ **Error:** Error 1062: Duplicate entry &#39;12345&#39; for key &#39;addresses.idx_user_id&#39;
 
 4 of 8 tables completed before failure.
 

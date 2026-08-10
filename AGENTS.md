@@ -164,13 +164,13 @@ Every operator control operation (stop, start, cutover, cancel, volume, revert, 
 
 **Instant DDL terminology:** In MySQL, "instant DDL" has a specific meaning — `ALTER TABLE` operations that only modify metadata (e.g., adding a column with `ALGORITHM=INSTANT`). `CREATE TABLE` and `DROP TABLE` are **not** instant DDL even though they complete quickly. Don't describe them as instant in code or comments.
 
-### SQL Parsing: TiDB Parser Requirement
+### SQL Parsing: Real-Parser Requirement
 
-All SQL statements processed by SchemaBot **must be parseable by the TiDB parser** (via Spirit's `statement.New()` and `statement.ParseCreateTable()`). This is a hard requirement, not a best-effort behavior.
+All SQL statements processed by SchemaBot **must be parseable by the dialect's real parser**. For the MySQL family (MySQL/Vitess/Strata) that is the TiDB parser (via Spirit's `statement.New()` and `statement.ParseCreateTable()`); for PostgreSQL it is libpg_query (via the `pkg/ddl` `StatementParser` obtained from `ParserForDialect`). This is a hard requirement, not a best-effort behavior, and the same discipline applies to both grammars.
 
-- **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the TiDB parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
+- **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
-- Schema files are expected to contain valid MySQL DDL. If the TiDB parser cannot handle a valid MySQL construct, that is a bug to fix in the parser or Spirit, not something to work around with string splitting.
+- Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
 
 ## AWS Infrastructure
 
@@ -239,7 +239,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 
 - Use `mysqlconn.Open()` from `github.com/block/schemabot/pkg/mysqlconn` for SchemaBot-managed MySQL connections. It centralizes DSN normalization, including required TLS settings for RDS targets. Use raw `sql.Open("mysql", ...)` only for local test/dev infrastructure (for example LocalScale) or engine-specific connection paths that intentionally manage their own TLS config (for example PlanetScale/Vitess mTLS).
 - Use `postgresconn.Open()` from `github.com/block/schemabot/pkg/postgresconn` for SchemaBot-managed PostgreSQL connections — it is the Postgres counterpart of `mysqlconn` (DSN normalization, required `sslmode` for RDS targets). Reserve `postgresconn.OpenReloadable()` for the single long-lived storage pool. Do not open Postgres connections with raw `sql.Open("pgx", ...)` outside local test/dev infrastructure.
-- After opening a database with `mysqlconn.Open()`, `postgresconn.Open()`, or raw `sql.Open(...)`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections).
+- After opening a database with `mysqlconn.Open()`, `postgresconn.Open()`, or raw `sql.Open(...)`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections). An immediately error-checked `db.Conn(ctx)` right after open also satisfies this rule — for a freshly opened pool it is equivalent to a ping, since the empty pool forces a real dial and auth handshake. Outside that right-after-open window `db.Conn(ctx)` can hand back an already-pooled connection and verifies nothing, so it is not a general ping substitute.
 - Always backtick-quote SQL identifiers: `` USE `db` ``, `` SHOW CREATE TABLE `tbl` ``.
 - **Never manipulate DSN strings with `strings.Replace`.** Use `mysql.ParseDSN()` / `cfg.FormatDSN()` from `github.com/go-sql-driver/mysql` to parse, modify fields, and re-serialize. String manipulation is fragile and breaks on DSNs with passwords containing `/` or other special characters.
 

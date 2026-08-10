@@ -148,3 +148,31 @@ func TestRenderRecentFailureLogsTruncatesSingleOversizedLine(t *testing.T) {
 	assert.Contains(t, rendered, "…", "the truncated line ends with an ellipsis")
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(rendered), "</details>"), "the fold still closes cleanly")
 }
+
+// Engine log lines rendered in the failure fold carry the same raw dial
+// errors the error block above redacts, so the fold redacts endpoints too —
+// otherwise it would reveal exactly what the error block hides.
+func TestRenderRecentFailureLogsRedactsEndpoints(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	rendered := RenderRecentFailureLogs([]LogEntryData{
+		{CreatedAt: at, Level: "error", Message: "dial tcp db-primary.internal:3306: connection refused"},
+	}, GitHubIssueCommentMaxChars, false)
+
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "[ERR] dial tcp [endpoint redacted]: connection refused")
+}
+
+// Engine log lines can carry ANSI escape sequences and bidi override
+// characters that browsers still apply inside a fenced block, letting a log
+// line recolor or visually reorder the text an operator reads during a
+// failure. The fold strips them the same way the error block above does.
+func TestRenderRecentFailureLogsStripsControlCharacters(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	rendered := RenderRecentFailureLogs([]LogEntryData{
+		{CreatedAt: at, Level: "error", Message: "red\x1b[31malert re\u202enamed.txt\u202c"},
+	}, GitHubIssueCommentMaxChars, false)
+
+	assert.Contains(t, rendered, "[ERR] redalert renamed.txt")
+	assert.NotContains(t, rendered, "\x1b", "ANSI escapes are stripped")
+	assert.NotContains(t, rendered, "\u202e", "bidi overrides are stripped")
+}

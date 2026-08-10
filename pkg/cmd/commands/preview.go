@@ -5,13 +5,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // PreviewCmd previews CLI output templates without running schema changes.
 type PreviewCmd struct {
-	Type string `arg:"" optional:"" help:"Preview type (run 'schemabot preview' for valid types)"`
+	Type string `arg:"" optional:"" help:"Preview type (run '${cli_name} preview' for valid types)"`
 	Live bool   `help:"Run interactive preview for TUI preview types"`
 }
 
@@ -152,17 +153,17 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		fmt.Println("=" + strings.Repeat("=", 70))
 		previewExitAll()
 	default:
-		return fmt.Errorf("unknown preview type: %s (run 'schemabot preview' for valid types)", cmd.Type)
+		return fmt.Errorf("unknown preview type: %s (run '%s preview' for valid types)", cmd.Type, cliname.Name())
 	}
 
 	return nil
 }
 
 func printPreviewUsage() {
-	fmt.Println(`Preview CLI output templates without running schema changes.
+	fmt.Printf(`Preview CLI output templates without running schema changes.
 
 Usage:
-  schemabot preview <type>
+  %[1]s preview <type>
 
 Basic Types:
   plan                  Show sample plan output
@@ -331,8 +332,9 @@ Meta:
   all                   Show all preview types
 
 Examples:
-  schemabot preview plan
-  schemabot preview sequential_all
-  schemabot preview comment_plan_all
-  schemabot preview all`)
+  %[1]s preview plan
+  %[1]s preview sequential_all
+  %[1]s preview comment_plan_all
+  %[1]s preview all
+`, cliname.Name())
 }

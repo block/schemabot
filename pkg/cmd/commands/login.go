@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // loginTimeout bounds the whole interactive login, including the wait for the
@@ -51,10 +52,10 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	profileName := client.ResolveProfileName(cfg, g.Profile)
 	profile, ok := cfg.Profiles[profileName]
 	if !ok {
-		return fmt.Errorf("profile %q is not configured; run `schemabot configure` to set its endpoint before logging in", profileName)
+		return fmt.Errorf("profile %q is not configured; run `%s configure` to set its endpoint before logging in", profileName, cliname.Name())
 	}
 	if profile.Endpoint == "" {
-		return fmt.Errorf("profile %q has no endpoint; run `schemabot configure` to set it before logging in", profileName)
+		return fmt.Errorf("profile %q has no endpoint; run `%s configure` to set it before logging in", profileName, cliname.Name())
 	}
 
 	loginCfg, err := resolveLoginConfig(cmd.Issuer, cmd.ClientID, cmd.RedirectPort, &profile)

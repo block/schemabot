@@ -8,6 +8,8 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // StatementParser abstracts the dialect-specific, string-level DDL parsing
@@ -44,6 +46,23 @@ type StatementParser interface {
 // and Vitess behavior is unchanged. Later work (Postgres support) selects a
 // dialect-specific parser at the call sites that know the database type.
 var defaultParser StatementParser = tidbStatementParser{}
+
+// ParserForDialect returns the StatementParser for a database family. The
+// MySQL family (MySQL, Vitess, Strata) shares the TiDB parser; Postgres gets
+// the libpg_query parser. An unregistered dialect is an error rather than a
+// silent fallback, so a mislabeled target can never have its DDL classified
+// by another family's grammar. Callers holding a database_type derive the
+// dialect with schema.DialectForDatabaseType.
+func ParserForDialect(dialect schema.Dialect) (StatementParser, error) {
+	switch dialect {
+	case schema.DialectMySQL:
+		return tidbStatementParser{}, nil
+	case schema.DialectPostgres:
+		return postgresStatementParser{}, nil
+	default:
+		return nil, fmt.Errorf("no statement parser registered for dialect %q", dialect)
+	}
+}
 
 // tidbStatementParser implements StatementParser over the TiDB parser via
 // Spirit's statement package — the behavior pkg/ddl has always had.

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 	"vitess.io/vitess/go/vt/key"
@@ -798,7 +800,7 @@ func previewWaitingForCutoverOutput() {
 	fmt.Println("Row copy complete. All data has been copied and new writes")
 	fmt.Println("continue to be replicated to keep the shadow table in sync.")
 	fmt.Println()
-	fmt.Println("To proceed: schemabot cutover -e staging <apply_id>")
+	fmt.Printf("To proceed: %s cutover -e staging <apply_id>\n", cliname.Name())
 	fmt.Println("Watching for cutover... (Ctrl+C to detach)")
 }
 
@@ -896,12 +898,12 @@ func previewStoppedOutput() {
 		},
 	}
 	WriteProgress(data)
-	fmt.Println("\nStopped. Use 'schemabot start -e staging <apply_id>' to resume from checkpoint.")
+	fmt.Printf("\nStopped. Use '%s start -e staging <apply_id>' to resume from checkpoint.\n", cliname.Name())
 }
 
 func previewApplyWatchOutput() {
 	fmt.Println("Apply watch mode: Running with footer controls")
-	fmt.Println("(schemabot apply -s ./schema -e staging)")
+	fmt.Printf("(%s apply -s ./schema -e staging)\n", cliname.Name())
 	fmt.Println()
 
 	// In-progress state
@@ -950,7 +952,7 @@ func previewApplyWatchOutput() {
 
 func previewApplyStoppedOutput() {
 	fmt.Println("Apply watch mode: Stopped by user")
-	fmt.Println("(user ran schemabot stop)")
+	fmt.Printf("(user ran %s stop)\n", cliname.Name())
 	fmt.Println()
 
 	data := ProgressData{
@@ -974,7 +976,7 @@ func previewApplyStoppedOutput() {
 	WriteProgress(data)
 
 	fmt.Printf("%s\n", FormatApplyStopped())
-	fmt.Println("Use 'schemabot start -e staging <apply_id>' to resume.")
+	fmt.Printf("Use '%s start -e staging <apply_id>' to resume.\n", cliname.Name())
 }
 
 // =============================================================================
@@ -982,7 +984,7 @@ func previewApplyStoppedOutput() {
 // =============================================================================
 
 func previewStopCommandOutput() {
-	fmt.Println("Stop command: User runs 'schemabot stop -e staging <apply_id>'")
+	fmt.Printf("Stop command: User runs '%s stop -e staging <apply_id>'\n", cliname.Name())
 	fmt.Println()
 
 	WriteStopSuccess(StopData{
@@ -1019,7 +1021,7 @@ func previewStopCommandOutput() {
 }
 
 func previewStartCommandOutput() {
-	fmt.Println("Start command: User runs 'schemabot start -e staging <apply_id>'")
+	fmt.Printf("Start command: User runs '%s start -e staging <apply_id>'\n", cliname.Name())
 	fmt.Println()
 
 	WriteStartSuccess(StartData{
