@@ -14,8 +14,8 @@ import (
 	"github.com/alecthomas/kong"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/commands"
-	"github.com/block/schemabot/pkg/cmd/internal/cliname"
 )
 
 // Set by ldflags at build time.

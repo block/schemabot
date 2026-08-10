@@ -3,9 +3,11 @@
 // Every pasteable command the CLI prints ("Force unlock: schemabot unlock
 // ...") starts with the tool name. When the CLI runs behind a wrapper, the
 // bare binary name is wrong: pasting it invokes an unconfigured binary
-// instead of the wrapper the operator actually uses. The wrapper passes its
-// own invocation on every call via the --cli-name flag, and every hint
-// renders through Name so pasted commands work as printed.
+// instead of the wrapper the operator actually uses. A wrapper that execs
+// the binary passes its own invocation on every call via the --cli-name
+// flag; a wrapper that embeds the command packages calls Set directly before
+// parsing. Every hint renders through Name so pasted commands work as
+// printed.
 package cliname
 
 import (

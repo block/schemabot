@@ -10,7 +10,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/cmd/internal/cliname"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ui"
 )
 

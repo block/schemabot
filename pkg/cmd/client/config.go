@@ -12,7 +12,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"gopkg.in/yaml.v3"
 
-	"github.com/block/schemabot/pkg/cmd/internal/cliname"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // Config represents the global SchemaBot CLI configuration.

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/block/schemabot/pkg/cmd/internal/cliname"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ui"
 )
 

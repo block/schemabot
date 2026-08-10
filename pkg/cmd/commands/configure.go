@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/internal/cliname"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // ConfigureCmd configures CLI settings.

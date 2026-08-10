@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/internal/cliname"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // loginTimeout bounds the whole interactive login, including the wait for the
