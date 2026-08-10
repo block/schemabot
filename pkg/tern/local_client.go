@@ -787,6 +787,7 @@ func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string
 	if err != nil {
 		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", c.config.Database, branch, err)
 	}
+	dialect := schema.DialectForDatabaseType(c.config.Type)
 	namespaces := make([]string, 0, len(keyspaces))
 	for _, keyspace := range keyspaces {
 		if keyspace == nil {
@@ -796,7 +797,7 @@ func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string
 		if keyspace.Name == "" {
 			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", c.config.Database, branch)
 		}
-		if schema.IsReservedPullNamespaceForDialect(schema.DialectForDatabaseType(c.config.Type), keyspace.Name) {
+		if schema.IsReservedPullNamespaceForDialect(dialect, keyspace.Name) {
 			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", branch, "namespace", keyspace.Name)
 			continue
 		}
