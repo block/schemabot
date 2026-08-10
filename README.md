@@ -130,6 +130,7 @@ Guides and reference:
 - [Vision](./docs/vision.md): See what we’re building toward
 - [Quick start](#quick-start): Try it on your machine
 - [Pre-merge workflow](./docs/pre-merge-workflow.md): Take a schema change from your first edit to a merged PR
+- [CLI guide](./docs/cli.md): Set up the CLI, inspect your databases, and run changes
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
