@@ -204,7 +204,8 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 // means the driver died mid-claim.
 func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
 	claimedAt := time.Now()
-	metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_started")
+	appName := h.metricAppForRepo(event.Repository)
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_started")
 	if event.Attempts == 1 {
 		// Only the first claim measures inbox wait: started_at pins to the
 		// first claim, and a retry claim's wait is the retry window, not
@@ -212,7 +213,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		// the refund means no genuine attempt happened — so the reclaim is
 		// the effective first attempt and records lag again, measured from
 		// the original receipt.
-		metrics.RecordWebhookInboxDispatchLag(ctx, event.Event, event.Repository, time.Since(event.ReceivedAt))
+		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(event.ReceivedAt))
 	}
 
 	runCtx, cancelRun := context.WithCancel(ctx)
@@ -228,7 +229,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	recordOutcome := func(outcome string) {
-		metrics.RecordWebhookDispatchDuration(finishCtx, event.Event, event.Repository, outcome, time.Since(claimedAt))
+		metrics.RecordWebhookDispatchDuration(finishCtx, appName, event.Event, event.Repository, outcome, time.Since(claimedAt))
 	}
 	if processErr != nil {
 		if heartbeatErr == nil && ctx.Err() != nil {
@@ -293,7 +294,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			outcome = "retrying"
 		}
 		recordOutcome(outcome)
-		metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, status)
+		metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, status)
 		h.logger.Warn("durable webhook driver recorded delivery failure",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
@@ -328,7 +329,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		return
 	}
 	recordOutcome("completed")
-	metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_completed")
+	metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_completed")
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)

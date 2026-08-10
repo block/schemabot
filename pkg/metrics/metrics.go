@@ -1427,11 +1427,11 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 // "default".
 func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, status string) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("event_type", eventType, appName, repo, status)
+		logUnknownWebhookMetricLabel("schemabot.webhook.events_total", "event_type", eventType, appName, repo, status)
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
-		logUnknownWebhookMetricLabel("action", action, appName, repo, status)
+		logUnknownWebhookMetricLabel("schemabot.webhook.events_total", "action", action, appName, repo, status)
 		action = "unknown"
 	}
 	if appName == "" {
@@ -1454,17 +1454,27 @@ func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, s
 		attrs...)
 }
 
-func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
-	key := label + "\x00" + value + "\x00" + appName + "\x00" + repo + "\x00" + status
+// logUnknownWebhookMetricLabel warns once per distinct label tuple when a
+// webhook metric label is folded to "unknown". metric names the instrument the
+// fold happened on; status is the webhook event status being recorded and must
+// be empty for instruments that do not carry one, so the event_status log field
+// only ever holds real statuses.
+func logUnknownWebhookMetricLabel(metric, label, value, appName, repo, status string) {
+	key := metric + "\x00" + label + "\x00" + value + "\x00" + appName + "\x00" + repo + "\x00" + status
 	if _, loaded := seenUnknownWebhookMetricLabels.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
-	slog.Warn("webhook metric label normalized to unknown",
+	attrs := []any{
+		"metric", metric,
 		"label", label,
 		"value", value,
 		"app_name", appName,
 		"repo", repo,
-		"event_status", status)
+	}
+	if status != "" {
+		attrs = append(attrs, "event_status", status)
+	}
+	slog.Warn("webhook metric label normalized to unknown", attrs...)
 }
 
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events
@@ -1473,11 +1483,11 @@ func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
 // deployment will not process.
 func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action, repo string) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("event_type", eventType, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "event_type", eventType, appName, repo, "ignored")
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
-		logUnknownWebhookMetricLabel("action", action, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "action", action, appName, repo, "ignored")
 		action = "unknown"
 	}
 	if appName == "" {
@@ -1572,10 +1582,12 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 // the original receipt — deploy churn therefore adds extra, longer samples
 // without any driver-capacity problem. Unknown event types fold to "unknown"
 // and negative lags (cross-pod clock skew between the enqueueing and claiming
-// replica) clamp to zero so the histogram stays trustworthy.
-func RecordWebhookInboxDispatchLag(ctx context.Context, eventType, repo string, lag time.Duration) {
+// replica) clamp to zero so the histogram stays trustworthy. appName is the
+// resolved GitHub App name used only for fold-log attribution; it is not a
+// metric attribute.
+func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo string, lag time.Duration) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("event_type", eventType, "", repo, "dispatch_lag")
+		logUnknownWebhookMetricLabel("schemabot.webhook.inbox_dispatch_lag_seconds", "event_type", eventType, appName, repo, "")
 		eventType = "unknown"
 	}
 	if lag < 0 {
@@ -1619,22 +1631,27 @@ var knownWebhookDispatchOutcomes = map[string]bool{
 // ledger for the durable_dispatch_started status on the webhook events
 // counter: a sustained gap between started and the sum of outcomes means
 // drivers are dying mid-claim without recording anything — investigate
-// crashes. A rising duration for an event type means its processing path is
-// slowing down and the driver pool drains fewer deliveries per lease.
-func RecordWebhookDispatchDuration(ctx context.Context, eventType, repo, outcome string, duration time.Duration) {
+// crashes. The two instruments only share the event_type dimension, so
+// aggregate both sides down to it before subtracting; the exact query lives in
+// this package's README. A rising duration for an event type means its
+// processing path is slowing down and the driver pool drains fewer deliveries
+// per lease. The histogram deliberately carries no repository label — a
+// histogram costs an order of magnitude more series per attribute combination
+// than a counter, and per-repo attribution belongs to the driver logs; appName
+// and repo are used only for fold-log attribution.
+func RecordWebhookDispatchDuration(ctx context.Context, appName, eventType, repo, outcome string, duration time.Duration) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("event_type", eventType, "", repo, "dispatch_duration")
+		logUnknownWebhookMetricLabel("schemabot.webhook.dispatch_duration_seconds", "event_type", eventType, appName, repo, "")
 		eventType = "unknown"
 	}
 	if !knownWebhookDispatchOutcomes[outcome] {
-		logUnknownWebhookMetricLabel("outcome", outcome, "", repo, "dispatch_duration")
+		logUnknownWebhookMetricLabel("schemabot.webhook.dispatch_duration_seconds", "outcome", outcome, appName, repo, "")
 		outcome = "unknown"
 	}
 	recordHistogram(ctx, "schemabot.webhook.dispatch_duration_seconds", duration.Seconds(),
 		"Duration of one durable webhook dispatch claim by outcome",
 		EnvironmentAttribute(""),
 		attribute.String("event_type", eventType),
-		attribute.String("repository", repo),
 		attribute.String("outcome", outcome),
 	)
 }

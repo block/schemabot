@@ -55,7 +55,7 @@ func collectHistogramPoints(t *testing.T, reader *metric.ManualReader, name stri
 func TestRecordWebhookInboxDispatchLag(t *testing.T) {
 	reader := newWebhookMetricsReader(t)
 
-	RecordWebhookInboxDispatchLag(t.Context(), "pull_request", "org/repo", 90*time.Second)
+	RecordWebhookInboxDispatchLag(t.Context(), "default", "pull_request", "org/repo", 90*time.Second)
 
 	points := collectHistogramPoints(t, reader, "schemabot.webhook.inbox_dispatch_lag_seconds")
 	require.Len(t, points, 1)
@@ -71,7 +71,7 @@ func TestRecordWebhookInboxDispatchLag(t *testing.T) {
 func TestRecordWebhookInboxDispatchLagClampsAndFolds(t *testing.T) {
 	reader := newWebhookMetricsReader(t)
 
-	RecordWebhookInboxDispatchLag(t.Context(), "not_a_real_event", "org/repo", -3*time.Second)
+	RecordWebhookInboxDispatchLag(t.Context(), "default", "not_a_real_event", "org/repo", -3*time.Second)
 
 	points := collectHistogramPoints(t, reader, "schemabot.webhook.inbox_dispatch_lag_seconds")
 	require.Len(t, points, 1)
@@ -81,19 +81,22 @@ func TestRecordWebhookInboxDispatchLagClampsAndFolds(t *testing.T) {
 }
 
 // The dispatch-duration histogram records the claim's duration in seconds
-// keyed by the allowlisted outcome.
+// keyed by the allowlisted outcome. It carries no repository label — the
+// outcome ledger stays cheap and per-repo attribution lives in the driver
+// logs.
 func TestRecordWebhookDispatchDuration(t *testing.T) {
 	reader := newWebhookMetricsReader(t)
 
-	RecordWebhookDispatchDuration(t.Context(), "pull_request", "org/repo", "completed", 2500*time.Millisecond)
+	RecordWebhookDispatchDuration(t.Context(), "default", "pull_request", "org/repo", "completed", 2500*time.Millisecond)
 
 	points := collectHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
 	require.Len(t, points, 1)
 	assert.Equal(t, uint64(1), points[0].Count)
 	assert.InDelta(t, 2.5, points[0].Sum, 0.001)
 	assert.Equal(t, "pull_request", metricAttributeString(t, points[0].Attributes, "event_type"))
-	assert.Equal(t, "org/repo", metricAttributeString(t, points[0].Attributes, "repository"))
 	assert.Equal(t, "completed", metricAttributeString(t, points[0].Attributes, "outcome"))
+	_, hasRepo := points[0].Attributes.Value("repository")
+	assert.False(t, hasRepo, "dispatch duration must not carry the repository label")
 }
 
 // An outcome outside the allowlist must fold to "unknown" so a typo at a call
@@ -101,7 +104,7 @@ func TestRecordWebhookDispatchDuration(t *testing.T) {
 func TestRecordWebhookDispatchDurationFoldsUnknownOutcome(t *testing.T) {
 	reader := newWebhookMetricsReader(t)
 
-	RecordWebhookDispatchDuration(t.Context(), "pull_request", "org/repo", "not_a_real_outcome", time.Second)
+	RecordWebhookDispatchDuration(t.Context(), "default", "pull_request", "org/repo", "not_a_real_outcome", time.Second)
 
 	points := collectHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
 	require.Len(t, points, 1)

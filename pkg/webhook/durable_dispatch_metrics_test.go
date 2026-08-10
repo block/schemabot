@@ -232,6 +232,71 @@ func TestDurableWebhookDispatchMetricsShutdownReleaseLeaseLost(t *testing.T) {
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "lease_lost")
 }
 
+// A shutdown release that fails for a reason other than lease loss records
+// finish_error: the claim could not be refunded and the row stays processing
+// until lease expiry — the storage-health signal on the shutdown path.
+func TestDurableWebhookDispatchMetricsShutdownReleaseFinishError(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.releaseErr = errors.New("storage unavailable")
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	driverCtx, cancelDriver := context.WithCancel(t.Context())
+	defer cancelDriver()
+	h.durableWebhookProcessOverride = func(ctx context.Context, _ *storage.WebhookEvent) (bool, error) {
+		cancelDriver()
+		<-ctx.Done()
+		return true, ctx.Err()
+	}
+
+	h.driveNextDurableWebhook(driverCtx, 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.released)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "finish_error")
+}
+
+// A failure finish that loses the lease records lease_lost, not finish_error:
+// another driver owns the row, so this claim's failure result is simply
+// discarded.
+func TestDurableWebhookDispatchMetricsFailureLeaseLost(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.markFailedErr = storage.ErrWebhookEventLeaseLost
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("transient auto-plan failure")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.failed)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "lease_lost")
+}
+
+// A completion finish that loses the lease records lease_lost, not
+// finish_error or completed: the row belongs to another driver and will be
+// re-processed there.
+func TestDurableWebhookDispatchMetricsCompletionLeaseLost(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.markCompletedErr = storage.ErrWebhookEventLeaseLost
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.completed)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "lease_lost")
+}
+
 // Losing the lease heartbeat after successful processing leaves the row for
 // reclaim and records the lease_lost outcome.
 func TestDurableWebhookDispatchMetricsLeaseLostOutcome(t *testing.T) {

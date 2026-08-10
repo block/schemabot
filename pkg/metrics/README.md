@@ -32,7 +32,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
 | `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
-| `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, repository, outcome | Duration of one durable webhook dispatch claim by outcome |
+| `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API responses observed by SchemaBot |
 | `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
 | `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
@@ -54,6 +54,15 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.pending_drops.cleanup_errors_total` | Counter | database, environment, reason | Pending drops cleanup failures (retried on the next pass) |
 
 > **Deprecated aliases:** the `schemabot.scheduler.*` series (`resumed_total`, `resume_failures_total`, `claim_failures_total`, `claim_duration_seconds`) is still emitted alongside the `schemabot.operator.*` series for one release so dashboards and alerts can migrate. The scheduler-named series will be removed afterward.
+
+> **Dispatch started-vs-outcomes ledger:** every durable dispatch claim records the `durable_dispatch_started` status on `schemabot.webhook.events_total` and exactly one outcome on `schemabot.webhook.dispatch_duration_seconds`, so a sustained gap between the two means drivers are dying mid-claim without recording anything. The two instruments only share the `event_type` dimension (`events_total` additionally carries `app_name`, `action`, and `repository`; the duration histogram deliberately carries none of those — a histogram costs an order of magnitude more series per attribute combination than a counter), so the subtraction is only valid after aggregating both sides down to `event_type`. In Datadog:
+>
+> ```
+> sum:schemabot.webhook.events_total{status:durable_dispatch_started} by {event_type}.as_count()
+>   - sum:schemabot.webhook.dispatch_duration_seconds.count{*} by {event_type}.as_count()
+> ```
+>
+> The ledger cannot be sliced by app, action, or repository — the started side has those dimensions but the outcome side does not. To attribute a gap to a repo or PR, pivot to the driver logs: every dispatch outcome path logs `delivery_id`, `repo`, and `pr`.
 
 > **`stuck_pending_applies` is per-pod, not fleet-wide:** every pod running the server runs the stuck-pending monitor (there is no leader election, matching the inbox-depth and health monitors), so each pod reports the same DB-wide count as its own series. Aggregate with `max()`/`avg()`, not `sum()`, and expect the paired WARN log to fire from every pod each scan while anything is stuck.
 
