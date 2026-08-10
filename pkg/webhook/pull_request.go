@@ -41,16 +41,15 @@ type pullRequestPayload struct {
 }
 
 // isAutoPlannablePullRequestAction reports whether a pull_request action
-// triggers auto-plan. The HTTP enqueue path and the durable dispatcher must
-// share this predicate: the dispatcher re-validates fail-closed, so an action
+// triggers auto-plan. The HTTP enqueue path, the durable dispatcher, and the
+// reconciler's inbox coverage query (HasEventForHead) must share this
+// predicate — it derives from storage.AutoPlanPullRequestActions so all three
+// stay in lockstep: the dispatcher re-validates fail-closed, so an action
 // added to only one side would either never enqueue or — worse — enqueue rows
-// the dispatcher silently completes without planning.
+// the dispatcher silently completes without planning, and a coverage mismatch
+// would mask lost deliveries from the reconciler.
 func isAutoPlannablePullRequestAction(action string) bool {
-	switch action {
-	case "opened", "synchronize", "reopened":
-		return true
-	}
-	return false
+	return slices.Contains(storage.AutoPlanPullRequestActions, action)
 }
 
 // handlePullRequest processes GitHub pull_request webhook events.
@@ -235,24 +234,35 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	if action != "synchronize" {
 		return true
 	}
+	comparedHeads := map[string]bool{}
 	if beforeSHA == "" {
-		h.logger.Info("auto-plan will post plan comment because synchronize payload has no previous HEAD SHA",
+		// A synchronize with no before range (synthesized recovery deliveries)
+		// cannot prove the push range schema-neutral, but the tracked plan
+		// comments below can still prove the visible plan fresh — a head that
+		// already carries a current plan must not get a duplicate comment just
+		// because its organic delivery went missing.
+		if len(configs) == 0 {
+			h.logger.Info("auto-plan will post plan comment because synchronize has no previous HEAD SHA and no tracked plan slots to prove freshness",
+				"repo", repo, "pr", pr, "head_sha", headSHA)
+			return true
+		}
+		h.logger.Info("auto-plan synchronize has no previous HEAD SHA; deciding from tracked plan comment freshness",
 			"repo", repo, "pr", pr, "head_sha", headSHA)
-		return true
+	} else {
+		files, err := client.FetchChangedFilesBetween(ctx, repo, beforeSHA, headSHA)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because changed files could not be compared",
+				"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA, "error", err)
+			return true
+		}
+		if ghclient.HasSchemaInputFiles(files) {
+			return true
+		}
+		// The synchronize range was just proven schema-neutral. Reuse that
+		// result when the visible plan was rendered at the immediately
+		// preceding head.
+		comparedHeads[beforeSHA] = true
 	}
-	files, err := client.FetchChangedFilesBetween(ctx, repo, beforeSHA, headSHA)
-	if err != nil {
-		h.logger.Warn("auto-plan will post plan comment because changed files could not be compared",
-			"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA, "error", err)
-		return true
-	}
-	if ghclient.HasSchemaInputFiles(files) {
-		return true
-	}
-
-	// The synchronize range was just proven schema-neutral. Reuse that result
-	// when the visible plan was rendered at the immediately preceding head.
-	comparedHeads := map[string]bool{beforeSHA: true}
 	for _, cfg := range configs {
 		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {
@@ -286,6 +296,14 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 		}
 
 		planHeadSHA := prior.HeadSHA
+		if planHeadSHA == "" {
+			// A tracked plan comment with no recorded head (a manual plan)
+			// cannot prove freshness for the current head.
+			h.logger.Info("auto-plan will post plan comment because the visible plan has no recorded head SHA",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA)
+			return true
+		}
 		if planHeadSHA == headSHA || comparedHeads[planHeadSHA] {
 			continue
 		}

@@ -219,10 +219,11 @@ func WithWebhookReconciler() HandlerOption {
 
 // WithWebhookReconcileSynthesis makes the reconciler's missing-delivery scan
 // enforcing: for each open PR head with no inbox delivery it synthesizes a
-// pull_request-equivalent inbox row (delivery GUID "recon:<repo>#<pr>@<sha>",
-// naturally deduped) that the durable dispatcher plans through the ordinary
-// auto-plan flow. Without this option the scan only reports misses. It takes
-// effect only alongside WithWebhookReconciler.
+// pull_request-equivalent inbox row (deterministic delivery GUID derived from
+// repo, PR, and head SHA; naturally deduped per head) that the durable
+// dispatcher plans through the ordinary auto-plan flow. Without this option
+// the scan only reports misses. It takes effect only alongside
+// WithWebhookReconciler.
 func WithWebhookReconcileSynthesis() HandlerOption {
 	return func(h *Handler) {
 		h.webhookReconcileSynthesis = true

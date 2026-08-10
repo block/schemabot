@@ -1342,6 +1342,15 @@ const (
 	WebhookEventFailed          = "failed"
 )
 
+// AutoPlanPullRequestActions are the pull_request actions that trigger
+// auto-plan for a PR head. This is the single source for every layer that
+// answers "does this delivery plan its head": the webhook enqueue/dispatch
+// predicate and the inbox coverage query (HasEventForHead) both derive from
+// it, so an action added in one place cannot silently diverge from the other —
+// a divergence would either mask lost deliveries from the reconciler or
+// enqueue rows the dispatcher completes without planning.
+var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
+
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a
 // series is always present even when a state is momentarily empty.

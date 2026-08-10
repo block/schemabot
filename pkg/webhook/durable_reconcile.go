@@ -12,14 +12,15 @@
 //     has no corresponding webhook_events row, surfacing deliveries lost
 //     upstream of the inbox (edge auth failures, GitHub-side send failures).
 //     With synthesis enabled (WithWebhookReconcileSynthesis) it also recovers
-//     each miss by enqueueing a pull_request-equivalent inbox row (delivery_id
-//     "recon:<repo>#<pr>@<sha>", naturally deduped) that the durable dispatcher
-//     plans through the ordinary auto-plan flow; otherwise the scan is
-//     report-only.
+//     each miss by enqueueing a pull_request-equivalent inbox row (see
+//     synthesizedDeliveryGUID; naturally deduped per head) that the durable
+//     dispatcher plans through the ordinary auto-plan flow; otherwise the scan
+//     is report-only.
 package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -242,8 +243,11 @@ pages:
 				continue
 			}
 			if !inserted {
-				// Another pod's reconciler or an in-flight organic delivery won
-				// the enqueue race; the head is covered either way.
+				// Another pod's reconciler won the enqueue race on the same
+				// synthesized GUID and its row is still live; the head is
+				// covered. (An organic delivery can never collide here — its
+				// GUID is GitHub's, not the synthesized form — it is caught by
+				// the HasEventForHead check upstream instead.)
 				h.logger.Debug("webhook reconciler skipped synthesizing recovery delivery because one is already queued",
 					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA)
 				continue
@@ -270,14 +274,29 @@ pages:
 // webhookReconcileSynthesizedAction is the pull_request action stamped on
 // synthesized recovery deliveries. The lost organic delivery could have been
 // any auto-plannable action; synchronize routes the row through the same
-// auto-plan flow, and its empty before SHA makes the comment gate post the
-// plan rather than assume a prior comparison.
+// auto-plan flow, and its empty before SHA makes the comment gate decide from
+// tracked plan comment freshness — posting the plan for a genuinely unplanned
+// head while a head already covered by a current plan is not commented twice.
 const webhookReconcileSynthesizedAction = "synchronize"
+
+// synthesizedDeliveryGUID is the deterministic dedup key for a synthesized
+// recovery delivery. It must fit the webhook_events delivery_id column, and
+// the repository full name is the only unbounded component, so the repo is
+// folded into a short digest while the PR number and a truncated head SHA
+// stay readable for triage. The GUID is a dedup key only — the inbox row's
+// repository, pull_request, and head_sha columns carry the full values.
+// Re-scans of the same head produce the same GUID and dedupe naturally, and
+// every new push mints a fresh recovery candidate.
+func synthesizedDeliveryGUID(repo string, pr int, headSHA string) string {
+	repoDigest := sha256.Sum256([]byte(repo))
+	if len(headSHA) > 12 {
+		headSHA = headSHA[:12]
+	}
+	return fmt.Sprintf("recon:%x:%d@%s", repoDigest[:6], pr, headSHA)
+}
 
 // synthesizeMissingHeadDelivery enqueues a pull_request-equivalent inbox row
 // for an open PR head whose organic webhook delivery never reached the inbox.
-// The delivery GUID embeds repo, PR, and head SHA, so re-scans of the same
-// head dedupe naturally and every new push mints a fresh recovery candidate.
 // The payload is the minimal pull_request shape the durable dispatcher
 // decodes, and the resolved installation is persisted as the tenant because a
 // synthesized delivery has no payload installation to resolve from.
@@ -293,7 +312,7 @@ func (h *Handler) synthesizeMissingHeadDelivery(ctx context.Context, repo string
 	}
 	return h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
 		Provider:    storage.WebhookProviderGitHub,
-		DeliveryID:  fmt.Sprintf("recon:%s#%d@%s", repo, pr, headSHA),
+		DeliveryID:  synthesizedDeliveryGUID(repo, pr, headSHA),
 		Event:       "pull_request",
 		Action:      webhookReconcileSynthesizedAction,
 		Repository:  repo,

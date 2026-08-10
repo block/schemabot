@@ -116,6 +116,86 @@ func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 	require.Error(t, err, "missing repository must be rejected")
 }
 
+// A terminally failed row must not cover its head — the reconciler needs to
+// synthesize a fresh recovery delivery for it — while every live state and a
+// completed delivery keep suppressing synthesis.
+func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailed(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	for i, tc := range []struct {
+		state  string
+		covers bool
+	}{
+		{storage.WebhookEventPending, true},
+		{storage.WebhookEventProcessing, true},
+		{storage.WebhookEventFailedRetryable, true},
+		{storage.WebhookEventCompleted, true},
+		{storage.WebhookEventFailed, false},
+	} {
+		deliveryID := fmt.Sprintf("delivery-state-%d", i)
+		headSHA := fmt.Sprintf("state-head-%d", i)
+		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID:  deliveryID,
+			Event:       "pull_request",
+			Action:      "synchronize",
+			Repository:  "block/example",
+			PullRequest: 7,
+			HeadSHA:     headSHA,
+			Payload:     []byte(`{}`),
+		})
+		require.NoError(t, err, tc.state)
+		_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET state = ? WHERE delivery_id = ?`, tc.state, deliveryID)
+		require.NoError(t, err, tc.state)
+
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
+		require.NoError(t, err, tc.state)
+		assert.Equal(t, tc.covers, found, "state %s", tc.state)
+	}
+}
+
+// Only auto-plannable pull_request rows cover a head. Rows of other event
+// types or actions can carry the same PR + head SHA without planning it — a
+// pull_request.closed row from before a reopen, or a check_run row — so they
+// must not suppress the reconciler's recovery of a lost auto-plan delivery.
+func TestWebhookEventStore_HasEventForHeadRequiresAutoPlanPullRequestRow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	for i, tc := range []struct {
+		name   string
+		event  string
+		action string
+		covers bool
+	}{
+		{"opened plans the head", "pull_request", "opened", true},
+		{"synchronize plans the head", "pull_request", "synchronize", true},
+		{"reopened plans the head", "pull_request", "reopened", true},
+		{"closed does not plan the head", "pull_request", "closed", false},
+		{"check_run does not plan the head", "check_run", "rerequested", false},
+		{"issue_comment does not plan the head", "issue_comment", "created", false},
+	} {
+		deliveryID := fmt.Sprintf("delivery-event-%d", i)
+		headSHA := fmt.Sprintf("event-head-%d", i)
+		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+			DeliveryID:  deliveryID,
+			Event:       tc.event,
+			Action:      tc.action,
+			Repository:  "block/example",
+			PullRequest: 7,
+			HeadSHA:     headSHA,
+			Payload:     []byte(`{}`),
+		})
+		require.NoError(t, err, tc.name)
+
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
+		require.NoError(t, err, tc.name)
+		assert.Equal(t, tc.covers, found, tc.name)
+	}
+}
+
 func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

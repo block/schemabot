@@ -762,11 +762,12 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig))
-	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger,
+	handlerOpts := append([]webhook.HandlerOption{
 		webhook.WithRepoWebhookSecret([]byte(repoWebhookSecret)),
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
-		webhook.WithWebhookReconcileSynthesis())
+	}, webhookReconcileSynthesisOptions(logger)...)
+	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
 		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
@@ -838,15 +839,17 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 			"app_name", e.name, "app_id", e.id, "trusted_check_app_slugs", e.cfg.TrustedCheckAppSlugs)
 	}
 
+	handlerOpts := append([]webhook.HandlerOption{
+		webhook.WithDurableWebhookDispatch(),
+		webhook.WithWebhookReconciler(),
+	}, webhookReconcileSynthesisOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
 		secretsByApp,
 		appByID,
 		logger,
-		webhook.WithDurableWebhookDispatch(),
-		webhook.WithWebhookReconciler(),
-		webhook.WithWebhookReconcileSynthesis(),
+		handlerOpts...,
 	)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub multi-App webhook endpoint registered", "apps", len(serverConfig.Apps))
@@ -864,6 +867,28 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// webhookReconcileSynthesisOptions returns the handler option enabling the
+// reconciler's missing-head synthesis, unless the operator disabled it with
+// WEBHOOK_RECONCILE_SYNTHESIS=false. The kill switch drops the reconciler
+// back to a report-only missing-delivery scan with a restart instead of a
+// code revert; the missing-delivery warning and metric keep flowing either
+// way, so detection is unaffected.
+func webhookReconcileSynthesisOptions(logger *slog.Logger) []webhook.HandlerOption {
+	if value := os.Getenv("WEBHOOK_RECONCILE_SYNTHESIS"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			logger.Warn("invalid WEBHOOK_RECONCILE_SYNTHESIS value; webhook reconcile synthesis stays enabled",
+				"value", value, "error", err)
+			return []webhook.HandlerOption{webhook.WithWebhookReconcileSynthesis()}
+		}
+		if !enabled {
+			logger.Info("webhook reconcile synthesis disabled by WEBHOOK_RECONCILE_SYNTHESIS; missing-delivery scan will run report-only")
+			return nil
+		}
+	}
+	return []webhook.HandlerOption{webhook.WithWebhookReconcileSynthesis()}
 }
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server

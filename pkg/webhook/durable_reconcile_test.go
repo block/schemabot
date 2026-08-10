@@ -1,11 +1,14 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +64,7 @@ func TestWebhookReconcilerReportsMissingInboxRow(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing)
 	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "recon:octocat/hello-world#7@head-sha")
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row, "report-only scan must not synthesize inbox rows")
 }
@@ -72,6 +75,7 @@ func TestWebhookReconcilerSkipsRecordedHead(t *testing.T) {
 		Provider:    storage.WebhookProviderGitHub,
 		DeliveryID:  "delivery-recorded",
 		Event:       "pull_request",
+		Action:      "synchronize",
 		Repository:  "octocat/hello-world",
 		PullRequest: 7,
 		HeadSHA:     "head-sha",
@@ -129,7 +133,7 @@ func TestWebhookReconcilerSynthesizesMissingHeadDelivery(t *testing.T) {
 	require.Equal(t, 1, missing)
 	require.Equal(t, 1, synthesized)
 
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "recon:octocat/hello-world#7@head-sha")
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, "pull_request", row.Event)
@@ -229,4 +233,167 @@ func TestWebhookReconcilerRunsOnDispatchLifecycle(t *testing.T) {
 		require.FailNow(t, "expected the reconciler to list open PRs on the dispatch lifecycle")
 	}
 	h.StopDurableWebhookDispatch()
+}
+
+// TestSynthesizedDeliveryGUIDFitsDeliveryColumn pins the GUID contract for
+// synthesized recovery deliveries: the dedup key must be deterministic per
+// (repo, PR, head), distinct across heads, and always fit the webhook_events
+// delivery_id column even for long repository names, large PR numbers, and
+// full 40-character head SHAs.
+func TestSynthesizedDeliveryGUIDFitsDeliveryColumn(t *testing.T) {
+	longRepo := strings.Repeat("organization-with-a-very-long-name-", 4) + "/repository-with-a-long-name"
+	fullSHA := "0123456789abcdef0123456789abcdef01234567"
+
+	guid := synthesizedDeliveryGUID(longRepo, 987654321, fullSHA)
+	require.LessOrEqual(t, len(guid), 64, "GUID must fit the delivery_id column")
+	require.Equal(t, guid, synthesizedDeliveryGUID(longRepo, 987654321, fullSHA),
+		"GUID must be deterministic so re-scans of the same head dedup")
+
+	require.NotEqual(t, guid, synthesizedDeliveryGUID(longRepo, 987654321, "fedcba9876543210fedcba9876543210fedcba98"),
+		"a new push must mint a fresh recovery candidate")
+	require.NotEqual(t, guid, synthesizedDeliveryGUID(longRepo, 123456789, fullSHA),
+		"different PRs must not collide")
+	require.NotEqual(t, guid, synthesizedDeliveryGUID("octocat/hello-world", 987654321, fullSHA),
+		"different repositories must not collide")
+}
+
+// failingCreateWebhookEventStore rejects every insert so tests can pin the
+// reconciler's behavior when the inbox refuses a synthesized recovery row.
+type failingCreateWebhookEventStore struct {
+	*recordingWebhookEventStore
+}
+
+func (s *failingCreateWebhookEventStore) Create(context.Context, *storage.WebhookEvent) (bool, error) {
+	return false, errors.New("insert rejected")
+}
+
+// TestWebhookReconcilerSynthesisInsertFailureLeavesHeadRecoverable exercises
+// the synthesis-failure branch: when the inbox rejects the recovery row, the
+// pass reports the miss without counting a synthesis, records nothing, and the
+// head stays uncovered so the next pass retries it.
+func TestWebhookReconcilerSynthesisInsertFailureLeavesHeadRecoverable(t *testing.T) {
+	store := &failingCreateWebhookEventStore{newRecordingWebhookEventStore()}
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	fullSHA := "0123456789abcdef0123456789abcdef01234567"
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, fullSHA, time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 1, missing)
+	require.Equal(t, 0, synthesized, "a rejected insert must not count as synthesized")
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, fullSHA))
+	require.NoError(t, err)
+	require.Nil(t, row)
+
+	scanned, missing, synthesized = h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 1, missing, "the head must stay visible as missing so later passes retry")
+	require.Equal(t, 0, synthesized)
+}
+
+// TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow exercises
+// recovery from a recovery: a synthesized row that exhausted its attempts must
+// not cover its head forever. The next pass sees the head as missing, and the
+// deterministic GUID lands in the store's duplicate branch, which reopens the
+// failed row as a fresh pending delivery.
+func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha")
+	_, err := store.Create(t.Context(), &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  guid,
+		Event:       "pull_request",
+		Action:      webhookReconcileSynthesizedAction,
+		Repository:  "octocat/hello-world",
+		PullRequest: 7,
+		HeadSHA:     "head-sha",
+		State:       storage.WebhookEventFailed,
+		Attempts:    storage.MaxWebhookEventAttempts,
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 1, missing, "a terminally failed row must not cover its head")
+	require.Equal(t, 1, synthesized)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, guid)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, storage.WebhookEventPending, row.State, "the failed row must be reopened as a fresh pending delivery")
+	require.Equal(t, 0, row.Attempts)
+}
+
+// TestWebhookReconcilerNonPlanRowDoesNotCoverHead exercises the
+// reopened-at-the-same-head scenario: a PR closed at head H leaves a
+// pull_request.closed inbox row, and when the PR is reopened without a new
+// push, the lost reopened delivery is the only thing that would have planned
+// the head. The closed row must not count as coverage, so the reconciler
+// synthesizes the recovery delivery.
+func TestWebhookReconcilerNonPlanRowDoesNotCoverHead(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	_, err := store.Create(t.Context(), &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  "delivery-closed",
+		Event:       "pull_request",
+		Action:      "closed",
+		Repository:  "octocat/hello-world",
+		PullRequest: 7,
+		HeadSHA:     "head-sha",
+		State:       storage.WebhookEventCompleted,
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 1, missing, "a closed row must not cover the reopened head")
+	require.Equal(t, 1, synthesized)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, storage.WebhookEventPending, row.State)
+}
+
+// TestWebhookReconcilerCompletedRowStillCoversHead pins the other side of the
+// terminal-state contract: a completed delivery is a processed head, so the
+// reconciler must not re-plan it on every pass.
+func TestWebhookReconcilerCompletedRowStillCoversHead(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	_, err := store.Create(t.Context(), &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  "delivery-completed",
+		Event:       "pull_request",
+		Action:      "synchronize",
+		Repository:  "octocat/hello-world",
+		PullRequest: 7,
+		HeadSHA:     "head-sha",
+		State:       storage.WebhookEventCompleted,
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 0, missing)
+	require.Equal(t, 0, synthesized)
 }
