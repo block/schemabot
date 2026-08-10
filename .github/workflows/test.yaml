@@ -343,11 +343,17 @@ jobs:
         if: failure()
         run: |
           # test-e2e-grpc tears its own stack down, so it captures
-          # e2e-logs/grpc-containers.log itself before teardown.
-          if [ -f e2e-logs/grpc-containers.log ]; then
-            echo "=== tail of gRPC container logs (full logs in the uploaded e2e-grpc-logs artifact) ==="
-            tail -n 200 e2e-logs/grpc-containers.log || true
+          # e2e-logs/grpc-containers.log itself before teardown (test
+          # failures and health-wait timeouts). If the target failed before
+          # those handlers ran (e.g. a compose build failure), the stack may
+          # still be up — capture whatever exists so the artifact is never
+          # empty for a diagnosable failure.
+          mkdir -p e2e-logs
+          if [ ! -f e2e-logs/grpc-containers.log ]; then
+            docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps > e2e-logs/grpc-containers.log 2>&1 || true
           fi
+          echo "=== tail of gRPC container logs (full logs in the uploaded e2e-grpc-logs artifact) ==="
+          tail -n 200 e2e-logs/grpc-containers.log || true
       - name: "Upload container logs on failure"
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
@@ -400,10 +406,17 @@ jobs:
         if: failure()
         run: |
           # test-e2e-grpc-multideploy tears its own stack down, so it captures
-          # grpc-multideploy-containers.log itself before teardown; the stack is
-          # already gone by the time this step runs.
+          # grpc-multideploy-containers.log itself before teardown (test
+          # failures and health-wait timeouts). If the target failed before
+          # those handlers ran (e.g. a compose build failure), the stack may
+          # still be up — capture whatever exists so the artifact is never
+          # empty for a diagnosable failure.
+          mkdir -p e2e-logs
+          if [ ! -f e2e-logs/grpc-multideploy-containers.log ]; then
+            docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps > e2e-logs/grpc-multideploy-containers.log 2>&1 || true
+          fi
           echo "=== tail of container logs (full logs in the uploaded e2e-grpc-md-logs-shard-${{ matrix.shard }} artifact) ==="
-          tail -n 200 e2e-logs/grpc-multideploy-containers.log 2>/dev/null || echo "no container logs captured (stack failed before tests ran; see the job log above)"
+          tail -n 200 e2e-logs/grpc-multideploy-containers.log || true
       - name: "Upload container logs on failure"
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2

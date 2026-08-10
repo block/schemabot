@@ -387,7 +387,8 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 		fi; \
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for SchemaBot gRPC e2e environment"; \
-			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs; \
+			mkdir -p e2e-logs; \
+			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps 2>&1 | tee e2e-logs/grpc-containers.log; \
 			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 			exit 1; \
 		fi; \
@@ -443,7 +444,8 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for multi-deployment SchemaBot gRPC e2e environment"; \
 			echo "(expected until the server supports deployments maps with more than one entry)"; \
-			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs; \
+			mkdir -p e2e-logs; \
+			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps 2>&1 | tee e2e-logs/grpc-multideploy-containers.log; \
 			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 			exit 1; \
 		fi; \
