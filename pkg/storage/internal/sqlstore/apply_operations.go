@@ -1099,14 +1099,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			}
 
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE applies a
-				SET a.attempt = a.attempt + 1, a.updated_at = NOW()
-				WHERE a.id = ?
-					AND a.state = ?
-					AND a.attempt < ?
+				UPDATE applies
+				SET attempt = attempt + 1, updated_at = NOW()
+				WHERE id = ?
+					AND state = ?
+					AND attempt < ?
 					AND EXISTS (
 						SELECT 1 FROM apply_operations o
-						WHERE o.apply_id = a.id AND o.id <> ?
+						WHERE o.apply_id = applies.id AND o.id <> ?
 					)
 			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
 				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
