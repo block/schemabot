@@ -200,6 +200,71 @@ func TestDeployRequestAutoCutoverRefusesAnUnreportedSetting(t *testing.T) {
 	}
 }
 
+// A failed call travels up as the apply's failure message and is rendered into a
+// PR comment. Only the API's own message field is written for a human to read;
+// the rest of a response body is text from whatever answered, so a response that
+// is not the API's error shape contributes nothing to the message and is kept on
+// the error for the server log instead.
+func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		wantInError string
+		wantOmitted []string
+	}{
+		{
+			name:        "the API refuses in its own words",
+			body:        `{"message":"deploy request is not deploying"}`,
+			wantInError: "deploy request is not deploying",
+		},
+		{
+			name:        "something else answered",
+			body:        "upstream 10.4.19.7:3306 unreachable\n| broken | table |",
+			wantOmitted: []string{"10.4.19.7", "|", "\n"},
+		},
+		{
+			name:        "the refusal would break the markdown it lands in",
+			body:        `{"message":"branch | main\nis behind"}`,
+			wantInError: "branch / main is behind",
+			wantOmitted: []string{"|", "\n"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+			require.NoError(t, err)
+
+			err = client.ThrottleDeployRequest(t.Context(), &ThrottleDeployRequestRequest{
+				Organization:  "block",
+				Database:      "orders",
+				Number:        132,
+				ThrottleRatio: 0.5,
+			})
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "502 Bad Gateway")
+			assert.Contains(t, err.Error(), "/v1/organizations/block/databases/orders/deploy-requests/132/throttle")
+			assert.NotContains(t, err.Error(), srv.URL, "the endpoint host does not belong in an operator-facing message")
+			if tc.wantInError != "" {
+				assert.Contains(t, err.Error(), tc.wantInError)
+			}
+			for _, omitted := range tc.wantOmitted {
+				assert.NotContains(t, err.Error(), omitted)
+			}
+
+			var apiErr *APIError
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+			assert.Equal(t, tc.body, apiErr.Body, "the whole response stays on the error for the server log")
+		})
+	}
+}
+
 func TestDeployRequestAutoCutoverRefusesWithoutBaseURL(t *testing.T) {
 	client, err := NewPSClient("token-name", "token-value")
 	require.NoError(t, err)
