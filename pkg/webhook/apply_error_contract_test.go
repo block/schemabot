@@ -65,7 +65,7 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a config-shape rejection is the command's answer, not a transient failure")
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database "orders" is not configured on this server`)
+		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
 	})
 
 	// Requesting an environment the database does not configure is a targeting
@@ -84,7 +84,7 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "an unconfigured-environment rejection is the command's answer, not a transient failure")
 		body := requireComment(t, comments, "environment-not-configured apply error")
-		assert.Contains(t, body, `database "orders" environment "staging" is not configured on this server`)
+		assert.Contains(t, body, `database &#34;orders&#34; environment &#34;staging&#34; is not configured on this server`)
 	})
 }
 
