@@ -170,8 +170,23 @@ var (
 func sanitizeCommentError(msg string) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
+	msg = stripControlText(msg)
+	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = strings.TrimSpace(msg)
+	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
+		msg = string(runes[:maxCommentErrorLen-1]) + "…"
+	}
+	return msg
+}
+
+// stripControlText removes ANSI escape sequences and control and format
+// characters (including bidi overrides usable for visual spoofing) from
+// untrusted text, keeping newlines and tabs.
+func stripControlText(msg string) string {
 	msg = ansiEscapeRe.ReplaceAllString(msg, "")
-	msg = strings.Map(func(r rune) rune {
+	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' {
 			return r
 		}
@@ -180,12 +195,30 @@ func sanitizeCommentError(msg string) string {
 		}
 		return r
 	}, msg)
-	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = strings.TrimSpace(msg)
-	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
-		msg = string(runes[:maxCommentErrorLen-1]) + "…"
+}
+
+// sanitizeInlineError makes an untrusted error safe for a single-line comment
+// context — a list item or an inline "— …" suffix: full comment sanitization
+// plus collapsing whitespace runs (including line breaks) so the message
+// cannot escape the enclosing Markdown line.
+func sanitizeInlineError(msg string) string {
+	return strings.Join(strings.Fields(sanitizeCommentError(msg)), " ")
+}
+
+// maxCellErrorLen clamps an error rendered inside a Markdown table cell so a
+// long message cannot make the table scroll horizontally. Tighter than the
+// comment-wide clamp because a cell shares its row with other columns.
+const maxCellErrorLen = 255
+
+// sanitizeCellError makes an untrusted error safe for a Markdown table cell:
+// single-line sanitization plus neutralizing the cell separator so the error
+// cannot break the table layout, clamped to the column width. The clamp runs
+// before the call site's HTML escaping, so entity expansion can render wider
+// than the clamp; the clamp is a layout mitigation, not a hard boundary.
+func sanitizeCellError(msg string) string {
+	msg = strings.ReplaceAll(sanitizeInlineError(msg), "|", "/")
+	if runes := []rune(msg); len(runes) > maxCellErrorLen {
+		msg = string(runes[:maxCellErrorLen-1]) + "…"
 	}
 	return msg
 }
@@ -205,7 +238,7 @@ func writeErrorBlock(sb *strings.Builder, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", quoteBlockLines(sanitized))
+	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // writeTableErrorLine writes a task's last error as a blockquote below its
@@ -216,7 +249,7 @@ func writeTableErrorLine(sb *strings.Builder, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoteBlockLines(sanitized))
+	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // taskErrorAddsDetail reports whether a failed table's own error message adds

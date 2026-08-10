@@ -198,3 +198,27 @@ func TestRenderInvalidEnv(t *testing.T) {
 		assert.NotContains(t, body, "``")
 	})
 }
+
+// The generic command-failure comment renders untrusted engine and
+// infrastructure error text: internal endpoints are redacted, HTML markup is
+// escaped so it renders as text, and a multi-line error stays inside the
+// blockquote instead of escaping into comment markup.
+func TestRenderGenericErrorSanitizesDetail(t *testing.T) {
+	body := RenderGenericError(SchemaErrorData{
+		Timestamp:   "2026-07-16 18:56:00",
+		CommandName: "plan",
+		ErrorDetail: "dial tcp db-primary.internal:3306: connection refused\n# not a heading",
+	})
+
+	assert.NotContains(t, body, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, body, "> dial tcp [endpoint redacted]: connection refused\n> # not a heading",
+		"a multi-line error stays inside the blockquote")
+
+	body = RenderGenericError(SchemaErrorData{
+		Timestamp:   "2026-07-16 18:56:00",
+		CommandName: "plan",
+		ErrorDetail: "unexpected <img src=x> in output",
+	})
+	assert.Contains(t, body, "&lt;img src=x&gt;", "HTML markup is escaped")
+	assert.NotContains(t, body, "<img", "raw markup never reaches the comment")
+}

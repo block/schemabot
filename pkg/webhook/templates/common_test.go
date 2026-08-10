@@ -88,6 +88,38 @@ func TestSanitizeCommentError(t *testing.T) {
 	})
 }
 
+func TestSanitizeInlineError(t *testing.T) {
+	t.Run("newlines collapse so the error cannot escape its line", func(t *testing.T) {
+		assert.Equal(t, "line one line two", sanitizeInlineError("line one\nline two"))
+	})
+
+	t.Run("endpoints are redacted", func(t *testing.T) {
+		got := sanitizeInlineError("dial tcp db-primary.internal:3306: connection refused")
+		assert.NotContains(t, got, "db-primary.internal")
+		assert.Contains(t, got, "[endpoint redacted]")
+	})
+
+	t.Run("whitespace-only input is empty", func(t *testing.T) {
+		assert.Empty(t, sanitizeInlineError(" \n\t "))
+	})
+}
+
+func TestSanitizeCellError(t *testing.T) {
+	t.Run("cell separators are neutralized", func(t *testing.T) {
+		assert.Equal(t, "left / right", sanitizeCellError("left | right"))
+	})
+
+	t.Run("newlines collapse so the error cannot break the table row", func(t *testing.T) {
+		assert.Equal(t, "a b", sanitizeCellError("a\nb"))
+	})
+
+	t.Run("long messages are clamped to the column width", func(t *testing.T) {
+		got := sanitizeCellError(strings.Repeat("x", maxCellErrorLen+100))
+		assert.Len(t, []rune(got), maxCellErrorLen)
+		assert.True(t, strings.HasSuffix(got, "…"), "clamped message ends with a truncation marker")
+	})
+}
+
 func TestWriteErrorBlock(t *testing.T) {
 	t.Run("multi-line error stays inside the blockquote", func(t *testing.T) {
 		var sb strings.Builder
@@ -99,6 +131,13 @@ func TestWriteErrorBlock(t *testing.T) {
 		var sb strings.Builder
 		writeErrorBlock(&sb, "  \n ")
 		assert.Empty(t, sb.String())
+	})
+
+	t.Run("HTML markup is escaped so it renders as text", func(t *testing.T) {
+		var sb strings.Builder
+		writeErrorBlock(&sb, "unexpected <img src=x> in output")
+		assert.Contains(t, sb.String(), "&lt;img src=x&gt;")
+		assert.NotContains(t, sb.String(), "<img")
 	})
 }
 
@@ -114,6 +153,13 @@ func TestWriteTableErrorLine(t *testing.T) {
 		writeTableErrorLine(&sb, "dial tcp 10.0.0.5:3306: i/o timeout")
 		assert.Contains(t, sb.String(), "[endpoint redacted]")
 		assert.NotContains(t, sb.String(), "10.0.0.5")
+	})
+
+	t.Run("HTML markup is escaped so it renders as text", func(t *testing.T) {
+		var sb strings.Builder
+		writeTableErrorLine(&sb, "expected <nil> but got <error>")
+		assert.Contains(t, sb.String(), "&lt;nil&gt;")
+		assert.NotContains(t, sb.String(), "<nil>")
 	})
 }
 

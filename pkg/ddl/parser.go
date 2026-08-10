@@ -8,12 +8,14 @@ import (
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/format"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // StatementParser abstracts the dialect-specific, string-level DDL parsing
 // operations that pkg/ddl exposes to its callers (schema discovery, planning,
 // the CLI): splitting a schema file into statements, classifying a statement,
-// and canonicalizing one.
+// inspecting CREATE TABLE columns, and canonicalizing a statement.
 //
 // The default implementation wraps the TiDB parser (via Spirit's statement
 // package), so behavior for MySQL and Vitess is exactly what it has always
@@ -34,6 +36,10 @@ type StatementParser interface {
 	// cannot hide behind the classification of the first one.
 	Classify(stmt string) (StatementType, string, error)
 
+	// CreateTableColumns returns the declared column names from exactly one
+	// CREATE TABLE statement. Table-level constraints are not columns.
+	CreateTableColumns(stmt string) ([]string, error)
+
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
 	Canonicalize(ddl string) string
@@ -44,6 +50,23 @@ type StatementParser interface {
 // and Vitess behavior is unchanged. Later work (Postgres support) selects a
 // dialect-specific parser at the call sites that know the database type.
 var defaultParser StatementParser = tidbStatementParser{}
+
+// ParserForDialect returns the StatementParser for a database family. The
+// MySQL family (MySQL, Vitess, Strata) shares the TiDB parser; Postgres gets
+// the libpg_query parser. An unregistered dialect is an error rather than a
+// silent fallback, so a mislabeled target can never have its DDL classified
+// by another family's grammar. Callers holding a database_type derive the
+// dialect with schema.DialectForDatabaseType.
+func ParserForDialect(dialect schema.Dialect) (StatementParser, error) {
+	switch dialect {
+	case schema.DialectMySQL:
+		return tidbStatementParser{}, nil
+	case schema.DialectPostgres:
+		return postgresStatementParser{}, nil
+	default:
+		return nil, fmt.Errorf("no statement parser registered for dialect %q", dialect)
+	}
+}
 
 // tidbStatementParser implements StatementParser over the TiDB parser via
 // Spirit's statement package — the behavior pkg/ddl has always had.
@@ -87,6 +110,19 @@ func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) 
 		)
 	}
 	return statementTypeFromSpirit(results[0].Type), results[0].Table, nil
+}
+
+// CreateTableColumns implements StatementParser.
+func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
+	createTable, err := statement.ParseCreateTable(stmt)
+	if err != nil {
+		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(stmt), err)
+	}
+	columns := make([]string, 0, len(createTable.Columns))
+	for _, column := range createTable.Columns {
+		columns = append(columns, column.Name)
+	}
+	return columns, nil
 }
 
 // statementTypeFromSpirit translates Spirit's parser-owned statement type into

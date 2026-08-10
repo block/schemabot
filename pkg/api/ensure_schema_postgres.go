@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver for the storage database
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -47,7 +48,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return err
 	}
 
-	db, err := sql.Open("pgx", dsn)
+	db, err := postgresconn.Open(dsn)
 	if err != nil {
 		return fmt.Errorf("open storage database: %w", err)
 	}
@@ -144,191 +145,27 @@ func verifyAndLogPostgresTableColumns(ctx context.Context, db *sql.DB, tables []
 	return nil
 }
 
-var postgresTableConstraintKeywords = map[string]bool{
-	"PRIMARY":    true,
-	"UNIQUE":     true,
-	"CONSTRAINT": true,
-	"CHECK":      true,
-	"FOREIGN":    true,
-	"EXCLUDE":    true,
-	"INDEX":      true,
-}
-
-// postgresCreateTableColumns extracts column names from the single plain
-// CREATE TABLE statement at the start of an embedded PostgreSQL schema file.
-// Nested type and constraint expressions are kept together while the table
-// body is split at top-level commas.
-func postgresCreateTableColumns(content string) ([]string, error) {
-	open := strings.IndexByte(content, '(')
-	if open < 0 {
-		return nil, fmt.Errorf("CREATE TABLE has no column list")
-	}
-	close, err := matchingPostgresParen(content, open)
-	if err != nil {
-		return nil, err
-	}
-
-	entries, err := splitPostgresTableEntries(content[open+1 : close])
-	if err != nil {
-		return nil, err
-	}
-	columns := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		first, remainder, err := postgresEntryFirstToken(entry)
-		if err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(remainder) == "" {
-			return nil, fmt.Errorf("unrecognized CREATE TABLE entry %q", entry)
-		}
-		if postgresTableConstraintKeywords[strings.ToUpper(first)] {
-			continue
-		}
-		if strings.HasPrefix(first, `"`) {
-			columns = append(columns, strings.ReplaceAll(first[1:len(first)-1], `""`, `"`))
-			continue
-		}
-		if first != strings.ToLower(first) {
-			return nil, fmt.Errorf("unrecognized CREATE TABLE entry %q", entry)
-		}
-		for _, r := range first {
-			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
-				return nil, fmt.Errorf("invalid column name %q", first)
-			}
-		}
-		columns = append(columns, first)
-	}
-	if len(columns) == 0 {
-		return nil, fmt.Errorf("CREATE TABLE has no columns")
-	}
-	return columns, nil
-}
-
-func postgresEntryFirstToken(entry string) (string, string, error) {
-	entry = strings.TrimSpace(entry)
-	if entry == "" {
-		return "", "", fmt.Errorf("empty CREATE TABLE entry")
-	}
-	if entry[0] != '"' {
-		if end := strings.IndexAny(entry, " \t\r\n"); end >= 0 {
-			return entry[:end], entry[end:], nil
-		}
-		return entry, "", nil
-	}
-	for i := 1; i < len(entry); i++ {
-		if entry[i] != '"' {
-			continue
-		}
-		if i+1 < len(entry) && entry[i+1] == '"' {
-			i++
-			continue
-		}
-		return entry[:i+1], entry[i+1:], nil
-	}
-	return "", "", fmt.Errorf("invalid quoted column name in entry %q", entry)
-}
-
-func matchingPostgresParen(content string, open int) (int, error) {
-	depth := 0
-	inSingle, inDouble := false, false
-	for i := open; i < len(content); i++ {
-		switch content[i] {
-		case '\'':
-			if !inDouble && inSingle && i+1 < len(content) && content[i+1] == '\'' {
-				i++
-			} else if !inDouble {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && inDouble && i+1 < len(content) && content[i+1] == '"' {
-				i++
-			} else if !inSingle {
-				inDouble = !inDouble
-			}
-		case '(':
-			if !inSingle && !inDouble {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble {
-				depth--
-				if depth == 0 {
-					return i, nil
-				}
-			}
-		}
-	}
-	return 0, fmt.Errorf("CREATE TABLE has an unterminated column list")
-}
-
-func splitPostgresTableEntries(body string) ([]string, error) {
-	var entries []string
-	start, depth := 0, 0
-	inSingle, inDouble := false, false
-	for i := 0; i < len(body); i++ {
-		switch body[i] {
-		case '\'':
-			if !inDouble && inSingle && i+1 < len(body) && body[i+1] == '\'' {
-				i++
-			} else if !inDouble {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle && inDouble && i+1 < len(body) && body[i+1] == '"' {
-				i++
-			} else if !inSingle {
-				inDouble = !inDouble
-			}
-		case '(':
-			if !inSingle && !inDouble {
-				depth++
-			}
-		case ')':
-			if !inSingle && !inDouble {
-				depth--
-				if depth < 0 {
-					return nil, fmt.Errorf("unexpected closing parenthesis in CREATE TABLE body")
-				}
-			}
-		case ',':
-			if !inSingle && !inDouble && depth == 0 {
-				entries = append(entries, strings.TrimSpace(body[start:i]))
-				start = i + 1
-			}
-		}
-	}
-	if inSingle || inDouble || depth != 0 {
-		return nil, fmt.Errorf("unterminated expression in CREATE TABLE body")
-	}
-	entries = append(entries, strings.TrimSpace(body[start:]))
-	return entries, nil
-}
-
 func verifyPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	if err != nil {
+		return fmt.Errorf("select PostgreSQL statement parser: %w", err)
+	}
 	for _, table := range tables {
-		expected, err := postgresCreateTableColumns(files[table])
+		statements, err := parser.Split(files[table])
+		if err != nil {
+			return fmt.Errorf("split schema file for table %q: %w", table, err)
+		}
+		if len(statements) == 0 {
+			return fmt.Errorf("schema file for table %q has no statements", table)
+		}
+		expected, err := parser.CreateTableColumns(statements[0])
 		if err != nil {
 			return fmt.Errorf("extract expected columns for table %q: %w", table, err)
 		}
-		rows, err := db.QueryContext(ctx,
-			"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1", table)
+		existing, err := postgresTableColumns(ctx, db, table)
 		if err != nil {
-			return fmt.Errorf("list columns for table %q: %w", table, err)
+			return err
 		}
-		existing := make(map[string]bool)
-		for rows.Next() {
-			var column string
-			if err := rows.Scan(&column); err != nil {
-				utils.CloseAndLog(rows)
-				return fmt.Errorf("scan column for table %q: %w", table, err)
-			}
-			existing[column] = true
-		}
-		if err := rows.Err(); err != nil {
-			utils.CloseAndLog(rows)
-			return fmt.Errorf("iterate columns for table %q: %w", table, err)
-		}
-		utils.CloseAndLog(rows)
 
 		var missing []string
 		for _, column := range expected {
@@ -341,6 +178,28 @@ func verifyPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string
 		}
 	}
 	return nil
+}
+
+func postgresTableColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx,
+		"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1", table)
+	if err != nil {
+		return nil, fmt.Errorf("list columns for table %q: %w", table, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return nil, fmt.Errorf("scan column for table %q: %w", table, err)
+		}
+		existing[column] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate columns for table %q: %w", table, err)
+	}
+	return existing, nil
 }
 
 // readEmbeddedPostgresSchemaFiles reads the embedded PostgreSQL schema files,
@@ -448,7 +307,7 @@ func createPostgresTable(ctx context.Context, db *sql.DB, table, content string,
 // the underlying session and releases the advisory lock — returning the
 // connection to a shared pool would leave the session (and the lock) alive.
 func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
-	db, err := sql.Open("pgx", dsn)
+	db, err := postgresconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

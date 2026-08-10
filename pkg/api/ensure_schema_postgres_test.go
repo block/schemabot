@@ -1,11 +1,29 @@
 package api
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 )
+
+// The bootstrapper opens its pool through postgresconn, which parses the DSN
+// eagerly: a malformed DSN must fail at open, before any dial or ping is
+// attempted, so a misconfigured deployment fails startup with a parse error
+// rather than a confusing connection failure.
+func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "open storage database")
+}
 
 // The embedded PostgreSQL schema files are the source of truth for the
 // storage tables the bootstrapper converges: reading them must yield one
@@ -30,12 +48,18 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 
 	_, files, err := readEmbeddedPostgresSchemaFiles()
 	require.NoError(t, err)
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
 
-	settings, err := postgresCreateTableColumns(files["settings"])
+	settingsStatements, err := parser.Split(files["settings"])
+	require.NoError(t, err)
+	settings, err := parser.CreateTableColumns(settingsStatements[0])
 	require.NoError(t, err)
 	assert.Equal(t, []string{"id", "setting_key", "setting_value", "created_at", "updated_at"}, settings)
 
-	applies, err := postgresCreateTableColumns(files["applies"])
+	appliesStatements, err := parser.Split(files["applies"])
+	require.NoError(t, err)
+	applies, err := parser.CreateTableColumns(appliesStatements[0])
 	require.NoError(t, err)
 	assert.Equal(t, []string{
 		"id", "apply_identifier", "lock_id", "plan_id", "database_name", "database_type",
@@ -46,34 +70,10 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 	}, applies)
 
 	for table, content := range files {
-		columns, err := postgresCreateTableColumns(content)
+		statements, err := parser.Split(content)
+		require.NoError(t, err, "table %s", table)
+		columns, err := parser.CreateTableColumns(statements[0])
 		require.NoError(t, err, "table %s", table)
 		assert.NotEmpty(t, columns, "table %s", table)
 	}
-}
-
-func TestPostgresCreateTableColumns_SkipsConstraints(t *testing.T) {
-	t.Parallel()
-
-	content := `CREATE TABLE example (
-  id bigint,
-  "display name" text,
-  PRIMARY KEY (id),
-  UNIQUE (id),
-  CONSTRAINT positive CHECK (id > 0),
-  CHECK (id > 0),
-  FOREIGN KEY (id) REFERENCES other (id),
-  EXCLUDE USING gist (id WITH =),
-  INDEX (id)
-);`
-	columns, err := postgresCreateTableColumns(content)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"id", "display name"}, columns)
-}
-
-func TestPostgresCreateTableColumns_RejectsUnknownEntry(t *testing.T) {
-	t.Parallel()
-
-	_, err := postgresCreateTableColumns("CREATE TABLE example (id bigint, PARTITION BY id)")
-	require.ErrorContains(t, err, "unrecognized CREATE TABLE entry")
 }

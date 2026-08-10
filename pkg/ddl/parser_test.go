@@ -38,6 +38,10 @@ func (f fakeStatementParser) Classify(string) (StatementType, string, error) {
 	return f.classifyType, f.classifyTable, f.classifyErr
 }
 
+func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
+	return nil, nil
+}
+
 func (f fakeStatementParser) Canonicalize(string) string {
 	return f.canonicalized
 }

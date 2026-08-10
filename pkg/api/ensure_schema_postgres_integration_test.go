@@ -92,6 +92,20 @@ func TestEnsureSchemaPostgres_AllowsExtraColumn(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
 }
 
+// Startup tolerates index differences because PostgreSQL bootstrap verifies
+// required columns only and leaves existing table indexes untouched.
+func TestEnsureSchemaPostgres_AllowsMissingIndex(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
+	require.NoError(t, err)
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+}
+
 // A storage database missing a subset of tables converges back to the full
 // schema: the bootstrapper creates only the missing tables and leaves the
 // existing ones — and their data — untouched.
