@@ -1735,10 +1735,9 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 			return fmt.Errorf("load plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, err)
 		}
 		// A missing plan row is its own cause, separate from a claim that resolved
-		// to the wrong operation. Naming it keeps the operator from chasing a stale
-		// claim when the plan the apply points at is simply gone.
+		// to the wrong operation, so name it rather than reporting a stale claim.
 		if plan == nil {
-			return fmt.Errorf("plan %d not found for task-less apply_operation %d (apply %s)", apply.PlanID, applyOperationID, apply.ApplyIdentifier)
+			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 		}
 		// Fail closed before any dispatch or state mutation on every other
 		// task-less work shape: it is an invalid or stale claim. The shared resume
