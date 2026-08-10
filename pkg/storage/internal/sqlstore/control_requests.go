@@ -138,6 +138,17 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 	if err != nil {
 		return err
 	}
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND operation = ? AND status = ?
+		`, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending)
+		if err != nil {
+			return fmt.Errorf("complete pending control requests for apply %d operation %s: %w", applyID, operation, err)
+		}
+		return nil
+	}
 	leaseJoin := ""
 	leasePredicate := ""
 	args := []any{storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending}
@@ -167,6 +178,17 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
 	if err != nil {
 		return err
+	}
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND operation = ? AND status = ?
+		`, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending)
+		if err != nil {
+			return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
+		}
+		return nil
 	}
 	leaseJoin := ""
 	leasePredicate := ""

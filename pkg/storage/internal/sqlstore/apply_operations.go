@@ -177,6 +177,9 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	if err != nil {
 		return err
 	}
+	if guard.kind != operationGuardApply {
+		setClause = strings.ReplaceAll(setClause, "ao.", "")
+	}
 	guardArgs := guard.args()
 	args := make([]any, 0, len(setArgs)+1+len(guardArgs))
 	args = append(args, setArgs...)
@@ -474,10 +477,14 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 		return err
 	}
 	args := append([]any{externalOperationID, operationID}, guard.args()...)
+	setClause := "external_operation_id = ?"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.external_operation_id = ?"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.external_operation_id = ?
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -498,10 +505,14 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 		return err
 	}
 	args := append([]any{externalID, operationID}, guard.args()...)
+	setClause := "external_id = ?"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.external_id = ?"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.external_id = ?
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -529,10 +540,14 @@ func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operati
 		metadata = "{}"
 	}
 	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, guard.args()...)
+	setClause := "engine_resume_context = ?, engine_resume_metadata = ?"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.engine_resume_context = ?, ao.engine_resume_metadata = ?"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.engine_resume_context = ?, ao.engine_resume_metadata = ?
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -1365,10 +1380,14 @@ func (s *applyOperationStore) Heartbeat(ctx context.Context, id int64) error {
 		return err
 	}
 	args := append([]any{id}, guard.args()...)
+	setClause := "updated_at = NOW()"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.updated_at = NOW()"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.updated_at = NOW()
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
