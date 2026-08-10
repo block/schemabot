@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -191,9 +192,9 @@ func (m WatchModel) progressView() string {
 		b.WriteString(templates.FormatApplyStopped())
 		b.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&b, "Use 'schemabot start -e %s %s' to resume.\n", m.environment, m.applyID)
+			fmt.Fprintf(&b, "Use '%s start -e %s %s' to resume.\n", cliname.Name(), m.environment, m.applyID)
 		} else {
-			fmt.Fprintf(&b, "Use 'schemabot status -d %s -e %s' to find the apply ID.\n", m.database, m.environment)
+			fmt.Fprintf(&b, "Use '%s status -d %s -e %s' to find the apply ID.\n", cliname.Name(), m.database, m.environment)
 		}
 	case isCuttingOver:
 		// During cutover, show minimal footer - no detach/stop allowed
@@ -219,9 +220,9 @@ func (m WatchModel) progressView() string {
 			b.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: schemabot start -e %s %s\n", m.environment, m.applyID)
+				fmt.Fprintf(&b, "To proceed: %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: schemabot status -d %s -e %s\n", m.database, m.environment)
+				fmt.Fprintf(&b, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 			}
 			b.WriteString("Watching for deploy... (ESC to detach)\n")
 		}
@@ -233,9 +234,9 @@ func (m WatchModel) progressView() string {
 			b.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: schemabot cutover -e %s %s\n", m.environment, m.applyID)
+				fmt.Fprintf(&b, "To proceed: %s cutover -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: schemabot status -d %s -e %s\n", m.database, m.environment)
+				fmt.Fprintf(&b, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 			}
 			b.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
@@ -422,13 +423,13 @@ func (m WatchModel) detachedView() string {
 	}
 	b.WriteString("\n")
 	if m.applyID != "" {
-		fmt.Fprintf(&b, "To reattach: schemabot progress %s\n", m.applyID)
+		fmt.Fprintf(&b, "To reattach: %s progress %s\n", cliname.Name(), m.applyID)
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   schemabot start -e %s %s\n", m.environment, m.applyID)
+			fmt.Fprintf(&b, "To deploy:   %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 		}
-		fmt.Fprintf(&b, "To stop:     schemabot stop -e %s %s\n", m.environment, m.applyID)
+		fmt.Fprintf(&b, "To stop:     %s stop -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 	} else {
-		fmt.Fprintf(&b, "Find apply:  schemabot status -d %s -e %s\n", m.database, m.environment)
+		fmt.Fprintf(&b, "Find apply:  %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 	}
 	return b.String()
 }

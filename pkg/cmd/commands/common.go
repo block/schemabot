@@ -18,6 +18,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -27,6 +28,10 @@ type Globals struct {
 	Endpoint string `help:"SchemaBot API endpoint (overrides profile)"`
 	Profile  string `help:"Configuration profile"`
 	Token    string `help:"Bearer token for authenticating to an auth-enabled server (or set SCHEMABOT_TOKEN)"`
+	// CLIName is declared so kong accepts the flag at any position; main.go
+	// consumes the value from the raw args before parsing, since it feeds
+	// kong's own usage text.
+	CLIName string `name:"cli-name" hidden:"" help:"Tool name rendered in command hints (for CLI wrappers)"`
 
 	// Build info (set by main.go from ldflags)
 	Version string `kong:"-"`
@@ -82,7 +87,7 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			absDir, _ := filepath.Abs(dir)
-			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  schemabot plan -s ./path/to/schema\n  schemabot apply -s ./path/to/schema -e staging", absDir)
+			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  %s plan -s ./path/to/schema\n  %s apply -s ./path/to/schema -e staging", absDir, cliname.Name(), cliname.Name())
 		}
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
@@ -113,7 +118,7 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 		return "", fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		return "", fmt.Errorf("no endpoint configured (run 'schemabot configure' to set up a profile)")
+		return "", fmt.Errorf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 	}
 	return ep, nil
 }
@@ -479,9 +484,9 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
+		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
 	} else {
-		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
 	}
 }
 

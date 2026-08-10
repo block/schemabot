@@ -4792,7 +4792,7 @@ func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
 	other := New(testDB)
 	held, err := other.applyOperations.db.Conn(ctx)
 	require.NoError(t, err)
-	acquired, err := namedlock.MySQL{}.Acquire(ctx, held.raw(), strandedReaperLockName, 0)
+	acquired, err := namedlock.MySQL{}.Acquire(ctx, held.lockerConn(), strandedReaperLockName, 0)
 	require.NoError(t, err)
 	require.True(t, acquired, "the stand-in instance should take the reaper lock")
 
@@ -4800,7 +4800,7 @@ func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
 	require.ErrorIs(t, err, storage.ErrStrandedReaperBusy, "a second reaper steps aside rather than re-scanning")
 	assertApplyOperationState(t, store, op.ID, state.ApplyOperation.Pending)
 
-	released, err := namedlock.MySQL{}.Release(ctx, held.raw(), strandedReaperLockName)
+	released, err := namedlock.MySQL{}.Release(ctx, held.lockerConn(), strandedReaperLockName)
 	require.NoError(t, err)
 	require.True(t, released)
 	require.NoError(t, held.Close())

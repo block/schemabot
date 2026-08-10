@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -243,7 +245,7 @@ func previewSeqStoppedOutput() {
 	}
 	WriteProgress(data)
 
-	fmt.Println("Use 'schemabot start' to resume from checkpoint.")
+	fmt.Printf("Use '%s start' to resume from checkpoint.\n", cliname.Name())
 }
 
 func previewSequentialAllOutput() {

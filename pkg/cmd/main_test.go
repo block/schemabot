@@ -14,6 +14,7 @@ func TestRollbackRequiresEnvironmentFlag(t *testing.T) {
 	parser, err := kong.New(&cli,
 		kong.Name("schemabot"),
 		kong.Writers(io.Discard, io.Discard),
+		kong.Vars{"cli_name": "schemabot"},
 	)
 	require.NoError(t, err)
 

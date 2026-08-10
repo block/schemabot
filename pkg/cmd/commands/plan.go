@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
@@ -46,7 +47,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		errMsg := "no endpoint configured (run 'schemabot configure' to set up a profile)"
+		errMsg := fmt.Sprintf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 		if cmd.JSON {
 			return client.ExitWithJSON("invalid_request", errMsg)
 		}

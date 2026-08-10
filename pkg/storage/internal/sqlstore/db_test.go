@@ -18,6 +18,8 @@ import (
 type recordingConnector struct {
 	queries []string
 	args    [][]driver.Value
+	txOpts  []driver.TxOptions
+	closes  int
 }
 
 func (c *recordingConnector) Connect(context.Context) (driver.Conn, error) { return c, nil }
@@ -27,8 +29,19 @@ func (c *recordingConnector) Prepare(query string) (driver.Stmt, error) {
 	c.queries = append(c.queries, query)
 	return &recordingStmt{connector: c}, nil
 }
-func (c *recordingConnector) Close() error              { return nil }
+func (c *recordingConnector) Close() error {
+	c.closes++
+	return nil
+}
 func (c *recordingConnector) Begin() (driver.Tx, error) { return noopTx{}, nil }
+
+// BeginTx records the transaction options the pool hands to the driver, so
+// tests can exercise the isolation-level-bearing BeginTx paths and assert the
+// options survive the wrapper types intact.
+func (c *recordingConnector) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	c.txOpts = append(c.txOpts, opts)
+	return noopTx{}, nil
+}
 
 type recordingStmt struct {
 	connector *recordingConnector
@@ -194,10 +207,41 @@ func TestRebindConnTxRebindsOnce(t *testing.T) {
 	assertReboundExactlyOnce(t, b, connector)
 }
 
-// The raw() escape hands the advisory locker the pinned session without the
-// binder in the way: locker SQL reaches the driver with its engine-native
-// placeholders untouched, and the binder is never invoked.
-func TestRebindConnRawEscapeBypassesBinder(t *testing.T) {
+// Transactions begun with an explicit isolation level — as the apply-write
+// (RepeatableRead) and read-only (ReadCommitted) paths do — carry the level
+// through the wrapper types to the driver and still rebind exactly once,
+// whether begun on the pool or on a pinned connection.
+func TestRebindTxIsolationLevelReachesDriver(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+	ctx := t.Context()
+
+	tx, err := rdb.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, "UPDATE applies SET state = ? WHERE id = ?", "running", int64(7))
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	conn, err := rdb.Conn(ctx)
+	require.NoError(t, err)
+	connTx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	require.NoError(t, err)
+	var id int64
+	err = connTx.QueryRowContext(ctx, "SELECT id FROM applies WHERE id = ?", int64(7)).Scan(&id)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+	require.NoError(t, connTx.Rollback())
+	require.NoError(t, conn.Close())
+
+	require.Len(t, connector.txOpts, 2)
+	assert.Equal(t, driver.IsolationLevel(sql.LevelRepeatableRead), connector.txOpts[0].Isolation)
+	assert.Equal(t, driver.IsolationLevel(sql.LevelReadCommitted), connector.txOpts[1].Isolation)
+	assertReboundExactlyOnce(t, b, connector)
+}
+
+// The lockerConn() escape hands the advisory locker the pinned session
+// without the binder in the way: locker SQL reaches the driver with its
+// engine-native placeholders untouched, and the binder is never invoked.
+func TestRebindConnLockerConnBypassesBinder(t *testing.T) {
 	b := &countingBinder{}
 	rdb, connector := newRecordingRebindDB(t, b)
 	ctx := t.Context()
@@ -206,12 +250,31 @@ func TestRebindConnRawEscapeBypassesBinder(t *testing.T) {
 	require.NoError(t, err)
 
 	var result sql.NullInt64
-	err = conn.raw().QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", "lock", int64(0)).Scan(&result)
+	err = conn.lockerConn().QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", "lock", int64(0)).Scan(&result)
 	require.ErrorIs(t, err, sql.ErrNoRows)
 	require.NoError(t, conn.Close())
 
 	assert.Equal(t, 0, b.calls)
 	assert.Equal(t, []string{"SELECT GET_LOCK(?, ?)"}, connector.queries)
+}
+
+// discardBadConn retires the pinned session on the spot without surfacing the
+// sentinel it injects: the pool destroys the driver connection immediately,
+// and a later Close reports the session as already retired.
+func TestRebindConnDiscardBadConnRetiresSession(t *testing.T) {
+	b := &countingBinder{}
+	rdb, connector := newRecordingRebindDB(t, b)
+	ctx := t.Context()
+
+	conn, err := rdb.Conn(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, conn.discardBadConn())
+	require.ErrorIs(t, conn.Close(), sql.ErrConnDone, "the discarded session is already retired")
+
+	assert.Equal(t, 1, connector.closes, "the pool should destroy the discarded session")
+	assert.Equal(t, 0, b.calls, "discarding a session must not touch the binder")
+	assert.Empty(t, connector.queries, "discarding a session must not execute SQL")
 }
 
 func TestMySQLDialectRebindIsIdentity(t *testing.T) {
