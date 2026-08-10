@@ -3,6 +3,8 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 )
 
 // binder rewrites a statement's parameter placeholders into the wire syntax
@@ -30,7 +32,9 @@ func (MySQLDialect) Rebind(query string) string {
 // Transactions and pinned connections obtained via BeginTx / Conn are wrapped
 // the same way, so every execution path — pool, transaction, or pinned
 // connection — rebinds exactly once on the final assembled SQL. The only
-// sanctioned escape is rebindConn.raw() for the advisory-lock boundary.
+// sanctioned binder bypass is rebindConn.lockerConn(), which hands the
+// advisory-lock boundary the pinned session; connection lifecycle control goes
+// through rebindConn.discardBadConn, which cannot execute SQL.
 type rebindDB struct {
 	pool   *sql.DB
 	binder binder
@@ -141,10 +145,19 @@ func (c *rebindConn) BeginTx(ctx context.Context, opts *sql.TxOptions) (*rebindT
 	return &rebindTx{tx: tx, binder: c.binder}, nil
 }
 
-// Raw runs f against the pinned driver connection, for lifecycle control such
-// as discarding a session whose advisory-lock state is uncertain.
-func (c *rebindConn) Raw(f func(driverConn any) error) error {
-	return c.conn.Raw(f)
+// discardBadConn retires the pinned session so the pool destroys it instead of
+// reusing a connection whose advisory-lock state is uncertain. The session is
+// closed as a side effect, so a later Close returns sql.ErrConnDone. It is the
+// only driver-level access the wrapper exposes, and it is deliberately
+// incapable of executing SQL, so it cannot bypass the binder.
+func (c *rebindConn) discardBadConn() error {
+	err := c.conn.Raw(func(any) error { return driver.ErrBadConn })
+	if errors.Is(err, driver.ErrBadConn) {
+		// The sentinel this method injects to mark the session bad; the pool
+		// has retired the connection as requested.
+		return nil
+	}
+	return err
 }
 
 // Close returns the pinned session to the pool.
@@ -152,10 +165,10 @@ func (c *rebindConn) Close() error {
 	return c.conn.Close()
 }
 
-// raw exposes the pinned *sql.Conn for the advisory-lock boundary. It is the
-// only sanctioned binder escape: namedlock.Locker implementations emit their
-// engine's native placeholders and must execute on the pinned session that
-// holds the lock. No store SQL may execute through it.
-func (c *rebindConn) raw() *sql.Conn {
+// lockerConn exposes the pinned *sql.Conn for the advisory-lock boundary:
+// namedlock.Locker implementations emit their engine's native placeholders and
+// must execute on the pinned session that holds the lock, so the locker
+// deliberately bypasses the binder. No store SQL may execute through it.
+func (c *rebindConn) lockerConn() *sql.Conn {
 	return c.conn
 }
