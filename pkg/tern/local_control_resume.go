@@ -1113,6 +1113,12 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 		if planErr != nil {
 			return fmt.Errorf("get plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, planErr)
 		}
+		// A missing plan row is its own cause, separate from a claim that resolved
+		// to the wrong operation. Naming it keeps the operator from chasing a stale
+		// claim when the plan the apply points at is simply gone.
+		if plan == nil {
+			return fmt.Errorf("plan %d not found for task-less apply_operation %d (apply %s)", apply.PlanID, applyOperationID, apply.ApplyIdentifier)
+		}
 		if !op.IsTasklessVSchemaOnlyWork(plan) {
 			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 		}
