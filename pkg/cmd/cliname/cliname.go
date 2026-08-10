@@ -24,7 +24,7 @@ const flagName = "--cli-name"
 var name atomic.Pointer[string]
 
 // Set records the tool name command hints render, typically a wrapper
-// invocation such as "sq schemabot". An empty name is ignored so an absent
+// invocation such as "acme schemabot". An empty name is ignored so an absent
 // --cli-name flag keeps the default rather than clearing the name.
 func Set(n string) {
 	if n == "" {

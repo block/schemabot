@@ -20,8 +20,8 @@ func TestName(t *testing.T) {
 	Set("")
 	assert.Equal(t, "schemabot", Name(), "empty Set keeps the default")
 
-	Set("sq schemabot")
-	assert.Equal(t, "sq schemabot", Name(), "wrapper-passed name is rendered")
+	Set("acme schemabot")
+	assert.Equal(t, "acme schemabot", Name(), "wrapper-passed name is rendered")
 }
 
 func TestFromArgs(t *testing.T) {
@@ -31,11 +31,11 @@ func TestFromArgs(t *testing.T) {
 		want string
 	}{
 		{"absent", []string{"status", "-e", "staging"}, ""},
-		{"equals form", []string{"--cli-name=sq schemabot", "status"}, "sq schemabot"},
-		{"space form", []string{"--cli-name", "sq schemabot", "status"}, "sq schemabot"},
-		{"after subcommand", []string{"rollback", "--cli-name", "sq schemabot"}, "sq schemabot"},
+		{"equals form", []string{"--cli-name=acme schemabot", "status"}, "acme schemabot"},
+		{"space form", []string{"--cli-name", "acme schemabot", "status"}, "acme schemabot"},
+		{"after subcommand", []string{"rollback", "--cli-name", "acme schemabot"}, "acme schemabot"},
 		{"missing value at end", []string{"status", "--cli-name"}, ""},
-		{"not scanned past double dash", []string{"status", "--", "--cli-name=sq schemabot"}, ""},
+		{"not scanned past double dash", []string{"status", "--", "--cli-name=acme schemabot"}, ""},
 		{"last occurrence wins", []string{"--cli-name=first", "--cli-name", "second"}, "second"},
 	}
 	for _, tt := range tests {
