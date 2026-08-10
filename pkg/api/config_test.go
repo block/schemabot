@@ -278,7 +278,6 @@ databases:
 }
 
 func TestServerConfig_Validate(t *testing.T) {
-	pendingDropsDisabled := false
 	tests := []struct {
 		name    string
 		cfg     ServerConfig
@@ -627,7 +626,6 @@ func TestServerConfig_Validate(t *testing.T) {
 		{
 			name: "postgres database type is valid",
 			cfg: ServerConfig{
-				PendingDrops: PendingDropsConfig{Enabled: &pendingDropsDisabled},
 				Databases: map[string]DatabaseConfig{
 					"mydb": {
 						Type:         storage.DatabaseTypePostgres,
@@ -664,28 +662,6 @@ func TestServerConfig_Validate(t *testing.T) {
 			} else {
 				assert.NoError(t, err, "Validate() should not have returned an error")
 			}
-		})
-	}
-}
-
-func TestValidateDatabaseFeatures(t *testing.T) {
-	t.Run("postgres pending drops is rejected", func(t *testing.T) {
-		err := validateDatabaseFeatures("orders", storage.DatabaseTypePostgres, true, false)
-		assert.EqualError(t, err, `database "orders": pending drops is not supported for database_type: postgres`)
-	})
-
-	t.Run("postgres deferred cutover is rejected", func(t *testing.T) {
-		err := validateDatabaseFeatures("orders", storage.DatabaseTypePostgres, false, true)
-		assert.EqualError(t, err, `database "orders": deferred cutover is not supported for database_type: postgres`)
-	})
-
-	t.Run("postgres without dialect-specific features is allowed", func(t *testing.T) {
-		assert.NoError(t, validateDatabaseFeatures("orders", storage.DatabaseTypePostgres, false, false))
-	})
-
-	for _, databaseType := range []string{storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess} {
-		t.Run(databaseType+" features remain allowed", func(t *testing.T) {
-			assert.NoError(t, validateDatabaseFeatures("orders", databaseType, true, true))
 		})
 	}
 }

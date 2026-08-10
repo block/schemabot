@@ -17,7 +17,6 @@ const (
 	// DialectPostgres covers PostgreSQL targets.
 	DialectPostgres Dialect = "postgres"
 
-	FeaturePendingDrops    Feature = "pending drops"
 	FeatureDeferredCutover Feature = "deferred cutover"
 )
 
@@ -43,13 +42,9 @@ func DialectForDatabaseType(databaseType string) Dialect {
 // SupportsFeature reports whether a database type supports a dialect-specific
 // feature. Unknown database types fail closed.
 func SupportsFeature(databaseType string, feature Feature) bool {
-	if DialectForDatabaseType(databaseType) != DialectMySQL {
-		return false
-	}
-
 	switch feature {
-	case FeaturePendingDrops, FeatureDeferredCutover:
-		return true
+	case FeatureDeferredCutover:
+		return databaseType == "mysql" || databaseType == "vitess"
 	default:
 		return false
 	}

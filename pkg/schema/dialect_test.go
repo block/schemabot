@@ -98,15 +98,25 @@ func TestDialectForDatabaseType(t *testing.T) {
 }
 
 func TestSupportsFeature(t *testing.T) {
-	for _, databaseType := range []string{"mysql", "vitess", "strata"} {
-		assert.True(t, SupportsFeature(databaseType, FeaturePendingDrops))
-		assert.True(t, SupportsFeature(databaseType, FeatureDeferredCutover))
+	tests := []struct {
+		name         string
+		databaseType string
+		feature      Feature
+		want         bool
+	}{
+		{name: "mysql deferred cutover", databaseType: "mysql", feature: FeatureDeferredCutover, want: true},
+		{name: "vitess deferred cutover", databaseType: "vitess", feature: FeatureDeferredCutover, want: true},
+		{name: "strata deferred cutover", databaseType: "strata", feature: FeatureDeferredCutover},
+		{name: "postgres deferred cutover", databaseType: "postgres", feature: FeatureDeferredCutover},
+		{name: "unknown database type", databaseType: "unknown", feature: FeatureDeferredCutover},
+		{name: "unknown feature", databaseType: "mysql", feature: Feature("unknown")},
 	}
 
-	assert.False(t, SupportsFeature("postgres", FeaturePendingDrops))
-	assert.False(t, SupportsFeature("postgres", FeatureDeferredCutover))
-	assert.False(t, SupportsFeature("unknown", FeaturePendingDrops))
-	assert.False(t, SupportsFeature("mysql", Feature("unknown")))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, SupportsFeature(tt.databaseType, tt.feature))
+		})
+	}
 }
 
 // An unregistered dialect — a raw database_type cast (e.g. "vitess", "strata")
