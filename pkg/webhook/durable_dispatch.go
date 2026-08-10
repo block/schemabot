@@ -198,8 +198,20 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 }
 
 // driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for
-// a freshly claimed delivery.
+// a freshly claimed delivery. It records the started status when the claim
+// begins and exactly one dispatch outcome when the claim ends, so the two
+// sides ledger against each other: a started claim with no recorded outcome
+// means the driver died mid-claim.
 func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent) {
+	claimedAt := time.Now()
+	metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_started")
+	if event.Attempts == 1 {
+		// Only the first claim measures inbox wait: started_at pins to the
+		// first claim, and a retry claim's wait is the retry window, not
+		// backlog latency.
+		metrics.RecordWebhookInboxDispatchLag(ctx, event.Event, event.Repository, time.Since(event.ReceivedAt))
+	}
+
 	runCtx, cancelRun := context.WithCancel(ctx)
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
@@ -212,6 +224,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
+	recordOutcome := func(outcome string) {
+		metrics.RecordWebhookDispatchDuration(finishCtx, event.Event, event.Repository, outcome, time.Since(claimedAt))
+	}
 	if processErr != nil {
 		if heartbeatErr == nil && ctx.Err() != nil {
 			// The driver context is cancelled, so the pool is shutting down and
@@ -225,11 +240,13 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// it, or deploy-churn restarts that each claim-and-cancel the same
 			// delivery would terminally fail it without a single real attempt.
 			if err := store.Release(finishCtx, event.ID, event.LeaseToken); err != nil {
+				recordOutcome("finish_error")
 				h.logger.Warn("durable webhook driver could not release delivery claim on shutdown; lease expiry will hand it to another driver",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 					"repo", event.Repository, "pr", event.PullRequest, "error", err)
 				return
 			}
+			recordOutcome("released")
 			h.logger.Info("durable webhook driver released delivery claim on shutdown",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"repo", event.Repository, "pr", event.PullRequest)
@@ -247,20 +264,25 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		if err := store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAfter); err != nil {
 			if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+				recordOutcome("lease_lost")
 				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 					"repo", event.Repository, "pr", event.PullRequest)
 				return
 			}
+			recordOutcome("finish_error")
 			h.logger.Error("durable webhook driver failed to record delivery failure",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"repo", event.Repository, "pr", event.PullRequest, "error", err)
 			return
 		}
 		status := "durable_dispatch_failed"
+		outcome := "failed"
 		if retryAfter != nil {
 			status = "durable_dispatch_retrying"
+			outcome = "retrying"
 		}
+		recordOutcome(outcome)
 		metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, status)
 		h.logger.Warn("durable webhook driver recorded delivery failure",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
@@ -275,6 +297,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		// not mark it completed — leave the row processing so lease expiry
 		// hands it to another driver. Re-processing an already-planned delivery
 		// re-runs auto-plan on the same head SHA, which is safe.
+		recordOutcome("lease_lost")
 		h.logger.Warn("durable webhook driver skipped completion because the delivery lease heartbeat failed; leaving delivery for reclaim",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"repo", event.Repository, "pr", event.PullRequest, "error", heartbeatErr)
@@ -282,16 +305,19 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	}
 	if err := store.MarkCompleted(finishCtx, event.ID, event.LeaseToken); err != nil {
 		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			recordOutcome("lease_lost")
 			h.logger.Warn("durable webhook driver lost the delivery lease before recording completion; another driver owns the delivery or the row is gone",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"repo", event.Repository, "pr", event.PullRequest)
 			return
 		}
+		recordOutcome("finish_error")
 		h.logger.Error("durable webhook driver failed to mark delivery completed",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"repo", event.Repository, "pr", event.PullRequest, "error", err)
 		return
 	}
+	recordOutcome("completed")
 	metrics.RecordWebhookEvent(finishCtx, h.metricAppForRepo(event.Repository), event.Event, event.Action, event.Repository, "durable_dispatch_completed")
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
