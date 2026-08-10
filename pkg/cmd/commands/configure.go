@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // ConfigureCmd configures CLI settings.
@@ -69,10 +70,10 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 
 	if cfg.DefaultProfile == profileName {
 		fmt.Printf("\nThis is your default profile. You can now run:\n")
-		fmt.Printf("  schemabot plan -s ./schema -e staging\n")
+		fmt.Printf("  %s plan -s ./schema -e staging\n", cliname.Name())
 	} else {
 		fmt.Printf("\nTo use this profile:\n")
-		fmt.Printf("  schemabot plan -s ./schema -e staging --profile %s\n", profileName)
+		fmt.Printf("  %s plan -s ./schema -e staging --profile %s\n", cliname.Name(), profileName)
 		fmt.Printf("\nOr set as default:\n")
 		fmt.Printf("  export SCHEMABOT_PROFILE=%s\n", profileName)
 	}

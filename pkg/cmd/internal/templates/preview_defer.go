@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -186,7 +188,7 @@ func previewDeferStoppedOutput() {
 	}
 	WriteProgress(data)
 
-	fmt.Println("Use 'schemabot start -e staging <apply_id>' to resume.")
+	fmt.Printf("Use '%s start -e staging <apply_id>' to resume.\n", cliname.Name())
 }
 
 func previewDeferDetachedOutput() {
@@ -198,18 +200,18 @@ func previewDeferDetachedOutput() {
 	fmt.Println("Row copy is complete and the shadow table is kept in sync.")
 	fmt.Println()
 	fmt.Println("To check status:")
-	fmt.Println("  schemabot status <apply_id>")
+	fmt.Printf("  %s status <apply_id>\n", cliname.Name())
 	fmt.Println()
 	fmt.Println("To proceed with cutover:")
-	fmt.Println("  schemabot cutover -e staging <apply_id>")
+	fmt.Printf("  %s cutover -e staging <apply_id>\n", cliname.Name())
 	fmt.Println()
 	fmt.Println("To abort the schema change:")
-	fmt.Println("  schemabot stop -e staging <apply_id>")
+	fmt.Printf("  %s stop -e staging <apply_id>\n", cliname.Name())
 }
 
 func previewDeferCuttingOutput() {
 	fmt.Println("Defer cutover: Cutting over in progress")
-	fmt.Println("(After user pressed Enter or ran `schemabot cutover`)")
+	fmt.Printf("(After user pressed Enter or ran `%s cutover`)\n", cliname.Name())
 	fmt.Println()
 
 	data := ProgressData{
