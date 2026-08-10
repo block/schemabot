@@ -273,6 +273,11 @@ type resumeDeployClient struct {
 	deployCalls  int
 	lastDeploy   *ps.PerformDeployRequest
 	deployResult *ps.DeployRequest
+	autoCutover  bool
+}
+
+func (c *resumeDeployClient) DeployRequestAutoCutover(_ context.Context, _, _ string, _ uint64) (bool, error) {
+	return c.autoCutover, nil
 }
 
 func (c *resumeDeployClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
@@ -333,10 +338,11 @@ func captureStateChanges(req *engine.ApplyRequest) *[]*engine.ResumeState {
 func TestDeployRequestNeedsResumeDeploy(t *testing.T) {
 	deployedAt := time.Now()
 	cases := []struct {
-		name string
-		dr   *ps.DeployRequest
-		meta *psMetadata
-		want bool
+		name        string
+		dr          *ps.DeployRequest
+		meta        *psMetadata
+		deferDeploy bool
+		want        bool
 	}{
 		{
 			name: "ready non-deferred not deployed needs deploy",
@@ -349,6 +355,16 @@ func TestDeployRequestNeedsResumeDeploy(t *testing.T) {
 			dr:   &ps.DeployRequest{DeploymentState: deployState.Ready},
 			meta: &psMetadata{DeferredDeploy: true},
 			want: false,
+		},
+		{
+			// The metadata flag is persisted after the deploy request is created,
+			// so a crash inside that window recovers a deferred apply whose stored
+			// metadata does not say so yet. The operator's request is what decides.
+			name:        "ready and deferred by request before the flag was stored",
+			dr:          &ps.DeployRequest{DeploymentState: deployState.Ready},
+			meta:        &psMetadata{},
+			deferDeploy: true,
+			want:        false,
 		},
 		{
 			name: "ready but already deployed is in flight",
@@ -372,7 +388,7 @@ func TestDeployRequestNeedsResumeDeploy(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, deployRequestNeedsResumeDeploy(tc.dr, tc.meta))
+			assert.Equal(t, tc.want, deployRequestNeedsResumeDeploy(tc.dr, tc.meta, tc.deferDeploy))
 		})
 	}
 }
@@ -427,6 +443,46 @@ func TestResumeExistingDeployRequest_InFlightIsNotRedeployed(t *testing.T) {
 	// A stored real Vitess context is authoritative — resume neither rediscovers
 	// nor re-persists it.
 	assert.Empty(t, *persisted)
+}
+
+// A driver can crash between creating a deploy request and deploying it, and the
+// drive that recovers it cannot know how it was created — the setting is fixed at
+// creation and the deploy request looks ordinary either way. So a recovered
+// request whose cutover the operator deferred is verified before it is deployed,
+// exactly as a fresh one is: held, and it deploys; not held, and it is refused
+// with the deploy never started.
+func TestResumeExistingDeployRequest_VerifiesTheCutoverHoldBeforeDeploying(t *testing.T) {
+	tests := []struct {
+		name        string
+		autoCutover bool
+		wantDeploys int
+	}{
+		{name: "cutover held by the deploy request", autoCutover: false, wantDeploys: 1},
+		{name: "cutover owned by the backend", autoCutover: true, wantDeploys: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &resumeDeployClient{
+				recovered:   &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/31"},
+				autoCutover: tt.autoCutover,
+			}
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-hold", DeployRequestID: 31}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Options = map[string]string{"defer_cutover": "true"}
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			assert.Equal(t, tt.wantDeploys, client.deployCalls)
+			if tt.autoCutover {
+				require.Error(t, err, "a recovered deploy request that would cut itself over must be refused")
+				assert.Contains(t, err.Error(), "auto-cutover")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 // A deferred deploy request recovered on resume must wait for the

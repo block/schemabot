@@ -904,7 +904,22 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	// resumes racing here could both decide to deploy. That read→call window is
 	// self-correcting: the provider accepts at most one deploy and rejects the
 	// loser, so a duplicate schema change is never started.
-	if deployRequestNeedsResumeDeploy(dr, meta) {
+	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
+
+	if deployRequestNeedsResumeDeploy(dr, meta, deferDeploy) {
+		// The cutover setting is settled when the deploy request is created and no
+		// later call can change it, so a recovered request has to be verified here
+		// for the same reason the fresh path verifies before deploying: this drive
+		// cannot know how the request it inherited was created. Deploying one whose
+		// cutover the backend still owns would let the schema swap itself, which is
+		// what the operator deferring the cutover asked to prevent.
+		if deferCutover {
+			if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+				return nil, err
+			}
+		}
+
 		e.logger.Info("deploying recovered deploy request that was never started",
 			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", meta.IsInstant)
 
@@ -983,8 +998,12 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // the driver crashed between creating the deploy request and deploying it. A
 // deferred deploy is left for the operator-triggered deploy, and a request that
 // already has a DeployedAt timestamp is in flight and must not be re-deployed.
-func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool {
-	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && dr.DeployedAt == nil
+// The deferral is read from both the stored metadata and the operator's request:
+// the metadata flag is persisted only after the deploy request is created, so a
+// crash inside that window leaves a deferred apply whose stored metadata does not
+// yet say so, and the request the operator made is what settles it.
+func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
 }
 
 // resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a
