@@ -874,14 +874,18 @@ func getEnv(key, defaultValue string) string {
 // WEBHOOK_RECONCILE_SYNTHESIS=false. The kill switch drops the reconciler
 // back to a report-only missing-delivery scan with a restart instead of a
 // code revert; the missing-delivery warning and metric keep flowing either
-// way, so detection is unaffected.
+// way, so detection is unaffected. An unparseable value also disables
+// synthesis: the only reason to set the variable is to turn synthesis off,
+// so a malformed value ("off", "disabled") is treated as intent to disable —
+// an operator reaching for a kill switch mid-incident must get the
+// switched-off behavior, not a warning in pod logs they are not watching.
 func webhookReconcileSynthesisOptions(logger *slog.Logger) []webhook.HandlerOption {
 	if value := os.Getenv("WEBHOOK_RECONCILE_SYNTHESIS"); value != "" {
 		enabled, err := strconv.ParseBool(value)
 		if err != nil {
-			logger.Warn("invalid WEBHOOK_RECONCILE_SYNTHESIS value; webhook reconcile synthesis stays enabled",
+			logger.Error("invalid WEBHOOK_RECONCILE_SYNTHESIS value; webhook reconcile synthesis disabled (fail-safe) — missing-delivery scan will run report-only",
 				"value", value, "error", err)
-			return []webhook.HandlerOption{webhook.WithWebhookReconcileSynthesis()}
+			return nil
 		}
 		if !enabled {
 			logger.Info("webhook reconcile synthesis disabled by WEBHOOK_RECONCILE_SYNTHESIS; missing-delivery scan will run report-only")

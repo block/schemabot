@@ -1342,6 +1342,15 @@ const (
 	WebhookEventFailed          = "failed"
 )
 
+// SynthesizedWebhookDeliveryIDPrefix marks delivery GUIDs minted by the
+// webhook reconciler for synthesized recovery rows, distinguishing them from
+// organic GitHub delivery GUIDs. The distinction is behavioral, not
+// cosmetic: a terminally failed organic row has a GitHub Redeliver lever, so
+// it still covers its head, while a terminally failed synthesized row has no
+// such lever and must not — the inbox coverage query (HasEventForHead) keys
+// its failed-row exclusion off this prefix.
+const SynthesizedWebhookDeliveryIDPrefix = "recon:"
+
 // AutoPlanPullRequestActions are the pull_request actions that trigger
 // auto-plan for a PR head. This is the single source for every layer that
 // answers "does this delivery plan its head": the webhook enqueue/dispatch

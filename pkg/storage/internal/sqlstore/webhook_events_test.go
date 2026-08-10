@@ -116,25 +116,34 @@ func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 	require.Error(t, err, "missing repository must be rejected")
 }
 
-// A terminally failed row must not cover its head — the reconciler needs to
-// synthesize a fresh recovery delivery for it — while every live state and a
-// completed delivery keep suppressing synthesis.
-func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailed(t *testing.T) {
+// A terminally failed row's coverage depends on its origin: a failed organic
+// delivery still covers its head because the operator's GitHub Redeliver
+// lever exists for it — synthesizing over it would loop a deterministically
+// failing head through a fresh claim budget every pass — while a failed
+// synthesized row must not cover, because there is no Redeliver lever for a
+// synthesized GUID and re-synthesis is the only recovery path.
+func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailedSynthesized(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
 
 	for i, tc := range []struct {
-		state  string
-		covers bool
+		state       string
+		synthesized bool
+		covers      bool
 	}{
-		{storage.WebhookEventPending, true},
-		{storage.WebhookEventProcessing, true},
-		{storage.WebhookEventFailedRetryable, true},
-		{storage.WebhookEventCompleted, true},
-		{storage.WebhookEventFailed, false},
+		{storage.WebhookEventPending, false, true},
+		{storage.WebhookEventProcessing, false, true},
+		{storage.WebhookEventFailedRetryable, false, true},
+		{storage.WebhookEventCompleted, false, true},
+		{storage.WebhookEventFailed, false, true},
+		{storage.WebhookEventPending, true, true},
+		{storage.WebhookEventFailed, true, false},
 	} {
 		deliveryID := fmt.Sprintf("delivery-state-%d", i)
+		if tc.synthesized {
+			deliveryID = storage.SynthesizedWebhookDeliveryIDPrefix + deliveryID
+		}
 		headSHA := fmt.Sprintf("state-head-%d", i)
 		_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
 			DeliveryID:  deliveryID,

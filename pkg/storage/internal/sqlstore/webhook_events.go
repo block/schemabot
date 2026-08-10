@@ -168,21 +168,25 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	// only auto-plannable pull_request rows count. Other event types can carry
 	// the same PR + head SHA without planning it — a pull_request.closed row
 	// from before a reopen, or a check_run row — and matching them would mask
-	// the very loss the reconciler exists to recover. A terminally failed row
-	// does not cover its head either: the reconciler must be able to
-	// synthesize a fresh recovery delivery for it — the retry lands in
-	// Create's duplicate-GUID branch, which reopens the failed row — because
-	// unlike an organic delivery there is no GitHub Redeliver lever for a
-	// synthesized GUID.
+	// the very loss the reconciler exists to recover. A terminally failed
+	// organic row still covers its head: its GitHub Redeliver lever is the
+	// operator's remediation, and synthesizing over it would loop a
+	// deterministically failing head through a fresh claim budget every
+	// pass. Only a terminally failed synthesized row (the
+	// SynthesizedWebhookDeliveryIDPrefix GUID form) fails to cover — there
+	// is no Redeliver lever for a synthesized GUID, so the reconciler must
+	// be able to synthesize a fresh recovery delivery, which lands in
+	// Create's duplicate-GUID branch and reopens the failed row.
 	args := []any{provider, repository, pullRequest, headSHA}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
-	args = append(args, storage.WebhookEventFailed)
+	args = append(args, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
 	var one int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT 1
 		FROM webhook_events
 		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
-			AND event = 'pull_request' AND action IN (`+placeholders(len(storage.AutoPlanPullRequestActions))+`) AND state <> ?
+			AND event = 'pull_request' AND action IN (`+placeholders(len(storage.AutoPlanPullRequestActions))+`)
+			AND (state <> ? OR delivery_id NOT LIKE ?)
 		LIMIT 1
 	`, args...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {

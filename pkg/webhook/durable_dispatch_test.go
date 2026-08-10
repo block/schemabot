@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -92,7 +93,8 @@ func (s *recordingWebhookEventStore) HasEventForHead(_ context.Context, provider
 		if event.Provider == provider && event.Repository == repository &&
 			event.PullRequest == pullRequest && event.HeadSHA == headSHA &&
 			event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) &&
-			event.State != storage.WebhookEventFailed {
+			(event.State != storage.WebhookEventFailed ||
+				!strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix)) {
 			return true, nil
 		}
 	}

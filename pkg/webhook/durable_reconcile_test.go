@@ -333,6 +333,41 @@ func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T)
 	require.Equal(t, 0, row.Attempts)
 }
 
+// TestWebhookReconcilerFailedOrganicRowCoversHead pins the organic side of
+// the terminal-failure contract: a terminally failed organic delivery still
+// covers its head, because the operator's remediation for it is GitHub
+// Redeliver — the reconciler synthesizing over it would put a
+// deterministically failing head through a fresh claim budget on every pass.
+func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	_, err := store.Create(t.Context(), &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  "organic-github-guid",
+		Event:       "pull_request",
+		Action:      "synchronize",
+		Repository:  "octocat/hello-world",
+		PullRequest: 7,
+		HeadSHA:     "head-sha",
+		State:       storage.WebhookEventFailed,
+		Attempts:    storage.MaxWebhookEventAttempts,
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 0, missing, "a terminally failed organic row must cover its head")
+	require.Equal(t, 0, synthesized)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	require.NoError(t, err)
+	require.Nil(t, row, "no recovery row may be synthesized over a failed organic delivery")
+}
+
 // TestWebhookReconcilerNonPlanRowDoesNotCoverHead exercises the
 // reopened-at-the-same-head scenario: a PR closed at head H leaves a
 // pull_request.closed inbox row, and when the PR is reopened without a new

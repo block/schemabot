@@ -51,9 +51,10 @@ func setupSynthesizedDispatchTest(t *testing.T, dbName, headSHA string) (*Handle
 	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger,
 		WithDurableWebhookDispatch(), WithWebhookReconciler(), WithWebhookReconcileSynthesis())
 
-	inserted, err := h.synthesizeMissingHeadDelivery(t.Context(), "octocat/hello-world", 1, headSHA, 12345)
+	inserted, resynthesized, err := h.synthesizeMissingHeadDelivery(t.Context(), "octocat/hello-world", 1, headSHA, 12345)
 	require.NoError(t, err)
 	require.True(t, inserted)
+	require.False(t, resynthesized, "first synthesis for a head must not be labeled a resynthesis")
 
 	row, err := svc.Storage().WebhookEvents().GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub,
 		synthesizedDeliveryGUID("octocat/hello-world", 1, headSHA))
