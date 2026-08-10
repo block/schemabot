@@ -35,6 +35,8 @@ func TestFromArgs(t *testing.T) {
 		{"space form", []string{"--cli-name", "acme schemabot", "status"}, "acme schemabot"},
 		{"after subcommand", []string{"rollback", "--cli-name", "acme schemabot"}, "acme schemabot"},
 		{"missing value at end", []string{"status", "--cli-name"}, ""},
+		{"flag-like space-form value not consumed", []string{"--cli-name", "-e", "staging"}, ""},
+		{"flag-like equals-form value accepted", []string{"--cli-name=-x"}, "-x"},
 		{"not scanned past double dash", []string{"status", "--", "--cli-name=acme schemabot"}, ""},
 		{"last occurrence wins", []string{"--cli-name=first", "--cli-name", "second"}, "second"},
 	}

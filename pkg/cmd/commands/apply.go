@@ -26,7 +26,7 @@ type ApplyCmd struct {
 	PullRequest  int           `help:"Pull request number (optional, for tracking)" name:"pull-request"`
 	AutoApprove  bool          `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	Watch        bool          `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
-	DeferCutover bool          `help:"Defer cutover until manual trigger (use 'schemabot cutover')" name:"defer-cutover"`
+	DeferCutover bool          `help:"Defer cutover until manual trigger (use '${cli_name} cutover')" name:"defer-cutover"`
 	DeferDeploy  bool          `help:"Defer deploy until manual trigger (holds at waiting_for_deploy)" name:"defer-deploy"`
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`

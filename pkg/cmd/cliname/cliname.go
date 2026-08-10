@@ -44,14 +44,17 @@ func Name() string {
 // FromArgs extracts the --cli-name flag value from raw command-line args,
 // returning "" when the flag is absent. It scans the args directly because
 // the name feeds kong's usage text, which must be fixed before kong parses;
-// kong still declares the flag so it is accepted at any position.
+// kong still declares the flag so it is accepted at any position. The scan
+// accepts exactly what kong's own parser accepts — in particular a
+// hyphen-leading space-form value is not consumed, matching kong's scanner —
+// so the two can never disagree on a successful parse.
 func FromArgs(args []string) string {
 	value := ""
 	for i := 0; i < len(args); i++ {
 		if args[i] == "--" {
 			break
 		}
-		if args[i] == flagName && i+1 < len(args) {
+		if args[i] == flagName && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 			value = args[i+1]
 			i++
 			continue

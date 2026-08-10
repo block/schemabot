@@ -71,7 +71,10 @@ func main() {
 		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
-		kong.Vars{"version": fmt.Sprintf("%s (commit: %s)", version, commit)},
+		kong.Vars{
+			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
+			"cli_name": cliname.Name(),
+		},
 	)
 
 	cli.Version = version
