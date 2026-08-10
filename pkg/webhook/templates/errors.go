@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"html"
 	"strings"
 	"text/template"
 )
@@ -279,9 +280,10 @@ func RenderGenericError(data SchemaErrorData) string {
 	// Capitalize command name for header
 	data.CommandName = capitalizeFirst(data.CommandName)
 	// The error detail is untrusted engine or infrastructure error text:
-	// sanitize it and keep a multi-line message inside the blockquote so it
-	// cannot leak endpoints or escape into the surrounding comment structure.
-	data.ErrorDetail = quoteBlockLines(sanitizeCommentError(data.ErrorDetail))
+	// sanitize it, escape HTML, and keep a multi-line message inside the
+	// blockquote so it cannot leak endpoints, inject markup, or escape into
+	// the surrounding comment structure.
+	data.ErrorDetail = quoteBlockLines(html.EscapeString(sanitizeCommentError(data.ErrorDetail)))
 	return offerSupportChannel(renderTemplate(tmplGenericError, data))
 }
 

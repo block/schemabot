@@ -132,6 +132,13 @@ func TestWriteErrorBlock(t *testing.T) {
 		writeErrorBlock(&sb, "  \n ")
 		assert.Empty(t, sb.String())
 	})
+
+	t.Run("HTML markup is escaped so it renders as text", func(t *testing.T) {
+		var sb strings.Builder
+		writeErrorBlock(&sb, "unexpected <img src=x> in output")
+		assert.Contains(t, sb.String(), "&lt;img src=x&gt;")
+		assert.NotContains(t, sb.String(), "<img")
+	})
 }
 
 func TestWriteTableErrorLine(t *testing.T) {
@@ -146,6 +153,13 @@ func TestWriteTableErrorLine(t *testing.T) {
 		writeTableErrorLine(&sb, "dial tcp 10.0.0.5:3306: i/o timeout")
 		assert.Contains(t, sb.String(), "[endpoint redacted]")
 		assert.NotContains(t, sb.String(), "10.0.0.5")
+	})
+
+	t.Run("HTML markup is escaped so it renders as text", func(t *testing.T) {
+		var sb strings.Builder
+		writeTableErrorLine(&sb, "expected <nil> but got <error>")
+		assert.Contains(t, sb.String(), "&lt;nil&gt;")
+		assert.NotContains(t, sb.String(), "<nil>")
 	})
 }
 

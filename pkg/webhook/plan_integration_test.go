@@ -362,7 +362,7 @@ func TestE2EPlanSourcePolicyBlocksUnauthorizedRepo(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "## ❌ Plan Failed")
 		assert.Contains(t, body, "source policy")
-		assert.Contains(t, body, "repo \"octocat/hello-world\" is not authorized")
+		assert.Contains(t, body, "repo &#34;octocat/hello-world&#34; is not authorized")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for source policy failure comment")
 	}

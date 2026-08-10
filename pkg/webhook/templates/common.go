@@ -170,16 +170,7 @@ var (
 func sanitizeCommentError(msg string) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
-	msg = ansiEscapeRe.ReplaceAllString(msg, "")
-	msg = strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\t' {
-			return r
-		}
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return -1
-		}
-		return r
-	}, msg)
+	msg = stripControlText(msg)
 	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
 	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
 	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
@@ -188,6 +179,22 @@ func sanitizeCommentError(msg string) string {
 		msg = string(runes[:maxCommentErrorLen-1]) + "…"
 	}
 	return msg
+}
+
+// stripControlText removes ANSI escape sequences and control and format
+// characters (including bidi overrides usable for visual spoofing) from
+// untrusted text, keeping newlines and tabs.
+func stripControlText(msg string) string {
+	msg = ansiEscapeRe.ReplaceAllString(msg, "")
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, msg)
 }
 
 // sanitizeInlineError makes an untrusted error safe for a single-line comment
@@ -205,7 +212,9 @@ const maxCellErrorLen = 255
 
 // sanitizeCellError makes an untrusted error safe for a Markdown table cell:
 // single-line sanitization plus neutralizing the cell separator so the error
-// cannot break the table layout, clamped to the column width.
+// cannot break the table layout, clamped to the column width. The clamp runs
+// before the call site's HTML escaping, so entity expansion can render wider
+// than the clamp; the clamp is a layout mitigation, not a hard boundary.
 func sanitizeCellError(msg string) string {
 	msg = strings.ReplaceAll(sanitizeInlineError(msg), "|", "/")
 	if runes := []rune(msg); len(runes) > maxCellErrorLen {
@@ -229,7 +238,7 @@ func writeErrorBlock(sb *strings.Builder, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", quoteBlockLines(sanitized))
+	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // writeTableErrorLine writes a task's last error as a blockquote below its
@@ -240,7 +249,7 @@ func writeTableErrorLine(sb *strings.Builder, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoteBlockLines(sanitized))
+	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // taskErrorAddsDetail reports whether a failed table's own error message adds
