@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -542,7 +543,11 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 // report it the way the PlanetScale API does: nested under the deployment.
 func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		cleanupActiveDeployRequests(t, cleanupCtx)
+	})
 
 	tests := []struct {
 		name        string
@@ -572,7 +577,9 @@ func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
 			})
 			require.NoError(t, err, "CreateDeployRequest")
 			t.Cleanup(func() {
-				_, _ = testClient.CancelDeployRequest(t.Context(), &ps.CancelDeployRequestRequest{
+				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				defer cancel()
+				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
 					Organization: testOrg,
 					Database:     testDB,
 					Number:       dr.Number,
