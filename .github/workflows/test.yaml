@@ -290,7 +290,7 @@ jobs:
             --dockerfile deploy/local/Dockerfile.dev \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
-        run: make test-e2e-mysql test-e2e-grpc
+        run: make test-e2e-mysql
       - name: "Capture container logs on failure"
         if: failure()
         run: |
@@ -299,16 +299,60 @@ jobs:
           docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/mysql-containers.log 2>&1 || true
           echo "=== tail of MySQL container logs (full logs in the uploaded e2e-mysql-logs artifact) ==="
           tail -n 200 e2e-logs/mysql-containers.log || true
-          # test-e2e-grpc tears its own stack down, so it captures grpc-containers.log itself.
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-mysql-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  e2e-grpc:
+    name: "E2E gRPC Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev
+      - name: "Test"
+        run: make test-e2e-grpc
+      - name: "Capture container logs on failure"
+        if: failure()
+        run: |
+          # test-e2e-grpc tears its own stack down, so it captures
+          # e2e-logs/grpc-containers.log itself before teardown.
           if [ -f e2e-logs/grpc-containers.log ]; then
-            echo "=== tail of gRPC container logs ==="
+            echo "=== tail of gRPC container logs (full logs in the uploaded e2e-grpc-logs artifact) ==="
             tail -n 200 e2e-logs/grpc-containers.log || true
           fi
       - name: "Upload container logs on failure"
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
         with:
-          name: e2e-mysql-logs
+          name: e2e-grpc-logs
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
@@ -636,7 +680,7 @@ jobs:
   # skipped or failed upstream is treated as failure.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc-multideploy, e2e-vitess]
+    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc, e2e-grpc-multideploy, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -649,6 +693,7 @@ jobs:
           VITESS_MODE: ${{ needs.e2e-vitess-matrix.outputs.mode }}
           VITESS_SHARD_COUNT: ${{ needs.e2e-vitess-matrix.outputs.shard_count }}
           E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
+          E2E_GRPC_RESULT: ${{ needs.e2e-grpc.result }}
           E2E_MULTIDEPLOY_RESULT: ${{ needs.e2e-grpc-multideploy.result }}
           E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
         run: |
@@ -678,6 +723,10 @@ jobs:
           fi
           if [ "$E2E_MYSQL_RESULT" != "success" ]; then
             echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
+            exit 1
+          fi
+          if [ "$E2E_GRPC_RESULT" != "success" ]; then
+            echo "::error::e2e-grpc result=$E2E_GRPC_RESULT"
             exit 1
           fi
           if [ "$E2E_MULTIDEPLOY_RESULT" != "success" ]; then
