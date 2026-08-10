@@ -53,7 +53,7 @@ profiles:
 
 `login` caches the ID token and refresh token on the profile; subsequent commands attach the token automatically and refresh it when it nears expiry. `--issuer`, `--client-id`, and `--redirect-port` override the profile's `oidc` block per invocation.
 
-**An authenticating proxy in front of the server.** Instead of tokens in the CLI, place the server behind an identity-aware proxy or ingress that authenticates at the edge (forward auth against your SSO). The profile's endpoint points at the proxy and the CLI sends no token at all; who may reach the server — and at what tier — is enforced before requests arrive. This is how Block's main deployment works: `sq schemabot` talks to an employee ingress that authenticates the operator, with access tiers enforced server-side.
+**An authenticating proxy in front of the server.** Instead of tokens in the CLI, place the server behind an identity-aware proxy or ingress that authenticates at the edge (forward auth against your SSO). The profile's endpoint points at the proxy and the CLI sends no token at all; who may reach the server — and at what tier — is enforced before requests arrive. A typical shape: a company wrapper (`acme schemabot`, see below) that talks to an employee ingress authenticating the operator, with access tiers enforced server-side.
 
 **Network isolation.** For a cluster with no ingress at all, reach the server over a `kubectl port-forward` (or equivalent tunnel) and point the CLI at `http://127.0.0.1:<port>`; whoever can open the tunnel — Kubernetes RBAC, in practice — is the access control. A wrapper can start and reuse the tunnel automatically (see below).
 
@@ -366,16 +366,16 @@ Outside an incident, the same dry-run pair doubles as a cheap fleet health sweep
 
 ## Wrapping the CLI
 
-Organizations often front the CLI with their own wrapper command that bakes in the environment — resolving internal endpoints, running SSO, starting a port-forward — so operators never configure any of it by hand. At Block, we build an internal wrapper around the schemabot CLI to target internal deployments, which we denote as `sq schemabot`; other schemabot users may want to follow suit. Two styles work:
+Organizations often front the CLI with their own wrapper command that bakes in the environment — resolving internal endpoints, running SSO, starting a port-forward — so operators never configure any of it by hand. The examples below use a fictional company launcher that invokes the CLI as `acme schemabot`. Two styles work:
 
 **Exec the binary.** The wrapper resolves routing and credentials, then execs `schemabot`, injecting them as flags:
 
 ```bash
 # inside the wrapper, after resolving the endpoint and token:
-exec schemabot --cli-name "sq schemabot" --endpoint "$ENDPOINT" --token "$TOKEN" "$@"
+exec schemabot --cli-name "acme schemabot" --endpoint "$ENDPOINT" --token "$TOKEN" "$@"
 ```
 
-**Embed the Go packages.** For a wrapper with real logic of its own — per-environment routing tables, automatic port-forwards, extra commands — import the command structs and build your own [kong](https://github.com/alecthomas/kong) CLI around them. This is how `sq schemabot` is built:
+**Embed the Go packages.** For a wrapper with real logic of its own — per-environment routing tables, automatic port-forwards, extra commands — import the command structs and build your own [kong](https://github.com/alecthomas/kong) CLI around them:
 
 ```go
 import (
@@ -395,10 +395,10 @@ type CLI struct {
 }
 
 func main() {
-    cliname.Set("sq schemabot")
+    cliname.Set("acme schemabot")
 
     var cli CLI
-    ctx := kong.Parse(&cli, kong.Name("sq schemabot"))
+    ctx := kong.Parse(&cli, kong.Name("acme schemabot"))
 
     // Resolve routing however your environment requires — a direct endpoint
     // behind your ingress, or a port-forward started here — then inject it:
