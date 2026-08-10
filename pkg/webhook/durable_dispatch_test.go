@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,11 +46,28 @@ func (s *recordingWebhookEventStore) Create(_ context.Context, event *storage.We
 	defer s.mu.Unlock()
 
 	key := event.Provider + ":" + event.DeliveryID
-	if _, ok := s.events[key]; ok {
+	if existing, ok := s.events[key]; ok {
+		// Mirror the real store's duplicate-GUID branch: terminal rows are
+		// reopened as fresh pending deliveries; live rows dedup.
+		if existing.State == storage.WebhookEventFailed || existing.State == storage.WebhookEventCompleted {
+			existing.State = storage.WebhookEventPending
+			existing.Attempts = 0
+			existing.Payload = append([]byte(nil), event.Payload...)
+			existing.LeaseOwner = ""
+			existing.LeaseToken = ""
+			existing.LeaseExpiresAt = nil
+			existing.RetryAfter = nil
+			existing.StartedAt = nil
+			existing.CompletedAt = nil
+			return true, nil
+		}
 		return false, nil
 	}
 	copy := *event
 	copy.Payload = append([]byte(nil), event.Payload...)
+	if copy.State == "" {
+		copy.State = storage.WebhookEventPending
+	}
 	s.events[key] = &copy
 	return true, nil
 }
@@ -73,7 +91,10 @@ func (s *recordingWebhookEventStore) HasEventForHead(_ context.Context, provider
 
 	for _, event := range s.events {
 		if event.Provider == provider && event.Repository == repository &&
-			event.PullRequest == pullRequest && event.HeadSHA == headSHA {
+			event.PullRequest == pullRequest && event.HeadSHA == headSHA &&
+			event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) &&
+			(event.State != storage.WebhookEventFailed ||
+				!strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix)) {
 			return true, nil
 		}
 	}

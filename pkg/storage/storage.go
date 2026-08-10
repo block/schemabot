@@ -229,10 +229,19 @@ type WebhookEventStore interface {
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
 	GetByDeliveryID(ctx context.Context, provider, deliveryID string) (*WebhookEvent, error)
 
-	// HasEventForHead reports whether any delivery is recorded for the given
-	// provider + repository + pull request + head SHA, in any state. The
-	// reconciliation loop uses it to detect open PR heads whose webhook
-	// delivery never reached the inbox.
+	// HasEventForHead reports whether a plan-trigger delivery — an
+	// auto-plannable pull_request row (AutoPlanPullRequestActions) — is
+	// recorded for the given provider + repository + pull request + head
+	// SHA. The reconciliation loop uses it to detect open PR heads whose
+	// auto-plan delivery never reached the inbox. Rows of other event types
+	// or actions can carry the same PR + head SHA without planning it, so
+	// they do not cover the head. A terminally failed row covers its head
+	// when it is organic (the operator's GitHub Redeliver lever exists for
+	// it), but not when it is synthesized
+	// (SynthesizedWebhookDeliveryIDPrefix) — there is no Redeliver lever for
+	// a synthesized GUID, so the reconciler must be able to synthesize a
+	// fresh recovery delivery that reopens it through Create's
+	// duplicate-GUID branch.
 	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
 
 	// FindNext atomically claims one pending, retryable, or lease-expired event.

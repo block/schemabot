@@ -1671,15 +1671,38 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 }
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook
-// reconciler found with no corresponding inbox delivery. A nonzero rate means
-// deliveries are being lost upstream of the inbox (edge auth, GitHub send
-// failures) — the divergence signal that report-only reconciliation exists to
-// surface.
+// reconciler found without a live inbox delivery — no row at all, or only a
+// terminally failed one. A nonzero rate means deliveries are being lost
+// upstream of the inbox (edge auth, GitHub send failures); with synthesis
+// enabled each miss also triggers a recovery delivery, counted by
+// RecordWebhookReconcileSynthesizedEvent, so investigate the upstream loss.
 func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 	addCounter(ctx, "schemabot.webhook.reconcile_missing_events_total",
 		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo))
+}
+
+// RecordWebhookReconcileSynthesizedEvent counts inbox deliveries the webhook
+// reconciler synthesized for open PR heads whose organic delivery never
+// reached the inbox. Each synthesized delivery re-plans the PR through the
+// durable dispatch path. The outcome attribute separates recovery from
+// thrash: "first" is the healthy case — a genuinely lost delivery recovered
+// once, so investigate the upstream loss (edge auth, GitHub send failures)
+// rather than the recovery — while "resynthesis" means a previously
+// synthesized row terminally failed and was reopened, so a sustained
+// resynthesis rate is the same head failing repeatedly after recovery —
+// investigate that head's processing failure, not delivery loss.
+func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string, resynthesis bool) {
+	outcome := "first"
+	if resynthesis {
+		outcome = "resynthesis"
+	}
+	addCounter(ctx, "schemabot.webhook.reconcile_synthesized_events_total",
+		"Total number of webhook inbox deliveries synthesized for open PR heads missing one", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.String("outcome", outcome))
 }
 
 // RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
