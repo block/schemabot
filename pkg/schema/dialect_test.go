@@ -97,6 +97,18 @@ func TestDialectForDatabaseType(t *testing.T) {
 	}
 }
 
+func TestSupportsFeature(t *testing.T) {
+	for _, databaseType := range []string{"mysql", "vitess", "strata"} {
+		assert.True(t, SupportsFeature(databaseType, FeaturePendingDrops))
+		assert.True(t, SupportsFeature(databaseType, FeatureDeferredCutover))
+	}
+
+	assert.False(t, SupportsFeature("postgres", FeaturePendingDrops))
+	assert.False(t, SupportsFeature("postgres", FeatureDeferredCutover))
+	assert.False(t, SupportsFeature("unknown", FeaturePendingDrops))
+	assert.False(t, SupportsFeature("mysql", Feature("unknown")))
+}
+
 // An unregistered dialect — a raw database_type cast (e.g. "vitess", "strata")
 // or a mislabeled target (e.g. "postgresql") — is classified conservatively:
 // classification reserves the union of every known dialect's system schemas

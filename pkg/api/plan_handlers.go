@@ -851,6 +851,16 @@ func (s *Service) authorizeStoredPlanSource(ctx context.Context, span trace.Span
 // gated entry points also run authorizeStoredPlanSource before queueing.
 func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan *storage.Plan, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
 	deployment := plan.Deployment
+	deferredCutover := storage.ApplyOptionsFromMap(req.Options).DeferCutover
+	if err := validateDatabaseFeatures(plan.Database, plan.DatabaseType, false, deferredCutover); err != nil {
+		s.logger.Warn("apply rejected because the database type does not support a requested feature",
+			"plan_id", req.PlanID,
+			"database", plan.Database,
+			"database_type", plan.DatabaseType,
+			"environment", req.Environment,
+			"error", err)
+		return nil, 0, err
+	}
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {

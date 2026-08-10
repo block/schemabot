@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	gomysql "github.com/go-sql-driver/mysql"
@@ -1274,6 +1275,9 @@ func (c *ServerConfig) Validate() error {
 		default:
 			return fmt.Errorf("database %q has invalid type %q (must be %s, %s, %s, or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
 		}
+		if err := validateDatabaseFeatures(name, dbConfig.Type, c.PendingDropsEnabled(), false); err != nil {
+			return err
+		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
 		}
@@ -1405,6 +1409,16 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("auth config: %w", err)
 	}
 
+	return nil
+}
+
+func validateDatabaseFeatures(database, databaseType string, pendingDrops, deferredCutover bool) error {
+	if pendingDrops && !schema.SupportsFeature(databaseType, schema.FeaturePendingDrops) {
+		return fmt.Errorf("database %q: pending drops is not supported for database_type: %s", database, databaseType)
+	}
+	if deferredCutover && !schema.SupportsFeature(databaseType, schema.FeatureDeferredCutover) {
+		return fmt.Errorf("database %q: deferred cutover is not supported for database_type: %s", database, databaseType)
+	}
 	return nil
 }
 
