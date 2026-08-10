@@ -73,13 +73,14 @@ func addUpDownCounter(ctx context.Context, name string, delta int64, description
 	counter.Add(ctx, delta, otelmetric.WithAttributes(attrs...))
 }
 
-// recordHistogram records value into a named Float64Histogram with the given
-// attributes, logging and skipping if the instrument cannot be created.
-func recordHistogram(ctx context.Context, name string, value float64, description, unit string, attrs ...attribute.KeyValue) {
+// recordHistogram records a duration value in seconds into a named
+// Float64Histogram with the given attributes, logging and skipping if the
+// instrument cannot be created.
+func recordHistogram(ctx context.Context, name string, value float64, description string, attrs ...attribute.KeyValue) {
 	meter := otel.Meter(meterName)
 	hist, err := meter.Float64Histogram(name,
 		otelmetric.WithDescription(description),
-		otelmetric.WithUnit(unit),
+		otelmetric.WithUnit("s"),
 	)
 	if err != nil {
 		slog.Warn("failed to create histogram", "metric", name, "error", err)
@@ -157,7 +158,7 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	recordHistogram(ctx, "schemabot.plan.duration_seconds", duration.Seconds(),
-		"Duration of plan operations", "s",
+		"Duration of plan operations",
 		attribute.String("repository", repo),
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
@@ -215,7 +216,7 @@ func RecordAutoCutoverFailure(ctx context.Context, database, deployment, environ
 // not the full Spirit run which can take hours).
 func RecordApplyDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	recordHistogram(ctx, "schemabot.apply.duration_seconds", duration.Seconds(),
-		"Duration of apply operations (API call time)", "s",
+		"Duration of apply operations (API call time)",
 		attribute.String("repository", repo),
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
@@ -1096,7 +1097,7 @@ func RecordRecoveredPanic(ctx context.Context, operation string) {
 func RecordOperatorClaimDuration(ctx context.Context, duration time.Duration, database, deployment, environment, previousState string) {
 	for _, name := range operatorMetricNames("claim_duration_seconds") {
 		recordHistogram(ctx, name, duration.Seconds(),
-			"Duration of operator claim + resume operations", "s",
+			"Duration of operator claim + resume operations",
 			attribute.String("database", database),
 			DeploymentAttribute(deployment),
 			EnvironmentAttribute(environment),
@@ -1426,11 +1427,11 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 // "default".
 func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, status string) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("event_type", eventType, appName, repo, status)
+		logUnknownWebhookMetricLabel("schemabot.webhook.events_total", "event_type", eventType, appName, repo, status)
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
-		logUnknownWebhookMetricLabel("action", action, appName, repo, status)
+		logUnknownWebhookMetricLabel("schemabot.webhook.events_total", "action", action, appName, repo, status)
 		action = "unknown"
 	}
 	if appName == "" {
@@ -1453,17 +1454,27 @@ func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, s
 		attrs...)
 }
 
-func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
-	key := label + "\x00" + value + "\x00" + appName + "\x00" + repo + "\x00" + status
+// logUnknownWebhookMetricLabel warns once per distinct label tuple when a
+// webhook metric label is folded to "unknown". metric names the instrument the
+// fold happened on; status is the webhook event status being recorded and must
+// be empty for instruments that do not carry one, so the event_status log field
+// only ever holds real statuses.
+func logUnknownWebhookMetricLabel(metric, label, value, appName, repo, status string) {
+	key := metric + "\x00" + label + "\x00" + value + "\x00" + appName + "\x00" + repo + "\x00" + status
 	if _, loaded := seenUnknownWebhookMetricLabels.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
-	slog.Warn("webhook metric label normalized to unknown",
+	attrs := []any{
+		"metric", metric,
 		"label", label,
 		"value", value,
 		"app_name", appName,
 		"repo", repo,
-		"event_status", status)
+	}
+	if status != "" {
+		attrs = append(attrs, "event_status", status)
+	}
+	slog.Warn("webhook metric label normalized to unknown", attrs...)
 }
 
 // RecordUnregisteredRepositoryWebhook increments the counter for webhook events
@@ -1472,11 +1483,11 @@ func logUnknownWebhookMetricLabel(label, value, appName, repo, status string) {
 // deployment will not process.
 func RecordUnregisteredRepositoryWebhook(ctx context.Context, appName, eventType, action, repo string) {
 	if !knownWebhookEvents[eventType] {
-		logUnknownWebhookMetricLabel("event_type", eventType, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "event_type", eventType, appName, repo, "ignored")
 		eventType = "unknown"
 	}
 	if !knownWebhookActions[action] {
-		logUnknownWebhookMetricLabel("action", action, appName, repo, "ignored")
+		logUnknownWebhookMetricLabel("schemabot.webhook.unregistered_repository_ignored_total", "action", action, appName, repo, "ignored")
 		action = "unknown"
 	}
 	if appName == "" {
@@ -1556,6 +1567,92 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 	addCounter(ctx, "schemabot.webhook.inbox_stats_collection_failures",
 		"Total number of failed durable webhook inbox metric snapshots", "{failure}",
 		EnvironmentAttribute(""),
+	)
+}
+
+// RecordWebhookInboxDispatchLag records how long an accepted delivery waited
+// in the durable inbox before a driver first claimed it. This is the
+// per-delivery counterpart of the oldest-claimable-age gauge: the gauge shows
+// the backlog's worst case right now, while this histogram shows the lag every
+// delivery actually experienced. A distribution drifting past the dispatch
+// poll cadence means accepted deliveries are waiting on driver capacity —
+// investigate driver-pool sizing and claim-query health. One caveat: a
+// shutdown-released claim refunds its attempt, so the delivery's reclaim
+// counts as the first attempt again and records another sample measured from
+// the original receipt — deploy churn therefore adds extra, longer samples
+// without any driver-capacity problem. Unknown event types fold to "unknown"
+// and negative lags (cross-pod clock skew between the enqueueing and claiming
+// replica) clamp to zero so the histogram stays trustworthy. appName is the
+// resolved GitHub App name used only for fold-log attribution; it is not a
+// metric attribute.
+func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo string, lag time.Duration) {
+	if !knownWebhookEvents[eventType] {
+		logUnknownWebhookMetricLabel("schemabot.webhook.inbox_dispatch_lag_seconds", "event_type", eventType, appName, repo, "")
+		eventType = "unknown"
+	}
+	if lag < 0 {
+		lag = 0
+	}
+	recordHistogram(ctx, "schemabot.webhook.inbox_dispatch_lag_seconds", lag.Seconds(),
+		"Time from webhook receipt to the delivery's first dispatch claim",
+		EnvironmentAttribute(""),
+		attribute.String("event_type", eventType),
+		attribute.String("repository", repo),
+	)
+}
+
+// knownWebhookDispatchOutcomes allowlists how one durable webhook dispatch
+// claim can end so the duration histogram's cardinality stays bounded. An
+// unrecognized value folds to "unknown". Outcomes:
+//   - "completed": processing succeeded and the row was marked completed.
+//   - "failed": processing failed terminally (deterministic rejection or
+//     retry budget exhausted).
+//   - "retrying": processing failed retryably; the row waits for its retry
+//     window.
+//   - "released": the pool shut down mid-flight and refunded the claim.
+//   - "lease_lost": the driver lost delivery ownership (heartbeat failure or
+//     a lease-token mismatch recording the finish); another driver owns the
+//     row or will reclaim it.
+//   - "finish_error": processing finished but storage failed to record the
+//     outcome; the row stays processing until lease expiry hands it to
+//     another driver — investigate storage health.
+var knownWebhookDispatchOutcomes = map[string]bool{
+	"completed":    true,
+	"failed":       true,
+	"retrying":     true,
+	"released":     true,
+	"lease_lost":   true,
+	"finish_error": true,
+}
+
+// RecordWebhookDispatchDuration records how long one dispatch claim held a
+// delivery, from claim to the recorded outcome. Every claim that starts also
+// records exactly one outcome, so this histogram's count is the finish-side
+// ledger for the durable_dispatch_started status on the webhook events
+// counter: a sustained gap between started and the sum of outcomes means
+// drivers are dying mid-claim without recording anything — investigate
+// crashes. The two instruments only share the event_type dimension, so
+// aggregate both sides down to it before subtracting; the exact query lives in
+// this package's README. A rising duration for an event type means its
+// processing path is slowing down and the driver pool drains fewer deliveries
+// per lease. The histogram deliberately carries no repository label — a
+// histogram costs an order of magnitude more series per attribute combination
+// than a counter, and per-repo attribution belongs to the driver logs; appName
+// and repo are used only for fold-log attribution.
+func RecordWebhookDispatchDuration(ctx context.Context, appName, eventType, repo, outcome string, duration time.Duration) {
+	if !knownWebhookEvents[eventType] {
+		logUnknownWebhookMetricLabel("schemabot.webhook.dispatch_duration_seconds", "event_type", eventType, appName, repo, "")
+		eventType = "unknown"
+	}
+	if !knownWebhookDispatchOutcomes[outcome] {
+		logUnknownWebhookMetricLabel("schemabot.webhook.dispatch_duration_seconds", "outcome", outcome, appName, repo, "")
+		outcome = "unknown"
+	}
+	recordHistogram(ctx, "schemabot.webhook.dispatch_duration_seconds", duration.Seconds(),
+		"Duration of one durable webhook dispatch claim by outcome",
+		EnvironmentAttribute(""),
+		attribute.String("event_type", eventType),
+		attribute.String("outcome", outcome),
 	)
 }
 
