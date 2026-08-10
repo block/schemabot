@@ -535,7 +535,7 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 }
 
 // deployRequestCreatedEvent states, on the operator's timeline, the cutover
-// ownership the deploy request was created with.
+// ownership SchemaBot asked this deploy request to be created with.
 //
 // The apply's log surface carries lifecycle events, not the engine's own log
 // lines, so a decision left in an engine logger is invisible to the operator
@@ -543,14 +543,19 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 // changed afterwards, and it is the fact an operator needs first when a schema
 // change swaps without them: either SchemaBot held the cutover, and the swap
 // was its call to make, or the deploy request was not created holding it.
+//
+// It reports the request rather than the outcome, because that is all it has:
+// the created deploy request echoes back no cutover setting, so what the
+// backend recorded is not knowable here. verifyCutoverHeld reads it back and is
+// what turns this into a confirmed fact before a deferred cutover is deployed.
 func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.ApplyEvent {
 	return engine.ApplyEvent{
-		Message: fmt.Sprintf("Deploy request #%d created with the cutover held by SchemaBot, validating...", dr.Number),
+		Message: fmt.Sprintf("Deploy request #%d created, requesting SchemaBot hold the cutover, validating...", dr.Number),
 		Metadata: map[string]string{
-			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-			"deploy_request_url": dr.HtmlURL,
-			"branch":             branchName,
-			"auto_cutover":       "false",
+			"deploy_request_id":      fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url":     dr.HtmlURL,
+			"branch":                 branchName,
+			"requested_auto_cutover": "false",
 		},
 		NewState: state.Apply.ValidatingDeployRequest,
 	}

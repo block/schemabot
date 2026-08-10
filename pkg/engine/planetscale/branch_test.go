@@ -204,12 +204,18 @@ func TestCreateDeployRequest_DisablesPlanetScaleAutoCutover(t *testing.T) {
 // be changed afterwards. The operator's timeline states it, because the apply's
 // log surface carries lifecycle events and not the engine's own log lines — so
 // a decision left in the engine logger cannot be read from the schema change.
-func TestDeployRequestCreatedEventStatesCutoverOwnership(t *testing.T) {
+//
+// The created deploy request echoes back no cutover setting, so the event states
+// what SchemaBot requested and says so: an operator who reads it as a confirmed
+// fact would take a deploy request that quietly kept auto-cutover for one that
+// holds it.
+func TestDeployRequestCreatedEventStatesRequestedCutoverOwnership(t *testing.T) {
 	event := deployRequestCreatedEvent(&ps.DeployRequest{Number: 132, HtmlURL: "https://example.test/deploy-requests/132"}, "schema-change-branch")
 
 	assert.Contains(t, event.Message, "#132")
-	assert.Contains(t, event.Message, "cutover held by SchemaBot")
-	assert.Equal(t, "false", event.Metadata["auto_cutover"])
+	assert.Contains(t, event.Message, "requesting SchemaBot hold the cutover")
+	assert.Equal(t, "false", event.Metadata["requested_auto_cutover"])
+	assert.NotContains(t, event.Metadata, "auto_cutover")
 	assert.Equal(t, "132", event.Metadata["deploy_request_id"])
 	assert.Equal(t, "https://example.test/deploy-requests/132", event.Metadata["deploy_request_url"])
 	assert.Equal(t, "schema-change-branch", event.Metadata["branch"])
