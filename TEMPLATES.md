@@ -1534,7 +1534,7 @@ Another schema change is in progress for this database.
 
 Options:
   • Wait for the current schema change to complete
-  • Ask the lock owner to release: schemabot unlock
+  • Ask the lock owner to release: schemabot unlock -d testapp
   • Force unlock: schemabot unlock -d testapp --force
 
 
@@ -1559,7 +1559,7 @@ Another schema change is in progress for this database.
 
 Options:
   • Wait for the current schema change to complete
-  • Ask the lock owner to release: schemabot unlock
+  • Ask the lock owner to release: schemabot unlock -d testapp
   • Force unlock: schemabot unlock -d testapp --force
 
 

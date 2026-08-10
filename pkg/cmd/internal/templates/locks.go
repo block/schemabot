@@ -67,7 +67,7 @@ func WriteLockConflict(data LockConflictData) {
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  • Wait for the current schema change to complete")
-	fmt.Printf("  • Ask the lock owner to release: %s unlock\n", cliname.Name())
+	fmt.Printf("  • Ask the lock owner to release: %s unlock -d %s\n", cliname.Name(), data.Database)
 	fmt.Printf("  • Force unlock: %s unlock -d %s --force\n", cliname.Name(), data.Database)
 	fmt.Println()
 }
