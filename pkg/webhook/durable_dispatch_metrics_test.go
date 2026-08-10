@@ -26,7 +26,9 @@ func newDispatchMetricsReader(t *testing.T) *sdkmetric.ManualReader {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		// t.Context() is already cancelled when cleanup runs; detach so the
+		// provider shutdown is not spuriously aborted.
+		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
 	})
 	return reader
 }
@@ -68,7 +70,7 @@ func TestDurableWebhookDispatchMetricsFirstClaimCompleted(t *testing.T) {
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
-	require.Len(t, store.completed, 1, "unsupported event must be marked completed")
+	require.Len(t, store.completed, 1, "the no-op issue_comment delivery must be marked completed")
 
 	lagPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.inbox_dispatch_lag_seconds")
 	require.Len(t, lagPoints, 1, "first claim must record inbox dispatch lag")
@@ -164,6 +166,70 @@ func TestDurableWebhookDispatchMetricsReleasedOutcome(t *testing.T) {
 	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
 	require.Len(t, durationPoints, 1)
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "released")
+}
+
+// Storage failing to record a completion leaves the row processing until
+// lease expiry and records the finish_error outcome — the storage-health
+// signal.
+func TestDurableWebhookDispatchMetricsFinishErrorOutcome(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.markCompletedErr = errors.New("storage unavailable")
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.completed)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "finish_error")
+}
+
+// Storage failing to record a delivery failure also records finish_error, so
+// the ledger stays intact on the failure-finish path.
+func TestDurableWebhookDispatchMetricsFailureFinishErrorOutcome(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.markFailedErr = errors.New("storage unavailable")
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("transient auto-plan failure")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.failed)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "finish_error")
+}
+
+// A shutdown release that fails because the lease was already lost records
+// lease_lost, not finish_error: storage is healthy and another driver owns
+// the row.
+func TestDurableWebhookDispatchMetricsShutdownReleaseLeaseLost(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.releaseErr = storage.ErrWebhookEventLeaseLost
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	driverCtx, cancelDriver := context.WithCancel(t.Context())
+	defer cancelDriver()
+	h.durableWebhookProcessOverride = func(ctx context.Context, _ *storage.WebhookEvent) (bool, error) {
+		cancelDriver()
+		<-ctx.Done()
+		return true, ctx.Err()
+	}
+
+	h.driveNextDurableWebhook(driverCtx, 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.released)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "lease_lost")
 }
 
 // Losing the lease heartbeat after successful processing leaves the row for

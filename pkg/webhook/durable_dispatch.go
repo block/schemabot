@@ -208,7 +208,10 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	if event.Attempts == 1 {
 		// Only the first claim measures inbox wait: started_at pins to the
 		// first claim, and a retry claim's wait is the retry window, not
-		// backlog latency.
+		// backlog latency. A shutdown-released claim refunds its attempt —
+		// the refund means no genuine attempt happened — so the reclaim is
+		// the effective first attempt and records lag again, measured from
+		// the original receipt.
 		metrics.RecordWebhookInboxDispatchLag(ctx, event.Event, event.Repository, time.Since(event.ReceivedAt))
 	}
 
@@ -240,6 +243,13 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// it, or deploy-churn restarts that each claim-and-cancel the same
 			// delivery would terminally fail it without a single real attempt.
 			if err := store.Release(finishCtx, event.ID, event.LeaseToken); err != nil {
+				if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+					recordOutcome("lease_lost")
+					h.logger.Warn("durable webhook driver lost the delivery lease before releasing the claim on shutdown; another driver owns the delivery or the row is gone",
+						"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+						"repo", event.Repository, "pr", event.PullRequest)
+					return
+				}
 				recordOutcome("finish_error")
 				h.logger.Warn("durable webhook driver could not release delivery claim on shutdown; lease expiry will hand it to another driver",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,

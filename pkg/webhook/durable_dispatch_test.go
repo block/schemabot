@@ -195,6 +195,12 @@ type scriptedWebhookEventStore struct {
 	nextID       int64
 	heartbeatErr error
 
+	// Optional injected finish errors, returned before the corresponding
+	// outcome channel send so tests can exercise the storage-failure paths.
+	markCompletedErr error
+	markFailedErr    error
+	releaseErr       error
+
 	completed chan scriptedWebhookOutcome
 	failed    chan scriptedWebhookFailure
 	released  chan scriptedWebhookOutcome
@@ -247,16 +253,25 @@ func (s *scriptedWebhookEventStore) Heartbeat(context.Context, int64, string, ti
 }
 
 func (s *scriptedWebhookEventStore) MarkCompleted(_ context.Context, id int64, leaseToken string) error {
+	if s.markCompletedErr != nil {
+		return s.markCompletedErr
+	}
 	s.completed <- scriptedWebhookOutcome{id: id, leaseToken: leaseToken}
 	return nil
 }
 
 func (s *scriptedWebhookEventStore) MarkFailed(_ context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error {
+	if s.markFailedErr != nil {
+		return s.markFailedErr
+	}
 	s.failed <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: retryAfter}
 	return nil
 }
 
 func (s *scriptedWebhookEventStore) Release(_ context.Context, id int64, leaseToken string) error {
+	if s.releaseErr != nil {
+		return s.releaseErr
+	}
 	s.released <- scriptedWebhookOutcome{id: id, leaseToken: leaseToken}
 	return nil
 }
@@ -292,6 +307,7 @@ func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
 		HeadSHA:     "head-sha",
 		TenantID:    "12345",
 		Payload:     payload,
+		ReceivedAt:  time.Now(),
 	}
 }
 

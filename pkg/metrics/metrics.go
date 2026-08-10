@@ -1566,12 +1566,16 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 // the backlog's worst case right now, while this histogram shows the lag every
 // delivery actually experienced. A distribution drifting past the dispatch
 // poll cadence means accepted deliveries are waiting on driver capacity —
-// investigate driver-pool sizing and claim-query health. Unknown event types
-// fold to "unknown" and negative lags (cross-pod clock skew between the
-// enqueueing and claiming replica) clamp to zero so the histogram stays
-// trustworthy.
+// investigate driver-pool sizing and claim-query health. One caveat: a
+// shutdown-released claim refunds its attempt, so the delivery's reclaim
+// counts as the first attempt again and records another sample measured from
+// the original receipt — deploy churn therefore adds extra, longer samples
+// without any driver-capacity problem. Unknown event types fold to "unknown"
+// and negative lags (cross-pod clock skew between the enqueueing and claiming
+// replica) clamp to zero so the histogram stays trustworthy.
 func RecordWebhookInboxDispatchLag(ctx context.Context, eventType, repo string, lag time.Duration) {
 	if !knownWebhookEvents[eventType] {
+		logUnknownWebhookMetricLabel("event_type", eventType, "", repo, "dispatch_lag")
 		eventType = "unknown"
 	}
 	if lag < 0 {
@@ -1619,9 +1623,11 @@ var knownWebhookDispatchOutcomes = map[string]bool{
 // slowing down and the driver pool drains fewer deliveries per lease.
 func RecordWebhookDispatchDuration(ctx context.Context, eventType, repo, outcome string, duration time.Duration) {
 	if !knownWebhookEvents[eventType] {
+		logUnknownWebhookMetricLabel("event_type", eventType, "", repo, "dispatch_duration")
 		eventType = "unknown"
 	}
 	if !knownWebhookDispatchOutcomes[outcome] {
+		logUnknownWebhookMetricLabel("outcome", outcome, "", repo, "dispatch_duration")
 		outcome = "unknown"
 	}
 	recordHistogram(ctx, "schemabot.webhook.dispatch_duration_seconds", duration.Seconds(),
