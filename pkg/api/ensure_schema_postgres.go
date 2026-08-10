@@ -19,11 +19,11 @@ import (
 
 // ensurePostgresSchema converges SchemaBot's storage schema on PostgreSQL by
 // creating every storage table whose embedded schema file has no matching
-// table in the current schema. Convergence is existence-only: a table that
-// already exists is left untouched, so column or index drift on an existing
-// table is not detected or repaired. That bound is deliberate — PostgreSQL has
+// table in the current schema. Existing tables are checked for every expected
+// column, but are never altered; extra columns and index differences are
+// tolerated. That bound is deliberate — PostgreSQL has
 // no in-process diff/apply mechanism here (Spirit is MySQL-only), and
-// existence-only convergence is sufficient to bootstrap a fresh storage
+// create-only convergence is sufficient to bootstrap a fresh storage
 // database. Evolving an already-bootstrapped PostgreSQL storage schema
 // requires a schema diff mechanism, which lands separately.
 //
@@ -82,6 +82,9 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return fmt.Errorf("check storage tables: %w", err)
 	}
 	if len(missing) == 0 {
+		if err := verifyAndLogPostgresTableColumns(ctx, db, tables, files, logger, database, schemaName); err != nil {
+			return fmt.Errorf("validate existing storage tables: %w", err)
+		}
 		logger.Info("storage schema up-to-date", "database", database)
 		return nil
 	}
@@ -103,6 +106,9 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return fmt.Errorf("check storage tables: %w", err)
 	}
 	if len(missing) == 0 {
+		if err := verifyAndLogPostgresTableColumns(ctx, db, tables, files, logger, database, schemaName); err != nil {
+			return fmt.Errorf("validate storage tables after lock: %w", err)
+		}
 		logger.Info("storage schema up-to-date", "database", database)
 		return nil
 	}
@@ -118,6 +124,222 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		"tables_created", len(missing),
 		"duration", time.Since(createStart),
 	)
+	if err := verifyAndLogPostgresTableColumns(ctx, db, tables, files, logger, database, schemaName); err != nil {
+		return fmt.Errorf("validate converged storage tables: %w", err)
+	}
+	return nil
+}
+
+func verifyAndLogPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
+	if err := verifyPostgresTableColumns(ctx, db, tables, files); err != nil {
+		logger.Error("PostgreSQL storage schema column check failed",
+			"dialect", schema.DialectPostgres,
+			"database", database,
+			"schema", schemaName,
+			"operation", "verify_storage_columns",
+			"error", err,
+		)
+		return fmt.Errorf("verify PostgreSQL storage schema columns: %w", err)
+	}
+	return nil
+}
+
+var postgresTableConstraintKeywords = map[string]bool{
+	"PRIMARY":    true,
+	"UNIQUE":     true,
+	"CONSTRAINT": true,
+	"CHECK":      true,
+	"FOREIGN":    true,
+	"EXCLUDE":    true,
+	"INDEX":      true,
+}
+
+// postgresCreateTableColumns extracts column names from the single plain
+// CREATE TABLE statement at the start of an embedded PostgreSQL schema file.
+// Nested type and constraint expressions are kept together while the table
+// body is split at top-level commas.
+func postgresCreateTableColumns(content string) ([]string, error) {
+	open := strings.IndexByte(content, '(')
+	if open < 0 {
+		return nil, fmt.Errorf("CREATE TABLE has no column list")
+	}
+	close, err := matchingPostgresParen(content, open)
+	if err != nil {
+		return nil, err
+	}
+
+	entries, err := splitPostgresTableEntries(content[open+1 : close])
+	if err != nil {
+		return nil, err
+	}
+	columns := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		first, remainder, err := postgresEntryFirstToken(entry)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(remainder) == "" {
+			return nil, fmt.Errorf("unrecognized CREATE TABLE entry %q", entry)
+		}
+		if postgresTableConstraintKeywords[strings.ToUpper(first)] {
+			continue
+		}
+		if strings.HasPrefix(first, `"`) {
+			columns = append(columns, strings.ReplaceAll(first[1:len(first)-1], `""`, `"`))
+			continue
+		}
+		if first != strings.ToLower(first) {
+			return nil, fmt.Errorf("unrecognized CREATE TABLE entry %q", entry)
+		}
+		for _, r := range first {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+				return nil, fmt.Errorf("invalid column name %q", first)
+			}
+		}
+		columns = append(columns, first)
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("CREATE TABLE has no columns")
+	}
+	return columns, nil
+}
+
+func postgresEntryFirstToken(entry string) (string, string, error) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return "", "", fmt.Errorf("empty CREATE TABLE entry")
+	}
+	if entry[0] != '"' {
+		if end := strings.IndexAny(entry, " \t\r\n"); end >= 0 {
+			return entry[:end], entry[end:], nil
+		}
+		return entry, "", nil
+	}
+	for i := 1; i < len(entry); i++ {
+		if entry[i] != '"' {
+			continue
+		}
+		if i+1 < len(entry) && entry[i+1] == '"' {
+			i++
+			continue
+		}
+		return entry[:i+1], entry[i+1:], nil
+	}
+	return "", "", fmt.Errorf("invalid quoted column name in entry %q", entry)
+}
+
+func matchingPostgresParen(content string, open int) (int, error) {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := open; i < len(content); i++ {
+		switch content[i] {
+		case '\'':
+			if !inDouble && inSingle && i+1 < len(content) && content[i+1] == '\'' {
+				i++
+			} else if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && inDouble && i+1 < len(content) && content[i+1] == '"' {
+				i++
+			} else if !inSingle {
+				inDouble = !inDouble
+			}
+		case '(':
+			if !inSingle && !inDouble {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble {
+				depth--
+				if depth == 0 {
+					return i, nil
+				}
+			}
+		}
+	}
+	return 0, fmt.Errorf("CREATE TABLE has an unterminated column list")
+}
+
+func splitPostgresTableEntries(body string) ([]string, error) {
+	var entries []string
+	start, depth := 0, 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '\'':
+			if !inDouble && inSingle && i+1 < len(body) && body[i+1] == '\'' {
+				i++
+			} else if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle && inDouble && i+1 < len(body) && body[i+1] == '"' {
+				i++
+			} else if !inSingle {
+				inDouble = !inDouble
+			}
+		case '(':
+			if !inSingle && !inDouble {
+				depth++
+			}
+		case ')':
+			if !inSingle && !inDouble {
+				depth--
+				if depth < 0 {
+					return nil, fmt.Errorf("unexpected closing parenthesis in CREATE TABLE body")
+				}
+			}
+		case ',':
+			if !inSingle && !inDouble && depth == 0 {
+				entries = append(entries, strings.TrimSpace(body[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if inSingle || inDouble || depth != 0 {
+		return nil, fmt.Errorf("unterminated expression in CREATE TABLE body")
+	}
+	entries = append(entries, strings.TrimSpace(body[start:]))
+	return entries, nil
+}
+
+func verifyPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
+	for _, table := range tables {
+		expected, err := postgresCreateTableColumns(files[table])
+		if err != nil {
+			return fmt.Errorf("extract expected columns for table %q: %w", table, err)
+		}
+		rows, err := db.QueryContext(ctx,
+			"SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1", table)
+		if err != nil {
+			return fmt.Errorf("list columns for table %q: %w", table, err)
+		}
+		existing := make(map[string]bool)
+		for rows.Next() {
+			var column string
+			if err := rows.Scan(&column); err != nil {
+				utils.CloseAndLog(rows)
+				return fmt.Errorf("scan column for table %q: %w", table, err)
+			}
+			existing[column] = true
+		}
+		if err := rows.Err(); err != nil {
+			utils.CloseAndLog(rows)
+			return fmt.Errorf("iterate columns for table %q: %w", table, err)
+		}
+		utils.CloseAndLog(rows)
+
+		var missing []string
+		for _, column := range expected {
+			if !existing[column] {
+				missing = append(missing, column)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("storage table %q is missing expected columns: %s", table, strings.Join(missing, ", "))
+		}
+	}
 	return nil
 }
 
