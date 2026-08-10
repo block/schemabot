@@ -6,22 +6,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// IsReservedPullNamespace is the MySQL-dialect classification, so MySQL and
-// Vitess pull discovery share a single definition of reserved namespaces.
-func TestIsReservedPullNamespaceUsesMySQLDialect(t *testing.T) {
-	for _, ns := range []string{
-		"mysql", "information_schema", "innodb", "performance_schema", "sys",
-		"rdsmon", "dbadmin", "polt", "tmp", "topo", "_pending_drops",
-		"schemabot", "_scratch", "orders_production",
-	} {
-		assert.Equal(t,
-			IsReservedPullNamespaceForDialect(DialectMySQL, ns),
-			IsReservedPullNamespace(ns),
-			"IsReservedPullNamespace should match the MySQL dialect for %q", ns,
-		)
-	}
-}
-
 func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -38,6 +22,14 @@ func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 		// MySQL system schemas are reserved on MySQL but not on Postgres.
 		{name: "mysql db on mysql", dialect: DialectMySQL, namespace: "mysql", want: true},
 		{name: "innodb on mysql", dialect: DialectMySQL, namespace: "innodb", want: true},
+		{name: "performance_schema on mysql", dialect: DialectMySQL, namespace: "performance_schema", want: true},
+		{name: "sys on mysql", dialect: DialectMySQL, namespace: "sys", want: true},
+		{name: "rdsmon on mysql", dialect: DialectMySQL, namespace: "rdsmon", want: true},
+		{name: "dbadmin on mysql", dialect: DialectMySQL, namespace: "dbadmin", want: true},
+		{name: "polt on mysql", dialect: DialectMySQL, namespace: "polt", want: true},
+		{name: "tmp on mysql", dialect: DialectMySQL, namespace: "tmp", want: true},
+		{name: "topo on mysql", dialect: DialectMySQL, namespace: "topo", want: true},
+		{name: "uppercase innodb on mysql", dialect: DialectMySQL, namespace: "INNODB", want: true},
 		{name: "mysql db on postgres", dialect: DialectPostgres, namespace: "mysql", want: false},
 		{name: "innodb on postgres", dialect: DialectPostgres, namespace: "innodb", want: false},
 
@@ -49,6 +41,18 @@ func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 		{name: "uppercase pg_catalog on postgres", dialect: DialectPostgres, namespace: "PG_CATALOG", want: true},
 		{name: "pg_catalog on mysql", dialect: DialectMySQL, namespace: "pg_catalog", want: false},
 		{name: "pg_temp prefix on mysql", dialect: DialectMySQL, namespace: "pg_temp_3", want: false},
+
+		// RDS/Aurora administrative and managed-extension schemas are reserved on
+		// Postgres but not on MySQL.
+		{name: "rds_tools on postgres", dialect: DialectPostgres, namespace: "rds_tools", want: true},
+		{name: "aws_commons on postgres", dialect: DialectPostgres, namespace: "aws_commons", want: true},
+		{name: "aws_s3 on postgres", dialect: DialectPostgres, namespace: "aws_s3", want: true},
+		{name: "aws_lambda on postgres", dialect: DialectPostgres, namespace: "aws_lambda", want: true},
+		{name: "aws_ml on postgres", dialect: DialectPostgres, namespace: "aws_ml", want: true},
+		{name: "apg_plan_mgmt on postgres", dialect: DialectPostgres, namespace: "apg_plan_mgmt", want: true},
+		{name: "uppercase aws_s3 on postgres", dialect: DialectPostgres, namespace: "AWS_S3", want: true},
+		{name: "aws_commons on mysql", dialect: DialectMySQL, namespace: "aws_commons", want: false},
+		{name: "apg_plan_mgmt on mysql", dialect: DialectMySQL, namespace: "apg_plan_mgmt", want: false},
 
 		// A differently-cased dialect value must not fail open: it still
 		// classifies system schemas for that dialect.

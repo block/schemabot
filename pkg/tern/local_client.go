@@ -679,13 +679,14 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 	}
 	defer utils.CloseAndLog(rows)
 
+	dialect := schema.DialectForDatabaseType(c.config.Type)
 	var namespaces []string
 	for rows.Next() {
 		var namespace string
 		if err := rows.Scan(&namespace); err != nil {
 			return nil, fmt.Errorf("scan namespace for schema pull: %w", err)
 		}
-		if schema.IsReservedPullNamespace(namespace) {
+		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
 			c.logger.Debug("LocalClient.PullSchema: skipping reserved namespace", "database", c.config.Database, "namespace", namespace)
 			continue
 		}
@@ -795,7 +796,7 @@ func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string
 		if keyspace.Name == "" {
 			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", c.config.Database, branch)
 		}
-		if schema.IsReservedPullNamespace(keyspace.Name) {
+		if schema.IsReservedPullNamespaceForDialect(schema.DialectForDatabaseType(c.config.Type), keyspace.Name) {
 			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", branch, "namespace", keyspace.Name)
 			continue
 		}

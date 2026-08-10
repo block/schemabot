@@ -74,17 +74,23 @@ var systemSchemasByDialect = map[Dialect]map[string]struct{}{
 		"tmp":                {},
 		"topo":               {},
 	},
-	// The Postgres set is provisional: it covers the always-present system
-	// schemas and RDS/Aurora's rdsadmin, but the managed-extension schemas
-	// (aws_commons, aws_s3, aws_lambda, aws_ml, ...) are deliberately not
-	// enumerated yet. It must be finalized when Postgres pull discovery is
-	// implemented so extension-owned schemas are not surfaced as pullable user
-	// namespaces.
+	// The Postgres set covers the always-present system schemas, RDS/Aurora's
+	// administrative schemas (rdsadmin, rds_tools), and the schemas owned by
+	// RDS/Aurora managed extensions: aws_commons (shared helper types),
+	// aws_s3/aws_lambda/aws_ml (AWS service integrations), and apg_plan_mgmt
+	// (Aurora query plan management). Extension-owned schemas are
+	// database-managed, so they must never surface as pullable user namespaces.
 	DialectPostgres: {
 		"information_schema": {},
 		"pg_catalog":         {},
 		"pg_toast":           {},
 		"rdsadmin":           {},
+		"rds_tools":          {},
+		"aws_commons":        {},
+		"aws_s3":             {},
+		"aws_lambda":         {},
+		"aws_ml":             {},
+		"apg_plan_mgmt":      {},
 	},
 }
 
