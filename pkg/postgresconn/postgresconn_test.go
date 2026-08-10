@@ -510,6 +510,39 @@ func TestReloadableConnectorRefreshWaiterRespectsDialContext(t *testing.T) {
 	assert.Equal(t, int32(1), reloads.Load(), "the canceled waiter must not trigger its own reload")
 }
 
+// The dial that elects a reload is not pinned by it: the reload runs
+// detached, so cancelling the electing dial's context returns it promptly
+// with its dial error — it cannot hold a pool connection slot for as long as
+// a hung secret resolution takes — while the reload finishes in the
+// background and publishes the rotated credentials for later dials.
+func TestReloadableConnectorRefreshElectingDialRespectsDialContext(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var reloads atomic.Int32
+	c := newReloadableConnector(t, "postgres://schemabot:old@localhost:5432/app",
+		hungReload(started, release, &reloads, "postgres://schemabot:rotated@localhost:5432/app", nil))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	electorDone := make(chan struct{})
+	go func() {
+		defer close(electorDone)
+		cfg, _, ok := c.refresh(ctx, 0)
+		assert.False(t, ok)
+		assert.Nil(t, cfg)
+	}()
+	waitClosed(t, started, "reload never started")
+	cancel()
+	waitClosed(t, electorDone, "the electing dial did not honor its own dial context")
+
+	// The detached reload finishes and publishes: a later same-generation
+	// refresh picks up the rotated credentials without reloading again.
+	close(release)
+	cfg, _, ok := c.refresh(t.Context(), 0)
+	require.True(t, ok)
+	assert.Equal(t, "rotated", cfg.Password)
+	assert.Equal(t, int32(1), reloads.Load(), "the abandoned reload's outcome must be reused, not re-resolved")
+}
+
 func TestReloadableConnectorRefreshWaiterObservesLeaderFailure(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -556,9 +589,10 @@ func TestReloadableConnectorRefreshWaiterObservesLeaderFailure(t *testing.T) {
 	assert.Equal(t, int32(1), reloads.Load(), "the waiter must not reload during the cooldown the failure armed")
 }
 
-// A reload callback that panics must not wedge the connector: the publish
-// defer releases the reloading guard, unblocks waiters, and arms the
-// cooldown before the panic propagates to the leader's caller.
+// A reload callback that panics must not wedge the connector or crash the
+// process: the recover in the publish defer converts the panic into a failed
+// reload — the reloading guard is released, waiters are unblocked, the
+// cooldown is armed, and the current credentials are kept.
 func TestReloadableConnectorReloadPanicUnblocksWaiters(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -572,15 +606,13 @@ func TestReloadableConnectorReloadPanicUnblocksWaiters(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		defer func() {
-			assert.Equal(t, "secret backend panicked", recover(), "refresh must propagate the reload panic")
-		}()
-		_, _, _ = c.refresh(t.Context(), 0)
-		assert.Fail(t, "refresh must not return normally from a panicking reload")
+		cfg, _, ok := c.refresh(t.Context(), 0)
+		assert.False(t, ok, "a panicking reload must surface as a failed reload")
+		assert.Nil(t, cfg)
 	})
 	waitClosed(t, started, "reload never started")
 
-	// A same-generation waiter blocked on the leader's outcome is unblocked
+	// A same-generation waiter blocked on the reload's outcome is unblocked
 	// by the publish defer and observes the armed cooldown.
 	waiterDone := make(chan struct{})
 	go func() {

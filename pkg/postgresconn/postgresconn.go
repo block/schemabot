@@ -157,7 +157,8 @@ func (c *reloadableConnector) armReloadCooldown(rejectedGen uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.gen != rejectedGen {
-		slog.Debug("skipping reload cooldown arm: credentials advanced past the rejected generation")
+		slog.Debug("skipping reload cooldown arm: credentials advanced past the rejected generation",
+			"rejected_gen", rejectedGen, "current_gen", c.gen)
 		return
 	}
 	c.lastReloadFail = c.clock()
@@ -189,11 +190,15 @@ func (c *reloadableConnector) clock() time.Time {
 // belongs to, so a later rejection of that config can be attributed to the
 // right generation.
 //
-// The reload callback runs outside the connector mutex so a hung secret
-// resolution cannot block healthy dials from snapshotting the current
-// config. The reloading guard keeps it to one reload in flight at a time:
-// concurrent same-generation failures wait for the leader's outcome — or
-// give up when their own dial context ends, surfacing the dial error.
+// The reload callback runs detached from every dial — outside the connector
+// mutex and on its own goroutine — so a hung secret resolution can neither
+// block healthy dials from snapshotting the current config nor pin the dial
+// that elected it: database/sql counts a dial against the pool's connection
+// budget before Connect runs, so a pinned dial would hold a pool slot for as
+// long as the reload hangs. The reloading guard keeps it to one reload in
+// flight at a time: every same-generation failure, the electing dial
+// included, waits for the reload's outcome — or gives up when its own dial
+// context ends, surfacing the dial error.
 func (c *reloadableConnector) refresh(ctx context.Context, failedGen uint64) (*pgx.ConnConfig, uint64, bool) {
 	for {
 		c.mu.Lock()
@@ -207,18 +212,17 @@ func (c *reloadableConnector) refresh(ctx context.Context, failedGen uint64) (*p
 			slog.Debug("skipping storage DSN reload during cooldown after a failed reload; surfacing the dial error")
 			return nil, 0, false
 		}
-		if c.reloading == nil {
-			done := make(chan struct{})
-			c.reloading = done
-			c.mu.Unlock()
-			return c.runReload(done)
-		}
 		done := c.reloading
+		if done == nil {
+			done = make(chan struct{})
+			c.reloading = done
+			go c.runReload(done)
+		}
 		c.mu.Unlock()
 		select {
 		case <-done:
-			// The in-flight reload finished; re-check the connector state to
-			// pick up the swapped config or the armed cooldown.
+			// The reload finished; re-check the connector state to pick up
+			// the swapped config or the armed cooldown.
 		case <-ctx.Done():
 			slog.Debug("dial context ended while waiting for an in-flight storage DSN reload; surfacing the dial error")
 			return nil, 0, false
@@ -228,38 +232,46 @@ func (c *reloadableConnector) refresh(ctx context.Context, failedGen uint64) (*p
 
 // runReload invokes the reload callback and parses its DSN outside the
 // connector mutex, then publishes the outcome under it: success swaps the
-// config, advances the generation, and returns the new generation; failure
-// arms reloadCooldown. The publish runs in a defer so the reloading guard is
-// released and waiters are unblocked even if the callback panics.
-func (c *reloadableConnector) runReload(done chan struct{}) (cfg *pgx.ConnConfig, gen uint64, ok bool) {
+// config, advances the generation, and clears the cooldown; failure arms
+// reloadCooldown. It runs on its own goroutine, detached from the dial that
+// elected it, so waiters observe the outcome through the connector state
+// rather than a return value. The publish runs in a defer so the reloading
+// guard is released and waiters are unblocked even if the callback panics;
+// the panic is recovered and treated as a failed reload — a detached
+// goroutine has no caller to propagate it to, and a panicking secret
+// resolver must leave the pool on its current credentials, not crash the
+// process.
+func (c *reloadableConnector) runReload(done chan struct{}) {
+	var fresh *pgx.ConnConfig
 	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("reload storage DSN after authentication failure panicked; keeping current credentials", "panic", r)
+		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.reloading = nil
 		close(done)
-		if cfg == nil {
+		if fresh == nil {
 			c.lastReloadFail = c.clock()
 			return
 		}
-		c.cfg = cfg
+		c.cfg = fresh
 		c.gen++
 		c.lastReloadFail = time.Time{}
-		gen = c.gen
-		ok = true
 		slog.Info("reloaded storage credentials after authentication failure")
 	}()
 
 	rawDSN, err := c.reload()
 	if err != nil {
 		slog.Error("reload storage DSN after authentication failure failed; keeping current credentials", "error", err)
-		return nil, 0, false
+		return
 	}
-	fresh, err := connectionConfig(rawDSN, c.opts...)
+	cfg, err := connectionConfig(rawDSN, c.opts...)
 	if err != nil {
 		slog.Error("parse reloaded storage DSN failed; keeping current credentials", "error", err)
-		return nil, 0, false
+		return
 	}
-	return fresh, 0, true
+	fresh = cfg
 }
 
 // isAuthError reports whether err is the server rejecting the connection's
