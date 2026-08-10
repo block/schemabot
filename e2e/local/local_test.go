@@ -1030,7 +1030,7 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 		seedTestRows(t, db, tbl,
 			"name, amount",
 			"CONCAT('item_', seq), FLOOR(1 + RAND() * 10000)",
-			50000)
+			500000)
 	}
 
 	// Build schema dir with indexes on all 3 tables
@@ -1091,7 +1091,7 @@ CREATE TABLE %s (
 		e2eutil.AssertContains(t, startOut, "resumed")
 	})
 
-	// Wait for everything to complete (3 tables × 50K rows each, sequential)
+	// Wait for all three tables to finish their sequential copies
 	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, 60*time.Second)
 
 	// Verify ALL 3 indexes exist

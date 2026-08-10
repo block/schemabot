@@ -193,7 +193,7 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 	return nil
 }
 
-func (s *controlRequestStore) getByIDForUpdate(ctx context.Context, tx *sql.Tx, id int64) (*storage.ApplyControlRequest, error) {
+func (s *controlRequestStore) getByIDForUpdate(ctx context.Context, tx *rebindTx, id int64) (*storage.ApplyControlRequest, error) {
 	row := tx.QueryRowContext(ctx, `
 		SELECT `+controlRequestColumns+`
 		FROM apply_control_requests
@@ -209,7 +209,7 @@ func (s *controlRequestStore) getByIDForUpdate(ctx context.Context, tx *sql.Tx, 
 
 func (s *controlRequestStore) getByApplyOperationForUpdate(
 	ctx context.Context,
-	tx *sql.Tx,
+	tx *rebindTx,
 	applyID int64,
 	operation storage.ControlOperation,
 ) (*storage.ApplyControlRequest, error) {

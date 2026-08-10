@@ -155,6 +155,85 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 	}
 }
 
+// A table that has finished copying drains the changes that accumulated on the
+// source during the copy. It is a table-level state: the apply header stays
+// "In Progress" while the per-table line and summary name the catch-up phase,
+// since on a busy table it can run for hours — a plain full bar would read as
+// a copy that is quietly done.
+func TestRenderApplyStatusComment_CatchingUp(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "catching_up", RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; catching up is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏩ Catching up on accumulated changes...")
+	assert.Contains(t, result, "Rows copied: 1,466,232")
+	assert.Contains(t, result, "1 catching up")
+}
+
+// The raw Spirit phase names reach the renderer when a stored task predates
+// normalization; each drain renders its own named phase, not an unknown
+// state.
+func TestRenderApplyStatusComment_DrainPhasesFromRawSpiritState(t *testing.T) {
+	for raw, wantLine := range map[string]string{
+		"applyChangeset": "⏩ Catching up on accumulated changes...",
+		"postChecksum":   "⏩ Data verified, applying final changes...",
+	} {
+		data := ApplyStatusCommentData{
+			Database:    "testapp",
+			Environment: "staging",
+			RequestedBy: "aparajon",
+			State:       "running",
+			Engine:      "Spirit",
+			Tables: []TableProgressData{
+				{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: raw, RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			},
+		}
+
+		result := RenderApplyStatusComment(data)
+
+		assert.Contains(t, result, wantLine, "raw state %q should render its drain phase", raw)
+	}
+}
+
+// After the checksum passes, the engine drains the changes that accumulated
+// during the verify. It is a table-level state: the apply header stays
+// "In Progress" while the per-table line names the post-checksum drain — and
+// never rewinds to an indeterminate checksum that already finished.
+func TestRenderApplyStatusComment_PostChecksum(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "post_checksum", RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; the post-checksum drain is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏩ Data verified, applying final changes...")
+	assert.Contains(t, result, "Rows copied: 1,466,232")
+	assert.Contains(t, result, "1 catching up")
+	assert.NotContains(t, result, "Checksumming to verify data")
+}
+
 // A table that has finished copying enters the checksum phase, where the engine
 // verifies the copied data before cutover. It is a table-level state: the apply
 // header stays "In Progress" while the per-table line and summary report
@@ -503,7 +582,7 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 	assert.Contains(t, inline, "shards:")
 	assert.Contains(t, inline, "✓ -80")
 	assert.Contains(t, inline, "◐ 80-c0 45%")
-	// A shard ready for cutover shows ● and no percent (it is no longer copying).
+	// A shard waiting for cutover shows ● and no percent (it is no longer copying).
 	assert.Contains(t, inline, "● c0-")
 	assert.NotContains(t, inline, "● c0- 100%")
 
@@ -1226,7 +1305,7 @@ func TestRenderApplyStatusComment_WaitingForCutoverAutomatic(t *testing.T) {
 		State:       state.Apply.WaitingForCutover,
 		Engine:      "PlanetScale",
 		Tables: []TableProgressData{
-			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+			{TableName: "orders", Status: state.Task.WaitingForCutover},
 		},
 	}
 
@@ -1457,9 +1536,8 @@ func TestApplyStatusFromProgress(t *testing.T) {
 	assert.Equal(t, "users", data.Tables[0].TableName)
 	assert.Equal(t, int64(5000), data.Tables[0].RowsCopied)
 	assert.Equal(t, 50, data.Tables[0].PercentComplete)
-	assert.False(t, data.Tables[0].ReadyToComplete, "a copying table is not ready for cutover")
 	assert.Equal(t, "orders", data.Tables[1].TableName)
-	assert.True(t, data.Tables[1].ReadyToComplete, "a table parked at the cutover barrier renders as ready")
+	assert.Equal(t, state.Task.WaitingForCutover, data.Tables[1].Status)
 }
 
 func TestPreviewCommentApplyProgress(t *testing.T) {
@@ -2016,7 +2094,7 @@ func TestRenderApplyBlockedByInProgressChecks_EmptyList(t *testing.T) {
 	}
 }
 
-func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) {
+func TestRenderApplyStatusComment_WaitingForCutover_MixedReadiness(t *testing.T) {
 	data := ApplyStatusCommentData{
 		ApplyID:      "apply-abc123",
 		Database:     "testapp",
@@ -2024,9 +2102,9 @@ func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) 
 		State:        state.Apply.WaitingForCutover,
 		DeferCutover: true,
 		Tables: []TableProgressData{
-			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE users ADD INDEX idx_email (email)"},
-			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
-			{TableName: "items", Status: state.Task.WaitingForCutover, ReadyToComplete: false, DDL: "ALTER TABLE items ADD INDEX idx_price (price_cents)"},
+			{TableName: "users", Status: state.Task.WaitingForCutover, DDL: "ALTER TABLE users ADD INDEX idx_email (email)"},
+			{TableName: "orders", Status: state.Task.WaitingForCutover, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
+			{TableName: "items", Status: state.Task.Running, PercentComplete: 60, DDL: "ALTER TABLE items ADD INDEX idx_price (price_cents)"},
 		},
 	}
 
@@ -2035,12 +2113,11 @@ func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) 
 	// Header
 	assert.Contains(t, result, "Waiting for Cutover")
 
-	// Cutover summary shows ready/waiting counts
+	// Cutover summary counts parked tables as ready, still-copying as waiting
 	assert.Contains(t, result, "2/3")
 	assert.Contains(t, result, "waiting on 1")
 
-	// Per-table: ready tables show checkmark, non-ready show plain waiting
-	assert.Contains(t, result, "Ready for cutover")
+	// Per-table: parked tables render as waiting for cutover
 	assert.Contains(t, result, "Waiting for cutover")
 
 	// Footer has cutover command
@@ -2054,8 +2131,8 @@ func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
 		Environment: "staging",
 		State:       state.Apply.WaitingForCutover,
 		Tables: []TableProgressData{
-			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
-			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+			{TableName: "users", Status: state.Task.WaitingForCutover},
+			{TableName: "orders", Status: state.Task.WaitingForCutover},
 		},
 	}
 

@@ -443,6 +443,12 @@ func aggregateLabel(s string) string {
 		return "running"
 	case state.Apply.RunningDegraded:
 		return "running (degraded)"
+	case state.Apply.CatchingUp:
+		return "catching up"
+	case state.Apply.Checksumming:
+		return "checksumming"
+	case state.Apply.PostChecksum:
+		return "applying final changes"
 	case state.Apply.Paused:
 		return "paused"
 	case state.Apply.WaitingForDeploy:

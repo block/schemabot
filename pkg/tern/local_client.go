@@ -2281,6 +2281,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	for _, t := range tasks {
 		switch {
 		case t.State == state.Task.Running ||
+			t.State == state.Task.CatchingUp ||
+			t.State == state.Task.Checksumming ||
+			t.State == state.Task.PostChecksum ||
 			t.State == state.Task.WaitingForCutover ||
 			t.State == state.Task.Recovering ||
 			t.State == state.Task.CuttingOver ||
@@ -2737,21 +2740,35 @@ func activeTaskProgressRank(taskState string) (int, bool) {
 		return 1, true
 	case state.Task.Running:
 		return 2, true
+	case state.Task.CatchingUp:
+		// Row copy is done; the engine is applying the changeset accumulated
+		// from the binlog during the copy. Ranks after Running and before
+		// Checksumming — the verify that follows this first drain — so a
+		// later poll never regresses the table to a plain copy.
+		return 3, true
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data. Ranks after
-		// Running and before WaitingForCutover — the phase the table moves through
-		// next — so a later poll never regresses a checksumming table to Running.
-		return 3, true
-	case state.Task.WaitingForCutover:
+		// CatchingUp and before PostChecksum — the second drain that follows
+		// the verify — so a later poll never regresses a checksumming table
+		// to an earlier phase.
 		return 4, true
-	case state.Task.CuttingOver:
+	case state.Task.PostChecksum:
+		// The verify passed and the engine is applying the changes that
+		// accumulated while it ran. Ranks after Checksumming so a stale
+		// checksum poll never rewinds the table into a verify that already
+		// finished, and before WaitingForCutover — the phase the table moves
+		// through next.
 		return 5, true
-	case state.Task.RevertWindow:
+	case state.Task.WaitingForCutover:
 		return 6, true
+	case state.Task.CuttingOver:
+		return 7, true
+	case state.Task.RevertWindow:
+		return 8, true
 	case state.Task.Reverting:
 		// Undoing the change after the revert window; ranks after RevertWindow so
 		// a reverting table never regresses to the resumable-window phase.
-		return 7, true
+		return 9, true
 	default:
 		return 0, false
 	}

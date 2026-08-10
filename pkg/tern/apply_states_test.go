@@ -214,6 +214,46 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.RevertWindow,
 		},
 		{
+			name: "post-copy phase surfaces when no table is copying",
+			tasks: []*storage.Task{
+				{State: state.Task.Checksumming},
+				{State: state.Task.Completed},
+			},
+			wantState: state.Task.Checksumming,
+		},
+		{
+			name: "a copying table dominates a sibling's post-copy phase",
+			tasks: []*storage.Task{
+				{State: state.Task.PostChecksum},
+				{State: state.Task.Running},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "least-advanced phase wins across mixed drains",
+			tasks: []*storage.Task{
+				{State: state.Task.CatchingUp},
+				{State: state.Task.PostChecksum},
+			},
+			wantState: state.Task.CatchingUp,
+		},
+		{
+			name: "a draining table holds the apply out of waiting_for_cutover",
+			tasks: []*storage.Task{
+				{State: state.Task.WaitingForCutover},
+				{State: state.Task.PostChecksum},
+			},
+			wantState: state.Task.PostChecksum,
+		},
+		{
+			name: "a table cutting over outranks a sibling's drain",
+			tasks: []*storage.Task{
+				{State: state.Task.CuttingOver},
+				{State: state.Task.CatchingUp},
+			},
+			wantState: state.Task.CuttingOver,
+		},
+		{
 			name: "running takes priority over revert_window",
 			tasks: []*storage.Task{
 				{State: state.Task.Running},

@@ -859,3 +859,65 @@ func TestForwardAuth_SkipsInfraPaths(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusUnauthorized, rec.Code, "/metrics should not bypass auth")
 }
+
+// A deployment may trust loopback so operators can reach the API through a
+// port-forward when the proxy path is unavailable. Identity headers on that
+// path are typed by the local caller, not verified by the proxy, so an
+// admitted write from loopback must leave an audit line naming the claimed
+// subject and the path — break-glass usage an operator can alert on.
+func TestForwardAuth_LoopbackTrustedWriteLogsBreakGlass(t *testing.T) {
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{"127.0.0.0/8"},
+		WriteGroups:       []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
+	req.RemoteAddr = "127.0.0.1:52000"
+	req.Header.Set("X-Forwarded-User", "alice")
+	req.Header.Set("X-Forwarded-Groups", "ops")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "loopback source")
+	assert.Contains(t, logged, "subject=alice")
+	assert.Contains(t, logged, "path=/api/apply")
+}
+
+// A write arriving through the trusted proxy's own network path is the normal
+// case and produces no break-glass line.
+func TestForwardAuth_ProxiedWriteHasNoBreakGlassLog(t *testing.T) {
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
+	req.RemoteAddr = trustedIPAddr
+	req.Header.Set("X-Forwarded-User", "alice")
+	req.Header.Set("X-Forwarded-Groups", "ops")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, logs.String(), "loopback")
+}
+
+// Loopback reads are counted (the auth-decision metric carries the loopback
+// reason) but not logged — status polling over a port-forward must not flood
+// the log.
+func TestForwardAuth_LoopbackTrustedReadDoesNotLog(t *testing.T) {
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{"127.0.0.0/8"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = "127.0.0.1:52000"
+	req.Header.Set("X-Forwarded-User", "alice")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, logs.String(), "loopback")
+}

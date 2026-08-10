@@ -12,7 +12,8 @@ import (
 
 func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T) {
 	result := &apitypes.ProgressResponse{
-		State: state.Apply.Running,
+		State:  state.Apply.Running,
+		Volume: 3,
 		Operations: []*apitypes.ProgressOperationResponse{
 			{
 				Deployment:          "deploy-a",
@@ -57,6 +58,42 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, "deploy-a", data.Tables[0].Deployment)
 	assert.Equal(t, state.Task.Running, data.Tables[0].Status)
+	assert.Equal(t, 3, data.Volume)
+}
+
+// The detail box names the operator-set volume level only while the engine is
+// actively working — copying, draining, or verifying, where volume remains
+// adjustable — and stays quiet when no volume was ever set or the apply is in
+// a state where the level carries no signal.
+func TestVolumeBoxRow(t *testing.T) {
+	cases := []struct {
+		name   string
+		volume int
+		state  string
+		want   string
+	}{
+		{"running with volume", 3, state.Apply.Running, "3/11"},
+		{"running degraded with volume", 5, state.Apply.RunningDegraded, "5/11"},
+		{"catching up with volume", 2, state.Apply.CatchingUp, "2/11"},
+		{"checksumming with volume", 7, state.Apply.Checksumming, "7/11"},
+		{"post checksum with volume", 11, state.Apply.PostChecksum, "11/11"},
+		{"running without volume", 0, state.Apply.Running, ""},
+		{"stopped with volume", 3, state.Apply.Stopped, ""},
+		{"waiting for cutover with volume", 3, state.Apply.WaitingForCutover, ""},
+		{"completed with volume", 3, state.Apply.Completed, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row, ok := volumeBoxRow(tc.volume, tc.state)
+			if tc.want == "" {
+				assert.False(t, ok)
+				return
+			}
+			require.True(t, ok)
+			assert.Equal(t, "Volume", row.Label)
+			assert.Equal(t, tc.want, row.Value)
+		})
+	}
 }
 
 func TestParseProgressResponseWithoutOperationsKeepsDeploymentEmpty(t *testing.T) {

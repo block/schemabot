@@ -27,9 +27,10 @@ func (MySQLDialect) Rebind(query string) string {
 // exactly once before reaching the SQL driver. Stores hold a *rebindDB rather
 // than a raw *sql.DB so no store can bypass the rebind boundary.
 //
-// Transactions and pinned connections obtained via BeginTx / Conn are handed
-// back as raw handles: statements executed on them do not pass through the
-// binder yet, so those paths remain MySQL-placeholder only.
+// Transactions and pinned connections obtained via BeginTx / Conn are wrapped
+// the same way, so every execution path — pool, transaction, or pinned
+// connection — rebinds exactly once on the final assembled SQL. The only
+// sanctioned escape is rebindConn.raw() for the advisory-lock boundary.
 type rebindDB struct {
 	pool   *sql.DB
 	binder binder
@@ -55,16 +56,24 @@ func (d *rebindDB) QueryRowContext(ctx context.Context, query string, args ...an
 	return d.pool.QueryRowContext(ctx, d.binder.Rebind(query), args...)
 }
 
-// BeginTx starts a transaction on the underlying pool. The returned *sql.Tx is
-// a raw handle: statements executed on it are not rebound.
-func (d *rebindDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
-	return d.pool.BeginTx(ctx, opts)
+// BeginTx starts a transaction on the underlying pool, wrapped so statements
+// executed on it rebind their placeholders like direct pool execution.
+func (d *rebindDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*rebindTx, error) {
+	tx, err := d.pool.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &rebindTx{tx: tx, binder: d.binder}, nil
 }
 
-// Conn pins a single connection from the underlying pool. The returned
-// *sql.Conn is a raw handle: statements executed on it are not rebound.
-func (d *rebindDB) Conn(ctx context.Context) (*sql.Conn, error) {
-	return d.pool.Conn(ctx)
+// Conn pins a single connection from the underlying pool, wrapped so
+// transactions begun on it rebind their placeholders.
+func (d *rebindDB) Conn(ctx context.Context) (*rebindConn, error) {
+	conn, err := d.pool.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &rebindConn{conn: conn, binder: d.binder}, nil
 }
 
 // PingContext verifies the underlying pool's connectivity.
@@ -75,4 +84,78 @@ func (d *rebindDB) PingContext(ctx context.Context) error {
 // Close closes the underlying pool.
 func (d *rebindDB) Close() error {
 	return d.pool.Close()
+}
+
+// rebindTx wraps an in-flight transaction so every statement executed on it
+// passes through the dialect's binder exactly once, matching direct pool
+// execution. Statements must reach the binder as final assembled SQL: a query
+// is rebound at the moment it executes, never earlier and never twice.
+type rebindTx struct {
+	tx     *sql.Tx
+	binder binder
+}
+
+// ExecContext rebinds the query's placeholders and executes it in the
+// transaction.
+func (t *rebindTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return t.tx.ExecContext(ctx, t.binder.Rebind(query), args...)
+}
+
+// QueryContext rebinds the query's placeholders and runs it in the
+// transaction.
+func (t *rebindTx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return t.tx.QueryContext(ctx, t.binder.Rebind(query), args...)
+}
+
+// QueryRowContext rebinds the query's placeholders and runs it in the
+// transaction.
+func (t *rebindTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(ctx, t.binder.Rebind(query), args...)
+}
+
+// Commit commits the transaction.
+func (t *rebindTx) Commit() error {
+	return t.tx.Commit()
+}
+
+// Rollback aborts the transaction.
+func (t *rebindTx) Rollback() error {
+	return t.tx.Rollback()
+}
+
+// rebindConn wraps a pinned pool connection. It exists for the advisory-lock
+// flow, which holds a session-scoped lock on the pinned session and runs its
+// apply writes in transactions begun on that same session.
+type rebindConn struct {
+	conn   *sql.Conn
+	binder binder
+}
+
+// BeginTx starts a transaction on the pinned connection, wrapped so statements
+// executed on it rebind their placeholders.
+func (c *rebindConn) BeginTx(ctx context.Context, opts *sql.TxOptions) (*rebindTx, error) {
+	tx, err := c.conn.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &rebindTx{tx: tx, binder: c.binder}, nil
+}
+
+// Raw runs f against the pinned driver connection, for lifecycle control such
+// as discarding a session whose advisory-lock state is uncertain.
+func (c *rebindConn) Raw(f func(driverConn any) error) error {
+	return c.conn.Raw(f)
+}
+
+// Close returns the pinned session to the pool.
+func (c *rebindConn) Close() error {
+	return c.conn.Close()
+}
+
+// raw exposes the pinned *sql.Conn for the advisory-lock boundary. It is the
+// only sanctioned binder escape: namedlock.Locker implementations emit their
+// engine's native placeholders and must execute on the pinned session that
+// holds the lock. No store SQL may execute through it.
+func (c *rebindConn) raw() *sql.Conn {
+	return c.conn
 }

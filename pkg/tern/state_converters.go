@@ -89,6 +89,12 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_PENDING
 	case state.Task.Running:
 		return ternv1.State_STATE_RUNNING
+	case state.Task.CatchingUp:
+		return ternv1.State_STATE_CATCHING_UP
+	case state.Task.Checksumming:
+		return ternv1.State_STATE_CHECKSUMMING
+	case state.Task.PostChecksum:
+		return ternv1.State_STATE_POST_CHECKSUM
 	case state.Task.WaitingForDeploy:
 		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
@@ -199,6 +205,12 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Pending
 	case ternv1.State_STATE_RUNNING:
 		return state.Apply.Running
+	case ternv1.State_STATE_CATCHING_UP:
+		return state.Apply.CatchingUp
+	case ternv1.State_STATE_CHECKSUMMING:
+		return state.Apply.Checksumming
+	case ternv1.State_STATE_POST_CHECKSUM:
+		return state.Apply.PostChecksum
 	case ternv1.State_STATE_WAITING_FOR_DEPLOY:
 		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:

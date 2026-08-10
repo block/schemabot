@@ -48,7 +48,7 @@ func tuiOperationsForPresentation(ops []templates.ProgressOperation, released bo
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply) {
-	if state.IsState(model.State, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
+	if state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
 		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
 	} else {
 		b.WriteString(model.Label + "\n")

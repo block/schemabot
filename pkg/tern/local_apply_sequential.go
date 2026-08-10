@@ -478,7 +478,18 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 			now := time.Now()
 			prevState := task.State
-			task.State = taskStateFromProgressResult(result)
+			engineTaskState := taskStateFromProgressResult(result)
+			// A sequential task drives a single DDL, so the first table's
+			// engine-reported post-copy phase (catching up, checksumming,
+			// post-checksum, cutting over) refines a running task the same way
+			// the grouped sync does. The no-backward guard keeps the displayed
+			// endgame monotonic across engine phases that map back to Running.
+			if len(result.Tables) > 0 && state.IsState(engineTaskState, state.Task.Running) {
+				if phase, isPhase := tablePhaseTaskState(result.Tables[0].State); isPhase {
+					engineTaskState = phase
+				}
+			}
+			task.State = taskStateWithNoBackwardProgress(prevState, engineTaskState)
 			task.UpdatedAt = now
 			retryableFailure := state.IsState(task.State, state.Task.FailedRetryable)
 

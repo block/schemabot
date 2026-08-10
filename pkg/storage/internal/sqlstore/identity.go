@@ -5,10 +5,11 @@ import (
 	"database/sql"
 )
 
-// queryExecer is the subset of *sql.DB / *sql.Tx needed to run an INSERT and
-// read back the generated identity, either from a driver Result (MySQL) or a
-// RETURNING clause (Postgres). Both the connection pool and an in-flight
-// transaction satisfy it.
+// queryExecer is the execution subset needed to run an INSERT and read back
+// the generated identity, either from a driver Result (MySQL) or a RETURNING
+// clause (Postgres). Both the rebind-aware pool (*rebindDB) and an in-flight
+// transaction (*rebindTx) satisfy it, so identity inserts always execute
+// behind the placeholder-rebind boundary.
 type queryExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row

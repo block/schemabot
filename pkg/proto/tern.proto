@@ -268,6 +268,13 @@ enum State {
   // reverting -> reverted). Distinct from running so a multi-minute revert is
   // not surfaced as an ordinary in-progress apply.
   STATE_REVERTING = 18;
+  // Post-copy phases: the row copy is done and the engine is draining its
+  // accumulated changeset or verifying the copied data. Running-family —
+  // distinct from STATE_RUNNING so operators see which phase an unbounded
+  // drain or verify is actually in.
+  STATE_CATCHING_UP = 19;
+  STATE_CHECKSUMMING = 20;
+  STATE_POST_CHECKSUM = 21;
 }
 
 // ChangeType represents the type of schema change.
