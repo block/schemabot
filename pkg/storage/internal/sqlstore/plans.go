@@ -20,8 +20,9 @@ const planColumns = `id, plan_identifier, database_name, database_type,
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
-	db       *rebindDB
-	identity identityInserter
+	db         *rebindDB
+	identity   identityInserter
+	classifier ErrorClassifier
 }
 
 // Create stores a new plan and returns its ID.
@@ -41,7 +42,7 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.CreatedAt)
 	if err != nil {
-		if isDuplicateKeyError(err) {
+		if s.classifier.IsDuplicateKey(err) {
 			return 0, storage.ErrPlanIDExists
 		}
 		return 0, err

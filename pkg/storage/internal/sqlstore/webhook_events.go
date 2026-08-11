@@ -20,9 +20,10 @@ const webhookEventColumns = `id, provider, delivery_id, event, action, repositor
 	received_at, started_at, completed_at, created_at, updated_at`
 
 type webhookEventStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	classifier ErrorClassifier
 }
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
@@ -62,7 +63,7 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
 		payload, state, event.Attempts, receivedAt)
 	if err != nil {
-		if isDuplicateKeyError(err) {
+		if s.classifier.IsDuplicateKey(err) {
 			return s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
 		}
 		return false, fmt.Errorf("insert webhook event (provider=%s, delivery_id=%s): %w", provider, event.DeliveryID, err)

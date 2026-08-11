@@ -27,24 +27,25 @@ const applyOperationColumns = `id, apply_id, deployment, operation_key, operatio
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
-	locker   namedlock.Locker
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	locker     namedlock.Locker
+	classifier ErrorClassifier
 }
 
 // Insert stores a new apply_operations row and returns its ID.
 // Translates a unique-key conflict on (apply_id, deployment, operation_key) into
 // storage.ErrApplyOperationExists so callers can branch cleanly.
 func (s *applyOperationStore) Insert(ctx context.Context, ad *storage.ApplyOperation) (int64, error) {
-	return insertApplyOperation(ctx, s.db, s.identity, ad)
+	return insertApplyOperation(ctx, s.db, s.identity, s.classifier, ad)
 }
 
 // insertApplyOperation inserts one apply_operations row using the supplied
 // executer (pool or transaction). On success the row's ID and State fields
 // are set. A duplicate-key violation on (apply_id, deployment, operation_key)
 // is translated to storage.ErrApplyOperationExists for callers to branch on.
-func insertApplyOperation(ctx context.Context, exec queryExecer, identity identityInserter, ad *storage.ApplyOperation) (int64, error) {
+func insertApplyOperation(ctx context.Context, exec queryExecer, identity identityInserter, classifier ErrorClassifier, ad *storage.ApplyOperation) (int64, error) {
 	stateVal := ad.State
 	if stateVal == "" {
 		stateVal = state.ApplyOperation.Pending
@@ -82,7 +83,7 @@ func insertApplyOperation(ctx context.Context, exec queryExecer, identity identi
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
-		if isDuplicateKeyError(err) {
+		if classifier.IsDuplicateKey(err) {
 			return 0, storage.ErrApplyOperationExists
 		}
 		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): %w", ad.ApplyID, ad.Deployment, ad.OperationKey, err)

@@ -53,9 +53,10 @@ const (
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	classifier ErrorClassifier
 	// locker serializes concurrent applies against the same target with a
 	// session-scoped advisory lock held on the pinned apply connection. It must
 	// match the storage database's family.
@@ -557,7 +558,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
-		if isDuplicateKeyError(err) {
+		if s.classifier.IsDuplicateKey(err) {
 			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
 		}
 		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
@@ -589,7 +590,7 @@ func (s *applyStore) CreateWithTasksAndOperations(ctx context.Context, apply *st
 		deployments = append(deployments, op.Deployment)
 	}
 	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *rebindTx, apply *storage.Apply, applyID int64) error {
-		return insertApplyTasksAndOperations(ctx, tx, s.identity, apply, applyID, tasks, operations)
+		return insertApplyTasksAndOperations(ctx, tx, s.identity, s.classifier, apply, applyID, tasks, operations)
 	})
 }
 
@@ -603,7 +604,7 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 		}
 	}
 	return s.createWithRows(ctx, apply, opName, deployments, func(ctx context.Context, tx *rebindTx, apply *storage.Apply, applyID int64) error {
-		return insertApplyGroupedOperations(ctx, tx, s.identity, apply, applyID, groups)
+		return insertApplyGroupedOperations(ctx, tx, s.identity, s.classifier, apply, applyID, groups)
 	})
 }
 
@@ -651,7 +652,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
-		if isDuplicateKeyError(err) {
+		if s.classifier.IsDuplicateKey(err) {
 			return 0, fmt.Errorf("create apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyIDExists)
 		}
 		return 0, fmt.Errorf("insert apply %s: %w", apply.ApplyIdentifier, err)
@@ -701,7 +702,7 @@ func verifyExpectedLockIntent(ctx context.Context, tx *rebindTx, apply *storage.
 	return nil
 }
 
-func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity identityInserter, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
+func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity identityInserter, classifier ErrorClassifier, apply *storage.Apply, applyID int64, tasks []*storage.Task, operations []*storage.ApplyOperation) error {
 	// Operations are inserted BEFORE tasks so each task can be persisted
 	// with the apply_operation_id of the operation it belongs to. Today
 	// the config layer hard-blocks multi-entry deployments so there is
@@ -711,7 +712,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity i
 	// by the caller (see the multi-op guard below).
 	for _, op := range operations {
 		op.ApplyID = applyID
-		if _, err := insertApplyOperation(ctx, tx, identity, op); err != nil {
+		if _, err := insertApplyOperation(ctx, tx, identity, classifier, op); err != nil {
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", op.Deployment, apply.ApplyIdentifier, err)
 		}
 	}
@@ -777,7 +778,7 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity i
 	return nil
 }
 
-func insertApplyGroupedOperations(ctx context.Context, tx *rebindTx, identity identityInserter, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
+func insertApplyGroupedOperations(ctx context.Context, tx *rebindTx, identity identityInserter, classifier ErrorClassifier, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
 	if len(groups) == 0 {
 		return fmt.Errorf("create apply %s: grouped operations are empty", apply.ApplyIdentifier)
 	}
@@ -802,7 +803,7 @@ func insertApplyGroupedOperations(ctx context.Context, tx *rebindTx, identity id
 		}
 
 		group.Operation.ApplyID = applyID
-		if _, err := insertApplyOperation(ctx, tx, identity, group.Operation); err != nil {
+		if _, err := insertApplyOperation(ctx, tx, identity, classifier, group.Operation); err != nil {
 			return fmt.Errorf("insert apply_operation (deployment=%s) for apply %s: %w", group.Operation.Deployment, apply.ApplyIdentifier, err)
 		}
 		for _, task := range group.Tasks {

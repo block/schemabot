@@ -14,18 +14,19 @@ const controlRequestColumns = `id, apply_id, operation, status,
 	requested_by, error_message, metadata, completed_at, created_at, updated_at`
 
 type controlRequestStore struct {
-	db       *rebindDB
-	identity identityInserter
+	db         *rebindDB
+	identity   identityInserter
+	classifier ErrorClassifier
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
 	var controlReq *storage.ApplyControlRequest
 	var alreadyPending bool
 	op := fmt.Sprintf("request control request for apply %d operation %s", req.ApplyID, req.Operation)
-	err := withLockRetry(ctx, op, func() error {
+	err := withLockRetry(ctx, s.classifier, op, func() error {
 		var attemptErr error
 		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
-		if attemptErr == nil || !isDuplicateKeyError(attemptErr) {
+		if attemptErr == nil || !s.classifier.IsDuplicateKey(attemptErr) {
 			return attemptErr
 		}
 

@@ -11,7 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIsRetryableLockError(t *testing.T) {
+func TestMySQLErrorClassifier_IsRetryableConflict(t *testing.T) {
+	classifier := NewMySQLErrorClassifier()
 	tests := []struct {
 		name string
 		err  error
@@ -26,14 +27,14 @@ func TestIsRetryableLockError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, isRetryableLockError(tt.err))
+			assert.Equal(t, tt.want, classifier.IsRetryableConflict(tt.err))
 		})
 	}
 }
 
 func TestWithLockRetry_SucceedsFirstAttempt(t *testing.T) {
 	calls := 0
-	err := withLockRetry(t.Context(), "op", func() error {
+	err := withLockRetry(t.Context(), NewMySQLErrorClassifier(), "op", func() error {
 		calls++
 		return nil
 	})
@@ -43,7 +44,7 @@ func TestWithLockRetry_SucceedsFirstAttempt(t *testing.T) {
 
 func TestWithLockRetry_RetriesThenSucceeds(t *testing.T) {
 	calls := 0
-	err := withLockRetry(t.Context(), "op", func() error {
+	err := withLockRetry(t.Context(), NewMySQLErrorClassifier(), "op", func() error {
 		calls++
 		if calls < 3 {
 			return &gomysql.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
@@ -56,7 +57,7 @@ func TestWithLockRetry_RetriesThenSucceeds(t *testing.T) {
 
 func TestWithLockRetry_ExhaustsAttempts(t *testing.T) {
 	calls := 0
-	err := withLockRetry(t.Context(), "acquire something", func() error {
+	err := withLockRetry(t.Context(), NewMySQLErrorClassifier(), "acquire something", func() error {
 		calls++
 		return &gomysql.MySQLError{Number: mysqlErrLockWaitTimeout, Message: "Lock wait timeout exceeded"}
 	})
@@ -65,13 +66,13 @@ func TestWithLockRetry_ExhaustsAttempts(t *testing.T) {
 	assert.Contains(t, err.Error(), "acquire something")
 	assert.Contains(t, err.Error(), fmt.Sprintf("after %d attempts", lockRetryMaxAttempts))
 	// The terminal lock error is preserved in the chain.
-	assert.True(t, isRetryableLockError(err))
+	assert.True(t, NewMySQLErrorClassifier().IsRetryableConflict(err))
 }
 
 func TestWithLockRetry_NonRetryableReturnsImmediately(t *testing.T) {
 	sentinel := errors.New("genuine conflict")
 	calls := 0
-	err := withLockRetry(t.Context(), "op", func() error {
+	err := withLockRetry(t.Context(), NewMySQLErrorClassifier(), "op", func() error {
 		calls++
 		return sentinel
 	})
@@ -83,7 +84,7 @@ func TestWithLockRetry_RespectsContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	calls := 0
-	err := withLockRetry(ctx, "op", func() error {
+	err := withLockRetry(ctx, NewMySQLErrorClassifier(), "op", func() error {
 		calls++
 		return &gomysql.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
 	})

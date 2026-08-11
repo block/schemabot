@@ -7,11 +7,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
-	gomysql "github.com/go-sql-driver/mysql"
 )
 
 // lockColumns lists all columns for SELECT queries.
@@ -20,7 +18,8 @@ const lockColumns = `id, database_name, database_type, repository, pull_request,
 
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
-	db *rebindDB
+	db         *rebindDB
+	classifier ErrorClassifier
 }
 
 // Acquire attempts to acquire a lock. Returns ErrLockHeld if held by another owner.
@@ -33,7 +32,7 @@ type lockStore struct {
 // leaves the existing value intact.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	op := fmt.Sprintf("acquire lock for %s/%s owner=%s", lock.DatabaseName, lock.DatabaseType, lock.Owner)
-	return withLockRetry(ctx, op, func() error {
+	return withLockRetry(ctx, s.classifier, op, func() error {
 		return s.acquireOnce(ctx, lock)
 	})
 }
@@ -65,7 +64,7 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 	if err == nil {
 		return nil
 	}
-	if !isDuplicateKeyError(err) {
+	if !s.classifier.IsDuplicateKey(err) {
 		return fmt.Errorf("insert lock for %s/%s owner=%s: %w",
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
 	}
@@ -310,13 +309,4 @@ func scanLockInto(s scanner) (*storage.Lock, error) {
 	}
 
 	return &lock, nil
-}
-
-// isDuplicateKeyError checks if the error is a MySQL duplicate key error (code 1062).
-func isDuplicateKeyError(err error) bool {
-	var mysqlErr *gomysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
-		return true
-	}
-	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }
