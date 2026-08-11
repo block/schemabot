@@ -23,6 +23,7 @@ func TestMySQLErrorClassifier(t *testing.T) {
 	assert.True(t, classifier.IsDuplicateKey(fmt.Errorf("write row: %w", &gomysql.MySQLError{Number: mysqlErrDuplicateKey})))
 	assert.True(t, classifier.IsDuplicateKey(errors.New("Duplicate entry 'value' for key 'key'")))
 	assert.False(t, classifier.IsDuplicateKey(&gomysql.MySQLError{Number: mysqlErrDeadlock}))
+	assert.False(t, classifier.IsDuplicateKey(errors.New("write failed")))
 	assert.False(t, classifier.IsDuplicateKey(nil))
 }
 
@@ -40,6 +41,8 @@ func TestPostgresErrorClassifier(t *testing.T) {
 
 	assert.True(t, classifier.IsDuplicateKey(&pgconn.PgError{Code: "23505"}))
 	assert.True(t, classifier.IsDuplicateKey(fmt.Errorf("write row: %w", &pgconn.PgError{Code: "23505"})))
+	assert.True(t, classifier.IsDuplicateKey(errors.New("write row: duplicate key value violates unique constraint \"widgets_name_key\"")))
 	assert.False(t, classifier.IsDuplicateKey(&pgconn.PgError{Code: "40P01"}))
+	assert.False(t, classifier.IsDuplicateKey(errors.New("write failed")))
 	assert.False(t, classifier.IsDuplicateKey(nil))
 }

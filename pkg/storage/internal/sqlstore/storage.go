@@ -34,28 +34,45 @@ var _ storage.Storage = (*Storage)(nil)
 // New creates a MySQL storage instance.
 func New(db *sql.DB) *Storage {
 	dialect := MySQLDialect{}
-	return NewWithDependencies(db, dialect, dialect, dialect, namedlock.MySQL{}, NewMySQLErrorClassifier())
+	return NewWithDependencies(Dependencies{
+		DB:         db,
+		Binder:     dialect,
+		Dialect:    dialect,
+		Identity:   dialect,
+		Locker:     namedlock.MySQL{},
+		Classifier: NewMySQLErrorClassifier(),
+	})
+}
+
+// Dependencies contains the database-specific behavior used by Storage.
+type Dependencies struct {
+	DB         *sql.DB
+	Binder     binder
+	Dialect    Dialect
+	Identity   identityInserter
+	Locker     namedlock.Locker
+	Classifier ErrorClassifier
 }
 
 // NewWithDependencies creates a storage instance with partially parameterized
 // database dependencies. Stores that have not yet been parameterized retain
 // MySQL behavior.
-func NewWithDependencies(db *sql.DB, binder binder, dialect Dialect, identity identityInserter, locker namedlock.Locker, classifier ErrorClassifier) *Storage {
-	rdb := newRebindDB(db, binder)
+func NewWithDependencies(deps Dependencies) *Storage {
+	rdb := newRebindDB(deps.DB, deps.Binder)
 	return &Storage{
 		db:              rdb,
-		locks:           &lockStore{db: rdb, classifier: classifier},
-		plans:           &planStore{db: rdb, identity: identity, classifier: classifier},
-		applies:         &applyStore{db: rdb, dialect: dialect, identity: identity, locker: locker, classifier: classifier},
+		locks:           &lockStore{db: rdb, classifier: deps.Classifier},
+		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
+		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		tasks:           &taskStore{db: rdb, identity: MySQLDialect{}},
 		applyLogs:       &applyLogStore{db: rdb, identity: MySQLDialect{}},
-		controlRequests: &controlRequestStore{db: rdb, identity: identity, classifier: classifier},
+		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
 		applyComments:   &applyCommentStore{db: rdb, dialect: MySQLDialect{}},
 		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}},
-		applyOperations: &applyOperationStore{db: rdb, dialect: dialect, identity: identity, locker: locker, classifier: classifier},
-		checks:          &checkStore{db: rdb, dialect: dialect, classifier: classifier},
+		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
+		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: MySQLDialect{}},
-		webhookEvents:   &webhookEventStore{db: rdb, dialect: dialect, identity: identity, classifier: classifier},
+		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 	}
 }
 

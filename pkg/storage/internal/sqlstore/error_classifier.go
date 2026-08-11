@@ -49,6 +49,7 @@ func (mysqlErrorClassifier) IsDuplicateKey(err error) bool {
 	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDuplicateKey {
 		return true
 	}
+	// Defend against driver errors flattened to strings with %v in a call path.
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }
 
@@ -71,5 +72,9 @@ func (postgresErrorClassifier) IsRetryableConflict(err error) bool {
 
 func (postgresErrorClassifier) IsDuplicateKey(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == postgresErrUniqueViolation
+	if errors.As(err, &pgErr) && pgErr.Code == postgresErrUniqueViolation {
+		return true
+	}
+	// Defend against driver errors flattened to strings with %v in a call path.
+	return err != nil && strings.Contains(err.Error(), "duplicate key value violates unique constraint")
 }

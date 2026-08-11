@@ -20,10 +20,10 @@ const lockRetryBaseBackoff = 5 * time.Millisecond
 // with bounded attempts and jittered backoff. It returns promptly if the context
 // is cancelled between attempts.
 //
-// fn must be idempotent: a retried attempt was fully rolled back — the offending
-// statement, or the entire transaction when fn runs one — so re-running it from a
-// clean read is safe. Non-retryable errors (including genuine application
-// conflicts) are returned immediately, unchanged.
+// fn must be idempotent and either run one autocommit statement or own its entire
+// transaction. It must not run inside a caller-owned transaction: PostgreSQL
+// aborts the transaction after a statement error, while MySQL lock-wait timeouts
+// roll back only the statement. Non-retryable errors are returned unchanged.
 func withLockRetry(ctx context.Context, classifier ErrorClassifier, op string, fn func() error) error {
 	var lastErr error
 	for attempt := range lockRetryMaxAttempts {
