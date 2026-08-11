@@ -819,6 +819,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
+	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
@@ -895,6 +896,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		webhook.WithDurableWebhookDispatch(),
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
+	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
@@ -945,6 +947,32 @@ func webhookReconcileSynthesisOptions(logger *slog.Logger) []webhook.HandlerOpti
 		}
 	}
 	return []webhook.HandlerOption{webhook.WithWebhookReconcileSynthesis()}
+}
+
+// checkSuiteRecoveryOptions returns the handler option enabling durable
+// check_suite.requested recovery, unless the operator disabled it with
+// WEBHOOK_CHECK_SUITE_RECOVERY=false. The kill switch makes the webhook
+// endpoint acknowledge and ignore check_suite deliveries with a restart
+// instead of a code revert; the reconciler's missing-head scan remains the
+// recovery backstop either way. An unparseable value also disables recovery:
+// the only reason to set the variable is to turn recovery off, so a malformed
+// value ("off", "disabled") is treated as intent to disable — an operator
+// reaching for a kill switch mid-incident must get the switched-off behavior,
+// not a warning in pod logs they are not watching.
+func checkSuiteRecoveryOptions(logger *slog.Logger) []webhook.HandlerOption {
+	if value := os.Getenv("WEBHOOK_CHECK_SUITE_RECOVERY"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			logger.Error("invalid WEBHOOK_CHECK_SUITE_RECOVERY value; check-suite recovery disabled (fail-safe) — lost auto-plan deliveries recover only via the reconciler",
+				"value", value, "error", err)
+			return nil
+		}
+		if !enabled {
+			logger.Info("check-suite recovery disabled by WEBHOOK_CHECK_SUITE_RECOVERY; lost auto-plan deliveries recover only via the reconciler")
+			return nil
+		}
+	}
+	return []webhook.HandlerOption{webhook.WithCheckSuiteRecovery()}
 }
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server

@@ -174,6 +174,9 @@ type Handler struct {
 	webhookReconcileGrace     time.Duration
 	webhookReconcileMaxPages  int
 
+	checkSuiteRecovery      bool
+	checkSuiteRecoveryGrace time.Duration
+
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
 	priorEnvCheckRetryInterval time.Duration
@@ -230,6 +233,19 @@ func WithWebhookReconcileSynthesis() HandlerOption {
 	}
 }
 
+// WithCheckSuiteRecovery feeds check_suite.requested deliveries into the
+// durable inbox as a redundant convergence signal: each is enqueued with a
+// not-before time (the recovery grace) and, once claimable, synthesizes a
+// recovery delivery for any open PR still at the suite head whose auto-plan
+// coverage is missing. It takes effect only alongside
+// WithDurableWebhookDispatch; without that, check_suite deliveries are
+// acknowledged and ignored.
+func WithCheckSuiteRecovery() HandlerOption {
+	return func(h *Handler) {
+		h.checkSuiteRecovery = true
+	}
+}
+
 // NewHandler creates a new webhook handler for the legacy single-App
 // configuration. The provided factory is registered in the internal
 // ClientSet under the "default" App name so per-repo client resolution
@@ -272,6 +288,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
@@ -731,6 +748,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		recordProcessed()
 	case "check_run":
 		h.handleCheckRun(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
+	case "check_suite":
+		h.handleCheckSuite(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "pull_request":
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
