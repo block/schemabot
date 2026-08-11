@@ -31,6 +31,8 @@ import (
 const applyOperationKeyMaxLen = 255
 const finalizerOperationKeySegment = "group_finalizer"
 
+const postgresVerdictUnavailableReason = "PostgreSQL classifier verdict unavailable; this change cannot be applied"
+
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
 	Database    string                         `json:"database"`
@@ -553,6 +555,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 		return nil, nil, err
 	}
+	if resolvedTarget.DatabaseType == storage.DatabaseTypePostgres {
+		blockPostgresPlanWithoutClassifierVerdicts(resp)
+	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
 	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
@@ -586,6 +591,38 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	// at rollup time.
 	planResp.Deployment = deployment
 	return resp, planResp, nil
+}
+
+// blockPostgresPlanWithoutClassifierVerdicts is the fail-closed seam for the
+// PostgreSQL classifier adapter. Until that adapter supplies authoritative
+// per-statement verdicts, no PostgreSQL statement is eligible to execute.
+func blockPostgresPlanWithoutClassifierVerdicts(resp *ternv1.PlanResponse) {
+	if resp == nil {
+		return
+	}
+	block := func(change *ternv1.TableChange) {
+		if change == nil {
+			return
+		}
+		change.ExecutionMode = "blocked"
+		change.ModeReason = postgresVerdictUnavailableReason
+	}
+	for _, schemaChange := range resp.Changes {
+		if schemaChange == nil {
+			continue
+		}
+		for _, tableChange := range schemaChange.TableChanges {
+			block(tableChange)
+		}
+	}
+	for _, shard := range resp.Shards {
+		if shard == nil {
+			continue
+		}
+		for _, tableChange := range shard.Changes {
+			block(tableChange)
+		}
+	}
 }
 
 type storedPlanRoute struct {
