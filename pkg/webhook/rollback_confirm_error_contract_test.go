@@ -155,7 +155,10 @@ func TestRollbackConfirmCommandCoreBootstrapFailureIsRetryable(t *testing.T) {
 // A GitHub App resolution failure inside the bootstrap is deterministic per
 // deployment config — the same repo resolves to the same missing App on every
 // attempt — so the core must report it as terminal rather than re-driving a
-// delivery that can only fail until an operator fixes the config.
+// delivery that can only fail until an operator fixes the config. The command
+// never ran and no PR comment could be posted, so the core also returns the
+// error: the delivery is recorded as failed (its only triage trail) rather
+// than completed.
 func TestRollbackConfirmCommandCoreAppResolutionFailureIsTerminal(t *testing.T) {
 	h := &Handler{
 		ghClients: ghclient.NewClientSet(nil),
@@ -164,7 +167,8 @@ func TestRollbackConfirmCommandCoreAppResolutionFailureIsTerminal(t *testing.T) 
 
 	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "hubot", rollbackConfirmCommand())
 
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGitHubAppResolution)
 	assert.False(t, retry, "a deterministic GitHub App resolution failure must not be re-driven; recovery is fixing the deployment config")
 }
 

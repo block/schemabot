@@ -437,9 +437,13 @@ func isRollbackConfirmRejection(err error) bool {
 //     attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (no pending rollback, a deterministic pinned-plan rejection, an
-//     authorization block on the merits, a GitHub App resolution failure,
-//     nothing left to roll back, or any exit at or after the ExecuteApply
-//     dispatch).
+//     authorization block on the merits, nothing left to roll back, or any
+//     exit at or after the ExecuteApply dispatch).
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure): the delivery must not be
+//     re-driven, but the command never ran and no PR comment could be posted,
+//     so the error is recorded on the delivery as its only triage trail
+//     rather than marking it completed.
 //
 // Every exit at or after the ExecuteApply call is terminal regardless of
 // outcome: once the dispatch is attempted, the rollback DDL may already be
@@ -469,12 +473,15 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		// A GitHub App resolution failure inside the bootstrap is deterministic
 		// per deployment config, so a re-drive reproduces it; recovery is an
 		// operator fixing the App mapping and the user re-issuing the command.
-		// Other bootstrap failures (an installation token fetch, for example)
-		// are transient and stay retryable.
+		// The command never ran and no PR comment could be posted, so the
+		// error is returned (with retry=false) to record the failure on the
+		// delivery instead of marking it completed. Other bootstrap failures
+		// (an installation token fetch, for example) are transient and stay
+		// retryable.
 		if errors.Is(err, errGitHubAppResolution) {
 			h.logger.Error("rollback-confirm blocked: cannot resolve GitHub App client for repo",
 				"repo", repo, "pr", pr, "environment", environment, "error", err)
-			return false, nil
+			return false, fmt.Errorf("rollback-confirm command bootstrap %s#%d: %w", repo, pr, err)
 		}
 		h.logger.Error("rollback-confirm: failed to bootstrap command", "repo", repo, "pr", pr,
 			"environment", environment, "error", err)
