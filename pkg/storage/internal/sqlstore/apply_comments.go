@@ -109,7 +109,10 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 			SET edit_count = edit_count + 1, last_edited_at = NOW()
 			WHERE apply_id = ? AND comment_state = ?
 		`, applyID, commentState)
-		return err
+		if err != nil {
+			return fmt.Errorf("increment edit count for apply %d state %s: %w", applyID, commentState, err)
+		}
+		return nil
 	}
 	leaseJoin := ""
 	leasePredicate := ""

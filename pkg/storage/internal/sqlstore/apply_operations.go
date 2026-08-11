@@ -168,17 +168,18 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 }
 
 // execStateUpdate runs a guarded UPDATE against a single apply_operations row,
-// applying setClause with its placeholder args and the write guard's join /
-// predicate. It centralizes the guard load, argument ordering, error wrapping,
-// and idempotent row-existence check shared by the state-transition helpers, so
-// each one supplies only its SET clause, args, and error context.
-func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, setClause string, setArgs ...any) error {
+// applying the appropriate SET clause with its placeholder args and the write
+// guard's join / predicate. It centralizes the guard load, argument ordering,
+// error wrapping, and idempotent row-existence check shared by the
+// state-transition helpers.
+func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, unqualifiedSetClause, qualifiedSetClause string, setArgs ...any) error {
 	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	if guard.kind != operationGuardApply {
-		setClause = strings.ReplaceAll(setClause, "ao.", "")
+	setClause := unqualifiedSetClause
+	if guard.kind == operationGuardApply {
+		setClause = qualifiedSetClause
 	}
 	guardArgs := guard.args()
 	args := make([]any, 0, len(setArgs)+1+len(guardArgs))
@@ -205,7 +206,7 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 // repeat call would report 0; we disambiguate with an existence check.
 func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, "update apply_operations state",
-		"ao.state = ?", newState)
+		"state = ?", "ao.state = ?", newState)
 }
 
 // MarkStarted sets state=running and stamps started_at=NOW().
@@ -215,6 +216,7 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 // against an already-started row is a no-op and returns nil.
 func (s *applyOperationStore) MarkStarted(ctx context.Context, id int64) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation started",
+		"state = ?, started_at = COALESCE(started_at, NOW())",
 		"ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW())", state.ApplyOperation.Running)
 }
 
@@ -436,6 +438,7 @@ func operationWriteGuardFromContext(ctx context.Context) (operationWriteGuard, e
 // don't spuriously return ErrApplyOperationNotFound.
 func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation completed",
+		"state = ?, completed_at = COALESCE(completed_at, NOW())",
 		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", state.ApplyOperation.Completed)
 }
 
@@ -448,6 +451,7 @@ func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error
 // a missing row.
 func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg string) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation failed",
+		"state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())",
 		"ao.state = ?, ao.error_message = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())",
 		state.ApplyOperation.Failed, nullString(errMsg))
 }
@@ -462,6 +466,7 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 // is a no-op, so a re-issue against an already-terminal row returns nil.
 func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, fmt.Sprintf("mark apply_operation terminal (state=%s)", newState),
+		"state = ?, completed_at = COALESCE(completed_at, NOW())",
 		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", newState)
 }
 

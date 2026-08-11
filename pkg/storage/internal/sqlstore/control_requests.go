@@ -149,27 +149,17 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 		}
 		return nil
 	}
-	leaseJoin := ""
-	leasePredicate := ""
-	args := []any{storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending}
-	if hasLease {
-		leaseJoin = " JOIN applies a ON a.id = cr.apply_id"
-		leasePredicate = " AND a.lease_token = ?"
-		args = append(args, lease.Token)
-	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_control_requests cr
-		`+leaseJoin+`
+		JOIN applies a ON a.id = cr.apply_id
 		SET cr.status = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
-			WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?`+leasePredicate+`
-		`, args...)
+		WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?
+	`, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
 		return fmt.Errorf("complete pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
-	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "completed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
-			return err
-		}
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "completed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -190,27 +180,17 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 		}
 		return nil
 	}
-	leaseJoin := ""
-	leasePredicate := ""
-	args := []any{storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending}
-	if hasLease {
-		leaseJoin = " JOIN applies a ON a.id = cr.apply_id"
-		leasePredicate = " AND a.lease_token = ?"
-		args = append(args, lease.Token)
-	}
 	result, err := s.db.ExecContext(ctx, `
-			UPDATE apply_control_requests cr
-			`+leaseJoin+`
-			SET cr.status = ?, cr.error_message = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
-			WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?`+leasePredicate+`
-		`, args...)
+		UPDATE apply_control_requests cr
+		JOIN applies a ON a.id = cr.apply_id
+		SET cr.status = ?, cr.error_message = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
+		WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?
+	`, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
 		return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
-	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "failed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
-			return err
-		}
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "failed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
+		return err
 	}
 	return nil
 }
