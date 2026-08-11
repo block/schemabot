@@ -1693,6 +1693,9 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     find the delivery in the driver logs and inspect its last_error.
 //   - "retrying": processing failed retryably; the row waits for its retry
 //     window.
+//   - "superseded": the claimed auto-plan delivery was discarded without
+//     processing because a newer covering delivery exists for the same pull
+//     request; the successor performs the work.
 //   - "released": the pool shut down mid-flight and refunded the claim.
 //   - "lease_lost": the driver lost delivery ownership (heartbeat failure or
 //     a lease-token mismatch recording the finish); another driver owns the
@@ -1705,6 +1708,7 @@ var knownWebhookDispatchOutcomes = map[string]bool{
 	"failed":           true,
 	"failed_permanent": true,
 	"retrying":         true,
+	"superseded":       true,
 	"released":         true,
 	"lease_lost":       true,
 	"finish_error":     true,

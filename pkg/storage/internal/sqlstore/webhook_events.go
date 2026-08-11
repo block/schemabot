@@ -85,6 +85,10 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 // GitHub's "Redeliver" reuses the original delivery GUID, so plain dedup would
 // make redelivery a permanent no-op for a terminal row — the one case where an
 // operator most needs it to work. Re-open:
+//   - superseded rows: the row's work was discarded at claim time in favor of
+//     a covering successor; an operator redelivering it explicitly asks for it
+//     to run, and the reopen's refreshed received_at makes it the PR's newest
+//     delivery so a fresh claim cannot immediately supersede it again.
 //   - failed and completed rows: a completed row can still have lost its
 //     follow-on work if the process died after the delivery was marked completed
 //     but before the detached plan goroutines durably recorded their plans.
@@ -124,9 +128,9 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
 		WHERE provider = ? AND delivery_id = ?
-			AND (state IN (?, ?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
+			AND (state IN (?, ?, ?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
 	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
-		storage.WebhookEventFailed, storage.WebhookEventFailedPermanent, storage.WebhookEventCompleted, storage.WebhookEventProcessing)
+		storage.WebhookEventFailed, storage.WebhookEventFailedPermanent, storage.WebhookEventCompleted, storage.WebhookEventSuperseded, storage.WebhookEventProcessing)
 	if err != nil {
 		return false, fmt.Errorf("reopen webhook delivery for redelivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
@@ -198,16 +202,21 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	// permanently failed (dead-lettered) row covers its head in either GUID
 	// form: the driver proved no retry can plan that head, so resurrecting
 	// it would replay the same deterministic failure on every reconcile
-	// pass.
+	// pass. A superseded row never covers: its work was discarded on the
+	// promise that a covering successor performs it, so it cannot itself
+	// attest coverage — when the successor's coverage lapses (e.g. it
+	// targeted a different head and the PR reopened on this one), the
+	// reconciler must be free to synthesize.
 	args := []any{provider, repository, pullRequest, headSHA}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
-	args = append(args, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
+	args = append(args, storage.WebhookEventSuperseded, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
 	var one int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT 1
 		FROM webhook_events
 		WHERE provider = ? AND repository = ? AND pull_request = ? AND head_sha = ?
 			AND event = 'pull_request' AND action IN (`+placeholders(len(storage.AutoPlanPullRequestActions))+`)
+			AND state <> ?
 			AND (state <> ? OR delivery_id NOT LIKE ?)
 		LIMIT 1
 	`, args...).Scan(&one)
@@ -218,6 +227,90 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 		return false, err
 	}
 	return true, nil
+}
+
+// SupersedeIfCovered marks a claimed auto-plannable pull_request event
+// superseded when a strictly newer covering delivery exists for the same
+// (provider, repository, pull request). One conditional UPDATE does the whole
+// check-and-supersede: the lease-token and processing-state guards make it
+// safe against a lost claim, and the auto-plan-only guard on the updated row
+// keeps closed deliveries from ever being superseded. The covering-successor
+// subquery is wrapped in a derived table because MySQL rejects a direct
+// self-reference to the update target in a subquery.
+//
+// Newness is a strictly greater received_at, not insertion order: a Redeliver
+// reopen refreshes received_at on its original row, so the reopened row is
+// the PR's newest delivery and pre-existing rows cannot supersede the
+// operator's explicit request. received_at has second precision, so
+// same-second deliveries never cover each other — they simply both process,
+// which is the safe direction for an optimization. A successor covers only in
+// states whose work will run, is running, or has run — pending, completed,
+// retryable under the attempt cap, or processing with a live lease or
+// reclaimable under the cap. A processing row at the cap with an expired
+// lease is a dead driver's leftover that only terminalizes, and terminally
+// failed / superseded rows never run — none of those may justify discarding
+// older work.
+func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	if event.LeaseToken == "" {
+		return false, fmt.Errorf("webhook event lease token is required")
+	}
+	if event.Repository == "" || event.PullRequest == 0 {
+		return false, fmt.Errorf("supersede webhook event %d: repository and pull request are required for coalescing", event.ID)
+	}
+	provider := event.Provider
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
+	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
+	args := []any{storage.WebhookEventSuperseded, event.ID, event.LeaseToken, storage.WebhookEventProcessing}
+	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
+	args = append(args, provider, event.Repository, event.PullRequest, event.ReceivedAt)
+	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
+	args = append(args,
+		storage.PullRequestClosedAction,
+		storage.WebhookEventPending, storage.WebhookEventCompleted,
+		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id = ? AND lease_token = ? AND state = ?
+			AND event = 'pull_request' AND action IN (`+autoPlanIn+`)
+			AND EXISTS (
+				SELECT 1 FROM (
+					SELECT 1
+					FROM webhook_events
+					WHERE provider = ? AND repository = ? AND pull_request = ?
+						AND received_at > ?
+						AND event = 'pull_request'
+						AND (action IN (`+autoPlanIn+`) OR action = ?)
+						AND (
+							state IN (?, ?)
+							OR (state = ? AND attempts < ?)
+							OR (state = ? AND (lease_expires_at > `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+` OR attempts < ?))
+						)
+					LIMIT 1
+				) AS covering_successor
+			)
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("supersede webhook event %d (repo=%s, pr=%d): %w", event.ID, event.Repository, event.PullRequest, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read superseded webhook event %d rows affected: %w", event.ID, err)
+	}
+	if rows > 0 {
+		event.State = storage.WebhookEventSuperseded
+		return true, nil
+	}
+	// No row updated: either no covering successor exists (the claim is still
+	// held, keep processing) or the claim was lost. checkWebhookEventLeaseResult
+	// distinguishes the two by re-reading the lease token.
+	if err := s.checkWebhookEventLeaseResult(ctx, result, event.ID, event.LeaseToken); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*storage.WebhookEvent, error) {

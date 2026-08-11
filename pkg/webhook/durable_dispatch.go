@@ -226,6 +226,12 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
 	}
 
+	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {
+		if h.supersedeCoveredAutoPlan(ctx, driverID, store, event, appName, claimedAt) {
+			return
+		}
+	}
+
 	runCtx, cancelRun := context.WithCancel(ctx)
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
@@ -360,6 +366,42 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+}
+
+// supersedeCoveredAutoPlan coalesces a freshly claimed auto-plannable
+// pull_request delivery against newer deliveries for the same PR: when a
+// covering successor exists (one that will plan the PR again or close it),
+// the claimed delivery is marked superseded instead of planning a stale head.
+// It reports whether the claim was finished here — superseded, or ownership
+// lost while superseding — so the caller skips processing. A storage error
+// keeps the claim alive: coalescing is an optimization, and re-planning a
+// possibly-stale head is idempotent, so the delivery processes normally
+// rather than failing on a coalescing query error.
+func (h *Handler) supersedeCoveredAutoPlan(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent, appName string, claimedAt time.Time) bool {
+	superseded, err := store.SupersedeIfCovered(ctx, event)
+	if err != nil {
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "lease_lost", time.Since(claimedAt))
+			h.logger.Warn("durable webhook driver lost the delivery lease while checking for a covering successor; another driver owns the delivery or the row is gone",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest)
+			return true
+		}
+		h.logger.Warn("durable webhook driver could not check the delivery for a covering successor; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	if !superseded {
+		return false
+	}
+	metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "superseded", time.Since(claimedAt))
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	h.logger.Info("durable webhook driver superseded stale auto-plan delivery; a newer delivery for the same pull request covers it",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA)
+	return true
 }
 
 // safeProcessDurableWebhookEvent runs process with panic recovery. The legacy

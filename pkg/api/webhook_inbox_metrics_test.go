@@ -65,6 +65,10 @@ func (f *fakeWebhookEventStore) HasEventForHead(context.Context, string, string,
 	return false, errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) SupersedeIfCovered(context.Context, *storage.WebhookEvent) (bool, error) {
+	return false, errors.New("unused")
+}
+
 func (f *fakeWebhookEventStore) TerminateStuckProcessing(context.Context, string) (int64, error) {
 	return 0, errors.New("unused")
 }
@@ -144,6 +148,7 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 		"completed":        10,
 		"failed":           4,
 		"failed_permanent": 5,
+		"superseded":       0,
 		"unknown":          0,
 	}, depthByState)
 	assert.True(t, oldestFound)
