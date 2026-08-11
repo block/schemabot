@@ -212,9 +212,18 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		// first claim, and a retry claim's wait is the retry window, not
 		// backlog latency. A shutdown-released claim refunds its attempt —
 		// the refund means no genuine attempt happened — so the reclaim is
-		// the effective first attempt and records lag again, measured from
-		// the original receipt.
-		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(event.ReceivedAt))
+		// the effective first attempt and records lag again. Lag is measured
+		// from when the row became eligible for dispatch (ClaimableSince):
+		// a row created with a not-before time waits out its grace period by
+		// design, and counting that deferral as lag would saturate the
+		// histogram's upper percentiles and mask real backlog regressions.
+		lagSince := event.ClaimableSince
+		if lagSince.IsZero() {
+			// A store that does not derive ClaimableSince falls back to
+			// receipt — the pre-deferral behavior, never a bogus epoch lag.
+			lagSince = event.ReceivedAt
+		}
+		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
 	}
 
 	runCtx, cancelRun := context.WithCancel(ctx)

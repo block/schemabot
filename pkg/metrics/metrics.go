@@ -1591,6 +1591,11 @@ var knownWebhookInboxStates = func() map[string]bool {
 // delivery that will never retry and needs explicit operator action (GitHub
 // Redeliver for an organic delivery; a new head push or check re-run for a
 // synthesized one).
+//
+// One caveat on pending: a row created with a not-before time sits in pending
+// by design until it becomes due, so steady nonzero pending depth alone does
+// not imply dispatch lag — cross-check the oldest-claimable-age gauge, which
+// counts only dispatchable rows.
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -1603,9 +1608,11 @@ func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 }
 
 // RecordWebhookInboxOldestClaimableAge records how long the oldest
-// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
-// inbox's backlog latency: a value climbing past the dispatch cadence means work
-// is acked but not being picked up.
+// ready-to-claim-but-unclaimed inbox row has been claimable, in seconds. Age
+// counts from when the row became claimable — the later of receipt and its
+// not-before/retry time — so a deliberately deferred row does not report its
+// grace period as backlog. It is the inbox's backlog latency: a value climbing
+// past the dispatch cadence means work is acked but not being picked up.
 func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
 	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
 		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
@@ -1637,16 +1644,19 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 }
 
 // RecordWebhookInboxDispatchLag records how long an accepted delivery waited
-// in the durable inbox before a driver first claimed it. This is the
-// per-delivery counterpart of the oldest-claimable-age gauge: the gauge shows
-// the backlog's worst case right now, while this histogram shows the lag every
-// delivery actually experienced. A distribution drifting past the dispatch
-// poll cadence means accepted deliveries are waiting on driver capacity —
-// investigate driver-pool sizing and claim-query health. One caveat: a
-// shutdown-released claim refunds its attempt, so the delivery's reclaim
-// counts as the first attempt again and records another sample measured from
-// the original receipt — deploy churn therefore adds extra, longer samples
-// without any driver-capacity problem. Unknown event types fold to "unknown"
+// dispatchable in the durable inbox before a driver first claimed it — from
+// when the row became eligible (receipt, or its not-before time for a
+// deliberately deferred row), so a deferral's grace period never counts as
+// lag. This is the per-delivery counterpart of the oldest-claimable-age
+// gauge: the gauge shows the backlog's worst case right now, while this
+// histogram shows the lag every delivery actually experienced. A distribution
+// drifting past the dispatch poll cadence means accepted deliveries are
+// waiting on driver capacity — investigate driver-pool sizing and claim-query
+// health. One caveat: a shutdown-released claim refunds its attempt, so the
+// delivery's reclaim counts as the first attempt again and records another
+// sample measured from the original eligibility time — deploy churn therefore
+// adds extra, longer samples without any driver-capacity problem. Unknown
+// event types fold to "unknown"
 // and negative lags (cross-pod clock skew between the enqueueing and claiming
 // replica) clamp to zero so the histogram stays trustworthy. appName is the
 // resolved GitHub App name used only for fold-log attribution; it is not a
@@ -1660,7 +1670,7 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 		lag = 0
 	}
 	recordHistogram(ctx, "schemabot.webhook.inbox_dispatch_lag_seconds", lag.Seconds(),
-		"Time from webhook receipt to the delivery's first dispatch claim",
+		"Time a webhook delivery spent dispatchable before its first dispatch claim",
 		EnvironmentAttribute(""),
 		attribute.String("event_type", eventType),
 		attribute.String("repository", repo),

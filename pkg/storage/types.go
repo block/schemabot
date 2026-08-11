@@ -1478,8 +1478,12 @@ type WebhookInboxStats struct {
 	CountsByState map[string]int64
 
 	// OldestClaimableAge is how long the oldest ready-to-claim-but-unclaimed row
-	// (pending, or retryable with an elapsed retry window) has been waiting. It
-	// is the inbox's backlog latency; zero when nothing is waiting.
+	// (pending with no future not-before time, or retryable with an elapsed
+	// retry window) has been claimable. Age is measured from when the row
+	// became claimable — the later of receipt and its retry_after — not from
+	// receipt, so a row that spent time deliberately deferred does not report
+	// its grace period as backlog. It is the inbox's backlog latency; zero
+	// when nothing is waiting.
 	OldestClaimableAge time.Duration
 
 	// StuckProcessing is the number of rows wedged in processing with an expired
@@ -1505,6 +1509,12 @@ type WebhookEvent struct {
 	LeaseToken     string
 	LeaseExpiresAt *time.Time
 	RetryAfter     *time.Time
+	// ClaimableSince is when the row became eligible for dispatch: the later
+	// of receipt and its not-before time (retry_after). It is not a column —
+	// FindNext derives it on the returned event because the claim consumes
+	// retry_after, and the dispatcher needs the original eligibility time to
+	// measure dispatch lag without counting a deliberate deferral as backlog.
+	ClaimableSince time.Time
 	LastError      string
 	ReceivedAt     time.Time
 	StartedAt      *time.Time

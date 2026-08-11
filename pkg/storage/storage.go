@@ -266,9 +266,17 @@ type WebhookEventStore interface {
 	// MaxWebhookEventAttempts, so a poison event cannot be reclaimed forever.
 	// Returns nil when no event is claimable.
 	//
-	// Ordering is currently global FIFO (created_at, id). A contemplated
-	// evolution is per-(repository, pull_request) claiming with coalescing of
-	// superseded deliveries; callers should not depend on cross-key ordering.
+	// The claim consumes retry_after (the persisted row's is cleared); the
+	// returned event carries ClaimableSince — the later of receipt and the
+	// consumed not-before time — so the dispatcher can measure dispatch lag
+	// from when the row became eligible rather than from receipt.
+	//
+	// Ordering is currently global FIFO (created_at, id). A row that spent
+	// time deferred re-enters dispatch at its original insertion position once
+	// due — ahead of rows created during its deferral — not at its due time. A
+	// contemplated evolution is per-(repository, pull_request) claiming with
+	// coalescing of superseded deliveries; callers should not depend on
+	// cross-key ordering.
 	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
 
 	// Heartbeat extends the current lease. Returns ErrWebhookEventNotFound when
