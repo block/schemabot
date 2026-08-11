@@ -237,6 +237,73 @@ func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 	assert.Equal(t, "delivery-2", next.DeliveryID)
 }
 
+// A pending delivery created with a not-before time is durable immediately but
+// invisible to dispatch until the time passes: a deferred producer — a
+// redundant convergence signal that should lose the race to the primary
+// delivery — must not have its row claimed early, while a past or unset
+// not-before time leaves the row immediately claimable. The backlog gauge
+// agrees: a deferred row is not backlog, because no driver would take it yet.
+func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	future := time.Now().Add(time.Hour)
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "deferred", Event: "check_suite", Payload: []byte(`{}`), RetryAfter: &future,
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	deferred, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "deferred")
+	require.NoError(t, err)
+	require.NotNil(t, deferred)
+	require.NotNil(t, deferred.RetryAfter, "the not-before time must be persisted with the row")
+	assert.WithinDuration(t, future, *deferred.RetryAfter, 2*time.Second)
+
+	none, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, none, "a pending row with a future not-before time must not be claimable")
+
+	stats, err := store.WebhookEvents().InboxStats(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, stats.OldestClaimableAge, "a deferred pending row is not claimable backlog")
+	assert.Equal(t, int64(1), stats.CountsByState[storage.WebhookEventPending])
+
+	// An older sibling whose not-before time has already elapsed is claimed
+	// while the deferred row stays invisible.
+	past := time.Now().Add(-time.Hour)
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "due", Event: "check_suite", Payload: []byte(`{}`), RetryAfter: &past,
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, "due", claimed.DeliveryID, "an elapsed not-before time leaves the row claimable")
+
+	none, err = store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, none, "the deferred row must stay invisible while its not-before time is in the future")
+
+	// Once the not-before time elapses, the deferred row becomes ordinary
+	// pending backlog and is claimed like any other row.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events SET retry_after = NOW() - INTERVAL 1 SECOND
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookProviderGitHub, "deferred")
+	require.NoError(t, err)
+
+	ready, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, ready)
+	assert.Equal(t, "deferred", ready.DeliveryID, "an elapsed not-before time makes the deferred row claimable")
+	assert.Equal(t, storage.WebhookEventProcessing, ready.State)
+	assert.Nil(t, ready.RetryAfter, "the claim consumes the not-before time")
+}
+
 // A delivery's claimability must not depend on its payload width. Ordering the
 // claimable set must keep the payload out of the sort, so a single delivery
 // whose payload exceeds the server's sort buffer is claimed like any other row

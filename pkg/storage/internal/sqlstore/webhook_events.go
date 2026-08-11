@@ -55,13 +55,18 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 		receivedAt = time.Now()
 	}
 
+	// A caller-set RetryAfter is a not-before time: the row is durable
+	// immediately but stays invisible to FindNext until the time passes.
+	// Producers of deferred work — a redundant convergence signal that should
+	// lose the race to the primary delivery — use it to schedule dispatch
+	// without holding the delivery outside the inbox.
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO webhook_events (
 			provider, delivery_id, event, action, repository, pull_request, head_sha, tenant_id,
-			payload, state, attempts, received_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			payload, state, attempts, retry_after, received_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, provider, event.DeliveryID, event.Event, event.Action, event.Repository, event.PullRequest, event.HeadSHA, event.TenantID,
-		payload, state, event.Attempts, receivedAt)
+		payload, state, event.Attempts, nullTimePtr(event.RetryAfter), receivedAt)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
 			return s.reopenTerminalWebhookEvent(ctx, provider, event.DeliveryID, payload, receivedAt)
@@ -109,7 +114,9 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 //
 // pending/retryable rows and processing rows with a live (unexpired) lease are
 // genuinely in flight, so they dedup (return false). last_error is kept for
-// forensics until the next attempt overwrites it.
+// forensics until the next attempt overwrites it. The reopen clears
+// retry_after: Redeliver is an operator recovery lever, so the reopened row is
+// claimable immediately rather than re-deferred.
 func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, provider, deliveryID, payload string, receivedAt time.Time) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
@@ -143,15 +150,16 @@ func (s *webhookEventStore) GetByDeliveryID(ctx context.Context, provider, deliv
 }
 
 // webhookClaimablePredicate matches exactly the rows a driver would claim: a
-// pending row, a retryable row whose retry window has elapsed and is under the
-// attempt cap, or a processing row whose lease has expired and is under the
-// attempt cap. FindNext and the InboxStats backlog-age query derive from this
-// single source so the "ready to claim" definition cannot drift between what a
-// driver picks up and what the backlog gauge measures. Bind its placeholders
-// with webhookClaimableArgs.
+// pending row whose not-before time (retry_after) is unset or has passed, a
+// retryable row whose retry window has elapsed and is under the attempt cap,
+// or a processing row whose lease has expired and is under the attempt cap.
+// FindNext and the InboxStats backlog-age query derive from this single source
+// so the "ready to claim" definition cannot drift between what a driver picks
+// up and what the backlog gauge measures. Bind its placeholders with
+// webhookClaimableArgs.
 func (s *webhookEventStore) webhookClaimablePredicate() string {
 	return `(
-			state = ?
+			(state = ? AND (retry_after IS NULL OR retry_after <= ` + s.dialect.CurrentTimestamp(TimestampPrecisionDefault) + `))
 			OR (state = ? AND (retry_after IS NULL OR retry_after <= ` + s.dialect.CurrentTimestamp(TimestampPrecisionDefault) + `) AND attempts < ?)
 			OR (state = ? AND lease_expires_at <= ` + s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond) + ` AND attempts < ?)
 		)`
