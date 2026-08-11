@@ -111,6 +111,37 @@ func durableCheckSuiteEvent(t *testing.T, headSHA string, prNumbers ...int) *sto
 	}
 }
 
+// durableCheckSuiteForkEvent builds a claimed inbox row for a fork-headed
+// suite: head_branch is null in the payload and GitHub cannot name the PRs,
+// so processing must resolve them via the open-PR listing.
+func durableCheckSuiteForkEvent(t *testing.T, headSHA string) *storage.WebhookEvent {
+	t.Helper()
+
+	payload, err := json.Marshal(map[string]any{
+		"action": "requested",
+		"check_suite": map[string]any{
+			"head_sha":      headSHA,
+			"head_branch":   "",
+			"pull_requests": []map[string]any{},
+		},
+		"repository": map[string]any{
+			"full_name": "octocat/hello-world",
+		},
+		"installation": map[string]any{"id": 12345},
+	})
+	require.NoError(t, err)
+	return &storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: "delivery-check-suite-1",
+		Event:      "check_suite",
+		Action:     "requested",
+		Repository: "octocat/hello-world",
+		HeadSHA:    headSHA,
+		TenantID:   "12345",
+		Payload:    payload,
+	}
+}
+
 // writeSinglePR responds to a GET /repos/{repo}/pulls/{n} fetch with a PR in
 // the given lifecycle state at the given current head.
 func writeSinglePR(t *testing.T, w http.ResponseWriter, number int, state, headSHA string) {
@@ -238,33 +269,76 @@ func TestCheckSuiteWebhookRejectsUnregisteredRepo(t *testing.T) {
 	require.Nil(t, row)
 }
 
-// check_suite.requested fires for every push to every branch; a push landing
-// on the default branch cannot be an open PR head from this repository, so
-// the busiest non-PR traffic source is filtered before it occupies a row.
-// Fork heads arrive with an empty head_branch and must pass through.
-func TestCheckSuiteWebhookSkipsDefaultBranchButKeepsForkHeads(t *testing.T) {
+// check_suite.requested fires for every push to every branch, but GitHub
+// names the open PRs at a same-repository head in the payload — so a
+// non-fork suite with an empty list had no open PR at delivery time and is
+// dropped before it occupies an inbox row, regardless of branch. A suite
+// that does name a PR is queued even when its head is the default branch (a
+// promotion/backport PR), and fork heads — empty head_branch, whose payload
+// cannot name PRs — pass through for API resolution.
+func TestCheckSuiteWebhookSkipsHeadsWithoutOpenPRs(t *testing.T) {
+	tests := []struct {
+		name        string
+		headBranch  string
+		prNumbers   []int
+		wantMessage string
+		wantQueued  bool
+	}{
+		{name: "branch push without a PR", headBranch: "feature",
+			wantMessage: `{"message":"check_suite without an open PR skipped"}`},
+		{name: "default-branch push without a PR", headBranch: "main",
+			wantMessage: `{"message":"check_suite without an open PR skipped"}`},
+		{name: "default-branch head with an open PR", headBranch: "main", prNumbers: []int{7},
+			wantMessage: `{"message":"check_suite recovery queued"}`, wantQueued: true},
+		{name: "fork head", headBranch: "",
+			wantMessage: `{"message":"check_suite recovery queued"}`, wantQueued: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newRecordingWebhookEventStore()
+			h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+
+			req := buildCheckSuiteWebhookRequest(t, "requested", "suite-sha", tt.headBranch, tt.prNumbers...)
+			req.Header.Set(headerDeliveryID, "delivery-cs-1")
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			require.JSONEq(t, tt.wantMessage, rr.Body.String())
+			row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-cs-1")
+			require.NoError(t, err)
+			if tt.wantQueued {
+				require.NotNil(t, row)
+			} else {
+				require.Nil(t, row)
+			}
+		})
+	}
+}
+
+// A payload missing its repository is malformed and must be rejected with a
+// 400 — not misfiled under the unregistered-repository metric with an empty
+// repo attribute.
+func TestCheckSuiteWebhookRejectsPayloadMissingRepo(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
 
-	req := buildCheckSuiteWebhookRequest(t, "requested", "suite-sha", "main", 7)
-	req.Header.Set(headerDeliveryID, "delivery-default-branch")
+	body, err := json.Marshal(map[string]any{
+		"action":      "requested",
+		"check_suite": map[string]any{"head_sha": "suite-sha", "head_branch": "feature"},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-GitHub-Event", "check_suite")
+	req.Header.Set(headerDeliveryID, "delivery-cs-1")
 	rr := httptest.NewRecorder()
+
 	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
-	require.JSONEq(t, `{"message":"default-branch check_suite skipped"}`, rr.Body.String())
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-default-branch")
+
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-cs-1")
 	require.NoError(t, err)
 	require.Nil(t, row)
-
-	forkReq := buildCheckSuiteWebhookRequest(t, "requested", "fork-sha", "")
-	forkReq.Header.Set(headerDeliveryID, "delivery-fork")
-	forkRR := httptest.NewRecorder()
-	h.ServeHTTP(forkRR, forkReq)
-	require.Equal(t, http.StatusOK, forkRR.Code)
-	require.JSONEq(t, `{"message":"check_suite recovery queued"}`, forkRR.Body.String())
-	forkRow, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-fork")
-	require.NoError(t, err)
-	require.NotNil(t, forkRow)
 }
 
 // GitHub redeliveries reuse the delivery GUID; the second arrival dedupes
@@ -386,8 +460,9 @@ func TestDurableCheckSuiteSkipsClosedAndMovedPRs(t *testing.T) {
 	}
 }
 
-// Fork heads arrive with an empty payload PR list, so processing falls back
-// to walking the repository's open PRs and matching by current head SHA.
+// Fork heads arrive with an empty payload PR list and a null head_branch, so
+// processing falls back to walking the repository's open PRs and matching by
+// current head SHA.
 func TestDurableCheckSuiteEmptyPayloadFallsBackToOpenPRScan(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
@@ -398,7 +473,7 @@ func TestDurableCheckSuiteEmptyPayloadFallsBackToOpenPRScan(t *testing.T) {
 		)
 	})
 
-	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha"))
+	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteForkEvent(t, "suite-sha"))
 
 	require.NoError(t, err)
 	require.False(t, retry)
@@ -410,8 +485,8 @@ func TestDurableCheckSuiteEmptyPayloadFallsBackToOpenPRScan(t *testing.T) {
 	require.Nil(t, other, "PRs at other heads must be untouched")
 }
 
-// A suite head that matches no open PR (a branch push without a PR) is a
-// clean no-op.
+// A fork suite head that matches no open PR is a clean no-op after the
+// listing walk comes back empty.
 func TestDurableCheckSuiteNoOpenPRMatchNoOps(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
@@ -419,10 +494,79 @@ func TestDurableCheckSuiteNoOpenPRMatchNoOps(t *testing.T) {
 		writeOpenPRs(t, w)
 	})
 
+	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteForkEvent(t, "suite-sha"))
+
+	require.NoError(t, err)
+	require.False(t, retry)
+}
+
+// A same-repository suite (non-empty head_branch) whose payload names no PRs
+// had no open PR at delivery time, so processing resolves nothing without
+// touching the open-PR listing — no route is registered on the fake server,
+// so any listing call would surface as an error.
+func TestDurableCheckSuiteSameRepoEmptyPRListSkipsOpenPRWalk(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h, _ := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+
 	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha"))
 
 	require.NoError(t, err)
 	require.False(t, retry)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	require.NoError(t, err)
+	require.Nil(t, row)
+}
+
+// One delivery can cover several PRs at the same head, and each PR's outcome
+// is independent: a PR whose auto-plan coverage already exists no-ops while
+// an uncovered sibling in the same pass still gets its recovery row.
+func TestDurableCheckSuiteMixedCoverageSynthesizesOnlyUncovered(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	coveringAutoPlanRow(t, store, 7, "suite-sha")
+	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	for _, pr := range []string{"7", "8"} {
+		mux.HandleFunc("/repos/octocat/hello-world/pulls/"+pr, func(w http.ResponseWriter, r *http.Request) {
+			num := 7
+			if strings.HasSuffix(r.URL.Path, "/8") {
+				num = 8
+			}
+			writeSinglePR(t, w, num, "open", "suite-sha")
+		})
+	}
+
+	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteEvent(t, "suite-sha", 7, 8))
+
+	require.NoError(t, err)
+	require.False(t, retry)
+	covered, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	require.NoError(t, err)
+	require.Nil(t, covered, "the covered PR must not get a recovery row")
+	uncovered, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 8, "suite-sha"))
+	require.NoError(t, err)
+	require.NotNil(t, uncovered, "the uncovered sibling must still be recovered")
+}
+
+// A malformed check_suite payload cannot be decoded, so the driver fails it
+// terminally (no retry) rather than crash-looping the fleet on a poison row.
+func TestDurableCheckSuiteDriverFailsMalformedTerminally(t *testing.T) {
+	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: "delivery-check-suite-malformed",
+		Event:      "check_suite",
+		Payload:    []byte(`{not json`),
+	})
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failed:
+		require.Nil(t, failure.retryAfter, "malformed payload must not be retried")
+		require.Contains(t, failure.errMsg, "decode durable check_suite delivery")
+	default:
+		t.Fatal("expected malformed check_suite event to be marked failed")
+	}
+	require.Empty(t, store.completed)
 }
 
 // A terminally failed synthesized row does not cover its head; the

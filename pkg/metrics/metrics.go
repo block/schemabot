@@ -1802,22 +1802,28 @@ func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string, re
 		attribute.String("outcome", outcome))
 }
 
-// RecordWebhookCheckSuiteRecovery counts per-PR outcomes of durable
-// check_suite.requested recovery processing. "covered" is the healthy steady
-// state — the organic pull_request delivery arrived during the recovery grace
-// and planned the head, so the redundant signal no-oped. "synthesized" means
-// the auto-plan delivery for an open PR head was genuinely lost and the
-// check_suite signal recovered it — investigate the upstream loss (edge auth,
-// GitHub send failures), not the recovery. "resynthesized" means the recovery
-// reopened a terminally failed synthesized row, so a sustained rate is the
-// same head failing repeatedly after recovery — investigate that head's
-// processing failure. "already_queued" means another recovery producer (the
-// reconciler or an earlier check_suite delivery) got there first.
-// "no_open_pr" means the suite head matched no open PR — expected for
-// non-default-branch pushes without a PR.
+// RecordWebhookCheckSuiteRecovery counts outcomes of durable
+// check_suite.requested recovery processing. "covered", "synthesized",
+// "resynthesized", and "already_queued" increment once per candidate PR (a
+// delivery can carry several), while "no_open_pr" increments once per
+// delivery when resolution finds no candidate at all; a delivery retried
+// under its attempt budget re-counts PRs it already observed on an earlier
+// attempt, so outcomes are per observation, not per unique PR. "covered" is
+// the healthy steady state — the organic pull_request delivery arrived
+// during the recovery grace and planned the head, so the redundant signal
+// no-oped. "synthesized" means the auto-plan delivery for an open PR head
+// was genuinely lost and the check_suite signal recovered it — investigate
+// the upstream loss (edge auth, GitHub send failures), not the recovery.
+// "resynthesized" means the recovery reopened a terminally failed
+// synthesized row, so a sustained rate is the same head failing repeatedly
+// after recovery — investigate that head's processing failure.
+// "already_queued" means another recovery producer (the reconciler or an
+// earlier check_suite delivery) got there first. "no_open_pr" means no PR
+// named by the delivery was still open at the suite head — its PRs closed or
+// moved on during the grace, or a fork head matched no open PR.
 func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome string) {
 	addCounter(ctx, "schemabot.webhook.check_suite_recovery_total",
-		"Total number of per-PR outcomes from durable check_suite recovery processing", "{event}",
+		"Total number of outcomes from durable check_suite recovery processing", "{event}",
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.String("outcome", outcome))

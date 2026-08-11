@@ -61,8 +61,7 @@ type checkSuitePayload struct {
 		} `json:"pull_requests"`
 	} `json:"check_suite"`
 	Repository struct {
-		FullName      string `json:"full_name"`
-		DefaultBranch string `json:"default_branch"`
+		FullName string `json:"full_name"`
 	} `json:"repository"`
 	Installation struct {
 		ID int64 `json:"id"`
@@ -96,6 +95,10 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite recovery disabled"})
 		return
 	}
+	if repo == "" || headSHA == "" {
+		h.writeError(w, http.StatusBadRequest, "check_suite payload missing repository or head SHA")
+		return
+	}
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
 		h.logger.Warn("webhook from unregistered repository",
 			"event", "check_suite", "action", payload.Action, "repo", repo,
@@ -104,21 +107,22 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "repository not registered"})
 		return
 	}
-	if repo == "" || headSHA == "" {
-		h.writeError(w, http.StatusBadRequest, "check_suite payload missing repository or head SHA")
-		return
-	}
-	// check_suite.requested fires for every push to every branch. A push to
-	// the default branch cannot be an open PR head from this repository (a PR
-	// from the default branch to itself does not exist), so the busiest
-	// non-PR traffic source — merges landing on the default branch — is
-	// filtered before it ever occupies an inbox row. Fork heads arrive with
-	// an empty head_branch and pass through.
-	if payload.CheckSuite.HeadBranch != "" && payload.CheckSuite.HeadBranch == payload.Repository.DefaultBranch {
-		h.logger.Debug("check_suite delivery skipped because the suite head is the default branch",
+	// check_suite.requested fires for every push to every branch, but GitHub
+	// names the open PRs at a same-repository head in the payload when it
+	// sends the delivery, so a non-fork suite with an empty list means no
+	// open PR existed at delivery time and there is nothing to recover.
+	// Skipping it here keeps the dominant non-PR traffic — pushes to branches
+	// (including the default branch) without an open PR — from occupying
+	// inbox rows and grace-delayed processing passes. A PR opened after the
+	// push produces its own pull_request.opened delivery, and the
+	// reconciler's missing-head scan backstops the exotic residue. Fork heads
+	// arrive with an empty head_branch and an empty list, so they pass
+	// through to processing's API-resolution fallback.
+	if payload.CheckSuite.HeadBranch != "" && len(payload.CheckSuite.PullRequests) == 0 {
+		h.logger.Debug("check_suite delivery skipped because no open PR existed at the suite head",
 			"repo", repo, "head_sha", headSHA, "branch", payload.CheckSuite.HeadBranch,
 			"delivery_id", deliveryID)
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "default-branch check_suite skipped"})
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite without an open PR skipped"})
 		return
 	}
 
@@ -129,7 +133,7 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 	}
 
 	retryAfter := time.Now().Add(h.checkSuiteRecoveryGrace)
-	inserted, err := h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
+	event := &storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
 		DeliveryID: deliveryID,
 		Event:      "check_suite",
@@ -139,7 +143,8 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		TenantID:   strconv.FormatInt(installationID, 10),
 		Payload:    body,
 		RetryAfter: &retryAfter,
-	})
+	}
+	inserted, err := h.enqueueDurableWebhookEvent(ctx, event)
 	if err != nil {
 		h.logger.Error("failed to enqueue durable check_suite recovery",
 			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
@@ -151,6 +156,16 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.logger.Info("durable check_suite delivery already queued",
 			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite recovery already queued"})
+		return
+	}
+	if event.ID == 0 {
+		// A zero ID after inserted=true means Create reopened a redelivered
+		// terminal row rather than inserting a fresh one, and a reopen clears
+		// the not-before time: Redeliver is an operator recovery lever, so
+		// the reopened row is claimable immediately.
+		h.logger.Info("durable check_suite recovery reopened by redelivery and claimable immediately",
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite recovery queued"})
 		return
 	}
 	h.logger.Info("durable check_suite recovery queued",
@@ -270,9 +285,10 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 // point-in-time snapshots taken when GitHub sent the delivery — and the
 // recovery grace means minutes have passed — so each is re-fetched and kept
 // only when the PR is still open at the same head; a moved or closed PR is
-// skipped because a fresher signal owns its new state. An empty payload list
-// (fork heads) falls back to a bounded walk of the repository's open PRs
-// matched by head SHA, whose listing is current at call time.
+// skipped because a fresher signal owns its new state. Only a fork head — an
+// empty head_branch, whose payload cannot name PRs — falls back to a bounded
+// walk of the repository's open PRs matched by head SHA, whose listing is
+// current at call time.
 func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, payload checkSuitePayload) (prs []int, retry bool, err error) {
 	if len(payload.CheckSuite.PullRequests) > 0 {
 		for _, candidate := range payload.CheckSuite.PullRequests {
@@ -300,6 +316,16 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 			prs = append(prs, candidate.Number)
 		}
 		return prs, false, nil
+	}
+	// GitHub names the open PRs for a same-repository head in the payload, so
+	// an empty list on a non-fork suite (a non-empty head_branch) means no
+	// open PR existed when the delivery was sent — a PR opened later produces
+	// its own pull_request.opened delivery. The API walk below exists only
+	// for fork heads, whose payload cannot name PRs.
+	if payload.CheckSuite.HeadBranch != "" {
+		h.logger.Debug("check_suite recovery resolved no PRs because the same-repository suite head had no open PR at delivery time",
+			"repo", repo, "head_sha", headSHA, "head_branch", payload.CheckSuite.HeadBranch)
+		return nil, false, nil
 	}
 	page := 1
 	for range h.webhookReconcileMaxPages {
