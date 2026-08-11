@@ -229,6 +229,61 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	return true, nil
 }
 
+// coveringSuccessorQuery builds the covering-successor predicate shared by
+// HasCoveringSuccessor and SupersedeIfCovered as a standalone SELECT 1 ...
+// LIMIT 1 query with its arguments, so the advisory probe and the guarded
+// write can never drift apart on what counts as a covering successor.
+func (s *webhookEventStore) coveringSuccessorQuery(provider string, event *storage.WebhookEvent) (string, []any) {
+	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
+	args := []any{provider, event.Repository, event.PullRequest, event.ReceivedAt}
+	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
+	args = append(args,
+		storage.PullRequestClosedAction,
+		storage.WebhookEventPending, storage.WebhookEventCompleted,
+		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
+		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	query := `
+		SELECT 1
+		FROM webhook_events
+		WHERE provider = ? AND repository = ? AND pull_request = ?
+			AND received_at > ?
+			AND event = 'pull_request'
+			AND (action IN (` + autoPlanIn + `) OR action = ?)
+			AND (
+				state IN (?, ?)
+				OR (state = ? AND attempts < ?)
+				OR (state = ? AND (lease_expires_at > ` + s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond) + ` OR attempts < ?))
+			)
+		LIMIT 1`
+	return query, args
+}
+
+// HasCoveringSuccessor is the read-only advisory probe for the covering
+// predicate SupersedeIfCovered enforces: it reports whether a covering
+// successor currently exists, without touching the claimed row or its lease.
+// The dispatcher uses it to decide whether verifying the claimed head against
+// the live PR is worth a GitHub call at all — the common no-successor claim
+// stays storage-only.
+func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	if event.Repository == "" || event.PullRequest == 0 {
+		return false, fmt.Errorf("check covering successor for webhook event %d: repository and pull request are required for coalescing", event.ID)
+	}
+	provider := event.Provider
+	if provider == "" {
+		provider = storage.WebhookProviderGitHub
+	}
+	query, args := s.coveringSuccessorQuery(provider, event)
+	var one int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check covering successor for webhook event %d (repo=%s, pr=%d): %w", event.ID, event.Repository, event.PullRequest, err)
+	}
+	return true, nil
+}
+
 // SupersedeIfCovered marks a claimed auto-plannable pull_request event
 // superseded when a strictly newer covering delivery exists for the same
 // (provider, repository, pull request). One conditional UPDATE does the whole
@@ -241,15 +296,18 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 // Newness is a strictly greater received_at, not insertion order: a Redeliver
 // reopen refreshes received_at on its original row, so the reopened row is
 // the PR's newest delivery and pre-existing rows cannot supersede the
-// operator's explicit request. received_at has second precision, so
-// same-second deliveries never cover each other — they simply both process,
-// which is the safe direction for an optimization. A successor covers only in
-// states whose work will run, is running, or has run — pending, completed,
-// retryable under the attempt cap, or processing with a live lease or
-// reclaimable under the cap. A processing row at the cap with an expired
-// lease is a dead driver's leftover that only terminalizes, and terminally
-// failed / superseded rows never run — none of those may justify discarding
-// older work.
+// operator's explicit request. Deliveries whose received_at ties at the
+// column's timestamp precision never cover each other — they simply both
+// process, which is the safe direction for an optimization. received_at is
+// arrival order, not push order, so a newer row can still carry an older
+// head; the caller confirms against the live PR that the claimed head is no
+// longer current before calling (see the interface contract). A successor
+// covers only in states whose work will run, is running, or has run —
+// pending, completed, retryable under the attempt cap, or processing with a
+// live lease or reclaimable under the cap. A processing row at the cap with
+// an expired lease is a dead driver's leftover that only terminalizes, and
+// terminally failed / superseded rows never run — none of those may justify
+// discarding older work.
 func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
 	if event.LeaseToken == "" {
 		return false, fmt.Errorf("webhook event lease token is required")
@@ -262,35 +320,17 @@ func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *stora
 		provider = storage.WebhookProviderGitHub
 	}
 	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
+	successorQuery, successorArgs := s.coveringSuccessorQuery(provider, event)
 	args := []any{storage.WebhookEventSuperseded, event.ID, event.LeaseToken, storage.WebhookEventProcessing}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
-	args = append(args, provider, event.Repository, event.PullRequest, event.ReceivedAt)
-	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
-	args = append(args,
-		storage.PullRequestClosedAction,
-		storage.WebhookEventPending, storage.WebhookEventCompleted,
-		storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts,
-		storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts)
+	args = append(args, successorArgs...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE webhook_events
 		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE id = ? AND lease_token = ? AND state = ?
 			AND event = 'pull_request' AND action IN (`+autoPlanIn+`)
 			AND EXISTS (
-				SELECT 1 FROM (
-					SELECT 1
-					FROM webhook_events
-					WHERE provider = ? AND repository = ? AND pull_request = ?
-						AND received_at > ?
-						AND event = 'pull_request'
-						AND (action IN (`+autoPlanIn+`) OR action = ?)
-						AND (
-							state IN (?, ?)
-							OR (state = ? AND attempts < ?)
-							OR (state = ? AND (lease_expires_at > `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+` OR attempts < ?))
-						)
-					LIMIT 1
-				) AS covering_successor
+				SELECT 1 FROM (`+successorQuery+`) AS covering_successor
 			)
 	`, args...)
 	if err != nil {

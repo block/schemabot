@@ -65,6 +65,10 @@ func (f *fakeWebhookEventStore) HasEventForHead(context.Context, string, string,
 	return false, errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) HasCoveringSuccessor(context.Context, *storage.WebhookEvent) (bool, error) {
+	return false, errors.New("unused")
+}
+
 func (f *fakeWebhookEventStore) SupersedeIfCovered(context.Context, *storage.WebhookEvent) (bool, error) {
 	return false, errors.New("unused")
 }

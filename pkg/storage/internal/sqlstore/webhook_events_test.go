@@ -297,6 +297,9 @@ func TestWebhookEventStore_SupersedeIfCoveredSuccessorStates(t *testing.T) {
 			createCoalescingEvent(t, store, "new", tc.event, tc.action, "block/example", 7, "new-head", 0, tc.state, tc.attempts, tc.leaseExpiresAt)
 
 			claimed := claimCoalescingEvent(t, store, "old")
+			covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
+			require.NoError(t, err)
+			assert.Equal(t, tc.covers, covered, "the advisory probe must agree with the guarded write's predicate")
 			superseded, err := store.WebhookEvents().SupersedeIfCovered(ctx, claimed)
 			require.NoError(t, err)
 			assert.Equal(t, tc.covers, superseded)
@@ -341,6 +344,9 @@ func TestWebhookEventStore_SupersedeIfCoveredScopesToPullRequest(t *testing.T) {
 			createCoalescingEvent(t, store, "new", "pull_request", "synchronize", tc.repo, tc.pr, tc.headSHA, 0, storage.WebhookEventPending, 0, "")
 
 			claimed := claimCoalescingEvent(t, store, "old")
+			covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
+			require.NoError(t, err)
+			assert.Equal(t, tc.covers, covered, "the advisory probe must agree with the guarded write's predicate")
 			superseded, err := store.WebhookEvents().SupersedeIfCovered(ctx, claimed)
 			require.NoError(t, err)
 			assert.Equal(t, tc.covers, superseded)
@@ -368,11 +374,17 @@ func TestWebhookEventStore_SupersedeIfCoveredIgnoresEqualTimestamps(t *testing.T
 	require.NoError(t, err)
 
 	claimed := claimCoalescingEvent(t, store, "first")
+	covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
+	require.NoError(t, err)
+	assert.False(t, covered, "an equal-timestamp delivery must not count as a covering successor")
 	superseded, err := store.WebhookEvents().SupersedeIfCovered(ctx, claimed)
 	require.NoError(t, err)
 	assert.False(t, superseded, "an equal-timestamp delivery must not cover")
 
 	claimedSecond := claimCoalescingEvent(t, store, "second")
+	covered, err = store.WebhookEvents().HasCoveringSuccessor(ctx, claimedSecond)
+	require.NoError(t, err)
+	assert.False(t, covered, "equal-timestamp deliveries must not count as covering in either direction")
 	superseded, err = store.WebhookEvents().SupersedeIfCovered(ctx, claimedSecond)
 	require.NoError(t, err)
 	assert.False(t, superseded, "equal-timestamp deliveries must not cover in either direction")
@@ -391,6 +403,12 @@ func TestWebhookEventStore_SupersedeIfCoveredNeverSupersedesClosed(t *testing.T)
 	createCoalescingEvent(t, store, "reopened-new", "pull_request", "reopened", "block/example", 7, "new-head", 0, storage.WebhookEventPending, 0, "")
 
 	claimed := claimCoalescingEvent(t, store, "closed-old")
+	// The probe reports only successor existence — it knows nothing about
+	// the claimed row's action — so a true answer here is advisory and the
+	// guarded write still refuses to supersede the closed claim.
+	covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
+	require.NoError(t, err)
+	assert.True(t, covered, "a newer auto-plan delivery is a covering successor by the successor predicate")
 	superseded, err := store.WebhookEvents().SupersedeIfCovered(ctx, claimed)
 	require.NoError(t, err)
 	assert.False(t, superseded, "a closed delivery must never be superseded")
@@ -399,6 +417,29 @@ func TestWebhookEventStore_SupersedeIfCoveredNeverSupersedesClosed(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, storage.WebhookEventProcessing, got.State)
+}
+
+// The SQL guards the updated row's event type independently of the
+// dispatcher's gate: a claimed non-pull_request row that carries the
+// coalescing key (repository + PR) — and so passes the Go precondition —
+// must never be superseded, even when a newer auto-plan delivery exists.
+func TestWebhookEventStore_SupersedeIfCoveredNeverSupersedesNonPullRequestEvents(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	createCoalescingEvent(t, store, "check-run-old", "check_run", "created", "block/example", 7, "old-head", time.Minute, storage.WebhookEventPending, 0, "")
+	createCoalescingEvent(t, store, "plan-new", "pull_request", "synchronize", "block/example", 7, "new-head", 0, storage.WebhookEventPending, 0, "")
+
+	claimed := claimCoalescingEvent(t, store, "check-run-old")
+	superseded, err := store.WebhookEvents().SupersedeIfCovered(ctx, claimed)
+	require.NoError(t, err)
+	assert.False(t, superseded, "a non-pull_request claim must never be superseded")
+
+	got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "check-run-old")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, storage.WebhookEventProcessing, got.State, "the non-pull_request claim must stay processing")
 }
 
 // SupersedeIfCovered is a lease-guarded write: a stale token reports the lost
@@ -419,9 +460,17 @@ func TestWebhookEventStore_SupersedeIfCoveredGuardsLeaseAndInputs(t *testing.T) 
 	_, err := store.WebhookEvents().SupersedeIfCovered(ctx, &missingToken)
 	require.ErrorContains(t, err, "lease token is required")
 
+	// The read-only probe carries no lease semantics: it answers without a
+	// lease token but still rejects a claim missing the coalescing key.
+	covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, &missingToken)
+	require.NoError(t, err)
+	assert.True(t, covered, "the probe must answer without a lease token")
+
 	missingKey := *claimed
 	missingKey.Repository = ""
 	_, err = store.WebhookEvents().SupersedeIfCovered(ctx, &missingKey)
+	require.ErrorContains(t, err, "repository and pull request are required")
+	_, err = store.WebhookEvents().HasCoveringSuccessor(ctx, &missingKey)
 	require.ErrorContains(t, err, "repository and pull request are required")
 
 	staleToken := *claimed
@@ -470,12 +519,18 @@ func TestWebhookEventStore_SupersedeIfCoveredRedeliveryReopensAndWins(t *testing
 	// The reopened row is claimed first (FIFO by created_at) and is now the
 	// PR's newest delivery, so the still-pending delivery-b cannot cover it.
 	reclaimed := claimCoalescingEvent(t, store, "delivery-a")
+	covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, reclaimed)
+	require.NoError(t, err)
+	assert.False(t, covered, "rows predating the redelivery must not count as covering successors")
 	superseded, err = store.WebhookEvents().SupersedeIfCovered(ctx, reclaimed)
 	require.NoError(t, err)
 	assert.False(t, superseded, "a redelivered row must not be re-superseded by rows that predate the redelivery")
 
 	// The reopened row's live claim now covers delivery-b instead.
 	claimedB := claimCoalescingEvent(t, store, "delivery-b")
+	covered, err = store.WebhookEvents().HasCoveringSuccessor(ctx, claimedB)
+	require.NoError(t, err)
+	assert.True(t, covered, "the redelivered row must count as delivery-b's covering successor")
 	superseded, err = store.WebhookEvents().SupersedeIfCovered(ctx, claimedB)
 	require.NoError(t, err)
 	assert.True(t, superseded, "the redelivered row's live claim must cover the older delivery")

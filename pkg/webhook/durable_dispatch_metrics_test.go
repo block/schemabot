@@ -399,8 +399,10 @@ func TestDurableWebhookDispatchMetricsLeaseLostOutcome(t *testing.T) {
 func TestDurableWebhookDispatchMetricsSupersededOutcome(t *testing.T) {
 	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
 	store.supersedeCovered = true
-	h := newDurableDriverHandler(t, store, nil, nil)
+	factory, _ := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 

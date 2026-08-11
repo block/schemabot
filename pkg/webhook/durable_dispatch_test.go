@@ -132,6 +132,10 @@ func (s *recordingWebhookEventStore) Release(context.Context, int64, string) err
 	return errors.New("Release not implemented by recordingWebhookEventStore")
 }
 
+func (s *recordingWebhookEventStore) HasCoveringSuccessor(context.Context, *storage.WebhookEvent) (bool, error) {
+	return false, errors.New("HasCoveringSuccessor not implemented by recordingWebhookEventStore")
+}
+
 func (s *recordingWebhookEventStore) SupersedeIfCovered(context.Context, *storage.WebhookEvent) (bool, error) {
 	return false, errors.New("SupersedeIfCovered not implemented by recordingWebhookEventStore")
 }
@@ -231,6 +235,17 @@ type scriptedWebhookEventStore struct {
 	nextID       int64
 	heartbeatErr error
 
+	// coveringSuccessor makes HasCoveringSuccessor report every claimed
+	// auto-plannable pull_request event as having a covering successor, so
+	// tests can exercise the live-head confirmation and supersede paths.
+	coveringSuccessor bool
+	// coveringSuccessorErr is returned by HasCoveringSuccessor so tests can
+	// exercise the driver's fail-open (process anyway) probe-error path.
+	coveringSuccessorErr error
+	// coveringSuccessorCalls counts HasCoveringSuccessor invocations so
+	// tests can assert the driver only probes auto-plannable pull_request
+	// claims.
+	coveringSuccessorCalls int
 	// supersedeCovered makes SupersedeIfCovered report every claimed
 	// auto-plannable pull_request event as covered by a newer delivery, so
 	// tests can exercise the driver's superseded claim path.
@@ -239,7 +254,7 @@ type scriptedWebhookEventStore struct {
 	// the driver's fail-open (process anyway) coalescing-error path.
 	supersedeErr error
 	// supersedeCalls counts SupersedeIfCovered invocations so tests can
-	// assert the driver only coalesces auto-plannable pull_request claims.
+	// assert the guarded write only runs after live-head confirmation.
 	supersedeCalls int
 
 	// Optional injected finish errors, returned before the corresponding
@@ -314,6 +329,16 @@ func (s *scriptedWebhookEventStore) FindNext(_ context.Context, owner string, _ 
 
 func (s *scriptedWebhookEventStore) Heartbeat(context.Context, int64, string, time.Duration) error {
 	return s.heartbeatErr
+}
+
+func (s *scriptedWebhookEventStore) HasCoveringSuccessor(context.Context, *storage.WebhookEvent) (bool, error) {
+	s.queueMu.Lock()
+	s.coveringSuccessorCalls++
+	s.queueMu.Unlock()
+	if s.coveringSuccessorErr != nil {
+		return false, s.coveringSuccessorErr
+	}
+	return s.coveringSuccessor, nil
 }
 
 func (s *scriptedWebhookEventStore) SupersedeIfCovered(_ context.Context, event *storage.WebhookEvent) (bool, error) {
@@ -395,6 +420,27 @@ func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
 		Payload:     payload,
 		ReceivedAt:  time.Now(),
 	}
+}
+
+// newLiveHeadGitHubFactory wires a fakeClientFactory whose installation
+// client is backed by a fake GitHub server serving the claimed PR
+// (octocat/hello-world#7) with the given live head SHA and state, so tests
+// can script the live-head confirmation that gates coalescing. The returned
+// counter reports how many live PR fetches the driver issued.
+func newLiveHeadGitHubFactory(t *testing.T, liveHeadSHA, state string) (*fakeClientFactory, *atomic.Int32) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	fetches := &atomic.Int32{}
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		fetches.Add(1)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"number": 7,
+			"state":  state,
+			"head":   map[string]any{"sha": liveHeadSHA, "ref": "feature"},
+		}))
+	})
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+	return &fakeClientFactory{client: installClient}, fetches
 }
 
 func TestDurableWebhookDriverCompletesUnsupportedEvent(t *testing.T) {
@@ -636,13 +682,16 @@ func TestDurableWebhookDriverCompletesUnregisteredRepo(t *testing.T) {
 	}
 }
 
-// A claimed auto-plan delivery covered by a newer delivery for the same PR is
+// A claimed auto-plan delivery covered by a newer delivery for the same PR —
+// with GitHub confirming its head is no longer the PR's current head — is
 // discarded at claim time: the driver marks it superseded and never plans the
 // stale head, so a burst of pushes plans only the newest head.
 func TestDurableWebhookDriverSupersedesCoveredAutoPlan(t *testing.T) {
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
 	store.supersedeCovered = true
-	h := newDurableDriverHandler(t, store, nil, nil)
+	factory, fetches := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
 		t.Error("a superseded delivery must not be processed")
 		return false, nil
@@ -652,15 +701,83 @@ func TestDurableWebhookDriverSupersedesCoveredAutoPlan(t *testing.T) {
 
 	require.Empty(t, store.completed, "a superseded delivery must not be marked completed")
 	require.Empty(t, store.failed, "a superseded delivery must not be marked failed")
+	require.Equal(t, int32(1), fetches.Load(), "staleness must be confirmed against the live PR")
 }
 
-// Coalescing is an optimization: when the covering-successor check itself
+// A closed PR's auto-plan delivery is coalesced without a head comparison:
+// planning a closed PR is pointless, and the covering successor (the closed
+// delivery) runs the cleanup.
+func TestDurableWebhookDriverSupersedesAutoPlanForClosedPR(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
+	store.supersedeCovered = true
+	factory, _ := newLiveHeadGitHubFactory(t, "head-sha", "closed")
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		t.Error("a superseded delivery must not be processed")
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.completed)
+	require.Empty(t, store.failed)
+}
+
+// received_at is arrival order, not push order: a delayed or redelivered
+// old-head delivery can arrive after the delivery that carries the PR's real
+// current head. When GitHub confirms the claimed head IS the live head, the
+// claim must survive — discarding it could leave the newest head unplanned in
+// configurations without reconciler synthesis.
+func TestDurableWebhookDriverKeepsAutoPlanCarryingLiveHead(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
+	store.supersedeCovered = true
+	factory, fetches := newLiveHeadGitHubFactory(t, "head-sha", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1, "the delivery carrying the live head must process normally")
+	require.Empty(t, store.failed)
+	require.Equal(t, int32(1), fetches.Load())
+	store.queueMu.Lock()
+	supersedes := store.supersedeCalls
+	store.queueMu.Unlock()
+	require.Zero(t, supersedes, "a delivery confirmed to carry the live head must never reach the supersede write")
+}
+
+// Without a covering successor there is nothing to coalesce against, so the
+// driver must not spend a GitHub call verifying the head: the common
+// no-successor claim stays storage-only.
+func TestDurableWebhookDriverSkipsHeadCheckWithoutCoveringSuccessor(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	factory, fetches := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1)
+	require.Zero(t, fetches.Load(), "no covering successor must mean no live PR fetch")
+	store.queueMu.Lock()
+	supersedes := store.supersedeCalls
+	store.queueMu.Unlock()
+	require.Zero(t, supersedes)
+}
+
+// Coalescing is an optimization: when the covering-successor probe itself
 // fails, the claim stays alive and the delivery processes normally — planning
 // a possibly stale head is idempotent, dropping the claim on a query error is
 // not safe.
-func TestDurableWebhookDriverProcessesWhenSupersedeCheckFails(t *testing.T) {
+func TestDurableWebhookDriverProcessesWhenSuccessorProbeFails(t *testing.T) {
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
-	store.supersedeErr = errors.New("storage briefly unavailable")
+	store.coveringSuccessorErr = errors.New("storage briefly unavailable")
 	h := newDurableDriverHandler(t, store, nil, nil)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
 		return false, nil
@@ -668,17 +785,104 @@ func TestDurableWebhookDriverProcessesWhenSupersedeCheckFails(t *testing.T) {
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
-	require.Len(t, store.completed, 1, "a delivery whose coalescing check failed must process normally")
+	require.Len(t, store.completed, 1, "a delivery whose coalescing probe failed must process normally")
 	require.Empty(t, store.failed)
 }
 
-// Losing the claim while checking for a covering successor means another
-// driver owns the delivery; this driver walks away without processing or
-// writing a terminal state.
+// When the live-PR fetch that would confirm staleness fails, the driver
+// cannot know whether the claimed head is current, so it fails open and
+// processes the delivery normally instead of discarding it.
+func TestDurableWebhookDriverProcessesWhenLiveHeadFetchFails(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
+	store.supersedeCovered = true
+	client, _ := setupGitHubServer(t) // no PR route: the live fetch 404s
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")}
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1, "a delivery whose live-head check failed must process normally")
+	require.Empty(t, store.failed)
+	store.queueMu.Lock()
+	supersedes := store.supersedeCalls
+	store.queueMu.Unlock()
+	require.Zero(t, supersedes, "an unconfirmed head must never reach the supersede write")
+}
+
+// A claimed delivery without a stored head SHA cannot be verified against the
+// live PR, so it processes normally rather than being discarded on an
+// unverifiable comparison.
+func TestDurableWebhookDriverProcessesAutoPlanWithoutHeadSHA(t *testing.T) {
+	event := durablePullRequestEvent(t)
+	event.HeadSHA = ""
+	store := newScriptedWebhookEventStore(event)
+	store.coveringSuccessor = true
+	store.supersedeCovered = true
+	factory, fetches := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1)
+	require.Zero(t, fetches.Load(), "a delivery without a head SHA must not attempt live-head verification")
+}
+
+// The covering successor can disappear between the advisory probe and the
+// guarded write — the write re-evaluates the predicate atomically and answers
+// false, and the claim processes normally.
+func TestDurableWebhookDriverProcessesWhenSuccessorVanishesBeforeWrite(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
+	store.supersedeCovered = false
+	factory, _ := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1, "a claim whose successor vanished must process normally")
+	require.Empty(t, store.failed)
+	store.queueMu.Lock()
+	supersedes := store.supersedeCalls
+	store.queueMu.Unlock()
+	require.Equal(t, 1, supersedes, "the guarded write must have re-evaluated the predicate")
+}
+
+// When the guarded supersede write fails on storage, the claim stays alive
+// and the delivery processes normally.
+func TestDurableWebhookDriverProcessesWhenSupersedeWriteFails(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
+	store.supersedeErr = errors.New("storage briefly unavailable")
+	factory, _ := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, nil
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1, "a delivery whose supersede write failed must process normally")
+	require.Empty(t, store.failed)
+}
+
+// Losing the claim while superseding means another driver owns the delivery;
+// this driver walks away without processing or writing a terminal state.
 func TestDurableWebhookDriverStopsWhenSupersedeLosesLease(t *testing.T) {
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
 	store.supersedeErr = storage.ErrWebhookEventLeaseLost
-	h := newDurableDriverHandler(t, store, nil, nil)
+	factory, _ := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
 		t.Error("a lease-lost delivery must not be processed")
 		return false, nil
@@ -692,7 +896,7 @@ func TestDurableWebhookDriverStopsWhenSupersedeLosesLease(t *testing.T) {
 
 // Only auto-plannable pull_request claims are coalesced. A closed delivery's
 // cleanup must always run, and non-PR events have no per-PR successor notion,
-// so neither may reach the covering-successor check.
+// so neither may reach the covering-successor probe.
 func TestDurableWebhookDriverSkipsSupersedeForNonAutoPlanClaims(t *testing.T) {
 	closed := durablePullRequestEvent(t)
 	closed.Action = "closed"
@@ -702,6 +906,7 @@ func TestDurableWebhookDriverSkipsSupersedeForNonAutoPlanClaims(t *testing.T) {
 		Event:      "issue_comment",
 		Payload:    []byte(`{}`),
 	})
+	store.coveringSuccessor = true
 	store.supersedeCovered = true
 	h := newDurableDriverHandler(t, store, nil, nil)
 	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
@@ -712,9 +917,11 @@ func TestDurableWebhookDriverSkipsSupersedeForNonAutoPlanClaims(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	store.queueMu.Lock()
+	probes := store.coveringSuccessorCalls
 	calls := store.supersedeCalls
 	store.queueMu.Unlock()
-	require.Zero(t, calls, "closed and non-pull_request claims must never be checked for a covering successor")
+	require.Zero(t, probes, "closed and non-pull_request claims must never be probed for a covering successor")
+	require.Zero(t, calls, "closed and non-pull_request claims must never reach the supersede write")
 	require.Len(t, store.completed, 2, "both deliveries must process to completion")
 }
 

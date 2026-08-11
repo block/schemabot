@@ -10,7 +10,9 @@
 //     complement that recovers rows nobody redelivered.
 //   - Detects any recently updated open PR head in a registered repository that
 //     has no corresponding webhook_events row, surfacing deliveries lost
-//     upstream of the inbox (edge auth failures, GitHub-side send failures).
+//     upstream of the inbox (edge auth failures, GitHub-side send failures) —
+//     or heads whose only rows were discarded by claim-time coalescing, since
+//     superseded rows do not attest coverage of their head.
 //     With synthesis enabled (WithWebhookReconcileSynthesis) it also recovers
 //     each miss by enqueueing a pull_request-equivalent inbox row (see
 //     synthesizedDeliveryGUID; naturally deduped per head) that the durable

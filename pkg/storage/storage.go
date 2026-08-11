@@ -262,6 +262,16 @@ type WebhookEventStore interface {
 	// able to synthesize afresh.
 	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
 
+	// HasCoveringSuccessor reports whether a covering successor — as defined
+	// by SupersedeIfCovered — currently exists for the claimed event's
+	// (provider, repository, pull request). It is a read-only, advisory
+	// probe with no lease semantics: the answer can change the moment it
+	// returns, so a true result is a reason to verify the claimed head
+	// against the live PR before discarding, never permission to discard by
+	// itself — SupersedeIfCovered re-evaluates the predicate atomically with
+	// its lease-guarded write.
+	HasCoveringSuccessor(ctx context.Context, event *WebhookEvent) (bool, error)
+
 	// SupersedeIfCovered marks a claimed auto-plannable pull_request event
 	// superseded when a covering successor exists for the same
 	// (provider, repository, pull request), and reports whether it did. The
@@ -272,16 +282,30 @@ type WebhookEventStore interface {
 	// A successor is a strictly newer pull_request delivery for the same PR —
 	// strictly greater received_at, so a Redeliver-reopened row (which
 	// refreshes received_at) is never superseded by rows that predate the
-	// operator's redelivery, and same-instant deliveries never cover each
-	// other (they both process, the safe direction for an optimization) —
-	// that either plans the PR (AutoPlanPullRequestActions) or closes it
-	// (PullRequestClosedAction). It covers only when its own work
-	// will run, is running, or has run: pending, processing (live lease, or
-	// reclaimable under the attempt cap), retryable under the attempt cap, or
-	// completed. Terminally failed and superseded successors never cover —
-	// discarding old work on the strength of a successor that will not run
-	// would lose the PR's plan. Coalescing is keyed per PR, not per head SHA:
-	// distinct PRs sharing a head remain independent.
+	// operator's redelivery, and deliveries whose received_at ties at the
+	// column's timestamp precision never cover each other (they both
+	// process, the safe direction for an optimization) — that either plans
+	// the PR (AutoPlanPullRequestActions) or closes it
+	// (PullRequestClosedAction). received_at is webhook arrival order, not
+	// Git push order: GitHub does not guarantee delivery order and a
+	// Redeliver refreshes received_at on an old-head row, so a newer
+	// received_at proves only that newer-arriving work exists, never that
+	// the claimed head is stale. Callers must independently confirm against
+	// the live PR that the claimed head is no longer current before
+	// invoking this — the durable dispatcher fetches the PR from GitHub and
+	// skips coalescing when the claimed delivery carries the current head.
+	//
+	// A successor covers only when its own work will run, is running, or
+	// has run: pending, processing (live lease, or reclaimable under the
+	// attempt cap), retryable under the attempt cap, or completed.
+	// Terminally failed and superseded successors never cover — discarding
+	// old work on the strength of a successor that will not run would lose
+	// the PR's plan. Coverage is a promise evaluated once, at supersede
+	// time: a covering successor that later terminally fails does not
+	// resurrect the superseded row. Recovery for that loss is the operator
+	// Redeliver lever, plus reconciler synthesis when the lost work
+	// targeted the PR's current head. Coalescing is keyed per PR, not per
+	// head SHA: distinct PRs sharing a head remain independent.
 	//
 	// The asymmetry for closed deliveries: a newer closed delivery covers
 	// older auto-plan work (planning a closed PR is pointless, and a reopen
@@ -307,8 +331,10 @@ type WebhookEventStore interface {
 	// cross-key ordering. A row that spent time deferred re-enters dispatch
 	// at its original insertion position once due — ahead of rows created
 	// during its deferral — not at its due time. Stale auto-plan claims are
-	// coalesced after the claim, not here: the driver calls SupersedeIfCovered
-	// on each claimed auto-plannable pull_request event before processing it.
+	// coalesced after the claim, not here: for each claimed auto-plannable
+	// pull_request event the driver probes HasCoveringSuccessor, confirms
+	// against the live PR that the claimed head is no longer current, and
+	// only then calls SupersedeIfCovered.
 	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
 
 	// Heartbeat extends the current lease. Returns ErrWebhookEventNotFound when
