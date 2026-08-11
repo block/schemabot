@@ -40,6 +40,11 @@ type StatementParser interface {
 	// CREATE TABLE statement. Table-level constraints are not columns.
 	CreateTableColumns(stmt string) ([]string, error)
 
+	// CreateUniqueIndex returns the index and table names from exactly one
+	// standalone CREATE UNIQUE INDEX statement. Other statement shapes return
+	// ok=false without an error.
+	CreateUniqueIndex(stmt string) (indexName, tableName string, ok bool, err error)
+
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
 	Canonicalize(ddl string) string
@@ -123,6 +128,12 @@ func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 		columns = append(columns, column.Name)
 	}
 	return columns, nil
+}
+
+// CreateUniqueIndex implements StatementParser. This inspection operation is
+// currently needed only by the PostgreSQL storage bootstrapper.
+func (tidbStatementParser) CreateUniqueIndex(string) (string, string, bool, error) {
+	return "", "", false, fmt.Errorf("CREATE UNIQUE INDEX inspection is not supported by the MySQL statement parser")
 }
 
 // statementTypeFromSpirit translates Spirit's parser-owned statement type into

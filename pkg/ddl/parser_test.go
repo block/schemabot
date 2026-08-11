@@ -42,6 +42,10 @@ func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
 	return nil, nil
 }
 
+func (f fakeStatementParser) CreateUniqueIndex(string) (string, string, bool, error) {
+	return "", "", false, nil
+}
+
 func (f fakeStatementParser) Canonicalize(string) string {
 	return f.canonicalized
 }

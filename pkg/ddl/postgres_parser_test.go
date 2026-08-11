@@ -183,6 +183,24 @@ func TestPostgresParserCreateTableColumns(t *testing.T) {
 	require.ErrorContains(t, err, "expected CREATE TABLE statement")
 }
 
+func TestPostgresParserCreateUniqueIndex(t *testing.T) {
+	p := postgresStatementParser{}
+
+	indexName, tableName, ok, err := p.CreateUniqueIndex(`CREATE UNIQUE INDEX "event delivery" ON public.webhook_events (provider, delivery_id)`)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "event delivery", indexName)
+	assert.Equal(t, "webhook_events", tableName)
+
+	_, _, ok, err = p.CreateUniqueIndex("CREATE INDEX idx_events_state ON webhook_events (state)")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	_, _, ok, err = p.CreateUniqueIndex("CREATE TABLE example (id bigint)")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
 // The two parser implementations must diverge where the grammars genuinely
 // differ while honoring the same seam contract, so a caller routed through
 // ParserForDialect gets dialect-correct behavior from identical inputs.

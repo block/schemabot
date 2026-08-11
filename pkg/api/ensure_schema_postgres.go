@@ -21,8 +21,10 @@ import (
 // ensurePostgresSchema converges SchemaBot's storage schema on PostgreSQL by
 // creating every storage table whose embedded schema file has no matching
 // table in the current schema. Existing tables are checked for every expected
-// column, but are never altered; extra columns and index differences are
-// tolerated. That bound is deliberate — PostgreSQL has
+// column and standalone unique index, but are never altered; extra columns and
+// non-unique index differences are tolerated. The column check is presence-only:
+// type, length, and nullability drift are outside its scope and are not detected.
+// That bound is deliberate — PostgreSQL has
 // no in-process diff/apply mechanism here (Spirit is MySQL-only), and
 // create-only convergence is sufficient to bootstrap a fresh storage
 // database. Evolving an already-bootstrapped PostgreSQL storage schema
@@ -83,7 +85,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return fmt.Errorf("check storage tables: %w", err)
 	}
 	if len(missing) == 0 {
-		if err := verifyAndLogPostgresTableColumns(ctx, db, tables, files, logger, database, schemaName); err != nil {
+		if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
 			return fmt.Errorf("validate existing storage tables: %w", err)
 		}
 		logger.Info("storage schema up-to-date", "database", database)
@@ -107,7 +109,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return fmt.Errorf("check storage tables: %w", err)
 	}
 	if len(missing) == 0 {
-		if err := verifyAndLogPostgresTableColumns(ctx, db, tables, files, logger, database, schemaName); err != nil {
+		if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
 			return fmt.Errorf("validate storage tables after lock: %w", err)
 		}
 		logger.Info("storage schema up-to-date", "database", database)
@@ -125,27 +127,30 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		"tables_created", len(missing),
 		"duration", time.Since(createStart),
 	)
-	if err := verifyAndLogPostgresTableColumns(ctx, db, tables, files, logger, database, schemaName); err != nil {
+	if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
 		return fmt.Errorf("validate converged storage tables: %w", err)
 	}
 	return nil
 }
 
-func verifyAndLogPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
-	if err := verifyPostgresTableColumns(ctx, db, tables, files); err != nil {
-		logger.Error("PostgreSQL storage schema column check failed",
+func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
+	if err := verifyPostgresSchemaShape(ctx, db, tables, files); err != nil {
+		logger.Error("PostgreSQL storage schema shape check failed",
 			"dialect", schema.DialectPostgres,
 			"database", database,
 			"schema", schemaName,
-			"operation", "verify_storage_columns",
+			"operation", "verify_storage_shape",
 			"error", err,
 		)
-		return fmt.Errorf("verify PostgreSQL storage schema columns: %w", err)
+		return fmt.Errorf("verify PostgreSQL storage schema shape: %w", err)
 	}
 	return nil
 }
 
-func verifyPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
+// verifyPostgresSchemaShape checks expected columns by presence only; it does
+// not detect type, length, or nullability drift. It also requires standalone
+// unique indexes because losing their constraints can change write semantics.
+func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return fmt.Errorf("select PostgreSQL statement parser: %w", err)
@@ -176,6 +181,34 @@ func verifyPostgresTableColumns(ctx context.Context, db *sql.DB, tables []string
 		if len(missing) > 0 {
 			return fmt.Errorf("storage table %q is missing expected columns: %s", table, strings.Join(missing, ", "))
 		}
+
+		expectedIndexes := make([]string, 0)
+		for _, statement := range statements[1:] {
+			indexName, indexTable, unique, err := parser.CreateUniqueIndex(statement)
+			if err != nil {
+				return fmt.Errorf("extract expected unique indexes for table %q: %w", table, err)
+			}
+			if !unique {
+				continue
+			}
+			if indexTable != table {
+				return fmt.Errorf("schema file for table %q declares unique index %q on table %q", table, indexName, indexTable)
+			}
+			expectedIndexes = append(expectedIndexes, indexName)
+		}
+		existingIndexes, err := postgresTableUniqueIndexes(ctx, db, table)
+		if err != nil {
+			return err
+		}
+		missing = nil
+		for _, indexName := range expectedIndexes {
+			if !existingIndexes[indexName] {
+				missing = append(missing, indexName)
+			}
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missing, ", "))
+		}
 	}
 	return nil
 }
@@ -198,6 +231,35 @@ func postgresTableColumns(ctx context.Context, db *sql.DB, table string) (map[st
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate columns for table %q: %w", table, err)
+	}
+	return existing, nil
+}
+
+func postgresTableUniqueIndexes(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT index_class.relname
+		FROM pg_index AS index_info
+		JOIN pg_class AS table_class ON table_class.oid = index_info.indrelid
+		JOIN pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
+		JOIN pg_class AS index_class ON index_class.oid = index_info.indexrelid
+		WHERE table_namespace.nspname = current_schema()
+		  AND table_class.relname = $1
+		  AND index_info.indisunique`, table)
+	if err != nil {
+		return nil, fmt.Errorf("list unique indexes for table %q: %w", table, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var indexName string
+		if err := rows.Scan(&indexName); err != nil {
+			return nil, fmt.Errorf("scan unique index for table %q: %w", table, err)
+		}
+		existing[indexName] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate unique indexes for table %q: %w", table, err)
 	}
 	return existing, nil
 }

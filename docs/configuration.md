@@ -502,10 +502,12 @@ on the storage dialect:
   applies whatever DDL is needed (via Spirit) — new tables, new columns, and
   index changes all converge automatically.
 - **PostgreSQL** creates missing tables and verifies that existing tables
-  contain every column declared by the embedded schema. Missing columns fail
-  startup with the affected table and columns identified; extra columns and
-  index differences are tolerated. Existing tables are never altered, and
-  `allow_destructive_schema_changes` has no effect because this flow never
+  contain every column and standalone unique index declared by the embedded
+  schema. Missing objects fail startup with the affected table and objects
+  identified; extra columns and non-unique index differences are tolerated.
+  Column verification is presence-only: type, length, and nullability drift
+  is outside its scope and is not detected. Existing tables are never altered,
+  and `allow_destructive_schema_changes` has no effect because this flow never
   produces destructive DDL. Apply column changes to already-bootstrapped
   PostgreSQL databases before deploying schema files that expect them.
 
