@@ -3567,6 +3567,21 @@ func TestNewLocalClientBuiltinEngineIgnoresRegistry(t *testing.T) {
 	assert.NotNil(t, c.getEngine())
 }
 
+func TestNewLocalClientUsesPostgresEngine(t *testing.T) {
+	metadata := map[string]string{"cluster": "aurora-postgres"}
+	c, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypePostgres,
+		TargetDSN: "postgres://schemabot:secret@localhost:5432/orders",
+		Metadata:  metadata,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	assert.Equal(t, storage.EnginePostgres, c.getEngine().Name())
+	assert.Equal(t, "postgres://schemabot:secret@localhost:5432/orders", c.credentials().DSN)
+	assert.Equal(t, metadata, c.credentials().Metadata)
+}
+
 // A type with no built-in engine and no registered factory fails closed.
 func TestNewLocalClientErrorsWhenEngineUnregistered(t *testing.T) {
 	_, err := NewLocalClient(LocalConfig{Database: "db", Type: "customengine"}, nil, slog.Default())

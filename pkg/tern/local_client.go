@@ -109,6 +109,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
@@ -134,8 +135,8 @@ type LocalConfig struct {
 	// Database is the name of this database.
 	Database string
 
-	// Type is the database type. "mysql" and "vitess" have built-in engines; any
-	// other value requires a matching EngineFactories entry.
+	// Type is the database type. "mysql", "vitess", and "postgres" have built-in
+	// engines; any other value requires a matching EngineFactories entry.
 	Type string
 
 	// TargetDSN is the connection string to the target database for schema changes.
@@ -195,6 +196,7 @@ type LocalClient struct {
 	storage           storage.Storage
 	spiritEngine      engine.Engine
 	planetscaleEngine engine.Engine
+	postgresEngine    engine.Engine
 	customEngine      engine.Engine
 	psClientFunc      func(tokenName, tokenValue string) (psclient.PSClient, error)
 	logger            *slog.Logger
@@ -272,7 +274,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	// factory. This is the embedder extension point for engines this build does
 	// not include.
 	var customEngine engine.Engine
-	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess {
+	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess && cfg.Type != storage.DatabaseTypePostgres {
 		factory, ok := cfg.EngineFactories[cfg.Type]
 		if !ok {
 			return nil, fmt.Errorf("no engine registered for database type %q", cfg.Type)
@@ -306,6 +308,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
+		postgresEngine:    postgres.New(),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -2215,6 +2218,8 @@ func (c *LocalClient) getEngine() engine.Engine {
 		return c.spiritEngine
 	case storage.DatabaseTypeVitess:
 		return c.planetscaleEngine
+	case storage.DatabaseTypePostgres:
+		return c.postgresEngine
 	default:
 		// A registered engine for a non-built-in type (nil if none registered).
 		return c.customEngine
