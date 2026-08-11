@@ -229,11 +229,7 @@ func (h *Handler) executeApply(
 	if err != nil {
 		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		message := "Failed to execute apply. See SchemaBot server logs for details."
-		if errors.Is(err, storage.ErrLockIntentChanged) {
-			message = "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
-		}
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(err))
 		return
 	}
 
@@ -293,6 +289,17 @@ func (h *Handler) executeApply(
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
+}
+
+func applyExecutionErrorMessage(err error) string {
+	if errors.Is(err, storage.ErrLockIntentChanged) {
+		return "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
+	}
+	var featureErr *api.UnsupportedFeatureError
+	if errors.As(err, &featureErr) {
+		return featureErr.Error()
+	}
+	return "Failed to execute apply. See SchemaBot server logs for details."
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an

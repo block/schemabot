@@ -672,6 +672,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
 		}
+		var featureErr *UnsupportedFeatureError
+		if errors.As(err, &featureErr) {
+			s.logger.Warn("apply rejected because the database type does not support a requested feature", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
 		return
@@ -687,6 +693,19 @@ func applyMetricStatusForError(err error) string {
 		return "conflict"
 	}
 	return "error"
+}
+
+// UnsupportedFeatureError identifies an apply option that the target database
+// cannot execute. Callers may present this operator-actionable rejection
+// without exposing an internal failure.
+type UnsupportedFeatureError struct {
+	Database     string
+	DatabaseType string
+	Feature      schema.Feature
+}
+
+func (e *UnsupportedFeatureError) Error() string {
+	return fmt.Sprintf("database %q: %s is not supported for database_type: %s", e.Database, e.Feature, e.DatabaseType)
 }
 
 // ExecuteApply queues an apply request in storage and returns once the work is
@@ -851,6 +870,23 @@ func (s *Service) authorizeStoredPlanSource(ctx context.Context, span trace.Span
 // gated entry points also run authorizeStoredPlanSource before queueing.
 func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan *storage.Plan, req ApplyRequest) (*apitypes.ApplyResponse, int64, error) {
 	deployment := plan.Deployment
+	deferredCutover := storage.ApplyOptionsFromMap(req.Options).DeferCutover
+	if deferredCutover && !schema.SupportsFeature(plan.DatabaseType, schema.FeatureDeferredCutover) {
+		err := &UnsupportedFeatureError{Database: plan.Database, DatabaseType: plan.DatabaseType, Feature: schema.FeatureDeferredCutover}
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unsupported apply feature")
+		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
+		s.logger.Warn("apply rejected because the database type does not support a requested feature",
+			"plan_id", req.PlanID,
+			"database", plan.Database,
+			"database_type", plan.DatabaseType,
+			"deployment", plan.Deployment,
+			"environment", req.Environment,
+			"repository", plan.Repository,
+			"pull_request", plan.PullRequest,
+			"error", err)
+		return nil, 0, err
+	}
 
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {

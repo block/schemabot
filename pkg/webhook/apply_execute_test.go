@@ -1,12 +1,31 @@
 package webhook
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestApplyExecutionErrorMessage(t *testing.T) {
+	t.Run("unsupported feature is actionable", func(t *testing.T) {
+		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
+		assert.Equal(t, `database "orders": deferred cutover is not supported for database_type: postgres`, applyExecutionErrorMessage(err))
+	})
+
+	t.Run("lock intent change remains actionable", func(t *testing.T) {
+		assert.Contains(t, applyExecutionErrorMessage(fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+	})
+
+	t.Run("internal error remains sanitized", func(t *testing.T) {
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(errors.New("secret DSN")))
+	})
+}
 
 func TestDDLMatchesStoredPlan(t *testing.T) {
 	tests := []struct {

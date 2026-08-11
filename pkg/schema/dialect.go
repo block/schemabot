@@ -8,11 +8,16 @@ import "strings"
 // underlying database family, not of the engine that drives it.
 type Dialect string
 
+// Feature identifies behavior that is not available on every database family.
+type Feature string
+
 const (
 	// DialectMySQL covers MySQL and every MySQL-protocol engine (Vitess, Strata).
 	DialectMySQL Dialect = "mysql"
 	// DialectPostgres covers PostgreSQL targets.
 	DialectPostgres Dialect = "postgres"
+
+	FeatureDeferredCutover Feature = "deferred cutover"
 )
 
 // DialectForDatabaseType maps a database_type to its database family for
@@ -31,6 +36,17 @@ func DialectForDatabaseType(databaseType string) Dialect {
 		return DialectPostgres
 	default:
 		return Dialect(strings.ToLower(databaseType))
+	}
+}
+
+// SupportsFeature reports whether a database type supports a dialect-specific
+// feature. Unknown database types fail closed.
+func SupportsFeature(databaseType string, feature Feature) bool {
+	switch feature {
+	case FeatureDeferredCutover:
+		return databaseType == "mysql" || databaseType == "vitess"
+	default:
+		return false
 	}
 }
 

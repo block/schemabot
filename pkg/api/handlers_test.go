@@ -2779,6 +2779,49 @@ func TestExecuteApplyQueuesLocalApplyForOperator(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, tasks.tasks[0].State)
 }
 
+func TestExecuteApplyGatesDeferredCutoverByDatabaseType(t *testing.T) {
+	tests := []struct {
+		name         string
+		databaseType string
+		options      map[string]string
+		wantErr      string
+	}{
+		{name: "postgres without deferred cutover", databaseType: storage.DatabaseTypePostgres},
+		{name: "postgres with deferred cutover", databaseType: storage.DatabaseTypePostgres, options: map[string]string{"defer_cutover": "true"}, wantErr: `database "testdb": deferred cutover is not supported for database_type: postgres`},
+		{name: "mysql with deferred cutover", databaseType: storage.DatabaseTypeMySQL, options: map[string]string{"defer_cutover": "true"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := executeApplyTestPlan()
+			plan.DatabaseType = tt.databaseType
+			applies := &capturingApplyStore{}
+			svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+
+			resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+				PlanID:      plan.PlanIdentifier,
+				Environment: plan.Environment,
+				Options:     tt.options,
+			})
+
+			if tt.wantErr != "" {
+				assert.EqualError(t, err, tt.wantErr)
+				assert.Nil(t, resp)
+				assert.Zero(t, applyID)
+				assert.Nil(t, applies.apply)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.True(t, resp.Accepted)
+			assert.Equal(t, int64(123), applyID)
+			require.NotNil(t, applies.apply)
+			assert.Equal(t, tt.databaseType, applies.apply.DatabaseType)
+			assert.Equal(t, tt.options["defer_cutover"] == "true", applies.apply.GetOptions().DeferCutover)
+		})
+	}
+}
+
 func TestExecuteApplyRejectsUnsafeStoredPlanWithoutOptIn(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Namespaces["testdb"].Tables[0].IsUnsafe = true
@@ -4037,6 +4080,28 @@ func TestServiceClose(t *testing.T) {
 }
 
 func TestApplyHandler(t *testing.T) {
+	t.Run("returns bad request for unsupported apply feature", func(t *testing.T) {
+		plan := executeApplyTestPlan()
+		plan.DatabaseType = storage.DatabaseTypePostgres
+		applies := &capturingApplyStore{}
+		svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"plan_id":"plan-1","environment":"staging","options":{"defer_cutover":"true"}}`
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
+		assert.Nil(t, applies.apply)
+	})
+
 	t.Run("returns conflict when an active apply already exists", func(t *testing.T) {
 		plan := &storage.Plan{
 			ID:             42,
