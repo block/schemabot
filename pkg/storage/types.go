@@ -1342,6 +1342,24 @@ const (
 	WebhookEventFailed          = "failed"
 )
 
+// SynthesizedWebhookDeliveryIDPrefix marks delivery GUIDs minted by the
+// webhook reconciler for synthesized recovery rows, distinguishing them from
+// organic GitHub delivery GUIDs. The distinction is behavioral, not
+// cosmetic: a terminally failed organic row has a GitHub Redeliver lever, so
+// it still covers its head, while a terminally failed synthesized row has no
+// such lever and must not — the inbox coverage query (HasEventForHead) keys
+// its failed-row exclusion off this prefix.
+const SynthesizedWebhookDeliveryIDPrefix = "recon:"
+
+// AutoPlanPullRequestActions are the pull_request actions that trigger
+// auto-plan for a PR head. This is the single source for every layer that
+// answers "does this delivery plan its head": the webhook enqueue/dispatch
+// predicate and the inbox coverage query (HasEventForHead) both derive from
+// it, so an action added in one place cannot silently diverge from the other —
+// a divergence would either mask lost deliveries from the reconciler or
+// enqueue rows the dispatcher completes without planning.
+var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
+
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a
 // series is always present even when a state is momentarily empty.
