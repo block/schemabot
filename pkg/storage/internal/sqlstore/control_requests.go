@@ -139,27 +139,28 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 	if err != nil {
 		return err
 	}
-	leaseJoin := ""
-	leasePredicate := ""
-	args := []any{storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending}
-	if hasLease {
-		leaseJoin = " JOIN applies a ON a.id = cr.apply_id"
-		leasePredicate = " AND a.lease_token = ?"
-		args = append(args, lease.Token)
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND operation = ? AND status = ?
+		`, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending)
+		if err != nil {
+			return fmt.Errorf("complete pending control requests for apply %d operation %s: %w", applyID, operation, err)
+		}
+		return nil
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_control_requests cr
-		`+leaseJoin+`
+		JOIN applies a ON a.id = cr.apply_id
 		SET cr.status = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
-			WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?`+leasePredicate+`
-		`, args...)
+		WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?
+	`, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
 		return fmt.Errorf("complete pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
-	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "completed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
-			return err
-		}
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "completed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -169,27 +170,28 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 	if err != nil {
 		return err
 	}
-	leaseJoin := ""
-	leasePredicate := ""
-	args := []any{storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending}
-	if hasLease {
-		leaseJoin = " JOIN applies a ON a.id = cr.apply_id"
-		leasePredicate = " AND a.lease_token = ?"
-		args = append(args, lease.Token)
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND operation = ? AND status = ?
+		`, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending)
+		if err != nil {
+			return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
+		}
+		return nil
 	}
 	result, err := s.db.ExecContext(ctx, `
-			UPDATE apply_control_requests cr
-			`+leaseJoin+`
-			SET cr.status = ?, cr.error_message = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
-			WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?`+leasePredicate+`
-		`, args...)
+		UPDATE apply_control_requests cr
+		JOIN applies a ON a.id = cr.apply_id
+		SET cr.status = ?, cr.error_message = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
+		WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?
+	`, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
 		return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
-	if hasLease {
-		if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "failed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
-			return err
-		}
+	if _, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "failed control request", fmt.Sprintf("apply %d operation %s", applyID, operation)); err != nil {
+		return err
 	}
 	return nil
 }

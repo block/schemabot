@@ -2031,9 +2031,9 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	cancelArgs := []any{state.Task.Cancelled, state.Task.Pending}
 	cancelArgs = append(cancelArgs, applyIDs...)
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE tasks t
-		SET t.state = ?, t.completed_at = COALESCE(t.completed_at, NOW()), t.updated_at = NOW()
-		WHERE t.state = ? AND t.apply_id IN (%s)
+		UPDATE tasks
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE state = ? AND apply_id IN (%s)
 	`, placeholders(len(applyIDs))), cancelArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("cancel pending tasks for expired retryable applies: %w", err)
@@ -2043,9 +2043,9 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	taskArgs = append(taskArgs, stringArgs(state.TerminalTaskStates)...)
 	taskArgs = append(taskArgs, applyIDs...)
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE tasks t
-		SET t.state = ?, t.completed_at = COALESCE(t.completed_at, NOW()), t.updated_at = NOW()
-		WHERE t.state NOT IN (%s) AND t.apply_id IN (%s)
+		UPDATE tasks
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE state NOT IN (%s) AND apply_id IN (%s)
 	`, placeholders(len(state.TerminalTaskStates)), placeholders(len(applyIDs))), taskArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("expire retryable tasks: %w", err)

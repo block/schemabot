@@ -103,14 +103,23 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 	if err != nil {
 		return err
 	}
+	if !hasLease {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE apply_comments
+			SET edit_count = edit_count + 1, last_edited_at = NOW()
+			WHERE apply_id = ? AND comment_state = ?
+		`, applyID, commentState)
+		if err != nil {
+			return fmt.Errorf("increment edit count for apply %d state %s: %w", applyID, commentState, err)
+		}
+		return nil
+	}
 	leaseJoin := ""
 	leasePredicate := ""
 	args := []any{applyID, commentState}
-	if hasLease {
-		leaseJoin = " JOIN applies a ON a.id = c.apply_id"
-		leasePredicate = " AND a.lease_token = ?"
-		args = append(args, lease.Token)
-	}
+	leaseJoin = " JOIN applies a ON a.id = c.apply_id"
+	leasePredicate = " AND a.lease_token = ?"
+	args = append(args, lease.Token)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_comments c
 		`+leaseJoin+`
@@ -120,15 +129,13 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 	if err != nil {
 		return err
 	}
-	if hasLease {
-		rows, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("read apply comment edit rows affected for apply %d state %s: %w", applyID, commentState, err)
-		}
-		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-				return err
-			}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read apply comment edit rows affected for apply %d state %s: %w", applyID, commentState, err)
+	}
+	if rows == 0 {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
 		}
 	}
 	return err

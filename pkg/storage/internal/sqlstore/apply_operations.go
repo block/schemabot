@@ -169,14 +169,18 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 }
 
 // execStateUpdate runs a guarded UPDATE against a single apply_operations row,
-// applying setClause with its placeholder args and the write guard's join /
-// predicate. It centralizes the guard load, argument ordering, error wrapping,
-// and idempotent row-existence check shared by the state-transition helpers, so
-// each one supplies only its SET clause, args, and error context.
-func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, setClause string, setArgs ...any) error {
+// applying the appropriate SET clause with its placeholder args and the write
+// guard's join / predicate. It centralizes the guard load, argument ordering,
+// error wrapping, and idempotent row-existence check shared by the
+// state-transition helpers.
+func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, unqualifiedSetClause, qualifiedSetClause string, setArgs ...any) error {
 	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
+	}
+	setClause := unqualifiedSetClause
+	if guard.kind == operationGuardApply {
+		setClause = qualifiedSetClause
 	}
 	guardArgs := guard.args()
 	args := make([]any, 0, len(setArgs)+1+len(guardArgs))
@@ -203,7 +207,7 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 // repeat call would report 0; we disambiguate with an existence check.
 func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, "update apply_operations state",
-		"ao.state = ?", newState)
+		"state = ?", "ao.state = ?", newState)
 }
 
 // MarkStarted sets state=running and stamps started_at=NOW().
@@ -213,6 +217,7 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 // against an already-started row is a no-op and returns nil.
 func (s *applyOperationStore) MarkStarted(ctx context.Context, id int64) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation started",
+		"state = ?, started_at = COALESCE(started_at, NOW())",
 		"ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW())", state.ApplyOperation.Running)
 }
 
@@ -434,6 +439,7 @@ func operationWriteGuardFromContext(ctx context.Context) (operationWriteGuard, e
 // don't spuriously return ErrApplyOperationNotFound.
 func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation completed",
+		"state = ?, completed_at = COALESCE(completed_at, NOW())",
 		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", state.ApplyOperation.Completed)
 }
 
@@ -446,6 +452,7 @@ func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error
 // a missing row.
 func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg string) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation failed",
+		"state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())",
 		"ao.state = ?, ao.error_message = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())",
 		state.ApplyOperation.Failed, nullString(errMsg))
 }
@@ -460,6 +467,7 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 // is a no-op, so a re-issue against an already-terminal row returns nil.
 func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, fmt.Sprintf("mark apply_operation terminal (state=%s)", newState),
+		"state = ?, completed_at = COALESCE(completed_at, NOW())",
 		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", newState)
 }
 
@@ -475,10 +483,14 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 		return err
 	}
 	args := append([]any{externalOperationID, operationID}, guard.args()...)
+	setClause := "external_operation_id = ?"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.external_operation_id = ?"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.external_operation_id = ?
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -499,10 +511,14 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 		return err
 	}
 	args := append([]any{externalID, operationID}, guard.args()...)
+	setClause := "external_id = ?"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.external_id = ?"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.external_id = ?
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -530,10 +546,14 @@ func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operati
 		metadata = "{}"
 	}
 	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, guard.args()...)
+	setClause := "engine_resume_context = ?, engine_resume_metadata = ?"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.engine_resume_context = ?, ao.engine_resume_metadata = ?"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.engine_resume_context = ?, ao.engine_resume_metadata = ?
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
@@ -1100,14 +1120,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			}
 
 			if _, err := tx.ExecContext(ctx, `
-				UPDATE applies a
-				SET a.attempt = a.attempt + 1, a.updated_at = NOW()
-				WHERE a.id = ?
-					AND a.state = ?
-					AND a.attempt < ?
+				UPDATE applies
+				SET attempt = attempt + 1, updated_at = NOW()
+				WHERE id = ?
+					AND state = ?
+					AND attempt < ?
 					AND EXISTS (
 						SELECT 1 FROM apply_operations o
-						WHERE o.apply_id = a.id AND o.id <> ?
+						WHERE o.apply_id = applies.id AND o.id <> ?
 					)
 			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
 				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
@@ -1366,10 +1386,14 @@ func (s *applyOperationStore) Heartbeat(ctx context.Context, id int64) error {
 		return err
 	}
 	args := append([]any{id}, guard.args()...)
+	setClause := "updated_at = NOW()"
+	if guard.kind == operationGuardApply {
+		setClause = "ao.updated_at = NOW()"
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET ao.updated_at = NOW()
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
