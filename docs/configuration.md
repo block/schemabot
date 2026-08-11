@@ -501,11 +501,15 @@ on the storage dialect:
 - **MySQL** diffs the embedded schema files against the live database and
   applies whatever DDL is needed (via Spirit) — new tables, new columns, and
   index changes all converge automatically.
-- **PostgreSQL** creates missing tables only. A table that already exists is
-  left untouched, so column or index drift on an existing table is not
-  detected or repaired, and `allow_destructive_schema_changes` has no effect —
-  the flow never produces destructive DDL. Evolving an already-bootstrapped
-  PostgreSQL storage schema requires a separate schema change mechanism.
+- **PostgreSQL** creates missing tables and verifies that existing tables
+  contain every column and standalone unique index declared by the embedded
+  schema. Missing objects fail startup with the affected table and objects
+  identified; extra columns and non-unique index differences are tolerated.
+  Column verification is presence-only: type, length, and nullability drift
+  is outside its scope and is not detected. Existing tables are never altered,
+  and `allow_destructive_schema_changes` has no effect because this flow never
+  produces destructive DDL. Apply column changes to already-bootstrapped
+  PostgreSQL databases before deploying schema files that expect them.
 
 The rest of this section describes the MySQL flow.
 

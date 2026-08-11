@@ -86,6 +86,54 @@ func (postgresStatementParser) Classify(stmt string) (StatementType, string, err
 	return stmtType, table, nil
 }
 
+// CreateTableColumns implements StatementParser using the parsed CREATE TABLE
+// node, so quoted identifiers and PostgreSQL expressions follow the server
+// grammar while table constraints are excluded by node type.
+func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error) {
+	result, err := pgquery.Parse(stmt)
+	if err != nil {
+		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(stmt), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return nil, fmt.Errorf("expected one CREATE TABLE statement, got %d", len(stmts))
+	}
+	createNode, ok := stmts[0].GetStmt().GetNode().(*pgproto.Node_CreateStmt)
+	if !ok {
+		return nil, fmt.Errorf("expected CREATE TABLE statement")
+	}
+	columns := make([]string, 0, len(createNode.CreateStmt.GetTableElts()))
+	for _, element := range createNode.CreateStmt.GetTableElts() {
+		column, ok := element.GetNode().(*pgproto.Node_ColumnDef)
+		if ok {
+			columns = append(columns, column.ColumnDef.GetColname())
+		}
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("CREATE TABLE has no columns")
+	}
+	return columns, nil
+}
+
+// CreateUniqueIndex implements StatementParser using the parsed IndexStmt.
+// Only standalone CREATE UNIQUE INDEX statements match; ordinary indexes and
+// other parsed statement types are not uniqueness expectations.
+func (postgresStatementParser) CreateUniqueIndex(stmt string) (string, string, bool, error) {
+	result, err := pgquery.Parse(stmt)
+	if err != nil {
+		return "", "", false, fmt.Errorf("parse CREATE UNIQUE INDEX %q: %w", statementPreview(stmt), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return "", "", false, fmt.Errorf("expected one statement, got %d", len(stmts))
+	}
+	indexNode, ok := stmts[0].GetStmt().GetNode().(*pgproto.Node_IndexStmt)
+	if !ok || !indexNode.IndexStmt.GetUnique() {
+		return "", "", false, nil
+	}
+	return indexNode.IndexStmt.GetIdxname(), indexNode.IndexStmt.GetRelation().GetRelname(), true, nil
+}
+
 // classifyPostgresNode maps one parsed statement node onto the pkg/ddl-owned
 // statement vocabulary and extracts the bare name of the first relation the
 // statement targets. Postgres expresses a table rename as

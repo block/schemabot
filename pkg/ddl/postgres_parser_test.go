@@ -163,6 +163,44 @@ func TestPostgresParserCanonicalize(t *testing.T) {
 	})
 }
 
+func TestPostgresParserCreateTableColumns(t *testing.T) {
+	p := postgresStatementParser{}
+
+	columns, err := p.CreateTableColumns(`CREATE TABLE example (
+  id bigint,
+  "display name" text DEFAULT $$value,with punctuation$$,
+  index integer,
+  exclude integer,
+  PRIMARY KEY (id),
+  UNIQUE(id),
+  CHECK(id > 0),
+  EXCLUDE USING gist (id WITH =)
+)`)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"id", "display name", "index", "exclude"}, columns)
+
+	_, err = p.CreateTableColumns("ALTER TABLE example ADD COLUMN value text")
+	require.ErrorContains(t, err, "expected CREATE TABLE statement")
+}
+
+func TestPostgresParserCreateUniqueIndex(t *testing.T) {
+	p := postgresStatementParser{}
+
+	indexName, tableName, ok, err := p.CreateUniqueIndex(`CREATE UNIQUE INDEX "event delivery" ON public.webhook_events (provider, delivery_id)`)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "event delivery", indexName)
+	assert.Equal(t, "webhook_events", tableName)
+
+	_, _, ok, err = p.CreateUniqueIndex("CREATE INDEX idx_events_state ON webhook_events (state)")
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	_, _, ok, err = p.CreateUniqueIndex("CREATE TABLE example (id bigint)")
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
 // The two parser implementations must diverge where the grammars genuinely
 // differ while honoring the same seam contract, so a caller routed through
 // ParserForDialect gets dialect-correct behavior from identical inputs.

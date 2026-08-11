@@ -15,7 +15,7 @@ import (
 // StatementParser abstracts the dialect-specific, string-level DDL parsing
 // operations that pkg/ddl exposes to its callers (schema discovery, planning,
 // the CLI): splitting a schema file into statements, classifying a statement,
-// and canonicalizing one.
+// inspecting CREATE TABLE columns, and canonicalizing a statement.
 //
 // The default implementation wraps the TiDB parser (via Spirit's statement
 // package), so behavior for MySQL and Vitess is exactly what it has always
@@ -35,6 +35,15 @@ type StatementParser interface {
 	// statement. It rejects multi-statement input so a destructive statement
 	// cannot hide behind the classification of the first one.
 	Classify(stmt string) (StatementType, string, error)
+
+	// CreateTableColumns returns the declared column names from exactly one
+	// CREATE TABLE statement. Table-level constraints are not columns.
+	CreateTableColumns(stmt string) ([]string, error)
+
+	// CreateUniqueIndex returns the index and table names from exactly one
+	// standalone CREATE UNIQUE INDEX statement. Other statement shapes return
+	// ok=false without an error.
+	CreateUniqueIndex(stmt string) (indexName, tableName string, ok bool, err error)
 
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
@@ -106,6 +115,25 @@ func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) 
 		)
 	}
 	return statementTypeFromSpirit(results[0].Type), results[0].Table, nil
+}
+
+// CreateTableColumns implements StatementParser.
+func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
+	createTable, err := statement.ParseCreateTable(stmt)
+	if err != nil {
+		return nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(stmt), err)
+	}
+	columns := make([]string, 0, len(createTable.Columns))
+	for _, column := range createTable.Columns {
+		columns = append(columns, column.Name)
+	}
+	return columns, nil
+}
+
+// CreateUniqueIndex implements StatementParser. This inspection operation is
+// currently needed only by the PostgreSQL storage bootstrapper.
+func (tidbStatementParser) CreateUniqueIndex(string) (string, string, bool, error) {
+	return "", "", false, fmt.Errorf("CREATE UNIQUE INDEX inspection is not supported by the MySQL statement parser")
 }
 
 // statementTypeFromSpirit translates Spirit's parser-owned statement type into
