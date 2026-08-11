@@ -1716,10 +1716,10 @@ func (s *applyOperationStore) loadStrandedParents(ctx context.Context, stranded 
 // the guarded UPDATE re-verifies the parent it was chosen for, so a write never
 // lands on the strength of a read that may be seconds old.
 func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *storage.ApplyOperation, parent *storage.Apply) (bool, error) {
-	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()"
+	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
 	args := []any{parent.State}
 	if state.IsState(parent.State, state.Apply.Failed) {
-		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()"
+		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())"
 		args = []any{parent.State, nullString(parent.ErrorMessage)}
 	}
 	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
@@ -1728,7 +1728,7 @@ func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *sto
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations
-		SET `+setClause+`
+		SET `+setClause+`, updated_at = NOW()
 		WHERE id = ? AND state = ? AND (lease_owner IS NULL OR lease_owner = '')
 			AND `+parentGate+`
 	`, args...)

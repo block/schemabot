@@ -26,7 +26,10 @@ type applyCommentStore struct {
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
 // posted_volume, posted_phase, and pending_freeze_github_comment_id so the
 // row always describes the currently tracked comment and the freeze it may
-// still owe.
+// still owe. The conflict path also clears superseded_at (the row is live
+// again) and stamps updated_at: that column is the summary-claim freshness
+// signal read by ReclaimStaleSummaryClaim, not incidental audit metadata, so
+// every mutation must renew it explicitly on both dialects.
 func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyComment) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, comment.ApplyID)
 	if err != nil {
@@ -107,7 +110,7 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
 			UPDATE apply_comments
-			SET edit_count = edit_count + 1, last_edited_at = NOW()
+			SET edit_count = edit_count + 1, last_edited_at = NOW(), updated_at = NOW()
 			WHERE apply_id = ? AND comment_state = ?
 		`, applyID, commentState)
 		if err != nil {

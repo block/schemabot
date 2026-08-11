@@ -642,6 +642,10 @@ func TestApplyCommentStore_MutationsStampUpdatedAt(t *testing.T) {
 		return stale.UpdatedAt
 	}
 
+	// The subtests mutate one shared comment row and depend on this order:
+	// "clear pending freeze" only matches because the preceding upserts re-set
+	// the freeze marker, and "supersede" must run last because it retires the
+	// row from further mutation.
 	mutations := []struct {
 		name   string
 		mutate func(t *testing.T)
