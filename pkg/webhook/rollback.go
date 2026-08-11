@@ -401,14 +401,84 @@ func (h *Handler) logRollbackLockReleaseFailure(repo string, pr int, database, d
 		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "owner", lockOwner, "error", err)
 }
 
-// handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.
-// It verifies the lock, loads the rollback plan pinned by the preceding rollback
-// command, and executes the apply.
+// handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>"
+// PR comment command. It is the synchronous goSafe entry point: it runs
+// rollbackConfirmCommandCore and discards the durability disposition, which
+// only a durable issue_comment driver consumes.
 func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment string, installationID int64, requestedBy string, result CommandResult) {
-	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
+	_, _ = h.rollbackConfirmCommandCore(context.Background(), repo, pr, environment, installationID, requestedBy, result)
+}
+
+// rollbackConfirmRejectionError marks a deterministic rollback-confirm
+// rejection inside the pinned-plan resolution: the message is the command's
+// answer, so a durable driver must not re-drive the delivery, while plain
+// errors from the same lookups stay retryable.
+type rollbackConfirmRejectionError struct{ err error }
+
+func (e *rollbackConfirmRejectionError) Error() string { return e.err.Error() }
+func (e *rollbackConfirmRejectionError) Unwrap() error { return e.err }
+
+func rollbackConfirmRejection(err error) error { return &rollbackConfirmRejectionError{err: err} }
+
+func isRollbackConfirmRejection(err error) bool {
+	var rejection *rollbackConfirmRejectionError
+	return errors.As(err, &rejection)
+}
+
+// rollbackConfirmCommandCore verifies the lock, loads the rollback plan pinned
+// by the preceding rollback command, and executes the apply. It returns a
+// durability disposition for a durable issue_comment driver:
+//
+//   - retry=true, err!=nil — a transient infrastructure failure before the
+//     rollback apply is dispatched (command bootstrap, a storage read inside
+//     the pinned-plan resolution, an unevaluable authorization gate, or a
+//     failed lock release when there is nothing left to roll back) that a
+//     durable driver should re-drive; the same window may succeed on a later
+//     attempt.
+//   - retry=false, err=nil — a terminal outcome that is the command's answer
+//     (no pending rollback, a deterministic pinned-plan rejection, an
+//     authorization block on the merits, a GitHub App resolution failure,
+//     nothing left to roll back, or any exit at or after the ExecuteApply
+//     dispatch).
+//
+// Every exit at or after the ExecuteApply call is terminal regardless of
+// outcome: once the dispatch is attempted, the rollback DDL may already be
+// executing on the target, so a durable re-drive could double-execute it.
+// The pinned lock is not released on those failures, so recovery for a
+// pre-acceptance failure is the user re-issuing rollback-confirm.
+//
+// A gate block is terminal only when the gate evaluated its inputs and
+// blocked on the merits. A gate that could not evaluate (for example a
+// GitHub team-membership read failed) returns an error, which the core
+// classifies retryable: the gate still fails closed for this delivery, but
+// the outcome is not the command's answer.
+//
+// A posted PR comment does not imply a terminal disposition: retryable sites
+// post best-effort error comments too, so a durable driver re-driving one may
+// post the same comment again.
+//
+// The parent context scopes the command beyond its own timeout: the
+// synchronous wrapper passes context.Background(), while the durable driver
+// passes its run context so lease loss or shutdown cancels in-flight work.
+//
+// The core logs each failure at its site, so the synchronous wrapper can
+// discard the result without losing observability.
+func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string, pr int, environment string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
-		h.logger.Error("rollback-confirm: failed to bootstrap command", "error", err)
-		return
+		// A GitHub App resolution failure inside the bootstrap is deterministic
+		// per deployment config, so a re-drive reproduces it; recovery is an
+		// operator fixing the App mapping and the user re-issuing the command.
+		// Other bootstrap failures (an installation token fetch, for example)
+		// are transient and stay retryable.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("rollback-confirm blocked: cannot resolve GitHub App client for repo",
+				"repo", repo, "pr", pr, "environment", environment, "error", err)
+			return false, nil
+		}
+		h.logger.Error("rollback-confirm: failed to bootstrap command", "repo", repo, "pr", pr,
+			"environment", environment, "error", err)
+		return true, fmt.Errorf("rollback-confirm command bootstrap %s#%d: %w", repo, pr, err)
 	}
 	defer cancel()
 
@@ -418,7 +488,10 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		h.logger.Error("failed to resolve rollback-confirm plan", "repo", repo, "pr", pr,
 			"environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, err.Error())
-		return
+		if isRollbackConfirmRejection(err) {
+			return false, nil
+		}
+		return true, fmt.Errorf("rollback-confirm command resolve pinned plan %s#%d environment %s: %w", repo, pr, environment, err)
 	}
 	if existingLock == nil || rollbackPlan == nil {
 		// On an aggregate repo an unscoped rollback-confirm fans out to every
@@ -428,10 +501,10 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("unscoped fan-out rollback-confirm found no pending rollback on this deployment; staying silent so the owning deployment responds",
 				"repo", repo, "pr", pr, "environment", environment)
-			return
+			return false, nil
 		}
 		h.postComment(repo, pr, installationID, templates.RenderRollbackConfirmNoLock("", environment, h.deploymentTenant()))
-		return
+		return false, nil
 	}
 	h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 
@@ -448,28 +521,42 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// must be an authorized admin/operator before any lock is released or acted
 	// on. The database comes from the lock-pinned rollback plan instead of
 	// current PR files so confirmation follows the reviewed rollback artifact.
-	// The rollback-confirm handler is not a durable core, so an authorization
-	// evaluation failure and a merit denial both stop the command here; the
-	// gate has already logged and posted the distinction.
 	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm)
-	if authErr != nil || blocked {
-		return
+	if authErr != nil {
+		return true, fmt.Errorf("rollback-confirm command actor authorization gate %s#%d database %s: %w", repo, pr, database, authErr)
+	}
+	if blocked {
+		return false, nil
 	}
 
-	// If no changes remain, release lock and notify
+	// If no changes remain, release the lock and notify. The release is
+	// conditioned on the observed pending plan so a newer same-owner intent
+	// acquired after the resolution above stays intact; a mismatch or missing
+	// lock is a no-op because the release's job is already done. A failed
+	// release stays retryable: nothing has executed yet and a re-drive
+	// re-resolves the pinned plan and retries the release, so the lock is not
+	// stranded on a transient storage write failure.
 	if !planHasChanges(rollbackPlan) {
-		if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
-			h.logger.Error("rollback-confirm found nothing to roll back but failed to release the database lock; applies on this database will be blocked until the lock is released manually",
+		released, relErr := h.service.Storage().Locks().ReleaseIfPendingPlanID(ctx, database, dbType, lockOwner, existingLock.PendingPlanID)
+		if relErr != nil {
+			h.logger.Error("rollback-confirm found nothing to roll back but failed to release the database lock; applies on this database stay blocked until a re-issued rollback-confirm releases it",
 				"repo", repo, "pr", pr, "database", database,
 				"database_type", dbType, "environment", environment,
-				"lock_owner", lockOwner, "error", err)
+				"lock_owner", lockOwner, "error", relErr)
 			h.postComment(repo, pr, installationID,
 				templates.RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, h.deploymentTenant()))
-			return
+			return true, fmt.Errorf("rollback-confirm command release lock with nothing to roll back %s#%d database %s type %s owner %s: %w",
+				repo, pr, database, dbType, lockOwner, relErr)
+		}
+		if !released {
+			h.logger.Info("rollback-confirm found nothing to roll back and the pinned rollback lock was already released or superseded; leaving the current lock state untouched",
+				"repo", repo, "pr", pr, "database", database,
+				"database_type", dbType, "environment", environment,
+				"lock_owner", lockOwner, "pending_plan_id", existingLock.PendingPlanID)
 		}
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackAlreadyRolledBack(database, environment))
-		return
+		return false, nil
 	}
 
 	// Build apply options — rollback always allows unsafe changes, and is marked
@@ -484,11 +571,15 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		options["defer_cutover"] = "true"
 	}
 
+	// The command bootstrap already resolved this factory, so this lookup only
+	// fails when the deployment config changed mid-command. The failure is
+	// still deterministic for a re-drive against the changed config, so it
+	// stays terminal; recovery is fixing the config and re-issuing the command.
 	factory, factoryErr := h.factoryForRepo(repo)
 	if factoryErr != nil {
 		h.logger.Error("rollback blocked: cannot resolve GitHub App client for repo",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "error", factoryErr)
-		return
+		return false, nil
 	}
 
 	observer := NewCommentObserver(CommentObserverConfig{
@@ -521,19 +612,23 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 		InstallationID: installationID,
 	}
 
+	// Every exit from here on is terminal for a durable driver: the dispatch
+	// has been attempted, so the rollback DDL may already be executing and a
+	// re-drive could double-execute it. A dispatch error leaves the pinned
+	// lock in place, so the user can re-issue rollback-confirm.
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
 		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Failed to execute rollback: "+err.Error())
-		return
+		return false, nil
 	}
 
 	if !applyResp.Accepted {
 		h.service.SetPendingObserver(database, rollbackPlan.Deployment, environment, nil)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNotAccepted(database, environment, applyResp.ErrorMessage))
-		return
+		return false, nil
 	}
 
 	// Track rollback progress. After the rollback apply completes, set the check
@@ -546,7 +641,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Rollback was accepted, but SchemaBot did not receive a stored apply ID. SchemaBot cannot safely track progress or update required status checks. An operator must reconcile the apply state before retrying.")
-		return
+		return false, nil
 	}
 
 	apply, err := h.service.Storage().Applies().Get(ctx, applyID)
@@ -555,20 +650,20 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
 			"apply_id", applyResp.ApplyID, "error", err)
-		return
+		return false, nil
 	}
 	if apply == nil {
 		h.logger.Error("rollback apply missing after accepted apply",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", dbType, "environment", environment,
 			"apply_id", applyResp.ApplyID)
-		return
+		return false, nil
 	}
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
 		h.logger.Error("failed to mark check in_progress for rollback",
 			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Rollback was accepted, but SchemaBot could not update the required status check: "+err.Error())
-		return
+		return false, nil
 	}
 
 	// Post initial progress comment for the observer to edit. VSchema status is
@@ -576,6 +671,7 @@ func (h *Handler) handleRollbackConfirmCommand(repo string, pr int, environment 
 	// display metadata on the next progress tick.
 	progressBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
+	return false, nil
 }
 
 func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr int, environment, lockOwner string) (*storage.Lock, *storage.Plan, error) {
@@ -598,8 +694,8 @@ func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr 
 			continue
 		}
 		if lock.Owner != lockOwner {
-			return nil, nil, fmt.Errorf("rollback lock for %s/%s belongs to %s, not %s",
-				lock.DatabaseName, lock.DatabaseType, lock.Owner, lockOwner)
+			return nil, nil, rollbackConfirmRejection(fmt.Errorf("rollback lock for %s/%s belongs to %s, not %s",
+				lock.DatabaseName, lock.DatabaseType, lock.Owner, lockOwner))
 		}
 
 		plan, err := h.rollbackPlanForLock(ctx, lock)
@@ -620,10 +716,10 @@ func (h *Handler) rollbackConfirmPlanForPR(ctx context.Context, repo string, pr 
 			continue
 		}
 		if mismatch := rollbackPlanCommandMismatch(plan, repo, pr, lock.DatabaseName, lock.DatabaseType, environment); mismatch != "" {
-			return nil, nil, fmt.Errorf("rollback lock %s/%s has mismatched pinned plan: %s", lock.DatabaseName, lock.DatabaseType, mismatch)
+			return nil, nil, rollbackConfirmRejection(fmt.Errorf("rollback lock %s/%s has mismatched pinned plan: %s", lock.DatabaseName, lock.DatabaseType, mismatch))
 		}
 		if matchedPlan != nil {
-			return nil, nil, fmt.Errorf("multiple rollback plans are pending for environment %s; cancel one with `schemabot unlock` before retrying `schemabot rollback-confirm -e %s`", environment, environment)
+			return nil, nil, rollbackConfirmRejection(fmt.Errorf("multiple rollback plans are pending for environment %s; cancel one with `schemabot unlock` before retrying `schemabot rollback-confirm -e %s`", environment, environment))
 		}
 		matchedLock = lock
 		matchedPlan = plan
@@ -647,6 +743,9 @@ func rollbackPlanIDFromLock(lock *storage.Lock) (string, bool) {
 	return planID, planID != ""
 }
 
+// rollbackPlanForLock loads the rollback plan the lock pins. A failed storage
+// read stays a plain (retryable) error; a pinned plan whose row is missing is
+// a deterministic rejection — a re-drive re-reads the same dangling pin.
 func (h *Handler) rollbackPlanForLock(ctx context.Context, lock *storage.Lock) (*storage.Plan, error) {
 	planID, ok := rollbackPlanIDFromLock(lock)
 	if !ok {
@@ -657,7 +756,7 @@ func (h *Handler) rollbackPlanForLock(ctx context.Context, lock *storage.Lock) (
 		return nil, fmt.Errorf("load rollback plan %s: %w", planID, err)
 	}
 	if plan == nil {
-		return nil, fmt.Errorf("rollback plan not found: %s", planID)
+		return nil, rollbackConfirmRejection(fmt.Errorf("rollback plan not found: %s", planID))
 	}
 	return plan, nil
 }
