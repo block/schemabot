@@ -2,9 +2,11 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -17,6 +19,12 @@ import (
 const (
 	rollbackPendingPlanPrefix = "rollback:"
 	vSchemaArtifactName       = "vschema.json"
+
+	// rollbackLockReleaseTimeout bounds the lock release that runs after a
+	// rollback will not proceed. The release runs detached from the command's
+	// own context, which may already be cancelled at that point, so it needs
+	// its own deadline.
+	rollbackLockReleaseTimeout = 5 * time.Second
 )
 
 // handleRollbackCommand handles the "schemabot rollback <apply-id> -e <env>"
@@ -36,6 +44,9 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 //     bootstrap, a storage read, lock acquisition, remote-deployment
 //     unavailability during plan generation, or plan pinning) that a durable
 //     driver should re-drive; the same window may succeed on a later attempt.
+//     When the exit also released a command-acquired lock, a failed release
+//     joins the returned error so the disposition never asserts a release
+//     that did not happen.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (a missing apply ID, an apply not found, a non-owned environment, a gate
 //     block on the merits, a source-apply guardrail rejection, a lock held by
@@ -208,7 +219,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		PullRequest:             pr,
 		RequirePullRequestScope: true,
 	}); err != nil {
-		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		// The released lock lets a re-drive start over, so an internal
 		// validation failure stays retryable; a deterministic guardrail
 		// rejection is the command's answer.
@@ -217,8 +228,11 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 				"repo", repo, "pr", pr, "apply_id", applyID,
 				"environment", result.Environment, "database", database, "error", err)
 			h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
-			return true, fmt.Errorf("rollback command revalidate source apply %s#%d apply %s: %w", repo, pr, applyID, err)
+			return true, errors.Join(
+				fmt.Errorf("rollback command revalidate source apply %s#%d apply %s: %w", repo, pr, applyID, err),
+				releaseErr)
 		}
+		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 		h.logger.Warn("rollback rejected by source apply guardrails after lock acquisition",
 			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", result.Environment, "database", database, "error", err)
@@ -231,12 +245,19 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	// after lock acquisition, so the plan can be pinned for confirmation.
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
 	if err != nil {
-		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
-		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "error", err)
+		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		// The retryable attribute makes the terminal class queryable: a
+		// non-transient plan failure that recurs in logs is a candidate for
+		// its own transient classifier.
+		retryable := isTransientRemotePlanError(err)
+		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "retryable", retryable, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
-		if isTransientRemotePlanError(err) {
-			return true, fmt.Errorf("rollback command plan %s#%d apply %s: %w", repo, pr, applyID, err)
+		if retryable {
+			return true, errors.Join(
+				fmt.Errorf("rollback command plan %s#%d apply %s: %w", repo, pr, applyID, err),
+				releaseErr)
 		}
+		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 		// Failures other than remote-deployment unavailability are treated
 		// as deterministic: the posted error is the command's answer. Some
 		// of them are not truly deterministic (plan generation reads storage
@@ -246,7 +267,8 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	}
 
 	if planResp == nil || !planResp.HasChanges() {
-		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 		h.postComment(repo, pr, installationID,
 			templates.RenderRollbackNothingToDo(database, environment, applyID))
 		return false, nil
@@ -261,12 +283,14 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		PendingPlanID: rollbackPendingPlanID(planResp.PlanID),
 	}
 	if err := lockStore.Acquire(ctx, lock); err != nil {
-		h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.logger.Error("failed to pin rollback plan on lock", "repo", repo, "pr", pr,
 			"database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, "Failed to pin rollback plan on lock: "+err.Error())
-		return true, fmt.Errorf("rollback command pin plan on lock %s#%d database %s plan %s: %w", repo, pr, database, planResp.PlanID, err)
+		return true, errors.Join(
+			fmt.Errorf("rollback command pin plan on lock %s#%d database %s plan %s: %w", repo, pr, database, planResp.PlanID, err),
+			releaseErr)
 	}
 
 	// Build comment data. The source apply ID stays in the comment metadata for
@@ -345,14 +369,36 @@ func (h *Handler) postRollbackRejected(repo string, pr int, installationID int64
 	h.postComment(repo, pr, installationID, templates.RenderRollbackRejected(data))
 }
 
-func (h *Handler) releaseRollbackLockAfterRejectedPlan(ctx context.Context, database, dbType, lockOwner string, release bool) {
+// releaseRollbackLockAfterRejectedPlan releases the lock this command acquired
+// once the rollback will not proceed. The release runs detached from the
+// command's cancellation with its own timeout: the exits that need it include
+// an expired command deadline, and the release must still happen so the
+// database is not left locked with no pinned plan. The caller decides what a
+// failed release means for its disposition: retryable exits join it into the
+// returned error, terminal exits log it.
+func (h *Handler) releaseRollbackLockAfterRejectedPlan(ctx context.Context, database, dbType, lockOwner string, release bool) error {
 	if !release {
+		return nil
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackLockReleaseTimeout)
+	defer cancel()
+	if err := h.service.Storage().Locks().Release(releaseCtx, database, dbType, lockOwner); err != nil {
+		return fmt.Errorf("release rollback lock database %s type %s owner %s: %w", database, dbType, lockOwner, err)
+	}
+	return nil
+}
+
+// logRollbackLockReleaseFailure records a lock release that did not happen on
+// a terminal exit. The terminal disposition is still the command's answer —
+// a re-drive would reproduce it, and a re-drive under the same lock owner
+// skips the release anyway — but the database stays locked until an operator
+// runs unlock, so the failure must be visible for triage.
+func (h *Handler) logRollbackLockReleaseFailure(repo string, pr int, database, dbType, lockOwner string, err error) {
+	if err == nil {
 		return
 	}
-	if err := h.service.Storage().Locks().Release(ctx, database, dbType, lockOwner); err != nil {
-		h.logger.Error("failed to release rollback lock after rejected plan",
-			"database", database, "database_type", dbType, "owner", lockOwner, "error", err)
-	}
+	h.logger.Error("rollback lock release failed; database stays locked until an operator runs unlock",
+		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "owner", lockOwner, "error", err)
 }
 
 // handleRollbackConfirmCommand handles the "schemabot rollback-confirm -e <env>" PR comment command.

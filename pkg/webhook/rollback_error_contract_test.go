@@ -108,6 +108,26 @@ func (s *rollbackFlakyPlanStore) GetByID(_ context.Context, _ int64) (*storage.P
 	return s.plan, nil
 }
 
+// rollbackCancelingPlanStore serves the plan on the first read and cancels the
+// command's parent context before failing later reads, modeling a command
+// whose own context has already expired by the time a post-lock failure needs
+// the acquired lock released.
+type rollbackCancelingPlanStore struct {
+	storage.PlanStore
+	plan   *storage.Plan
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (s *rollbackCancelingPlanStore) GetByID(_ context.Context, _ int64) (*storage.Plan, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.plan, nil
+	}
+	s.cancel()
+	return nil, errors.New("storage read failed")
+}
+
 // rollbackShrinkingTaskStore serves the tasks on the first read and an empty
 // set afterwards, modeling a concurrent apply changing which schema change the
 // rollback planner would select between validation and revalidation.
@@ -130,9 +150,14 @@ type rollbackTestLockStore struct {
 	lock       *storage.Lock
 	getErr     error
 	acquireErr error
+	releaseErr error
 
 	acquireCalls int
 	releaseCalls int
+	// releaseCtxErr snapshots the release context's cancellation state at
+	// call time, proving the release ran detached from an already-cancelled
+	// command context.
+	releaseCtxErr error
 }
 
 func (s *rollbackTestLockStore) Get(_ context.Context, _, _ string) (*storage.Lock, error) {
@@ -144,9 +169,10 @@ func (s *rollbackTestLockStore) Acquire(_ context.Context, _ *storage.Lock) erro
 	return s.acquireErr
 }
 
-func (s *rollbackTestLockStore) Release(_ context.Context, _, _, _ string) error {
+func (s *rollbackTestLockStore) Release(ctx context.Context, _, _, _ string) error {
 	s.releaseCalls++
-	return nil
+	s.releaseCtxErr = ctx.Err()
+	return s.releaseErr
 }
 
 // completedSourceApply is a rollback source apply that passes every guardrail:
@@ -267,6 +293,54 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
 		body := requireComment(t, comments, "revalidation failure comment")
 		assert.Contains(t, body, "load source plan")
+	})
+
+	// The lock release after a post-lock failure must run even when the
+	// command's own context has already been cancelled — the common retryable
+	// case is an expired deadline — so a re-drive is not blocked by a lock the
+	// failed attempt could not release.
+	t.Run("lock release after a post-lock failure survives command cancellation", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		recordComments(t, mux)
+		parent, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		lockStore := &rollbackTestLockStore{}
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackCancelingPlanStore{plan: capturedSourcePlan(), cancel: cancel},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(parent, "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.Error(t, err)
+		assert.True(t, retry, "an internal revalidation failure must stay retryable")
+		require.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
+		assert.NoError(t, lockStore.releaseCtxErr, "the release must run detached from the cancelled command context")
+	})
+
+	// A release that did not happen must not be asserted by the retryable
+	// disposition: the failure joins the returned error so the durable
+	// driver's record shows the database is still locked.
+	t.Run("failed lock release joins the retryable revalidation error", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{releaseErr: errors.New("storage write failed")}
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackFlakyPlanStore{plan: capturedSourcePlan(), failAfter: 1},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.Error(t, err)
+		assert.True(t, retry, "a failed release must not change the retryable disposition")
+		assert.Contains(t, err.Error(), "release rollback lock", "the failed release must be visible in the returned error")
 	})
 
 	t.Run("lock status read failure is retryable", func(t *testing.T) {
@@ -465,6 +539,31 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		body := requireComment(t, comments, "revalidation rejection comment")
 		assert.Contains(t, body, "Rollback Not Allowed")
 		assert.Contains(t, body, "no completed schema change task found")
+	})
+
+	// A failed release does not turn a deterministic rejection into a
+	// retryable delivery: a re-drive would re-reject under the same lock owner
+	// and skip the release anyway, so the rejection stays the answer and the
+	// stuck lock is an operator unlock, surfaced through the error log.
+	t.Run("failed lock release keeps a terminal rejection terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{releaseErr: errors.New("storage write failed")}
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackTestPlanStore{plan: capturedSourcePlan()},
+			tasks:   &rollbackShrinkingTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a deterministic rejection stays the command's answer even when the release failed")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the release must still be attempted")
+		body := requireComment(t, comments, "revalidation rejection comment")
+		assert.Contains(t, body, "Rollback Not Allowed")
 	})
 
 	// A rollback plan cannot be generated for a source plan that predates
