@@ -242,6 +242,7 @@ enum Engine {
   ENGINE_SPIRIT = 0;
   ENGINE_PLANETSCALE = 1;
   ENGINE_STRATA = 2;
+  ENGINE_POSTGRES = 3;
 }
 
 // State represents the state of a schema change task.

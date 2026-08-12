@@ -367,10 +367,14 @@ func (c *LocalClient) protoEngine() ternv1.Engine {
 	}
 	// Fall back to the type default when there is no engine or its name has no
 	// proto representation.
-	if c.config.Type == storage.DatabaseTypeVitess {
+	switch c.config.Type {
+	case storage.DatabaseTypeVitess:
 		return ternv1.Engine_ENGINE_PLANETSCALE
+	case storage.DatabaseTypePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES
+	default:
+		return ternv1.Engine_ENGINE_SPIRIT
 	}
-	return ternv1.Engine_ENGINE_SPIRIT
 }
 
 func localPlanTarget(req *ternv1.PlanRequest, database string) string {
@@ -389,6 +393,8 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 		return ternv1.Engine_ENGINE_SPIRIT, nil
 	case storage.EngineStrata:
 		return ternv1.Engine_ENGINE_STRATA, nil
+	case storage.EnginePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES, nil
 	default:
 		return 0, fmt.Errorf("unknown engine: %s", name)
 	}
