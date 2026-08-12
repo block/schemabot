@@ -2,6 +2,7 @@ package sqlstore
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -9,10 +10,8 @@ import (
 // Dialect abstracts the SQL-syntax differences between database families (MySQL
 // and, in the future, Postgres) that the state store depends on. This is an
 // incremental seam: the store still emits MySQL-style "?" placeholders, and
-// only the family-varying syntax (upsert clause, current-time and
-// relative-time expressions) routes through here. When a Postgres backend is
-// introduced its parameterized SQL will need a "?"-to-"$n" rebind at the store
-// boundary.
+// family-varying syntax routes through here. When a Postgres backend is introduced
+// its parameterized SQL will need a "?"-to-"$n" rebind at the store boundary.
 type Dialect interface {
 	// InsertIfAbsent returns the syntax that makes an INSERT a no-op when the
 	// named unique-key columns conflict. Modifier is placed between INSERT and
@@ -39,8 +38,9 @@ type Dialect interface {
 	RelativeTime(precision TimestampPrecision, direction RelativeTimeDirection, amount IntervalAmount, unit IntervalUnit) string
 	// JSONBooleanIsTrue returns a predicate that is true only when the JSON value
 	// at path is the boolean true. Missing paths, JSON null, SQL NULL, strings,
-	// numbers, objects, and arrays must all yield false. Path contains unescaped
-	// object keys, ordered from the root to the value.
+	// numbers, objects, and arrays must all yield false. Path contains plain
+	// identifier object keys (letters, digits, and underscores), ordered from the
+	// root to the value. Implementations panic when a key is not a plain identifier.
 	JSONBooleanIsTrue(expression string, path []string) string
 	// IndexHint returns an optional table-level hint that directs lookups through
 	// index. The returned text includes any required leading whitespace and is
@@ -125,6 +125,8 @@ type UpsertAssignment struct {
 // MySQLDialect implements Dialect for MySQL and MySQL-protocol engines.
 type MySQLDialect struct{}
 
+var plainJSONIdentifier = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
 // InsertIfAbsent uses MySQL's INSERT IGNORE modifier. MySQL infers conflicts
 // from every unique key on the table, so conflictColumns is not rendered.
 func (MySQLDialect) InsertIfAbsent(_ []string) InsertIfAbsentSyntax {
@@ -187,12 +189,15 @@ func (d MySQLDialect) RelativeTime(precision TimestampPrecision, direction Relat
 // JSONBooleanIsTrue compares the extracted MySQL JSON value with JSON true
 // using null-safe equality so absent and null values do not match.
 func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
-	jsonPath := "$"
+	var jsonPath strings.Builder
+	jsonPath.WriteString("$")
 	for _, key := range path {
-		jsonPath += "." + strconv.Quote(key)
+		if !plainJSONIdentifier.MatchString(key) {
+			panic(fmt.Sprintf("sqlstore: JSON path key %q is not a plain identifier", key))
+		}
+		jsonPath.WriteString(`."` + key + `"`)
 	}
-	jsonPath = strings.ReplaceAll(jsonPath, "'", "''")
-	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath + "') <=> CAST('true' AS JSON))"
+	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath.String() + "') <=> CAST('true' AS JSON))"
 }
 
 // IndexHint returns a MySQL FORCE INDEX hint for the named index.

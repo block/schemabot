@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMySQLDialectExcludedValue(t *testing.T) {
@@ -18,6 +19,13 @@ func TestMySQLDialectJSONBooleanIsTrue(t *testing.T) {
 	assert.Equal(t,
 		`(JSON_EXTRACT(a.options, '$."defer_cutover"') <=> CAST('true' AS JSON))`,
 		MySQLDialect{}.JSONBooleanIsTrue("a.options", []string{"defer_cutover"}),
+	)
+}
+
+func TestMySQLDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "defer-cutover" is not a plain identifier`,
+		func() { MySQLDialect{}.JSONBooleanIsTrue("a.options", []string{"defer-cutover"}) },
 	)
 }
 
