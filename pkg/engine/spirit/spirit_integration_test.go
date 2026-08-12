@@ -18,7 +18,7 @@ import (
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -54,7 +54,7 @@ func TestMain(m *testing.M) {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
 			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
 		}).WithStartupTimeout(30 * time.Second),
 	}
@@ -2493,7 +2493,7 @@ func TestNewSpiritMigrationGTIDChangeSource(t *testing.T) {
 		// connections", so log- and port-based waits can be satisfied
 		// before the final server accepts clients — and the GTID probe
 		// treats any connection failure as "no GTID support".
-		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
 			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
 		}).WithStartupTimeout(30 * time.Second),
 	}

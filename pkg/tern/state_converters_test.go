@@ -6,12 +6,34 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Every DDL operation with a dedicated proto change type survives the
+// storage-op → proto → storage-op round trip exactly, so a remote deployment
+// rebuilding a plan from a dispatch stores the same operation the planner
+// classified. Index operations must keep their own change types: collapsing
+// them into table create/drop would make a DROP INDEX materialize as a table
+// drop and trip the fail-closed unsafe opt-in gate.
+func TestChangeTypeProtoRoundTrip(t *testing.T) {
+	for _, op := range []string{
+		ddl.StatementTypeToOp(ddl.StatementCreateTable),
+		ddl.StatementTypeToOp(ddl.StatementAlterTable),
+		ddl.StatementTypeToOp(ddl.StatementDropTable),
+		ddl.StatementTypeToOp(ddl.StatementCreateIndex),
+		ddl.StatementTypeToOp(ddl.StatementDropIndex),
+		"vschema_update",
+	} {
+		assert.Equal(t, op, protoChangeTypeToDDLAction(ddlActionToProtoChangeType(op)),
+			"round-trip failed for op %q", op)
+	}
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_OTHER, ddlActionToProtoChangeType("unknown"))
+}
 
 // The reverting state round-trips across the engine, task, and proto boundaries
 // so a revert in progress is reported end-to-end as "reverting" rather than

@@ -27,6 +27,8 @@ func TestChangeTypeRoundTrip(t *testing.T) {
 		ternv1.ChangeType_CHANGE_TYPE_CREATE,
 		ternv1.ChangeType_CHANGE_TYPE_ALTER,
 		ternv1.ChangeType_CHANGE_TYPE_DROP,
+		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
+		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
 		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
 		ternv1.ChangeType_CHANGE_TYPE_OTHER,
 	} {

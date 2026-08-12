@@ -193,11 +193,13 @@ func (State) EnumDescriptor() ([]byte, []int) {
 type ChangeType int32
 
 const (
-	ChangeType_CHANGE_TYPE_OTHER   ChangeType = 0
-	ChangeType_CHANGE_TYPE_CREATE  ChangeType = 1
-	ChangeType_CHANGE_TYPE_ALTER   ChangeType = 2
-	ChangeType_CHANGE_TYPE_DROP    ChangeType = 3
-	ChangeType_CHANGE_TYPE_VSCHEMA ChangeType = 4
+	ChangeType_CHANGE_TYPE_OTHER        ChangeType = 0
+	ChangeType_CHANGE_TYPE_CREATE       ChangeType = 1
+	ChangeType_CHANGE_TYPE_ALTER        ChangeType = 2
+	ChangeType_CHANGE_TYPE_DROP         ChangeType = 3
+	ChangeType_CHANGE_TYPE_VSCHEMA      ChangeType = 4
+	ChangeType_CHANGE_TYPE_CREATE_INDEX ChangeType = 5
+	ChangeType_CHANGE_TYPE_DROP_INDEX   ChangeType = 6
 )
 
 // Enum value maps for ChangeType.
@@ -208,13 +210,17 @@ var (
 		2: "CHANGE_TYPE_ALTER",
 		3: "CHANGE_TYPE_DROP",
 		4: "CHANGE_TYPE_VSCHEMA",
+		5: "CHANGE_TYPE_CREATE_INDEX",
+		6: "CHANGE_TYPE_DROP_INDEX",
 	}
 	ChangeType_value = map[string]int32{
-		"CHANGE_TYPE_OTHER":   0,
-		"CHANGE_TYPE_CREATE":  1,
-		"CHANGE_TYPE_ALTER":   2,
-		"CHANGE_TYPE_DROP":    3,
-		"CHANGE_TYPE_VSCHEMA": 4,
+		"CHANGE_TYPE_OTHER":        0,
+		"CHANGE_TYPE_CREATE":       1,
+		"CHANGE_TYPE_ALTER":        2,
+		"CHANGE_TYPE_DROP":         3,
+		"CHANGE_TYPE_VSCHEMA":      4,
+		"CHANGE_TYPE_CREATE_INDEX": 5,
+		"CHANGE_TYPE_DROP_INDEX":   6,
 	}
 )
 
@@ -3807,14 +3813,16 @@ const file_tern_proto_rawDesc = "" +
 	"\x0fSTATE_REVERTING\x10\x12\x12\x15\n" +
 	"\x11STATE_CATCHING_UP\x10\x13\x12\x16\n" +
 	"\x12STATE_CHECKSUMMING\x10\x14\x12\x17\n" +
-	"\x13STATE_POST_CHECKSUM\x10\x15*\x81\x01\n" +
+	"\x13STATE_POST_CHECKSUM\x10\x15*\xbb\x01\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +
 	"\x12CHANGE_TYPE_CREATE\x10\x01\x12\x15\n" +
 	"\x11CHANGE_TYPE_ALTER\x10\x02\x12\x14\n" +
 	"\x10CHANGE_TYPE_DROP\x10\x03\x12\x17\n" +
-	"\x13CHANGE_TYPE_VSCHEMA\x10\x04*T\n" +
+	"\x13CHANGE_TYPE_VSCHEMA\x10\x04\x12\x1c\n" +
+	"\x18CHANGE_TYPE_CREATE_INDEX\x10\x05\x12\x1a\n" +
+	"\x16CHANGE_TYPE_DROP_INDEX\x10\x06*T\n" +
 	"\x11PullCatalogDetail\x12\x1d\n" +
 	"\x19PULL_CATALOG_DETAIL_BASIC\x10\x00\x12 \n" +
 	"\x1cPULL_CATALOG_DETAIL_DETAILED\x10\x012\x92\t\n" +
