@@ -109,6 +109,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
@@ -134,8 +135,8 @@ type LocalConfig struct {
 	// Database is the name of this database.
 	Database string
 
-	// Type is the database type. "mysql" and "vitess" have built-in engines; any
-	// other value requires a matching EngineFactories entry.
+	// Type is the database type. "mysql", "vitess", and "postgres" have built-in
+	// engines; any other value requires a matching EngineFactories entry.
 	Type string
 
 	// TargetDSN is the connection string to the target database for schema changes.
@@ -195,6 +196,7 @@ type LocalClient struct {
 	storage           storage.Storage
 	spiritEngine      engine.Engine
 	planetscaleEngine engine.Engine
+	postgresEngine    engine.Engine
 	customEngine      engine.Engine
 	psClientFunc      func(tokenName, tokenValue string) (psclient.PSClient, error)
 	logger            *slog.Logger
@@ -272,7 +274,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	// factory. This is the embedder extension point for engines this build does
 	// not include.
 	var customEngine engine.Engine
-	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess {
+	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess && cfg.Type != storage.DatabaseTypePostgres {
 		factory, ok := cfg.EngineFactories[cfg.Type]
 		if !ok {
 			return nil, fmt.Errorf("no engine registered for database type %q", cfg.Type)
@@ -306,6 +308,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
+		postgresEngine:    postgres.New(),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -364,10 +367,14 @@ func (c *LocalClient) protoEngine() ternv1.Engine {
 	}
 	// Fall back to the type default when there is no engine or its name has no
 	// proto representation.
-	if c.config.Type == storage.DatabaseTypeVitess {
+	switch c.config.Type {
+	case storage.DatabaseTypeVitess:
 		return ternv1.Engine_ENGINE_PLANETSCALE
+	case storage.DatabaseTypePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES
+	default:
+		return ternv1.Engine_ENGINE_SPIRIT
 	}
-	return ternv1.Engine_ENGINE_SPIRIT
 }
 
 func localPlanTarget(req *ternv1.PlanRequest, database string) string {
@@ -386,6 +393,8 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 		return ternv1.Engine_ENGINE_SPIRIT, nil
 	case storage.EngineStrata:
 		return ternv1.Engine_ENGINE_STRATA, nil
+	case storage.EnginePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES, nil
 	default:
 		return 0, fmt.Errorf("unknown engine: %s", name)
 	}
@@ -2217,6 +2226,8 @@ func (c *LocalClient) getEngine() engine.Engine {
 		return c.spiritEngine
 	case storage.DatabaseTypeVitess:
 		return c.planetscaleEngine
+	case storage.DatabaseTypePostgres:
+		return c.postgresEngine
 	default:
 		// A registered engine for a non-built-in type (nil if none registered).
 		return c.customEngine
