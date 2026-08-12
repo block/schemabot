@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	gomysql "github.com/go-sql-driver/mysql"
@@ -450,6 +451,14 @@ type StorageConfig struct {
 	// DSNFrom builds the MySQL connection string from separate database config
 	// and password references. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+
+	// Dialect selects the database family of SchemaBot's internal storage
+	// database: "mysql" (the default when unset) or "postgres". It routes
+	// schema bootstrapping, connection handling, and the storage
+	// implementation together, so the whole storage stack always agrees on
+	// the dialect. Unknown values fail startup rather than falling back to
+	// the MySQL flow.
+	Dialect string `yaml:"dialect,omitempty"`
 
 	// AllowDestructiveSchemaChanges permits EnsureSchema to execute destructive
 	// DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) when converging
@@ -2489,7 +2498,32 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 			return err
 		}
 	}
+	dialect, err := c.ResolveDialect()
+	if err != nil {
+		return fmt.Errorf("%s: %w", context, err)
+	}
+	// dsn_from assembles a Go MySQL driver DSN, which no other dialect's
+	// driver can parse, so the combination fails at validation instead of at
+	// the first connection attempt.
+	if dialect != schema.DialectMySQL && c.DSNFrom != nil {
+		return fmt.Errorf("%s dsn_from builds a MySQL DSN and is not supported with dialect %q; use dsn", context, dialect)
+	}
 	return c.Pool.Validate(context)
+}
+
+// ResolveDialect returns the storage database family selected by
+// storage.dialect, defaulting to MySQL when unset. Matching is
+// case-insensitive. An unknown value fails closed so a typo cannot silently
+// run the MySQL storage flow against another database family.
+func (c StorageConfig) ResolveDialect() (schema.Dialect, error) {
+	switch schema.Dialect(strings.ToLower(strings.TrimSpace(c.Dialect))) {
+	case "", schema.DialectMySQL:
+		return schema.DialectMySQL, nil
+	case schema.DialectPostgres:
+		return schema.DialectPostgres, nil
+	default:
+		return "", fmt.Errorf("unsupported storage dialect %q (supported: %q, %q)", c.Dialect, schema.DialectMySQL, schema.DialectPostgres)
+	}
 }
 
 // HasLocalDSN returns true when the environment should use a local database connection.

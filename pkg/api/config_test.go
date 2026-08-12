@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -2368,6 +2369,88 @@ database: appdb
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must contain an integer")
 	})
+}
+
+// The storage dialect selects the database family for the whole storage
+// stack: schema bootstrapping, the connection pool, and the storage
+// implementation. Unset defaults to MySQL, matching is case-insensitive, and
+// unknown values fail closed so a typo cannot run the MySQL storage flow
+// against another database family.
+func TestStorageConfig_ResolveDialect(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect string
+		want    schema.Dialect
+		wantErr string
+	}{
+		{name: "unset defaults to mysql", dialect: "", want: schema.DialectMySQL},
+		{name: "mysql", dialect: "mysql", want: schema.DialectMySQL},
+		{name: "postgres", dialect: "postgres", want: schema.DialectPostgres},
+		{name: "case-insensitive", dialect: "Postgres", want: schema.DialectPostgres},
+		{name: "surrounding whitespace ignored", dialect: " mysql ", want: schema.DialectMySQL},
+		{name: "unknown dialect fails closed", dialect: "oracle", wantErr: `unsupported storage dialect "oracle"`},
+		{name: "near-miss spelling fails closed", dialect: "postgresql", wantErr: `unsupported storage dialect "postgresql"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := StorageConfig{Dialect: tt.dialect}.ResolveDialect()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// dsn_from assembles a Go MySQL driver DSN, so combining it with a
+// non-MySQL storage dialect is rejected at config validation instead of
+// failing at the first connection attempt with an unparseable DSN.
+func TestServerConfig_ValidateRejectsDSNFromWithPostgresDialect(t *testing.T) {
+	cfg := ServerConfig{
+		Storage: StorageConfig{
+			Dialect: "postgres",
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "file:/run/secrets/storage-config.yaml",
+				Username:    "schemabot_user",
+				PasswordRef: "file:/run/secrets/storage-password",
+			},
+		},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dsn_from builds a MySQL DSN")
+}
+
+// An unknown storage dialect is rejected at config validation, before any
+// connection attempt, so a misconfigured server fails fast at load time.
+func TestServerConfig_ValidateRejectsUnknownStorageDialect(t *testing.T) {
+	cfg := ServerConfig{
+		Storage: StorageConfig{Dialect: "oracle"},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsupported storage dialect "oracle"`)
 }
 
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
