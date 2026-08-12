@@ -890,7 +890,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							WHERE sibling.apply_id = apply_operations.apply_id
 								AND sibling.deployment = apply_operations.deployment
 								AND sibling.operation_kind = ?
-								AND SUBSTRING_INDEX(sibling.operation_key, '/', 1) = SUBSTRING_INDEX(apply_operations.operation_key, '/', 1)
+								AND CASE
+									WHEN POSITION('/' IN sibling.operation_key) = 0 THEN sibling.operation_key
+									ELSE SUBSTRING(sibling.operation_key FROM 1 FOR POSITION('/' IN sibling.operation_key) - 1)
+								END = CASE
+									WHEN POSITION('/' IN apply_operations.operation_key) = 0 THEN apply_operations.operation_key
+									ELSE SUBSTRING(apply_operations.operation_key FROM 1 FOR POSITION('/' IN apply_operations.operation_key) - 1)
+								END
 								AND sibling.state <> ?
 							)
 						)
@@ -1237,6 +1243,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	)
 
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	deferCutoverIsTrue := s.dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1251,7 +1258,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 			SELECT 1
 			FROM applies AS a
 			WHERE a.id = apply_operations.apply_id
-				AND NOT (JSON_EXTRACT(a.options, '$.defer_cutover') <=> CAST('true' AS JSON))
+				AND NOT %s
 		)
 		AND (
 			(
@@ -1277,7 +1284,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, deferCutoverIsTrue, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
