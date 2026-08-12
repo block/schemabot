@@ -15,8 +15,15 @@ import (
 // lease heartbeat) and apply_comments (summary-claim freshness).
 var heartbeatTableUpdateRe = regexp.MustCompile(`UPDATE\s+apply_(?:operations|comments)\b`)
 
+// heartbeatJoinedUpdateRe matches dialect JoinedUpdate call sites that target a
+// heartbeat table. The statement is rendered by the dialect, so the raw-SQL
+// scan above never sees it; the assignments literal inside the call must stamp
+// updated_at just like a raw UPDATE's SET clause.
+var heartbeatJoinedUpdateRe = regexp.MustCompile(`\.JoinedUpdate\(\s*\n?\s*"apply_(?:operations|comments)"`)
+
 // TestHeartbeatTableUpdatesStampUpdatedAt asserts that every UPDATE statement
-// in this package against apply_operations or apply_comments assigns
+// in this package against apply_operations or apply_comments — whether written
+// as a raw SQL literal or rendered through dialect JoinedUpdate — assigns
 // updated_at in its SET clause. Stamping these columns is the application's
 // responsibility on every dialect: the staleness predicates
 // (FindNextApplyOperation's stale-active arm, ReclaimStaleSummaryClaim) read
@@ -64,6 +71,39 @@ func TestHeartbeatTableUpdatesStampUpdatedAt(t *testing.T) {
 					"the staleness predicates read it as the liveness signal and no dialect-level "+
 					"default may be relied on", name, line)
 		}
+
+		for _, loc := range heartbeatJoinedUpdateRe.FindAllStringIndex(src, -1) {
+			checked++
+			line := 1 + strings.Count(src[:loc[0]], "\n")
+			window, ok := callWindow(src, loc[0])
+			require.True(t, ok, "%s:%d: unterminated JoinedUpdate call", name, line)
+			assert.Contains(t, window, "updated_at",
+				"%s:%d: JoinedUpdate on a heartbeat table must include an updated_at assignment; "+
+					"the staleness predicates read it as the liveness signal and no dialect-level "+
+					"default may be relied on", name, line)
+		}
 	}
 	require.NotZero(t, checked, "expected UPDATE statements on apply_operations/apply_comments in this package")
+}
+
+// callWindow returns the source text of the call expression starting at the
+// match position, from its opening parenthesis through the balancing close.
+func callWindow(src string, matchStart int) (string, bool) {
+	open := strings.Index(src[matchStart:], "(")
+	if open < 0 {
+		return "", false
+	}
+	depth := 0
+	for i := matchStart + open; i < len(src); i++ {
+		switch src[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return src[matchStart : i+1], true
+			}
+		}
+	}
+	return "", false
 }

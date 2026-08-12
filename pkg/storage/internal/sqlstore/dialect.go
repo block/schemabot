@@ -2,6 +2,7 @@ package sqlstore
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -137,6 +138,8 @@ type JoinedUpdateAssignment struct {
 
 // MySQLDialect implements Dialect for MySQL and MySQL-protocol engines.
 type MySQLDialect struct{}
+
+var plainJSONIdentifier = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // InsertIfAbsent uses MySQL's INSERT IGNORE modifier. MySQL infers conflicts
 // from every unique key on the table, so conflictColumns is not rendered.
@@ -282,7 +285,9 @@ func (PostgresDialect) Rebind(query string) string {
 			b.WriteByte(query[i])
 			continue
 		}
-		if query[i] == '$' {
+		// A dollar sign that continues an identifier (PostgreSQL permits $
+		// inside identifiers) never opens a dollar-quoted string.
+		if query[i] == '$' && (i == 0 || !isPostgresIdentifierChar(query[i-1])) {
 			if end := strings.IndexByte(query[i+1:], '$'); end >= 0 {
 				delimiter := query[i : i+end+2]
 				tag := delimiter[1 : len(delimiter)-1]
@@ -312,6 +317,28 @@ func (PostgresDialect) Rebind(query string) string {
 			i += end - 1
 			continue
 		}
+		// Block comments nest in PostgreSQL; question marks inside them are
+		// prose, not placeholders. An unterminated comment consumes the rest of
+		// the query, matching the server's tokenization.
+		if query[i] == '/' && i+1 < len(query) && query[i+1] == '*' {
+			depth := 1
+			end := i + 2
+			for end < len(query) && depth > 0 {
+				switch {
+				case query[end] == '/' && end+1 < len(query) && query[end+1] == '*':
+					depth++
+					end += 2
+				case query[end] == '*' && end+1 < len(query) && query[end+1] == '/':
+					depth--
+					end += 2
+				default:
+					end++
+				}
+			}
+			b.WriteString(query[i:end])
+			i = end - 1
+			continue
+		}
 		if query[i] == '?' {
 			b.WriteByte('$')
 			b.WriteString(strconv.Itoa(ordinal))
@@ -336,7 +363,10 @@ func (PostgresDialect) InsertIfAbsent(conflictColumns []string) InsertIfAbsentSy
 func (PostgresDialect) JSONBooleanIsTrue(expression string, path []string) string {
 	keys := make([]string, len(path))
 	for i, key := range path {
-		keys[i] = "'" + strings.ReplaceAll(key, "'", "''") + "'"
+		if !plainJSONIdentifier.MatchString(key) {
+			panic(fmt.Sprintf("sqlstore: JSON path key %q is not a plain identifier", key))
+		}
+		keys[i] = "'" + key + "'"
 	}
 	return "(jsonb_extract_path(" + expression + ", " + strings.Join(keys, ", ") + ") IS NOT DISTINCT FROM 'true'::jsonb)"
 }
@@ -347,9 +377,13 @@ func (PostgresDialect) IndexHint(string) string { return "" }
 
 // JoinedUpdate builds a PostgreSQL UPDATE … FROM statement. The join condition
 // moves into the WHERE clause alongside the residual predicate; SET
-// placeholders still precede predicate placeholders, so argument order matches
-// the MySQL rendering.
+// placeholders still precede predicate placeholders, so the placeholder-free
+// join condition the interface requires keeps argument order identical to the
+// MySQL rendering.
 func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	if len(assignments) == 0 {
+		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
 		sets[i] = assignment.Column + " = " + assignment.Expr
@@ -401,6 +435,12 @@ func (d PostgresDialect) RelativeTime(precision TimestampPrecision, direction Re
 		panic(fmt.Sprintf("sqlstore: unknown relative-time direction %d", direction))
 	}
 	return d.CurrentTimestamp(precision) + op + magnitude + " * interval '1 " + postgresIntervalUnit(unit) + "'"
+}
+
+// isPostgresIdentifierChar reports whether c can appear inside a PostgreSQL
+// identifier body (letters, digits, underscores, and dollar signs).
+func isPostgresIdentifierChar(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 func postgresIntervalUnit(unit IntervalUnit) string {

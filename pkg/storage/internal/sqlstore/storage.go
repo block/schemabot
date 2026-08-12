@@ -1,7 +1,8 @@
 // Package sqlstore implements the storage interface over database/sql. It is
 // the shared dialect-parameterized core behind the public per-dialect
-// constructors (mysqlstore, and in the future postgresstore); it currently
-// emits MySQL-style SQL and is wired with MySQL dependencies.
+// constructors (mysqlstore, and in the future postgresstore); every store
+// routes family-varying SQL syntax, placeholder binding, and identity
+// retrieval through the injected dependencies.
 package sqlstore
 
 import (
@@ -12,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// Storage implements the storage.Storage interface using MySQL.
+// Storage implements the storage.Storage interface over database/sql.
 type Storage struct {
 	db              *rebindDB
 	locks           *lockStore
@@ -54,9 +55,8 @@ type Dependencies struct {
 	Classifier ErrorClassifier
 }
 
-// NewWithDependencies creates a storage instance with partially parameterized
-// database dependencies. Stores that have not yet been parameterized retain
-// MySQL behavior.
+// NewWithDependencies creates a storage instance whose database-specific
+// behavior comes entirely from deps; no store hardwires a dialect.
 func NewWithDependencies(deps Dependencies) *Storage {
 	rdb := newRebindDB(deps.DB, deps.Binder)
 	return &Storage{

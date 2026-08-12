@@ -13,7 +13,7 @@ import (
 // settingColumns lists all columns for SELECT queries.
 const settingColumns = `id, setting_key, setting_value, created_at, updated_at`
 
-// settingsStore implements storage.SettingsStore using MySQL.
+// settingsStore implements storage.SettingsStore.
 type settingsStore struct {
 	db      *rebindDB
 	dialect Dialect
@@ -38,11 +38,16 @@ func (s *settingsStore) Get(ctx context.Context, key string) (*storage.Setting, 
 	return &setting, nil
 }
 
-// Set saves a setting. Creates if not exists, updates if exists.
+// Set saves a setting. Creates if not exists, updates if exists. The conflict
+// path stamps updated_at explicitly: the column reports when the setting was
+// last written, and not every dialect renews it automatically on update.
 func (s *settingsStore) Set(ctx context.Context, key, value string) error {
 	upsert := s.dialect.UpsertClause(
 		[]string{"setting_key"},
-		[]UpsertAssignment{{Column: "setting_value"}},
+		[]UpsertAssignment{
+			{Column: "setting_value"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
 	)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO settings (setting_key, setting_value)

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMySQLDialectExcludedValue(t *testing.T) {
@@ -181,6 +182,18 @@ func TestPostgresDialectRebind(t *testing.T) {
 	d := PostgresDialect{}
 	assert.Equal(t, "SELECT $1, '$2?', 'it''s ?', \"why?\", $$body ?$$, $tag$also ?$tag$ -- ?\nWHERE id = $2",
 		d.Rebind("SELECT ?, '$2?', 'it''s ?', \"why?\", $$body ?$$, $tag$also ?$tag$ -- ?\nWHERE id = ?"))
+	// Question marks inside block comments (including nested ones) are prose,
+	// not placeholders, so they must not consume ordinals.
+	assert.Equal(t, "SELECT 1 /* why? /* nested? */ still? */ WHERE id = $1",
+		d.Rebind("SELECT 1 /* why? /* nested? */ still? */ WHERE id = ?"))
+	// An unterminated block comment consumes the rest of the query, matching
+	// the server's tokenization.
+	assert.Equal(t, "SELECT 1 /* dangling ? WHERE id = ?",
+		d.Rebind("SELECT 1 /* dangling ? WHERE id = ?"))
+	// A dollar sign continuing an identifier does not open a dollar-quoted
+	// string, so later placeholders still rebind.
+	assert.Equal(t, "SELECT abc$x$ FROM t WHERE id = $1",
+		d.Rebind("SELECT abc$x$ FROM t WHERE id = ?"))
 }
 
 func TestPostgresDialect(t *testing.T) {
@@ -209,8 +222,15 @@ func TestPostgresDialectJSONBooleanIsTrue(t *testing.T) {
 		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"defer_cutover"}),
 	)
 	assert.Equal(t,
-		`(jsonb_extract_path(a.options, 'outer', 'it''s') IS NOT DISTINCT FROM 'true'::jsonb)`,
-		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "it's"}),
+		`(jsonb_extract_path(a.options, 'outer', 'inner_key') IS NOT DISTINCT FROM 'true'::jsonb)`,
+		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "inner_key"}),
+	)
+}
+
+func TestPostgresDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "it's" is not a plain identifier`,
+		func() { PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "it's"}) },
 	)
 }
 
@@ -234,4 +254,24 @@ func TestPostgresDialectJoinedUpdate(t *testing.T) {
 			"c.apply_id = ? AND a.lease_token = ?",
 		),
 	)
+	// A placeholder assignment expression must render ahead of the predicate's
+	// placeholders, pinning the interface's assignments-then-predicate argument
+	// order at the rendering level.
+	assert.Equal(t,
+		"UPDATE apply_control_requests cr SET status = ?, completed_at = COALESCE(cr.completed_at, NOW()) FROM applies a WHERE (a.id = cr.apply_id) AND (cr.apply_id = ? AND a.lease_token = ?)",
+		PostgresDialect{}.JoinedUpdate(
+			"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "status", Expr: "?"},
+				{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			},
+			"cr.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+func TestPostgresDialectJoinedUpdateRequiresAssignments(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate requires at least one assignment", func() {
+		PostgresDialect{}.JoinedUpdate("apply_comments", "c", "applies", "a", "a.id = c.apply_id", nil, "c.apply_id = ?")
+	})
 }
