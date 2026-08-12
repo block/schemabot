@@ -3,11 +3,11 @@ package postgres
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"sort"
-	"strings"
+	"time"
 
+	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/diffplan"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
@@ -59,15 +59,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("normalize PostgreSQL database %q DSN for planning: %w", req.Database, err)
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	pool, err := dbconn.NewPool(ctx, dbconn.Config{URL: dsn})
 	if err != nil {
 		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
 	}
 	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("ping pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
-	}
-
 	return planSchemas(ctx, pool, req)
 }
 
@@ -79,7 +75,6 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 
 	namespaces := sortedKeys(req.SchemaFiles)
 	result := &engine.PlanResult{}
-	fingerprints := make([]string, 0)
 	for _, namespace := range namespaces {
 		ns := req.SchemaFiles[namespace]
 		if ns == nil {
@@ -101,14 +96,13 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
-			fingerprints = append(fingerprints, report.Fingerprint)
 		}
 		if len(schemaChange.TableChanges) > 0 {
 			result.Changes = append(result.Changes, schemaChange)
 		}
 	}
 	result.NoChanges = len(result.Changes) == 0
-	result.PlanID = planID(fingerprints)
+	result.PlanID = fmt.Sprintf("postgres-plan-%d", time.Now().UnixNano())
 	return result, nil
 }
 
@@ -171,11 +165,6 @@ func destructiveReason(destructive bool, table string) string {
 		return ""
 	}
 	return fmt.Sprintf("statement removes live structure from table %q", table)
-}
-
-func planID(fingerprints []string) string {
-	digest := sha256.Sum256([]byte(strings.Join(fingerprints, "\x00")))
-	return fmt.Sprintf("postgres-plan-%x", digest[:8])
 }
 
 func sortedKeys[V any](values map[string]V) []string {

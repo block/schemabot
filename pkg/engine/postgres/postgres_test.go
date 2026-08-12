@@ -17,10 +17,18 @@ import (
 func TestExecutionVerdict(t *testing.T) {
 	tests := []struct {
 		name       string
+		version    int
 		statement  pgplan.Statement
 		wantMode   string
 		wantReason string
 	}{
+		{
+			name:       "unrecognized plan contract",
+			version:    pgplan.FormatVersion + 1,
+			statement:  pgplan.Statement{Disposition: router.DispositionExecute},
+			wantMode:   engine.ExecutionModeBlocked,
+			wantReason: `statement for table "users" has an unrecognized plan contract`,
+		},
 		{
 			name: "native safe",
 			statement: pgplan.Statement{Route: planner.RouteNative, Backend: router.BackendNative,
@@ -34,10 +42,22 @@ func TestExecutionVerdict(t *testing.T) {
 			wantReason: `statement for table "users" requires copy-and-swap, which is unavailable`,
 		},
 		{
+			name:       "rewrite required",
+			statement:  pgplan.Statement{Disposition: router.DispositionRewriteRequired},
+			wantMode:   engine.ExecutionModeBlocked,
+			wantReason: `statement for table "users" has blocked verdict "rewrite-required"`,
+		},
+		{
 			name:       "refuse",
 			statement:  pgplan.Statement{Route: planner.RouteRefuse, Disposition: router.DispositionRefuse},
 			wantMode:   engine.ExecutionModeBlocked,
 			wantReason: `statement for table "users" has blocked verdict "refuse"`,
+		},
+		{
+			name:       "unrecognized disposition",
+			statement:  pgplan.Statement{Disposition: router.Disposition("future")},
+			wantMode:   engine.ExecutionModeBlocked,
+			wantReason: `statement for table "users" has blocked verdict "unrecognized"`,
 		},
 		{
 			name: "execute without authoritative steps",
@@ -50,11 +70,47 @@ func TestExecutionVerdict(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mode, reason := executionVerdict(pgplan.FormatVersion, tt.statement, "users")
+			version := tt.version
+			if version == 0 {
+				version = pgplan.FormatVersion
+			}
+			mode, reason := executionVerdict(version, tt.statement, "users")
 			assert.Equal(t, tt.wantMode, mode)
 			assert.Equal(t, tt.wantReason, reason)
 		})
 	}
+}
+
+func TestTableChangesMapsDestructiveSafety(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.Statements = []pgplan.Statement{
+		{
+			SQL:         "ALTER TABLE public.users DROP COLUMN legacy",
+			Route:       planner.RouteNative,
+			Backend:     router.BackendNative,
+			Disposition: router.DispositionExecute,
+			ExecSQL:     []string{"ALTER TABLE public.users DROP COLUMN legacy"},
+			Destructive: true,
+		},
+		{
+			SQL:         "ALTER TABLE public.users ADD COLUMN email text",
+			Route:       planner.RouteNative,
+			Backend:     router.BackendNative,
+			Disposition: router.DispositionExecute,
+			ExecSQL:     []string{"ALTER TABLE public.users ADD COLUMN email text"},
+		},
+	}
+
+	changes, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	assert.True(t, changes[0].IsUnsafe)
+	assert.NotEmpty(t, changes[0].UnsafeReason)
+	assert.False(t, changes[1].IsUnsafe)
+	assert.Empty(t, changes[1].UnsafeReason)
 }
 
 func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
