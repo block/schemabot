@@ -3,18 +3,23 @@ package sqlstore
 import (
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// timestampedTableUpdateRe matches UPDATE statements against storage tables
-// whose schema has an updated_at column.
-var timestampedTableUpdateRe = regexp.MustCompile(`UPDATE\s+(?:applies|apply_comments|apply_control_requests|apply_operations|apply_target_locks|checks|locks|plan_comments|settings|tasks|webhook_events)\b`)
-
 var upsertClauseRe = regexp.MustCompile(`\.UpsertClause\(`)
+var createTableNameRe = regexp.MustCompile(`(?i)CREATE\s+TABLE\s+` + "`" + `([^` + "`" + `]+)` + "`")
+var updatedAtColumnRe = regexp.MustCompile(`(?m)^\s*` + "`updated_at`" + `\s+`)
+
+type timestampedWrite struct {
+	loc    []int
+	upsert bool
+}
 
 // TestTimestampedTableWritesStampUpdatedAt asserts that every UPDATE and upsert
 // in this package against a table with updated_at assigns the column explicitly.
@@ -29,9 +34,19 @@ var upsertClauseRe = regexp.MustCompile(`\.UpsertClause\(`)
 //
 // Some statements assemble their SET clause in a variable above the SQL
 // template (per-guard qualified/unqualified variants), so the scan window
-// runs from the start of the enclosing function to the statement's WHERE
-// clause rather than covering the SQL literal alone.
+// starts after the preceding timestamped write in the enclosing function and
+// ends at the statement's WHERE clause or ExecContext call. This keeps nearby
+// variable-assembled clauses in scope without letting one write's stamp satisfy
+// a later write.
 func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
+	timestampedTables := timestampedMySQLTables(t)
+	require.NotEmpty(t, timestampedTables, "expected timestamped tables in the MySQL schema")
+	quotedTables := make([]string, 0, len(timestampedTables))
+	for _, table := range timestampedTables {
+		quotedTables = append(quotedTables, regexp.QuoteMeta(table))
+	}
+	timestampedTableUpdateRe := regexp.MustCompile(`UPDATE\s+(?:` + strings.Join(quotedTables, "|") + `)\b`)
+
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
 
@@ -45,35 +60,66 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 		require.NoError(t, err)
 		src := string(content)
 
+		var writes []timestampedWrite
 		for _, loc := range timestampedTableUpdateRe.FindAllStringIndex(src, -1) {
+			writes = append(writes, timestampedWrite{loc: loc})
+		}
+		for _, loc := range upsertClauseRe.FindAllStringIndex(src, -1) {
+			writes = append(writes, timestampedWrite{loc: loc, upsert: true})
+		}
+		sort.Slice(writes, func(i, j int) bool { return writes[i].loc[0] < writes[j].loc[0] })
+
+		previousWindowEnd := 0
+		for _, write := range writes {
 			checked++
+			loc := write.loc
 			line := 1 + strings.Count(src[:loc[0]], "\n")
 			funcIdx := strings.LastIndex(src[:loc[0]], "\nfunc ")
 			require.GreaterOrEqual(t, funcIdx, 0,
-				"%s:%d: UPDATE on a timestamped table outside a function body", name, line)
-			rest := src[loc[1]:]
-			whereIdx := strings.Index(rest, "WHERE")
+				"%s:%d: timestamped write outside a function body", name, line)
+			windowStart := max(funcIdx, previousWindowEnd)
+
+			if write.upsert {
+				execIdx := strings.Index(src[loc[1]:], "ExecContext")
+				require.GreaterOrEqual(t, execIdx, 0,
+					"%s:%d: upsert clause without an ExecContext call", name, line)
+				previousWindowEnd = loc[1] + execIdx
+				assert.Contains(t, src[windowStart:previousWindowEnd], "updated_at",
+					"%s:%d: upsert must assign updated_at in its conflict branch", name, line)
+				continue
+			}
+
+			whereIdx := strings.Index(src[loc[1]:], "WHERE")
 			require.GreaterOrEqual(t, whereIdx, 0,
-				"%s:%d: UPDATE on a heartbeat table without a WHERE clause", name, line)
-			window := src[funcIdx:loc[1]] + rest[:whereIdx]
-			assert.Contains(t, window, "updated_at",
+				"%s:%d: UPDATE on a timestamped table without a WHERE clause", name, line)
+			previousWindowEnd = loc[1] + whereIdx
+			assert.Contains(t, src[windowStart:previousWindowEnd], "updated_at",
 				"%s:%d: UPDATE on a timestamped table must assign updated_at in its SET clause; "+
 					"no dialect-level default may be relied on", name, line)
 		}
-
-		for _, loc := range upsertClauseRe.FindAllStringIndex(src, -1) {
-			checked++
-			line := 1 + strings.Count(src[:loc[0]], "\n")
-			funcIdx := strings.LastIndex(src[:loc[0]], "\nfunc ")
-			require.GreaterOrEqual(t, funcIdx, 0,
-				"%s:%d: upsert clause outside a function body", name, line)
-			execIdx := strings.Index(src[loc[1]:], "ExecContext")
-			require.GreaterOrEqual(t, execIdx, 0,
-				"%s:%d: upsert clause without an ExecContext call", name, line)
-			window := src[funcIdx : loc[1]+execIdx]
-			assert.Contains(t, window, "updated_at",
-				"%s:%d: upsert must assign updated_at in its conflict branch", name, line)
-		}
 	}
 	require.NotZero(t, checked, "expected UPDATE or upsert statements on timestamped tables in this package")
+}
+
+func timestampedMySQLTables(t *testing.T) []string {
+	t.Helper()
+	entries, err := schema.MySQLFS.ReadDir("mysql")
+	require.NoError(t, err)
+
+	var tables []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		content, err := schema.MySQLFS.ReadFile("mysql/" + entry.Name())
+		require.NoError(t, err)
+		if !updatedAtColumnRe.Match(content) {
+			continue
+		}
+		match := createTableNameRe.FindSubmatch(content)
+		require.Len(t, match, 2, "%s must contain one backtick-quoted CREATE TABLE name", entry.Name())
+		tables = append(tables, string(match[1]))
+	}
+	sort.Strings(tables)
+	return tables
 }
