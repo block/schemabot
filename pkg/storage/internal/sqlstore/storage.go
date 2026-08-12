@@ -68,10 +68,10 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		applyLogs:       &applyLogStore{db: rdb, identity: MySQLDialect{}},
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
 		applyComments:   &applyCommentStore{db: rdb, dialect: MySQLDialect{}},
-		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}},
+		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}, dialect: deps.Dialect},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
-		settings:        &settingsStore{db: rdb, dialect: MySQLDialect{}},
+		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 	}
 }

@@ -42,7 +42,10 @@ func (s *settingsStore) Get(ctx context.Context, key string) (*storage.Setting, 
 func (s *settingsStore) Set(ctx context.Context, key, value string) error {
 	upsert := s.dialect.UpsertClause(
 		[]string{"setting_key"},
-		[]UpsertAssignment{{Column: "setting_value"}},
+		[]UpsertAssignment{
+			{Column: "setting_value"},
+			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
+		},
 	)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO settings (setting_key, setting_value)

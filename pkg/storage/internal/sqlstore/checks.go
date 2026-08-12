@@ -55,6 +55,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			{Column: "blocking_reason"},
 			{Column: "error_message"},
 			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
+			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
 	)
 	return withLockRetry(ctx, s.classifier, op, func() error {
@@ -131,7 +132,8 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
 				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
 				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
-				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END
+				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
+				    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 				WHERE repository = ? AND pull_request = ?
 				  AND environment = ? AND database_type = ? AND database_name = ?
 				  AND NOT (status = ? AND apply_id IS NOT NULL)
@@ -158,7 +160,8 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 			    conclusion = ?,
 			    blocking_reason = ?,
 			    error_message = ?,
-			    change_summary = ?
+			    change_summary = ?,
+			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
 			  AND NOT (status = ? AND apply_id IS NOT NULL)
@@ -191,7 +194,8 @@ func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, che
 		    conclusion = ?,
 		    blocking_reason = ?,
 		    error_message = ?,
-		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
+		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status = ? AND head_sha = ? AND apply_id IS NOT NULL
@@ -244,7 +248,8 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 		    conclusion = ?,
 		    blocking_reason = ?,
 		    error_message = ?,
-		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
+		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status != ? AND apply_id IS NULL
@@ -291,7 +296,8 @@ func (s *checkStore) ClearAggregateBlock(ctx context.Context, check *storage.Che
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE checks
 		SET blocking_reason = '',
-		    error_message = ''
+		    error_message = '',
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND head_sha = ? AND blocking_reason = ?
@@ -351,7 +357,8 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		    conclusion = ?,
 		    blocking_reason = ?,
 		    error_message = ?,
-		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
+		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND status = ?
@@ -421,7 +428,8 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		    conclusion = ?,
 		    blocking_reason = ?,
 		    error_message = ?,
-		    change_summary = COALESCE(NULLIF(?, ''), change_summary)
+		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
 		  AND (apply_id IS NULL OR apply_id <= ?)
