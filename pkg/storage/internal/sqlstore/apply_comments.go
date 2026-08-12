@@ -118,18 +118,18 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 		}
 		return nil
 	}
-	leaseJoin := ""
-	leasePredicate := ""
 	args := []any{applyID, commentState}
-	leaseJoin = " JOIN applies a ON a.id = c.apply_id"
-	leasePredicate = " AND a.lease_token = ?"
 	args = append(args, lease.Token)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_comments c
-		`+leaseJoin+`
-		SET c.edit_count = c.edit_count + 1, c.last_edited_at = NOW(), c.updated_at = NOW()
-		WHERE c.apply_id = ? AND c.comment_state = ?`+leasePredicate+`
-	`, args...)
+	query := s.dialect.JoinedUpdate(
+		"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "edit_count", Expr: "c.edit_count + 1"},
+			{Column: "last_edited_at", Expr: "NOW()"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"c.apply_id = ? AND c.comment_state = ? AND a.lease_token = ?",
+	)
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -176,12 +176,15 @@ func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commen
 		`, applyID, commentState)
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_comments c
-		JOIN applies a ON a.id = c.apply_id
-		SET c.superseded_at = NOW(), c.updated_at = NOW()
-		WHERE c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND a.lease_token = ?
-	`, applyID, commentState, lease.Token)
+	query := s.dialect.JoinedUpdate(
+		"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "superseded_at", Expr: "NOW()"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND a.lease_token = ?",
+	)
+	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -215,12 +218,15 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 		`, applyID, commentState)
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_comments c
-		JOIN applies a ON a.id = c.apply_id
-		SET c.pending_freeze_github_comment_id = NULL, c.updated_at = NOW()
-		WHERE c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND a.lease_token = ?
-	`, applyID, commentState, lease.Token)
+	query := s.dialect.JoinedUpdate(
+		"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "pending_freeze_github_comment_id", Expr: "NULL"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND a.lease_token = ?",
+	)
+	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
 		return err
 	}
