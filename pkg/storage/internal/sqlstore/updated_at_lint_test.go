@@ -32,12 +32,14 @@ type timestampedWrite struct {
 // still satisfies the invariant: the statement owns the column's value rather
 // than leaving it to schema defaults.
 //
-// Some statements assemble their SET clause in a variable above the SQL
-// template (per-guard qualified/unqualified variants), so the scan window
+// Some UPDATE statements assemble their SET clause in a variable above the SQL
+// template (per-guard qualified/unqualified variants), so their scan window
 // starts after the preceding timestamped write in the enclosing function and
-// ends at the statement's WHERE clause or ExecContext call. This keeps nearby
-// variable-assembled clauses in scope without letting one write's stamp satisfy
-// a later write.
+// ends at the statement's WHERE clause. This keeps nearby variable-assembled
+// clauses in scope without letting one write's stamp satisfy a later write.
+// Upserts are scanned more tightly: the assignment must appear inside the
+// UpsertClause call's argument list, so unrelated mentions of the column
+// elsewhere in the function cannot satisfy the check.
 func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 	timestampedTables := timestampedMySQLTables(t)
 	require.NotEmpty(t, timestampedTables, "expected timestamped tables in the MySQL schema")
@@ -80,12 +82,12 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 			windowStart := max(funcIdx, previousWindowEnd)
 
 			if write.upsert {
-				execIdx := strings.Index(src[loc[1]:], "ExecContext")
-				require.GreaterOrEqual(t, execIdx, 0,
-					"%s:%d: upsert clause without an ExecContext call", name, line)
-				previousWindowEnd = loc[1] + execIdx
-				assert.Contains(t, src[windowStart:previousWindowEnd], "updated_at",
-					"%s:%d: upsert must assign updated_at in its conflict branch", name, line)
+				argsEnd := balancedParenEnd(src, loc[1])
+				require.Greater(t, argsEnd, loc[1],
+					"%s:%d: unterminated UpsertClause call", name, line)
+				previousWindowEnd = argsEnd
+				assert.Contains(t, src[loc[1]:argsEnd], "updated_at",
+					"%s:%d: upsert must assign updated_at in its conflict assignments", name, line)
 				continue
 			}
 
@@ -99,6 +101,27 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 		}
 	}
 	require.NotZero(t, checked, "expected UPDATE or upsert statements on timestamped tables in this package")
+}
+
+// balancedParenEnd returns the index just past the parenthesis that closes the
+// call whose opening parenthesis ends at start, or -1 when the call is never
+// closed. Parentheses inside string literals are counted too, which is correct
+// for SQL expression fragments: a valid SQL expression's parentheses balance
+// across the argument list even when individual fragments are unbalanced.
+func balancedParenEnd(src string, start int) int {
+	depth := 1
+	for i := start; i < len(src); i++ {
+		switch src[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
 }
 
 func timestampedMySQLTables(t *testing.T) []string {
