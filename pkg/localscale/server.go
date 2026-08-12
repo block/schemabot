@@ -1370,6 +1370,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/apply-deploy", s.handleError(s.handleApplyDeployRequest))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/revert", s.handleError(s.handleRevertDeployRequest))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/skip-revert", s.handleError(s.handleSkipRevertDeployRequest))
+	mux.HandleFunc("PUT /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/auto-apply", s.handleError(s.handleAutoApplyDeployRequest))
 	mux.HandleFunc("PUT /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/throttle", s.handleError(s.handleThrottleDeployRequest))
 
 	// Deploy request CRUD endpoints

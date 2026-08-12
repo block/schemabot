@@ -219,6 +219,43 @@ func (s *Server) handleSkipRevertDeployRequest(w http.ResponseWriter, r *http.Re
 	return nil
 }
 
+// handleAutoApplyDeployRequest turns a deploy request's auto-apply on or off.
+// It is the only way a client can state that a deploy request must hold at
+// pending_cutover instead of cutting over on its own, because the create
+// request's auto_cutover field cannot carry a false.
+func (s *Server) handleAutoApplyDeployRequest(w http.ResponseWriter, r *http.Request) error {
+	_, ref, err := s.resolveDeployAction(r)
+	if err != nil {
+		return err
+	}
+
+	var body struct {
+		Enable *bool `json:"enable"`
+	}
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
+	}
+	if body.Enable == nil {
+		return newHTTPError(http.StatusUnprocessableEntity, "enable is required")
+	}
+
+	info, err := s.getDeployRequestInfo(r.Context(), ref)
+	if err != nil {
+		return err
+	}
+	if err := s.execLog(r.Context(),
+		`UPDATE localscale_deploy_requests
+		 SET auto_cutover = ?
+		 WHERE org = ? AND database_name = ? AND number = ?`,
+		*body.Enable, ref.org, ref.database, ref.number,
+	); err != nil {
+		return newHTTPError(http.StatusInternalServerError, "update auto cutover: %v", err)
+	}
+
+	s.writeJSON(w, deployResponse(ref.number, info.branch, info.deploymentState))
+	return nil
+}
+
 func (s *Server) handleThrottleDeployRequest(w http.ResponseWriter, r *http.Request) error {
 	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {

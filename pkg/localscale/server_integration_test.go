@@ -600,6 +600,10 @@ func applyBranchVSchema(t *testing.T, ctx context.Context, branchName string, vs
 
 // createDeploy creates a deploy request for the given branch, waits for the
 // background diff to complete, and returns the ready deploy request.
+//
+// Holding the cutover takes a second call: the create request's AutoCutover
+// field is tagged `omitempty`, so a false never reaches the server and the
+// deploy request would cut over on its own.
 func createDeploy(t *testing.T, ctx context.Context, branchName string, autoCutover bool) *ps.DeployRequest {
 	t.Helper()
 	dr, err := testClient.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
@@ -610,6 +614,9 @@ func createDeploy(t *testing.T, ctx context.Context, branchName string, autoCuto
 		AutoCutover:  autoCutover,
 	})
 	require.NoError(t, err, "CreateDeployRequest")
+	if !autoCutover {
+		require.NoError(t, testClient.DisableAutoApply(ctx, testOrg, testDB, dr.Number), "DisableAutoApply")
+	}
 	return waitForDeployReady(t, ctx, dr.Number)
 }
 

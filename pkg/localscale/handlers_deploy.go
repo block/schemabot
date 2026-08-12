@@ -24,10 +24,16 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusNotFound, "%v", err)
 	}
 
+	// auto_cutover is a pointer so an absent field is distinguishable from an
+	// explicit false. PlanetScale remembers an auto-apply default per database
+	// and it may be on, so an unspecified request must land on cutover, not off
+	// — a client that means to hold the cutover has to say so on the auto-apply
+	// endpoint. Defaulting the other way would make every caller that fails to
+	// state its intent look correct here and cut over unattended in production.
 	var body struct {
 		Branch           string `json:"branch"`
 		IntoBranch       string `json:"into_branch"`
-		AutoCutover      bool   `json:"auto_cutover"`
+		AutoCutover      *bool  `json:"auto_cutover"`
 		AutoDeleteBranch bool   `json:"auto_delete_branch"`
 	}
 	if err := s.decodeJSON(r, &body); err != nil {
@@ -35,6 +41,10 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 	if body.IntoBranch == "" {
 		body.IntoBranch = "main"
+	}
+	autoCutover := true
+	if body.AutoCutover != nil {
+		autoCutover = *body.AutoCutover
 	}
 
 	// Extract token name from Authorization header (format: "tokenName:tokenValue")
@@ -60,7 +70,7 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		`INSERT INTO localscale_deploy_requests (number, org, database_name, token_name, branch, into_branch, auto_cutover, ddl_statements, deployment_state)
 		 SELECT COALESCE(MAX(number), 0) + 1, ?, ?, ?, ?, ?, ?, '{}', ?
 		 FROM localscale_deploy_requests WHERE org = ? AND database_name = ?`,
-		org, database, tokenName, body.Branch, body.IntoBranch, body.AutoCutover, dr.Pending, org, database,
+		org, database, tokenName, body.Branch, body.IntoBranch, autoCutover, dr.Pending, org, database,
 	)
 	if err != nil {
 		return newHTTPError(http.StatusInternalServerError, "insert deploy request: %v", err)
