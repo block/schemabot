@@ -584,6 +584,7 @@ func TestHandleRollbackConfirmCommandBlocksUnauthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "@mona is not authorized")
 	assert.Contains(t, body, "`schemabot rollback-confirm`")
 	assert.Empty(t, locks.released, "denied rollback-confirm must not release the lock")
+	assert.Empty(t, locks.releasedIfPending, "denied rollback-confirm must not release the pinned rollback lock")
 }
 
 // TestHandleRollbackConfirmCommandAllowsAuthorizedActor verifies that a
@@ -881,6 +882,9 @@ func (s *actorAuthLockStore) Release(_ context.Context, database, _, _ string) e
 }
 
 func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, pendingPlanID string) (bool, error) {
+	if s.releaseErr != nil {
+		return false, s.releaseErr
+	}
 	s.releasedIfPending = append(s.releasedIfPending, pendingPlanID)
 	return true, nil
 }
