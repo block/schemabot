@@ -45,6 +45,26 @@ func TestMySQLDialectJoinedUpdate(t *testing.T) {
 			"c.apply_id = ? AND a.lease_token = ?",
 		),
 	)
+	// A placeholder assignment expression must render ahead of the predicate's
+	// placeholders, pinning the interface's assignments-then-predicate argument
+	// order at the rendering level.
+	assert.Equal(t,
+		"UPDATE apply_control_requests cr JOIN applies a ON a.id = cr.apply_id SET cr.status = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()) WHERE cr.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedUpdate(
+			"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "status", Expr: "?"},
+				{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			},
+			"cr.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+func TestMySQLDialectJoinedUpdateRequiresAssignments(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate requires at least one assignment", func() {
+		MySQLDialect{}.JoinedUpdate("apply_comments", "c", "applies", "a", "a.id = c.apply_id", nil, "c.apply_id = ?")
+	})
 }
 
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches

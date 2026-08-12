@@ -118,8 +118,6 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 		}
 		return nil
 	}
-	args := []any{applyID, commentState}
-	args = append(args, lease.Token)
 	query := s.dialect.JoinedUpdate(
 		"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
 		[]JoinedUpdateAssignment{
@@ -129,7 +127,7 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 		},
 		"c.apply_id = ? AND c.comment_state = ? AND a.lease_token = ?",
 	)
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
 		return err
 	}

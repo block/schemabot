@@ -51,7 +51,11 @@ type Dialect interface {
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
 	// dialects. joinCondition and predicate remain separate so dialects can place
-	// them in the clauses their syntax requires.
+	// them in the clauses their syntax requires. Because that placement differs
+	// per dialect, joinCondition must not contain bind placeholders: placeholders
+	// are permitted only in assignment expressions and predicate, and callers
+	// supply their arguments in that order. Implementations panic when
+	// assignments is empty.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 }
 
@@ -220,6 +224,9 @@ func (MySQLDialect) IndexHint(index string) string {
 
 // JoinedUpdate builds a MySQL multi-table UPDATE statement.
 func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	if len(assignments) == 0 {
+		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
 		sets[i] = targetAlias + "." + assignment.Column + " = " + assignment.Expr
