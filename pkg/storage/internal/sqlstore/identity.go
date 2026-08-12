@@ -3,6 +3,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 )
 
 // queryExecer is the execution subset needed to run an INSERT and read back
@@ -30,6 +31,28 @@ type identityInserter interface {
 	// it is false the caller interprets the guard (for example a lost lease).
 	// id is meaningful only when inserted is true.
 	InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (id int64, inserted bool, err error)
+}
+
+// InsertID appends RETURNING id and scans the generated PostgreSQL identity.
+func (PostgresDialect) InsertID(ctx context.Context, exec queryExecer, query string, args ...any) (int64, error) {
+	var id int64
+	if err := exec.QueryRowContext(ctx, query+" RETURNING id", args...).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// InsertGuardedID distinguishes a guarded INSERT that selected no row from a
+// successful insert by the absence of a RETURNING row.
+func (PostgresDialect) InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (int64, bool, error) {
+	id, err := (PostgresDialect{}).InsertID(ctx, exec, query, args...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
 }
 
 // InsertID executes the INSERT and returns Result.LastInsertId().

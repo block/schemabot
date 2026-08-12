@@ -64,14 +64,14 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		locks:           &lockStore{db: rdb, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
 		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
-		tasks:           &taskStore{db: rdb, identity: MySQLDialect{}},
-		applyLogs:       &applyLogStore{db: rdb, identity: MySQLDialect{}},
+		tasks:           &taskStore{db: rdb, identity: deps.Identity},
+		applyLogs:       &applyLogStore{db: rdb, identity: deps.Identity},
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
-		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}},
+		planComments:    &planCommentStore{db: rdb, identity: deps.Identity},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
-		settings:        &settingsStore{db: rdb, dialect: MySQLDialect{}},
+		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 	}
 }

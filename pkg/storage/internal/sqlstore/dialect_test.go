@@ -176,3 +176,62 @@ func countPlaceholders(s string) int {
 	}
 	return n
 }
+
+func TestPostgresDialectRebind(t *testing.T) {
+	d := PostgresDialect{}
+	assert.Equal(t, "SELECT $1, '$2?', 'it''s ?', \"why?\", $$body ?$$, $tag$also ?$tag$ -- ?\nWHERE id = $2",
+		d.Rebind("SELECT ?, '$2?', 'it''s ?', \"why?\", $$body ?$$, $tag$also ?$tag$ -- ?\nWHERE id = ?"))
+}
+
+func TestPostgresDialect(t *testing.T) {
+	d := PostgresDialect{}
+	assert.Equal(t, "EXCLUDED.setting_value", d.ExcludedValue("setting_value"))
+	assert.Equal(t, "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+		d.UpsertClause([]string{"setting_key"}, []UpsertAssignment{{Column: "setting_value"}}))
+	assert.Equal(t, "now()", d.CurrentTimestamp(TimestampPrecisionDefault))
+	assert.Equal(t, "now()", d.CurrentTimestamp(TimestampPrecisionMicrosecond))
+	assert.Equal(t, "now() - ? * interval '1 second'",
+		d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond))
+	assert.Equal(t, "now() + 2 * interval '1 day'",
+		d.RelativeTime(TimestampPrecisionDefault, AfterCurrentTime, LiteralIntervalAmount(2), IntervalDay))
+}
+
+func TestPostgresDialectInsertIfAbsent(t *testing.T) {
+	assert.Equal(t,
+		InsertIfAbsentSyntax{Suffix: " ON CONFLICT (apply_id, comment_state) DO NOTHING"},
+		PostgresDialect{}.InsertIfAbsent([]string{"apply_id", "comment_state"}),
+	)
+}
+
+func TestPostgresDialectJSONBooleanIsTrue(t *testing.T) {
+	assert.Equal(t,
+		`(jsonb_extract_path(a.options, 'defer_cutover') IS NOT DISTINCT FROM 'true'::jsonb)`,
+		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"defer_cutover"}),
+	)
+	assert.Equal(t,
+		`(jsonb_extract_path(a.options, 'outer', 'it''s') IS NOT DISTINCT FROM 'true'::jsonb)`,
+		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "it's"}),
+	)
+}
+
+func TestPostgresDialectIndexHint(t *testing.T) {
+	assert.Empty(t, PostgresDialect{}.IndexHint("idx_database_env_deployment"))
+}
+
+// The PostgreSQL joined UPDATE moves the join condition into the WHERE clause
+// (UPDATE … FROM has no ON clause) while keeping SET assignments before the
+// predicate, so placeholder ordinals line up with the MySQL rendering's
+// argument order.
+func TestPostgresDialectJoinedUpdate(t *testing.T) {
+	assert.Equal(t,
+		"UPDATE apply_comments c SET edit_count = c.edit_count + 1, updated_at = NOW() FROM applies a WHERE (a.id = c.apply_id) AND (c.apply_id = ? AND a.lease_token = ?)",
+		PostgresDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "edit_count", Expr: "c.edit_count + 1"},
+				{Column: "updated_at", Expr: "NOW()"},
+			},
+			"c.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
