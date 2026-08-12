@@ -410,6 +410,13 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
 }
 
+// errGitHubAppResolution marks factoryForRepo failures. GitHub App resolution
+// is deterministic per deployment config — no configured clients, an unknown
+// repo in multi-App mode — so the same request reproduces the failure until
+// an operator fixes the config. Command cores classifying durability treat it
+// as terminal rather than re-driving.
+var errGitHubAppResolution = errors.New("GitHub App resolution failed")
+
 // factoryForRepo returns the GitHub App client factory that owns the given
 // repository. In multi-App mode (ServerConfig.Apps is non-empty) the
 // resolution goes through ServerConfig.ResolveGitHubAppForRepo so unknown
@@ -418,19 +425,19 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 // repo.
 func (h *Handler) factoryForRepo(repo string) (github.GitHubClientFactory, error) {
 	if h.ghClients.Len() == 0 {
-		return nil, fmt.Errorf("no GitHub App clients configured")
+		return nil, fmt.Errorf("%w: no GitHub App clients configured", errGitHubAppResolution)
 	}
 	appName := defaultAppName
 	if cfg := h.config(); cfg != nil && len(cfg.Apps) > 0 {
 		resolved, err := cfg.ResolveGitHubAppForRepo(repo)
 		if err != nil {
-			return nil, fmt.Errorf("resolve GitHub App for repo %q: %w", repo, err)
+			return nil, fmt.Errorf("%w for repo %q: %w", errGitHubAppResolution, repo, err)
 		}
 		appName = resolved.Name
 	}
 	factory, err := h.ghClients.For(appName)
 	if err != nil {
-		return nil, fmt.Errorf("lookup GitHub App client %q for repo %q: %w", appName, repo, err)
+		return nil, fmt.Errorf("%w: lookup GitHub App client %q for repo %q: %w", errGitHubAppResolution, appName, repo, err)
 	}
 	return factory, nil
 }

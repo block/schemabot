@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"database/sql"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -604,4 +605,107 @@ func backdateSummaryClaim(t *testing.T, applyID int64) {
 		WHERE apply_id = ? AND comment_state = ?
 	`, int64(storage.SummaryClaimStaleAfter.Seconds())+1, applyID, state.Comment.Summary)
 	require.NoError(t, err)
+}
+
+// TestApplyCommentStore_MutationsStampUpdatedAt verifies that every comment
+// mutation renews the row's updated_at. The summary-claim machinery reads the
+// column as its freshness signal, and stamping it is the application's
+// responsibility on every dialect. An upsert replay that writes identical
+// values still counts as publisher activity and renews the timestamp.
+func TestApplyCommentStore_MutationsStampUpdatedAt(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_updated_at_stamp", 1)
+
+	frozen := int64(900)
+	comment := &storage.ApplyComment{
+		ApplyID:                apply.ID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        1001,
+		PendingFreezeCommentID: &frozen,
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+
+	backdate := func(t *testing.T) time.Time {
+		t.Helper()
+		_, err := testDB.ExecContext(t.Context(), `
+			UPDATE apply_comments SET updated_at = NOW() - INTERVAL 1 HOUR
+			WHERE apply_id = ? AND comment_state = ?
+		`, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		stale, err := store.ApplyComments().Get(t.Context(), apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, stale)
+		return stale.UpdatedAt
+	}
+
+	// The subtests mutate one shared comment row and depend on this order:
+	// "clear pending freeze" only matches because the preceding upserts re-set
+	// the freeze marker, and "supersede" must run last because it retires the
+	// row from further mutation.
+	mutations := []struct {
+		name   string
+		mutate func(t *testing.T)
+	}{
+		{"upsert conflict update", func(t *testing.T) {
+			comment.GitHubCommentID = 1002
+			require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+		}},
+		{"identical-value upsert replay", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+		}},
+		{"increment edit count", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
+		}},
+		{"clear pending freeze", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+		}},
+		{"supersede", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Progress))
+		}},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			stale := backdate(t)
+			m.mutate(t)
+			got, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.True(t, got.UpdatedAt.After(stale),
+				"mutation must renew updated_at (stale=%s got=%s)", stale, got.UpdatedAt)
+		})
+	}
+}
+
+// TestApplyCommentStore_ClaimConversionRestartsStaleWindow verifies that
+// converting a superseded posted summary marker back into a claim sentinel
+// restarts the stale-claim window. The conversion is a brand-new claim, so
+// ReclaimStaleSummaryClaim must not immediately hand the same claim to a
+// second publisher.
+func TestApplyCommentStore_ClaimConversionRestartsStaleWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_comment_claim_fresh", 1)
+
+	// A stop's summary was posted and later consumed by a resume rotation,
+	// then the row sat idle long past the stale window.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	backdateSummaryClaim(t, apply.ID)
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won, "the superseded posted marker converts back into a claim sentinel")
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-converted sentinel is a fresh in-flight publish, not reclaimable")
 }

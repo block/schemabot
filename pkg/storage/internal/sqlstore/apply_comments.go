@@ -26,7 +26,10 @@ type applyCommentStore struct {
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
 // posted_volume, posted_phase, and pending_freeze_github_comment_id so the
 // row always describes the currently tracked comment and the freeze it may
-// still owe.
+// still owe. The conflict path also clears superseded_at (the row is live
+// again) and stamps updated_at: that column is the summary-claim freshness
+// signal read by ReclaimStaleSummaryClaim, not incidental audit metadata, so
+// every mutation must renew it explicitly on both dialects.
 func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyComment) error {
 	lease, hasLease, err := applyLeaseFromContext(ctx, comment.ApplyID)
 	if err != nil {
@@ -40,6 +43,7 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 			{Column: "posted_phase"},
 			{Column: "pending_freeze_github_comment_id"},
 			{Column: "superseded_at", Expr: "NULL"},
+			{Column: "updated_at", Expr: "NOW()"},
 		},
 	)
 	if !hasLease {
@@ -106,7 +110,7 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
 			UPDATE apply_comments
-			SET edit_count = edit_count + 1, last_edited_at = NOW()
+			SET edit_count = edit_count + 1, last_edited_at = NOW(), updated_at = NOW()
 			WHERE apply_id = ? AND comment_state = ?
 		`, applyID, commentState)
 		if err != nil {
@@ -123,7 +127,7 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_comments c
 		`+leaseJoin+`
-		SET c.edit_count = c.edit_count + 1, c.last_edited_at = NOW()
+		SET c.edit_count = c.edit_count + 1, c.last_edited_at = NOW(), c.updated_at = NOW()
 		WHERE c.apply_id = ? AND c.comment_state = ?`+leasePredicate+`
 	`, args...)
 	if err != nil {
@@ -167,7 +171,7 @@ func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commen
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
-			UPDATE apply_comments SET superseded_at = NOW()
+			UPDATE apply_comments SET superseded_at = NOW(), updated_at = NOW()
 			WHERE apply_id = ? AND comment_state = ? AND superseded_at IS NULL
 		`, applyID, commentState)
 		return err
@@ -175,7 +179,7 @@ func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commen
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_comments c
 		JOIN applies a ON a.id = c.apply_id
-		SET c.superseded_at = NOW()
+		SET c.superseded_at = NOW(), c.updated_at = NOW()
 		WHERE c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND a.lease_token = ?
 	`, applyID, commentState, lease.Token)
 	if err != nil {
@@ -206,7 +210,7 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
-			UPDATE apply_comments SET pending_freeze_github_comment_id = NULL
+			UPDATE apply_comments SET pending_freeze_github_comment_id = NULL, updated_at = NOW()
 			WHERE apply_id = ? AND comment_state = ? AND pending_freeze_github_comment_id IS NOT NULL
 		`, applyID, commentState)
 		return err
@@ -214,7 +218,7 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_comments c
 		JOIN applies a ON a.id = c.apply_id
-		SET c.pending_freeze_github_comment_id = NULL
+		SET c.pending_freeze_github_comment_id = NULL, c.updated_at = NOW()
 		WHERE c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND a.lease_token = ?
 	`, applyID, commentState, lease.Token)
 	if err != nil {
@@ -268,9 +272,12 @@ func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int
 		return true, nil
 	}
 
+	// The converted sentinel starts a new claim: stamping updated_at restarts
+	// its staleness window so ReclaimStaleSummaryClaim cannot immediately hand
+	// the same claim to a second publisher.
 	result, err = s.db.ExecContext(ctx, `
 		UPDATE apply_comments
-		SET github_comment_id = 0, superseded_at = NULL
+		SET github_comment_id = 0, superseded_at = NULL, updated_at = NOW()
 		WHERE apply_id = ? AND comment_state = ? AND superseded_at IS NOT NULL
 		  AND github_comment_id != 0
 	`, applyID, state.Comment.Summary)
