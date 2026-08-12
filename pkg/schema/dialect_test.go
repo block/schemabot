@@ -16,7 +16,9 @@ func TestIsReservedPullNamespaceForDialect(t *testing.T) {
 		// SchemaBot-internal namespaces are reserved for every dialect.
 		{name: "pending drops on mysql", dialect: DialectMySQL, namespace: "_pending_drops", want: true},
 		{name: "pending drops on postgres", dialect: DialectPostgres, namespace: "_pending_drops", want: true},
+		{name: "schemabot storage on mysql", dialect: DialectMySQL, namespace: "schemabot", want: true},
 		{name: "schemabot storage on postgres", dialect: DialectPostgres, namespace: "schemabot", want: true},
+		{name: "underscore prefix on mysql", dialect: DialectMySQL, namespace: "_scratch", want: true},
 		{name: "underscore prefix on postgres", dialect: DialectPostgres, namespace: "_scratch", want: true},
 
 		// MySQL system schemas are reserved on MySQL but not on Postgres.
