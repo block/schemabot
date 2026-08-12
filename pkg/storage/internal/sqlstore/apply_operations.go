@@ -192,7 +192,7 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations ao
 		`+guard.join()+`
-		SET `+setClause+`, ao.updated_at = NOW()
+		SET `+setClause+`
 		WHERE ao.id = ?`+guard.predicate()+`
 	`, args...)
 	if err != nil {
