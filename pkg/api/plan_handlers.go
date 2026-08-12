@@ -175,7 +175,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "unsupported database type")
 		return nil, unsupportedErr
 	}
-	namespaces, err := pullNamespaces(req.Namespaces)
+	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
@@ -264,7 +264,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	return pullSchemaResponseFromProto(merged), nil
 }
 
-func pullNamespaces(namespaces []string) ([]string, error) {
+func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, error) {
 	if len(namespaces) == 0 {
 		return []string{""}, nil
 	}
@@ -280,7 +280,7 @@ func pullNamespaces(namespaces []string) ([]string, error) {
 		if strings.Contains(namespace, "$ENV") {
 			return nil, fmt.Errorf("pull namespace %q must be a concrete live namespace; resolve $ENV before calling pull", namespace)
 		}
-		if schema.IsReservedPullNamespace(namespace) {
+		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
 			return nil, fmt.Errorf("pull namespace %q is reserved and cannot be pulled", namespace)
 		}
 		if _, ok := seenOutput[namespace]; ok {

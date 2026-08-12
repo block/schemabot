@@ -82,11 +82,3 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 
 	return result, nil
 }
-
-// IsReservedPullNamespace reports whether a live namespace should be excluded
-// from schema pull discovery and rejected for explicit pull requests, using the
-// MySQL dialect. Callers that know the target dialect should use
-// IsReservedPullNamespaceForDialect.
-func IsReservedPullNamespace(namespace string) bool {
-	return IsReservedPullNamespaceForDialect(DialectMySQL, namespace)
-}
