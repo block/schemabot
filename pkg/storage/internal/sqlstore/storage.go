@@ -1,8 +1,8 @@
 // Package sqlstore implements the storage interface over database/sql. It is
 // the shared dialect-parameterized core behind the public per-dialect
-// constructors (mysqlstore, and in the future postgresstore); every store
-// routes family-varying SQL syntax, placeholder binding, and identity
-// retrieval through the injected dependencies.
+// constructors (mysqlstore and postgresstore); every store routes
+// family-varying SQL syntax, placeholder binding, and identity retrieval
+// through the injected dependencies.
 package sqlstore
 
 import (
@@ -42,6 +42,19 @@ func New(db *sql.DB) *Storage {
 		Identity:   dialect,
 		Locker:     namedlock.MySQL{},
 		Classifier: NewMySQLErrorClassifier(),
+	})
+}
+
+// NewPostgres creates a PostgreSQL storage instance.
+func NewPostgres(db *sql.DB) *Storage {
+	dialect := PostgresDialect{}
+	return NewWithDependencies(Dependencies{
+		DB:         db,
+		Binder:     dialect,
+		Dialect:    dialect,
+		Identity:   dialect,
+		Locker:     namedlock.Postgres{},
+		Classifier: NewPostgresErrorClassifier(),
 	})
 }
 
