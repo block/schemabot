@@ -47,6 +47,12 @@ type Dialect interface {
 	// placed immediately after a table name or alias; dialects without index-hint
 	// syntax return an empty string.
 	IndexHint(index string) string
+	// JoinedUpdate returns an UPDATE that changes target rows selected through a
+	// join. Aliases qualify join and predicate expressions, while assignments to
+	// target columns must be unqualified so the statement is valid across
+	// dialects. joinCondition and predicate remain separate so dialects can place
+	// them in the clauses their syntax requires.
+	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 }
 
 // InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
@@ -118,6 +124,13 @@ func ParameterIntervalAmount() IntervalAmount {
 // existing row. Expr is the raw SQL update expression; when empty, the column is
 // set to its excluded (to-be-inserted) value.
 type UpsertAssignment struct {
+	Column string
+	Expr   string
+}
+
+// JoinedUpdateAssignment describes one target-table column update. Column is
+// unqualified; Expr is the raw SQL expression assigned to it.
+type JoinedUpdateAssignment struct {
 	Column string
 	Expr   string
 }
@@ -203,6 +216,18 @@ func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
 // IndexHint returns a MySQL FORCE INDEX hint for the named index.
 func (MySQLDialect) IndexHint(index string) string {
 	return " FORCE INDEX (`" + strings.ReplaceAll(index, "`", "``") + "`)"
+}
+
+// JoinedUpdate builds a MySQL multi-table UPDATE statement.
+func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	sets := make([]string, len(assignments))
+	for i, assignment := range assignments {
+		sets[i] = targetAlias + "." + assignment.Column + " = " + assignment.Expr
+	}
+	return "UPDATE " + targetTable + " " + targetAlias +
+		" JOIN " + joinTable + " " + joinAlias + " ON " + joinCondition +
+		" SET " + strings.Join(sets, ", ") +
+		" WHERE " + predicate
 }
 
 func mysqlIntervalUnit(unit IntervalUnit) string {

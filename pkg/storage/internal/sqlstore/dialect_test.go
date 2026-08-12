@@ -33,6 +33,20 @@ func TestMySQLDialectIndexHint(t *testing.T) {
 	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
 }
 
+func TestMySQLDialectJoinedUpdate(t *testing.T) {
+	assert.Equal(t,
+		"UPDATE apply_comments c JOIN applies a ON a.id = c.apply_id SET c.edit_count = c.edit_count + 1, c.updated_at = NOW() WHERE c.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "edit_count", Expr: "c.edit_count + 1"},
+				{Column: "updated_at", Expr: "NOW()"},
+			},
+			"c.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The
