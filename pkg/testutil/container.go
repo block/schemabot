@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -30,11 +29,11 @@ func ContainerHost(ctx context.Context, c testcontainers.Container) (string, err
 func ContainerPort(ctx context.Context, c testcontainers.Container, port string) (int, error) {
 	var result int
 	_, err := retryContainerOp(ctx, "MappedPort", func() (string, error) {
-		p, err := c.MappedPort(ctx, nat.Port(port))
+		p, err := c.MappedPort(ctx, port)
 		if err != nil {
 			return "", err
 		}
-		result = p.Int()
+		result = int(p.Num())
 		return "", nil
 	})
 	return result, err

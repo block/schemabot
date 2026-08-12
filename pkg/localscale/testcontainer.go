@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -186,7 +185,7 @@ func RunContainer(ctx context.Context, cfg ContainerConfig, opts ...testcontaine
 	if err != nil {
 		return nil, fmt.Errorf("get container host: %w", err)
 	}
-	apiPort, err := ctr.MappedPort(ctx, nat.Port(defaultAPIPort))
+	apiPort, err := ctr.MappedPort(ctx, defaultAPIPort)
 	if err != nil {
 		return nil, fmt.Errorf("get API port: %w", err)
 	}
@@ -195,11 +194,11 @@ func RunContainer(ctx context.Context, cfg ContainerConfig, opts ...testcontaine
 	// Register proxy port mappings so the password API returns correct external ports.
 	portMap := make(map[int]int)
 	for p := cfg.ProxyPortStart; p <= cfg.ProxyPortEnd; p++ {
-		mapped, err := ctr.MappedPort(ctx, nat.Port(fmt.Sprintf("%d", p)))
+		mapped, err := ctr.MappedPort(ctx, fmt.Sprintf("%d", p))
 		if err != nil {
 			continue
 		}
-		portMap[p] = mapped.Int()
+		portMap[p] = int(mapped.Num())
 	}
 	if len(portMap) > 0 {
 		if err := postProxyPortMap(ctx, baseURL, portMap); err != nil {
