@@ -4,10 +4,33 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMySQLDialectExcludedValue(t *testing.T) {
 	assert.Equal(t, "VALUES(setting_value)", MySQLDialect{}.ExcludedValue("setting_value"))
+}
+
+func TestMySQLDialectInsertIfAbsent(t *testing.T) {
+	assert.Equal(t, InsertIfAbsentSyntax{Modifier: " IGNORE"}, MySQLDialect{}.InsertIfAbsent([]string{"apply_id", "comment_state"}))
+}
+
+func TestMySQLDialectJSONBooleanIsTrue(t *testing.T) {
+	assert.Equal(t,
+		`(JSON_EXTRACT(a.options, '$."defer_cutover"') <=> CAST('true' AS JSON))`,
+		MySQLDialect{}.JSONBooleanIsTrue("a.options", []string{"defer_cutover"}),
+	)
+}
+
+func TestMySQLDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "defer-cutover" is not a plain identifier`,
+		func() { MySQLDialect{}.JSONBooleanIsTrue("a.options", []string{"defer-cutover"}) },
+	)
+}
+
+func TestMySQLDialectIndexHint(t *testing.T) {
+	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
 }
 
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches

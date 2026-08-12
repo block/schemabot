@@ -2,6 +2,7 @@ package sqlstore
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -9,11 +10,14 @@ import (
 // Dialect abstracts the SQL-syntax differences between database families (MySQL
 // and, in the future, Postgres) that the state store depends on. This is an
 // incremental seam: the store still emits MySQL-style "?" placeholders, and
-// only the family-varying syntax (upsert clause, current-time and
-// relative-time expressions) routes through here. When a Postgres backend is
-// introduced its parameterized SQL will need a "?"-to-"$n" rebind at the store
-// boundary.
+// family-varying syntax routes through here. When a Postgres backend is introduced
+// its parameterized SQL will need a "?"-to-"$n" rebind at the store boundary.
 type Dialect interface {
+	// InsertIfAbsent returns the syntax that makes an INSERT a no-op when the
+	// named unique-key columns conflict. Modifier is placed between INSERT and
+	// INTO; Suffix is placed after the VALUES clause. A successful insert must
+	// report one affected row, while a conflict must report zero affected rows.
+	InsertIfAbsent(conflictColumns []string) InsertIfAbsentSyntax
 	// UpsertClause returns the trailing conflict-resolution clause that turns an
 	// INSERT into an upsert. conflictColumns names the unique key that defines a
 	// conflict; MySQL infers the key from the table and ignores it, while
@@ -32,6 +36,24 @@ type Dialect interface {
 	// build-time literal or a bound query parameter; a parameterized amount emits
 	// exactly one placeholder that the caller supplies as a query argument.
 	RelativeTime(precision TimestampPrecision, direction RelativeTimeDirection, amount IntervalAmount, unit IntervalUnit) string
+	// JSONBooleanIsTrue returns a predicate that is true only when the JSON value
+	// at path is the boolean true. Missing paths, JSON null, SQL NULL, strings,
+	// numbers, objects, and arrays must all yield false. Path contains plain
+	// identifier object keys (letters, digits, and underscores), ordered from the
+	// root to the value. Implementations panic when a key is not a plain identifier.
+	JSONBooleanIsTrue(expression string, path []string) string
+	// IndexHint returns an optional table-level hint that directs lookups through
+	// index. The returned text includes any required leading whitespace and is
+	// placed immediately after a table name or alias; dialects without index-hint
+	// syntax return an empty string.
+	IndexHint(index string) string
+}
+
+// InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
+// INSERT's portable INTO, column-list, and VALUES body.
+type InsertIfAbsentSyntax struct {
+	Modifier string
+	Suffix   string
 }
 
 // TimestampPrecision selects the fractional-second precision of a current-time
@@ -103,6 +125,14 @@ type UpsertAssignment struct {
 // MySQLDialect implements Dialect for MySQL and MySQL-protocol engines.
 type MySQLDialect struct{}
 
+var plainJSONIdentifier = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// InsertIfAbsent uses MySQL's INSERT IGNORE modifier. MySQL infers conflicts
+// from every unique key on the table, so conflictColumns is not rendered.
+func (MySQLDialect) InsertIfAbsent(_ []string) InsertIfAbsentSyntax {
+	return InsertIfAbsentSyntax{Modifier: " IGNORE"}
+}
+
 // ExcludedValue returns the MySQL reference to the proposed row value.
 func (MySQLDialect) ExcludedValue(column string) string {
 	return "VALUES(" + column + ")"
@@ -154,6 +184,25 @@ func (d MySQLDialect) RelativeTime(precision TimestampPrecision, direction Relat
 	default:
 		panic(fmt.Sprintf("sqlstore: unknown relative-time direction %d", direction))
 	}
+}
+
+// JSONBooleanIsTrue compares the extracted MySQL JSON value with JSON true
+// using null-safe equality so absent and null values do not match.
+func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
+	var jsonPath strings.Builder
+	jsonPath.WriteString("$")
+	for _, key := range path {
+		if !plainJSONIdentifier.MatchString(key) {
+			panic(fmt.Sprintf("sqlstore: JSON path key %q is not a plain identifier", key))
+		}
+		jsonPath.WriteString(`."` + key + `"`)
+	}
+	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath.String() + "') <=> CAST('true' AS JSON))"
+}
+
+// IndexHint returns a MySQL FORCE INDEX hint for the named index.
+func (MySQLDialect) IndexHint(index string) string {
+	return " FORCE INDEX (`" + strings.ReplaceAll(index, "`", "``") + "`)"
 }
 
 func mysqlIntervalUnit(unit IntervalUnit) string {

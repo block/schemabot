@@ -472,17 +472,17 @@ func (s *webhookEventStore) InboxStats(ctx context.Context) (*storage.WebhookInb
 	// won't take it, so it isn't backlog), and an expired-lease processing row a
 	// driver would reclaim is counted (real backlog when its driver crashed).
 	// NULL (nothing waiting) scans into a zero age.
-	var oldestAgeSeconds sql.NullFloat64
+	var oldestReceivedAt, databaseNow sql.NullTime
 	err = s.db.QueryRowContext(ctx, `
-		SELECT TIMESTAMPDIFF(MICROSECOND, MIN(received_at), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`) / 1e6
+		SELECT MIN(received_at), `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`
 		FROM webhook_events
 		WHERE `+s.webhookClaimablePredicate()+`
-	`, webhookClaimableArgs()...).Scan(&oldestAgeSeconds)
+	`, webhookClaimableArgs()...).Scan(&oldestReceivedAt, &databaseNow)
 	if err != nil {
 		return nil, fmt.Errorf("measure oldest claimable webhook inbox row: %w", err)
 	}
-	if oldestAgeSeconds.Valid && oldestAgeSeconds.Float64 > 0 {
-		stats.OldestClaimableAge = time.Duration(oldestAgeSeconds.Float64 * float64(time.Second))
+	if oldestReceivedAt.Valid && databaseNow.Valid && databaseNow.Time.After(oldestReceivedAt.Time) {
+		stats.OldestClaimableAge = databaseNow.Time.Sub(oldestReceivedAt.Time)
 	}
 
 	err = s.db.QueryRowContext(ctx, `
