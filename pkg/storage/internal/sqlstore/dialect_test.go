@@ -10,6 +10,21 @@ func TestMySQLDialectExcludedValue(t *testing.T) {
 	assert.Equal(t, "VALUES(setting_value)", MySQLDialect{}.ExcludedValue("setting_value"))
 }
 
+func TestMySQLDialectInsertIfAbsent(t *testing.T) {
+	assert.Equal(t, InsertIfAbsentSyntax{Modifier: " IGNORE"}, MySQLDialect{}.InsertIfAbsent([]string{"apply_id", "comment_state"}))
+}
+
+func TestMySQLDialectJSONBooleanIsTrue(t *testing.T) {
+	assert.Equal(t,
+		`(JSON_EXTRACT(a.options, '$."defer_cutover"') <=> CAST('true' AS JSON))`,
+		MySQLDialect{}.JSONBooleanIsTrue("a.options", []string{"defer_cutover"}),
+	)
+}
+
+func TestMySQLDialectIndexHint(t *testing.T) {
+	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The

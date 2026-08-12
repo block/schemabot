@@ -257,9 +257,11 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 // claim itself is the exactly-once authority, so a publisher whose apply
 // lease was re-claimed can still win or lose cleanly.
 func (s *applyCommentStore) ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error) {
+	insertIfAbsent := s.dialect.InsertIfAbsent([]string{"apply_id", "comment_state"})
 	result, err := s.db.ExecContext(ctx, `
-		INSERT IGNORE INTO apply_comments (apply_id, comment_state, github_comment_id)
+		INSERT`+insertIfAbsent.Modifier+` INTO apply_comments (apply_id, comment_state, github_comment_id)
 		VALUES (?, ?, 0)
+		`+insertIfAbsent.Suffix+`
 	`, applyID, state.Comment.Summary)
 	if err != nil {
 		return false, fmt.Errorf("claim summary comment for apply %d: %w", applyID, err)

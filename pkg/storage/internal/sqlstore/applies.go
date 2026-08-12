@@ -381,7 +381,7 @@ func operationDeploymentsForApply(ctx context.Context, tx *rebindTx, applyID int
 // is matched against both the parent applies.deployment (the primary) and the
 // apply_operations.deployment rows, so single-operation applies (where the two
 // are equal) behave exactly as before.
-func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
+func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
 	deployments = dedupeDeployments(deployments)
 	if len(deployments) == 0 {
 		return fmt.Errorf("active apply target requires at least one deployment for %s/%s/%s", database, dbType, environment)
@@ -390,7 +390,7 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, database, d
 	statePredicate, stateArgs := nonTerminalApplyStatePredicate("a.state")
 	deploymentPlaceholders := placeholders(len(deployments))
 	query := fmt.Sprintf(`
-		SELECT 1 FROM applies a FORCE INDEX (idx_database_env_deployment)
+		SELECT 1 FROM applies a%s
 		WHERE a.database_name = ?
 		AND a.database_type = ?
 		AND a.environment = ?
@@ -403,7 +403,7 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, database, d
 				AND o.deployment IN (%s)
 			)
 		)
-	`, statePredicate, deploymentPlaceholders, deploymentPlaceholders)
+	`, dialect.IndexHint("idx_database_env_deployment"), statePredicate, deploymentPlaceholders, deploymentPlaceholders)
 	args := []any{database, dbType, environment}
 	args = append(args, stateArgs...)
 	args = append(args, stringArgs(deployments)...)
@@ -541,7 +541,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	}
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
+		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
 			return 0, err
 		}
 	}
@@ -635,7 +635,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	}
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
+		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
 			return 0, err
 		}
 	}
@@ -935,7 +935,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 			return err
 		}
 		deployments = append(deployments, deployment)
-		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, database, dbType, environment, deployments, apply.ID); err != nil {
+		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, database, dbType, environment, deployments, apply.ID); err != nil {
 			return err
 		}
 	}
@@ -1492,7 +1492,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 		return nil, fmt.Errorf("query claimable apply %d: %w", applyID, err)
 	}
 
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, s.dialect, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1610,7 +1610,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	// stopped apply reaches this path — terminal states are excluded above — so
 	// claimAcquiredCommitted, the stopped-only outcome, cannot occur and the
 	// caller always commits an acquired claim).
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, s.dialect, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1695,7 +1695,7 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 	// persistApplyClaim rotates the lease and refreshes the heartbeat. Refreshing
 	// it is what bounds re-claim churn: a parent the projection cannot settle is
 	// not reconsidered until the staleness window elapses again.
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.db, s.locker, s.dialect, tx, apply, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -1753,7 +1753,7 @@ func (o claimOutcome) claimedAndComplete() bool {
 // window between the re-check and the commit. When another active apply owns the
 // target the claim is refused and the pending start control request is failed so
 // the operator sees why.
-func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locker, tx *rebindTx, apply *storage.Apply, owner string) (claimOutcome, error) {
+func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
@@ -1761,7 +1761,7 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
 	if state.IsState(apply.State, state.Apply.Stopped) {
-		return claimStoppedApplyUnderTargetLock(ctx, db, locker, tx, apply, owner, leaseToken)
+		return claimStoppedApplyUnderTargetLock(ctx, db, locker, dialect, tx, apply, owner, leaseToken)
 	}
 
 	if isStartingClaim(apply.State) {
@@ -1791,7 +1791,7 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
 // re-check and the commit. The lock is released only after the commit.
-func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker namedlock.Locker, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
 	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
 	if err != nil {
 		return claimLostRace, err
@@ -1811,7 +1811,7 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker 
 		return claimLostRace, err
 	}
 	deployments = append(deployments, deployment)
-	if err := checkNoActiveApplyForTargets(ctx, tx, database, dbType, environment, deployments, apply.ID); err != nil {
+	if err := checkNoActiveApplyForTargets(ctx, tx, dialect, database, dbType, environment, deployments, apply.ID); err != nil {
 		if !errors.Is(err, storage.ErrActiveApplyExists) {
 			return claimLostRace, err
 		}
