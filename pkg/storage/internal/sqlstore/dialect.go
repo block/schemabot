@@ -54,6 +54,11 @@ type Dialect interface {
 	// dialects. joinCondition and predicate remain separate so dialects can place
 	// them in the clauses their syntax requires.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
+	// JoinedDelete returns a DELETE that removes target rows selected through a
+	// join. Aliases qualify join and predicate expressions. joinCondition and
+	// predicate remain separate so dialects can place them in the clauses their
+	// syntax requires.
+	JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string
 }
 
 // InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
@@ -228,6 +233,15 @@ func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias,
 		" WHERE " + predicate
 }
 
+// JoinedDelete builds a MySQL multi-table DELETE statement that removes only
+// the target alias's rows.
+func (MySQLDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
+	return "DELETE " + targetAlias +
+		" FROM " + targetTable + " " + targetAlias +
+		" JOIN " + joinTable + " " + joinAlias + " ON " + joinCondition +
+		" WHERE " + predicate
+}
+
 func mysqlIntervalUnit(unit IntervalUnit) string {
 	switch unit {
 	case IntervalMicrosecond:
@@ -391,6 +405,16 @@ func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAli
 	return "UPDATE " + targetTable + " " + targetAlias +
 		" SET " + strings.Join(sets, ", ") +
 		" FROM " + joinTable + " " + joinAlias +
+		" WHERE (" + joinCondition + ") AND (" + predicate + ")"
+}
+
+// JoinedDelete builds a PostgreSQL DELETE … USING statement. The join
+// condition moves into the WHERE clause alongside the residual predicate
+// (DELETE … USING has no ON clause), preserving the MySQL rendering's argument
+// order.
+func (PostgresDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
+	return "DELETE FROM " + targetTable + " " + targetAlias +
+		" USING " + joinTable + " " + joinAlias +
 		" WHERE (" + joinCondition + ") AND (" + predicate + ")"
 }
 

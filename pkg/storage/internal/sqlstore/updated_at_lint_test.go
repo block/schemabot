@@ -15,11 +15,11 @@ import (
 // lease heartbeat) and apply_comments (summary-claim freshness).
 var heartbeatTableUpdateRe = regexp.MustCompile(`UPDATE\s+apply_(?:operations|comments)\b`)
 
-// heartbeatJoinedUpdateRe matches dialect JoinedUpdate call sites that target a
-// heartbeat table. The statement is rendered by the dialect, so the raw-SQL
-// scan above never sees it; the assignments literal inside the call must stamp
-// updated_at just like a raw UPDATE's SET clause.
-var heartbeatJoinedUpdateRe = regexp.MustCompile(`\.JoinedUpdate\(\s*\n?\s*"apply_(?:operations|comments)"`)
+// heartbeatJoinedUpdateRe matches dialect-built joined UPDATEs whose target is
+// a heartbeat table. These statements never contain a literal "UPDATE <table>"
+// in source, so they need their own scan: the assignments passed to the
+// JoinedUpdate call must include the updated_at stamp.
+var heartbeatJoinedUpdateRe = regexp.MustCompile(`\.JoinedUpdate\(\s*"apply_(?:operations|comments)"`)
 
 // TestHeartbeatTableUpdatesStampUpdatedAt asserts that every UPDATE statement
 // in this package against apply_operations or apply_comments — whether written
@@ -75,10 +75,18 @@ func TestHeartbeatTableUpdatesStampUpdatedAt(t *testing.T) {
 		for _, loc := range heartbeatJoinedUpdateRe.FindAllStringIndex(src, -1) {
 			checked++
 			line := 1 + strings.Count(src[:loc[0]], "\n")
-			window, ok := callWindow(src, loc[0])
-			require.True(t, ok, "%s:%d: unterminated JoinedUpdate call", name, line)
+			funcIdx := strings.LastIndex(src[:loc[0]], "\nfunc ")
+			require.GreaterOrEqual(t, funcIdx, 0,
+				"%s:%d: joined UPDATE on a heartbeat table outside a function body", name, line)
+			closeIdx := matchingCloseParen(src, loc[0])
+			require.GreaterOrEqual(t, closeIdx, 0,
+				"%s:%d: joined UPDATE on a heartbeat table without a closing parenthesis", name, line)
+			// The assignments may be assembled in a variable above the call, so
+			// the scan window runs from the start of the enclosing function to
+			// the end of the JoinedUpdate call.
+			window := src[funcIdx:closeIdx]
 			assert.Contains(t, window, "updated_at",
-				"%s:%d: JoinedUpdate on a heartbeat table must include an updated_at assignment; "+
+				"%s:%d: joined UPDATE on a heartbeat table must include an updated_at assignment; "+
 					"the staleness predicates read it as the liveness signal and no dialect-level "+
 					"default may be relied on", name, line)
 		}
@@ -86,24 +94,41 @@ func TestHeartbeatTableUpdatesStampUpdatedAt(t *testing.T) {
 	require.NotZero(t, checked, "expected UPDATE statements on apply_operations/apply_comments in this package")
 }
 
-// callWindow returns the source text of the call expression starting at the
-// match position, from its opening parenthesis through the balancing close.
-func callWindow(src string, matchStart int) (string, bool) {
-	open := strings.Index(src[matchStart:], "(")
-	if open < 0 {
-		return "", false
+// matchingCloseParen returns the index just past the closing parenthesis that
+// balances the first '(' at or after start, skipping parentheses inside Go
+// string literals and comments. Returns -1 when no balanced close is found.
+func matchingCloseParen(src string, start int) int {
+	openIdx := strings.IndexByte(src[start:], '(')
+	if openIdx < 0 {
+		return -1
 	}
 	depth := 0
-	for i := matchStart + open; i < len(src); i++ {
+	for i := start + openIdx; i < len(src); i++ {
 		switch src[i] {
 		case '(':
 			depth++
 		case ')':
 			depth--
 			if depth == 0 {
-				return src[matchStart : i+1], true
+				return i + 1
+			}
+		case '"', '\'', '`':
+			quote := src[i]
+			for i++; i < len(src); i++ {
+				if quote != '`' && src[i] == '\\' {
+					i++
+					continue
+				}
+				if src[i] == quote {
+					break
+				}
+			}
+		case '/':
+			if i+1 < len(src) && src[i+1] == '/' {
+				for i++; i < len(src) && src[i] != '\n'; i++ {
+				}
 			}
 		}
 	}
-	return "", false
+	return -1
 }

@@ -40,6 +40,18 @@ func TestMySQLDialectJoinedUpdate(t *testing.T) {
 	)
 }
 
+// The MySQL joined DELETE names the target alias after DELETE so only the
+// target table's rows are removed, never the joined lease rows.
+func TestMySQLDialectJoinedDelete(t *testing.T) {
+	assert.Equal(t,
+		"DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE ao.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			"ao.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The
@@ -274,4 +286,17 @@ func TestPostgresDialectJoinedUpdateRequiresAssignments(t *testing.T) {
 	require.PanicsWithValue(t, "sqlstore: JoinedUpdate requires at least one assignment", func() {
 		PostgresDialect{}.JoinedUpdate("apply_comments", "c", "applies", "a", "a.id = c.apply_id", nil, "c.apply_id = ?")
 	})
+}
+
+// The PostgreSQL joined DELETE uses DELETE … USING with the join condition in
+// the WHERE clause (USING has no ON clause), keeping argument order aligned
+// with the MySQL rendering.
+func TestPostgresDialectJoinedDelete(t *testing.T) {
+	assert.Equal(t,
+		"DELETE FROM apply_operations ao USING applies a WHERE (a.id = ao.apply_id) AND (ao.apply_id = ? AND a.lease_token = ?)",
+		PostgresDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			"ao.apply_id = ? AND a.lease_token = ?",
+		),
+	)
 }

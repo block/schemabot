@@ -186,6 +186,144 @@ func TestPGXStdlibValueContracts(t *testing.T) {
 	assert.Equal(t, int64(1), affected, "PostgreSQL reports matched rows even when values are unchanged")
 }
 
+// TestPostgresApplyOperationLeaseGuards exercises every guarded write shape of
+// the apply-operation store against PostgreSQL: the single-table UPDATE under
+// an operation lease, the joined UPDATE under a parent apply lease, the bulk
+// pending-stop self-join, and the joined DELETE. Each shape must succeed with
+// the owning lease token and fail closed (ErrApplyLeaseLost, row untouched)
+// with a stale one, matching the MySQL behavior the drivers rely on.
+func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_guards")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+	ops := store.ApplyOperations()
+
+	seedApply := func(t *testing.T, identifier, leaseToken string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+				repository, pull_request, environment, engine, state, options, lease_owner, lease_token)
+			VALUES ($1, 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', 'running', '{}', 'owner', $2)
+			RETURNING id`, identifier, leaseToken).Scan(&id))
+		return id
+	}
+	seedOperation := func(t *testing.T, applyID int64, key, opState, leaseToken string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+			VALUES ($1, 'dep-1', $2, $3, 'owner', $4)
+			RETURNING id`, applyID, key, opState, leaseToken).Scan(&id))
+		return id
+	}
+	operationState := func(t *testing.T, id int64) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM apply_operations WHERE id = $1`, id).Scan(&got))
+		return got
+	}
+
+	t.Run("apply lease guards the joined update", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-join", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "pending", "")
+
+		staleCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "stale"})
+		err := ops.MarkStarted(staleCtx, opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		assert.Equal(t, "pending", operationState(t, opID))
+
+		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
+		require.NoError(t, ops.MarkStarted(ownerCtx, opID))
+		assert.Equal(t, "running", operationState(t, opID))
+		var startedAt sql.NullTime
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT started_at FROM apply_operations WHERE id = $1`, opID).Scan(&startedAt))
+		assert.True(t, startedAt.Valid, "MarkStarted must stamp started_at")
+	})
+
+	t.Run("operation lease guards the single-table update", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-op", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "running", "tok-op")
+		_, err := db.ExecContext(t.Context(),
+			`UPDATE apply_operations SET updated_at = NOW() - INTERVAL '1 hour' WHERE id = $1`, opID)
+		require.NoError(t, err)
+		var before time.Time
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT updated_at FROM apply_operations WHERE id = $1`, opID).Scan(&before))
+
+		staleCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "owner", Token: "stale"})
+		err = ops.Heartbeat(staleCtx, opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+
+		ownerCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: opID, Owner: "owner", Token: "tok-op"})
+		require.NoError(t, ops.Heartbeat(ownerCtx, opID))
+		var after time.Time
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT updated_at FROM apply_operations WHERE id = $1`, opID).Scan(&after))
+		assert.True(t, after.After(before), "heartbeat must advance updated_at (before=%v after=%v)", before, after)
+	})
+
+	t.Run("apply lease guards the bulk pending stop", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-stop", "tok-apply")
+		pendingID := seedOperation(t, applyID, "op-pending", "pending", "")
+		runningID := seedOperation(t, applyID, "op-running", "running", "")
+
+		staleCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "stale"})
+		_, err := ops.MarkPendingStoppedByApply(staleCtx, applyID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		assert.Equal(t, "pending", operationState(t, pendingID))
+
+		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
+		stopped, err := ops.MarkPendingStoppedByApply(ownerCtx, applyID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), stopped)
+		assert.Equal(t, "stopped", operationState(t, pendingID))
+		assert.Equal(t, "running", operationState(t, runningID), "in-flight operations are left for their own driver")
+	})
+
+	t.Run("operation lease guards the bulk pending stop", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-stop-op", "tok-apply")
+		ownerOpID := seedOperation(t, applyID, "op-owner", "running", "tok-op")
+		pendingID := seedOperation(t, applyID, "op-pending", "pending", "")
+
+		staleCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: ownerOpID, Owner: "owner", Token: "stale"})
+		_, err := ops.MarkPendingStoppedByApply(staleCtx, applyID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		assert.Equal(t, "pending", operationState(t, pendingID))
+
+		ownerCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: ownerOpID, Owner: "owner", Token: "tok-op"})
+		stopped, err := ops.MarkPendingStoppedByApply(ownerCtx, applyID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), stopped)
+		assert.Equal(t, "stopped", operationState(t, pendingID))
+	})
+
+	t.Run("apply lease guards the joined delete", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-delete", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "pending", "")
+
+		staleCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "stale"})
+		err := ops.DeleteByApply(staleCtx, applyID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		assert.Equal(t, "pending", operationState(t, opID))
+
+		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
+		require.NoError(t, ops.DeleteByApply(ownerCtx, applyID))
+		var remaining int
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT COUNT(*) FROM apply_operations WHERE apply_id = $1`, applyID).Scan(&remaining))
+		assert.Zero(t, remaining)
+	})
+}
+
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	entries, err := schema.PostgresFS.ReadDir("postgres")

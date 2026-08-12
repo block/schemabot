@@ -2263,11 +2263,11 @@ func (s *applyStore) DeleteByPR(ctx context.Context, repo string, pr int) error 
 	}
 	defer writeTx.close(ctx, opName)
 
-	if _, err := writeTx.tx.ExecContext(ctx, `
-		DELETE ao FROM apply_operations ao
-		JOIN applies a ON a.id = ao.apply_id
-		WHERE a.repository = ? AND a.pull_request = ?
-	`, repo, pr); err != nil {
+	deleteOperations := s.dialect.JoinedDelete(
+		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+		"a.repository = ? AND a.pull_request = ?",
+	)
+	if _, err := writeTx.tx.ExecContext(ctx, deleteOperations, repo, pr); err != nil {
 		return fmt.Errorf("delete apply_operations for PR %s#%d: %w", repo, pr, err)
 	}
 
