@@ -273,13 +273,23 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 			"apply_id", req.ApplyID, "operation", req.Operation)
 		return false, nil
 	}
+	// A mirrored report crosses the control RPC boundary, which carries no
+	// operator identity, so its requester can name the forwarding path instead
+	// of a person. A row this plane queued does name the operator, and the
+	// notice exists to tell them which of their commands did not take effect —
+	// so keep whichever value names an operator rather than letting the mirror
+	// replace one with the forwarder.
+	requestedBy := req.RequestedBy
+	if existing != nil && !storage.ControlRequestNamesAnOperator(requestedBy) && existing.RequestedBy != "" {
+		requestedBy = existing.RequestedBy
+	}
 	// The same rejection is reported on every poll until the operator retries
 	// the operation, so an unchanged row means the failure is already recorded.
 	// The requester is part of that identity: a second operator whose re-issued
 	// command fails for the same reason is a distinct rejection, and the notice
 	// names who issued the command that did not take effect.
 	if existing != nil && existing.Status == storage.ControlRequestFailed &&
-		existing.ErrorMessage == req.ErrorMessage && existing.RequestedBy == req.RequestedBy {
+		existing.ErrorMessage == req.ErrorMessage && existing.RequestedBy == requestedBy {
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("commit unchanged remote failure read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 		}
@@ -290,7 +300,7 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 			UPDATE apply_control_requests
 			SET status = ?, requested_by = ?, error_message = ?, completed_at = NOW(), updated_at = NOW()
 			WHERE id = ?
-		`, storage.ControlRequestFailed, req.RequestedBy, nullString(req.ErrorMessage), existing.ID); err != nil {
+		`, storage.ControlRequestFailed, requestedBy, nullString(req.ErrorMessage), existing.ID); err != nil {
 			return false, fmt.Errorf("record remote failure on control request %d for apply %d operation %s: %w", existing.ID, req.ApplyID, req.Operation, err)
 		}
 	} else if _, err := s.identity.InsertID(ctx, tx, `

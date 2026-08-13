@@ -1008,6 +1008,20 @@ func MirroredControlRequestMetadata() []byte {
 	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
 }
 
+// ForwardingControlRequestCaller is the requester recorded for a control
+// request that reached this plane over the data-plane RPC boundary. The control
+// RPCs carry no operator identity, so this names the path the request arrived
+// on rather than the person who issued it.
+const ForwardingControlRequestCaller = "tern-grpc"
+
+// ControlRequestNamesAnOperator reports whether a requester identifies the
+// operator who issued the command. Only such a value is worth showing in the
+// PR notice, whose whole purpose is telling an operator which of their commands
+// did not take effect.
+func ControlRequestNamesAnOperator(requestedBy string) bool {
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+}
+
 // IsMirroredRemoteRejection reports whether this row exists only to carry
 // another plane's rejection, so no local request lifecycle will ever clear it.
 func (r *ApplyControlRequest) IsMirroredRemoteRejection() bool {

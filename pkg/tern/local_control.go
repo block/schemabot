@@ -212,7 +212,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 	}
 	requestedBy := caller
 	if requestedBy == "" {
-		requestedBy = "tern-grpc"
+		requestedBy = storage.ForwardingControlRequestCaller
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -387,7 +387,7 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 	}
 	requestedBy := caller
 	if requestedBy == "" {
-		requestedBy = "tern-grpc"
+		requestedBy = storage.ForwardingControlRequestCaller
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -447,7 +447,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 	}
 	requestedBy := caller
 	if requestedBy == "" {
-		requestedBy = "tern-grpc"
+		requestedBy = storage.ForwardingControlRequestCaller
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -1685,7 +1685,7 @@ func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.App
 	if err != nil {
 		return nil, fmt.Errorf("encode volume request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	requestedBy := "tern-grpc"
+	requestedBy := storage.ForwardingControlRequestCaller
 	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationVolume,

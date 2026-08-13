@@ -38,7 +38,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationStart,
 		Status:      storage.ControlRequestPending,
-		RequestedBy: "tern-grpc",
+		RequestedBy: storage.ForwardingControlRequestCaller,
 		Metadata:    metadata,
 	})
 	if err != nil {

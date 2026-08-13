@@ -303,3 +303,116 @@ func TestGRPCClient_MirrorRetiresARejectionTheDataPlaneLaterCompleted(t *testing
 			"operation %s still reads as rejected after the data plane completed it", req.Operation)
 	}
 }
+
+// failLocallyQueuedControlRequest queues a control request as the operator who
+// issued it and settles it failed, standing in for this plane queueing the
+// command and its own drive rejecting it. FailPending needs the driving lease in
+// context, which no client here holds, so the row is settled directly.
+func failLocallyQueuedControlRequest(t *testing.T, dsn string, stor storage.Storage, applyID int64, operation storage.ControlOperation, requestedBy, errorMessage string) {
+	t.Helper()
+	_, _, err := stor.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: requestedBy,
+		Metadata:    []byte(`{}`),
+	})
+	require.NoError(t, err, "queue the %s control request", operation)
+
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open database to settle the control request")
+	defer utils.CloseAndLog(db)
+	_, err = db.ExecContext(t.Context(), `
+		UPDATE apply_control_requests
+		SET status = ?, error_message = ?, completed_at = NOW()
+		WHERE apply_id = ? AND operation = ?
+	`, storage.ControlRequestFailed, errorMessage, applyID, operation)
+	require.NoError(t, err, "settle the %s control request as failed", operation)
+}
+
+// A command this plane queued records the operator who issued it. The mirrored
+// report of that same operation arrives over the control RPCs, which carry no
+// operator identity, so its requester names the forwarding path. Recording the
+// remote reason must not trade the operator's name for that one: the notice
+// exists to tell an operator which of their commands did not take effect.
+func TestGRPCClient_MirrorKeepsTheOperatorNameOnALocallyQueuedRequest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
+
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = stor
+
+	failLocallyQueuedControlRequest(t, dsn, stor, apply.ID, storage.ControlOperationCutover,
+		"octocat", "cutover request was not applied because apply is failed")
+
+	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+		Operation:    string(storage.ControlOperationCutover),
+		Status:       string(storage.ControlRequestFailed),
+		ErrorMessage: "deploy request is not in a cutover-ready state",
+		RequestedBy:  storage.ForwardingControlRequestCaller,
+	}})
+
+	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "octocat", stored.RequestedBy,
+		"the notice must keep naming the operator who issued the command, not the path the report arrived on")
+	assert.Equal(t, "deploy request is not in a cutover-ready state", stored.ErrorMessage,
+		"the remote reason is still the one the operator needs to read")
+	assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+}
+
+// An operator identity that does reach the mirror still re-attributes the
+// rejection, so a command re-issued by someone else is not reported under the
+// earlier operator's name.
+func TestGRPCClient_MirrorReattributesToANamedOperator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
+
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = stor
+
+	failLocallyQueuedControlRequest(t, dsn, stor, apply.ID, storage.ControlOperationCutover,
+		"octocat", "cutover request was not applied because apply is failed")
+
+	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+		Operation:    string(storage.ControlOperationCutover),
+		Status:       string(storage.ControlRequestFailed),
+		ErrorMessage: "deploy request is not in a cutover-ready state",
+		RequestedBy:  "hubot",
+	}})
+
+	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "hubot", stored.RequestedBy,
+		"a named operator on the report is the one whose command was rejected")
+}
