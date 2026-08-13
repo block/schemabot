@@ -191,7 +191,11 @@ func TestPGXStdlibValueContracts(t *testing.T) {
 // an operation lease, the joined UPDATE under a parent apply lease, the bulk
 // pending-stop self-join, and the joined DELETE. Each shape must succeed with
 // the owning lease token and fail closed (ErrApplyLeaseLost, row untouched)
-// with a stale one, matching the MySQL behavior the drivers rely on.
+// when the token already mismatches at execution time. These checks run
+// sequentially: they do not cover a lease steal committing concurrently with
+// a guarded write, which PostgreSQL's joined renderings do not serialize
+// against the way MySQL's row-locking joins do (see
+// PostgresDialect.JoinedUpdate).
 func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_guards")
 	db, err := postgresconn.Open(dsn)
