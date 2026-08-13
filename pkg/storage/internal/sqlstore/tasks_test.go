@@ -762,7 +762,7 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 func TestTaskStore_FindTableOwners(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_object_owners", 1)
@@ -823,7 +823,7 @@ func TestTaskStore_FindTableOwners(t *testing.T) {
 func TestTaskStore_FindTableOwnersReturnsARecencyWindow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_object_owner_window", 1)
