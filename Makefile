@@ -22,7 +22,7 @@ E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
 E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -581,11 +581,18 @@ cli: build ## Install schemabot CLI to /usr/local/bin
 	cp bin/schemabot /usr/local/bin/schemabot
 
 # Run all tests (unit with race detection + integration + e2e)
-test: proto test-unit test-integration test-e2e ## Run all tests
+test: proto test-unit test-consumer-module test-integration test-e2e ## Run all tests
 
 # Run unit tests only (with race detection, no testcontainers)
 test-unit: ## Run unit tests with race detection
 	$(GOTEST) -race ./...
+
+# Verify schemabot's startup surface from a consumer module that pins a newer
+# OpenTelemetry SDK than this repo. Host binaries embedding schemabot resolve
+# their own dependency versions, so this catches conflicts (such as semconv
+# schema URL mismatches) that cannot reproduce inside this module.
+test-consumer-module: ## Run consumer-module startup tests
+	cd e2e/consumermodule && $(GOTEST) -race ./...
 
 # Run integration tests (uses testcontainers for MySQL)
 # Note: -race is omitted because Spirit (upstream) has known data races in

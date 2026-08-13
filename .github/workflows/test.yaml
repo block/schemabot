@@ -131,6 +131,8 @@ jobs:
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-unit
+      - name: "Consumer-module startup test"
+        run: make test-consumer-module
 
   integration:
     name: "Integration Tests (${{ matrix.shard }})"
