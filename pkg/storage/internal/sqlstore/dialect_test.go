@@ -80,6 +80,19 @@ func TestMySQLDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) 
 	})
 }
 
+// The dialect qualifies assignment columns with the target alias itself, so a
+// pre-qualified column would render an invalid double-qualified reference and
+// break on dialects with different assignment syntax.
+func TestMySQLDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate assignment columns must be unqualified", func() {
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{{Column: "c.state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The
