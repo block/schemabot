@@ -55,7 +55,7 @@ type Dialect interface {
 	// per dialect, joinCondition must not contain bind placeholders: placeholders
 	// are permitted only in assignment expressions and predicate, and callers
 	// supply their arguments in that order. Implementations panic when
-	// assignments is empty.
+	// assignments is empty or joinCondition contains a placeholder.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 }
 
@@ -226,6 +226,9 @@ func (MySQLDialect) IndexHint(index string) string {
 func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
 		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
 	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {

@@ -67,6 +67,19 @@ func TestMySQLDialectJoinedUpdateRequiresAssignments(t *testing.T) {
 	})
 }
 
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestMySQLDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate joinCondition must not contain bind placeholders", func() {
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id AND a.state = ?",
+			[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The
