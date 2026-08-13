@@ -1777,7 +1777,7 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return fmt.Errorf("plan %d not found for group_finalizer apply_operation %d (apply %s)", apply.PlanID, op.ID, apply.ApplyIdentifier)
+		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
 	// Fail closed if the namespace carries no VSchema artifact, mirroring the
 	// local finalizer drive.
@@ -3088,20 +3088,37 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 // persistTasklessOperationTerminalState reflects a remote terminal state onto a
 // task-less operation row. Because such an operation carries no task rows, the
 // operator's task-derived projection can never move it: the drive owns its
-// terminal transition, mirroring the local drive (MarkCompleted on success,
-// MarkFailed on failure). Non-completed/non-failed terminal states
-// (stopped/cancelled) stay owned by the operator's stop/cancel handling, so the
-// drive leaves the operation row untouched for those.
+// terminal transition, mirroring the local drive. Every terminal state is
+// written, not just completion and failure — a stop or cancel that lands on a
+// task-less operation has no task rows for the operator's stop handling to move
+// either, so leaving one of those unwritten would hold the operation row and its
+// parent apply running forever with the target blocked.
 func (c *GRPCClient) persistTasklessOperationTerminalState(ctx context.Context, applyOperationID int64, terminalState, errMsg string) error {
+	opStore := c.storage.ApplyOperations()
 	switch {
 	case state.IsState(terminalState, state.Apply.Completed):
-		if err := c.storage.ApplyOperations().MarkCompleted(ctx, applyOperationID); err != nil {
+		if err := opStore.MarkCompleted(ctx, applyOperationID); err != nil {
 			return fmt.Errorf("mark task-less apply_operation %d completed from remote terminal state: %w", applyOperationID, err)
 		}
 	case state.IsState(terminalState, state.Apply.Failed):
-		if err := c.storage.ApplyOperations().MarkFailed(ctx, applyOperationID, errMsg); err != nil {
+		if err := opStore.MarkFailed(ctx, applyOperationID, errMsg); err != nil {
 			return fmt.Errorf("mark task-less apply_operation %d failed from remote terminal state: %w", applyOperationID, err)
 		}
+	case state.IsState(terminalState, state.Apply.Stopped):
+		// Stopped is terminal but resumable, so mirror the state and leave
+		// completed_at nil — the same convention the operator's own operation
+		// writer uses, so a later start finds a row it can resume.
+		if err := opStore.UpdateState(ctx, applyOperationID, terminalState); err != nil {
+			return fmt.Errorf("update task-less apply_operation %d to stopped from remote terminal state: %w", applyOperationID, err)
+		}
+	case state.IsTerminalApplyState(terminalState):
+		// cancelled / reverted — non-resumable, so stamp completed_at.
+		if err := opStore.MarkTerminal(ctx, applyOperationID, terminalState); err != nil {
+			return fmt.Errorf("mark task-less apply_operation %d terminal state %q from remote: %w", applyOperationID, terminalState, err)
+		}
+	default:
+		c.baseLogger().WarnContext(ctx, "task-less apply_operation reached the terminal writer with a non-terminal remote state; operation left claimable",
+			"apply_operation_id", applyOperationID, "remote_state", terminalState)
 	}
 	return nil
 }

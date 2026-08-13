@@ -861,7 +861,10 @@ func (s *Server) waitForBackendSidecars(
 			started := time.Now()
 			ready := false
 			var lastErr error
-			for time.Now().Before(deadline) {
+			// Probe every shard at least once, even when an earlier shard has
+			// already spent the cluster's budget, so the failure names what this
+			// shard was actually missing instead of reporting no cause at all.
+			for {
 				if err := ctx.Err(); err != nil {
 					return fmt.Errorf("online DDL readiness for %s/%s shard %s: %w",
 						key.database, keyspace, shard.Name, err)
@@ -881,6 +884,9 @@ func (s *Server) waitForBackendSidecars(
 					lastErr = err
 				} else {
 					lastErr = fmt.Errorf("sidecar database %s has no %s table yet", sidecar, onlineDDLSidecarTable)
+				}
+				if !time.Now().Before(deadline) {
+					break
 				}
 				s.logger.Debug("waiting for online DDL readiness",
 					"database", key.database, "keyspace", keyspace, "shard", shard.Name,
