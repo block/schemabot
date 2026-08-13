@@ -1214,7 +1214,8 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	//      keeps the operator holding the claim and polling for a manual cutover,
 	//      so the cutover worker must not steal it. defer_cutover lives in the
 	//      applies.options JSON (boolean, omitted when false), not a column; the
-	//      null-safe <=> CAST('true' AS JSON) means "exactly JSON true".
+	//      predicate matches exactly JSON boolean true per Dialect.JSONBooleanIsTrue,
+	//      so absent keys, JSON null, and non-boolean values do not match.
 	//
 	// The gate wraps BOTH claim branches (start and stale recovery): a stale
 	// cutting_over/revert_window row outside this population reached that state

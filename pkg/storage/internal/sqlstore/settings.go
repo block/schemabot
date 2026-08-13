@@ -46,7 +46,7 @@ func (s *settingsStore) Set(ctx context.Context, key, value string) error {
 		[]string{"setting_key"},
 		[]UpsertAssignment{
 			{Column: "setting_value"},
-			{Column: "updated_at", Expr: "NOW()"},
+			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
 	)
 	_, err := s.db.ExecContext(ctx, `

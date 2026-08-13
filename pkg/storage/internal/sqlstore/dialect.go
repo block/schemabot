@@ -10,10 +10,8 @@ import (
 // Dialect abstracts the SQL-syntax differences between database families (MySQL
 // and, in the future, Postgres) that the state store depends on. This is an
 // incremental seam: the store still emits MySQL-style "?" placeholders, and
-// only the family-varying syntax (upsert clause, current-time and
-// relative-time expressions) routes through here. When a Postgres backend is
-// introduced its parameterized SQL will need a "?"-to-"$n" rebind at the store
-// boundary.
+// family-varying syntax routes through here. When a Postgres backend is introduced
+// its parameterized SQL will need a "?"-to-"$n" rebind at the store boundary.
 type Dialect interface {
 	// InsertIfAbsent returns the syntax that makes an INSERT a no-op when the
 	// named unique-key columns conflict. Modifier is placed between INSERT and
@@ -40,8 +38,9 @@ type Dialect interface {
 	RelativeTime(precision TimestampPrecision, direction RelativeTimeDirection, amount IntervalAmount, unit IntervalUnit) string
 	// JSONBooleanIsTrue returns a predicate that is true only when the JSON value
 	// at path is the boolean true. Missing paths, JSON null, SQL NULL, strings,
-	// numbers, objects, and arrays must all yield false. Path contains unescaped
-	// object keys, ordered from the root to the value.
+	// numbers, objects, and arrays must all yield false. Path contains plain
+	// identifier object keys (letters, digits, and underscores), ordered from the
+	// root to the value. Implementations panic when a key is not a plain identifier.
 	JSONBooleanIsTrue(expression string, path []string) string
 	// IndexHint returns an optional table-level hint that directs lookups through
 	// index. The returned text includes any required leading whitespace and is
@@ -52,7 +51,11 @@ type Dialect interface {
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
 	// dialects. joinCondition and predicate remain separate so dialects can place
-	// them in the clauses their syntax requires.
+	// them in the clauses their syntax requires. Because that placement differs
+	// per dialect, joinCondition must not contain bind placeholders: placeholders
+	// are permitted only in assignment expressions and predicate, and callers
+	// supply their arguments in that order. Implementations panic when
+	// assignments is empty or joinCondition contains a placeholder.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 }
 
@@ -203,12 +206,15 @@ func (d MySQLDialect) RelativeTime(precision TimestampPrecision, direction Relat
 // JSONBooleanIsTrue compares the extracted MySQL JSON value with JSON true
 // using null-safe equality so absent and null values do not match.
 func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
-	jsonPath := "$"
+	var jsonPath strings.Builder
+	jsonPath.WriteString("$")
 	for _, key := range path {
-		jsonPath += "." + strconv.Quote(key)
+		if !plainJSONIdentifier.MatchString(key) {
+			panic(fmt.Sprintf("sqlstore: JSON path key %q is not a plain identifier", key))
+		}
+		jsonPath.WriteString(`."` + key + `"`)
 	}
-	jsonPath = strings.ReplaceAll(jsonPath, "'", "''")
-	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath + "') <=> CAST('true' AS JSON))"
+	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath.String() + "') <=> CAST('true' AS JSON))"
 }
 
 // IndexHint returns a MySQL FORCE INDEX hint for the named index.
@@ -218,6 +224,12 @@ func (MySQLDialect) IndexHint(index string) string {
 
 // JoinedUpdate builds a MySQL multi-table UPDATE statement.
 func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	if len(assignments) == 0 {
+		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
+	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
 		sets[i] = targetAlias + "." + assignment.Column + " = " + assignment.Expr
@@ -383,6 +395,9 @@ func (PostgresDialect) IndexHint(string) string { return "" }
 func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
 		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
 	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
