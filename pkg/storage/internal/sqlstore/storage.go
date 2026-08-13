@@ -32,8 +32,8 @@ type Storage struct {
 
 var _ storage.Storage = (*Storage)(nil)
 
-// New creates a MySQL storage instance.
-func New(db *sql.DB) *Storage {
+// NewMySQL creates a MySQL storage instance.
+func NewMySQL(db *sql.DB) *Storage {
 	dialect := MySQLDialect{}
 	return NewWithDependencies(Dependencies{
 		DB:         db,

@@ -73,7 +73,7 @@ SchemaBot has three layers:
   - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
   - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
 - **Engine** ([`pkg/engine`](../pkg/engine/)): Stateless executor interface for schema change backends
-- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/)
+- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/)
 
 Supporting packages: [`pkg/ddl`](../pkg/ddl/) (schema diffing), [`pkg/lint`](../pkg/lint/) (safety linting and auto-fix), [`pkg/secrets`](../pkg/secrets/) (secret resolution), [`pkg/schema`](../pkg/schema/) (shared schema types and embedded storage SQL)
 
