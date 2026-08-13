@@ -752,3 +752,113 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	crossApply.ApplyOperationID = &otherOpID // belongs to otherApply, not the leased apply
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
 }
+
+// The object-ownership lookup answers "which pull requests have changed this
+// object in this deployment target?" — the question the plan path asks before
+// rendering a drop. It is scoped to one database, database type, and
+// environment; it collapses a pull request's many tasks into one row carrying
+// its most recent activity; and it excludes CLI-originated tasks, which carry
+// no pull request to attribute anything to.
+func TestTaskStore_FindTableOwners(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_object_owners", 1)
+
+	createTask := func(identifier, table, environment, repo string, pr int, createdAt time.Time) {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: identifier,
+			ApplyID:        apply.ID,
+			PlanID:         apply.PlanID,
+			Database:       apply.Database,
+			DatabaseType:   apply.DatabaseType,
+			Engine:         storage.EngineSpirit,
+			Repository:     repo,
+			PullRequest:    pr,
+			Environment:    environment,
+			State:          state.Task.Completed,
+			TableName:      table,
+			DDL:            "CREATE TABLE `" + table + "` (`id` bigint unsigned NOT NULL)",
+			DDLAction:      "CREATE",
+			CreatedAt:      createdAt,
+			UpdatedAt:      createdAt,
+		})
+		require.NoError(t, err)
+	}
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	createTask("task_owner_first", "reconcile_state", "staging", "octocat/hello-world", 7, base)
+	createTask("task_owner_second", "reconcile_state", "staging", "octocat/hello-world", 7, base.Add(30*time.Minute))
+	createTask("task_owner_other_pr", "reconcile_state", "staging", "octocat/hello-world", 9, base.Add(time.Minute))
+	createTask("task_owner_other_env", "reconcile_state", "production", "octocat/hello-world", 11, base)
+	createTask("task_owner_other_table", "users", "staging", "octocat/hello-world", 13, base)
+	createTask("task_owner_cli", "reconcile_state", "staging", "", 0, base)
+
+	ref := storage.TableRef{
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  "staging",
+		TableName:    "reconcile_state",
+	}
+	owners, err := store.Tasks().FindTableOwners(ctx, ref)
+	require.NoError(t, err)
+	require.Len(t, owners, 2, "one row per pull request, and never the CLI-originated task")
+	assert.Equal(t, "octocat/hello-world", owners[0].Repository)
+	assert.Equal(t, 7, owners[0].PullRequest, "the pull request seen most recently comes first")
+	assert.Equal(t, base.Add(30*time.Minute).UTC(), owners[0].LastSeen.UTC())
+	assert.Equal(t, 9, owners[1].PullRequest)
+
+	ref.TableName = "audit_log"
+	owners, err = store.Tasks().FindTableOwners(ctx, ref)
+	require.NoError(t, err)
+	assert.Empty(t, owners, "an object no task names has no owner")
+}
+
+// A long-lived table accumulates an owner for every pull request that ever
+// changed it, and the plan path resolves each one's state against GitHub in
+// turn. The lookup returns a recency window rather than the whole history, so
+// that walk stays bounded no matter how much history a table carries.
+func TestTaskStore_FindTableOwnersReturnsARecencyWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_object_owner_window", 1)
+
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	total := tableOwnerLookupLimit + 5
+	for i := range total {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: fmt.Sprintf("task_owner_window_%d", i),
+			ApplyID:        apply.ID,
+			PlanID:         apply.PlanID,
+			Database:       apply.Database,
+			DatabaseType:   apply.DatabaseType,
+			Engine:         storage.EngineSpirit,
+			Repository:     "octocat/hello-world",
+			PullRequest:    100 + i,
+			Environment:    "staging",
+			State:          state.Task.Completed,
+			TableName:      "reconcile_state",
+			DDL:            "ALTER TABLE `reconcile_state` ADD COLUMN `c` int",
+			DDLAction:      "ALTER",
+			CreatedAt:      base.Add(time.Duration(i) * time.Minute),
+			UpdatedAt:      base.Add(time.Duration(i) * time.Minute),
+		})
+		require.NoError(t, err)
+	}
+
+	owners, err := store.Tasks().FindTableOwners(ctx, storage.TableRef{
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  "staging",
+		TableName:    "reconcile_state",
+	})
+	require.NoError(t, err)
+	require.Len(t, owners, tableOwnerLookupLimit)
+	assert.Equal(t, 100+total-1, owners[0].PullRequest, "the window holds the most recent owners")
+	assert.Equal(t, 100+total-tableOwnerLookupLimit, owners[len(owners)-1].PullRequest)
+}

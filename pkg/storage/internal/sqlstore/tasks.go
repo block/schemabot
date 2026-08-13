@@ -519,6 +519,51 @@ func (s *taskStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 	return scanTasks(rows)
 }
 
+// tableOwnerLookupLimit bounds how many pull requests one ownership lookup
+// returns. A long-lived table accumulates an owner for every pull request that
+// ever changed it, and the caller resolves each one's state against GitHub
+// until it finds an open one — so an unbounded result turns a routine plan into
+// a serial walk of the table's entire history. Owners come back most recent
+// first, and a pull request old enough to fall outside this window has long
+// since been merged or closed, so the bound costs no attribution in practice.
+const tableOwnerLookupLimit = 20
+
+// FindTableOwners returns the pull requests stored tasks attribute a table
+// to. The aggregate runs in SQL rather than over a loaded task list because it
+// is on the plan path: one query per table the plan would drop, served by the
+// tasks index on (database_name, database_type, environment, table_name).
+func (s *taskStore) FindTableOwners(ctx context.Context, ref storage.TableRef) ([]storage.TableOwner, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT repository, pull_request, MAX(created_at)
+		FROM tasks
+		WHERE database_name = ? AND database_type = ? AND environment = ? AND table_name = ?
+		  AND repository != '' AND pull_request > 0
+		GROUP BY repository, pull_request
+		ORDER BY MAX(created_at) DESC
+		LIMIT %d
+	`, tableOwnerLookupLimit), ref.Database, ref.DatabaseType, ref.Environment, ref.TableName)
+	if err != nil {
+		return nil, fmt.Errorf("query table owners for %s.%s (%s, %s): %w",
+			ref.Database, ref.TableName, ref.DatabaseType, ref.Environment, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var owners []storage.TableOwner
+	for rows.Next() {
+		var owner storage.TableOwner
+		if err := rows.Scan(&owner.Repository, &owner.PullRequest, &owner.LastSeen); err != nil {
+			return nil, fmt.Errorf("scan table owner for %s.%s (%s, %s): %w",
+				ref.Database, ref.TableName, ref.DatabaseType, ref.Environment, err)
+		}
+		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read table owners for %s.%s (%s, %s): %w",
+			ref.Database, ref.TableName, ref.DatabaseType, ref.Environment, err)
+	}
+	return owners, nil
+}
+
 // List returns tasks matching the filter criteria.
 func (s *taskStore) List(ctx context.Context, filter storage.TaskFilter) ([]*storage.Task, error) {
 	query := `

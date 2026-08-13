@@ -184,6 +184,48 @@ schemabot unlock
 </details>
 
 <details>
+<summary><a name="mysql-plan-change-attributed-to-another-pr"></a><strong>MySQL Plan (Change Attributed To Another PR)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `notes`;
+
+DROP TABLE `reconcile_state`;
+```
+
+🛑 **Check before applying**: **2** destructive changes SchemaBot cannot attribute to this PR
+- `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
+- `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
+
+A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
+
+⚠️ **Issues**: **2** unsafe changes detected
+- `orders`: DROP COLUMN discards the column's data
+- `reconcile_state`: DROP TABLE removes all data
+
+**Destructive drop guidance:**
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+
+📋 **Plan**: **1** table to alter, **1** table to drop
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
 
 

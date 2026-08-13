@@ -155,6 +155,25 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 	)
 }
 
+// RecordPlanChangeOwnership counts one planned destructive change's ownership
+// verdict. Outcomes: "unowned" (no other pull request is attributed the table,
+// so the change renders normally), "owned" (an open pull request is attributed
+// it, so the change is annotated), "storage_error" and "pr_state_error" (the
+// lookup could not decide, so the change is annotated as unresolved —
+// investigate storage or GitHub API health respectively).
+// Sustained error outcomes mean operators are seeing destructive changes they
+// cannot get an attribution for; a rising "owned" count means pull requests are
+// applying and merging far apart.
+func RecordPlanChangeOwnership(ctx context.Context, repo, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.plan_change_ownership.total",
+		"Total number of planned destructive changes classified by table-ownership lookup outcome", "{change}",
+		attribute.String("repository", repo),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	recordHistogram(ctx, "schemabot.plan.duration_seconds", duration.Seconds(),

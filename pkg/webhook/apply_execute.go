@@ -127,7 +127,7 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+		h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
 			"Schema changes differ from auto-plan — review and confirm manually")
 		return
 	}
@@ -139,7 +139,7 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postAutoConfirmDowngrade(repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+		h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
 			"Plan contains direct-execution changes — review the disclosure and confirm manually")
 		return
 	}
@@ -162,6 +162,7 @@ func (h *Handler) executeApply(
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 		return
@@ -306,11 +307,19 @@ func applyExecutionErrorMessage(err error) string {
 // automatic apply for manual confirmation. It carries the original command's
 // flags and the lock owner so the coached apply-confirm command re-issues the
 // operator's full intent and the comment shows who holds the lock.
+//
+// The re-plan this downgrade acts on is the first time an automatic apply sees
+// the live database, so it is also the first time it can see a destructive
+// change to a table another pull request owns. The attributed-change disclosure
+// belongs on this comment for the same reason as the direct-execution one: it
+// must sit on the comment the confirmation acts on.
 func (h *Handler) postAutoConfirmDowngrade(
+	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
 ) {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe

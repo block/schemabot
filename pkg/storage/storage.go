@@ -629,8 +629,43 @@ type TaskStore interface {
 	// GetByPR returns all tasks for a repository and pull request.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Task, error)
 
+	// FindTableOwners returns the pull requests that stored tasks attribute a
+	// table to, most recently seen first. The plan path uses it to tell a drop
+	// the planning PR proposes from a drop of a table another pull request
+	// created and has not merged yet — SchemaBot's schema-first
+	// workflow applies from the PR before the code merges, so the live database
+	// legitimately carries tables no merged tree describes.
+	//
+	// Tasks from CLI-originated applies carry no pull request and are excluded;
+	// every other state is included, since a task that named the table is an
+	// ownership signal regardless of how its apply ended.
+	//
+	// The result is capped at a recency window rather than returning a table's
+	// whole history, because the caller resolves each owner's state against
+	// GitHub one at a time.
+	FindTableOwners(ctx context.Context, ref TableRef) ([]TableOwner, error)
+
 	// List returns tasks matching the filter criteria.
 	List(ctx context.Context, filter TaskFilter) ([]*Task, error)
+}
+
+// TableRef names one table in a single deployment target. Namespace
+// is deliberately absent: matching on the table name alone across a database's
+// namespaces over-matches, and for the ownership lookup over-matching is the
+// safe direction — it annotates a drop rather than presenting it bare.
+type TableRef struct {
+	Database     string
+	DatabaseType string
+	Environment  string
+	TableName    string
+}
+
+// TableOwner is a pull request that stored tasks attribute a table to. LastSeen is the most recent task creation time for that pull request, so
+// callers can present the newest attribution first.
+type TableOwner struct {
+	Repository  string
+	PullRequest int
+	LastSeen    time.Time
 }
 
 // ApplyCommentStore tracks GitHub PR comment IDs for apply lifecycle management.

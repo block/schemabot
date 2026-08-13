@@ -37,6 +37,6 @@ CREATE TABLE tasks (
 CREATE UNIQUE INDEX idx_tasks_task_identifier ON tasks (task_identifier);
 CREATE INDEX idx_tasks_apply_id ON tasks (apply_id);
 CREATE INDEX idx_tasks_apply_operation_id ON tasks (apply_operation_id);
-CREATE INDEX idx_tasks_database ON tasks (database_name);
+CREATE INDEX idx_tasks_database ON tasks (database_name, database_type, environment, table_name);
 CREATE INDEX idx_tasks_repo_pr ON tasks (repository, pull_request);
 CREATE INDEX idx_tasks_state ON tasks (state);

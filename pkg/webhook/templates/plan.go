@@ -51,6 +51,20 @@ type DirectChangeData struct {
 	Shards []string
 }
 
+// AttributedChangeData is a table carrying a planned destructive change that
+// stored task history attributes to a pull request other than the one being
+// planned. Repository and PullRequest name the owner when the lookup resolved
+// an open one; Unresolved marks a table whose ownership could not be
+// established, which is annotated the same way — the lookup fails toward
+// ownership rather than presenting a change SchemaBot cannot vouch for as one
+// this pull request proposes.
+type AttributedChangeData struct {
+	Table       string
+	Repository  string
+	PullRequest int
+	Unresolved  bool
+}
+
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
 	Database     string
@@ -78,6 +92,10 @@ type PlanCommentData struct {
 
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
+
+	// Tables carrying a destructive change that another pull request owns, or
+	// whose ownership could not be established.
+	AttributedChanges []AttributedChangeData
 
 	// Options
 	DeferCutover bool
@@ -164,6 +182,13 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
+	// Destructive changes to tables another pull request owns. Shown on the
+	// locked apply comment too, for the same reason as the direct-execution
+	// disclosure: it must sit on the comment the confirmation acts on.
+	if len(data.AttributedChanges) > 0 {
+		writeAttributedChanges(&sb, data.AttributedChanges)
+	}
+
 	// Direct-execution changes — statements the policy routes to native DDL.
 	// Shown on the locked apply comment too: confirming the apply is the
 	// operator's consent to their blocking, non-revertible semantics, so the
@@ -199,7 +224,8 @@ func RenderPlanComment(data PlanCommentData) string {
 	// Footer
 	sb.WriteString("\n---\n\n")
 
-	if data.IsLocked {
+	switch {
+	case data.IsLocked:
 		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
 		if data.Tenant != "" {
 			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
@@ -226,7 +252,7 @@ func RenderPlanComment(data PlanCommentData) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
-	} else {
+	default:
 		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
@@ -241,6 +267,35 @@ func RenderPlanComment(data PlanCommentData) string {
 func writeApplyInstruction(sb *strings.Builder, command string) {
 	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// writeAttributedChanges writes the section for destructive changes to tables
+// that stored task history attributes to another pull request. SchemaBot plans
+// a full diff of the pull request's schema files against the live database, so
+// what an unmerged pull request already applied reads as something this pull
+// request wants gone. Reconciling the database to the declared schema is the
+// operator's call to make; what the comment owes them is the attribution they
+// cannot see from the DDL alone.
+//
+// Attribution is table-grained: stored task history records the table a task
+// changed and nothing finer, so the notice names the table and the pull request
+// that last changed it, never the specific column or index.
+func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
+	n := len(changes)
+	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	for _, d := range changes {
+		if d.Unresolved {
+			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
+			continue
+		}
+		// The owner named is the most recent open pull request that changed the
+		// table, which is not necessarily the last one to change it: a later
+		// change from a pull request that has since closed leaves no open claim
+		// and is passed over.
+		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
+			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+	}
+	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
 
 // writePlanMetadata writes the metadata line for plan comments.
@@ -1007,6 +1062,13 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeBlockedChanges(sb, plan.BlockedChanges)
 	}
 
+	// Destructive changes to tables another pull request owns — resolved per
+	// environment, since the task history that attributes them is per
+	// environment.
+	if len(plan.AttributedChanges) > 0 {
+		writeAttributedChanges(sb, plan.AttributedChanges)
+	}
+
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
 	if len(plan.DirectChanges) > 0 {
@@ -1059,7 +1121,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	}
 
-	// Apply instructions for environments with changes
+	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
 		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
