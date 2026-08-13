@@ -16,17 +16,24 @@ var upsertClauseRe = regexp.MustCompile(`\.UpsertClause\(`)
 var createTableNameRe = regexp.MustCompile(`(?i)CREATE\s+TABLE\s+` + "`" + `([^` + "`" + `]+)` + "`")
 var updatedAtColumnRe = regexp.MustCompile(`(?m)^\s*` + "`updated_at`" + `\s+`)
 
+// heartbeatJoinedUpdateRe matches dialect JoinedUpdate call sites that target a
+// heartbeat table. The statement is rendered by the dialect, so the raw-SQL
+// scan below never sees it; the assignments literal inside the call must stamp
+// updated_at just like a raw UPDATE's SET clause.
+var heartbeatJoinedUpdateRe = regexp.MustCompile(`\.JoinedUpdate\(\s*\n?\s*"apply_(?:operations|comments)"`)
+
 type timestampedWrite struct {
 	loc    []int
 	upsert bool
 }
 
 // TestTimestampedTableWritesStampUpdatedAt asserts that every UPDATE and upsert
-// in this package against a table with updated_at assigns the column explicitly.
-// Stamping these columns is the application's responsibility on every dialect.
-// MySQL's ON UPDATE CURRENT_TIMESTAMP masks a missing stamp for any
-// value-changing write, so behavioral integration tests cannot catch a dropped
-// assignment there; this source scan can.
+// in this package against a table with updated_at — whether written as a raw
+// SQL literal, an UpsertClause call, or rendered through dialect JoinedUpdate —
+// assigns the column explicitly. Stamping these columns is the application's
+// responsibility on every dialect. MySQL's ON UPDATE CURRENT_TIMESTAMP masks a
+// missing stamp for any value-changing write, so behavioral integration tests
+// cannot catch a dropped assignment there; this source scan can.
 //
 // A deliberate non-NOW() assignment (such as a release-time stale backdate)
 // still satisfies the invariant: the statement owns the column's value rather
@@ -99,6 +106,17 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 				"%s:%d: UPDATE on a timestamped table must assign updated_at in its SET clause; "+
 					"no dialect-level default may be relied on", name, line)
 		}
+
+		for _, loc := range heartbeatJoinedUpdateRe.FindAllStringIndex(src, -1) {
+			checked++
+			line := 1 + strings.Count(src[:loc[0]], "\n")
+			window, ok := callWindow(src, loc[0])
+			require.True(t, ok, "%s:%d: unterminated JoinedUpdate call", name, line)
+			assert.Contains(t, window, "updated_at",
+				"%s:%d: JoinedUpdate on a heartbeat table must include an updated_at assignment; "+
+					"the staleness predicates read it as the liveness signal and no dialect-level "+
+					"default may be relied on", name, line)
+		}
 	}
 	require.NotZero(t, checked, "expected UPDATE or upsert statements on timestamped tables in this package")
 }
@@ -145,4 +163,26 @@ func timestampedMySQLTables(t *testing.T) []string {
 	}
 	sort.Strings(tables)
 	return tables
+}
+
+// callWindow returns the source text of the call expression starting at the
+// match position, from its opening parenthesis through the balancing close.
+func callWindow(src string, matchStart int) (string, bool) {
+	open := strings.Index(src[matchStart:], "(")
+	if open < 0 {
+		return "", false
+	}
+	depth := 0
+	for i := matchStart + open; i < len(src); i++ {
+		switch src[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return src[matchStart : i+1], true
+			}
+		}
+	}
+	return "", false
 }

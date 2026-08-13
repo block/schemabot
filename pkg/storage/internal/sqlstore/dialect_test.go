@@ -230,3 +230,133 @@ func countPlaceholders(s string) int {
 	}
 	return n
 }
+
+func TestPostgresDialectRebind(t *testing.T) {
+	d := PostgresDialect{}
+	assert.Equal(t, "SELECT $1, '$2?', 'it''s ?', \"why?\", $$body ?$$, $tag$also ?$tag$ -- ?\nWHERE id = $2",
+		d.Rebind("SELECT ?, '$2?', 'it''s ?', \"why?\", $$body ?$$, $tag$also ?$tag$ -- ?\nWHERE id = ?"))
+	// Question marks inside block comments (including nested ones) are prose,
+	// not placeholders, so they must not consume ordinals.
+	assert.Equal(t, "SELECT 1 /* why? /* nested? */ still? */ WHERE id = $1",
+		d.Rebind("SELECT 1 /* why? /* nested? */ still? */ WHERE id = ?"))
+	// An unterminated block comment consumes the rest of the query, matching
+	// the server's tokenization.
+	assert.Equal(t, "SELECT 1 /* dangling ? WHERE id = ?",
+		d.Rebind("SELECT 1 /* dangling ? WHERE id = ?"))
+	// A dollar sign continuing an identifier does not open a dollar-quoted
+	// string, so later placeholders still rebind.
+	assert.Equal(t, "SELECT abc$x$ FROM t WHERE id = $1",
+		d.Rebind("SELECT abc$x$ FROM t WHERE id = ?"))
+	// A digit-leading tag is not a dollar-quote delimiter — the server lexes
+	// $1 as a parameter placeholder — so a question mark between $1$ pairs is
+	// a real placeholder, while underscore-leading tags still quote.
+	assert.Equal(t, "SELECT $1$body$1$1$ WHERE id = $2",
+		d.Rebind("SELECT $1$body?$1$ WHERE id = ?"))
+	assert.Equal(t, "SELECT $_1$body ?$_1$ WHERE id = $1",
+		d.Rebind("SELECT $_1$body ?$_1$ WHERE id = ?"))
+}
+
+func TestPostgresDialect(t *testing.T) {
+	d := PostgresDialect{}
+	assert.Equal(t, "EXCLUDED.setting_value", d.ExcludedValue("setting_value"))
+	assert.Equal(t, "ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value",
+		d.UpsertClause([]string{"setting_key"}, []UpsertAssignment{{Column: "setting_value"}}))
+	assert.Equal(t, "now()", d.CurrentTimestamp(TimestampPrecisionDefault))
+	assert.Equal(t, "now()", d.CurrentTimestamp(TimestampPrecisionMicrosecond))
+	assert.Equal(t, "now() - ? * interval '1 second'",
+		d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond))
+	assert.Equal(t, "now() + 2 * interval '1 day'",
+		d.RelativeTime(TimestampPrecisionDefault, AfterCurrentTime, LiteralIntervalAmount(2), IntervalDay))
+}
+
+func TestPostgresDialectInsertIfAbsent(t *testing.T) {
+	assert.Equal(t,
+		InsertIfAbsentSyntax{Suffix: " ON CONFLICT (apply_id, comment_state) DO NOTHING"},
+		PostgresDialect{}.InsertIfAbsent([]string{"apply_id", "comment_state"}),
+	)
+}
+
+func TestPostgresDialectJSONBooleanIsTrue(t *testing.T) {
+	assert.Equal(t,
+		`(jsonb_extract_path(a.options, 'defer_cutover') IS NOT DISTINCT FROM 'true'::jsonb)`,
+		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"defer_cutover"}),
+	)
+	assert.Equal(t,
+		`(jsonb_extract_path(a.options, 'outer', 'inner_key') IS NOT DISTINCT FROM 'true'::jsonb)`,
+		PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "inner_key"}),
+	)
+}
+
+func TestPostgresDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "it's" is not a plain identifier`,
+		func() { PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "it's"}) },
+	)
+}
+
+func TestPostgresDialectIndexHint(t *testing.T) {
+	assert.Empty(t, PostgresDialect{}.IndexHint("idx_database_env_deployment"))
+}
+
+// The PostgreSQL joined UPDATE moves the join condition into the WHERE clause
+// (UPDATE … FROM has no ON clause) while keeping SET assignments before the
+// predicate, so placeholder ordinals line up with the MySQL rendering's
+// argument order.
+func TestPostgresDialectJoinedUpdate(t *testing.T) {
+	assert.Equal(t,
+		"UPDATE apply_comments c SET edit_count = c.edit_count + 1, updated_at = NOW() FROM applies a WHERE (a.id = c.apply_id) AND (c.apply_id = ? AND a.lease_token = ?)",
+		PostgresDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "edit_count", Expr: "c.edit_count + 1"},
+				{Column: "updated_at", Expr: "NOW()"},
+			},
+			"c.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+	// A placeholder assignment expression must render ahead of the predicate's
+	// placeholders, pinning the interface's assignments-then-predicate argument
+	// order at the rendering level.
+	assert.Equal(t,
+		"UPDATE apply_control_requests cr SET status = ?, completed_at = COALESCE(cr.completed_at, NOW()) FROM applies a WHERE (a.id = cr.apply_id) AND (cr.apply_id = ? AND a.lease_token = ?)",
+		PostgresDialect{}.JoinedUpdate(
+			"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "status", Expr: "?"},
+				{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			},
+			"cr.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+func TestPostgresDialectJoinedUpdateRequiresAssignments(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate requires at least one assignment", func() {
+		PostgresDialect{}.JoinedUpdate("apply_comments", "c", "applies", "a", "a.id = c.apply_id", nil, "c.apply_id = ?")
+	})
+}
+
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestPostgresDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate joinCondition must not contain bind placeholders", func() {
+		PostgresDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id AND a.state = ?",
+			[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
+// PostgreSQL SET clauses reference target columns unqualified; a pre-qualified
+// column would render an invalid alias-qualified assignment.
+func TestPostgresDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate assignment columns must be unqualified", func() {
+		PostgresDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{{Column: "c.state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}

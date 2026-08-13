@@ -260,3 +260,230 @@ func mysqlIntervalUnit(unit IntervalUnit) string {
 		panic(fmt.Sprintf("sqlstore: unknown interval unit %d", unit))
 	}
 }
+
+// PostgresDialect implements Dialect for PostgreSQL.
+type PostgresDialect struct{}
+
+// Rebind rewrites store-native question-mark placeholders to PostgreSQL's
+// ordinal placeholders. Question marks inside SQL string literals are data,
+// not placeholders, and are left untouched.
+func (PostgresDialect) Rebind(query string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+	ordinal := 1
+	quote := byte(0)
+	dollarQuote := ""
+	for i := 0; i < len(query); i++ {
+		if dollarQuote != "" {
+			if strings.HasPrefix(query[i:], dollarQuote) {
+				b.WriteString(dollarQuote)
+				i += len(dollarQuote) - 1
+				dollarQuote = ""
+			} else {
+				b.WriteByte(query[i])
+			}
+			continue
+		}
+		if quote != 0 {
+			b.WriteByte(query[i])
+			if query[i] == quote && i+1 < len(query) && query[i+1] == quote {
+				i++
+				b.WriteByte(query[i])
+				continue
+			}
+			if query[i] == quote {
+				quote = 0
+			}
+			continue
+		}
+		if query[i] == '\'' || query[i] == '"' {
+			quote = query[i]
+			b.WriteByte(query[i])
+			continue
+		}
+		// A dollar sign that continues an identifier (PostgreSQL permits $
+		// inside identifiers) never opens a dollar-quoted string.
+		if query[i] == '$' && (i == 0 || !isPostgresIdentifierChar(query[i-1])) {
+			if end := strings.IndexByte(query[i+1:], '$'); end >= 0 {
+				delimiter := query[i : i+end+2]
+				tag := delimiter[1 : len(delimiter)-1]
+				// A dollar-quote tag follows identifier rules: letters,
+				// digits, and underscores, but never a leading digit — the
+				// server lexes a digit-leading run like $1 as a parameter
+				// placeholder, not a quote delimiter.
+				valid := true
+				for j := range len(tag) {
+					c := tag[j]
+					isLetter := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+					isDigit := c >= '0' && c <= '9'
+					if (!isLetter && !isDigit) || (j == 0 && isDigit) {
+						valid = false
+						break
+					}
+				}
+				if valid {
+					dollarQuote = delimiter
+					b.WriteString(delimiter)
+					i += len(delimiter) - 1
+					continue
+				}
+			}
+		}
+		if query[i] == '-' && i+1 < len(query) && query[i+1] == '-' {
+			end := strings.IndexByte(query[i:], '\n')
+			if end < 0 {
+				b.WriteString(query[i:])
+				break
+			}
+			b.WriteString(query[i : i+end])
+			i += end - 1
+			continue
+		}
+		// Block comments nest in PostgreSQL; question marks inside them are
+		// prose, not placeholders. An unterminated comment consumes the rest of
+		// the query, matching the server's tokenization.
+		if query[i] == '/' && i+1 < len(query) && query[i+1] == '*' {
+			depth := 1
+			end := i + 2
+			for end < len(query) && depth > 0 {
+				switch {
+				case query[end] == '/' && end+1 < len(query) && query[end+1] == '*':
+					depth++
+					end += 2
+				case query[end] == '*' && end+1 < len(query) && query[end+1] == '/':
+					depth--
+					end += 2
+				default:
+					end++
+				}
+			}
+			b.WriteString(query[i:end])
+			i = end - 1
+			continue
+		}
+		if query[i] == '?' {
+			b.WriteByte('$')
+			b.WriteString(strconv.Itoa(ordinal))
+			ordinal++
+			continue
+		}
+		b.WriteByte(query[i])
+	}
+	return b.String()
+}
+
+// InsertIfAbsent uses PostgreSQL's ON CONFLICT DO NOTHING clause targeting the
+// named unique-key columns. A skipped conflicting insert reports zero affected
+// rows, matching the interface contract.
+func (PostgresDialect) InsertIfAbsent(conflictColumns []string) InsertIfAbsentSyntax {
+	return InsertIfAbsentSyntax{Suffix: " ON CONFLICT (" + strings.Join(conflictColumns, ", ") + ") DO NOTHING"}
+}
+
+// JSONBooleanIsTrue extracts the JSONB value at path and compares it with JSON
+// true using null-safe equality, so missing paths, JSON null, and SQL NULL all
+// yield false rather than NULL.
+func (PostgresDialect) JSONBooleanIsTrue(expression string, path []string) string {
+	keys := make([]string, len(path))
+	for i, key := range path {
+		if !plainJSONIdentifier.MatchString(key) {
+			panic(fmt.Sprintf("sqlstore: JSON path key %q is not a plain identifier", key))
+		}
+		keys[i] = "'" + key + "'"
+	}
+	return "(jsonb_extract_path(" + expression + ", " + strings.Join(keys, ", ") + ") IS NOT DISTINCT FROM 'true'::jsonb)"
+}
+
+// IndexHint returns an empty string: PostgreSQL has no index-hint syntax and
+// relies on the planner to choose the access path.
+func (PostgresDialect) IndexHint(string) string { return "" }
+
+// JoinedUpdate builds a PostgreSQL UPDATE … FROM statement. The join condition
+// moves into the WHERE clause alongside the residual predicate; SET
+// placeholders still precede predicate placeholders, so the placeholder-free
+// join condition the interface requires keeps argument order identical to the
+// MySQL rendering.
+func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	if len(assignments) == 0 {
+		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
+	}
+	sets := make([]string, len(assignments))
+	for i, assignment := range assignments {
+		if strings.Contains(assignment.Column, ".") {
+			panic("sqlstore: JoinedUpdate assignment columns must be unqualified")
+		}
+		sets[i] = assignment.Column + " = " + assignment.Expr
+	}
+	return "UPDATE " + targetTable + " " + targetAlias +
+		" SET " + strings.Join(sets, ", ") +
+		" FROM " + joinTable + " " + joinAlias +
+		" WHERE (" + joinCondition + ") AND (" + predicate + ")"
+}
+
+// ExcludedValue returns the PostgreSQL reference to the proposed row value.
+func (PostgresDialect) ExcludedValue(column string) string { return "EXCLUDED." + column }
+
+// UpsertClause builds a PostgreSQL ON CONFLICT DO UPDATE clause.
+func (d PostgresDialect) UpsertClause(conflictColumns []string, assignments []UpsertAssignment) string {
+	sets := make([]string, len(assignments))
+	for i, a := range assignments {
+		expr := a.Expr
+		if expr == "" {
+			expr = d.ExcludedValue(a.Column)
+		}
+		sets[i] = a.Column + " = " + expr
+	}
+	return "ON CONFLICT (" + strings.Join(conflictColumns, ", ") + ") DO UPDATE SET " + strings.Join(sets, ", ")
+}
+
+// CurrentTimestamp returns PostgreSQL's transaction timestamp. PostgreSQL
+// timestamps retain microsecond precision without a precision argument.
+func (PostgresDialect) CurrentTimestamp(precision TimestampPrecision) string {
+	switch precision {
+	case TimestampPrecisionDefault, TimestampPrecisionMicrosecond:
+		return "now()"
+	default:
+		panic(fmt.Sprintf("sqlstore: unknown timestamp precision %d", precision))
+	}
+}
+
+// RelativeTime builds PostgreSQL interval arithmetic while retaining the
+// store-native placeholder for the execution-boundary binder.
+func (d PostgresDialect) RelativeTime(precision TimestampPrecision, direction RelativeTimeDirection, amount IntervalAmount, unit IntervalUnit) string {
+	magnitude := "?"
+	if !amount.parameterized {
+		magnitude = strconv.FormatUint(amount.literal, 10)
+	}
+	op := " - "
+	if direction == AfterCurrentTime {
+		op = " + "
+	} else if direction != BeforeCurrentTime {
+		panic(fmt.Sprintf("sqlstore: unknown relative-time direction %d", direction))
+	}
+	return d.CurrentTimestamp(precision) + op + magnitude + " * interval '1 " + postgresIntervalUnit(unit) + "'"
+}
+
+// isPostgresIdentifierChar reports whether c can appear inside a PostgreSQL
+// identifier body (letters, digits, underscores, and dollar signs).
+func isPostgresIdentifierChar(c byte) bool {
+	return c == '_' || c == '$' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+func postgresIntervalUnit(unit IntervalUnit) string {
+	switch unit {
+	case IntervalMicrosecond:
+		return "microsecond"
+	case IntervalSecond:
+		return "second"
+	case IntervalMinute:
+		return "minute"
+	case IntervalHour:
+		return "hour"
+	case IntervalDay:
+		return "day"
+	default:
+		panic(fmt.Sprintf("sqlstore: unknown interval unit %d", unit))
+	}
+}
