@@ -125,7 +125,7 @@ func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 // row covers regardless of origin: the driver proved the head can never
 // succeed, so re-synthesis would replay the identical failure every
 // reconciler pass.
-func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailedSynthesized(t *testing.T) {
+func TestWebhookEventStore_HasEventForHeadExcludesFailedStateSynthesized(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
