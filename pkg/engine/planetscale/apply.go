@@ -920,14 +920,27 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			}
 		}
 
+		// The instant decision is re-taken against the deferral this drive was
+		// given rather than read straight out of recovered metadata. Instant DDL
+		// swaps the schema as the deploy runs, so running one while the operator
+		// holds the cutover hands them a gate with nothing left behind it — and
+		// the metadata was written by a drive whose deferral this one cannot
+		// confirm. The stored decision is only ever narrowed here: a deploy that
+		// was never going to be instant stays that way.
+		useInstant := meta.IsInstant && !deferCutover
+		if meta.IsInstant && !useInstant {
+			e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
+				"database", req.Database, "deploy_request", dr.Number)
+		}
+
 		e.logger.Info("deploying recovered deploy request that was never started",
-			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", meta.IsInstant)
+			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
 
 		// Capture the migration_context baseline before deploying so the new
 		// Vitess context can be identified after Vitess creates migrations.
 		existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, meta.IsInstant)
+		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
 		if deployErr != nil {
 			return nil, fmt.Errorf("recovered deploy request on resume: %w", deployErr)
 		}

@@ -485,6 +485,41 @@ func TestResumeExistingDeployRequest_VerifiesTheCutoverHoldBeforeDeploying(t *te
 	}
 }
 
+// Instant DDL swaps the schema as the deploy runs, so a recovered deploy request
+// carrying an instant decision must not take it while the operator holds the
+// cutover — that would leave them a gate with the swap already behind it. The
+// recorded decision is only ever narrowed: an ordinary resume still deploys
+// instantly.
+func TestResumeExistingDeployRequest_DeferredCutoverDeclinesRecoveredInstantDDL(t *testing.T) {
+	tests := []struct {
+		name        string
+		options     map[string]string
+		wantInstant bool
+	}{
+		{name: "cutover deferred declines the recorded instant decision", options: map[string]string{"defer_cutover": "true"}, wantInstant: false},
+		{name: "cutover not deferred keeps it", options: nil, wantInstant: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/58"},
+			}
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-inst", DeployRequestID: 58, IsInstant: true}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			require.NoError(t, err)
+			require.Equal(t, 1, client.deployCalls)
+			require.NotNil(t, client.lastDeploy)
+			assert.Equal(t, tt.wantInstant, client.lastDeploy.InstantDDL)
+		})
+	}
+}
+
 // A deferred deploy request recovered on resume must wait for the
 // operator-triggered deploy rather than being started automatically.
 func TestResumeExistingDeployRequest_DeferredIsNotDeployed(t *testing.T) {
