@@ -280,15 +280,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
-	emitEvent(engine.ApplyEvent{
-		Message: fmt.Sprintf("Deploy request #%d created, validating...", dr.Number),
-		Metadata: map[string]string{
-			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-			"deploy_request_url": dr.HtmlURL,
-			"branch":             branchName,
-		},
-		NewState: state.Apply.ValidatingDeployRequest,
-	})
+	emitEvent(deployRequestCreatedEvent(dr, branchName))
 	persistState(&psMetadata{
 		BranchName:            branchName,
 		DeployRequestID:       dr.Number,
@@ -319,10 +311,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
 	// it as eligible — instant DDL modifies metadata only (no row copy), so it
 	// completes immediately and has no revert window regardless of skip_revert.
-	// Instant DDL is orthogonal to defer flags — the mechanism (instant vs row copy)
-	// is independent of when the deploy executes.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	useInstant := useInstantDDL(dr, deferCutover)
 
 	// Log the raw deploy request fields for debugging instant DDL detection.
 	if dr.Deployment != nil {
@@ -350,14 +340,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"deploy_state", dr.DeploymentState,
 	)
 
-	// Log when --defer-cutover has no effect for instant DDL
-	if deferCutover && useInstant {
-		e.logger.Info("--defer-cutover has no effect for instant DDL",
+	// State the trade the deferral bought, since the operator sees only that an
+	// eligible change took the slow path.
+	if instantEligible && !useInstant {
+		e.logger.Info("declining instant DDL so the deferred cutover has a gate to hold",
 			"database", req.Database,
 			"deploy_request", dr.Number,
 		)
 		emitEvent(engine.ApplyEvent{
-			Message: "Note: --defer-cutover has no effect for instant DDL",
+			Message: "Deploying with a row copy rather than instant DDL: instant DDL swaps the schema as soon as the deploy runs, and this cutover was deferred.",
 		})
 	}
 
@@ -375,13 +366,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		},
 	})
 
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
 	// Deferred deploy: don't call DeployDeployRequest yet. The user will review
 	// the deploy request diff on PlanetScale and trigger via `schemabot cutover`.
 	if deferDeploy {
 		e.logger.Info("deferring deploy — user must trigger via cutover",
 			"database", req.Database,
 			"deploy_request", dr.Number,
-			"instant_eligible", useInstant,
+			"use_instant", useInstant,
 		)
 		meta, encErr := encodePSMetadata(&psMetadata{
 			BranchName:            branchName,
@@ -763,6 +760,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Create deploy request
 	main := mainBranch(req.Credentials)
 	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
 
 	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, true)
 	if err != nil {
@@ -779,9 +777,14 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return noChangesApplyResult("no changes detected on resume"), nil
 	}
 
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
 	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
-	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	useInstant := useInstantDDL(dr, deferCutover)
 
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
@@ -901,15 +904,43 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	// resumes racing here could both decide to deploy. That read→call window is
 	// self-correcting: the provider accepts at most one deploy and rejects the
 	// loser, so a duplicate schema change is never started.
-	if deployRequestNeedsResumeDeploy(dr, meta) {
+	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
+
+	if deployRequestNeedsResumeDeploy(dr, meta, deferDeploy) {
+		// The cutover setting is settled when the deploy request is created and no
+		// later call can change it, so a recovered request has to be verified here
+		// for the same reason the fresh path verifies before deploying: this drive
+		// cannot know how the request it inherited was created. Deploying one whose
+		// cutover the backend still owns would let the schema swap itself, which is
+		// what the operator deferring the cutover asked to prevent.
+		if deferCutover {
+			if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+				return nil, err
+			}
+		}
+
+		// The instant decision is re-taken against the deferral this drive was
+		// given rather than read straight out of recovered metadata. Instant DDL
+		// swaps the schema as the deploy runs, so running one while the operator
+		// holds the cutover hands them a gate with nothing left behind it — and
+		// the metadata was written by a drive whose deferral this one cannot
+		// confirm. The stored decision is only ever narrowed here: a deploy that
+		// was never going to be instant stays that way.
+		useInstant := meta.IsInstant && !deferCutover
+		if meta.IsInstant && !useInstant {
+			e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
+				"database", req.Database, "deploy_request", dr.Number)
+		}
+
 		e.logger.Info("deploying recovered deploy request that was never started",
-			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", meta.IsInstant)
+			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
 
 		// Capture the migration_context baseline before deploying so the new
 		// Vitess context can be identified after Vitess creates migrations.
 		existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, meta.IsInstant)
+		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
 		if deployErr != nil {
 			return nil, fmt.Errorf("recovered deploy request on resume: %w", deployErr)
 		}
@@ -980,8 +1011,12 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // the driver crashed between creating the deploy request and deploying it. A
 // deferred deploy is left for the operator-triggered deploy, and a request that
 // already has a DeployedAt timestamp is in flight and must not be re-deployed.
-func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool {
-	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && dr.DeployedAt == nil
+// The deferral is read from both the stored metadata and the operator's request:
+// the metadata flag is persisted only after the deploy request is created, so a
+// crash inside that window leaves a deferred apply whose stored metadata does not
+// yet say so, and the request the operator made is what settles it.
+func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
 }
 
 // resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a
