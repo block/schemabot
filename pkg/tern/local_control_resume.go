@@ -290,6 +290,11 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
+	// A resumed drive runs the same engine work as the drive that started it, so
+	// it needs the same log wiring: without it the engine's own lines stop
+	// reaching the apply log stream the moment an apply changes hands, and the
+	// stream goes quiet for exactly the drive an operator is trying to read.
+	defer c.setupSpiritLogging(ctx, apply, tasks)()
 	creds := c.credentials()
 	eng := c.getEngine()
 	// Bind the apply's identity once so every line of this sequential resume is
@@ -764,6 +769,20 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return err
 	}
 
+	// Route the engine's own log lines into this apply's log stream, so a
+	// resumed drive reads like the drive that started it. The wiring goes up
+	// before the engine accepts the resume — it emits setup and lock lines from
+	// inside Apply — and comes down when the drive that polls the work returns.
+	// A detached resume polls in its own goroutine that outlives this call, so
+	// that goroutine unwires it instead.
+	stopEngineLogging := c.setupSpiritLogging(ctx, apply, tasks)
+	pollDetached := false
+	defer func() {
+		if !pollDetached {
+			stopEngineLogging()
+		}
+	}()
+
 	// Resume the grouped apply with the engine's persisted state so it
 	// reattaches to in-flight engine work instead of launching a duplicate
 	// schema change. The changes are rebuilt from the stored tasks so the
@@ -835,9 +854,11 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
 	stopHeartbeat := c.startParentApplyHeartbeat(resumeCtx, apply, suppressParent, cancelResume)
+	pollDetached = true
 	go func() {
 		defer cancelResume()
 		defer stopHeartbeat()
+		defer stopEngineLogging()
 		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}()
 	return nil
@@ -1510,14 +1531,19 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		return ctx.Err()
 	}
 
-	logger.Info("resuming apply (heartbeat expired)",
+	// This drive knows only that it holds the claim on an already-started apply;
+	// the claim arm that selected it — a stale heartbeat, a pending control
+	// request, a barrier-parked cutover — is decided by the operator's claim
+	// query and is not carried here. Report what is known and let the operator's
+	// claim logs name the cause, rather than asserting one this path never
+	// checked.
+	logger.Info("recovering apply: resuming an already-started apply from its stored state",
 		"state", apply.State,
 		"task_count", len(tasks),
 	)
 
-	// Log recovery event
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Recovering apply (heartbeat expired, was in %s state)", apply.State), "", "")
+		fmt.Sprintf("Recovering apply from its stored state (was in %s state)", apply.State), "", "")
 
 	deferredCutoverSignalAbsent := false
 	if shouldInspectCutoverSignalForResume(apply, forceCutoverResume) {
