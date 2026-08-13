@@ -28,19 +28,26 @@ type Telemetry struct {
 	tracerProvider *sdktrace.TracerProvider
 }
 
+// telemetryResource merges the base resource with the schemabot service-name
+// override. The override is schemaless so the merge never conflicts with the
+// base resource's schema URL, which is owned by the host binary's SDK
+// version. Host binaries embed this server and upgrade their OTel SDK
+// independently; a pinned schema URL here would make that upgrade fail
+// resource creation.
+func telemetryResource(base *resource.Resource) (*resource.Resource, error) {
+	return resource.Merge(
+		base,
+		resource.NewSchemaless(semconv.ServiceName("schemabot")),
+	)
+}
+
 // SetupTelemetry initializes OpenTelemetry with a Prometheus metrics exporter
 // (always on) and optional OTLP exporters for metrics and traces when
 // OTEL_EXPORTER_OTLP_ENDPOINT is set.
 func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 	ctx := context.Background()
 
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("schemabot"),
-		),
-	)
+	res, err := telemetryResource(resource.Default())
 	if err != nil {
 		return nil, fmt.Errorf("create resource: %w", err)
 	}
