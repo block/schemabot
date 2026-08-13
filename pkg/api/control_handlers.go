@@ -781,6 +781,7 @@ func (s *Service) tryImmediateStopAfterQueue(ctx context.Context, client tern.Cl
 	resp, err := client.Stop(ctx, &ternv1.StopRequest{
 		ApplyId:     ternApplyID,
 		Environment: environment,
+		Caller:      caller,
 	})
 	if err != nil {
 		s.logger.Warn("immediate stop failed; durable stop request remains pending for apply owner retry",
@@ -1001,7 +1002,7 @@ func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, ap
 	if client.IsRemote() {
 		ternApplyID = apply.ExternalID
 	}
-	resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: ternApplyID, Environment: apply.Environment})
+	resp, err := client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: ternApplyID, Environment: apply.Environment, Caller: caller})
 	if err != nil {
 		s.logger.Warn("immediate cancel failed; durable cancel request remains pending for apply owner retry",
 			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error", err)...)
@@ -1869,10 +1870,12 @@ func (s *Service) ExecuteVolume(ctx context.Context, req apitypes.ControlRequest
 // client, which queues a durable control request for the driver, and records
 // an apply log entry when the queue accepts the level.
 func (s *Service) executeVolumeForApply(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID, caller string, volume int32) (*apitypes.VolumeResponse, error) {
+	caller = resolveCaller(ctx, caller)
 	resp, err := client.Volume(ctx, &ternv1.VolumeRequest{
 		ApplyId:     ternApplyID,
 		Environment: apply.Environment,
 		Volume:      volume,
+		Caller:      caller,
 	})
 	if err != nil {
 		metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, "error")
@@ -1880,7 +1883,7 @@ func (s *Service) executeVolumeForApply(ctx context.Context, client tern.Client,
 	}
 	metrics.RecordControlOperation(ctx, "volume", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
-		s.logControlOperationForApply(ctx, apply, resolveCaller(ctx, caller), storage.LogEventVolumeRequested,
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventVolumeRequested,
 			fmt.Sprintf("Volume change to %d queued; the driver applies it at its next progress check", volume))
 	} else {
 		s.logger.Warn("volume change was not accepted by the data plane",

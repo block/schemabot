@@ -206,6 +206,18 @@ func controlRequestCaller(req *storage.ApplyControlRequest) string {
 	return req.RequestedBy
 }
 
+// controlRequestRequester names the requester to record on a durable control
+// request. An empty caller means the command reached this plane without an
+// operator identity — an internal resume, or a plane that predates the caller
+// field — so the row names the path it arrived on rather than inventing a
+// person.
+func controlRequestRequester(caller string) string {
+	if caller == "" {
+		return storage.ForwardingControlRequestCaller
+	}
+	return caller
+}
+
 func callerApplyLogSuffix(caller string) string {
 	return fmt.Sprintf(" (caller: %s)", storage.ApplyLogCaller(caller))
 }

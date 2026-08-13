@@ -466,7 +466,7 @@ func TestLocalClient_VolumeQueuedAfterSettleIsSweptAndRejected(t *testing.T) {
 
 	// The dispatch-time apply snapshot still reads as non-terminal, modelling a
 	// state check that passed just before the driver settled the apply.
-	rejected, err := client.queueVolumeRequest(ctx, apply, 5)
+	rejected, err := client.queueVolumeRequest(ctx, apply, 5, "cli:armand")
 	require.NoError(t, err)
 	assert.False(t, rejected.Accepted, "a request that raced the settle must not be accepted")
 	assert.Contains(t, rejected.ErrorMessage, "volume can only be adjusted while it is running")

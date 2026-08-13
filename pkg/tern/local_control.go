@@ -19,7 +19,7 @@ import (
 // change performs the cutover when it observes the pending request through
 // shared storage, so the request is safe on any instance serving this route.
 func (c *LocalClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
-	return c.requestCutover(ctx, req, "")
+	return c.requestCutover(ctx, req, req.Caller)
 }
 
 // requestCutover resolves the target apply and records a durable cutover request
@@ -210,10 +210,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
 	}
-	requestedBy := caller
-	if requestedBy == "" {
-		requestedBy = storage.ForwardingControlRequestCaller
-	}
+	requestedBy := controlRequestRequester(caller)
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
@@ -341,12 +338,12 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 
 // Stop pauses an in-progress schema change.
 func (c *LocalClient) Stop(ctx context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
-	return c.requestStop(ctx, req, "")
+	return c.requestStop(ctx, req, req.Caller)
 }
 
 // Cancel terminates an in-progress schema change permanently.
 func (c *LocalClient) Cancel(ctx context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
-	return c.requestCancel(ctx, req, "")
+	return c.requestCancel(ctx, req, req.Caller)
 }
 
 // requestCancel records a durable, owner-routed cancel control request rather than
@@ -385,10 +382,7 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
 	}
-	requestedBy := caller
-	if requestedBy == "" {
-		requestedBy = storage.ForwardingControlRequestCaller
-	}
+	requestedBy := controlRequestRequester(caller)
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCancel,
@@ -445,10 +439,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
 	}
-	requestedBy := caller
-	if requestedBy == "" {
-		requestedBy = storage.ForwardingControlRequestCaller
-	}
+	requestedBy := controlRequestRequester(caller)
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationStop,
@@ -918,11 +909,11 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 // stop, leaving the apply stopped with a pending start that the claim
 // lease-freshness gate cannot re-claim until the lease goes stale.
 func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (bool, error) {
-	hasPendingStart, err := hasPendingStartControlRequest(ctx, c.storage, apply)
+	pendingStart, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if hasPendingStart {
+	if pendingStart != nil {
 		logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
 			"state", apply.State)
 		return false, nil
@@ -1666,7 +1657,7 @@ func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*t
 		}, nil
 	}
 
-	return c.queueVolumeRequest(ctx, apply, req.Volume)
+	return c.queueVolumeRequest(ctx, apply, req.Volume, req.Caller)
 }
 
 // queueVolumeRequest records a durable volume control request carrying the
@@ -1676,7 +1667,7 @@ func (c *LocalClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*t
 // retry guidance. This keeps the level the driver reads, applies, and completes
 // unambiguous — there is no window where a superseding write could make the
 // driver complete a level it never applied.
-func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.Apply, volume int32) (*ternv1.VolumeResponse, error) {
+func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.Apply, volume int32, caller string) (*ternv1.VolumeResponse, error) {
 	controlStore := c.storage.ControlRequests()
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
@@ -1685,7 +1676,7 @@ func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.App
 	if err != nil {
 		return nil, fmt.Errorf("encode volume request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	requestedBy := storage.ForwardingControlRequestCaller
+	requestedBy := controlRequestRequester(caller)
 	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationVolume,

@@ -628,6 +628,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	resp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     remoteID,
 		Environment: apply.Environment,
+		Caller:      controlReq.RequestedBy,
 	})
 	if err != nil {
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
@@ -819,9 +820,9 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 			fmt.Sprintf("Pending remote stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
+		if pendingStart, startErr := pendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
 			return true, startErr
-		} else if hasPendingStart {
+		} else if pendingStart != nil {
 			return false, nil
 		}
 		return true, nil
@@ -933,9 +934,9 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
-		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
+		if pendingStart, startErr := pendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
 			return true, startErr
-		} else if hasPendingStart {
+		} else if pendingStart != nil {
 			return false, nil
 		}
 		return true, nil
@@ -2032,11 +2033,11 @@ func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply 
 	if op == nil || !state.IsState(op.State, state.Apply.Stopped) {
 		return false, nil
 	}
-	startRequested, err := hasPendingStartControlRequest(ctx, c.storage, apply)
+	startReq, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
 		return false, fmt.Errorf("check pending start for stopped %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
 	}
-	if !startRequested {
+	if startReq == nil {
 		// The operator has not asked for it back. Polling reports the stored
 		// stopped state without touching the target.
 		c.applyLogger(apply).DebugContext(ctx, "stopped task-less operation has no pending start request; leaving it stopped",
@@ -2064,7 +2065,7 @@ func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply 
 				"remote_apply_id", remoteID, "remote_state", resp.State.String())...)
 		return false, nil
 	}
-	if _, err := c.client.Start(ctx, &ternv1.StartRequest{ApplyId: remoteID, Environment: apply.Environment}); err != nil {
+	if _, err := c.client.Start(ctx, &ternv1.StartRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: startReq.RequestedBy}); err != nil {
 		message := fmt.Sprintf("Remote start failed for the %s operation; it stays stopped and the command can be re-issued", kind)
 		logger.WarnContext(ctx, "remote start failed for a stopped task-less operation; leaving it stopped for operator retry",
 			append(apply.MutableLogAttrs(),
@@ -2462,12 +2463,8 @@ func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, a
 	return false, nil
 }
 
-func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
-	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
-	if err != nil {
-		return false, err
-	}
-	return controlReq != nil, nil
+func pendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (*storage.ApplyControlRequest, error) {
+	return pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
 }
 
 // waitForPendingStopBeforeStart blocks a pending start until the apply-level
