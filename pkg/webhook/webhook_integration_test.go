@@ -68,6 +68,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -334,9 +335,11 @@ type planFlowResult struct {
 	PRState atomic.Pointer[string]
 
 	// baseFiles is what the default branch holds, as repository path to blob
-	// SHA. Nil (the default) means it holds none of the PR's files, so every
-	// changed file is the PR's own proposal. Tests set it through baseHolds to
-	// model a changed-file list that carries a file the PR does not propose.
+	// SHA. It starts as the schema directory carrying the config at a blob of
+	// its own, so resolving a PR's schema file at the default branch tip walks
+	// the same directory levels a real repository has, and none of the PR's own
+	// files are found there. Tests add to it through baseHolds to model a
+	// changed-file list that carries a file the PR does not propose.
 	baseFiles atomic.Pointer[map[string]string]
 
 	// headTreeEntries is the repository at head, as the fixture described it.
@@ -370,7 +373,18 @@ type planFlowResult struct {
 	// is retried, and the retry would serve the request and hide the failure
 	// the test is asking for.
 	FailFirstPRRead atomic.Bool
-	prReadRequests  atomic.Int64
+
+	// FailPRReadsAfterFirstFetch makes /pulls/1 serve only its first request and
+	// answer every later one with a 403. Auto-plan snapshots the PR once at the
+	// top of discovery and re-reads it uncached before publishing, so this models
+	// SchemaBot losing access to the PR in between — the publish-time
+	// re-verification cannot be answered and the plan must not be published. The
+	// status is the non-retryable kind on purpose: the client already retries an
+	// availability failure, so what reaches that re-verification is a failure
+	// retrying does not fix.
+	FailPRReadsAfterFirstFetch atomic.Bool
+
+	prReadRequests atomic.Int64
 
 	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
 	// request and answer every later one with a 503. Config discovery fetches
@@ -516,12 +530,15 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
 }
 
-// baseHolds describes the default branch as carrying the given repository
-// paths: each at the blob head has for it when head has it too — a file the
+// baseHolds adds the given repository paths to what the default branch already
+// carries: each at the blob head has for it when head has it too — a file the
 // PR's changed-file list carries but that merging it would not change — and at
 // a blob of its own otherwise, which is what a file the PR deletes looks like.
 func (r *planFlowResult) baseHolds(paths ...string) {
 	held := make(map[string]string, len(paths))
+	if existing := r.baseFiles.Load(); existing != nil {
+		maps.Copy(held, *existing)
+	}
 	for _, path := range paths {
 		held[path] = "basesha~" + path
 		for _, entry := range r.headTreeEntries {
@@ -689,7 +706,14 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// PR info — head SHA can shift across calls via result.HeadSHAs (default
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
-		if result.FailFirstPRRead.Load() && result.prReadRequests.Add(1) == 1 {
+		read := result.prReadRequests.Add(1)
+		if result.FailFirstPRRead.Load() && read == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
+		if result.FailPRReadsAfterFirstFetch.Load() && read > 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
@@ -773,6 +797,15 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		})
 	}
 	result.headTreeEntries = treeEntries
+
+	// The default branch already has the schema directory and the config in it,
+	// at a blob of its own. Resolving one of the PR's schema files at the default
+	// branch tip then descends the directory levels a real repository has instead
+	// of stopping at an empty root, and still finds none of the PR's own files
+	// there — so every changed file remains the PR's own proposal.
+	if schemabotConfig != "" {
+		result.baseFiles.Store(&map[string]string{"schema/schemabot.yaml": "baseconfigsha001"})
+	}
 
 	// The repository at both commits a plan flow reads. By default the default
 	// branch tip is the PR's own base commit, so the base branch appears

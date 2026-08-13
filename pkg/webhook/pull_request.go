@@ -441,6 +441,10 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// not silently unmanage a server-owned schema directory.
 	if unmanaged := h.unmanagedServerManagedSchemaChanges(repo, files, configs); len(unmanaged) > 0 {
 		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, unmanaged)
+		// This exit posts a blocking aggregate and no plan comment, so an earlier
+		// head's plan comment would otherwise stay expanded beside it, still
+		// offering to apply DDL for a config this head no longer carries.
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "schema change under managed directory has no config", nil
 	}
 
@@ -548,6 +552,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, baseRef)
 	if err != nil {
 		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
 		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
 	}
 	if moved {
@@ -686,6 +691,30 @@ func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclie
 		block = githubConfigDiscoveryUnavailableBlock
 	}
 	h.logger.Info("posting failing aggregate for config discovery failure",
+		"repo", repo, "pr", pr, "head_sha", headSHA,
+		"blocking_reason", block.blockingReason)
+	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
+		h.aggregateMessagesForAllEnvironments(block.message), block)
+}
+
+// postPlanPublishVerificationFailure blocks the aggregate when the PR could not
+// be re-read before its plan was published. The read is the last thing standing
+// between a discovered plan and a merge-blocking check posted for a commit or
+// base branch the PR may no longer have, so a failure to answer it fails closed
+// on the PR rather than only in the logs — the request path has no durable row
+// to retry, and the failures that reach here are the ones retrying does not fix.
+func (h *Handler) postPlanPublishVerificationFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, verifyErr error) {
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  "plan_publish_verification",
+		Repository: repo,
+		Status:     "error",
+	})
+
+	block := planPublishVerificationFailedBlock
+	if ghclient.IsUnavailableError(verifyErr) {
+		block = githubConfigDiscoveryUnavailableBlock
+	}
+	h.logger.Info("posting failing aggregate for plan publish verification failure",
 		"repo", repo, "pr", pr, "head_sha", headSHA,
 		"blocking_reason", block.blockingReason)
 	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,

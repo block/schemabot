@@ -796,6 +796,130 @@ func TestE2EAutoPlanDiscardsAPlanWhoseBaseMovedDuringDiscovery(t *testing.T) {
 	}
 }
 
+// A push lands while discovery is still running, so the DDL a plan computed
+// describes a commit the PR no longer has. Publishing it would post a plan — and
+// a merge-blocking check — for schema that is no longer proposed, so the plan is
+// discarded and the push's own delivery plans the PR at its new head.
+func TestE2EAutoPlanDiscardsAPlanWhoseHeadMovedDuringDiscovery(t *testing.T) {
+	dbName := "webhook_autoplan_head_moved"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	// The head the delivery carries is served to the snapshot read at the top of
+	// discovery; every later read reports the commit that landed under it, which
+	// is what the uncached re-verification before publishing sees.
+	result.HeadSHAs = []string{"abc123", "newsha456"}
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment for a head the PR no longer has, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+
+	// The push's own delivery plans the PR at the head it now has.
+	pushReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "newsha456",
+		headRef: "feature-branch",
+	}, nil)
+	pushRR := httptest.NewRecorder()
+	h.ServeHTTP(pushRR, pushReq)
+	require.Equal(t, http.StatusOK, pushRR.Code)
+	assert.Contains(t, pushRR.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment on the pushed head")
+	}
+}
+
+// SchemaBot loses access to the PR between the snapshot discovery starts from
+// and the re-read that would confirm the PR still has that head and base. The
+// question a plan is published on cannot be answered, so no plan is published
+// and the aggregate fails closed naming what could not be confirmed — the
+// request path has no durable row to retry, so a failure only in the logs would
+// leave the PR showing nothing at all.
+func TestE2EAutoPlanFailsClosedWhenThePRCannotBeReVerifiedBeforePublishing(t *testing.T) {
+	dbName := "webhook_autoplan_reverify_fails"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.FailPRReadsAfterFirstFetch.Store(true)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion,
+			"a PR that cannot be re-verified must fail the check closed")
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, planPublishVerificationFailedBlock.message, cr.Output.Summary,
+			"the check must name the verification that could not be answered")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the publish-verification failure check run")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment for a PR that could not be re-verified, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+}
+
 func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	dbName := "webhook_autoplan_lint"
 	svc := setupE2EService(t, dbName)
