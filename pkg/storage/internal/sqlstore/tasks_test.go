@@ -815,3 +815,50 @@ func TestTaskStore_FindTableOwners(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, owners, "an object no task names has no owner")
 }
+
+// A long-lived table accumulates an owner for every pull request that ever
+// changed it, and the plan path resolves each one's state against GitHub in
+// turn. The lookup returns a recency window rather than the whole history, so
+// that walk stays bounded no matter how much history a table carries.
+func TestTaskStore_FindTableOwnersReturnsARecencyWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_object_owner_window", 1)
+
+	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	total := tableOwnerLookupLimit + 5
+	for i := range total {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: fmt.Sprintf("task_owner_window_%d", i),
+			ApplyID:        apply.ID,
+			PlanID:         apply.PlanID,
+			Database:       apply.Database,
+			DatabaseType:   apply.DatabaseType,
+			Engine:         storage.EngineSpirit,
+			Repository:     "octocat/hello-world",
+			PullRequest:    100 + i,
+			Environment:    "staging",
+			State:          state.Task.Completed,
+			TableName:      "reconcile_state",
+			DDL:            "ALTER TABLE `reconcile_state` ADD COLUMN `c` int",
+			DDLAction:      "ALTER",
+			CreatedAt:      base.Add(time.Duration(i) * time.Minute),
+			UpdatedAt:      base.Add(time.Duration(i) * time.Minute),
+		})
+		require.NoError(t, err)
+	}
+
+	owners, err := store.Tasks().FindTableOwners(ctx, storage.TableRef{
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  "staging",
+		TableName:    "reconcile_state",
+	})
+	require.NoError(t, err)
+	require.Len(t, owners, tableOwnerLookupLimit)
+	assert.Equal(t, 100+total-1, owners[0].PullRequest, "the window holds the most recent owners")
+	assert.Equal(t, 100+total-tableOwnerLookupLimit, owners[len(owners)-1].PullRequest)
+}

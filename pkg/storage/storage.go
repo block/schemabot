@@ -638,6 +638,10 @@ type TaskStore interface {
 	// Tasks from CLI-originated applies carry no pull request and are excluded;
 	// every other state is included, since a task that named the table is an
 	// ownership signal regardless of how its apply ended.
+	//
+	// The result is capped at a recency window rather than returning a table's
+	// whole history, because the caller resolves each owner's state against
+	// GitHub one at a time.
 	FindTableOwners(ctx context.Context, ref TableRef) ([]TableOwner, error)
 
 	// List returns tasks matching the filter criteria.
