@@ -451,13 +451,16 @@ func PreviewCommentReviewGateError() string {
 }
 
 // PreviewCommentPRCommandNotAuthorized renders a sample actor authorization
-// denial for apply/apply-confirm PR comments.
+// denial for apply/apply-confirm PR comments: the database's operators lead
+// in their own section, with the broader admins as an explicit fallback.
 func PreviewCommentPRCommandNotAuthorized() string {
 	return RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
-		RequestedBy: "mona",
-		CommandName: action.Apply,
-		Database:    "orders",
-		Environment: "staging",
+		RequestedBy:        "mona",
+		CommandName:        action.Apply,
+		Database:           "orders",
+		Environment:        "staging",
+		OperatorPrincipals: []string{"acme/orders-operators"},
+		OtherPrincipals:    []string{"acme/db-admins", "jdoe"},
 	})
 }
 
