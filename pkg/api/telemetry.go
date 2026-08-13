@@ -34,12 +34,14 @@ type Telemetry struct {
 func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 	ctx := context.Background()
 
+	// The service-name override is schemaless so the merge never conflicts
+	// with the schema URL reported by resource.Default(), which is owned by
+	// the host binary's SDK version. Host binaries (e.g. Tern) embed this
+	// server and upgrade their OTel SDK independently; a pinned schema URL
+	// here would make that upgrade fail resource creation.
 	res, err := resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("schemabot"),
-		),
+		resource.NewSchemaless(semconv.ServiceName("schemabot")),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create resource: %w", err)
