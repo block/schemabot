@@ -377,10 +377,10 @@ type operationWriteGuard struct {
 // shapes the WHERE placeholders follow the SET placeholders, so callers append
 // the row ID and then args() to their SET arguments.
 //
-// The strength of the apply-lease guard is dialect-specific: the token check
-// serializes against a concurrent lease steal only where the rendering locks
-// the joined applies row (MySQL does; PostgreSQL's UPDATE … FROM does not —
-// see PostgresDialect.JoinedUpdate). The operation-lease guard checks the
+// The apply-lease guard's token check is built with the dialect's
+// LeaseTokenFence, so it serializes against a concurrent lease steal on every
+// dialect: MySQL's joined rendering locks the applies row it scans, and
+// PostgreSQL's fence locks it explicitly. The operation-lease guard checks the
 // token on the updated row itself, which every dialect locks.
 //
 // Assignment columns are unqualified (the dialect qualifies them where its
@@ -397,7 +397,7 @@ func (g operationWriteGuard) updateStatement(d Dialect, assignments []JoinedUpda
 		return d.JoinedUpdate(
 			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
 			stamped,
-			"ao.id = ? AND ao.apply_id = ? AND a.lease_token = ?",
+			"ao.id = ? AND ao.apply_id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
 		)
 	}
 	sets := make([]string, len(stamped))
@@ -1424,7 +1424,7 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 	}
 	query := s.dialect.JoinedDelete(
 		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
-		"ao.apply_id = ? AND a.lease_token = ?",
+		"ao.apply_id = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, lease.Token)
 	if err != nil {
@@ -1471,7 +1471,7 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 				{Column: "state", Expr: "?"},
 				{Column: "updated_at", Expr: "NOW()"},
 			},
-			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND owner_op.lease_token = ?",
+			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
 		)
 		result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
 		if err != nil {
@@ -1518,7 +1518,7 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 			{Column: "state", Expr: "?"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"ao.apply_id = ? AND ao.state = ? AND a.lease_token = ?",
+		"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
 	if err != nil {

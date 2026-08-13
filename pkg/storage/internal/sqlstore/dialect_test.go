@@ -406,3 +406,22 @@ func TestPostgresDialectJoinedDeleteRejectsJoinConditionPlaceholders(t *testing.
 		)
 	})
 }
+
+// The fence consumes exactly one placeholder (the token) in both renderings,
+// so a guarded statement's argument order is dialect-independent. MySQL's
+// joined DML already record-locks the joined row, so a plain equality
+// suffices; PostgreSQL must lock the row explicitly through the correlated
+// FOR UPDATE subquery.
+func TestMySQLDialectLeaseTokenFence(t *testing.T) {
+	assert.Equal(t, "a.lease_token = ?",
+		MySQLDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
+}
+
+func TestPostgresDialectLeaseTokenFence(t *testing.T) {
+	assert.Equal(t,
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
+	assert.Equal(t,
+		"owner_op.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = owner_op.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"))
+}
