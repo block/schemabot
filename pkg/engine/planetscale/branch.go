@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/vschema"
 )
 
@@ -517,6 +518,12 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
 	// over on its own would race the driver's cutover call and move the schema
 	// without SchemaBot's involvement or caller attribution.
+	//
+	// The client sends this setting explicitly rather than through the SDK's
+	// request struct, whose omitempty tag drops a false — see
+	// psclient.CreateDeployRequest. Saying it out loud is the whole point: it is
+	// the only chance to say it, since the API offers no way to change
+	// auto_cutover once the deploy request exists.
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
@@ -525,6 +532,104 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
+}
+
+// deployRequestCreatedEvent states, on the operator's timeline, the cutover
+// ownership SchemaBot asked this deploy request to be created with.
+//
+// The apply's log surface carries lifecycle events, not the engine's own log
+// lines, so a decision left in an engine logger is invisible to the operator
+// reading the schema change. This one is settled at creation and can never be
+// changed afterwards, and it is the fact an operator needs first when a schema
+// change swaps without them: either SchemaBot held the cutover, and the swap
+// was its call to make, or the deploy request was not created holding it.
+//
+// It reports the request rather than the outcome, because that is all it has:
+// the created deploy request echoes back no cutover setting, so what the
+// backend recorded is not knowable here. verifyCutoverHeld reads it back and is
+// what turns this into a confirmed fact before a deferred cutover is deployed.
+func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.ApplyEvent {
+	return engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d created, requesting SchemaBot hold the cutover, validating...", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id":      fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url":     dr.HtmlURL,
+			"branch":                 branchName,
+			"requested_auto_cutover": "false",
+		},
+		NewState: state.Apply.ValidatingDeployRequest,
+	}
+}
+
+// verifyCutoverHeld checks that the backend is holding the cutover of a deploy
+// request whose cutover the operator deferred.
+//
+// auto_cutover is settled when the deploy request is created and no later call
+// can change it, so the create request is the only thing standing between a
+// deferred cutover and a schema that swaps seconds after the deploy goes ready.
+// A create request that did not arrive as sent leaves no trace on any surface
+// the operator reads: the deploy request looks ordinary right up to the moment
+// it cuts itself over. Reading the setting back is the only way to know the
+// deferral took.
+//
+// Fails closed, including when the setting cannot be read — the deploy has not
+// started, so refusing costs a re-run, while proceeding costs the decision the
+// operator kept for themselves.
+//
+// A read that does not answer is read again before it is treated as a refusal.
+// Auto-cutover on is an answer and stops the deploy immediately; anything else —
+// a request that did not arrive, a response carrying no deployment, a body that
+// did not decode — leaves the question open, and none of those can be told apart
+// from a moment's lag from here. Seconds of re-reading is cheap next to failing
+// an apply that would have been fine, and a gate that refuses at random is one
+// operators learn to re-run past, which is how a gate stops being one.
+func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient, org, database string, number uint64) error {
+	const maxAttempts = 3
+	const pollInterval = 2 * time.Second
+
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and reading the cutover setting was interrupted: %w", number, ctx.Err())
+			case <-time.After(pollInterval):
+			}
+		}
+
+		autoCutover, err := client.DeployRequestAutoCutover(ctx, org, database, number)
+		if err != nil {
+			lastErr = err
+			e.logger.Warn("could not read the deploy request's cutover setting, reading again before refusing the deploy",
+				"database", database, "deploy_request", number, "attempt", attempt+1, "error", err)
+			continue
+		}
+		if autoCutover {
+			return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
+		}
+		e.logger.Info("the deploy request holds the cutover for the operator",
+			"database", database, "deploy_request", number, "attempts", attempt+1)
+		return nil
+	}
+	return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, lastErr)
+}
+
+// useInstantDDL decides whether to run an eligible schema change as instant DDL.
+//
+// Instant DDL rewrites metadata only: the deploy executes and the schema is
+// swapped in a single step, with nothing in between. That makes it the right
+// way to run an eligible change — except when the operator asked to hold the
+// cutover. A held cutover is a decision the operator kept for themselves, and
+// instant DDL takes it: there is no pending_cutover to park at, so the schema
+// swaps the moment the deploy runs and the operator is told afterwards. The
+// row-copy path parks at the gate, so a deferred cutover is deployed that way
+// instead, trading the speed of an eligible change for the gate that was asked
+// for.
+func useInstantDDL(dr *ps.DeployRequest, deferCutover bool) bool {
+	if dr.Deployment == nil || !dr.Deployment.InstantDDLEligible {
+		return false
+	}
+	return !deferCutover
 }
 
 func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (*ps.DeployRequest, error) {

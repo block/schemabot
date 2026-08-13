@@ -276,7 +276,7 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 	database := r.PathValue("db")
 
 	rows, err := s.metadataDB.QueryContext(r.Context(),
-		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible
+		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ?
 		 ORDER BY number DESC`,
@@ -290,8 +290,8 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 	for rows.Next() {
 		var number int64
 		var branch, intoBranch, state string
-		var instantEligible bool
-		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible); err != nil {
+		var instantEligible, instantDDL, autoCutover bool
+		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "scan deploy request: %v", err)
 		}
 		results = append(results, map[string]any{
@@ -302,6 +302,8 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 			"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 			"deployment": map[string]any{
 				"instant_ddl_eligible": instantEligible,
+				"instant_ddl":          instantDDL,
+				"auto_cutover":         autoCutover,
 			},
 		})
 	}
@@ -322,13 +324,13 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var branch, intoBranch, state string
-	var instantEligible bool
+	var instantEligible, instantDDL, autoCutover bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible
+		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &intoBranch, &state, &instantEligible)
+	).Scan(&branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
 	}
@@ -341,6 +343,8 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 		"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 		"deployment": map[string]any{
 			"instant_ddl_eligible": instantEligible,
+			"instant_ddl":          instantDDL,
+			"auto_cutover":         autoCutover,
 		},
 	}
 	s.writeJSON(w, resp)

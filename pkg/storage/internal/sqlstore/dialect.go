@@ -55,7 +55,8 @@ type Dialect interface {
 	// per dialect, joinCondition must not contain bind placeholders: placeholders
 	// are permitted only in assignment expressions and predicate, and callers
 	// supply their arguments in that order. Implementations panic when
-	// assignments is empty or joinCondition contains a placeholder.
+	// assignments is empty, joinCondition contains a placeholder, or an
+	// assignment column is qualified.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 }
 
@@ -232,6 +233,9 @@ func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias,
 	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
+		if strings.Contains(assignment.Column, ".") {
+			panic("sqlstore: JoinedUpdate assignment columns must be unqualified")
+		}
 		sets[i] = targetAlias + "." + assignment.Column + " = " + assignment.Expr
 	}
 	return "UPDATE " + targetTable + " " + targetAlias +
@@ -401,6 +405,9 @@ func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAli
 	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
+		if strings.Contains(assignment.Column, ".") {
+			panic("sqlstore: JoinedUpdate assignment columns must be unqualified")
+		}
 		sets[i] = assignment.Column + " = " + assignment.Expr
 	}
 	return "UPDATE " + targetTable + " " + targetAlias +
