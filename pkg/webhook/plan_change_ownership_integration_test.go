@@ -35,6 +35,13 @@ const (
 		"  PRIMARY KEY (`id`)\n" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
 
+	ownershipUsersWithEmailSchema = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `name` varchar(255) NOT NULL,\n" +
+		"  `email` varchar(255) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
 	ownershipReconcileSchema = "CREATE TABLE `reconcile_state` (\n" +
 		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
 		"  `pending` tinyint(1) NOT NULL DEFAULT '0',\n" +
@@ -89,6 +96,54 @@ func TestE2EPlanFlagsDropOfTableAnOpenPullRequestOwns(t *testing.T) {
 		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
 		assert.Contains(t, body, "▶️ **To apply**",
 			"reconciling to the declared schema stays the operator's call, so the command is still offered")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment")
+	}
+}
+
+// Attribution is table-grained, so the same window is disclosed for a change
+// that destroys part of a table the table itself survives. Another pull request
+// adds a column and applies it without merging; a plan whose schema files
+// predate that column reads it as one to drop, and the comment names the pull
+// request that last changed the table.
+func TestE2EPlanFlagsDroppedColumnOnTableAnOpenPullRequestOwns(t *testing.T) {
+	dbName := "webhook_column_ownership"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	// The other pull request applies its new column, then stays open.
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{
+		"users.sql": ownershipUsersWithEmailSchema,
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersSchema}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "DROP COLUMN", "the plan still shows the diff it computed")
+		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "`users`", "the notice names the table, the grain task history records")
+		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
+		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the plan comment")
 	}

@@ -81,10 +81,11 @@ func PreviewCommentPlanBlocked() string {
 	})
 }
 
-// PreviewCommentPlanAttributedDrop renders a sample plan whose drop targets a
-// table another open pull request applied but has not merged yet, so the entry
-// is annotated with its owner.
-func PreviewCommentPlanAttributedDrop() string {
+// PreviewCommentPlanAttributedChange renders a sample plan whose destructive
+// changes target tables another open pull request applied but has not merged
+// yet, so each entry is annotated with its owner. Attribution is table-grained,
+// so a dropped column is named by its table exactly as a dropped table is.
+func PreviewCommentPlanAttributedChange() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:    "testapp",
 		SchemaName:  "testapp",
@@ -97,16 +98,18 @@ func PreviewCommentPlanAttributedDrop() string {
 			{
 				Keyspace: "testapp",
 				Statements: []string{
-					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT;",
+					"ALTER TABLE `orders` DROP COLUMN `notes`;",
 					"DROP TABLE `reconcile_state`;",
 				},
 			},
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data"},
 			{Table: "reconcile_state", Reason: "DROP TABLE removes all data"},
 		},
-		OwnedDrops: []OwnedDropData{
+		AttributedChanges: []AttributedChangeData{
+			{Table: "orders", Repository: previewRepository, PullRequest: 4820},
 			{Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821},
 		},
 	})

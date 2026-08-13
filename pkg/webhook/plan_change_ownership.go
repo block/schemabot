@@ -11,14 +11,15 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// annotateOwnedDrops fills in the plan comment's attributed drops: the tables
-// the plan would drop that SchemaBot cannot vouch for as this pull request's to
-// drop.
+// annotateAttributedChanges fills in the plan comment's attributed changes: the
+// tables the plan would destroy something on that SchemaBot cannot vouch for as
+// this pull request's to destroy.
 //
-// An attributed drop is always a whole table. Stored task history names the
-// table a task changed and nothing finer, so a destructive change to a table
-// that survives — a dropped column or index — is outside what this can
-// attribute.
+// Attribution is table-grained. Stored task history names the table a task
+// changed and nothing finer, so the notice can say an open pull request last
+// changed this table, never that it created the column or index being dropped.
+// Over-attributing is the safe direction: it annotates a destructive change
+// rather than leaving one unremarked.
 //
 // SchemaBot's workflow is schema-first — a pull request applies its schema
 // change and merges afterwards — so between those two moments the live database
@@ -34,11 +35,11 @@ import (
 // The lookup fails toward ownership. A storage failure, or a pull-request state
 // lookup that fails, annotates the drop as unresolved rather than letting it
 // render as a drop with nothing said about it.
-func (h *Handler) annotateOwnedDrops(ctx context.Context, client *ghclient.InstallationClient, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, repo string, pr int, environment string) {
+func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclient.InstallationClient, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, repo string, pr int, environment string) {
 	if data == nil {
 		return
 	}
-	tables := plannedDropTables(planResp)
+	tables := plannedDestructiveTables(planResp)
 	if len(tables) == 0 {
 		return
 	}
@@ -49,24 +50,25 @@ func (h *Handler) annotateOwnedDrops(ctx context.Context, client *ghclient.Insta
 			Environment:  environment,
 			TableName:    table,
 		}
-		drop, annotate := h.classifyPlannedDrop(ctx, client, ref, repo, pr, table)
+		change, annotate := h.classifyDestructiveChange(ctx, client, ref, repo, pr, table)
 		if annotate {
-			data.OwnedDrops = append(data.OwnedDrops, drop)
+			data.AttributedChanges = append(data.AttributedChanges, change)
 		}
 	}
 }
 
-// classifyPlannedDrop decides whether one planned drop must be annotated, and
-// how it should read. annotate is false only when the lookup positively
-// established that no other pull request has an open claim on the table.
-func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.InstallationClient, ref storage.TableRef, repo string, pr int, table string) (drop templates.OwnedDropData, annotate bool) {
+// classifyDestructiveChange decides whether one table's destructive change must
+// be annotated, and how it should read. annotate is false only when the lookup
+// positively established that no other pull request has an open claim on the
+// table.
+func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclient.InstallationClient, ref storage.TableRef, repo string, pr int, table string) (change templates.AttributedChangeData, annotate bool) {
 	owners, err := h.service.Storage().Tasks().FindTableOwners(ctx, ref)
 	if err != nil {
-		h.logger.Error("planned drop will be annotated as unresolved: table-ownership lookup failed",
+		h.logger.Error("planned destructive change will be annotated as unresolved: table-ownership lookup failed",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table, "error", err)
-		metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
-		return templates.OwnedDropData{Table: table, Unresolved: true}, true
+		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
+		return templates.AttributedChangeData{Table: table, Unresolved: true}, true
 	}
 
 	var checked int
@@ -79,26 +81,26 @@ func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.Inst
 		checked++
 		info, err := client.FetchPullRequest(ctx, owner.Repository, owner.PullRequest)
 		if err != nil {
-			h.logger.Error("planned drop will be annotated as unresolved: owning pull request's state could not be read",
+			h.logger.Error("planned destructive change will be annotated as unresolved: owning pull request's state could not be read",
 				"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 				"environment", ref.Environment, "table", table,
 				"owner_repo", owner.Repository, "owner_pr", owner.PullRequest, "error", err)
-			metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "pr_state_error")
-			return templates.OwnedDropData{Table: table, Unresolved: true}, true
+			metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "pr_state_error")
+			return templates.AttributedChangeData{Table: table, Unresolved: true}, true
 		}
 		if info.IsClosed() {
-			h.logger.Debug("planned drop is not attributed to this owner: its pull request is closed",
+			h.logger.Debug("planned destructive change is not attributed to this owner: its pull request is closed",
 				"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment,
 				"table", table, "owner_repo", owner.Repository, "owner_pr", owner.PullRequest,
 				"owner_merged", info.Merged)
 			continue
 		}
-		h.logger.Warn("planned drop will be annotated: an open pull request last changed this table",
+		h.logger.Warn("planned destructive change will be annotated: an open pull request last changed this table",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table,
 			"owner_repo", owner.Repository, "owner_pr", owner.PullRequest)
-		metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "owned")
-		return templates.OwnedDropData{
+		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "owned")
+		return templates.AttributedChangeData{
 			Table:       table,
 			Repository:  owner.Repository,
 			PullRequest: owner.PullRequest,
@@ -106,24 +108,30 @@ func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.Inst
 	}
 
 	if checked == 0 {
-		h.logger.Debug("planned drop is this pull request's to make: no other pull request is attributed the table",
+		h.logger.Debug("planned destructive change is this pull request's to make: no other pull request is attributed the table",
 			"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment, "table", table)
 	}
-	metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "unowned")
-	return templates.OwnedDropData{}, false
+	metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "unowned")
+	return templates.AttributedChangeData{}, false
 }
 
-// plannedDropTables returns the distinct tables the plan would drop, in a
-// stable order. Both the namespace-level view and the per-shard view are read:
-// a sharded plan can carry a drop on individual shards that the collapsed view
-// omits, and a drop confined to one shard is still a drop.
-func plannedDropTables(planResp *apitypes.PlanResponse) []string {
+// plannedDestructiveTables returns the distinct tables the plan would destroy
+// something on — a dropped table, column, or index — in a stable order. The
+// set is the one --allow-unsafe already gates, so the annotation and the
+// deliberate opt-in cover the same statements. Both the namespace-level view
+// and the per-shard view are read: a sharded plan can carry a destructive
+// change on individual shards that the collapsed view omits, and one confined
+// to a single shard is still destructive.
+func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 	if planResp == nil {
 		return nil
 	}
 	seen := map[string]struct{}{}
 	add := func(t *apitypes.TableChangeResponse) {
-		if !t.DropsTable() || t.TableName == "" {
+		if t.TableName == "" {
+			return
+		}
+		if _, unsafe := t.UnsafeChange(); !unsafe {
 			return
 		}
 		seen[t.TableName] = struct{}{}

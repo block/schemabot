@@ -155,18 +155,18 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 	)
 }
 
-// RecordPlanDropOwnership counts one planned drop's ownership verdict.
-// Outcomes: "unowned" (no other pull request is attributed the table, so the
-// drop renders normally), "owned" (an open pull request is attributed it, so
-// the drop is annotated), "storage_error" and
-// "pr_state_error" (the lookup could not decide, so the drop is annotated as
-// unresolved — investigate storage or GitHub API health respectively).
-// Sustained error outcomes mean operators are seeing drops they cannot get an
-// attribution for; a rising "owned" count means pull requests are applying and
-// merging far apart.
-func RecordPlanDropOwnership(ctx context.Context, repo, database, environment, outcome string) {
-	addCounter(ctx, "schemabot.plan_drop_ownership.total",
-		"Total number of planned drops classified by table-ownership lookup outcome", "{drop}",
+// RecordPlanChangeOwnership counts one planned destructive change's ownership
+// verdict. Outcomes: "unowned" (no other pull request is attributed the table,
+// so the change renders normally), "owned" (an open pull request is attributed
+// it, so the change is annotated), "storage_error" and "pr_state_error" (the
+// lookup could not decide, so the change is annotated as unresolved —
+// investigate storage or GitHub API health respectively).
+// Sustained error outcomes mean operators are seeing destructive changes they
+// cannot get an attribution for; a rising "owned" count means pull requests are
+// applying and merging far apart.
+func RecordPlanChangeOwnership(ctx context.Context, repo, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.plan_change_ownership.total",
+		"Total number of planned destructive changes classified by table-ownership lookup outcome", "{change}",
 		attribute.String("repository", repo),
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),

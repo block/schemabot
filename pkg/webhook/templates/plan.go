@@ -51,13 +51,14 @@ type DirectChangeData struct {
 	Shards []string
 }
 
-// OwnedDropData is a planned drop of a table that stored task history
-// attributes to a pull request other than the one being planned. Repository and
-// PullRequest name the owner when the lookup resolved an open one; Unresolved
-// marks a drop whose ownership could not be established, which is annotated the
-// same way — the lookup fails toward ownership rather than presenting a drop
-// SchemaBot cannot vouch for as one this pull request proposes.
-type OwnedDropData struct {
+// AttributedChangeData is a table carrying a planned destructive change that
+// stored task history attributes to a pull request other than the one being
+// planned. Repository and PullRequest name the owner when the lookup resolved
+// an open one; Unresolved marks a table whose ownership could not be
+// established, which is annotated the same way — the lookup fails toward
+// ownership rather than presenting a change SchemaBot cannot vouch for as one
+// this pull request proposes.
+type AttributedChangeData struct {
 	Table       string
 	Repository  string
 	PullRequest int
@@ -92,9 +93,9 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
-	// Drops of tables another pull request owns, or whose ownership could not
-	// be established.
-	OwnedDrops []OwnedDropData
+	// Tables carrying a destructive change that another pull request owns, or
+	// whose ownership could not be established.
+	AttributedChanges []AttributedChangeData
 
 	// Options
 	DeferCutover bool
@@ -181,11 +182,11 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
-	// Drops of tables another pull request owns. Shown on the locked apply
-	// comment too, for the same reason as the direct-execution disclosure: it
-	// must sit on the comment the confirmation acts on.
-	if len(data.OwnedDrops) > 0 {
-		writeOwnedDrops(&sb, data.OwnedDrops)
+	// Destructive changes to tables another pull request owns. Shown on the
+	// locked apply comment too, for the same reason as the direct-execution
+	// disclosure: it must sit on the comment the confirmation acts on.
+	if len(data.AttributedChanges) > 0 {
+		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
 	// Direct-execution changes — statements the policy routes to native DDL.
@@ -268,17 +269,21 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
-// writeOwnedDrops writes the section for drops of tables that stored task
-// history attributes to another pull request. SchemaBot plans a full diff of
-// the pull request's schema files against the live database, so a table an
-// unmerged pull request already applied reads as one this pull request wants
-// gone. Reconciling the database to the declared schema is the operator's call
-// to make; what the comment owes them is the attribution they cannot see from
-// the DDL alone.
-func writeOwnedDrops(sb *strings.Builder, drops []OwnedDropData) {
-	n := len(drops)
-	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s attributed to another open PR\n", n, pluralize("drop", n))
-	for _, d := range drops {
+// writeAttributedChanges writes the section for destructive changes to tables
+// that stored task history attributes to another pull request. SchemaBot plans
+// a full diff of the pull request's schema files against the live database, so
+// what an unmerged pull request already applied reads as something this pull
+// request wants gone. Reconciling the database to the declared schema is the
+// operator's call to make; what the comment owes them is the attribution they
+// cannot see from the DDL alone.
+//
+// Attribution is table-grained: stored task history records the table a task
+// changed and nothing finer, so the notice names the table and the pull request
+// that last changed it, never the specific column or index.
+func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
+	n := len(changes)
+	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s attributed to another open PR\n", n, pluralize("destructive change", n))
+	for _, d := range changes {
 		if d.Unresolved {
 			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
 			continue
@@ -286,7 +291,7 @@ func writeOwnedDrops(sb *strings.Builder, drops []OwnedDropData) {
 		fmt.Fprintf(sb, "- `%s`: last changed by [%s#%d](https://github.com/%s/pull/%d), still open\n",
 			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
 	}
-	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a table another PR applied before merging reads here as one to drop. If that is not what you intend, merge that PR, or add the table's definition to this PR's schema files, then re-plan.\n\n")
+	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
 
 // writePlanMetadata writes the metadata line for plan comments.
@@ -992,10 +997,11 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeBlockedChanges(sb, plan.BlockedChanges)
 	}
 
-	// Drops of tables another pull request owns — resolved per environment,
-	// since the task history that attributes them is per environment.
-	if len(plan.OwnedDrops) > 0 {
-		writeOwnedDrops(sb, plan.OwnedDrops)
+	// Destructive changes to tables another pull request owns — resolved per
+	// environment, since the task history that attributes them is per
+	// environment.
+	if len(plan.AttributedChanges) > 0 {
+		writeAttributedChanges(sb, plan.AttributedChanges)
 	}
 
 	// Direct-execution changes — each environment's section discloses its own,

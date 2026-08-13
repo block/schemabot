@@ -9,7 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-func TestPlannedDropTables_CollectsDropsFromBothViews(t *testing.T) {
+func TestPlannedDestructiveTables_CollectsFromBothViews(t *testing.T) {
 	planResp := &apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{{
 			Namespace: "keyspace",
@@ -28,10 +28,29 @@ func TestPlannedDropTables_CollectsDropsFromBothViews(t *testing.T) {
 		}},
 	}
 
-	assert.Equal(t, []string{"audit_log", "orders"}, plannedDropTables(planResp))
+	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp))
 }
 
-func TestPlannedDropTables_NoDrops(t *testing.T) {
+// An ALTER that destroys something a table keeps — a dropped column, a dropped
+// index — comes out of the same window as a dropped table and is attributed the
+// same way. The set matches what --allow-unsafe already gates.
+func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN discards the column's data"},
+				{TableName: "customers", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP INDEX is not guarded"},
+				{TableName: "users", ChangeType: "alter"},
+			},
+		}},
+	}
+
+	assert.Equal(t, []string{"customers", "orders"}, plannedDestructiveTables(planResp),
+		"an additive alter stays out; a destructive one is attributed by its table")
+}
+
+func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
 	planResp := &apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{{
 			Namespace:    "keyspace",
@@ -39,11 +58,11 @@ func TestPlannedDropTables_NoDrops(t *testing.T) {
 		}},
 	}
 
-	assert.Empty(t, plannedDropTables(planResp))
-	assert.Empty(t, plannedDropTables(nil))
+	assert.Empty(t, plannedDestructiveTables(planResp))
+	assert.Empty(t, plannedDestructiveTables(nil))
 }
 
-func TestRenderPlanComment_AttributedDropNamesOwnerAndStillOffersApply(t *testing.T) {
+func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:    "testdb",
 		Environment: "staging",
@@ -52,7 +71,7 @@ func TestRenderPlanComment_AttributedDropNamesOwnerAndStillOffersApply(t *testin
 			Keyspace:   "testdb",
 			Statements: []string{"DROP TABLE `reconcile_state`"},
 		}},
-		OwnedDrops: []templates.OwnedDropData{{
+		AttributedChanges: []templates.AttributedChangeData{{
 			Table:       "reconcile_state",
 			Repository:  "block/schemabot",
 			PullRequest: 42,
@@ -61,7 +80,7 @@ func TestRenderPlanComment_AttributedDropNamesOwnerAndStillOffersApply(t *testin
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** drop attributed to another open PR")
+	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** destructive change attributed to another open PR")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	// Reconciling the live database to the declared schema stays the operator's
 	// call, so the attribution informs the decision without removing it.
@@ -78,7 +97,7 @@ func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T
 			Keyspace:   "testdb",
 			Statements: []string{"DROP TABLE `reconcile_state`"},
 		}},
-		OwnedDrops: []templates.OwnedDropData{{Table: "reconcile_state", Unresolved: true}},
+		AttributedChanges: []templates.AttributedChangeData{{Table: "reconcile_state", Unresolved: true}},
 	}
 
 	rendered := templates.RenderPlanComment(data)
@@ -87,7 +106,7 @@ func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T
 	assert.Contains(t, rendered, "▶️ **To apply**")
 }
 
-func TestRenderMultiEnvPlanComment_AttributedDropAnnotatesItsOwnEnvironmentOnly(t *testing.T) {
+func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnly(t *testing.T) {
 	staging := templates.PlanCommentData{
 		Database:    "testdb",
 		Environment: "staging",
@@ -96,7 +115,7 @@ func TestRenderMultiEnvPlanComment_AttributedDropAnnotatesItsOwnEnvironmentOnly(
 			Keyspace:   "testdb",
 			Statements: []string{"DROP TABLE `reconcile_state`"},
 		}},
-		OwnedDrops: []templates.OwnedDropData{{
+		AttributedChanges: []templates.AttributedChangeData{{
 			Table:       "reconcile_state",
 			Repository:  "block/schemabot",
 			PullRequest: 42,

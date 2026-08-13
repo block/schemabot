@@ -141,7 +141,7 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="mysql-plan-drop-attributed-to-another-pr"></a><strong>MySQL Plan (Drop Attributed To Another PR)</strong></summary>
+<summary><a name="mysql-plan-change-attributed-to-another-pr"></a><strong>MySQL Plan (Change Attributed To Another PR)</strong></summary>
 
 
 ## Schema Change Plan — Staging
@@ -151,22 +151,24 @@ schemabot unlock
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
 ```sql
-ALTER TABLE `orders` ADD COLUMN `notes` text;
+ALTER TABLE `orders` DROP COLUMN `notes`;
 
 DROP TABLE `reconcile_state`;
 ```
 
-🛑 **Check before applying**: **1** drop attributed to another open PR
+🛑 **Check before applying**: **2** destructive changes attributed to another open PR
+- `orders`: last changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), still open
 - `reconcile_state`: last changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), still open
 
-A plan diffs this PR's schema files against the live database, so a table another PR applied before merging reads here as one to drop. If that is not what you intend, merge that PR, or add the table's definition to this PR's schema files, then re-plan.
+A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
 
-⚠️ **Issues**: **1** unsafe change detected
+⚠️ **Issues**: **2** unsafe changes detected
+- `orders`: DROP COLUMN discards the column's data
 - `reconcile_state`: DROP TABLE removes all data
 
 **Destructive drop guidance:**
 
-Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
 
 📋 **Plan**: **1** table to alter, **1** table to drop
 

@@ -323,11 +323,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
 
-	// Build plan comment data with lock info. The attributed-drop disclosure sits
+	// Build plan comment data with lock info. The attributed-change disclosure sits
 	// on this comment for the same reason as the direct-execution one: it must
 	// be on the comment the confirmation acts on.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-	h.annotateOwnedDrops(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
