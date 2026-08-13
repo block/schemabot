@@ -588,6 +588,8 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 	for {
 		select {
 		case <-ctx.Done():
+			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
+				apply.IdentityLogAttrs()...)
 			return
 		case <-ticker.C:
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {

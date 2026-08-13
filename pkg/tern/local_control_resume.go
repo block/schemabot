@@ -312,6 +312,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		}
 
 		action := c.checkTaskReady(ctx, logger, task)
+		if action == taskHandover {
+			return
+		}
 		if action == taskStopped {
 			stoppedByUser = true
 			break
@@ -371,7 +374,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			failedTask = task
 			break
 		}
-		if action == taskAbort {
+		if action == taskAbort || action == taskHandover {
 			return
 		}
 		if action == taskStopped {
