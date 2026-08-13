@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -456,6 +457,187 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 			"task %s (table=%s) should be completed, but is %q — pollForCompletion did not sync terminal task state",
 			task.TaskIdentifier, task.TableName, task.State)
 	}
+}
+
+// TestGRPC_FailedTableErrorSurfacesInTaskRecord drives a schema change through a
+// remote Tern over gRPC that fails at the engine: adding a unique index over
+// duplicate rows. The control plane never polls the engine directly, so the PR
+// comment and CLI can only name the table whose engine error caused the failure
+// if the remote's per-table error reaches SchemaBot's own stored task row. The
+// driver that holds the apply's lease is the only writer of that row, so driving
+// the apply to terminal must be sufficient on its own: the failed table carries
+// the engine error on its task record, not just on the apply record.
+func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
+	ctx := t.Context()
+
+	// Create a unique target database for this test. The close cleanup is
+	// registered before the drop cleanup so it runs after it (cleanups run
+	// LIFO): the drop still has a live handle.
+	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	require.NoError(t, err, "open target db")
+	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
+	require.NoError(t, targetDB.PingContext(ctx), "ping target db")
+
+	appDBName := fmt.Sprintf("tblerr_%d", time.Now().UnixNano()%100000)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdentifier(appDBName))
+	require.NoError(t, err, "create app database")
+	t.Cleanup(func() {
+		// Cleanup runs after the test context is cancelled, so it needs a context
+		// that outlives it.
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
+			t.Logf("cleanup: drop database %s: %v", appDBName, err)
+		}
+	})
+
+	// Seed a table with duplicate values so adding a unique index must fail in
+	// the engine with this table's own error.
+	_, err = targetDB.ExecContext(ctx, "CREATE TABLE "+quoteIdentifier(appDBName)+".`dup_users` ("+
+		"`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "+
+		"`name` VARCHAR(255) NOT NULL"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create seeded table")
+	_, err = targetDB.ExecContext(ctx, "INSERT INTO "+quoteIdentifier(appDBName)+".`dup_users` (`name`) VALUES ('a'), ('a')")
+	require.NoError(t, err, "seed duplicate rows")
+
+	appCfg, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err, "parse target DSN")
+	appCfg.DBName = appDBName
+	appDSN := appCfg.FormatDSN()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// Set up a separate Tern gRPC server for this test (backed by LocalClient)
+	ternGRPCAddr, err := startTernGRPC(ctx, appDSN, ternStorageDSN)
+	require.NoError(t, err, "start tern grpc")
+
+	// Create SchemaBot with its own storage and a GRPCClient to remote Tern.
+	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	require.NoError(t, err, "open schemabot db")
+	defer utils.CloseAndLog(schemabotDB)
+	require.NoError(t, schemabotDB.PingContext(ctx), "ping schemabot db")
+	schemabotStorage := schemabotmysql.New(schemabotDB)
+
+	ternClient, err := tern.NewGRPCClient(tern.Config{
+		Address: ternGRPCAddr,
+		Storage: schemabotStorage,
+	})
+	require.NoError(t, err, "create tern client")
+	defer utils.CloseAndLog(ternClient)
+
+	serverConfig := &schemabotapi.ServerConfig{
+		Databases: map[string]schemabotapi.DatabaseConfig{
+			appDBName: {
+				Type: "mysql",
+				Environments: map[string]schemabotapi.EnvironmentConfig{
+					"staging": {Target: appDBName + "-target", Deployment: "default"},
+				},
+			},
+		},
+		TernDeployments: schemabotapi.TernConfig{
+			"default": {"staging": ternGRPCAddr},
+		},
+	}
+	svc := schemabotapi.New(schemabotStorage, serverConfig, map[string]tern.Client{
+		"default/staging": ternClient,
+	}, logger)
+	startTestOperator(t, svc)
+	defer utils.CloseAndLog(svc)
+
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "localhost:0")
+	require.NoError(t, err, "listen")
+	server := &http.Server{Handler: mux}
+	go func() { _ = server.Serve(listener) }()
+	defer utils.CloseAndLog(server)
+	schemabotAddr := listener.Addr().String()
+
+	// Wait for HTTP server readiness
+	testutil.Poll(t, 5*time.Second, 10*time.Millisecond,
+		func() bool {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+schemabotAddr+"/health", nil)
+			require.NoError(t, err)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return false
+			}
+			_ = resp.Body.Close()
+			return resp.StatusCode == http.StatusOK
+		},
+		func() string { return "schemabot HTTP server did not become healthy" },
+	)
+
+	// Step 1: Plan — add a unique index the seeded duplicate rows cannot satisfy
+	schemaSQL := `CREATE TABLE dup_users (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		UNIQUE KEY uniq_name (name)
+	);`
+	planResp := postJSON(t, "http://"+schemabotAddr+"/api/plan", map[string]any{
+		"database":    appDBName,
+		"environment": "staging",
+		"type":        "mysql",
+		"schema_files": map[string]any{
+			"default": map[string]any{
+				"files": map[string]string{
+					"dup_users.sql": schemaSQL,
+				},
+			},
+		},
+		"repository":   "test/tableerror",
+		"pull_request": 148,
+	})
+	planID, ok := planResp["plan_id"].(string)
+	require.True(t, ok && planID != "", "plan response missing plan_id: %v", planResp)
+
+	// Step 2: Apply
+	applyResp := postJSON(t, "http://"+schemabotAddr+"/api/apply", map[string]any{
+		"plan_id":     planID,
+		"environment": "staging",
+	})
+	require.True(t, applyResp["accepted"] == true, "apply not accepted: %v", applyResp)
+	applyID, ok := applyResp["apply_id"].(string)
+	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
+
+	// Step 3: Wait for the apply to fail on the duplicate rows
+	waitForState(t, "http://"+schemabotAddr, applyID, "failed", 15*time.Second)
+
+	// Step 4: Wait for the local apply record to be updated by pollForCompletion.
+	var storedApply *storage.Apply
+	testutil.Poll(t, 5*time.Second, 100*time.Millisecond,
+		func() bool {
+			storedApply, err = schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
+			require.NoError(t, err, "get apply by identifier")
+			require.NotNil(t, storedApply, "apply not found")
+			return storedApply.State == state.Apply.Failed
+		},
+		func() string {
+			return fmt.Sprintf("apply record should be failed in local storage, last state: %q", storedApply.State)
+		},
+	)
+	require.NotEmpty(t, storedApply.ErrorMessage, "failed apply record should carry the engine error")
+
+	// Step 5: The failed table's own engine error must be on SchemaBot's stored
+	// task row — the record the PR comment and CLI render from — written there by
+	// the driver, with no read-path repair involved.
+	tasks, err := schemabotStorage.Tasks().GetByApplyID(ctx, storedApply.ID)
+	require.NoError(t, err, "get tasks by apply ID")
+	require.NotEmpty(t, tasks, "expected task records for apply %s", applyID)
+
+	var dupTask *storage.Task
+	for _, task := range tasks {
+		if task.TableName == "dup_users" && task.Shard == "" {
+			dupTask = task
+			break
+		}
+	}
+	require.NotNil(t, dupTask, "expected a task record for table dup_users")
+	assert.Equal(t, state.Task.Failed, dupTask.State,
+		"task %s should be failed, but is %q", dupTask.TaskIdentifier, dupTask.State)
+	assert.Contains(t, dupTask.ErrorMessage, "checksum failed",
+		"failed task should carry the engine's own reason for this table, mirrored from the remote per-table progress")
 }
 
 // TestGRPC_ServerSideTargetPlan verifies that HTTP plan succeeds when the
