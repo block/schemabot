@@ -78,14 +78,6 @@ type psClientWrapper struct {
 	baseURL    string // for endpoints not in the SDK (throttle)
 	tokenName  string
 	tokenValue string
-	logger     *slog.Logger
-}
-
-func (w *psClientWrapper) log() *slog.Logger {
-	if w.logger == nil {
-		return slog.Default()
-	}
-	return w.logger
 }
 
 // APIError is a non-2xx response from a PlanetScale endpoint this package calls
@@ -339,7 +331,7 @@ func (w *psClientWrapper) doRawJSON(ctx context.Context, method, path string, bo
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		// The body is logged rather than returned: it is what explains a refusal,
 		// and this is the only place it is still in hand.
-		w.log().Error("PlanetScale API request failed",
+		slog.Error("PlanetScale API request failed",
 			"method", method,
 			"path", path,
 			"status_code", resp.StatusCode,
