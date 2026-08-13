@@ -247,6 +247,13 @@ func TestPostgresDialectRebind(t *testing.T) {
 	// string, so later placeholders still rebind.
 	assert.Equal(t, "SELECT abc$x$ FROM t WHERE id = $1",
 		d.Rebind("SELECT abc$x$ FROM t WHERE id = ?"))
+	// A digit-leading tag is not a dollar-quote delimiter — the server lexes
+	// $1 as a parameter placeholder — so a question mark between $1$ pairs is
+	// a real placeholder, while underscore-leading tags still quote.
+	assert.Equal(t, "SELECT $1$body$1$1$ WHERE id = $2",
+		d.Rebind("SELECT $1$body?$1$ WHERE id = ?"))
+	assert.Equal(t, "SELECT $_1$body ?$_1$ WHERE id = $1",
+		d.Rebind("SELECT $_1$body ?$_1$ WHERE id = ?"))
 }
 
 func TestPostgresDialect(t *testing.T) {
