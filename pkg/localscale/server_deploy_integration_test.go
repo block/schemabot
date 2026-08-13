@@ -594,6 +594,74 @@ func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
 	}
 }
 
+// An instant-eligible change whose cutover the operator deferred is deployed
+// with a row copy so it has a gate to park at, and it stays eligible the whole
+// time. Progress therefore reads what the deployment ran as rather than what it
+// was eligible for, and that only works if the deploy request reports the two
+// separately — otherwise a change still copying rows and waiting for the
+// operator renders as already swapped.
+func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		cleanupActiveDeployRequests(t, cleanupCtx)
+	})
+
+	tests := []struct {
+		name       string
+		instantDDL bool
+	}{
+		{name: "deployed instantly", instantDDL: true},
+		{name: "eligible but deployed with a row copy", instantDDL: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+
+			branchName := createBranch(t, ctx, "instant-report")
+			applyBranchSchemaHTTP(t, ctx, branchName, map[string][]string{
+				"testapp_sharded": {"ALTER TABLE users ADD COLUMN instant_report_col VARCHAR(50) NULL"},
+			})
+
+			dr := createDeploy(t, ctx, branchName, true)
+			require.Equal(t, drState.Ready, dr.DeploymentState)
+			require.NotNil(t, dr.Deployment)
+			require.True(t, dr.Deployment.InstantDDLEligible, "ADD COLUMN NULL should be instant-eligible")
+			t.Cleanup(func() {
+				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				defer cancel()
+				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
+					Organization: testOrg,
+					Database:     testDB,
+					Number:       dr.Number,
+				})
+			})
+
+			_, err := testClient.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Number:       dr.Number,
+				InstantDDL:   tt.instantDDL,
+			})
+			require.NoError(t, err, "DeployDeployRequest")
+
+			read, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Number:       dr.Number,
+			})
+			require.NoError(t, err, "GetDeployRequest")
+			require.NotNil(t, read.Deployment)
+			assert.Equal(t, tt.instantDDL, read.Deployment.InstantDDL,
+				"deploy request should report whether it was deployed instantly")
+			assert.True(t, read.Deployment.InstantDDLEligible,
+				"eligibility should stay reported independently of how the deploy ran")
+		})
+	}
+}
+
 // TestDeployRequestPendingToNoChanges verifies that CreateDeployRequest returns "pending"
 // and transitions to "no_changes" when branch matches main.
 func TestDeployRequestPendingToNoChanges(t *testing.T) {
