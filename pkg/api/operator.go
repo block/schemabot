@@ -238,6 +238,39 @@ func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 				"attempt", apply.Attempt,
 				"reason", expiration.Reason)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
+		s.logApplyExpiration(ctx, apply, expiration.Reason)
+	}
+}
+
+// logApplyExpiration appends a durable apply log entry recording that operator
+// recovery gave up on the apply. Expiry is what makes a retryable failure
+// permanent, so without it the apply log ends on the last paused attempt and an
+// operator reading the CLI or the PR summary sees the apply reach a terminal
+// state with nothing stating why. Best-effort: a failed append must not stop
+// the driver from expiring the remaining applies.
+func (s *Service) logApplyExpiration(ctx context.Context, apply *storage.Apply, reason storage.RetryableExpirationReason) {
+	logStore := s.storage.ApplyLogs()
+	if logStore == nil {
+		s.logger.Warn("operator: no apply log store configured; apply expiry will not appear in apply logs",
+			apply.LogAttrs()...)
+		return
+	}
+	message := fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
+		apply.Attempt, storage.MaxRecoveryAttempts, reason)
+	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
+	defer cancel()
+	if err := logStore.Append(logCtx, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelError,
+		EventType: storage.LogEventError,
+		Source:    storage.LogSourceSchemaBot,
+		Message:   message,
+		OldState:  state.Apply.FailedRetryable,
+		NewState:  state.Apply.Failed,
+		CreatedAt: s.clock.Now(),
+	}); err != nil {
+		s.logger.Warn("operator: failed to log apply expiry; the apply's own log will not state why recovery stopped",
+			append(apply.LogAttrs(), "error", err)...)
 	}
 }
 

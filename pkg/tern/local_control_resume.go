@@ -1591,8 +1591,6 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		message := "deferred cutover signal is absent but live schema does not match desired schema; manual reconciliation required"
 		logger.Error("deferred cutover recovery cannot reconcile absent cutover signal",
 			"active_task_count", len(activeTasks))
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			message, apply.State, state.Apply.Failed)
 		c.failApplyWithTasks(ctx, apply, activeTasks, message)
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
@@ -1676,9 +1674,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 
 	logger.Error("engine apply failed during recovery",
 		"error", err)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-		fmt.Sprintf("Recovery failed: %v", err), apply.State, state.Apply.Failed)
-	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
+	c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("recovery failed: %v", err))
 	if startRequested {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
 			return failErr

@@ -130,19 +130,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		} else {
 			logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
 		}
-		logLevel := storage.LogLevelError
-		if newState == state.Apply.FailedRetryable {
-			logLevel = storage.LogLevelWarn
-		}
-		c.logApplyEvent(ctx, apply.ID, nil, logLevel, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Engine apply failed: %v", err), state.Apply.Pending, newState)
 		return
 	}
 
 	if !result.Accepted {
-		c.failApplyWithTasks(ctx, apply, tasks, result.Message)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Engine apply not accepted: %s", result.Message), state.Apply.Pending, state.Apply.Failed)
+		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("engine did not accept the apply: %s", result.Message))
 		return
 	}
 

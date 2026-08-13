@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -38,12 +39,20 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		return
 	}
 
+	previousState := apply.State
 	apply.State = state.Apply.Failed
 	apply.ErrorMessage = errMsg
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+	} else {
+		// Record the failure in the apply's own log stream. It is the only
+		// surface an operator reads from the CLI or the PR summary, so a failure
+		// that lands only in the server logs reads there as an apply that went
+		// terminal for no stated reason.
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Apply failed: %s", errMsg), previousState, state.Apply.Failed)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 }
@@ -74,12 +83,20 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 		return
 	}
 
+	previousState := apply.State
 	apply.State = state.Apply.FailedRetryable
 	apply.ErrorMessage = errMsg
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+	} else {
+		// Each paused attempt is recorded with the budget it spent, so the apply
+		// log shows recovery burning through its attempts rather than only the
+		// silence between them.
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Apply paused for operator retry (attempt %d of %d): %s", apply.Attempt+1, storage.MaxRecoveryAttempts, errMsg),
+			previousState, state.Apply.FailedRetryable)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	if obs := c.getObserver(apply.ID); obs != nil {
