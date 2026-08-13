@@ -94,14 +94,15 @@ func TestStopOperatorSkipsClientsWithoutInProcessEngines(t *testing.T) {
 // Shutdown hands them back instead, making the apply claimable on the next
 // poll.
 func TestReleaseHeldClaimsHandsBackAnActiveApply(t *testing.T) {
-	applies := &capturingApplyStore{apply: &storage.Apply{
+	apply := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
 		Environment: "staging", State: state.Apply.Running,
 		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
-	}}
+	}
+	applies := &capturingApplyStore{apply: apply}
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
 
-	svc.releaseHeldClaims([]storage.ApplyLease{{ApplyID: 123, Owner: "departing/driver-0", Token: "held-token"}})
+	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), logAttrs: apply.IdentityLogAttrs()}})
 
 	released := applies.releasedClaimLeases()
 	require.Len(t, released, 1, "the claim on a still-active apply is handed back")
@@ -112,14 +113,15 @@ func TestReleaseHeldClaimsHandsBackAnActiveApply(t *testing.T) {
 // over, and backdating its heartbeat would misreport when it settled. Shutdown
 // leaves it alone.
 func TestReleaseHeldClaimsLeavesSettledAppliesAlone(t *testing.T) {
-	applies := &capturingApplyStore{apply: &storage.Apply{
+	apply := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
 		Environment: "staging", State: state.Apply.Completed,
 		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
-	}}
+	}
+	applies := &capturingApplyStore{apply: apply}
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
 
-	svc.releaseHeldClaims([]storage.ApplyLease{{ApplyID: 123, Owner: "departing/driver-0", Token: "held-token"}})
+	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), logAttrs: apply.IdentityLogAttrs()}})
 
 	assert.Empty(t, applies.releasedClaimLeases(), "a settled apply is not handed back")
 }
@@ -129,18 +131,29 @@ func TestReleaseHeldClaimsLeavesSettledAppliesAlone(t *testing.T) {
 // peer driver has since rotated onto itself.
 func TestTrackHeldClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
-	lease := storage.ApplyLease{ApplyID: 123, Owner: "driver-0", Token: "held-token"}
+	apply := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
+		Environment: "staging", LeaseOwner: "driver-0", LeaseToken: "held-token",
+	}
 
-	done := svc.trackHeldClaim(lease)
-	assert.Equal(t, []storage.ApplyLease{lease}, svc.heldClaimsSnapshot())
+	done := svc.trackHeldClaim(apply)
+	claimed := svc.heldClaimsSnapshot()
+	require.Len(t, claimed, 1)
+	assert.Equal(t, apply.Lease(), claimed[0].lease)
+	assert.Contains(t, claimed[0].logAttrs, "apply-123",
+		"the apply's identity is captured while the apply is in hand, so shutdown can name it even if the reload fails")
 
 	// A peer rotates the lease onto itself mid-drive.
-	rotated := storage.ApplyLease{ApplyID: 123, Owner: "driver-1", Token: "rotated-token"}
+	rotated := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
+		Environment: "staging", LeaseOwner: "driver-1", LeaseToken: "rotated-token",
+	}
 	svc.trackHeldClaim(rotated)
 
 	done()
-	assert.Equal(t, []storage.ApplyLease{rotated}, svc.heldClaimsSnapshot(),
-		"a drive must not deregister a claim another driver now holds")
+	held := svc.heldClaimsSnapshot()
+	require.Len(t, held, 1, "a drive must not deregister a claim another driver now holds")
+	assert.Equal(t, rotated.Lease(), held[0].lease)
 }
 
 // A drive that never held a usable lease has no claim to hand back, so nothing
@@ -148,7 +161,7 @@ func TestTrackHeldClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
 func TestTrackHeldClaimIgnoresAnInvalidLease(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
 
-	done := svc.trackHeldClaim(storage.ApplyLease{ApplyID: 123})
+	done := svc.trackHeldClaim(&storage.Apply{ID: 123, ApplyIdentifier: "apply-123"})
 
 	assert.Empty(t, svc.heldClaimsSnapshot())
 	done()

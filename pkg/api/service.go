@@ -160,7 +160,7 @@ type Service struct {
 	// peer driver picks the work up on its next poll, instead of waiting out the
 	// staleness window on a claim this process will never use again.
 	heldClaimsMu sync.Mutex
-	heldClaims   map[int64]storage.ApplyLease
+	heldClaims   map[int64]heldClaim
 
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
@@ -284,7 +284,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
-		heldClaims:           make(map[int64]storage.ApplyLease),
+		heldClaims:           make(map[int64]heldClaim),
 	}
 }
 
