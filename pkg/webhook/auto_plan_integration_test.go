@@ -1747,3 +1747,55 @@ func TestE2EAutoPlanSchemaDirMoveNotBlocked(t *testing.T) {
 		assert.NotEqual(t, "managed_dir_missing_config", check.BlockingReason, "a clean move must not be blocked as a missing-config change")
 	}
 }
+
+// TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead verifies that a plan
+// is never published on a base SchemaBot could not establish. The base branch
+// is snapshotted before discovery so a retarget landing mid-flow can be caught
+// at publish time; without that snapshot the retarget would go unnoticed and
+// the plan would be published against a base the PR no longer has. Being
+// unable to read it is therefore a discovery failure that fails the check
+// closed, not a reason to proceed with only the head verified.
+func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
+	dbName := "webhook_autoplan_base_unreadable"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.FailFirstPRRead.Store(true)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
+			"a base branch that cannot be read must fail the check closed")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the discovery-failure check run")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment when the base branch could not be read, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+}

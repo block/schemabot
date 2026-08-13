@@ -373,15 +373,26 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // outage).
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
 	// Snapshot the base ref before anything is read, so the publish-time check
-	// below covers the whole of discovery. A failure here is not fatal: the
-	// snapshot only narrows what publishing will accept, and the head SHA the
-	// delivery carries is verified either way.
-	baseRef := ""
-	if prInfo, prErr := client.FetchPullRequest(ctx, repo, pr); prErr != nil {
-		h.logger.Warn("could not read the PR's base branch before auto-plan; only the head SHA will be re-verified before publishing",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", prErr)
-	} else {
-		baseRef = prInfo.BaseRef
+	// below covers the whole of discovery. A base that moves mid-discovery
+	// changes which databases the PR touches, which is the case that check
+	// exists to catch — so a base ref that cannot be established is a discovery
+	// failure like any other, not a reason to publish under a weaker guarantee.
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to read the PR for auto-plan; its base branch cannot be re-verified before publishing",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "config discovery failed", fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
+	}
+	baseRef := prInfo.BaseRef
+	if baseRef == "" {
+		missingBase := fmt.Errorf("PR %s#%d reports no base branch", repo, pr)
+		h.logger.Error("PR reports no base branch; a plan's base cannot be re-verified before publishing",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, missingBase)
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "config discovery failed", missingBase
 	}
 
 	// Fetch the changed files once so the same list drives both config discovery
@@ -564,10 +575,9 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 }
 
 // autoPlanInputsMoved reports whether the PR changed underneath a plan that is
-// about to be published. baseRef is empty when it could not be snapshotted, in
-// which case only the head is compared. An error means the question could not
-// be answered — the caller must not publish on an unverified PR, and durable
-// callers retry the delivery.
+// about to be published. An error means the question could not be answered —
+// the caller must not publish on an unverified PR, and durable callers retry
+// the delivery.
 func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, baseRef string) (bool, error) {
 	fresh, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {

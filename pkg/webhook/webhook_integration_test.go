@@ -361,6 +361,14 @@ type planFlowResult struct {
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
 
+	// FailFirstPRRead makes the first /pulls/1 request answer with a 503 and
+	// serves every later one. Auto-plan reads the PR to snapshot its base
+	// branch before discovery, so this models a transient failure to establish
+	// which base a plan would be computed against, while leaving the reads that
+	// post the resulting check run working.
+	FailFirstPRRead atomic.Bool
+	prReadRequests  atomic.Int64
+
 	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
 	// request and answer every later one with a 503. Config discovery fetches
 	// the changed files exactly once, so this simulates GitHub becoming
@@ -678,6 +686,10 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// PR info — head SHA can shift across calls via result.HeadSHAs (default
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		if result.FailFirstPRRead.Load() && result.prReadRequests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		sha := result.nextHeadSHA()
 		prState := "open"
 		if override := result.PRState.Load(); override != nil {
