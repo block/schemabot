@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -52,7 +52,7 @@ func run(ctx context.Context, m *testing.M) int {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port nat.Port) string {
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
 			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
 		}).WithStartupTimeout(30 * time.Second),
 	}

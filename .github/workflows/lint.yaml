@@ -84,6 +84,30 @@ jobs:
         with:
           version: v2.11.4
           args: ${{ matrix.args }}
+          # The action's built-in config-verify downloads the config JSON
+          # schema from golangci-lint.run on every run, so a transient network
+          # failure on the runner fails this merge-gating job with no lint
+          # findings. Disable it here; the hermetic step below runs the same
+          # check against the vendored copy of the schema instead.
+          verify: false
+      # Expose the pinned golangci-lint binary on PATH for the verify step
+      # below via the action's documented install-only contract, instead of
+      # relying on the lint step above leaving it there as a side effect.
+      - name: golangci-lint (install for config verify)
+        if: matrix.name == 'default'
+        uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # ratchet:golangci/golangci-lint-action@v9.0.0
+        with:
+          version: v2.11.4
+          install-only: true
+      # Validate .golangci.yaml against the vendored schema so the check is
+      # hermetic (no remote fetch). The vendored file must be refreshed when
+      # the golangci-lint version above moves to a new minor. The hidden
+      # --schema flag is removed in v2.12+, which embeds the schema in the
+      # binary — on that upgrade, delete this step and the vendored file and
+      # re-enable the action's built-in verify.
+      - name: golangci-lint config verify (vendored schema)
+        if: matrix.name == 'default'
+        run: golangci-lint config verify --schema .github/golangci.v2.11.jsonschema.json
       - name: webhookheaders analyzer
         if: matrix.name == 'default'
         run: make check-webhookheaders

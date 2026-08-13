@@ -242,6 +242,7 @@ enum Engine {
   ENGINE_SPIRIT = 0;
   ENGINE_PLANETSCALE = 1;
   ENGINE_STRATA = 2;
+  ENGINE_POSTGRES = 3;
 }
 
 // State represents the state of a schema change task.
@@ -284,6 +285,8 @@ enum ChangeType {
   CHANGE_TYPE_ALTER = 2;
   CHANGE_TYPE_DROP = 3;
   CHANGE_TYPE_VSCHEMA = 4;
+  CHANGE_TYPE_CREATE_INDEX = 5;
+  CHANGE_TYPE_DROP_INDEX = 6;
 }
 
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).

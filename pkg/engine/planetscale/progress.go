@@ -68,8 +68,16 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		engineState = engine.StateWaitingForDeploy
 	}
 
-	// Update instant DDL flag from deploy request if not already set.
-	if !meta.IsInstant && dr.Deployment != nil && dr.Deployment.InstantDDLEligible {
+	// Recover the instant DDL flag for an apply whose metadata was persisted
+	// before the deploy decision was made.
+	//
+	// The deploy request reports both what it could have done and what it did,
+	// and only the second one is the flag: an eligible change is deployed with a
+	// row copy whenever the cutover is held for the operator, and a change
+	// reported as instant on that basis renders as already swapped while it is
+	// still copying rows and waiting at the gate. What the deployment ran as is
+	// the only thing worth reading here.
+	if !meta.IsInstant && dr.Deployment != nil && dr.Deployment.InstantDDL {
 		meta.IsInstant = true
 	}
 

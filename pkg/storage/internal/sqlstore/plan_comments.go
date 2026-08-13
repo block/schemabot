@@ -18,6 +18,7 @@ const planCommentColumns = `id, repository, pull_request, database_name, databas
 type planCommentStore struct {
 	db       *rebindDB
 	identity identityInserter
+	dialect  Dialect
 }
 
 // Insert stores a newly posted plan comment and sets comment.ID.
@@ -63,7 +64,9 @@ func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo stri
 // An already-minimized row is not an error.
 func (s *planCommentStore) MarkMinimized(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE plan_comments SET minimized_at = NOW()
+		UPDATE plan_comments
+		SET minimized_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`,
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE id = ? AND minimized_at IS NULL
 	`, id)
 	if err != nil {

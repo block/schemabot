@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/table"
 )
 
@@ -168,6 +169,26 @@ func (c *deployRequestRecorderClient) CreateDeployRequest(_ context.Context, req
 	return &ps.DeployRequest{Number: 1}, nil
 }
 
+// autoCutoverReportingClient answers what the backend holds for a deploy
+// request. When err is set it is returned instead of an answer: for the first
+// failures reads when failures is positive, and for every read otherwise. reads
+// counts every read it was asked for.
+type autoCutoverReportingClient struct {
+	psclient.PSClient
+	autoCutover bool
+	err         error
+	failures    int
+	reads       int
+}
+
+func (c *autoCutoverReportingClient) DeployRequestAutoCutover(_ context.Context, _, _ string, _ uint64) (bool, error) {
+	c.reads++
+	if c.err != nil && (c.failures <= 0 || c.reads <= c.failures) {
+		return false, c.err
+	}
+	return c.autoCutover, nil
+}
+
 // SchemaBot is the sole cutover actor: deploy requests are created with
 // PlanetScale's auto-cutover disabled so they park at pending_cutover until
 // the driver (or a deferred-cutover operator) completes the cutover. If
@@ -185,4 +206,106 @@ func TestCreateDeployRequest_DisablesPlanetScaleAutoCutover(t *testing.T) {
 	assert.True(t, client.created.AutoDeleteBranch)
 	assert.Equal(t, "schemabot-mydb-abc", client.created.Branch)
 	assert.Equal(t, "main", client.created.IntoBranch)
+}
+
+// Cutover ownership is settled when the deploy request is created and can never
+// be changed afterwards. The operator's timeline states it, because the apply's
+// log surface carries lifecycle events and not the engine's own log lines — so
+// a decision left in the engine logger cannot be read from the schema change.
+//
+// The created deploy request echoes back no cutover setting, so the event states
+// what SchemaBot requested and says so: an operator who reads it as a confirmed
+// fact would take a deploy request that quietly kept auto-cutover for one that
+// holds it.
+func TestDeployRequestCreatedEventStatesRequestedCutoverOwnership(t *testing.T) {
+	event := deployRequestCreatedEvent(&ps.DeployRequest{Number: 132, HtmlURL: "https://example.test/deploy-requests/132"}, "schema-change-branch")
+
+	assert.Contains(t, event.Message, "#132")
+	assert.Contains(t, event.Message, "requesting SchemaBot hold the cutover")
+	assert.Equal(t, "false", event.Metadata["requested_auto_cutover"])
+	assert.NotContains(t, event.Metadata, "auto_cutover")
+	assert.Equal(t, "132", event.Metadata["deploy_request_id"])
+	assert.Equal(t, "https://example.test/deploy-requests/132", event.Metadata["deploy_request_url"])
+	assert.Equal(t, "schema-change-branch", event.Metadata["branch"])
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, event.NewState)
+}
+
+// A deferred cutover is only held if the deploy request the backend holds says
+// so, and that setting is settled at creation and cannot be changed afterwards.
+// Reading it back before deploying is the last point at which a schema change
+// that would swap on its own can still be stopped, so an unheld — or unreadable
+// — cutover stops the deploy rather than starting one that cuts over without
+// the operator.
+func TestVerifyCutoverHeld(t *testing.T) {
+	e := &Engine{logger: slog.New(slog.NewTextHandler(os.Stdout, nil))}
+
+	t.Run("a held cutover deploys", func(t *testing.T) {
+		err := e.verifyCutoverHeld(t.Context(), &autoCutoverReportingClient{autoCutover: false}, "org", "mydb", 132)
+		require.NoError(t, err)
+	})
+
+	t.Run("a backend that would cut over on its own stops the deploy", func(t *testing.T) {
+		client := &autoCutoverReportingClient{autoCutover: true}
+
+		err := e.verifyCutoverHeld(t.Context(), client, "org", "mydb", 132)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "#132 was not deployed")
+		assert.Contains(t, err.Error(), "swap the schema on its own")
+		assert.Contains(t, err.Error(), "re-run the schema change")
+		assert.Equal(t, 1, client.reads, "auto-cutover on is an answer, so it is not read again")
+	})
+
+	t.Run("an unreadable setting stops the deploy", func(t *testing.T) {
+		client := &autoCutoverReportingClient{err: errors.New("deploy request read timed out")}
+
+		err := e.verifyCutoverHeld(t.Context(), client, "org", "mydb", 132)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "#132 was not deployed")
+		assert.Contains(t, err.Error(), "could not confirm the cutover is held")
+		assert.Contains(t, err.Error(), "deploy request read timed out")
+		assert.Greater(t, client.reads, 1, "a read that does not answer is read again before it refuses")
+	})
+
+	// A read that answers on a later attempt is an answer. Refusing on the first
+	// one would fail an apply whose cutover was held all along, and a gate that
+	// refuses at random is one operators learn to re-run past.
+	t.Run("a setting that reads on a retry deploys", func(t *testing.T) {
+		client := &autoCutoverReportingClient{
+			autoCutover: false,
+			err:         psclient.ErrDeploymentNotReported,
+			failures:    1,
+		}
+
+		err := e.verifyCutoverHeld(t.Context(), client, "org", "mydb", 132)
+
+		require.NoError(t, err)
+		assert.Equal(t, 2, client.reads)
+	})
+
+	t.Run("a cancelled context stops the deploy", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		err := e.verifyCutoverHeld(ctx, &autoCutoverReportingClient{err: errors.New("deploy request read timed out")}, "org", "mydb", 132)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "#132 was not deployed")
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+// Instant DDL swaps the schema in the same step that runs the deploy, so there
+// is no pending_cutover for a deferred cutover to park at. An operator who held
+// the cutover kept that decision for themselves, so an eligible change is
+// deployed with a row copy instead — slower, but it stops at the gate.
+func TestUseInstantDDL(t *testing.T) {
+	eligible := &ps.DeployRequest{Deployment: &ps.Deployment{InstantDDLEligible: true}}
+	ineligible := &ps.DeployRequest{Deployment: &ps.Deployment{InstantDDLEligible: false}}
+
+	assert.True(t, useInstantDDL(eligible, false), "an eligible change with no held cutover deploys instantly")
+	assert.False(t, useInstantDDL(eligible, true), "a held cutover needs a gate, so instant DDL is declined")
+	assert.False(t, useInstantDDL(ineligible, false))
+	assert.False(t, useInstantDDL(&ps.DeployRequest{}, false), "a deploy request with no deployment is not eligible")
 }

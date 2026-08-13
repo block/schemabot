@@ -61,14 +61,16 @@ func TestSummarizeReviewDrift_BoundedAndSanitized(t *testing.T) {
 // Review-time drift fails the plan check closed even when the reviewed primary
 // plan is a clean no-op, taking precedence over the plan's own outcome.
 func TestPlanCheckConclusion_DriftFailsClosed(t *testing.T) {
-	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, false, true),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, false, false, true),
 		"drift must block even a clean no-op primary plan")
-	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, true),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, false, true),
 		"drift must block a plan that also has changes")
-	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, true, false),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, true, false, false),
 		"a primary plan with errors fails closed")
-	assert.Equal(t, checkConclusionActionRequired, planCheckConclusion(true, false, false),
-		"changes without drift require an apply")
-	assert.Equal(t, checkConclusionSuccess, planCheckConclusion(false, false, false),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, true, false),
+		"a PostgreSQL engine refusal fails the plan check")
+	assert.Equal(t, checkConclusionActionRequired, planCheckConclusion(true, false, false, false),
+		"non-PostgreSQL changes retain the existing action-required policy")
+	assert.Equal(t, checkConclusionSuccess, planCheckConclusion(false, false, false, false),
 		"a clean no-op plan with no drift passes")
 }

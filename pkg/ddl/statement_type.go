@@ -57,7 +57,7 @@ func (t StatementType) String() string {
 }
 
 // StatementTypeToOp converts a StatementType to the lowercase operation
-// string used in storage and API layers ("create", "alter", "drop", "rename").
+// string used in storage and API layers.
 func StatementTypeToOp(t StatementType) string {
 	switch t {
 	case StatementCreateTable:
@@ -68,6 +68,10 @@ func StatementTypeToOp(t StatementType) string {
 		return "drop"
 	case StatementRenameTable:
 		return "rename"
+	case StatementCreateIndex:
+		return "create_index"
+	case StatementDropIndex:
+		return "drop_index"
 	default:
 		return "unknown"
 	}
@@ -85,6 +89,10 @@ func OpToStatementType(op string) StatementType {
 		return StatementDropTable
 	case "rename":
 		return StatementRenameTable
+	case "create_index":
+		return StatementCreateIndex
+	case "drop_index":
+		return StatementDropIndex
 	default:
 		return StatementUnknown
 	}
