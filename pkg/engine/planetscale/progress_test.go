@@ -1,14 +1,72 @@
 package planetscale
 
 import (
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 )
+
+// An eligible change whose cutover the operator deferred is deployed with a row
+// copy, so it is still copying and waiting at the gate while the deploy request
+// keeps reporting it as eligible. Progress must report what the deployment ran
+// as, not what it could have run as — reading eligibility here tells the
+// operator their change already swapped instantly while it is holding for them.
+func TestProgress_InstantIsReportedFromTheDeploymentNotItsEligibility(t *testing.T) {
+	tests := []struct {
+		name        string
+		instantDDL  bool
+		wantInstant bool
+	}{
+		{name: "eligible but deployed with a row copy", instantDDL: false, wantInstant: false},
+		{name: "deployed instantly", instantDDL: true, wantInstant: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{
+					DeploymentState: deployState.InProgress,
+					Deployment: &ps.Deployment{
+						InstantDDLEligible: true,
+						InstantDDL:         tt.instantDDL,
+					},
+				},
+			}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-prog", DeployRequestID: 71}
+			encoded, err := encodePSMetadata(meta)
+			require.NoError(t, err)
+
+			result, err := e.Progress(t.Context(), &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org",
+					"token_name":   "token",
+					"token_value":  "secret",
+				}},
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			if tt.wantInstant {
+				assert.Equal(t, "true", result.Metadata["is_instant"])
+			} else {
+				assert.NotContains(t, result.Metadata, "is_instant")
+			}
+		})
+	}
+}
 
 func TestAggregateShardProgress(t *testing.T) {
 	t.Run("two shards one table", func(t *testing.T) {
