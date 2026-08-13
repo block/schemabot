@@ -701,6 +701,11 @@ func (t *TableChangeResponse) DirectExecution() bool {
 	return t != nil && strings.EqualFold(t.ExecutionMode, executionModeDirect)
 }
 
+// DropsTable reports whether this change removes the table from the target.
+func (t *TableChangeResponse) DropsTable() bool {
+	return t != nil && strings.EqualFold(t.ChangeType, "drop")
+}
+
 // UnsafeChange returns the unsafe-change view for table changes that require
 // explicit operator opt-in. Engines should mark unsafe table changes directly;
 // the drop fallback keeps table deletion fail-closed if an engine omits that
@@ -709,11 +714,11 @@ func (t *TableChangeResponse) UnsafeChange() (UnsafeChange, bool) {
 	if t == nil {
 		return UnsafeChange{}, false
 	}
-	if !t.IsUnsafe && !strings.EqualFold(t.ChangeType, "drop") {
+	if !t.IsUnsafe && !t.DropsTable() {
 		return UnsafeChange{}, false
 	}
 	reason := t.UnsafeReason
-	if reason == "" && strings.EqualFold(t.ChangeType, "drop") {
+	if reason == "" && t.DropsTable() {
 		reason = "DROP TABLE removes all data"
 	}
 	return UnsafeChange{

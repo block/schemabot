@@ -1,0 +1,180 @@
+package webhook
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/webhook/templates"
+)
+
+func TestPlannedDestructiveTables_CollectsFromBothViews(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter"},
+				{TableName: "orders", ChangeType: "drop"},
+			},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{{
+			Namespace: "keyspace",
+			Shard:     "-80",
+			Changes: []*apitypes.TableChangeResponse{
+				{TableName: "audit_log", ChangeType: "drop"},
+				{TableName: "orders", ChangeType: "drop"},
+			},
+		}},
+	}
+
+	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp))
+}
+
+// An ALTER that destroys something a table keeps — a dropped column, a dropped
+// index — comes out of the same window as a dropped table and is attributed the
+// same way. The set matches what --allow-unsafe already gates.
+func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN discards the column's data"},
+				{TableName: "customers", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP INDEX is not guarded"},
+				{TableName: "users", ChangeType: "alter"},
+			},
+		}},
+	}
+
+	assert.Equal(t, []string{"customers", "orders"}, plannedDestructiveTables(planResp),
+		"an additive alter stays out; a destructive one is attributed by its table")
+}
+
+func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", ChangeType: "create"}},
+		}},
+	}
+
+	assert.Empty(t, plannedDestructiveTables(planResp))
+	assert.Empty(t, plannedDestructiveTables(nil))
+}
+
+func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `reconcile_state`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "reconcile_state",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** destructive change SchemaBot cannot attribute to this PR")
+	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+	// Reconciling the live database to the declared schema stays the operator's
+	// call, so the attribution informs the decision without removing it.
+	assert.Contains(t, rendered, "▶️ **To apply**")
+	assert.Contains(t, rendered, "schemabot apply -e staging")
+}
+
+func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `reconcile_state`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{Table: "reconcile_state", Unresolved: true}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "ownership could not be established; see server logs")
+	assert.Contains(t, rendered, "▶️ **To apply**")
+}
+
+// The unsafe-blocked comment is where an operator is told how to override the
+// block, so it carries the attribution alongside the override it coaches.
+func TestRenderUnsafeChangesBlocked_CarriesAttributedChange(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `reconcile_state`"},
+		}},
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "reconcile_state",
+			Reason: "DROP TABLE removes all data",
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "reconcile_state",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+	assert.Contains(t, rendered, "--allow-unsafe")
+}
+
+func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnly(t *testing.T) {
+	staging := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `reconcile_state`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "reconcile_state",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+	}
+	production := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "production",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(templates.MultiEnvPlanCommentData{
+		Database:     "testdb",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging":    &staging,
+			"production": &production,
+		},
+		Errors: map[string]string{},
+	})
+
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	// The sequence walks the environments in order and is offered in full: the
+	// attribution belongs to staging's drop, not to production's unrelated add.
+	assert.Contains(t, rendered, "▶️ **To apply**")
+	assert.Contains(t, rendered, "schemabot apply -e staging")
+}

@@ -35,10 +35,13 @@ type ActorAuthorizationCommentData struct {
 	CommandName string
 	Database    string
 	Environment string
-	// AuthorizedPrincipals are the GitHub teams (org/team) and users allowed
-	// to run mutating commands for the database, listed on rejection so the
-	// blocked user knows who to ask.
-	AuthorizedPrincipals []string
+	// OperatorPrincipals are the database's own operator teams (org/team) and
+	// users — the people the blocked user should ask first, shown in their own
+	// section on rejection.
+	OperatorPrincipals []string
+	// OtherPrincipals are the broader principals also allowed to run mutating
+	// commands: deployment-wide admins and the repository's admins.
+	OtherPrincipals []string
 }
 
 // RenderPRCommandNotAuthorized renders a comment when a GitHub PR command
@@ -54,20 +57,62 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	} else {
 		fmt.Fprintf(&sb, "The requester is not authorized to run `schemabot %s` for this database.\n\n", data.CommandName)
 	}
-	if len(data.AuthorizedPrincipals) > 0 {
-		// Principals render as inline code, never @-mentions: the list is
-		// guidance for the blocked user, and mentions would notify every
-		// admin team and operator on every rejected command.
-		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
-		for _, principal := range data.AuthorizedPrincipals {
-			fmt.Fprintf(&sb, "- `%s`\n", principal)
+	// The database's own operators lead in their own section so the blocked
+	// user knows who to ask first, mirroring the review-required comment; the
+	// broader principals follow as an explicit fallback. Principals render as
+	// inline code, never @-mentions: the list is guidance for the blocked
+	// user, and mentions would notify every admin team and operator on every
+	// rejected command.
+	hasOperators := len(data.OperatorPrincipals) > 0
+	hasOthers := len(data.OtherPrincipals) > 0
+	switch {
+	case hasOperators:
+		fmt.Fprintf(&sb, "**Operators of `%s`** — members of these teams, or these users, can run it:\n", data.Database)
+		writePrincipalList(&sb, data.OperatorPrincipals)
+		if hasOthers {
+			sb.WriteString("\n**Other authorized teams and users**:\n")
+			writePrincipalList(&sb, data.OtherPrincipals)
 		}
-		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
-	} else {
+		writeAskPrincipalsGuidance(&sb, data.OperatorPrincipals, data.OtherPrincipals)
+	case hasOthers:
+		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
+		writePrincipalList(&sb, data.OtherPrincipals)
+		writeAskPrincipalsGuidance(&sb, data.OtherPrincipals)
+	default:
 		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
 	}
 
 	return offerSupportChannel(sb.String())
+}
+
+func writePrincipalList(sb *strings.Builder, principals []string) {
+	for _, principal := range principals {
+		fmt.Fprintf(sb, "- `%s`\n", principal)
+	}
+}
+
+// writeAskPrincipalsGuidance closes the principal lists with what the blocked
+// user can do next. Requesting team membership is only suggested when a team
+// is actually listed — lists of plain user logins have no team to join.
+func writeAskPrincipalsGuidance(sb *strings.Builder, principalLists ...[]string) {
+	if anyTeamPrincipal(principalLists...) {
+		sb.WriteString("\nAsk one of them to run it, or request membership in one of the teams above.\n")
+		return
+	}
+	sb.WriteString("\nAsk one of them to run it.\n")
+}
+
+// anyTeamPrincipal reports whether any listed principal is a GitHub team
+// (org/team) rather than a user login.
+func anyTeamPrincipal(principalLists ...[]string) bool {
+	for _, principals := range principalLists {
+		for _, principal := range principals {
+			if strings.Contains(principal, "/") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RenderPRCommandDatabaseNotConfigured renders a comment when a mutating PR
@@ -141,6 +186,13 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
+
+	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
+	// is consent to destroy the data, and whether the change is this pull
+	// request's to make is part of what the operator is consenting to.
+	if len(data.AttributedChanges) > 0 {
+		writeAttributedChanges(&sb, data.AttributedChanges)
+	}
 
 	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
 	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)

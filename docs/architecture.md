@@ -73,7 +73,7 @@ SchemaBot has three layers:
   - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
   - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
 - **Engine** ([`pkg/engine`](../pkg/engine/)): Stateless executor interface for schema change backends
-- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/)
+- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/)
 
 Supporting packages: [`pkg/ddl`](../pkg/ddl/) (schema diffing), [`pkg/lint`](../pkg/lint/) (safety linting and auto-fix), [`pkg/secrets`](../pkg/secrets/) (secret resolution), [`pkg/schema`](../pkg/schema/) (shared schema types and embedded storage SQL)
 
@@ -817,7 +817,7 @@ Task 3 → engine.Apply(DDL 3)        → waits for cutover
 
 Each DDL becomes a separate Vitess migration with its own `migration_uuid`, visible in `SHOW VITESS_MIGRATIONS`. DDL tasks in SchemaBot map 1:1 with migration UUIDs — one task per DDL. DDLs run sequentially, but within a single DDL, all shards run in parallel. Per-shard progress is surfaced in the Progress API but not stored — only aggregated per-task progress is persisted.
 
-VSchema updates are tracked as VSchema task rows in the regular `tasks` table (one per changed keyspace), not a separate table. A deploy can be DDL-only, VSchema-only, or both.
+VSchema updates are never modelled as task rows — a task row represents table work, and a VSchema change touches no table. The changed keyspaces are read from the plan, and the work operation that carries a VSchema-only change has no tasks at all, so its drive owns its state directly instead of having it derived from tasks. A deploy can be DDL-only, VSchema-only, or both.
 
 | Flags | Behavior |
 |---|---|

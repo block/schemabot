@@ -1917,3 +1917,156 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 	assert.Equal(t, 2, ops.claims,
 		"the driver must keep claiming after containing the panic, and the failed operation must not be claimable")
 }
+
+// tasklessOperationStores holds the four stores markOperationFromOwnResult
+// touches for a task-less operation: its (empty) task set, the operation row as
+// the drive left it, the parent apply, and the plan that decides whether an
+// operation with no tasks is a legitimate VSchema-only drive.
+type tasklessOperationStores struct {
+	mockStorage
+	tasks    storage.TaskStore
+	applyOps storage.ApplyOperationStore
+	applies  storage.ApplyStore
+	plans    storage.PlanStore
+}
+
+func (m *tasklessOperationStores) Tasks() storage.TaskStore { return m.tasks }
+func (m *tasklessOperationStores) ApplyOperations() storage.ApplyOperationStore {
+	return m.applyOps
+}
+func (m *tasklessOperationStores) Applies() storage.ApplyStore { return m.applies }
+func (m *tasklessOperationStores) Plans() storage.PlanStore    { return m.plans }
+
+// driveWrittenApplyOperationStore returns the operation row as the drive left it
+// and records any further write, so a test can assert the drive's outcome is
+// read back rather than re-derived.
+type driveWrittenApplyOperationStore struct {
+	storage.ApplyOperationStore
+	row     *storage.ApplyOperation
+	written bool
+}
+
+func (s *driveWrittenApplyOperationStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
+	return s.row, nil
+}
+
+func (s *driveWrittenApplyOperationStore) MarkFailed(context.Context, int64, string) error {
+	s.written = true
+	return nil
+}
+
+func (s *driveWrittenApplyOperationStore) MarkCompleted(context.Context, int64) error {
+	s.written = true
+	return nil
+}
+
+func (s *driveWrittenApplyOperationStore) UpdateState(context.Context, int64, string) error {
+	s.written = true
+	return nil
+}
+
+type stubApplyLookupStore struct {
+	storage.ApplyStore
+	apply *storage.Apply
+}
+
+func (s *stubApplyLookupStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.apply, nil
+}
+
+type stubPlanByIDStore struct {
+	storage.PlanStore
+	plan *storage.Plan
+}
+
+func (s *stubPlanByIDStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+	return s.plan, nil
+}
+
+// TestMarkOperationFromOwnResult_TasklessVSchemaOnlyKeepsDriveOutcome verifies
+// that a task-less VSchema-only work operation is reported as already written
+// whenever the drive left it terminal. Such an operation has no task rows to
+// derive a state from, so the drive owns its outcome; an operation-lease-only
+// drive also leaves the parent apply running, so re-deriving the operation from
+// the parent would take the "leave claimable" branch and return updated=false —
+// which stops the caller from projecting the parent and strands a failed or
+// stopped rollout with its target blocked.
+func TestMarkOperationFromOwnResult_TasklessVSchemaOnlyKeepsDriveOutcome(t *testing.T) {
+	vschemaOnlyPlan := &storage.Plan{
+		ID: 7,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+		},
+	}
+
+	for _, tc := range []struct {
+		name       string
+		driveState string
+	}{
+		{name: "completed", driveState: state.ApplyOperation.Completed},
+		{name: "failed", driveState: state.ApplyOperation.Failed},
+		{name: "stopped", driveState: state.ApplyOperation.Stopped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			op := &storage.ApplyOperation{
+				ID:            21,
+				ApplyID:       3,
+				Deployment:    "region-a",
+				OperationKind: storage.ApplyOperationKindWork,
+			}
+			opStore := &driveWrittenApplyOperationStore{
+				row: &storage.ApplyOperation{ID: op.ID, ApplyID: op.ApplyID, State: tc.driveState},
+			}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&tasklessOperationStores{
+				tasks:    &stubTaskStore{},
+				applyOps: opStore,
+				// The parent is still running: an operation-lease-only drive never
+				// writes it, and the projection this method gates has not run yet.
+				applies: &stubApplyLookupStore{apply: &storage.Apply{ID: 3, PlanID: 7, State: state.Apply.Running}},
+				plans:   &stubPlanByIDStore{plan: vschemaOnlyPlan},
+			}, testServerConfig(), nil, logger)
+
+			marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+			require.NoError(t, err)
+			assert.True(t, marked,
+				"the drive's %s outcome must be reported as written so the caller projects the parent", tc.driveState)
+			assert.False(t, opStore.written,
+				"the operation row the drive already wrote must not be written again")
+		})
+	}
+}
+
+// TestMarkOperationFromOwnResult_TasklessVSchemaOnlyMirrorsParentWhenDriveLeftItOpen
+// verifies the other half: when the drive left a task-less VSchema-only
+// operation non-terminal — the retryable-failure contract, where the operator is
+// meant to re-drive it — the operation mirrors the parent apply instead, and a
+// still-running parent leaves the row claimable for the next poll.
+func TestMarkOperationFromOwnResult_TasklessVSchemaOnlyMirrorsParentWhenDriveLeftItOpen(t *testing.T) {
+	op := &storage.ApplyOperation{
+		ID:            22,
+		ApplyID:       4,
+		Deployment:    "region-a",
+		OperationKind: storage.ApplyOperationKindWork,
+	}
+	opStore := &driveWrittenApplyOperationStore{
+		row: &storage.ApplyOperation{ID: op.ID, ApplyID: op.ApplyID, State: state.ApplyOperation.Running},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&tasklessOperationStores{
+		tasks:    &stubTaskStore{},
+		applyOps: opStore,
+		applies:  &stubApplyLookupStore{apply: &storage.Apply{ID: 4, PlanID: 8, State: state.Apply.Running}},
+		plans: &stubPlanByIDStore{plan: &storage.Plan{
+			ID: 8,
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+			},
+		}},
+	}, testServerConfig(), nil, logger)
+
+	marked, err := svc.markOperationFromOwnResult(t.Context(), 1, op)
+	require.NoError(t, err)
+	assert.False(t, marked, "a still-running operation must be left claimable for a later poll")
+	assert.False(t, opStore.written, "no state write should occur while the operation is still in flight")
+}

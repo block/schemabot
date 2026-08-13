@@ -19,7 +19,7 @@ import (
 func TestLockStore_Acquire(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := &storage.Lock{
 		DatabaseName: "testdb",
@@ -52,7 +52,7 @@ func TestLockStore_Acquire(t *testing.T) {
 func TestLockStore_Acquire_SameOwnerRefreshesPendingPlanID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
 		DatabaseName:  "testdb",
@@ -110,7 +110,7 @@ func TestLockStore_Acquire_SameOwnerConcurrent(t *testing.T) {
 		t.Cleanup(func() {
 			require.NoError(t, db.Close())
 		})
-		stores[i] = New(db)
+		stores[i] = NewMySQL(db)
 	}
 
 	start := make(chan struct{})
@@ -291,7 +291,7 @@ func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 func TestLockStore_Release(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := &storage.Lock{
 		DatabaseName: "testdb",
@@ -317,7 +317,7 @@ func TestLockStore_Release(t *testing.T) {
 func TestLockStore_ReleaseIfPendingPlanID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
 		DatabaseName:  "testdb",
@@ -344,7 +344,7 @@ func TestLockStore_ReleaseIfPendingPlanID(t *testing.T) {
 func TestLockStore_ReleaseIsolation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Create multiple locks for different databases
 	locks := []*storage.Lock{
@@ -392,7 +392,7 @@ func TestLockStore_ReleaseIsolation(t *testing.T) {
 func TestLockStore_ReleaseWrongOwnerDoesNotDelete(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// UserA acquires lock
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
@@ -416,7 +416,7 @@ func TestLockStore_ReleaseWrongOwnerDoesNotDelete(t *testing.T) {
 func TestLockStore_ForceRelease(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := &storage.Lock{
 		DatabaseName: "testdb",
@@ -439,7 +439,7 @@ func TestLockStore_ForceRelease(t *testing.T) {
 func TestLockStore_Get(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Get non-existent lock should return nil
 	lock, err := store.Locks().Get(ctx, "testdb", "vitess")
@@ -466,7 +466,7 @@ func TestLockStore_Get(t *testing.T) {
 func TestLockStore_List(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// List empty should return empty slice
 	locks, err := store.Locks().List(ctx)
@@ -594,7 +594,7 @@ func TestStorage_Close(t *testing.T) {
 	db, err := sql.Open("mysql", testDSN)
 	require.NoError(t, err)
 
-	store := New(db)
+	store := NewMySQL(db)
 
 	// Verify connection works
 	require.NoError(t, db.PingContext(t.Context()))
@@ -607,7 +607,7 @@ func TestStorage_Close(t *testing.T) {
 }
 
 func TestStorage_Ping(t *testing.T) {
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	require.NoError(t, store.Ping(t.Context()))
 }
 
@@ -616,7 +616,7 @@ func TestStorage_Ping_Error(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	require.Error(t, store.Ping(t.Context()))
 }
 
@@ -625,7 +625,7 @@ func TestLockStore_Acquire_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Locks().Acquire(t.Context(), &storage.Lock{
 		DatabaseName: "testdb",
 		DatabaseType: "vitess",
@@ -641,7 +641,7 @@ func TestLockStore_List_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Locks().List(t.Context())
 	require.Error(t, err)
 }
@@ -651,7 +651,7 @@ func TestLockStore_GetByPR_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Locks().GetByPR(t.Context(), "org/repo", 123)
 	require.Error(t, err)
 }
@@ -661,7 +661,7 @@ func TestLockStore_Update_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Locks().Update(t.Context(), &storage.Lock{
 		DatabaseName: "testdb",
 		DatabaseType: "vitess",
@@ -674,7 +674,7 @@ func TestLockStore_Release_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Locks().Release(t.Context(), "testdb", "vitess", "owner")
 	require.Error(t, err)
 }
@@ -684,7 +684,7 @@ func TestLockStore_ForceRelease_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Locks().ForceRelease(t.Context(), "testdb", "vitess")
 	require.Error(t, err)
 }
@@ -692,7 +692,7 @@ func TestLockStore_ForceRelease_DBError(t *testing.T) {
 func TestLockStore_GetByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// GetByPR on empty table should return empty slice
 	locks, err := store.Locks().GetByPR(ctx, "org/repo", 999)

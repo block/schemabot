@@ -330,6 +330,7 @@ SchemaBot listens to these GitHub `pull_request` webhook actions:
 | `synchronize` | PR head changed, usually from a pushed commit or force-push. | Treat the new head SHA as the source of truth, auto-plan affected configs, clean up stale records, and publish checks on the new SHA. |
 | `reopened` | Closed PR was reopened. | Re-discover configs and auto-plan the current head. Stored rows deleted on close are not restored. |
 | `closed` | PR was closed or merged. | Release locks held by the PR and delete internal check records. In-flight applies continue in Tern. |
+| `edited` | PR metadata changed. | Auto-plan **only when the edit retargeted the base branch**. A retarget changes which commits the PR proposes, and so which databases it touches; a title or body edit arrives under the same action and is ignored. |
 
 Other `pull_request` actions are ignored by the check-run lifecycle.
 

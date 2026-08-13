@@ -169,32 +169,21 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 }
 
 // execStateUpdate runs a guarded UPDATE against a single apply_operations row,
-// applying the appropriate SET clause with its placeholder args and the write
-// guard's join / predicate. It centralizes the guard load, argument ordering,
-// error wrapping, and idempotent row-existence check shared by the
-// state-transition helpers. Every write stamps updated_at explicitly: the
-// column is the claim's lease heartbeat read by the staleness predicates, and
-// stamping is the application's responsibility on every dialect.
-func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext, unqualifiedSetClause, qualifiedSetClause string, setArgs ...any) error {
+// applying the given SET assignments with their placeholder args and the write
+// guard's statement rendering. It centralizes the guard load, argument
+// ordering, error wrapping, and idempotent row-existence check shared by the
+// state-transition helpers. updateStatement stamps updated_at on every write.
+func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, errContext string, assignments []JoinedUpdateAssignment, setArgs ...any) error {
 	guard, err := operationWriteGuardFromContext(ctx)
 	if err != nil {
 		return err
-	}
-	setClause := unqualifiedSetClause + ", updated_at = NOW()"
-	if guard.kind == operationGuardApply {
-		setClause = qualifiedSetClause + ", ao.updated_at = NOW()"
 	}
 	guardArgs := guard.args()
 	args := make([]any, 0, len(setArgs)+1+len(guardArgs))
 	args = append(args, setArgs...)
 	args = append(args, id)
 	args = append(args, guardArgs...)
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET `+setClause+`
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
+	result, err := s.db.ExecContext(ctx, guard.updateStatement(s.dialect, assignments), args...)
 	if err != nil {
 		return fmt.Errorf("%s (id=%d): %w", errContext, id, err)
 	}
@@ -209,7 +198,7 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 // repeat call would report 0; we disambiguate with an existence check.
 func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, "update apply_operations state",
-		"state = ?", "ao.state = ?", newState)
+		[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}}, newState)
 }
 
 // MarkStarted sets state=running and stamps started_at=NOW().
@@ -219,8 +208,10 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 // against an already-started row is a no-op and returns nil.
 func (s *applyOperationStore) MarkStarted(ctx context.Context, id int64) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation started",
-		"state = ?, started_at = COALESCE(started_at, NOW())",
-		"ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW())", state.ApplyOperation.Running)
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "started_at", Expr: "COALESCE(ao.started_at, NOW())"},
+		}, state.ApplyOperation.Running)
 }
 
 // checkUpdatedOrExists returns nil if the UPDATE affected at least one row,
@@ -379,28 +370,49 @@ type operationWriteGuard struct {
 	opLease    storage.OperationLease
 }
 
-// join returns the extra FROM/JOIN fragment the guard needs in an UPDATE.
-func (g operationWriteGuard) join() string {
+// updateStatement renders the guarded single-row UPDATE against
+// apply_operations for the store's dialect. The apply-lease guard joins the
+// parent applies row, so its statement goes through the dialect's joined-UPDATE
+// rendering; the other guards produce a portable single-table UPDATE. In both
+// shapes the WHERE placeholders follow the SET placeholders, so callers append
+// the row ID and then args() to their SET arguments.
+//
+// The apply-lease guard's token check is built with the dialect's
+// LeaseTokenFence, so it serializes against a concurrent lease steal on every
+// dialect: MySQL's joined rendering locks the applies row it scans, and
+// PostgreSQL's fence locks it explicitly. The operation-lease guard checks the
+// token on the updated row itself, which every dialect locks.
+//
+// Assignment columns are unqualified (the dialect qualifies them where its
+// syntax requires); expressions that read current row values qualify them with
+// the "ao" alias, which is valid in every rendering. Every guarded write stamps
+// updated_at: the column is the claim's lease heartbeat read by the staleness
+// predicates, and stamping is the application's responsibility on every
+// dialect, so the stamp is appended here rather than left to each caller.
+func (g operationWriteGuard) updateStatement(d Dialect, assignments []JoinedUpdateAssignment) string {
+	stamped := make([]JoinedUpdateAssignment, 0, len(assignments)+1)
+	stamped = append(stamped, assignments...)
+	stamped = append(stamped, JoinedUpdateAssignment{Column: "updated_at", Expr: "NOW()"})
 	if g.kind == operationGuardApply {
-		return " JOIN applies a ON a.id = ao.apply_id"
+		return d.JoinedUpdate(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			stamped,
+			"ao.id = ? AND ao.apply_id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
 	}
-	return ""
+	sets := make([]string, len(stamped))
+	for i, assignment := range stamped {
+		sets[i] = assignment.Column + " = " + assignment.Expr
+	}
+	predicate := "ao.id = ?"
+	if g.kind == operationGuardOperation {
+		predicate += " AND ao.lease_token = ?"
+	}
+	return "UPDATE apply_operations ao SET " + strings.Join(sets, ", ") + " WHERE " + predicate
 }
 
-// predicate returns the extra WHERE fragment that enforces lease ownership.
-func (g operationWriteGuard) predicate() string {
-	switch g.kind {
-	case operationGuardOperation:
-		return " AND ao.lease_token = ?"
-	case operationGuardApply:
-		return " AND ao.apply_id = ? AND a.lease_token = ?"
-	default:
-		return ""
-	}
-}
-
-// args returns the bind args matching predicate(), to append after the
-// statement's own arguments.
+// args returns the bind args matching updateStatement's guard predicate, to
+// append after the statement's own arguments and the row ID.
 func (g operationWriteGuard) args() []any {
 	switch g.kind {
 	case operationGuardOperation:
@@ -441,8 +453,10 @@ func operationWriteGuardFromContext(ctx context.Context) (operationWriteGuard, e
 // don't spuriously return ErrApplyOperationNotFound.
 func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation completed",
-		"state = ?, completed_at = COALESCE(completed_at, NOW())",
-		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", state.ApplyOperation.Completed)
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "completed_at", Expr: "COALESCE(ao.completed_at, NOW())"},
+		}, state.ApplyOperation.Completed)
 }
 
 // MarkFailed sets state=failed, error_message, and stamps completed_at=NOW().
@@ -454,8 +468,11 @@ func (s *applyOperationStore) MarkCompleted(ctx context.Context, id int64) error
 // a missing row.
 func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg string) error {
 	return s.execStateUpdate(ctx, id, "mark apply_operation failed",
-		"state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())",
-		"ao.state = ?, ao.error_message = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())",
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "error_message", Expr: "?"},
+			{Column: "completed_at", Expr: "COALESCE(ao.completed_at, NOW())"},
+		},
 		state.ApplyOperation.Failed, nullString(errMsg))
 }
 
@@ -469,8 +486,10 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 // is a no-op, so a re-issue against an already-terminal row returns nil.
 func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, fmt.Sprintf("mark apply_operation terminal (state=%s)", newState),
-		"state = ?, completed_at = COALESCE(completed_at, NOW())",
-		"ao.state = ?, ao.completed_at = COALESCE(ao.completed_at, NOW())", newState)
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "completed_at", Expr: "COALESCE(ao.completed_at, NOW())"},
+		}, newState)
 }
 
 // SaveExternalOperationID stores the remote data plane's apply_operation_id on
@@ -485,16 +504,10 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 		return err
 	}
 	args := append([]any{externalOperationID, operationID}, guard.args()...)
-	setClause := "external_operation_id = ?, updated_at = NOW()"
-	if guard.kind == operationGuardApply {
-		setClause = "ao.external_operation_id = ?, ao.updated_at = NOW()"
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET `+setClause+`
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
+	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
+		{Column: "external_operation_id", Expr: "?"},
+	})
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save external operation id for apply_operation %d: %w", operationID, err)
 	}
@@ -513,16 +526,10 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 		return err
 	}
 	args := append([]any{externalID, operationID}, guard.args()...)
-	setClause := "external_id = ?, updated_at = NOW()"
-	if guard.kind == operationGuardApply {
-		setClause = "ao.external_id = ?, ao.updated_at = NOW()"
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET `+setClause+`
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
+	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
+		{Column: "external_id", Expr: "?"},
+	})
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save external id for apply_operation %d: %w", operationID, err)
 	}
@@ -549,16 +556,11 @@ func (s *applyOperationStore) SaveEngineResumeState(ctx context.Context, operati
 		metadata = "{}"
 	}
 	args := append([]any{nullString(resumeState.MigrationContext), metadata, operationID}, guard.args()...)
-	setClause := "engine_resume_context = ?, engine_resume_metadata = ?, updated_at = NOW()"
-	if guard.kind == operationGuardApply {
-		setClause = "ao.engine_resume_context = ?, ao.engine_resume_metadata = ?, ao.updated_at = NOW()"
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET `+setClause+`
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
+	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
+		{Column: "engine_resume_context", Expr: "?"},
+		{Column: "engine_resume_metadata", Expr: "?"},
+	})
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save engine resume state for apply_operation %d: %w", operationID, err)
 	}
@@ -1111,12 +1113,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			// test the parent state and write the child row. Unlike the budget
 			// bump this is not gated on multi-operation: attempt is
 			// operation-local and a sibling's retry must never rotate it.
-			res, err := tx.ExecContext(ctx, `
-				UPDATE apply_operations o
-				JOIN applies a ON a.id = o.apply_id
-				SET o.attempt = o.attempt + 1, o.updated_at = NOW()
-				WHERE o.id = ? AND a.state = ?
-			`, ad.ID, state.Apply.FailedRetryable)
+			attemptBump := s.dialect.JoinedUpdate(
+				"apply_operations", "o", "applies", "a", "a.id = o.apply_id",
+				[]JoinedUpdateAssignment{
+					{Column: "attempt", Expr: "o.attempt + 1"},
+					{Column: "updated_at", Expr: "NOW()"},
+				},
+				"o.id = ? AND a.state = ?",
+			)
+			res, err := tx.ExecContext(ctx, attemptBump, ad.ID, state.Apply.FailedRetryable)
 			if err != nil {
 				return nil, fmt.Errorf("advance attempt for apply_operation %d redispatch: %w", ad.ID, err)
 			}
@@ -1397,16 +1402,7 @@ func (s *applyOperationStore) Heartbeat(ctx context.Context, id int64) error {
 		return err
 	}
 	args := append([]any{id}, guard.args()...)
-	setClause := "updated_at = NOW()"
-	if guard.kind == operationGuardApply {
-		setClause = "ao.updated_at = NOW()"
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		`+guard.join()+`
-		SET `+setClause+`
-		WHERE ao.id = ?`+guard.predicate()+`
-	`, args...)
+	result, err := s.db.ExecContext(ctx, guard.updateStatement(s.dialect, nil), args...)
 	if err != nil {
 		return fmt.Errorf("heartbeat apply_operation %d: %w", id, err)
 	}
@@ -1426,12 +1422,11 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 		}
 		return nil
 	}
-	result, err := s.db.ExecContext(ctx, `
-		DELETE ao
-		FROM apply_operations ao
-		JOIN applies a ON a.id = ao.apply_id
-		WHERE ao.apply_id = ? AND a.lease_token = ?
-	`, applyID, lease.Token)
+	query := s.dialect.JoinedDelete(
+		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+		"ao.apply_id = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+	)
+	result, err := s.db.ExecContext(ctx, query, applyID, lease.Token)
 	if err != nil {
 		return fmt.Errorf("delete apply_operations for apply %d: %w", applyID, err)
 	}
@@ -1470,13 +1465,15 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 		if opLease.ApplyID != applyID {
 			return 0, fmt.Errorf("operation lease for apply %d does not authorize stopping pending operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
 		}
-		result, err := s.db.ExecContext(ctx, `
-			UPDATE apply_operations ao
-			JOIN apply_operations owner_op ON owner_op.apply_id = ao.apply_id
-			SET ao.state = ?, ao.updated_at = NOW()
-			WHERE ao.apply_id = ? AND ao.state = ?
-			  AND owner_op.id = ? AND owner_op.lease_token = ?
-		`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
+		query := s.dialect.JoinedUpdate(
+			"apply_operations", "ao", "apply_operations", "owner_op", "owner_op.apply_id = ao.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "state", Expr: "?"},
+				{Column: "updated_at", Expr: "NOW()"},
+			},
+			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
+		)
+		result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
 		if err != nil {
 			return 0, fmt.Errorf("stop pending apply_operations for apply %d under operation lease: %w", applyID, err)
 		}
@@ -1515,12 +1512,15 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 		}
 		return rows, nil
 	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_operations ao
-		JOIN applies a ON a.id = ao.apply_id
-		SET ao.state = ?, ao.updated_at = NOW()
-		WHERE ao.apply_id = ? AND ao.state = ? AND a.lease_token = ?
-	`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
+	query := s.dialect.JoinedUpdate(
+		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+	)
+	result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
 	if err != nil {
 		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
 	}

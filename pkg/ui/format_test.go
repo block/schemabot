@@ -119,3 +119,53 @@ func TestCleanLintReason(t *testing.T) {
 		})
 	}
 }
+
+func TestCodeQuoteIdentifiers(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{
+			name:   "single-quoted index name",
+			input:  "Index 'idx_status' should be made invisible before dropping",
+			expect: "Index `idx_status` should be made invisible before dropping",
+		},
+		{
+			name:   "double-quoted type name",
+			input:  `Using "varchar" as primary key is discouraged`,
+			expect: "Using `varchar` as primary key is discouraged",
+		},
+		{
+			name:   "type with length keeps parentheses",
+			input:  `Using "mediumint(9)" as primary key is discouraged`,
+			expect: "Using `mediumint(9)` as primary key is discouraged",
+		},
+		{
+			name:   "multiple identifiers in one message",
+			input:  `Column 'created_at' of type "DATETIME" should not be the leftmost index column`,
+			expect: "Column `created_at` of type `DATETIME` should not be the leftmost index column",
+		},
+		{
+			name:   "quoted prose with spaces is left alone",
+			input:  "The index 'idx_a' is marked \"do not drop\"",
+			expect: "The index `idx_a` is marked \"do not drop\"",
+		},
+		{
+			name:   "qualified table name",
+			input:  "Table 'app.users' has no primary key",
+			expect: "Table `app.users` has no primary key",
+		},
+		{
+			name:   "no quoted tokens passes through",
+			input:  "DROP TABLE removes all data",
+			expect: "DROP TABLE removes all data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expect, CodeQuoteIdentifiers(tt.input))
+		})
+	}
+}

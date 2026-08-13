@@ -217,7 +217,7 @@ func TestDriftGuard_VSchemaParityMatches(t *testing.T) {
 			{TableName: "VSchema: testapp", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "testapp"},
 		},
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"testapp": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+			"testapp": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 		},
 	})
 

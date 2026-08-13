@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	gomysql "github.com/go-sql-driver/mysql"
@@ -34,7 +35,8 @@ const DefaultGitHubCheckName = "SchemaBot"
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
 	// Storage configures SchemaBot's internal storage database.
-	// If not specified, falls back to MYSQL_DSN environment variable.
+	// If not specified, falls back to the STORAGE_DSN environment variable,
+	// then to MYSQL_DSN (legacy name, honored for every dialect).
 	Storage StorageConfig `yaml:"storage"`
 
 	// Auth configures API authentication. When Type is empty or "none" (the
@@ -450,6 +452,14 @@ type StorageConfig struct {
 	// DSNFrom builds the MySQL connection string from separate database config
 	// and password references. It is mutually exclusive with DSN.
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
+
+	// Dialect selects the database family of SchemaBot's internal storage
+	// database: "mysql" (the default when unset) or "postgres". It routes
+	// schema bootstrapping, connection handling, and the storage
+	// implementation together, so the whole storage stack always agrees on
+	// the dialect. Unknown values fail startup rather than falling back to
+	// the MySQL flow.
+	Dialect string `yaml:"dialect,omitempty"`
 
 	// AllowDestructiveSchemaChanges permits EnsureSchema to execute destructive
 	// DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) when converging
@@ -2472,10 +2482,17 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 // StorageDSN returns the resolved storage DSN.
 // It handles special prefixes (env:, file:) to read from various sources and
 // can build a DSN from separate config/password references.
-// Falls back to MYSQL_DSN environment variable if not configured.
+// When storage.dsn is not configured, it falls back to the dialect-neutral
+// STORAGE_DSN environment variable, then to MYSQL_DSN, which is honored for
+// every storage dialect as the legacy fallback name.
 func (c *ServerConfig) StorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
 		return c.Storage.DSNFrom.Resolve()
+	}
+	if c.Storage.DSN == "" {
+		if dsn := os.Getenv("STORAGE_DSN"); dsn != "" {
+			return dsn, nil
+		}
 	}
 	return secrets.Resolve(c.Storage.DSN, "MYSQL_DSN")
 }
@@ -2489,7 +2506,32 @@ func (c StorageConfig) validateLocalDSNConfig(context string) error {
 			return err
 		}
 	}
+	dialect, err := c.ResolveDialect()
+	if err != nil {
+		return fmt.Errorf("%s: %w", context, err)
+	}
+	// dsn_from assembles a Go MySQL driver DSN, which no other dialect's
+	// driver can parse, so the combination fails at validation instead of at
+	// the first connection attempt.
+	if dialect != schema.DialectMySQL && c.DSNFrom != nil {
+		return fmt.Errorf("%s dsn_from builds a MySQL DSN and is not supported with dialect %q; use dsn", context, dialect)
+	}
 	return c.Pool.Validate(context)
+}
+
+// ResolveDialect returns the storage database family selected by
+// storage.dialect, defaulting to MySQL when unset. Matching is
+// case-insensitive. An unknown value fails closed so a typo cannot silently
+// run the MySQL storage flow against another database family.
+func (c StorageConfig) ResolveDialect() (schema.Dialect, error) {
+	switch schema.Dialect(strings.ToLower(strings.TrimSpace(c.Dialect))) {
+	case "", schema.DialectMySQL:
+		return schema.DialectMySQL, nil
+	case schema.DialectPostgres:
+		return schema.DialectPostgres, nil
+	default:
+		return "", fmt.Errorf("unsupported storage dialect %q (supported: %q, %q)", c.Dialect, schema.DialectMySQL, schema.DialectPostgres)
+	}
 }
 
 // HasLocalDSN returns true when the environment should use a local database connection.

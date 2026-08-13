@@ -32,8 +32,11 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/panicsafe"
+	"github.com/block/schemabot/pkg/postgresconn"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/schemabot/pkg/storage/postgresstore"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
 )
@@ -126,7 +129,8 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 
 // Run starts the SchemaBot server with the given configuration and blocks until
 // it receives SIGINT/SIGTERM or either HTTP server fails, then shuts down
-// gracefully. The storage DSN is resolved from cfg (falling back to MYSQL_DSN);
+// gracefully. The storage DSN is resolved from cfg (falling back to the
+// STORAGE_DSN env var, then MYSQL_DSN);
 // PORT and GRPC_PORT are read from the environment. Prometheus metrics are
 // served on a dedicated listener at cfg.MetricsListenPort, not on the API port.
 func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
@@ -263,13 +267,22 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	logger := o.logger
 	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
 
-	// Get storage DSN from config (with fallback to MYSQL_DSN env var)
+	// Get storage DSN from config (with fallback to the STORAGE_DSN env var,
+	// then MYSQL_DSN)
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if dsn == "" {
-		return nil, fmt.Errorf("storage DSN not configured (set storage.dsn in config or MYSQL_DSN env var)")
+		return nil, fmt.Errorf("storage DSN not configured (set storage.dsn in config or the STORAGE_DSN env var)")
+	}
+
+	// The storage dialect routes schema bootstrapping, the connection pool,
+	// and the storage implementation together, so every layer of the storage
+	// stack agrees on the database family. Unknown dialects fail startup here.
+	dialect, err := cfg.Storage.ResolveDialect()
+	if err != nil {
+		return nil, fmt.Errorf("resolve storage dialect: %w", err)
 	}
 
 	// Storage boot is patient: failures here are expected transients — DNS may
@@ -278,8 +291,8 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// catches up with the database password. Retrying inside the startup-probe
 	// budget lets the pod wait the window out instead of crash-looping
 	// through it.
-	logger.Info("ensuring storage schema")
-	db, err := bootStorage(ctx, cfg, logger)
+	logger.Info("ensuring storage schema", "dialect", dialect)
+	db, err := bootStorage(ctx, cfg, dialect, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +335,10 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	store := mysqlstore.New(db)
+	store, err := newStore(dialect, db)
+	if err != nil {
+		return nil, err
+	}
 	svc := api.New(store, cfg, nil, logger)
 	defer func() {
 		if !success {
@@ -415,10 +431,10 @@ const inProcessWebhookDrainTimeout = 25 * time.Second
 // failed attempts until the boot budget is spent. The DSN is re-resolved on
 // every attempt so file-backed references pick up credentials rotated while
 // the server waits.
-func bootStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (*sql.DB, error) {
+func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
 	deadline := time.Now().Add(storageBootRetryBudget)
 	for attempt := 1; ; attempt++ {
-		db, err := connectStorage(ctx, cfg, logger)
+		db, err := connectStorage(ctx, cfg, dialect, logger)
 		if err == nil {
 			return db, nil
 		}
@@ -440,17 +456,18 @@ func bootStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger
 
 // connectStorage runs a single storage boot attempt: resolve the DSN, apply
 // the storage schema, open the pool, and verify it with a ping.
-func connectStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (*sql.DB, error) {
+func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
 	const pingTimeout = 10 * time.Second
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage DSN: %w", err)
 	}
-	if err := api.EnsureSchema(dsn, logger, api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges)); err != nil {
+	if err := api.EnsureSchema(dsn, logger,
+		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
+		api.WithDialect(dialect)); err != nil {
 		return nil, fmt.Errorf("ensure storage schema: %w", err)
 	}
-	db, err := mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
-		mysqlconn.WithConnectTimeout(cfg.Storage.Pool.ConnectTimeoutOrZero()))
+	db, err := openStoragePool(dialect, dsn, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open storage database: %w", err)
 	}
@@ -461,6 +478,41 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, logger *slog.Log
 		return nil, fmt.Errorf("ping storage database: %w", err)
 	}
 	return db, nil
+}
+
+// openStoragePool opens the long-lived reloadable storage pool for the
+// configured dialect. Both connectors re-resolve the DSN through
+// cfg.StorageDSN on authentication failure so a rotated storage credential
+// is picked up without a restart. The dispatch fails closed: a dialect
+// without a connector returns an error instead of dialing with another
+// family's driver.
+func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig) (*sql.DB, error) {
+	connectTimeout := cfg.Storage.Pool.ConnectTimeoutOrZero()
+	switch dialect {
+	case schema.DialectMySQL:
+		return mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
+			mysqlconn.WithConnectTimeout(connectTimeout))
+	case schema.DialectPostgres:
+		return postgresconn.OpenReloadable(dsn, cfg.StorageDSN,
+			postgresconn.WithConnectTimeout(connectTimeout))
+	default:
+		return nil, fmt.Errorf("no storage connector for storage dialect %q (supported: %q, %q)", dialect, schema.DialectMySQL, schema.DialectPostgres)
+	}
+}
+
+// newStore returns the storage implementation for the configured storage
+// dialect. The dispatch fails closed: a dialect without a store returns an
+// error instead of running the MySQL implementation against another database
+// family.
+func newStore(dialect schema.Dialect, db *sql.DB) (storage.Storage, error) {
+	switch dialect {
+	case schema.DialectMySQL:
+		return mysqlstore.New(db), nil
+	case schema.DialectPostgres:
+		return postgresstore.New(db), nil
+	default:
+		return nil, fmt.Errorf("no storage implementation for storage dialect %q (supported: %q, %q)", dialect, schema.DialectMySQL, schema.DialectPostgres)
+	}
 }
 
 // Service returns the underlying API service for embedders that need direct

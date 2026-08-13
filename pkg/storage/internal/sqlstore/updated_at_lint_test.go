@@ -19,14 +19,16 @@ var updatedAtColumnRe = regexp.MustCompile(`(?m)^\s*` + "`updated_at`" + `\s+`)
 type timestampedWrite struct {
 	loc    []int
 	upsert bool
+	joined bool
 }
 
-// TestTimestampedTableWritesStampUpdatedAt asserts that every UPDATE and upsert
-// in this package against a table with updated_at assigns the column explicitly.
-// Stamping these columns is the application's responsibility on every dialect.
-// MySQL's ON UPDATE CURRENT_TIMESTAMP masks a missing stamp for any
-// value-changing write, so behavioral integration tests cannot catch a dropped
-// assignment there; this source scan can.
+// TestTimestampedTableWritesStampUpdatedAt asserts that every UPDATE, upsert,
+// and dialect-built joined UPDATE in this package against a table with
+// updated_at assigns the column explicitly. Stamping these columns is the
+// application's responsibility on every dialect. MySQL's ON UPDATE
+// CURRENT_TIMESTAMP masks a missing stamp for any value-changing write, so
+// behavioral integration tests cannot catch a dropped assignment there; this
+// source scan can.
 //
 // A deliberate non-NOW() assignment (such as a release-time stale backdate)
 // still satisfies the invariant: the statement owns the column's value rather
@@ -40,6 +42,16 @@ type timestampedWrite struct {
 // Upserts are scanned more tightly: the assignment must appear inside the
 // UpsertClause call's argument list, so unrelated mentions of the column
 // elsewhere in the function cannot satisfy the check.
+//
+// Joined UPDATEs rendered through Dialect.JoinedUpdate never contain a literal
+// "UPDATE <table>" in source, so they get their own scan. A call that writes
+// its assignments inline must include the stamp among them, so an unrelated
+// updated_at literal earlier in a long function cannot mask a dropped stamp;
+// only a call that assembles its assignments in a variable above widens the
+// scan to the enclosing function, bounded by the preceding timestamped write
+// like the UPDATE scan. Such an assembled clause is shared with sibling
+// renderings in the same function, so unlike other writes it does not advance
+// the window boundary past itself.
 func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 	timestampedTables := timestampedMySQLTables(t)
 	require.NotEmpty(t, timestampedTables, "expected timestamped tables in the MySQL schema")
@@ -48,6 +60,7 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 		quotedTables = append(quotedTables, regexp.QuoteMeta(table))
 	}
 	timestampedTableUpdateRe := regexp.MustCompile(`UPDATE\s+(?:` + strings.Join(quotedTables, "|") + `)\b`)
+	joinedUpdateRe := regexp.MustCompile(`\.JoinedUpdate\(\s*"(?:` + strings.Join(quotedTables, "|") + `)"`)
 
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
@@ -69,6 +82,9 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 		for _, loc := range upsertClauseRe.FindAllStringIndex(src, -1) {
 			writes = append(writes, timestampedWrite{loc: loc, upsert: true})
 		}
+		for _, loc := range joinedUpdateRe.FindAllStringIndex(src, -1) {
+			writes = append(writes, timestampedWrite{loc: loc, joined: true})
+		}
 		sort.Slice(writes, func(i, j int) bool { return writes[i].loc[0] < writes[j].loc[0] })
 
 		previousWindowEnd := 0
@@ -88,6 +104,25 @@ func TestTimestampedTableWritesStampUpdatedAt(t *testing.T) {
 				previousWindowEnd = argsEnd
 				assert.Contains(t, src[loc[1]:argsEnd], "updated_at",
 					"%s:%d: upsert must assign updated_at in its conflict assignments", name, line)
+				continue
+			}
+
+			if write.joined {
+				argsEnd := balancedParenEnd(src, loc[1])
+				require.Greater(t, argsEnd, loc[1],
+					"%s:%d: unterminated JoinedUpdate call", name, line)
+				window := src[loc[0]:argsEnd]
+				if strings.Contains(window, "JoinedUpdateAssignment{") {
+					previousWindowEnd = argsEnd
+				} else {
+					// A variable-assembled clause is shared with sibling
+					// renderings in the same function (per-guard variants), so
+					// it stays visible to the writes that follow.
+					window = src[windowStart:argsEnd]
+				}
+				assert.Contains(t, window, "updated_at",
+					"%s:%d: joined UPDATE on a timestamped table must include an updated_at assignment; "+
+						"no dialect-level default may be relied on", name, line)
 				continue
 			}
 
