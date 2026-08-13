@@ -16,7 +16,7 @@ import (
 func TestControlRequestStore_RequestPendingReturnsExistingPending(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_pending")
 	first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -48,7 +48,7 @@ func TestControlRequestStore_RequestPendingReturnsExistingPending(t *testing.T) 
 func TestControlRequestStore_RequestPendingConcurrentFirstRequests(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_concurrent")
 	const requestCount = 8
@@ -109,7 +109,7 @@ func TestControlRequestStore_RequestPendingConcurrentFirstRequests(t *testing.T)
 func TestControlRequestStore_RequestPendingResetsCompletedRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_restart")
 	first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -144,7 +144,7 @@ func TestControlRequestStore_RequestPendingResetsCompletedRequest(t *testing.T) 
 func TestControlRequestStore_CompletePending(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_complete")
 	created, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -176,7 +176,7 @@ func TestControlRequestStore_CompletePending(t *testing.T) {
 func TestControlRequestStore_FailPending(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_fail")
 	created, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -204,7 +204,7 @@ func TestControlRequestStore_FailPending(t *testing.T) {
 func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_lease")
 	_, err := testDB.ExecContext(ctx, `
@@ -245,7 +245,7 @@ func TestControlRequestStore_LeaseGuardsPendingResolution(t *testing.T) {
 func TestControlRequestStore_RequestPendingReleaseLatchIdempotent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_release")
 	first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -277,7 +277,7 @@ func TestControlRequestStore_RequestPendingReleaseLatchIdempotent(t *testing.T) 
 func TestControlRequestStore_GetByOperationReturnsRegardlessOfStatus(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_get_by_op")
 
@@ -320,7 +320,7 @@ func TestControlRequestStore_GetByOperationReturnsRegardlessOfStatus(t *testing.
 func TestControlRequestStore_GetByOperationFailedReleaseDoesNotLatch(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_failed_release")
 	_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -380,7 +380,7 @@ func createControlRequestTestApply(t *testing.T, store *Storage, applyIdentifier
 func TestControlRequestStore_VolumeRequestLifecycleRoundTripsLevel(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_volume")
 	firstMetadata, err := storage.EncodeVolumeControlRequestMetadata(3)
@@ -435,7 +435,7 @@ func TestControlRequestStore_VolumeRequestLifecycleRoundTripsLevel(t *testing.T)
 func TestControlRequestStore_VolumeRequestPendingKeepsOriginalLevel(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	applyID := createControlRequestTestApply(t, store, "apply_control_request_volume_pending")
 	firstMetadata, err := storage.EncodeVolumeControlRequestMetadata(5)

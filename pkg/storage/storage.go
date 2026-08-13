@@ -1,5 +1,6 @@
 // Package storage defines the storage interface for SchemaBot.
-// Currently implemented by the MySQL backend (pkg/storage/mysqlstore).
+// Implemented by the MySQL backend (pkg/storage/mysqlstore) and the
+// PostgreSQL backend (pkg/storage/postgresstore).
 package storage
 
 import (

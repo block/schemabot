@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -29,15 +28,7 @@ type postgresHarness struct {
 func (h postgresHarness) NewStorage(t *testing.T) storage.Storage {
 	t.Helper()
 	clearPostgresTables(t, h.db)
-	dialect := PostgresDialect{}
-	return NewWithDependencies(Dependencies{
-		DB:         h.db,
-		Binder:     dialect,
-		Dialect:    dialect,
-		Identity:   dialect,
-		Locker:     namedlock.Postgres{},
-		Classifier: NewPostgresErrorClassifier(),
-	})
+	return NewPostgres(h.db)
 }
 
 func (h postgresHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
@@ -45,15 +36,7 @@ func (h postgresHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
 	db, err := sql.Open("pgx", h.dsn)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
-	dialect := PostgresDialect{}
-	return NewWithDependencies(Dependencies{
-		DB:         db,
-		Binder:     dialect,
-		Dialect:    dialect,
-		Identity:   dialect,
-		Locker:     namedlock.Postgres{},
-		Classifier: NewPostgresErrorClassifier(),
-	})
+	return NewPostgres(db)
 }
 
 func TestPostgresStorageParity(t *testing.T) {
@@ -65,9 +48,8 @@ func TestPostgresStorageParity(t *testing.T) {
 	applyPostgresTestSchema(t, fixtureDB)
 
 	h := postgresHarness{db: db, dsn: dsn}
-	t.Run("Settings", func(t *testing.T) { storagetest.TestSettings(t, h) })
+	storagetest.Run(t, h)
 	t.Run("SettingsUpdatedAtAdvances", func(t *testing.T) { testPostgresSettingsUpdatedAtAdvances(t, h) })
-	t.Run("ApplyLogs", func(t *testing.T) { storagetest.TestApplyLogs(t, h) })
 	t.Run("LeaseGuardedApplyLogAppend", func(t *testing.T) { testPostgresLeaseGuardedApplyLogAppend(t, h) })
 }
 

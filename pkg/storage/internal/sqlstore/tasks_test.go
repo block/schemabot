@@ -22,7 +22,7 @@ import (
 func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_task_oplease", 1)
@@ -104,7 +104,7 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 func TestTaskStore_CountByApplyID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	applyWithTasks := createTestApply(t, store, lock, "apply_count_tasks", 1)
@@ -158,7 +158,7 @@ func TestTaskStore_CountByApplyID(t *testing.T) {
 func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_tasks_by_op", 1)
@@ -238,7 +238,7 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "resolute", "vitess", "staging")
 	apply := createTestApply(t, store, lock, "apply_shard_tasks", 1)
@@ -316,7 +316,7 @@ func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
 	apply := createTestApply(t, store, lock, "apply_sharded_work_tasks", 1)
@@ -376,7 +376,7 @@ func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testi
 func TestTaskStore_GetByApplyIDReturnsTasksInCreationOrder(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_tasks_creation_order", 1)
@@ -421,7 +421,7 @@ func TestTaskStore_GetByApplyIDReturnsTasksInCreationOrder(t *testing.T) {
 func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
 	apply := createTestApply(t, store, lock, "apply_shard_drive_tasks", 1)
@@ -502,7 +502,7 @@ func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_unsharded", 1)
@@ -541,7 +541,7 @@ func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {
 func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "resolute", "vitess", "staging")
 	apply := createTestApply(t, store, lock, "apply_upsert_shard", 1)
@@ -657,7 +657,7 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "resolute", "vitess", "staging")
 	apply := createTestApply(t, store, lock, "apply_upsert_shard_applylease", 1)

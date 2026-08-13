@@ -19,14 +19,14 @@ type mysqlHarness struct{}
 
 func (mysqlHarness) NewStorage(t *testing.T) storage.Storage {
 	clearTables(t)
-	return New(testDB)
+	return NewMySQL(testDB)
 }
 
 func (mysqlHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
 	db, err := sql.Open("mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
-	return New(db)
+	return NewMySQL(db)
 }
 
 func TestStorageParity(t *testing.T) {

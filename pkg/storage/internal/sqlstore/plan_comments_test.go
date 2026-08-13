@@ -34,7 +34,7 @@ func insertTestPlanComment(t *testing.T, store *Storage, repo string, pr int, da
 func TestPlanCommentStore_InsertAndListUnminimizedForSlot(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Two comments in the orders slot, one in a different-database slot on the
 	// same PR, and one for the same database on a different PR.
@@ -70,7 +70,7 @@ func TestPlanCommentStore_InsertAndListUnminimizedForSlot(t *testing.T) {
 func TestPlanCommentStore_MarkMinimized(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	first := insertTestPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
 	second := insertTestPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha2", 200)
@@ -107,7 +107,7 @@ func TestPlanCommentStore_MarkMinimized(t *testing.T) {
 func TestApplyStore_ExistsForDatabaseHead(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// No applies at all: nothing owns any head.
 	exists, err := store.Applies().ExistsForDatabaseHead(ctx, "org/repo", 123, "testdb", "mysql", "shaA")
@@ -160,7 +160,7 @@ func TestPlanCommentStore_Insert_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.PlanComments().Insert(t.Context(), &storage.PlanComment{
 		Repository: "org/repo", PullRequest: 1, DatabaseName: "db", DatabaseType: "mysql",
 	})
@@ -172,7 +172,7 @@ func TestPlanCommentStore_ListUnminimizedForSlot_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.PlanComments().ListUnminimizedForSlot(t.Context(), "org/repo", 1, "db", "mysql")
 	require.Error(t, err)
 }
@@ -182,7 +182,7 @@ func TestPlanCommentStore_MarkMinimized_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	require.Error(t, store.PlanComments().MarkMinimized(t.Context(), 1))
 }
 
@@ -191,7 +191,7 @@ func TestApplyStore_ExistsForDatabaseHead_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().ExistsForDatabaseHead(t.Context(), "org/repo", 1, "db", "mysql", "sha")
 	require.Error(t, err)
 }

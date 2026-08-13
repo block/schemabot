@@ -17,7 +17,7 @@ import (
 func TestCheckStore_Upsert(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	check := &storage.Check{
 		Repository:     "org/repo",
@@ -63,7 +63,7 @@ func TestCheckStore_Upsert(t *testing.T) {
 func TestCheckStore_GetByCheckRunID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	check := &storage.Check{
 		Repository:   "org/repo",
@@ -94,7 +94,7 @@ func TestCheckStore_GetByCheckRunID(t *testing.T) {
 func TestCheckStore_GetByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// GetByPR on empty table should return empty slice
 	checks, err := store.Checks().GetByPR(ctx, "org/repo", 999)
@@ -131,7 +131,7 @@ func TestCheckStore_GetByPR(t *testing.T) {
 func TestCheckStore_GetByDatabase(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// GetByDatabase on empty table should return empty slice
 	checks, err := store.Checks().GetByDatabase(ctx, "org/repo", "staging", "vitess", "nonexistent")
@@ -168,7 +168,7 @@ func TestCheckStore_GetByDatabase(t *testing.T) {
 func TestCheckStore_Delete(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	check := &storage.Check{
 		Repository:   "org/repo",
@@ -303,7 +303,7 @@ func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
 	t.Run("merged close deletes successful apply-owned rows", func(t *testing.T) {
 		clearTables(t)
 		ctx := t.Context()
-		store := New(testDB)
+		store := NewMySQL(testDB)
 		seedPRCloseRetentionChecks(t, store)
 
 		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, true))
@@ -321,7 +321,7 @@ func TestCheckStore_DeleteByPRRetainingBlockingApplyOwned(t *testing.T) {
 	t.Run("unmerged close retains successful apply-owned rows", func(t *testing.T) {
 		clearTables(t)
 		ctx := t.Context()
-		store := New(testDB)
+		store := NewMySQL(testDB)
 		seedPRCloseRetentionChecks(t, store)
 
 		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, false))
@@ -345,7 +345,7 @@ func TestCheckStore_GetByPR_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Checks().GetByPR(t.Context(), "org/repo", 123)
 	require.Error(t, err)
 }
@@ -355,7 +355,7 @@ func TestCheckStore_GetByDatabase_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Checks().GetByDatabase(t.Context(), "org/repo", "staging", "vitess", "db")
 	require.Error(t, err)
 }
@@ -365,7 +365,7 @@ func TestCheckStore_Delete_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Checks().Delete(t.Context(), 123)
 	require.Error(t, err)
 }
@@ -373,7 +373,7 @@ func TestCheckStore_Delete_DBError(t *testing.T) {
 func TestCheckStore_CheckRunIDZeroIsNull(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Create check without CheckRunID (zero value)
 	check := &storage.Check{
@@ -405,7 +405,7 @@ func TestCheckStore_CheckRunIDZeroIsNull(t *testing.T) {
 func TestCheckStore_ApplyIDRoundTrip(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	check := &storage.Check{
 		Repository:   "org/repo",
@@ -438,7 +438,7 @@ func TestCheckStore_ApplyIDRoundTrip(t *testing.T) {
 func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-running", state.Apply.Running)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -479,7 +479,7 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApply(t *testing.T) {
 func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRecoversStoredCheckState(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-noop-success", state.Apply.Running)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -539,7 +539,7 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRecoversStoredCheckState(t
 func TestCheckStore_UpsertPlanResultPreservesApplyOwnedCheckStateOnNoOpSuccess(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-noop-recovery-disabled", state.Apply.Running)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -610,7 +610,7 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRequiresNoOpSuccess(t *tes
 		t.Run(tc.name, func(t *testing.T) {
 			clearTables(t)
 			ctx := t.Context()
-			store := New(testDB)
+			store := NewMySQL(testDB)
 
 			apply := createCheckStoreApply(t, store, tc.applyID, state.Apply.Running)
 			require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -670,7 +670,7 @@ func TestCheckStore_RecoverApplyOwnedCheckWithNoOpPlanRequiresNoOpSuccess(t *tes
 func TestCheckStore_MarkStalePlanSuccessfulMarksPlanOnlyCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
 		Repository:     "org/repo",
@@ -720,7 +720,7 @@ func TestCheckStore_MarkStalePlanSuccessfulMarksPlanOnlyCheck(t *testing.T) {
 func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlocking(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-claimed-after-cleanup-read", state.Apply.Running)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -768,7 +768,7 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlocking(t *test
 func TestCheckStore_MarkStalePlanSuccessfulLeavesTerminalApplyOwnedBlocking(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-terminal-owned", state.Apply.Completed)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -939,7 +939,7 @@ func seedBlockedAggregateRow(t *testing.T, store *Storage, headSHA, blockingReas
 func TestCheckStore_ClearAggregateBlockClearsMatchingRow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
 
@@ -965,7 +965,7 @@ func TestCheckStore_ClearAggregateBlockClearsMatchingRow(t *testing.T) {
 func TestCheckStore_ClearAggregateBlockPreservesConcurrentlyMovedRow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
 
@@ -992,7 +992,7 @@ func TestCheckStore_ClearAggregateBlockPreservesConcurrentlyMovedRow(t *testing.
 func TestCheckStore_ClearAggregateBlockPreservesDifferentReason(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	seedBlockedAggregateRow(t, store, "abc123", "managed_dir_missing_config")
 
@@ -1022,13 +1022,13 @@ func newChangedRowsStore(t *testing.T) *Storage {
 	t.Cleanup(func() {
 		require.NoError(t, db.Close())
 	})
-	return New(db)
+	return NewMySQL(db)
 }
 
 func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
 		Repository:   "org/repo",
@@ -1072,7 +1072,7 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheck(t *testing.T)
 func TestCheckStore_UpsertPlanResultPreservesInProgressApplyOnNewHead(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-running-old-head", state.Apply.Running)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -1133,7 +1133,7 @@ func TestCheckStore_UpsertPlanResultPreservesInProgressApplyOnNewHead(t *testing
 func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheckOnNewHead(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
 		Repository:   "org/repo",
@@ -1172,7 +1172,7 @@ func TestCheckStore_UpsertPlanResultReplacesUnownedInProgressCheckOnNewHead(t *t
 func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-completed-plan", state.Apply.Completed)
 	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
@@ -1213,7 +1213,7 @@ func TestCheckStore_UpsertPlanResultClearsApplyIDWhenNotInProgress(t *testing.T)
 func TestCheckStore_CompleteForApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-complete", state.Apply.Completed)
 
@@ -1252,7 +1252,7 @@ func TestCheckStore_CompleteForApply(t *testing.T) {
 func TestCheckStore_ChangeSummaryRoundTripsAndSurvivesApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Plan records the summary.
 	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
@@ -1326,7 +1326,7 @@ func TestCheckStore_ChangeSummaryRoundTripsAndSurvivesApply(t *testing.T) {
 func TestCheckStore_ReplanUpdatesChangeSummary(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	planCheck := func(summary string) *storage.Check {
 		hasChanges := summary != ""
@@ -1363,7 +1363,7 @@ func TestCheckStore_ReplanUpdatesChangeSummary(t *testing.T) {
 func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-complete-lease", state.Apply.Completed)
 	_, err := testDB.ExecContext(ctx, `
@@ -1414,7 +1414,7 @@ func TestCheckStore_CompleteForApplyLeaseGuard(t *testing.T) {
 func TestCheckStore_CompleteForApplySkipsNewerRunningApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	oldApply := createCheckStoreApply(t, store, "apply-old", state.Apply.Completed)
 	newApply := createCheckStoreApply(t, store, "apply-new", state.Apply.Running)
@@ -1451,7 +1451,7 @@ func TestCheckStore_CompleteForApplySkipsNewerRunningApply(t *testing.T) {
 func TestCheckStore_CompleteForApplySkipsNewerTerminalApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	oldApply := createCheckStoreApply(t, store, "apply-old-terminal", state.Apply.Completed)
 	newApply := createCheckStoreApply(t, store, "apply-new-terminal", state.Apply.Failed)
@@ -1488,7 +1488,7 @@ func TestCheckStore_CompleteForApplySkipsNewerTerminalApply(t *testing.T) {
 func TestCheckStore_CompleteForApplySkipsUnownedCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "apply-unowned", state.Apply.Completed)
 
@@ -1522,7 +1522,7 @@ func TestCheckStore_CompleteForApplySkipsUnownedCheck(t *testing.T) {
 func TestCheckStore_MarkActionRequiredForApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "rollback-complete", state.Apply.Completed)
 
@@ -1562,7 +1562,7 @@ func TestCheckStore_MarkActionRequiredForApply(t *testing.T) {
 func TestCheckStore_MarkActionRequiredForApplyConvergesPriorApplyOwnedCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	priorApply := createCheckStoreApply(t, store, "apply-succeeded", state.Apply.Completed)
 	rollbackApply := createCheckStoreApply(t, store, "rollback-unclaimed", state.Apply.Completed)
@@ -1603,7 +1603,7 @@ func TestCheckStore_MarkActionRequiredForApplyConvergesPriorApplyOwnedCheck(t *t
 func TestCheckStore_MarkActionRequiredForApplyConvergesUnownedCheck(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	rollbackApply := createCheckStoreApply(t, store, "rollback-unclaimed", state.Apply.Completed)
 
@@ -1638,7 +1638,7 @@ func TestCheckStore_MarkActionRequiredForApplyConvergesUnownedCheck(t *testing.T
 func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := createCheckStoreApply(t, store, "rollback-complete-lease", state.Apply.Completed)
 	_, err := testDB.ExecContext(ctx, `
@@ -1690,7 +1690,7 @@ func TestCheckStore_MarkActionRequiredForApplyLeaseGuard(t *testing.T) {
 func TestCheckStore_MarkActionRequiredForApplySkipsNewerRunningApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	rollbackApply := createCheckStoreApply(t, store, "rollback-complete-old", state.Apply.Completed)
 	newApply := createCheckStoreApply(t, store, "apply-running-new", state.Apply.Running)
@@ -1728,7 +1728,7 @@ func TestCheckStore_MarkActionRequiredForApplySkipsNewerRunningApply(t *testing.
 func TestCheckStore_MarkActionRequiredForApplySkipsNewerTerminalApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	rollbackApply := createCheckStoreApply(t, store, "rollback-complete-old", state.Apply.Completed)
 	newApply := createCheckStoreApply(t, store, "apply-terminal-new", state.Apply.Failed)
@@ -1789,7 +1789,7 @@ func createCheckStoreApply(t *testing.T, store storage.Storage, applyIdentifier,
 func TestCheckStore_UpsertPlanResultStoresDriftBlock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:     "org/repo",
@@ -1820,7 +1820,7 @@ func TestCheckStore_UpsertPlanResultStoresDriftBlock(t *testing.T) {
 func TestCheckStore_UpsertPlanResultNotEvaluatedPreservesDriftBlock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:     "org/repo",
@@ -1862,7 +1862,7 @@ func TestCheckStore_UpsertPlanResultNotEvaluatedPreservesDriftBlock(t *testing.T
 func TestCheckStore_UpsertPlanResultCleanReplanClearsDriftBlock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:     "org/repo",
@@ -1902,7 +1902,7 @@ func TestCheckStore_UpsertPlanResultCleanReplanClearsDriftBlock(t *testing.T) {
 func TestCheckStore_UpsertPlanResultNotEvaluatedReplacesNonDriftRow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:   "org/repo",
@@ -1943,7 +1943,7 @@ func TestCheckStore_UpsertPlanResultNotEvaluatedReplacesNonDriftRow(t *testing.T
 func TestCheckStore_MarkStalePlanSuccessfulClearsDriftBlock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
 		Repository:     "org/repo",
