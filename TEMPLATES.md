@@ -156,9 +156,9 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-🛑 **Check before applying**: **2** destructive changes attributed to another open PR
-- `orders`: last changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), still open
-- `reconcile_state`: last changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), still open
+🛑 **Check before applying**: **2** destructive changes SchemaBot cannot attribute to this PR
+- `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
+- `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
 
 A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
 

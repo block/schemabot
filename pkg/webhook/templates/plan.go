@@ -282,13 +282,17 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 // that last changed it, never the specific column or index.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s attributed to another open PR\n", n, pluralize("destructive change", n))
+	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
 	for _, d := range changes {
 		if d.Unresolved {
 			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
 			continue
 		}
-		fmt.Fprintf(sb, "- `%s`: last changed by [%s#%d](https://github.com/%s/pull/%d), still open\n",
+		// The owner named is the most recent open pull request that changed the
+		// table, which is not necessarily the last one to change it: a later
+		// change from a pull request that has since closed leaves no open claim
+		// and is passed over.
+		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
 			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")

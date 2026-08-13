@@ -142,6 +142,13 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
 
+	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
+	// is consent to destroy the data, and whether the change is this pull
+	// request's to make is part of what the operator is consenting to.
+	if len(data.AttributedChanges) > 0 {
+		writeAttributedChanges(&sb, data.AttributedChanges)
+	}
+
 	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
 	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
 	if data.Tenant != "" {

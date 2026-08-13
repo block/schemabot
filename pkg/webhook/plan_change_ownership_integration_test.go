@@ -236,6 +236,203 @@ func TestE2EPlanFlagsDropAsUnresolvedWhenOwnershipLookupFails(t *testing.T) {
 	}
 }
 
+// A pull request that applied a table earlier and now removes it from its own
+// schema files is undoing its own work, not another pull request's. Stored task
+// history names it as the table's owner, so the annotation would fire on every
+// pull request that iterates on a schema change before merging; the planning
+// pull request's own history is passed over and the drop renders unremarked.
+func TestE2EPlanOffersDropOfATableThisPullRequestApplied(t *testing.T) {
+	dbName := "webhook_drop_self_owned"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	// The planning pull request's own earlier apply created both tables.
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 1, map[string]string{
+		"users.sql":           ownershipUsersSchema,
+		"reconcile_state.sql": ownershipReconcileSchema,
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersSchema}, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "DROP TABLE")
+		assert.Contains(t, body, "`reconcile_state`")
+		assert.NotContains(t, body, "🛑 **Check before applying**",
+			"a pull request undoing its own applied change owes no attribution notice")
+		assert.Contains(t, body, "▶️ **To apply**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment")
+	}
+}
+
+// The table's owning pull request is known, but its state cannot be read from
+// GitHub — a revoked installation, a deleted pull request, a repository
+// SchemaBot no longer reaches. Whether the claim is still open is exactly the
+// question the annotation answers, so a plan that cannot answer it annotates
+// the drop as unresolved rather than presenting it as this pull request's to
+// make.
+func TestE2EPlanFlagsDropAsUnresolvedWhenTheOwningPullRequestCannotBeRead(t *testing.T) {
+	dbName := "webhook_drop_owner_unreadable"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{
+		"users.sql":           ownershipUsersSchema,
+		"reconcile_state.sql": ownershipReconcileSchema,
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersSchema}, schemabotConfig, dbName)
+	registerUnreadablePullRequest(mux, 2)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "`reconcile_state`")
+		assert.Contains(t, body, "ownership could not be established")
+		assert.NotContains(t, body, "octocat/hello-world#2",
+			"a pull request whose state is unknown must not be presented as an established owner")
+		assert.Contains(t, body, "▶️ **To apply**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment")
+	}
+}
+
+// An apply is blocked for carrying a destructive change and is told how to
+// override that block with --allow-unsafe. The override is consent to destroy
+// the data, and whether the change is this pull request's to make is part of
+// what is being consented to, so the attribution travels onto the comment that
+// coaches the override rather than only onto the plan comment.
+func TestE2EUnsafeBlockedApplyDisclosesAttributedChange(t *testing.T) {
+	dbName := "webhook_unsafe_block_ownership"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{
+		"users.sql":           ownershipUsersSchema,
+		"reconcile_state.sql": ownershipReconcileSchema,
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersSchema}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Unsafe")
+		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "`reconcile_state`")
+		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
+		assert.Contains(t, body, "--allow-unsafe",
+			"the override is still offered; the attribution informs the decision to take it")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the unsafe-blocked comment")
+	}
+}
+
+// An apply that carries --allow-unsafe passes the unsafe gate and acquires the
+// lock, and the locked comment it posts is the one apply-confirm acts on. The
+// attribution sits there for the same reason as the direct-execution
+// disclosure: the operator confirms against this comment, so what it does not
+// say is not part of the decision.
+func TestE2ELockedApplyCommentDisclosesAttributedChange(t *testing.T) {
+	dbName := "webhook_locked_apply_ownership"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{
+		"users.sql":           ownershipUsersSchema,
+		"reconcile_state.sql": ownershipReconcileSchema,
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"users.sql": ownershipUsersSchema}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging --allow-unsafe",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Lock acquired by")
+		assert.Contains(t, body, "🛑 **Check before applying**")
+		assert.Contains(t, body, "`reconcile_state`")
+		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the locked apply comment")
+	}
+}
+
 // applyDeclaredSchemaForPullRequest plans and applies a pull request's declared
 // schema, waiting for the apply to complete. The target then carries the tables
 // those files declare, and storage records which pull request changed them.
@@ -312,6 +509,18 @@ func registerOpenPullRequest(mux *http.ServeMux, pr int) {
 // as closed.
 func registerMergedPullRequest(mux *http.ServeMux, pr int) {
 	registerPullRequestState(mux, pr, "closed", true)
+}
+
+// registerUnreadablePullRequest serves a pull request SchemaBot cannot read.
+// The status is the non-retryable kind: the client already retries an
+// availability failure, so what reaches the ownership lookup is a failure
+// retrying does not fix.
+func registerUnreadablePullRequest(mux *http.ServeMux, pr int) {
+	mux.HandleFunc(fmt.Sprintf("GET /repos/octocat/hello-world/pulls/%d", pr), func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	})
 }
 
 func registerPullRequestState(mux *http.ServeMux, pr int, prState string, merged bool) {

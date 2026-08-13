@@ -80,7 +80,7 @@ func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *test
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** destructive change attributed to another open PR")
+	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** destructive change SchemaBot cannot attribute to this PR")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	// Reconciling the live database to the declared schema stays the operator's
 	// call, so the attribution informs the decision without removing it.
@@ -104,6 +104,35 @@ func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T
 
 	assert.Contains(t, rendered, "ownership could not be established; see server logs")
 	assert.Contains(t, rendered, "▶️ **To apply**")
+}
+
+// The unsafe-blocked comment is where an operator is told how to override the
+// block, so it carries the attribution alongside the override it coaches.
+func TestRenderUnsafeChangesBlocked_CarriesAttributedChange(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `reconcile_state`"},
+		}},
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "reconcile_state",
+			Reason: "DROP TABLE removes all data",
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "reconcile_state",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+	assert.Contains(t, rendered, "--allow-unsafe")
 }
 
 func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnly(t *testing.T) {
