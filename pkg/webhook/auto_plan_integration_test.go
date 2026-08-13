@@ -1787,7 +1787,7 @@ func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
 	select {
 	case cr := <-result.checkRuns:
 		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion,
 			"a base branch that cannot be read must fail the check closed")
 		require.NotNil(t, cr.Output)
 		assert.Equal(t, configDiscoveryFailedBlock.message, cr.Output.Summary,
