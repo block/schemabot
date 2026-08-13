@@ -25,11 +25,16 @@ import (
 // version, otherwise every embedding service fails to start whenever the two
 // modules upgrade OTel independently.
 func TestSetupTelemetryWithNewerHostSDK(t *testing.T) {
-	// Guard the scenario: if these ever match, this module's OTel SDK pin no
-	// longer produces a schema URL conflict and the test proves nothing. Bump
-	// the go.opentelemetry.io/otel/sdk requirement in this module's go.mod so
-	// it is ahead of the semconv version imported by pkg/api/telemetry.go.
-	require.NotEqual(t, semconv.SchemaURL, resource.Default().SchemaURL(),
+	// Guard the scenario: the host SDK's default resource must carry a
+	// non-empty schema URL that differs from schemabot's semconv pin,
+	// otherwise this module no longer produces a schema URL conflict and the
+	// test proves nothing. Bump the go.opentelemetry.io/otel/sdk requirement
+	// in this module's go.mod so it is ahead of the semconv version imported
+	// by pkg/api/telemetry.go.
+	hostSchemaURL := resource.Default().SchemaURL()
+	require.NotEmpty(t, hostSchemaURL,
+		"host SDK default resource must carry a schema URL for the conflict scenario to exist")
+	require.NotEqual(t, semconv.SchemaURL, hostSchemaURL,
 		"host SDK default resource must carry a different schema URL than schemabot's semconv pin; bump this module's go.opentelemetry.io/otel/sdk requirement")
 
 	tel, err := api.SetupTelemetry(slog.Default())
