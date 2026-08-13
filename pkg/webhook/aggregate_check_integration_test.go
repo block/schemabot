@@ -1130,20 +1130,17 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	})
 
 	// Git tree — has the .sql file but no schemabot.yaml anywhere
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA: new("abc123"),
-			Entries: []*gh.TreeEntry{
-				{
-					Path: new("legacy-service/schema/users.sql"),
-					Mode: new("100644"),
-					Type: new("blob"),
-					SHA:  new("blobsha001"),
-					Size: new(100),
-				},
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA: "abc123",
+		headEntries: []*gh.TreeEntry{
+			{
+				Path: new("legacy-service/schema/users.sql"),
+				Mode: new("100644"),
+				Type: new("blob"),
+				SHA:  new("blobsha001"),
+				Size: new(100),
 			},
-			Truncated: new(false),
-		})
+		},
 	})
 
 	// Capture check runs

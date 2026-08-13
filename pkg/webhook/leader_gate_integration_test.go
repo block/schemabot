@@ -433,11 +433,22 @@ func TestE2ELeaderRefoldSkippedForOwnAggregateCheck(t *testing.T) {
 	}
 }
 
-// mockLeaderEmptyTree serves an empty git tree for headSHA so config discovery
-// resolves no schemabot.yaml — the leader manages none of the PR's files.
-func mockLeaderEmptyTree(mux *http.ServeMux, headSHA string) {
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+headSHA, func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new(headSHA), Entries: []*gh.TreeEntry{}, Truncated: new(false)})
+// mockLeaderRepositoryWithoutConfig serves the repository at headSHA and at the
+// default branch tip. The head carries the participant's changed schema file
+// and no schemabot.yaml anywhere, so config discovery resolves nothing — the
+// leader manages none of the PR's files — while the changed file still reads as
+// one this PR proposes.
+func mockLeaderRepositoryWithoutConfig(t *testing.T, mux *http.ServeMux, headSHA string) {
+	t.Helper()
+
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA: headSHA,
+		headEntries: []*gh.TreeEntry{{
+			Path: new(tenantBSchemaDir + "/users.sql"),
+			Mode: new("100644"),
+			Type: new("blob"),
+			SHA:  new("blobsha_tenant_b_users"),
+		}},
 	})
 }
 
@@ -460,7 +471,7 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	// The participant has posted no Check Run at all on the head commit.
 	mockParticipantCheckRuns(mux, nil)
 	checkRuns := captureLeaderCheckRuns(mux)
@@ -503,7 +514,7 @@ func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 
 	// The first fold reads one participant check per environment and sees
 	// nothing — the participant has not published yet. Every later read finds
@@ -610,7 +621,7 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 			{Filename: new("README.md"), Status: new("modified")},
 		})
 	})
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	checkRuns := captureLeaderCheckRuns(mux)
 
 	h := newLeaderHandler(t, svc, client)
@@ -729,7 +740,7 @@ func TestE2ELeaderParticipantSchemaWithDiscoverableConfigFoldsInsteadOfPlanning(
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	// The participant's schema root carries a discoverable schemabot.yaml for a
 	// database only tenant-b's deployment registers.
 	var configFetches atomic.Int64

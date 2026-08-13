@@ -372,14 +372,47 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // check here (the post re-verifies the head SHA and can no-op during a GitHub
 // outage).
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
+	// Snapshot the base ref before anything is read, so the publish-time check
+	// below covers the whole of discovery. A failure here is not fatal: the
+	// snapshot only narrows what publishing will accept, and the head SHA the
+	// delivery carries is verified either way.
+	baseRef := ""
+	if prInfo, prErr := client.FetchPullRequest(ctx, repo, pr); prErr != nil {
+		h.logger.Warn("could not read the PR's base branch before auto-plan; only the head SHA will be re-verified before publishing",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", prErr)
+	} else {
+		baseRef = prInfo.BaseRef
+	}
+
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
-	files, err := client.FetchPRFiles(ctx, repo, pr)
+	changedFiles, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
+	}
+
+	// Narrow the list to what the PR proposes against the default branch before
+	// anything reads it. Every guard below asks a question about the PR's own
+	// schema changes — which databases it touches, whether it drops a config out
+	// from under a managed directory, whether participants must report — and a
+	// file the PR inherited from history it has not caught up with answers none
+	// of them. Failing here is a discovery failure like any other: without the
+	// comparison there is no way to tell an inherited file from a proposed one.
+	files, defaultTipSHA, err := client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, changedFiles)
+	if err != nil {
+		h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
+	}
+	if len(files) != len(changedFiles) {
+		h.logger.Info("auto-plan scoped to the files the PR proposes against the default branch",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "default_tip_sha", defaultTipSHA,
+			"changed_files", len(changedFiles), "proposed_files", len(files),
+			"source", source, "delivery_id", deliveryID)
 	}
 
 	// Discover all configs matching changed schema files in this PR
@@ -495,6 +528,24 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 		return "no schema files in PR", nil
 	}
+	// Publishing a plan asserts that the inputs it was computed from still
+	// describe the PR. Both can move while discovery runs: a push changes what
+	// the DDL would be applied to, and a retarget changes which commits the PR
+	// proposes and so which databases it touches. Re-read them and discard
+	// rather than publish a plan and a merge-blocking check for a PR that has
+	// moved on — whichever event moved it re-plans on its own.
+	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, baseRef)
+	if err != nil {
+		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
+	}
+	if moved {
+		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
+			"source", source, "delivery_id", deliveryID)
+		return "auto-plan discarded because the PR moved during discovery", nil
+	}
+
 	postPlanComment := shouldPostComment()
 
 	// Launch auto-plan for each discovered config
@@ -510,6 +561,29 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	}
 
 	return "auto-plan started", nil
+}
+
+// autoPlanInputsMoved reports whether the PR changed underneath a plan that is
+// about to be published. baseRef is empty when it could not be snapshotted, in
+// which case only the head is compared. An error means the question could not
+// be answered — the caller must not publish on an unverified PR, and durable
+// callers retry the delivery.
+func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, baseRef string) (bool, error) {
+	fresh, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		return false, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
+	}
+	if fresh.HeadSHA != headSHA {
+		h.logger.Info("PR head moved while its plan was being discovered",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", fresh.HeadSHA)
+		return true, nil
+	}
+	if baseRef != "" && fresh.BaseRef != baseRef {
+		h.logger.Info("PR base branch moved while its plan was being discovered",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef, "current_base_ref", fresh.BaseRef)
+		return true, nil
+	}
+	return false, nil
 }
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
