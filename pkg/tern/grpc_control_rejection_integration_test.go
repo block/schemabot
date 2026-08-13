@@ -201,6 +201,51 @@ func TestGRPCClient_MirrorLeavesAReissuedCommandPending(t *testing.T) {
 		"a superseded rejection must not be reported against the command now in flight")
 }
 
+// The notice names who issued the command that did not take effect, so a second
+// operator whose re-issued command is rejected for the same reason has to be
+// reported under their own name. Volume is the case that reaches this: a pure
+// proxy queues no local request, so nothing else resets the mirrored row.
+func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
+
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = stor
+
+	rejection := func(requestedBy string) []*ternv1.SettledControlRequest {
+		return []*ternv1.SettledControlRequest{{
+			Operation:    string(storage.ControlOperationVolume),
+			Status:       string(storage.ControlRequestFailed),
+			ErrorMessage: "throttle endpoint returned 404",
+			RequestedBy:  requestedBy,
+		}}
+	}
+
+	client.mirrorRemoteControlRejections(ctx, apply, rejection("cli:alice"))
+	client.mirrorRemoteControlRejections(ctx, apply, rejection("cli:bob"))
+
+	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "cli:bob", stored.RequestedBy,
+		"the rejection must name the operator whose command was rejected, not the earlier attempt's")
+	assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+}
+
 // Volume is a pure proxy: the request lives entirely in the data plane, so the
 // mirrored row is the only record the control plane holds and no local request
 // lifecycle will ever reset it. When the operator re-issues the command and it

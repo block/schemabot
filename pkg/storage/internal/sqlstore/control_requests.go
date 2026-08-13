@@ -275,7 +275,11 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 	}
 	// The same rejection is reported on every poll until the operator retries
 	// the operation, so an unchanged row means the failure is already recorded.
-	if existing != nil && existing.Status == storage.ControlRequestFailed && existing.ErrorMessage == req.ErrorMessage {
+	// The requester is part of that identity: a second operator whose re-issued
+	// command fails for the same reason is a distinct rejection, and the notice
+	// names who issued the command that did not take effect.
+	if existing != nil && existing.Status == storage.ControlRequestFailed &&
+		existing.ErrorMessage == req.ErrorMessage && existing.RequestedBy == req.RequestedBy {
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("commit unchanged remote failure read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 		}
@@ -284,9 +288,9 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 	if existing != nil {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE apply_control_requests
-			SET status = ?, error_message = ?, completed_at = NOW(), updated_at = NOW()
+			SET status = ?, requested_by = ?, error_message = ?, completed_at = NOW(), updated_at = NOW()
 			WHERE id = ?
-		`, storage.ControlRequestFailed, nullString(req.ErrorMessage), existing.ID); err != nil {
+		`, storage.ControlRequestFailed, req.RequestedBy, nullString(req.ErrorMessage), existing.ID); err != nil {
 			return false, fmt.Errorf("record remote failure on control request %d for apply %d operation %s: %w", existing.ID, req.ApplyID, req.Operation, err)
 		}
 	} else if _, err := s.identity.InsertID(ctx, tx, `
