@@ -128,8 +128,10 @@ func TestDurableWebhookDispatchMetricsRetryingOutcome(t *testing.T) {
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "retrying")
 }
 
-// A non-retryable processing failure records the failed outcome.
-func TestDurableWebhookDispatchMetricsFailedOutcome(t *testing.T) {
+// A non-retryable processing failure dead-letters the delivery on the first
+// attempt and records the failed_permanent outcome — no retry budget is
+// burned replaying a failure the processor proved deterministic.
+func TestDurableWebhookDispatchMetricsFailedPermanentOutcome(t *testing.T) {
 	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
 	h := newDurableDriverHandler(t, store, nil, nil)
@@ -139,7 +141,34 @@ func TestDurableWebhookDispatchMetricsFailedOutcome(t *testing.T) {
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
+	require.Empty(t, store.failed, "a dead-lettered delivery must not take the retryable failure path")
+	require.Len(t, store.failedPermanent, 1)
+	failure := <-store.failedPermanent
+	assert.Equal(t, "deterministic rejection", failure.errMsg)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "failed_permanent")
+}
+
+// A retryable failure on the final budgeted attempt records the failed
+// outcome: the delivery is terminal but stays eligible for reconciler
+// resurrection and GitHub Redeliver, unlike a dead-lettered one.
+func TestDurableWebhookDispatchMetricsBudgetExhaustedFailedOutcome(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	event := durablePullRequestEvent(t)
+	event.Attempts = maxDurableWebhookAttempts - 1 // the FindNext claim increments to the cap
+	store := newScriptedWebhookEventStore(event)
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("transient auto-plan failure")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.failedPermanent, "budget exhaustion must not dead-letter the delivery")
 	require.Len(t, store.failed, 1)
+	failure := <-store.failed
+	assert.Nil(t, failure.retryAfter, "the terminal failure must not schedule another retry")
 	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
 	require.Len(t, durationPoints, 1)
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "failed")
@@ -202,6 +231,26 @@ func TestDurableWebhookDispatchMetricsFailureFinishErrorOutcome(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	require.Empty(t, store.failed)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "finish_error")
+}
+
+// Storage failing to record a dead-letter also records finish_error: the row
+// stays processing until lease expiry and the next claim re-derives the
+// permanent classification.
+func TestDurableWebhookDispatchMetricsPermanentFailureFinishErrorOutcome(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.markFailedPermanentErr = errors.New("storage unavailable")
+	h := newDurableDriverHandler(t, store, nil, nil)
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return false, errors.New("deterministic rejection")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.failedPermanent)
 	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
 	require.Len(t, durationPoints, 1)
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "finish_error")

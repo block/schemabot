@@ -173,7 +173,7 @@ func TestDurableIssueCommentDriverRetriesBootstrapFailure(t *testing.T) {
 }
 
 // An inbox row whose payload no longer decodes is a corrupted or hand-crafted
-// delivery: retrying cannot repair it, so the driver fails it terminally.
+// delivery: retrying cannot repair it, so the driver dead-letters it.
 func TestDurableIssueCommentDriverFailsMalformedRowTerminally(t *testing.T) {
 	event := durableIssueCommentEvent("schemabot apply -e production")
 	event.Payload = []byte("{not json")
@@ -183,18 +183,18 @@ func TestDurableIssueCommentDriverFailsMalformedRowTerminally(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "a malformed issue_comment row must not be retried")
+	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable issue_comment delivery")
 	default:
-		t.Fatal("expected malformed issue_comment delivery to be marked failed")
+		t.Fatal("expected malformed issue_comment delivery to be dead-lettered")
 	}
+	require.Empty(t, store.failed, "a malformed row is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
 }
 
 // An inbox row with an unparseable tenant cannot resolve an installation, and
 // driver work runs outside any HTTP request, so there is no out-of-band
-// resolution to recover with: the driver fails it terminally.
+// resolution to recover with: the driver dead-letters it.
 func TestDurableIssueCommentDriverFailsUnparseableTenantTerminally(t *testing.T) {
 	event := durableIssueCommentEvent("schemabot apply -e production")
 	event.TenantID = "not-a-number"
@@ -204,12 +204,12 @@ func TestDurableIssueCommentDriverFailsUnparseableTenantTerminally(t *testing.T)
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "an unparseable tenant must not be retried")
+	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "unparseable tenant ID")
 	default:
-		t.Fatal("expected unparseable-tenant delivery to be marked failed")
+		t.Fatal("expected unparseable-tenant delivery to be dead-lettered")
 	}
+	require.Empty(t, store.failed, "an unparseable tenant is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
 }
 

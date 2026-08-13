@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -263,18 +264,37 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 				"repo", event.Repository, "pr", event.PullRequest)
 			return
 		}
-		retryAfter := (*time.Time)(nil)
-		if retry && event.Attempts < maxDurableWebhookAttempts {
+		var markErr error
+		var outcome string
+		switch {
+		case !retry:
+			// The processor proved this delivery can never succeed for its head
+			// (a deterministic failure such as GitHub's per-PR file-listing cap
+			// or an undecodable row), so it dead-letters immediately: the
+			// permanently failed row counts as head coverage, which stops the
+			// reconciler from synthesizing a recovery delivery that would replay
+			// the same failure every pass. GitHub Redeliver remains the operator
+			// lever to re-run it after the underlying cause is fixed.
+			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; GitHub Redeliver is the only lever that re-runs it",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+				"attempts", event.Attempts, "error", processErr)
+			markErr = store.MarkFailedPermanent(finishCtx, event.ID, event.LeaseToken, processErr.Error())
+			outcome = "failed_permanent"
+		case event.Attempts < maxDurableWebhookAttempts:
 			due := time.Now().Add(durableWebhookRetryDelay)
-			retryAfter = &due
-		} else if retry {
+			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), &due)
+			outcome = "retrying"
+		default:
 			h.logger.Error("durable webhook delivery exhausted its retry budget and is now terminal",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
 				"attempts", event.Attempts, "error", processErr)
+			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), nil)
+			outcome = "failed"
 		}
-		if err := store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), retryAfter); err != nil {
-			if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+		if markErr != nil {
+			if errors.Is(markErr, storage.ErrWebhookEventLeaseLost) || errors.Is(markErr, storage.ErrWebhookEventNotFound) {
 				recordOutcome("lease_lost")
 				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone",
 					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
@@ -284,21 +304,15 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			recordOutcome("finish_error")
 			h.logger.Error("durable webhook driver failed to record delivery failure",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-				"repo", event.Repository, "pr", event.PullRequest, "error", err)
+				"repo", event.Repository, "pr", event.PullRequest, "error", markErr)
 			return
 		}
-		status := "durable_dispatch_failed"
-		outcome := "failed"
-		if retryAfter != nil {
-			status = "durable_dispatch_retrying"
-			outcome = "retrying"
-		}
 		recordOutcome(outcome)
-		metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, status)
+		metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
 		h.logger.Warn("durable webhook driver recorded delivery failure",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-			"retry", retryAfter != nil, "error", processErr)
+			"disposition", outcome, "error", processErr)
 		return
 	}
 	if heartbeatErr != nil {
@@ -545,7 +559,7 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 
 	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, headSHA, installationID, "pull_request", payload.Action, payload.Before, event.DeliveryID)
 	if planErr != nil {
-		return true, fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
+		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable delivery %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
 	}
 	if ctxErr := runCtx.Err(); ctxErr != nil {
 		// The run was cancelled (shutdown or lease loss) — the dispatch may be
@@ -558,6 +572,19 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 		"action", payload.Action, "repo", repo, "pr", pr, "head_sha", headSHA,
 		"delivery_id", event.DeliveryID, "outcome", message)
 	return false, nil
+}
+
+// autoPlanFailureIsPermanent reports whether a failed auto-plan run is
+// deterministic for the delivery's head, so retrying the same head cannot
+// succeed and the delivery must dead-letter instead of burning its retry
+// budget. Discovery failures default to retryable — they are typically
+// transient GitHub API errors. The permanent class is GitHub's per-PR
+// file-listing cap (ErrPRFilesIncomplete): every retry repeats the identical
+// truncated listing, and the head already carries a failing config discovery
+// check telling the author the change is too large to review. Only a new head
+// (or an explicit redelivery) can change the outcome.
+func autoPlanFailureIsPermanent(err error) bool {
+	return errors.Is(err, ghclient.ErrPRFilesIncomplete)
 }
 
 // processDurableCheckRun routes a claimed check_run delivery by action.
@@ -750,7 +777,7 @@ func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *st
 
 	message, planErr := h.runAutoPlanForPR(ctx, client, repo, pr, payload.CheckRun.HeadSHA, installationID, "check_run.rerequested", "check_run.rerequested", "", event.DeliveryID)
 	if planErr != nil {
-		return true, fmt.Errorf("auto-plan for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
+		return !autoPlanFailureIsPermanent(planErr), fmt.Errorf("auto-plan for durable check_run rerequest %s (%s#%d): %w", event.DeliveryID, repo, pr, planErr)
 	}
 	if ctxErr := runCtx.Err(); ctxErr != nil {
 		// The run was cancelled (shutdown or lease loss) — the dispatch may be

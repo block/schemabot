@@ -221,10 +221,13 @@ type WebhookEventStore interface {
 	// Create records a webhook delivery in the pending state. Returns
 	// inserted=false when provider + delivery GUID already exists, so callers
 	// can deduplicate redeliveries. One exception: when the existing row is
-	// terminally failed, Create re-opens it (pending, attempts reset, fresh
-	// payload) and returns inserted=true, so GitHub's "Redeliver" button —
-	// which reuses the original delivery GUID — is a real remediation for a
-	// terminally failed delivery instead of a permanent no-op.
+	// terminal — failed, permanently failed, or completed — Create re-opens it
+	// (pending, attempts reset, fresh payload) and returns inserted=true, so
+	// GitHub's "Redeliver" button — which reuses the original delivery GUID —
+	// is a real remediation for a terminal delivery instead of a permanent
+	// no-op. Redeliver is also the only lever that revives a permanently
+	// failed row: the reconciler never re-Creates its GUID because
+	// HasEventForHead reports the dead-lettered head as covered.
 	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
 
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
@@ -238,11 +241,13 @@ type WebhookEventStore interface {
 	// or actions can carry the same PR + head SHA without planning it, so
 	// they do not cover the head. A terminally failed row covers its head
 	// when it is organic (the operator's GitHub Redeliver lever exists for
-	// it), but not when it is synthesized
+	// it), but not when it is a plain failed synthesized row
 	// (SynthesizedWebhookDeliveryIDPrefix) — there is no Redeliver lever for
 	// a synthesized GUID, so the reconciler must be able to synthesize a
 	// fresh recovery delivery that reopens it through Create's
-	// duplicate-GUID branch.
+	// duplicate-GUID branch. A permanently failed (dead-lettered) row covers
+	// its head in either GUID form: the driver proved no retry can plan that
+	// head, so no reconciler synthesis may resurrect it.
 	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
 
 	// FindNext atomically claims one pending, retryable, or lease-expired event.
@@ -265,8 +270,17 @@ type WebhookEventStore interface {
 	MarkCompleted(ctx context.Context, id int64, leaseToken string) error
 
 	// MarkFailed marks a claimed event failed. A non-nil retryAfter keeps it
-	// retryable after that time; nil makes the failure terminal.
+	// retryable after that time; nil makes the failure terminal but still
+	// recoverable: the reconciler may synthesize a recovery delivery for its
+	// head, and GitHub Redeliver reopens it.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
+
+	// MarkFailedPermanent dead-letters a claimed event: the driver proved the
+	// delivery can never succeed for its head, so no retry, reconciler
+	// synthesis, or attempt-budget reset may revive it. The row counts as head
+	// coverage in HasEventForHead; only an explicit GitHub Redeliver reopens
+	// it.
+	MarkFailedPermanent(ctx context.Context, id int64, leaseToken string, errMsg string) error
 
 	// Release returns a claimed event to pending and refunds the attempt its
 	// claim consumed. Drivers use it when shutdown cancels in-flight

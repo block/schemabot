@@ -251,8 +251,8 @@ func TestDurableCheckRunDriverCompletesUnsupportedAction(t *testing.T) {
 	require.Empty(t, store.failed)
 }
 
-// A malformed check_run payload cannot be decoded, so the driver fails it
-// terminally (no retry) rather than crash-looping the fleet on a poison row.
+// A malformed check_run payload cannot be decoded, so the driver dead-letters
+// it (no retry) rather than crash-looping the fleet on a poison row.
 func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
@@ -265,12 +265,12 @@ func TestDurableCheckRunDriverFailsMalformedTerminally(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "malformed payload must not be retried")
+	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable check_run delivery")
 	default:
-		t.Fatal("expected malformed check_run event to be marked failed")
+		t.Fatal("expected malformed check_run event to be dead-lettered")
 	}
+	require.Empty(t, store.failed, "a malformed payload is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
 }
 
@@ -487,7 +487,7 @@ func TestDurableCheckRunDriverCompletionRetriesFoldFailure(t *testing.T) {
 // The producer always stores a resolved positive installation ID in the row's
 // tenant, so a completion whose tenant is missing or does not resolve is a
 // corrupted or hand-crafted row: retrying cannot repair it, so the delivery
-// fails terminally instead of burning retry attempts on a deterministic
+// is dead-lettered instead of burning retry attempts on a deterministic
 // failure, with the error naming which of the two defects the row has.
 func TestDurableCheckRunDriverCompletionFailsUnresolvableTenantTerminally(t *testing.T) {
 	tests := []struct {
@@ -510,12 +510,12 @@ func TestDurableCheckRunDriverCompletionFailsUnresolvableTenantTerminally(t *tes
 			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 			select {
-			case failure := <-store.failed:
-				require.Nil(t, failure.retryAfter, "an unresolvable persisted tenant must not be retried")
+			case failure := <-store.failedPermanent:
 				require.Contains(t, failure.errMsg, tt.wantErr)
 			default:
-				t.Fatal("expected an unresolvable tenant to be marked failed")
+				t.Fatal("expected an unresolvable tenant to be dead-lettered")
 			}
+			require.Empty(t, store.failed, "an unresolvable persisted tenant is deterministic and must not burn retry budget")
 			require.Empty(t, store.completed)
 			select {
 			case <-factory.forInstallationStarted:

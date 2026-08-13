@@ -13,9 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -49,7 +51,7 @@ func (s *recordingWebhookEventStore) Create(_ context.Context, event *storage.We
 	if existing, ok := s.events[key]; ok {
 		// Mirror the real store's duplicate-GUID branch: terminal rows are
 		// reopened as fresh pending deliveries; live rows dedup.
-		if existing.State == storage.WebhookEventFailed || existing.State == storage.WebhookEventCompleted {
+		if existing.State == storage.WebhookEventFailed || existing.State == storage.WebhookEventFailedPermanent || existing.State == storage.WebhookEventCompleted {
 			existing.State = storage.WebhookEventPending
 			existing.Attempts = 0
 			existing.Payload = append([]byte(nil), event.Payload...)
@@ -115,6 +117,10 @@ func (s *recordingWebhookEventStore) MarkCompleted(context.Context, int64, strin
 
 func (s *recordingWebhookEventStore) MarkFailed(context.Context, int64, string, string, *time.Time) error {
 	return errors.New("MarkFailed not implemented by recordingWebhookEventStore")
+}
+
+func (s *recordingWebhookEventStore) MarkFailedPermanent(context.Context, int64, string, string) error {
+	return errors.New("MarkFailedPermanent not implemented by recordingWebhookEventStore")
 }
 
 func (s *recordingWebhookEventStore) Release(context.Context, int64, string) error {
@@ -218,13 +224,15 @@ type scriptedWebhookEventStore struct {
 
 	// Optional injected finish errors, returned before the corresponding
 	// outcome channel send so tests can exercise the storage-failure paths.
-	markCompletedErr error
-	markFailedErr    error
-	releaseErr       error
+	markCompletedErr       error
+	markFailedErr          error
+	markFailedPermanentErr error
+	releaseErr             error
 
-	completed chan scriptedWebhookOutcome
-	failed    chan scriptedWebhookFailure
-	released  chan scriptedWebhookOutcome
+	completed       chan scriptedWebhookOutcome
+	failed          chan scriptedWebhookFailure
+	failedPermanent chan scriptedWebhookPermanentFailure
+	released        chan scriptedWebhookOutcome
 }
 
 type scriptedWebhookOutcome struct {
@@ -239,12 +247,19 @@ type scriptedWebhookFailure struct {
 	retryAfter *time.Time
 }
 
+type scriptedWebhookPermanentFailure struct {
+	id         int64
+	leaseToken string
+	errMsg     string
+}
+
 func newScriptedWebhookEventStore(queue ...*storage.WebhookEvent) *scriptedWebhookEventStore {
 	return &scriptedWebhookEventStore{
 		recordingWebhookEventStore: *newRecordingWebhookEventStore(),
 		queue:                      queue,
 		completed:                  make(chan scriptedWebhookOutcome, 8),
 		failed:                     make(chan scriptedWebhookFailure, 8),
+		failedPermanent:            make(chan scriptedWebhookPermanentFailure, 8),
 		released:                   make(chan scriptedWebhookOutcome, 8),
 	}
 }
@@ -286,6 +301,14 @@ func (s *scriptedWebhookEventStore) MarkFailed(_ context.Context, id int64, leas
 		return s.markFailedErr
 	}
 	s.failed <- scriptedWebhookFailure{id: id, leaseToken: leaseToken, errMsg: errMsg, retryAfter: retryAfter}
+	return nil
+}
+
+func (s *scriptedWebhookEventStore) MarkFailedPermanent(_ context.Context, id int64, leaseToken string, errMsg string) error {
+	if s.markFailedPermanentErr != nil {
+		return s.markFailedPermanentErr
+	}
+	s.failedPermanent <- scriptedWebhookPermanentFailure{id: id, leaseToken: leaseToken, errMsg: errMsg}
 	return nil
 }
 
@@ -365,13 +388,28 @@ func TestDurableWebhookDriverFailsMalformedPullRequestTerminally(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "malformed payload must not be retried")
+	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable pull_request delivery")
 	default:
-		t.Fatal("expected malformed event to be marked failed")
+		t.Fatal("expected malformed event to be dead-lettered")
 	}
+	require.Empty(t, store.failed, "a malformed payload is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
+}
+
+// autoPlanFailureIsPermanent gates dead-lettering, so it must recognize the
+// file-listing cap sentinel through the wrapping the fetch path applies, and
+// must leave transient failures — GitHub outages, timeouts — retryable.
+func TestAutoPlanFailureIsPermanent(t *testing.T) {
+	truncatedListing := fmt.Errorf("fetch PR files for octocat/hello-world#7: %w",
+		fmt.Errorf("list PR files for octocat/hello-world#7 reached GitHub API limit: %w", ghclient.ErrPRFilesIncomplete))
+	assert.True(t, autoPlanFailureIsPermanent(truncatedListing),
+		"the file-listing cap is deterministic for the head and must dead-letter")
+
+	assert.False(t, autoPlanFailureIsPermanent(errors.New("github unavailable: connection refused")),
+		"a transient GitHub failure must stay retryable")
+	assert.False(t, autoPlanFailureIsPermanent(context.DeadlineExceeded),
+		"a timeout must stay retryable")
 }
 
 func TestDurableInstallationID(t *testing.T) {
@@ -425,12 +463,12 @@ func TestDurableWebhookDriverFailsUnparseableTenantTerminally(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "a corrupted persisted tenant must not be retried")
+	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "unparseable tenant ID")
 	default:
-		t.Fatal("expected unparseable tenant to be marked failed")
+		t.Fatal("expected unparseable tenant to be dead-lettered")
 	}
+	require.Empty(t, store.failed, "a corrupted persisted tenant is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
 }
 

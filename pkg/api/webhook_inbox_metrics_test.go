@@ -53,6 +53,10 @@ func (f *fakeWebhookEventStore) MarkFailed(context.Context, int64, string, strin
 	return errors.New("unused")
 }
 
+func (f *fakeWebhookEventStore) MarkFailedPermanent(context.Context, int64, string, string) error {
+	return errors.New("unused")
+}
+
 func (f *fakeWebhookEventStore) Release(context.Context, int64, string) error {
 	return errors.New("unused")
 }
@@ -91,6 +95,7 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 			storage.WebhookEventFailedRetryable: 2,
 			storage.WebhookEventCompleted:       10,
 			storage.WebhookEventFailed:          4,
+			storage.WebhookEventFailedPermanent: 5,
 		},
 		OldestClaimableAge: 90 * time.Second,
 		StuckProcessing:    2,
@@ -138,6 +143,7 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 		"failed_retryable": 2,
 		"completed":        10,
 		"failed":           4,
+		"failed_permanent": 5,
 		"unknown":          0,
 	}, depthByState)
 	assert.True(t, oldestFound)

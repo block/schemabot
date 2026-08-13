@@ -1624,8 +1624,13 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 // claim can end so the duration histogram's cardinality stays bounded. An
 // unrecognized value folds to "unknown". Outcomes:
 //   - "completed": processing succeeded and the row was marked completed.
-//   - "failed": processing failed terminally (deterministic rejection or
-//     retry budget exhausted).
+//   - "failed": processing exhausted the retry budget; the row is terminal
+//     but stays eligible for reconciler resurrection and GitHub Redeliver.
+//   - "failed_permanent": processing proved the delivery can never succeed
+//     for its head, so the row was dead-lettered; only GitHub Redeliver
+//     re-runs it. A sustained rate means PRs are hitting a deterministic
+//     limit (for example GitHub's per-PR file-listing cap) — find the
+//     delivery in the driver logs and inspect its last_error.
 //   - "retrying": processing failed retryably; the row waits for its retry
 //     window.
 //   - "released": the pool shut down mid-flight and refunded the claim.
@@ -1636,12 +1641,13 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     outcome; the row stays processing until lease expiry hands it to
 //     another driver — investigate storage health.
 var knownWebhookDispatchOutcomes = map[string]bool{
-	"completed":    true,
-	"failed":       true,
-	"retrying":     true,
-	"released":     true,
-	"lease_lost":   true,
-	"finish_error": true,
+	"completed":        true,
+	"failed":           true,
+	"failed_permanent": true,
+	"retrying":         true,
+	"released":         true,
+	"lease_lost":       true,
+	"finish_error":     true,
 }
 
 // RecordWebhookDispatchDuration records how long one dispatch claim held a

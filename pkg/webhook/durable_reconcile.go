@@ -15,7 +15,9 @@
 //     each miss by enqueueing a pull_request-equivalent inbox row (see
 //     synthesizedDeliveryGUID; naturally deduped per head) that the durable
 //     dispatcher plans through the ordinary auto-plan flow; otherwise the scan
-//     is report-only.
+//     is report-only. A dead-lettered head (failed_permanent) is not a miss —
+//     HasEventForHead reports it covered — so synthesis cannot resurrect a
+//     delivery the driver proved can never succeed for that head.
 package webhook
 
 import (
