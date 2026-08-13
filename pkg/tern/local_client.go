@@ -612,17 +612,44 @@ func (c *LocalClient) Health(ctx context.Context) error {
 }
 
 // PullSchema fetches the live schema and returns declarative schema files.
+// MySQL and Vitess use the built-in pull paths; any other database type is
+// delegated to the configured engine's SchemaPuller capability.
 func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL && c.config.Type != storage.DatabaseTypeVitess {
-		return nil, fmt.Errorf("pull schema for database %s type %s: only %s and %s are supported: %w", c.config.Database, c.config.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, ErrPullSchemaUnsupportedType)
-	}
 	if req.Type != "" && req.Type != c.config.Type {
 		return nil, fmt.Errorf("pull schema for database %s: request type %q does not match client type %q: %w", c.config.Database, req.Type, c.config.Type, ErrPullSchemaInvalidRequest)
+	}
+	if c.config.Type != storage.DatabaseTypeMySQL && c.config.Type != storage.DatabaseTypeVitess {
+		return c.pullSchemaFromEngine(ctx, req)
 	}
 	if req.GetNamespace() == "" {
 		return c.pullAllNamespaces(ctx, req)
 	}
 	return c.pullSchemaNamespace(ctx, req, req.GetNamespace())
+}
+
+// pullSchemaFromEngine delegates a pull for a database type without a
+// built-in pull path to the configured engine's SchemaPuller capability. An
+// engine that does not implement the capability fails closed with
+// ErrPullSchemaUnsupportedType, which the gRPC server surfaces as
+// codes.Unimplemented.
+func (c *LocalClient) pullSchemaFromEngine(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	puller, ok := c.getEngine().(SchemaPuller)
+	if !ok {
+		return nil, fmt.Errorf("pull schema for database %s type %s: engine does not support schema pull: %w", c.config.Database, c.config.Type, ErrPullSchemaUnsupportedType)
+	}
+	c.logger.Info("LocalClient.PullSchema: delegating to engine schema pull",
+		"database", c.config.Database,
+		"type", c.config.Type,
+		"namespace", req.GetNamespace(),
+	)
+	resp, err := puller.PullSchema(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("engine pull schema for database %s type %s: %w", c.config.Database, c.config.Type, err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("engine pull schema for database %s type %s returned a nil response", c.config.Database, c.config.Type)
+	}
+	return resp, nil
 }
 
 func (c *LocalClient) pullAllNamespaces(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {

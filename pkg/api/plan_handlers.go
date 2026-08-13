@@ -26,6 +26,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 const applyOperationKeyMaxLen = 255
@@ -60,6 +61,19 @@ type unsupportedPullSchemaError struct {
 
 func (e *unsupportedPullSchemaError) Error() string {
 	return fmt.Sprintf("pull schema supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, e.DatabaseType)
+}
+
+// pullSchemaUnsupportedByDataPlane reports whether a pull failure means the
+// resolved data plane does not support pull for this database type: the local
+// client's typed sentinel, or its gRPC mapping (codes.Unimplemented) from a
+// remote data plane. Whether pull is supported is the data plane's answer —
+// it depends on which engine backs the deployment — so the control plane
+// derives the 501 from the pull attempt instead of gating on database type.
+func pullSchemaUnsupportedByDataPlane(pullErr error, isRemoteTarget bool) bool {
+	if errors.Is(pullErr, tern.ErrPullSchemaUnsupportedType) {
+		return true
+	}
+	return isRemoteTarget && grpcstatus.Code(pullErr) == grpccodes.Unimplemented
 }
 
 // RemoteDeploymentUnavailableError carries routing metadata for remote
@@ -169,12 +183,6 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
 	}
-	if resolvedTarget.DatabaseType != storage.DatabaseTypeMySQL && resolvedTarget.DatabaseType != storage.DatabaseTypeVitess {
-		unsupportedErr := &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
-		span.RecordError(unsupportedErr)
-		span.SetStatus(otelcodes.Error, "unsupported database type")
-		return nil, unsupportedErr
-	}
 	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
 	if err != nil {
 		span.RecordError(err)
@@ -242,6 +250,9 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 					Target:     resolvedTarget.Target,
 					Err:        pullErr,
 				}
+			}
+			if pullSchemaUnsupportedByDataPlane(pullErr, isRemoteTarget) {
+				return nil, &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
 			}
 			return nil, pullErr
 		}

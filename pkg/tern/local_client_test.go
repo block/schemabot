@@ -3637,6 +3637,117 @@ type namedEngine struct {
 
 func (e namedEngine) Name() string { return e.name }
 
+// fakeSchemaPullEngine is a registered engine that implements the SchemaPuller
+// capability, standing in for an embedder-supplied engine that answers pull.
+type fakeSchemaPullEngine struct {
+	engine.Engine
+	pullReq  *ternv1.PullSchemaRequest
+	pullResp *ternv1.PullSchemaResponse
+	pullErr  error
+}
+
+func (e *fakeSchemaPullEngine) Name() string { return storage.EngineStrata }
+
+func (e *fakeSchemaPullEngine) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	e.pullReq = req
+	return e.pullResp, e.pullErr
+}
+
+func newCustomEngineClient(t *testing.T, dbType string, eng engine.Engine) *LocalClient {
+	t.Helper()
+	client, err := NewLocalClient(LocalConfig{
+		Database: "orders",
+		Type:     dbType,
+		EngineFactories: map[string]EngineFactory{
+			dbType: func(LocalConfig, *slog.Logger) (engine.Engine, error) { return eng, nil },
+		},
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	return client
+}
+
+// A pull for a database type without a built-in pull path is answered by the
+// registered engine's SchemaPuller capability, with the request forwarded
+// intact and the engine's response returned as-is.
+func TestLocalClient_PullSchemaDelegatesToEngineCapability(t *testing.T) {
+	fake := &fakeSchemaPullEngine{
+		pullResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeStrata,
+			Environment: "staging",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, fake)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "orders",
+		Type:        storage.DatabaseTypeStrata,
+		Environment: "staging",
+		Namespace:   "orders",
+	})
+
+	require.NoError(t, err)
+	assert.Same(t, fake.pullResp, resp)
+	require.NotNil(t, fake.pullReq)
+	assert.Equal(t, "orders", fake.pullReq.Database)
+	assert.Equal(t, "orders", fake.pullReq.Namespace)
+}
+
+// A registered engine without the SchemaPuller capability fails closed with
+// the typed sentinel the gRPC server maps to codes.Unimplemented.
+func TestLocalClient_PullSchemaEngineWithoutCapabilityUnsupported(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeControlEngine{})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.ErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Contains(t, err.Error(), "engine does not support schema pull")
+}
+
+// The built-in PostgreSQL engine has no pull path, so a postgres client
+// reports pull as unsupported rather than attempting a MySQL-shaped pull.
+func TestLocalClient_PullSchemaPostgresUnsupported(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypePostgres,
+		TargetDSN: "postgres://localhost:5432/orders",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.ErrorIs(t, err, ErrPullSchemaUnsupportedType)
+}
+
+// A request whose type disagrees with the client's configured type is a
+// malformed request, reported as such even when the configured type would
+// otherwise be delegated or unsupported.
+func TestLocalClient_PullSchemaTypeMismatchBeforeDelegation(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeControlEngine{})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "orders",
+		Type:     storage.DatabaseTypeMySQL,
+	})
+
+	require.ErrorIs(t, err, ErrPullSchemaInvalidRequest)
+}
+
+// An engine that returns neither a response nor an error is a broken
+// capability; the client fails closed instead of handing callers a nil pull.
+func TestLocalClient_PullSchemaEngineNilResponseFailsClosed(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeSchemaPullEngine{})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil response")
+}
+
 // The reported proto engine reflects the engine actually backing the client, so
 // a registered engine is not misreported as the Spirit default.
 func TestLocalClientProtoEngineReflectsRegisteredEngine(t *testing.T) {
