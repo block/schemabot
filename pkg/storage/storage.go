@@ -480,6 +480,20 @@ type ApplyStore interface {
 	// If not called for > 1 minute, another driver can claim the apply.
 	Heartbeat(ctx context.Context, applyID int64) error
 
+	// ReleaseClaim releases an apply lease the calling driver holds but will not
+	// drive any further — a process shutting down hands its claimed applies back
+	// rather than holding them until the lease goes stale on its own. It clears
+	// the lease fields and backdates the heartbeat past the staleness window so
+	// the row is re-claimable on the next poll. The apply's state is left
+	// unchanged: the released row re-enters through the same stale-recovery path
+	// that recovers a crashed driver's work. Mirrors
+	// ApplyOperationStore.ReleaseClaim.
+	//
+	// The write is guarded on the lease token. Reports false when the lease no
+	// longer matches (another writer rotated or cleared it), in which case the
+	// row has moved on and needs nothing from the caller.
+	ReleaseClaim(ctx context.Context, lease ApplyLease) (bool, error)
+
 	// SetRevertSkipped records when skip-revert was dispatched for an apply, so
 	// progress consumers can show that revert was skipped and finalization is in
 	// progress. It is a targeted write of revert_skipped_at that preserves the

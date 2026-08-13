@@ -392,13 +392,14 @@ func cloneControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControl
 
 type capturingApplyStore struct {
 	storage.ApplyStore
-	mu         sync.Mutex
-	apply      *storage.Apply
-	operations []*storage.ApplyOperation
-	taskStore  *capturingTaskStore
-	claimed    bool
-	findCh     chan struct{}
-	err        error
+	mu             sync.Mutex
+	apply          *storage.Apply
+	operations     []*storage.ApplyOperation
+	taskStore      *capturingTaskStore
+	claimed        bool
+	releasedClaims []storage.ApplyLease
+	findCh         chan struct{}
+	err            error
 }
 
 // capture stores a snapshot of the apply, as real storage would materialize a
@@ -495,6 +496,35 @@ func (s *capturingApplyStore) ClaimApplyByID(_ context.Context, _ int64, owner s
 	apply.LeaseOwner = owner
 	apply.LeaseToken = "test-lease-token"
 	return &apply, nil
+}
+
+func (s *capturingApplyStore) Get(_ context.Context, applyID int64) (*storage.Apply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.apply == nil || s.apply.ID != applyID {
+		return nil, nil
+	}
+	apply := *s.apply
+	return &apply, nil
+}
+
+func (s *capturingApplyStore) ReleaseClaim(_ context.Context, lease storage.ApplyLease) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.apply == nil || s.apply.LeaseToken != lease.Token {
+		return false, nil
+	}
+	s.apply.LeaseOwner = ""
+	s.apply.LeaseToken = ""
+	s.releasedClaims = append(s.releasedClaims, lease)
+	return true, nil
+}
+
+// releasedClaimLeases returns the claims handed back through ReleaseClaim.
+func (s *capturingApplyStore) releasedClaimLeases() []storage.ApplyLease {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.releasedClaims)
 }
 
 func (s *capturingApplyStore) FindNextApplyForStopReconciliation(context.Context, string) (*storage.Apply, error) {

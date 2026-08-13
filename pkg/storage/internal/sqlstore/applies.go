@@ -1935,6 +1935,38 @@ func (s *applyStore) SetRevertSkipped(ctx context.Context, applyID int64, at tim
 	return nil
 }
 
+// ReleaseClaim clears the lease fields and backdates the heartbeat past the
+// staleness window, guarded on the lease token, so the row is re-claimable on
+// the next poll. State is intentionally untouched: a released apply is
+// indistinguishable from a crashed driver's work, and the recovery path already
+// re-leases active applies without changing their state. Reports false when the
+// lease no longer matches, meaning another writer already rotated or cleared it
+// and the row has moved on.
+func (s *applyStore) ReleaseClaim(ctx context.Context, lease storage.ApplyLease) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("release claim for apply %d: %w", lease.ApplyID, storage.ErrApplyLeaseLost)
+	}
+	// Backdate one second past the staleness window: updated_at has second
+	// precision, so a backdate of exactly the window can round onto the cutoff
+	// boundary and fail the claim's strict comparison.
+	staleBackdate := storage.ApplyLeaseStaleAfter + time.Second
+	staleHeartbeat := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(staleBackdate.Microseconds())), IntervalMicrosecond)
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE applies
+		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = %s
+		WHERE id = ? AND lease_token = ?
+	`, staleHeartbeat), lease.ApplyID, lease.Token)
+	if err != nil {
+		return false, fmt.Errorf("release claim for apply %d: %w", lease.ApplyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read release claim rows affected for apply %d: %w", lease.ApplyID, err)
+	}
+	return rows > 0, nil
+}
+
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 	// A drive that holds only an operation lease must never bump the parent
 	// applies row: under fan-out the parent's liveness is owned by the parent

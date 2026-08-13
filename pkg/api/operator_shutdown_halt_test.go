@@ -9,6 +9,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // haltingTernClient records whether shutdown halted it, and how many operator
@@ -83,4 +86,70 @@ func TestStopOperatorSkipsClientsWithoutInProcessEngines(t *testing.T) {
 	svc.StopOperator()
 
 	assert.Equal(t, int64(1), local.halts.Load(), "the in-process target is still halted")
+}
+
+// A process going away holds claims on the applies its drivers were driving.
+// Left alone, those claims stay fresh until the staleness window elapses, so
+// the work sits idle for a full minute before any peer driver can pick it up.
+// Shutdown hands them back instead, making the apply claimable on the next
+// poll.
+func TestReleaseHeldClaimsHandsBackAnActiveApply(t *testing.T) {
+	applies := &capturingApplyStore{apply: &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
+		Environment: "staging", State: state.Apply.Running,
+		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
+	}}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
+
+	svc.releaseHeldClaims([]storage.ApplyLease{{ApplyID: 123, Owner: "departing/driver-0", Token: "held-token"}})
+
+	released := applies.releasedClaimLeases()
+	require.Len(t, released, 1, "the claim on a still-active apply is handed back")
+	assert.Equal(t, "held-token", released[0].Token)
+}
+
+// An apply that finished while shutdown was in progress has nothing to hand
+// over, and backdating its heartbeat would misreport when it settled. Shutdown
+// leaves it alone.
+func TestReleaseHeldClaimsLeavesSettledAppliesAlone(t *testing.T) {
+	applies := &capturingApplyStore{apply: &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
+		Environment: "staging", State: state.Apply.Completed,
+		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
+	}}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
+
+	svc.releaseHeldClaims([]storage.ApplyLease{{ApplyID: 123, Owner: "departing/driver-0", Token: "held-token"}})
+
+	assert.Empty(t, applies.releasedClaimLeases(), "a settled apply is not handed back")
+}
+
+// A drive registers the claim it is driving under and deregisters it on the way
+// out, so shutdown hands back exactly the claims still in flight — never one a
+// peer driver has since rotated onto itself.
+func TestTrackHeldClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
+	lease := storage.ApplyLease{ApplyID: 123, Owner: "driver-0", Token: "held-token"}
+
+	done := svc.trackHeldClaim(lease)
+	assert.Equal(t, []storage.ApplyLease{lease}, svc.heldClaimsSnapshot())
+
+	// A peer rotates the lease onto itself mid-drive.
+	rotated := storage.ApplyLease{ApplyID: 123, Owner: "driver-1", Token: "rotated-token"}
+	svc.trackHeldClaim(rotated)
+
+	done()
+	assert.Equal(t, []storage.ApplyLease{rotated}, svc.heldClaimsSnapshot(),
+		"a drive must not deregister a claim another driver now holds")
+}
+
+// A drive that never held a usable lease has no claim to hand back, so nothing
+// is registered for shutdown to release.
+func TestTrackHeldClaimIgnoresAnInvalidLease(t *testing.T) {
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
+
+	done := svc.trackHeldClaim(storage.ApplyLease{ApplyID: 123})
+
+	assert.Empty(t, svc.heldClaimsSnapshot())
+	done()
 }

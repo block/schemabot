@@ -119,6 +119,11 @@ func (s *Service) StopOperator() {
 	// drives are being brought down.
 	close(stop)
 
+	// Snapshot the claims still being driven before cancelling: a drive
+	// deregisters its claim as it returns, so after the cancel there is nothing
+	// left to record, and these are exactly the claims that need handing back.
+	held := s.heldClaimsSnapshot()
+
 	// End the in-flight drives. A drive inside a claim only observes its
 	// context, so cancelling it is what returns it; it exits leaving its apply
 	// active for another driver rather than recording an operator stop.
@@ -133,6 +138,94 @@ func (s *Service) StopOperator() {
 	// down before the process exits, so the lock is released rather than left
 	// held for peer drivers that would reclaim the apply and be refused.
 	s.haltEnginesForShutdown()
+
+	// Only now, with the targets released, hand the claims back. Releasing them
+	// any earlier would invite a peer driver onto a target this process still
+	// held; leaving them to go stale instead would idle the work for the whole
+	// staleness window.
+	s.releaseHeldClaims(held)
+}
+
+// trackHeldClaim registers an apply lease this process is driving under and
+// returns the function that deregisters it when the drive returns. Shutdown
+// snapshots the registered leases so it can hand back the claims still being
+// driven when the process goes away.
+func (s *Service) trackHeldClaim(lease storage.ApplyLease) func() {
+	if !lease.Valid() {
+		// An invalid lease authorizes no write, so there is no claim to hand
+		// back. The drive's own lease validation reports the cause.
+		return func() {}
+	}
+	s.heldClaimsMu.Lock()
+	if s.heldClaims == nil {
+		s.heldClaims = make(map[int64]storage.ApplyLease)
+	}
+	s.heldClaims[lease.ApplyID] = lease
+	s.heldClaimsMu.Unlock()
+
+	return func() {
+		s.heldClaimsMu.Lock()
+		// Delete only this lease: a peer that rotated the lease onto itself is
+		// recorded under a different token, and this drive must not deregister
+		// a claim it no longer owns.
+		if current, ok := s.heldClaims[lease.ApplyID]; ok && current.Token == lease.Token {
+			delete(s.heldClaims, lease.ApplyID)
+		}
+		s.heldClaimsMu.Unlock()
+	}
+}
+
+// heldClaimsSnapshot returns the apply leases this process is currently driving
+// under.
+func (s *Service) heldClaimsSnapshot() []storage.ApplyLease {
+	s.heldClaimsMu.Lock()
+	defer s.heldClaimsMu.Unlock()
+	return slices.Collect(maps.Values(s.heldClaims))
+}
+
+// releaseHeldClaims hands back the claims this process was driving under, so a
+// peer driver picks the work up on its next poll rather than waiting out the
+// staleness window. An apply that settled while shutdown was in progress is
+// left alone: it has nothing to hand over, and backdating its heartbeat would
+// misreport when it finished.
+func (s *Service) releaseHeldClaims(leases []storage.ApplyLease) {
+	if len(leases) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	defer cancel()
+
+	for _, lease := range leases {
+		apply, err := s.storage.Applies().Get(ctx, lease.ApplyID)
+		if err != nil {
+			s.logger.Error("operator: could not read a claimed apply while handing back claims on shutdown; the apply stays claimed until its lease goes stale, delaying the driver that would resume it",
+				"apply_row_lookup_id", lease.ApplyID, "lease_owner", lease.Owner, "error", err)
+			continue
+		}
+		if apply == nil {
+			s.logger.Debug("operator: a claimed apply no longer exists; nothing to hand back",
+				"apply_row_lookup_id", lease.ApplyID, "lease_owner", lease.Owner)
+			continue
+		}
+		if state.IsTerminalApplyState(apply.State) {
+			s.logger.Debug("operator: claimed apply settled before shutdown handed its claim back",
+				append(apply.LogAttrs(), "lease_owner", lease.Owner)...)
+			continue
+		}
+		released, err := s.storage.Applies().ReleaseClaim(ctx, lease)
+		if err != nil {
+			s.logger.Error("operator: could not hand back a claimed apply on shutdown; the apply stays claimed until its lease goes stale, delaying the driver that would resume it",
+				append(apply.LogAttrs(), "lease_owner", lease.Owner, "error", err)...)
+			continue
+		}
+		if !released {
+			s.logger.Debug("operator: a claimed apply's lease had already moved on; nothing to hand back",
+				append(apply.LogAttrs(), "lease_owner", lease.Owner)...)
+			continue
+		}
+		s.logger.Info("operator: handed a claimed apply back on shutdown; it is claimable again on the next poll",
+			append(apply.LogAttrs(), "lease_owner", lease.Owner)...)
+	}
 }
 
 // shutdownHaltTimeout bounds how long shutdown waits for this process's engines
@@ -1299,6 +1392,7 @@ type resumeClaimedApplyOptions struct {
 
 func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, operationDeployment string, opts resumeClaimedApplyOptions) (bool, error) {
 	lease := apply.Lease()
+	defer s.trackHeldClaim(lease)()
 	start := s.clock.Now()
 
 	// Bind the apply's identity once so every line of this drive is
