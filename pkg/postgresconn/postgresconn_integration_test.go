@@ -29,6 +29,27 @@ func TestOpenAgainstPostgres(t *testing.T) {
 	assert.Equal(t, 1, one)
 }
 
+// Sessions run in UTC even when the database default is a different
+// timezone, so server-side now() feeds storage's timestamp comparisons
+// consistently across pods regardless of server configuration. Startup-packet
+// parameters take precedence over ALTER DATABASE defaults, which this pins.
+func TestOpenPinsSessionTimezoneToUTC(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_tz")
+
+	_, err := adminDB.ExecContext(t.Context(),
+		`ALTER DATABASE postgresconn_tz SET timezone = 'America/New_York'`)
+	require.NoError(t, err)
+
+	db, err := Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var tz string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW timezone").Scan(&tz))
+	assert.Equal(t, "UTC", tz)
+}
+
 // Rotating the storage password out from under a running pool must be
 // transparent: the next fresh physical connection is rejected with an
 // authentication error, the pool re-resolves the DSN through reload, retries,

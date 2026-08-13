@@ -116,6 +116,27 @@ func TestWithConnectTimeout(t *testing.T) {
 	assert.Equal(t, time.Duration(0), cfg.ConnectTimeout)
 }
 
+// Sessions are pinned to timezone=UTC so server-side now() is UTC on any
+// server default, keeping storage's timestamp comparisons consistent across
+// pods. An explicit timezone in the DSN wins, in either DSN form.
+func TestConnectionConfigPinsUTCTimezone(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot password=secret dbname=app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?timezone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot timezone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", cfg.RuntimeParams["timezone"])
+}
+
 // stubConn is the minimal driver.Conn a fake dial can hand back.
 type stubConn struct{}
 
