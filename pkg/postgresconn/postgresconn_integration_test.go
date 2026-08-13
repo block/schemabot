@@ -3,6 +3,7 @@
 package postgresconn
 
 import (
+	"database/sql"
 	"net/url"
 	"sync/atomic"
 	"testing"
@@ -34,18 +35,34 @@ func TestOpenAgainstPostgres(t *testing.T) {
 // consistently across pods regardless of server configuration. Startup-packet
 // parameters take precedence over ALTER DATABASE defaults, which this pins.
 func TestOpenPinsSessionTimezoneToUTC(t *testing.T) {
+	// PGTZ is a libpq env fallback that reaches every session below as an
+	// explicit timezone; clear it so both the baseline and the pin assert
+	// server-versus-connection behavior alone.
+	t.Setenv("PGTZ", "")
+
 	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_tz")
 
 	_, err := adminDB.ExecContext(t.Context(),
 		`ALTER DATABASE postgresconn_tz SET timezone = 'America/New_York'`)
 	require.NoError(t, err)
 
+	// Baseline: a fresh unpinned session must observe the non-UTC database
+	// default. ALTER DATABASE only affects new sessions, so a raw pool opened
+	// now proves the default took effect — without this, a UTC assertion on
+	// the pinned pool holds on any UTC-default server even if Open never
+	// pinned anything.
+	baseline, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(baseline) })
+	var tz string
+	require.NoError(t, baseline.QueryRowContext(t.Context(), "SHOW timezone").Scan(&tz))
+	require.Equal(t, "America/New_York", tz)
+
 	db, err := Open(dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 
-	var tz string
 	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW timezone").Scan(&tz))
 	assert.Equal(t, "UTC", tz)
 }
