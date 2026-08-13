@@ -484,7 +484,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	t.Cleanup(func() {
 		// Cleanup runs after the test context is cancelled, so it needs a context
 		// that outlives it.
-		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		dropCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 		defer cancel()
 		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
 			t.Logf("cleanup: drop database %s: %v", appDBName, err)
@@ -513,9 +513,13 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	require.NoError(t, err, "start tern grpc")
 
 	// Create SchemaBot with its own storage and a GRPCClient to remote Tern.
+	// The service owns both handles once it is built — its Close closes the
+	// storage, which closes this DB, and every Tern client it was given. These
+	// closes only cover an early failure before the service exists, so they
+	// discard the error the service's own close makes inevitable.
 	schemabotDB, err := sql.Open("mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
-	defer utils.CloseAndLog(schemabotDB)
+	defer func() { _ = schemabotDB.Close() }()
 	require.NoError(t, schemabotDB.PingContext(ctx), "ping schemabot db")
 	schemabotStorage := schemabotmysql.New(schemabotDB)
 
@@ -524,7 +528,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 		Storage: schemabotStorage,
 	})
 	require.NoError(t, err, "create tern client")
-	defer utils.CloseAndLog(ternClient)
+	defer func() { _ = ternClient.Close() }()
 
 	serverConfig := &schemabotapi.ServerConfig{
 		Databases: map[string]schemabotapi.DatabaseConfig{
@@ -638,6 +642,11 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 		"task %s should be failed, but is %q", dupTask.TaskIdentifier, dupTask.State)
 	assert.Contains(t, dupTask.ErrorMessage, "checksum failed",
 		"failed task should carry the engine's own reason for this table, mirrored from the remote per-table progress")
+	// The apply-level error names the table it blames ("table X failed: ..."),
+	// so its absence here shows the reason came from this table's own remote
+	// progress rather than from the apply-level error being stamped over it.
+	assert.NotContains(t, dupTask.ErrorMessage, "table "+dupTask.TableName+" failed",
+		"per-table reason should reach the task row directly, not by way of the apply-level error")
 }
 
 // TestGRPC_ServerSideTargetPlan verifies that HTTP plan succeeds when the

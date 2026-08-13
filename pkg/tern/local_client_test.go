@@ -3821,6 +3821,8 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 		State:          state.Task.Completed,
 		DDLAction:      "alter",
 	}
+	// An earlier table's failure ends the sequential apply, so a table still
+	// pending is cancelled rather than run.
 	blockedTask := &storage.Task{
 		ID:             10,
 		ApplyID:        apply.ID,
@@ -3829,7 +3831,7 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 		DatabaseType:   storage.DatabaseTypeMySQL,
 		Engine:         storage.EngineSpirit,
 		TableName:      "payments",
-		State:          state.Task.Failed,
+		State:          state.Task.Cancelled,
 		DDLAction:      "alter",
 	}
 	client := &LocalClient{
@@ -3855,5 +3857,5 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
 	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
 	assert.Empty(t, byTable["payments"].ErrorMessage,
-		"a table that failed only because an earlier table's failure blocked it has no error of its own, so the root-cause table stays identifiable")
+		"a table cancelled because an earlier table's failure ended the apply has no error of its own, so the root-cause table stays identifiable")
 }
