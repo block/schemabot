@@ -993,6 +993,35 @@ func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
 	return data, nil
 }
 
+// mirroredControlRequestMetadataKey marks a control request row this plane never
+// queued: the row exists only because another plane reported the operation
+// rejected, as happens for a pure proxy like volume where the request lives
+// entirely in the serving plane. Such a row has no local lifecycle to reset it,
+// so it is the mirror's to clear when the operation later succeeds. Rows this
+// plane queued itself carry no marker and are only ever cleared by their own
+// request lifecycle.
+const mirroredControlRequestMetadataKey = "mirrored_remote_rejection"
+
+// MirroredControlRequestMetadata returns the metadata stamped on a control
+// request row created solely to carry another plane's rejection.
+func MirroredControlRequestMetadata() []byte {
+	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
+}
+
+// IsMirroredRemoteRejection reports whether this row exists only to carry
+// another plane's rejection, so no local request lifecycle will ever clear it.
+func (r *ApplyControlRequest) IsMirroredRemoteRejection() bool {
+	if r == nil || len(r.Metadata) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return false
+	}
+	marked, _ := payload[mirroredControlRequestMetadataKey].(bool)
+	return marked
+}
+
 // DecodeVolumeControlRequestMetadata parses the desired volume level from a
 // volume control request's metadata, validating the shared volume range.
 func DecodeVolumeControlRequestMetadata(metadata []byte) (int32, error) {

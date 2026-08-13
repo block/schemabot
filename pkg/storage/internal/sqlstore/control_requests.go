@@ -236,7 +236,7 @@ func (s *controlRequestStore) ListSettled(ctx context.Context, applyID int64) ([
 func (s *controlRequestStore) RecordRemoteFailure(ctx context.Context, req *storage.ApplyControlRequest) (bool, error) {
 	var changed bool
 	op := fmt.Sprintf("record remote failure for apply %d operation %s", req.ApplyID, req.Operation)
-	err := withLockRetry(ctx, op, func() error {
+	err := withLockRetry(ctx, s.classifier, op, func() error {
 		var attemptErr error
 		changed, attemptErr = s.recordRemoteFailure(ctx, req)
 		return attemptErr
@@ -257,6 +257,21 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 	existing, err := s.getByApplyOperationForUpdate(ctx, tx, req.ApplyID, req.Operation)
 	if err != nil {
 		return false, err
+	}
+	// A pending row is a live request this plane has not handed to the serving
+	// plane yet, so it is necessarily newer than anything the serving plane has
+	// already settled — the report in hand describes a superseded attempt. The
+	// local plane completes a request the moment the serving plane accepts it,
+	// so the row a real rejection lands on is completed or absent, never
+	// pending. Overwriting a pending row would drop the operator's command:
+	// nothing forwards it once it stops being pending.
+	if existing != nil && existing.Status == storage.ControlRequestPending {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit superseded remote failure read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+		}
+		slog.DebugContext(ctx, "ignoring remote control rejection for an operation that has been requested again",
+			"apply_id", req.ApplyID, "operation", req.Operation)
+		return false, nil
 	}
 	// The same rejection is reported on every poll until the operator retries
 	// the operation, so an unchanged row means the failure is already recorded.
@@ -280,12 +295,63 @@ func (s *controlRequestStore) recordRemoteFailure(ctx context.Context, req *stor
 		) VALUES (?, ?, ?, ?, ?, ?, NOW())
 	`,
 		req.ApplyID, req.Operation, storage.ControlRequestFailed,
-		req.RequestedBy, nullString(req.ErrorMessage), nullJSON(req.Metadata),
+		req.RequestedBy, nullString(req.ErrorMessage), nullJSON(storage.MirroredControlRequestMetadata()),
 	); err != nil {
 		return false, fmt.Errorf("create failed control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("commit remote failure for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	}
+	return true, nil
+}
+
+func (s *controlRequestStore) ClearRemoteFailure(ctx context.Context, applyID int64, operation storage.ControlOperation) (bool, error) {
+	var changed bool
+	op := fmt.Sprintf("clear remote failure for apply %d operation %s", applyID, operation)
+	err := withLockRetry(ctx, s.classifier, op, func() error {
+		var attemptErr error
+		changed, attemptErr = s.clearRemoteFailure(ctx, applyID, operation)
+		return attemptErr
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed, nil
+}
+
+func (s *controlRequestStore) clearRemoteFailure(ctx context.Context, applyID int64, operation storage.ControlOperation) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin clear remote failure transaction for apply %d operation %s: %w", applyID, operation, err)
+	}
+	defer rollbackTx(ctx, tx, "clear remote failure")
+
+	existing, err := s.getByApplyOperationForUpdate(ctx, tx, applyID, operation)
+	if err != nil {
+		return false, err
+	}
+	// Only a row the mirror itself created is the mirror's to clear. A row this
+	// plane queued carries its own lifecycle — re-requesting it resets it to
+	// pending — so clearing one here could erase a failure this plane recorded
+	// for its own reason.
+	clearable := existing != nil &&
+		existing.Status == storage.ControlRequestFailed &&
+		existing.IsMirroredRemoteRejection()
+	if !clearable {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit clear remote failure read for apply %d operation %s: %w", applyID, operation, err)
+		}
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET status = ?, error_message = NULL, completed_at = NOW(), updated_at = NOW()
+		WHERE id = ?
+	`, storage.ControlRequestCompleted, existing.ID); err != nil {
+		return false, fmt.Errorf("clear remote failure on control request %d for apply %d operation %s: %w", existing.ID, applyID, operation, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit clear remote failure for apply %d operation %s: %w", applyID, operation, err)
 	}
 	return true, nil
 }

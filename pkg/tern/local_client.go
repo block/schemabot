@@ -2330,7 +2330,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			"apply_id", req.ApplyId, "operation_count", len(ops), "state", apply.State)
 		settled, err := c.settledControlRequests(ctx, apply)
 		if err != nil {
-			return nil, err
+			c.logger.Error("progress: serving a task-less apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+				append(apply.LogAttrs(), "error", err)...)
 		}
 		return &ternv1.ProgressResponse{
 			State:                  storageStateToProto(apply.State),
@@ -2559,7 +2560,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		resp.ApplyId = apply.ApplyIdentifier
 		settled, err := c.settledControlRequests(ctx, apply)
 		if err != nil {
-			return nil, err
+			c.logger.Error("progress: serving an apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+				append(apply.LogAttrs(), "error", err)...)
 		}
 		resp.SettledControlRequests = settled
 		if eng, err := engineNameToProto(apply.Engine); err != nil {
@@ -2663,6 +2665,12 @@ func (c *LocalClient) loadStoredShardsByTable(ctx context.Context, apply *storag
 // when it takes effect, so this is how the plane that accepted one learns
 // whether the operation actually landed — without it, a rejection recorded here
 // never leaves this plane.
+//
+// Callers on the progress path degrade rather than propagate: the field is
+// advisory, and the same settled rows are reported on every poll until the
+// operator retries the operation, so a failed load costs one tick of notice and
+// self-heals. Failing the RPC instead would throw away the state and task
+// progress the caller drives the apply from, over a field it only displays.
 func (c *LocalClient) settledControlRequests(ctx context.Context, apply *storage.Apply) ([]*ternv1.SettledControlRequest, error) {
 	controlStore := c.storage.ControlRequests()
 	if controlStore == nil {

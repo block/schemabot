@@ -1022,10 +1022,21 @@ type ControlRequestStore interface {
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// RecordRemoteFailure records the terminal failure another plane reported
-	// for a control request, whatever status the local row carries — a locally
-	// completed row means the request was queued there, which a later rejection
-	// overtakes — and creates the row when the local plane never held one. It
+	// for a control request, and creates the row when the local plane never held
+	// one. A locally completed row means the request was queued there, which a
+	// later rejection overtakes; a locally pending row is a live request this
+	// plane has not forwarded yet, so a settled report necessarily describes a
+	// superseded attempt and is ignored rather than dropping the command. It
 	// reports whether the stored row changed, so a caller polling the same
 	// rejection every tick surfaces it exactly once.
 	RecordRemoteFailure(ctx context.Context, req *ApplyControlRequest) (bool, error)
+
+	// ClearRemoteFailure retires a rejection this plane mirrored from another,
+	// for use when that plane later reports the same operation succeeded. It
+	// only touches a failed row the mirror itself created: rows this plane
+	// queued are cleared by their own request lifecycle, and a row with no
+	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// keep warning about a command the operator has since re-issued
+	// successfully. It reports whether the stored row changed.
+	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)
 }

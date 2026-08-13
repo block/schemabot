@@ -1681,13 +1681,20 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 		return
 	}
 	for _, entry := range settled {
-		if entry == nil || entry.Status != string(storage.ControlRequestFailed) {
+		if entry == nil {
 			continue
 		}
 		operation := storage.ControlOperation(entry.Operation)
 		if !operation.Valid() {
-			logger.Warn("data plane reported a rejection for an unrecognized control operation; it will not reach the operator",
-				append(apply.MutableLogAttrs(), "operation", entry.Operation)...)
+			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
+		if entry.Status == string(storage.ControlRequestCompleted) {
+			c.retireMirroredControlRejection(ctx, apply, controlStore, operation)
+			continue
+		}
+		if entry.Status != string(storage.ControlRequestFailed) {
 			continue
 		}
 		message := remoteControlRejectionMessage(entry)
@@ -1719,6 +1726,33 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 			fmt.Sprintf("%s was accepted but not applied: %s%s", remoteControlOperationLabel(operation), message,
 				callerApplyLogSuffix(entry.RequestedBy)), "", "")
 	}
+}
+
+// retireMirroredControlRejection clears a rejection this plane mirrored once the
+// data plane reports the same operation succeeded. It matters for an operation
+// this plane only proxies — volume, whose request lives entirely in the data
+// plane — because the mirrored row is the sole record here and no local request
+// lifecycle will ever reset it: without this the operator re-issues the command,
+// it works, and the PR keeps warning that it did not.
+func (c *GRPCClient) retireMirroredControlRejection(
+	ctx context.Context,
+	apply *storage.Apply,
+	controlStore storage.ControlRequestStore,
+	operation storage.ControlOperation,
+) {
+	changed, err := controlStore.ClearRemoteFailure(ctx, apply.ID, operation)
+	if err != nil {
+		c.applyLogger(apply).Warn("failed to clear a mirrored control rejection the data plane has since completed; the notice stays until a later poll clears it",
+			append(apply.MutableLogAttrs(), "operation", string(operation), "error", err)...)
+		return
+	}
+	if !changed {
+		return
+	}
+	c.applyLogger(apply).Info("data plane completed a control command it had previously rejected; clearing the mirrored rejection",
+		append(apply.MutableLogAttrs(), "operation", string(operation))...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition,
+		fmt.Sprintf("%s succeeded on a later attempt; the earlier rejection no longer applies", remoteControlOperationLabel(operation)), "", "")
 }
 
 // remoteControlRejectionMessage renders the reason the data plane gave, falling
