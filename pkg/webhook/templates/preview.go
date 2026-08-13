@@ -81,10 +81,10 @@ func PreviewCommentPlanBlocked() string {
 	})
 }
 
-// PreviewCommentPlanHeldBackDrop renders a sample plan whose drop targets an
-// object another open pull request applied but has not merged yet, so the entry
-// is annotated with its owner and the apply prompt is withheld.
-func PreviewCommentPlanHeldBackDrop() string {
+// PreviewCommentPlanAttributedDrop renders a sample plan whose drop targets a
+// table another open pull request applied but has not merged yet, so the entry
+// is annotated with its owner.
+func PreviewCommentPlanAttributedDrop() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:    "testapp",
 		SchemaName:  "testapp",

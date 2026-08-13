@@ -1,8 +1,8 @@
 //go:build integration
 
-// Integration tests for the plan comment's held-back-drop annotation: the guard
-// that keeps a plan from presenting a drop of an object another pull request
-// owns as a change the planning pull request proposes.
+// Integration tests for the plan comment's drop-attribution annotation: the
+// disclosure that keeps a plan from presenting a drop of a table another pull
+// request owns as a change the planning pull request proposes.
 
 package webhook
 
@@ -46,10 +46,10 @@ const (
 // and merges afterwards, so between those two moments the live database carries
 // a table no merged tree describes. A plan on a different pull request diffs its
 // own schema files against that database and reads the table as one to drop. The
-// plan comment names the pull request the table belongs to and offers no apply
-// command, so an operator cannot destroy another team's table by pasting one
-// line.
-func TestE2EPlanHoldsBackDropOfObjectAnOpenPullRequestOwns(t *testing.T) {
+// plan comment names the pull request the table belongs to, so an operator
+// deciding whether to reconcile the database to the declared schema can see
+// that the table traces to a change that has not merged yet.
+func TestE2EPlanFlagsDropOfTableAnOpenPullRequestOwns(t *testing.T) {
 	dbName := "webhook_drop_ownership"
 	svc := setupE2EService(t, dbName)
 	resetOwnershipHistory(t, dbName)
@@ -84,19 +84,19 @@ func TestE2EPlanHoldsBackDropOfObjectAnOpenPullRequestOwns(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP TABLE", "the plan still shows the diff it computed")
-		assert.Contains(t, body, "🛑 **Held back**")
+		assert.Contains(t, body, "🛑 **Check before applying**")
 		assert.Contains(t, body, "`reconcile_state`")
 		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
-		assert.NotContains(t, body, "▶️ **To apply**", "a held-back drop must not come with a pasteable apply command")
-		assert.Contains(t, body, "No apply command is offered")
+		assert.Contains(t, body, "▶️ **To apply**",
+			"reconciling to the declared schema stays the operator's call, so the command is still offered")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the plan comment")
 	}
 }
 
 // Once the pull request that applied the table is closed, the table is nobody's
-// open claim: the plan renders the drop normally and offers the apply command,
-// so a legitimate cleanup is never held back.
+// open claim: the plan renders the drop with no attribution notice, so a
+// legitimate cleanup carries no warning it does not need.
 func TestE2EPlanOffersDropWhenTheOwningPullRequestIsClosed(t *testing.T) {
 	dbName := "webhook_drop_owner_closed"
 	svc := setupE2EService(t, dbName)
@@ -131,18 +131,18 @@ func TestE2EPlanOffersDropWhenTheOwningPullRequestIsClosed(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "DROP TABLE")
-		assert.NotContains(t, body, "🛑 **Held back**")
+		assert.NotContains(t, body, "🛑 **Check before applying**")
 		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the plan comment")
 	}
 }
 
-// A plan that cannot establish who owns an object it would drop must not present
-// the drop as this pull request's to make. The lookup fails toward ownership: the
-// entry is annotated as unresolved, the apply prompt is withheld, and the
-// underlying failure stays in the server logs rather than the public comment.
-func TestE2EPlanHoldsBackDropWhenOwnershipLookupFails(t *testing.T) {
+// A plan that cannot establish who owns a table it would drop must not present
+// the drop as unremarkable. The lookup fails toward ownership: the entry is
+// annotated as unresolved, and the underlying failure stays in the server logs
+// rather than the public comment.
+func TestE2EPlanFlagsDropAsUnresolvedWhenOwnershipLookupFails(t *testing.T) {
 	dbName := "webhook_drop_ownership_error"
 	svc := setupE2EServiceWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
 		return &ownershipLookupFailureStorage{Storage: st}
@@ -171,11 +171,11 @@ func TestE2EPlanHoldsBackDropWhenOwnershipLookupFails(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "🛑 **Held back**")
+		assert.Contains(t, body, "🛑 **Check before applying**")
 		assert.Contains(t, body, "`reconcile_state`")
 		assert.Contains(t, body, "ownership could not be established")
 		assert.NotContains(t, body, ownershipLookupFailureMessage, "a public comment must not carry the raw lookup error")
-		assert.NotContains(t, body, "▶️ **To apply**")
+		assert.Contains(t, body, "▶️ **To apply**")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the plan comment")
 	}

@@ -141,7 +141,7 @@ schemabot unlock
 </details>
 
 <details>
-<summary><a name="mysql-plan-heldback-drop"></a><strong>MySQL Plan (Held-back Drop)</strong></summary>
+<summary><a name="mysql-plan-drop-attributed-to-another-pr"></a><strong>MySQL Plan (Drop Attributed To Another PR)</strong></summary>
 
 
 ## Schema Change Plan — Staging
@@ -156,10 +156,10 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 DROP TABLE `reconcile_state`;
 ```
 
-🛑 **Held back**: **1** drop that may not be this PR's to make
+🛑 **Check before applying**: **1** drop attributed to another open PR
 - `reconcile_state`: last changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), still open
 
-A plan diffs this PR's schema files against the live database, so a table another PR applied before merging reads here as one to drop. Merge that PR, or add the table's definition to this PR's schema files, then re-plan.
+A plan diffs this PR's schema files against the live database, so a table another PR applied before merging reads here as one to drop. If that is not what you intend, merge that PR, or add the table's definition to this PR's schema files, then re-plan.
 
 ⚠️ **Issues**: **1** unsafe change detected
 - `reconcile_state`: DROP TABLE removes all data
@@ -173,7 +173,10 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-⛔ **No apply command is offered** for this plan. Resolve the drops listed above first.
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
 
 </details>
 

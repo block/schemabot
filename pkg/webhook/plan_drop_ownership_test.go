@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -44,7 +43,7 @@ func TestPlannedDropTables_NoDrops(t *testing.T) {
 	assert.Empty(t, plannedDropTables(nil))
 }
 
-func TestRenderPlanComment_HeldBackDropNamesOwnerAndWithholdsApply(t *testing.T) {
+func TestRenderPlanComment_AttributedDropNamesOwnerAndStillOffersApply(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:    "testdb",
 		Environment: "staging",
@@ -62,11 +61,12 @@ func TestRenderPlanComment_HeldBackDropNamesOwnerAndWithholdsApply(t *testing.T)
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "🛑 **Held back**: **1** drop that may not be this PR's to make")
+	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** drop attributed to another open PR")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
-	assert.NotContains(t, rendered, "▶️ **To apply**")
-	assert.Contains(t, rendered, "No apply command is offered")
-	require.True(t, data.ApplyPromptWithheld())
+	// Reconciling the live database to the declared schema stays the operator's
+	// call, so the attribution informs the decision without removing it.
+	assert.Contains(t, rendered, "▶️ **To apply**")
+	assert.Contains(t, rendered, "schemabot apply -e staging")
 }
 
 func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T) {
@@ -84,10 +84,10 @@ func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "ownership could not be established; see server logs")
-	assert.NotContains(t, rendered, "▶️ **To apply**")
+	assert.Contains(t, rendered, "▶️ **To apply**")
 }
 
-func TestRenderMultiEnvPlanComment_HeldBackDropInOneEnvironmentWithholdsEverySequenceStep(t *testing.T) {
+func TestRenderMultiEnvPlanComment_AttributedDropAnnotatesItsOwnEnvironmentOnly(t *testing.T) {
 	staging := templates.PlanCommentData{
 		Database:    "testdb",
 		Environment: "staging",
@@ -124,7 +124,9 @@ func TestRenderMultiEnvPlanComment_HeldBackDropInOneEnvironmentWithholdsEverySeq
 		Errors: map[string]string{},
 	})
 
-	assert.Contains(t, rendered, "🛑 **Held back**")
-	assert.NotContains(t, rendered, "▶️ **To apply**")
-	assert.Contains(t, rendered, "No apply command is offered")
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	// The sequence walks the environments in order and is offered in full: the
+	// attribution belongs to staging's drop, not to production's unrelated add.
+	assert.Contains(t, rendered, "▶️ **To apply**")
+	assert.Contains(t, rendered, "schemabot apply -e staging")
 }

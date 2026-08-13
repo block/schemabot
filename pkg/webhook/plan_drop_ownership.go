@@ -11,13 +11,14 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// annotateOwnedDrops fills in the plan comment's held-back drops: the tables
+// annotateOwnedDrops fills in the plan comment's attributed drops: the tables
 // the plan would drop that SchemaBot cannot vouch for as this pull request's to
 // drop.
 //
-// A held-back drop is always a whole table. Stored task history names the table
-// a task changed and nothing finer, so a destructive change to a table that
-// survives — a dropped column or index — is outside what this can attribute.
+// An attributed drop is always a whole table. Stored task history names the
+// table a task changed and nothing finer, so a destructive change to a table
+// that survives — a dropped column or index — is outside what this can
+// attribute.
 //
 // SchemaBot's workflow is schema-first — a pull request applies its schema
 // change and merges afterwards — so between those two moments the live database
@@ -26,9 +27,13 @@ import (
 // the table reads as one to drop. Stored task history knows better: it records
 // which pull request last changed each table.
 //
+// Reconciling the database to the declared schema stays the operator's call —
+// that is what declarative means — so the annotation informs rather than
+// blocks, and the plan still offers its apply command.
+//
 // The lookup fails toward ownership. A storage failure, or a pull-request state
 // lookup that fails, annotates the drop as unresolved rather than letting it
-// fall through to a bare drop with an apply prompt beside it.
+// render as a drop with nothing said about it.
 func (h *Handler) annotateOwnedDrops(ctx context.Context, client *ghclient.InstallationClient, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, repo string, pr int, environment string) {
 	if data == nil {
 		return
@@ -51,13 +56,13 @@ func (h *Handler) annotateOwnedDrops(ctx context.Context, client *ghclient.Insta
 	}
 }
 
-// classifyPlannedDrop decides whether one planned drop must be held back, and
+// classifyPlannedDrop decides whether one planned drop must be annotated, and
 // how it should read. annotate is false only when the lookup positively
 // established that no other pull request has an open claim on the table.
 func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.InstallationClient, ref storage.TableRef, repo string, pr int, table string) (drop templates.OwnedDropData, annotate bool) {
 	owners, err := h.service.Storage().Tasks().FindTableOwners(ctx, ref)
 	if err != nil {
-		h.logger.Error("planned drop will be held back: table-ownership lookup failed",
+		h.logger.Error("planned drop will be annotated as unresolved: table-ownership lookup failed",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table, "error", err)
 		metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
@@ -74,7 +79,7 @@ func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.Inst
 		checked++
 		info, err := client.FetchPullRequest(ctx, owner.Repository, owner.PullRequest)
 		if err != nil {
-			h.logger.Error("planned drop will be held back: owning pull request's state could not be read",
+			h.logger.Error("planned drop will be annotated as unresolved: owning pull request's state could not be read",
 				"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 				"environment", ref.Environment, "table", table,
 				"owner_repo", owner.Repository, "owner_pr", owner.PullRequest, "error", err)
@@ -82,13 +87,13 @@ func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.Inst
 			return templates.OwnedDropData{Table: table, Unresolved: true}, true
 		}
 		if info.IsClosed() {
-			h.logger.Debug("planned drop is not held back by this owner: its pull request is closed",
+			h.logger.Debug("planned drop is not attributed to this owner: its pull request is closed",
 				"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment,
 				"table", table, "owner_repo", owner.Repository, "owner_pr", owner.PullRequest,
 				"owner_merged", info.Merged)
 			continue
 		}
-		h.logger.Warn("planned drop will be held back: an open pull request last changed this table",
+		h.logger.Warn("planned drop will be annotated: an open pull request last changed this table",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table,
 			"owner_repo", owner.Repository, "owner_pr", owner.PullRequest)

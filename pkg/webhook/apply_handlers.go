@@ -323,7 +323,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
 
-	// Build plan comment data with lock info. The held-back-drop disclosure sits
+	// Build plan comment data with lock info. The attributed-drop disclosure sits
 	// on this comment for the same reason as the direct-execution one: it must
 	// be on the comment the confirmation acts on.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
