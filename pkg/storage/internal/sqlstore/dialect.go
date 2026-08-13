@@ -47,6 +47,17 @@ type Dialect interface {
 	// placed immediately after a table name or alias; dialects without index-hint
 	// syntax return an empty string.
 	IndexHint(index string) string
+	// JoinedUpdate returns an UPDATE that changes target rows selected through a
+	// join. Aliases qualify join and predicate expressions, while assignments to
+	// target columns must be unqualified so the statement is valid across
+	// dialects. joinCondition and predicate remain separate so dialects can place
+	// them in the clauses their syntax requires. Because that placement differs
+	// per dialect, joinCondition must not contain bind placeholders: placeholders
+	// are permitted only in assignment expressions and predicate, and callers
+	// supply their arguments in that order. Implementations panic when
+	// assignments is empty, joinCondition contains a placeholder, or an
+	// assignment column is qualified.
+	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 }
 
 // InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
@@ -118,6 +129,13 @@ func ParameterIntervalAmount() IntervalAmount {
 // existing row. Expr is the raw SQL update expression; when empty, the column is
 // set to its excluded (to-be-inserted) value.
 type UpsertAssignment struct {
+	Column string
+	Expr   string
+}
+
+// JoinedUpdateAssignment describes one target-table column update. Column is
+// unqualified; Expr is the raw SQL expression assigned to it.
+type JoinedUpdateAssignment struct {
 	Column string
 	Expr   string
 }
@@ -203,6 +221,27 @@ func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
 // IndexHint returns a MySQL FORCE INDEX hint for the named index.
 func (MySQLDialect) IndexHint(index string) string {
 	return " FORCE INDEX (`" + strings.ReplaceAll(index, "`", "``") + "`)"
+}
+
+// JoinedUpdate builds a MySQL multi-table UPDATE statement.
+func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	if len(assignments) == 0 {
+		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
+	}
+	sets := make([]string, len(assignments))
+	for i, assignment := range assignments {
+		if strings.Contains(assignment.Column, ".") {
+			panic("sqlstore: JoinedUpdate assignment columns must be unqualified")
+		}
+		sets[i] = targetAlias + "." + assignment.Column + " = " + assignment.Expr
+	}
+	return "UPDATE " + targetTable + " " + targetAlias +
+		" JOIN " + joinTable + " " + joinAlias + " ON " + joinCondition +
+		" SET " + strings.Join(sets, ", ") +
+		" WHERE " + predicate
 }
 
 func mysqlIntervalUnit(unit IntervalUnit) string {

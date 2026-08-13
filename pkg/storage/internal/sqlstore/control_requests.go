@@ -17,6 +17,7 @@ type controlRequestStore struct {
 	db         *rebindDB
 	identity   identityInserter
 	classifier ErrorClassifier
+	dialect    Dialect
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
@@ -150,12 +151,16 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 		}
 		return nil
 	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_control_requests cr
-		JOIN applies a ON a.id = cr.apply_id
-		SET cr.status = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
-		WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?
-	`, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending, lease.Token)
+	query := s.dialect.JoinedUpdate(
+		"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "status", Expr: "?"},
+			{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?",
+	)
+	result, err := s.db.ExecContext(ctx, query, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
 		return fmt.Errorf("complete pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}
@@ -181,12 +186,17 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 		}
 		return nil
 	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE apply_control_requests cr
-		JOIN applies a ON a.id = cr.apply_id
-		SET cr.status = ?, cr.error_message = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()), cr.updated_at = NOW()
-		WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?
-	`, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending, lease.Token)
+	query := s.dialect.JoinedUpdate(
+		"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "status", Expr: "?"},
+			{Column: "error_message", Expr: "?"},
+			{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?",
+	)
+	result, err := s.db.ExecContext(ctx, query, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
 		return fmt.Errorf("fail pending control requests for apply %d operation %s: %w", applyID, operation, err)
 	}

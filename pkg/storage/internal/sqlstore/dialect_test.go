@@ -33,6 +33,66 @@ func TestMySQLDialectIndexHint(t *testing.T) {
 	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
 }
 
+func TestMySQLDialectJoinedUpdate(t *testing.T) {
+	assert.Equal(t,
+		"UPDATE apply_comments c JOIN applies a ON a.id = c.apply_id SET c.edit_count = c.edit_count + 1, c.updated_at = NOW() WHERE c.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "edit_count", Expr: "c.edit_count + 1"},
+				{Column: "updated_at", Expr: "NOW()"},
+			},
+			"c.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+	// A placeholder assignment expression must render ahead of the predicate's
+	// placeholders, pinning the interface's assignments-then-predicate argument
+	// order at the rendering level.
+	assert.Equal(t,
+		"UPDATE apply_control_requests cr JOIN applies a ON a.id = cr.apply_id SET cr.status = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()) WHERE cr.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedUpdate(
+			"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "status", Expr: "?"},
+				{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			},
+			"cr.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+func TestMySQLDialectJoinedUpdateRequiresAssignments(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate requires at least one assignment", func() {
+		MySQLDialect{}.JoinedUpdate("apply_comments", "c", "applies", "a", "a.id = c.apply_id", nil, "c.apply_id = ?")
+	})
+}
+
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestMySQLDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate joinCondition must not contain bind placeholders", func() {
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id AND a.state = ?",
+			[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
+// The dialect qualifies assignment columns with the target alias itself, so a
+// pre-qualified column would render an invalid double-qualified reference and
+// break on dialects with different assignment syntax.
+func TestMySQLDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate assignment columns must be unqualified", func() {
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{{Column: "c.state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The
