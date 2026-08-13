@@ -16,6 +16,7 @@
 - [Metrics](#metrics)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
+- [Storage Dialect](#storage-dialect)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Storage Schema Changes](#storage-schema-changes)
@@ -416,6 +417,35 @@ disabled one — is set on a non-MySQL database, when the policy is enabled
 without a positive `max_table_rows`, or when `lock_acquisition_timeout` is malformed
 (not a duration, under a second, or not whole seconds). A policy that can
 never take effect is never silently carried in config.
+
+## Storage Dialect
+
+SchemaBot's internal storage database runs on MySQL by default. Set
+`storage.dialect` to select the database family; the dialect routes schema
+bootstrapping, connection handling, and the storage implementation together,
+so the whole storage stack always agrees on the database family.
+
+```yaml
+storage:
+  dialect: "postgres"   # default: "mysql"
+  dsn: "env:SCHEMABOT_DSN"
+```
+
+Supported values are `mysql` (the default when unset) and `postgres`
+(matching is case-insensitive). Any other value fails config validation —
+an unknown dialect never falls back to the MySQL flow.
+
+The DSN format follows the dialect: a Go MySQL driver DSN
+(`user:pass@tcp(host:3306)/schemabot`) for `mysql`, and a PostgreSQL URL or
+keyword/value string (`postgres://user:pass@host:5432/schemabot`) for
+`postgres`. Both dialects support the same secret reference formats (`env:`,
+`file:`, `secretsmanager:`). When `storage.dsn` is unset, the DSN is read
+from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
+legacy name that is honored regardless of dialect. `dsn_from` assembles a
+MySQL-format DSN and is only supported with the `mysql` dialect; combining it
+with `postgres` fails config validation. See
+[Storage Schema Changes](#storage-schema-changes) for how schema
+bootstrapping differs between the two dialects.
 
 ## Storage Connection Pool
 
