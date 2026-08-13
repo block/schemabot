@@ -439,9 +439,11 @@ The DSN format follows the dialect: a Go MySQL driver DSN
 (`user:pass@tcp(host:3306)/schemabot`) for `mysql`, and a PostgreSQL URL or
 keyword/value string (`postgres://user:pass@host:5432/schemabot`) for
 `postgres`. Both dialects support the same secret reference formats (`env:`,
-`file:`, `secretsmanager:`). `dsn_from` assembles a MySQL-format DSN and is
-only supported with the `mysql` dialect; combining it with `postgres` fails
-config validation. See
+`file:`, `secretsmanager:`). When `storage.dsn` is unset, the DSN is read
+from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
+legacy name that is honored regardless of dialect. `dsn_from` assembles a
+MySQL-format DSN and is only supported with the `mysql` dialect; combining it
+with `postgres` fails config validation. See
 [Storage Schema Changes](#storage-schema-changes) for how schema
 bootstrapping differs between the two dialects.
 

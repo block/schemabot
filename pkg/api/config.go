@@ -35,7 +35,8 @@ const DefaultGitHubCheckName = "SchemaBot"
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
 	// Storage configures SchemaBot's internal storage database.
-	// If not specified, falls back to MYSQL_DSN environment variable.
+	// If not specified, falls back to the STORAGE_DSN environment variable,
+	// then to MYSQL_DSN (legacy name, honored for every dialect).
 	Storage StorageConfig `yaml:"storage"`
 
 	// Auth configures API authentication. When Type is empty or "none" (the
@@ -2481,10 +2482,17 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 // StorageDSN returns the resolved storage DSN.
 // It handles special prefixes (env:, file:) to read from various sources and
 // can build a DSN from separate config/password references.
-// Falls back to MYSQL_DSN environment variable if not configured.
+// When storage.dsn is not configured, it falls back to the dialect-neutral
+// STORAGE_DSN environment variable, then to MYSQL_DSN, which is honored for
+// every storage dialect as the legacy fallback name.
 func (c *ServerConfig) StorageDSN() (string, error) {
 	if c.Storage.DSNFrom != nil {
 		return c.Storage.DSNFrom.Resolve()
+	}
+	if c.Storage.DSN == "" {
+		if dsn := os.Getenv("STORAGE_DSN"); dsn != "" {
+			return dsn, nil
+		}
 	}
 	return secrets.Resolve(c.Storage.DSN, "MYSQL_DSN")
 }

@@ -129,7 +129,8 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 
 // Run starts the SchemaBot server with the given configuration and blocks until
 // it receives SIGINT/SIGTERM or either HTTP server fails, then shuts down
-// gracefully. The storage DSN is resolved from cfg (falling back to MYSQL_DSN);
+// gracefully. The storage DSN is resolved from cfg (falling back to the
+// STORAGE_DSN env var, then MYSQL_DSN);
 // PORT and GRPC_PORT are read from the environment. Prometheus metrics are
 // served on a dedicated listener at cfg.MetricsListenPort, not on the API port.
 func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
@@ -266,13 +267,14 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	logger := o.logger
 	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
 
-	// Get storage DSN from config (with fallback to MYSQL_DSN env var)
+	// Get storage DSN from config (with fallback to the STORAGE_DSN env var,
+	// then MYSQL_DSN)
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if dsn == "" {
-		return nil, fmt.Errorf("storage DSN not configured (set storage.dsn in config or MYSQL_DSN env var)")
+		return nil, fmt.Errorf("storage DSN not configured (set storage.dsn in config or the STORAGE_DSN env var)")
 	}
 
 	// The storage dialect routes schema bootstrapping, the connection pool,

@@ -2453,6 +2453,39 @@ func TestServerConfig_ValidateRejectsUnknownStorageDialect(t *testing.T) {
 	assert.Contains(t, err.Error(), `unsupported storage dialect "oracle"`)
 }
 
+// The storage DSN resolves from config first, then the dialect-neutral
+// STORAGE_DSN environment variable, then the legacy MYSQL_DSN name, so a
+// PostgreSQL deployment never has to route its connection string through a
+// variable named for the other family.
+func TestServerConfig_StorageDSNEnvFallback(t *testing.T) {
+	t.Run("config value wins over both env vars", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "env-storage-dsn")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "config-dsn"}}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "config-dsn", dsn)
+	})
+
+	t.Run("STORAGE_DSN wins over MYSQL_DSN when config is unset", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "env-storage-dsn")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "env-storage-dsn", dsn)
+	})
+
+	t.Run("MYSQL_DSN is the legacy fallback", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "env-mysql-dsn", dsn)
+	})
+}
+
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
 	dir := t.TempDir()
 	databaseConfigPath := filepath.Join(dir, "storage.yaml")
