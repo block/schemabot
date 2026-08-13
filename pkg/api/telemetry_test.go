@@ -22,8 +22,10 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 func TestSetupTelemetry(t *testing.T) {
@@ -35,6 +37,29 @@ func TestSetupTelemetry(t *testing.T) {
 
 	require.NotNil(t, tel.MetricsHandler)
 	assert.Nil(t, tel.tracerProvider, "tracerProvider should be nil without OTLP endpoint")
+}
+
+func TestTelemetryResourceToleratesForeignSchemaURL(t *testing.T) {
+	// A host binary embedding this server builds the base resource with its
+	// own SDK, whose semantic-convention schema URL may differ from the one
+	// this module pins. The service-name override must merge cleanly against
+	// any such base instead of failing on a schema URL conflict.
+	base := resource.NewWithAttributes(
+		"https://opentelemetry.io/schemas/1.99.0",
+		attribute.String("host.attr", "host-value"),
+	)
+
+	res, err := telemetryResource(base)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	attrs := make(map[attribute.Key]string)
+	for _, kv := range res.Attributes() {
+		attrs[kv.Key] = kv.Value.Emit()
+	}
+	assert.Equal(t, "schemabot", attrs[semconv.ServiceNameKey], "service-name override must survive the merge")
+	assert.Equal(t, "host-value", attrs["host.attr"], "base resource attributes must survive the merge")
+	assert.Equal(t, "https://opentelemetry.io/schemas/1.99.0", res.SchemaURL(), "the base resource's schema URL is authoritative")
 }
 
 func TestSetupTelemetryWithOTLP(t *testing.T) {
