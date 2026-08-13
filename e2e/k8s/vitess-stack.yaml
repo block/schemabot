@@ -203,16 +203,16 @@ spec:
             - { name: config, mountPath: /config, readOnly: true }
             - { name: vtdataroot, mountPath: /vtdataroot }
           # /health reports 200 only once every shard can accept a DDL
-          # submission, so this window has to outlast LocalScale's own budget for
-          # that — otherwise the pod is still NotReady when the suite's rollout
-          # wait gives up, and a cluster that was merely slow to come up reads as
-          # a broken stack.
+          # submission. Nothing restarts this pod, so the probe only decides when
+          # it flips to Ready; how long the suite is willing to wait for that is
+          # the rollout wait in e2e-vitess-test.sh, which is what has to outlast
+          # LocalScale's own readiness budget.
           readinessProbe:
             httpGet: { path: /health, port: 8080 }
             initialDelaySeconds: 15
             periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 48
+            failureThreshold: 24
           # The request is what schedules the pod; the limit has headroom over it
           # because every shard adds a tablet and a sidecar database to the same
           # process, and an OOM kill here surfaces as an unexplained apply

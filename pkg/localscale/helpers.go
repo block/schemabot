@@ -837,6 +837,14 @@ func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("connect to mysqld for %s/%s: %w", key.org, key.database, err)
 		}
+		// Report an unreachable mysqld as the connectivity failure it is. Without
+		// this every probe below fails on the same dial error and the cluster
+		// spends its whole readiness budget before reporting a timeout waiting
+		// for online DDL.
+		if err := db.PingContext(ctx); err != nil {
+			utils.CloseAndLog(db)
+			return fmt.Errorf("ping mysqld for %s/%s: %w", key.org, key.database, err)
+		}
 		err = s.waitForBackendSidecars(ctx, key, backend, db, deadline)
 		utils.CloseAndLog(db)
 		if err != nil {
