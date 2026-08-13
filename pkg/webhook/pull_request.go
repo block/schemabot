@@ -38,6 +38,16 @@ type pullRequestPayload struct {
 	Installation struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
+	// Changes carries the previous values of fields an "edited" action
+	// modified. GitHub populates changes.base.ref.from only when the PR was
+	// retargeted, which is what separates a retarget from a title or body edit.
+	Changes struct {
+		Base struct {
+			Ref struct {
+				From string `json:"from"`
+			} `json:"ref"`
+		} `json:"base"`
+	} `json:"changes"`
 }
 
 // isAutoPlannablePullRequestAction reports whether a pull_request action
@@ -50,6 +60,31 @@ type pullRequestPayload struct {
 // would mask lost deliveries from the reconciler.
 func isAutoPlannablePullRequestAction(action string) bool {
 	return slices.Contains(storage.AutoPlanPullRequestActions, action)
+}
+
+// isBaseRetarget reports whether an "edited" delivery moved the PR's base
+// branch. A retarget changes which commits the PR proposes, and the diff
+// against the base is what decides which databases the PR touches, so it is a
+// schema-relevant event by construction. A title or body edit arrives under the
+// same action and must not re-plan.
+func isBaseRetarget(p pullRequestPayload) bool {
+	return p.Action == "edited" && p.Changes.Base.Ref.From != ""
+}
+
+// isAutoPlannablePullRequest reports whether a delivery triggers auto-plan.
+// The HTTP enqueue path and the durable dispatcher share it so the dispatcher's
+// fail-closed re-validation cannot disagree with what was enqueued.
+//
+// It deliberately covers more than isAutoPlannablePullRequestAction, and the
+// inbox coverage query (HasEventForHead) keeps using the narrower action list.
+// The two answer different questions. Coverage asks whether a delivery that
+// plans a head reached the inbox, which a SQL "action IN (...)" test can only
+// answer from the action alone — it cannot tell a retarget from a title edit,
+// so admitting "edited" there would let a title edit mask a lost synchronize.
+// Nothing is lost by leaving it out: a retarget does not move the head SHA, so
+// the head it re-plans is already covered by the delivery that introduced it.
+func isAutoPlannablePullRequest(p pullRequestPayload) bool {
+	return isAutoPlannablePullRequestAction(p.Action) || isBaseRetarget(p)
 }
 
 // handlePullRequest processes GitHub pull_request webhook events.
@@ -67,7 +102,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 
 	// Route PR actions
 	switch {
-	case isAutoPlannablePullRequestAction(payload.Action):
+	case isAutoPlannablePullRequest(payload):
 		// proceed to auto-plan below
 	case payload.Action == "closed":
 		if h.durableWebhookDispatch {

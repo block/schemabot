@@ -594,6 +594,72 @@ func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {
 	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
 }
 
+// TestE2ERetargetedPRAutoPlansAgainstTheNewBase verifies that moving a PR's
+// base branch re-plans it, and that an ordinary title or body edit does not.
+// The diff against the base decides which databases a PR touches, so a retarget
+// can change that answer — a plan and its merge-blocking check must not outlive
+// the base they were computed against. Both arrive as the same action, so the
+// retarget is told apart by the previous base ref GitHub reports with it.
+func TestE2ERetargetedPRAutoPlansAgainstTheNewBase(t *testing.T) {
+	dbName := "webhook_retarget_autoplan"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	editedReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "edited",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	editedRR := httptest.NewRecorder()
+	h.ServeHTTP(editedRR, editedReq)
+	require.Equal(t, http.StatusOK, editedRR.Code)
+	assert.Contains(t, editedRR.Body.String(), "pull_request action ignored")
+
+	retargetReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:      "edited",
+		headSHA:     "abc123",
+		headRef:     "feature-branch",
+		baseRefFrom: "stacked-parent",
+	}, nil)
+	retargetRR := httptest.NewRecorder()
+	h.ServeHTTP(retargetRR, retargetReq)
+	require.Equal(t, http.StatusOK, retargetRR.Code)
+	assert.Contains(t, retargetRR.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for retargeted auto-plan comment")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for retargeted auto-plan check run")
+	}
+}
+
 func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	dbName := "webhook_autoplan_lint"
 	svc := setupE2EService(t, dbName)
