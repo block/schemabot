@@ -42,11 +42,54 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-⚠️ **Lint Warnings**:
-- [users] Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- [products] Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)
+💡 **Lint Warnings**: **2** advisory findings
+- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-many-lint-warnings"></a><strong>MySQL Plan (Many Lint Warnings)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` DROP INDEX `idx_legacy_status`;
+
+ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
+```
+
+<details>
+<summary>💡 <b>Lint Warnings</b>: <b>6</b> advisory findings</summary>
+
+**`orders`**
+- Primary key column `order_ref` has type `varchar`
+
+**`order_events`**
+- Index `idx_status_created` has DATETIME column `created_at` in position 3 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+- Index `idx_region_created` has DATETIME column `created_at` in position 4 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+- Primary key column `event_id` has type `mediumint`
+- Index `idx_status_created` on columns (status, region, created_at, event_id, order_pk) has a redundant PRIMARY KEY suffix (order_pk) - a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (order_pk, event_id) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
+- Column `event_id` in table `order_events` has type `mediumint(9)` but 2 other table(s) use type `int(11)` (e.g. shipments, invoices)
+
+</details>
+
+📋 **Plan**: **2** tables to alter
 
 
 ---
@@ -782,9 +825,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
-⚠️ **Lint Warnings**:
-- [users] Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- [products] Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)
+💡 **Lint Warnings**: **2** advisory findings
+- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1238,9 +1281,9 @@ That command wasn't recognized. Available commands:
      ~ products
        ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
-⚠️  Lint Warnings:
-  - [orders] has_float: New column uses floating-point data type
-  - [users] no_default: Column added without DEFAULT value
+💡 Lint Warnings (2):
+  • orders: has_float: New column uses floating-point data type
+  • users: no_default: Column added without DEFAULT value
 
 📋 Plan: 2 tables to create, 1 table to alter
 
@@ -1439,9 +1482,9 @@ Production
      ~ products
        ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
-⚠️  Lint Warnings:
-  - [orders] has_float: New column uses floating-point data type
-  - [users] no_default: Column added without DEFAULT value
+💡 Lint Warnings (2):
+  • orders: has_float: New column uses floating-point data type
+  • users: no_default: Column added without DEFAULT value
 
 📋 Plan: 2 tables to create, 1 table to alter
 
@@ -2315,7 +2358,14 @@ schemabot apply -e staging
 
 @mona is not authorized to run `schemabot apply` for this database.
 
-A configured SchemaBot admin/database operator must run this command.
+**Operators of `orders`** — members of these teams, or these users, can run it:
+- `acme/orders-operators`
+
+**Other authorized teams and users**:
+- `acme/db-admins`
+- `jdoe`
+
+Ask one of them to run it, or request membership in one of the teams above.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -7511,9 +7561,9 @@ Tables are being renamed atomically...
 
 Lint violations: Non-blocking warnings during plan/apply
 
-⚠️  Lint Warnings:
-  - [orders] has_float: New column uses floating-point data type
-  - [users] no_default: Column added without DEFAULT value
+💡 Lint Warnings (2):
+  • orders: has_float: New column uses floating-point data type
+  • users: no_default: Column added without DEFAULT value
 
 
 ```

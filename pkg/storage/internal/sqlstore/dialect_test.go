@@ -22,6 +22,13 @@ func TestMySQLDialectJSONBooleanIsTrue(t *testing.T) {
 	)
 }
 
+func TestMySQLDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "defer-cutover" is not a plain identifier`,
+		func() { MySQLDialect{}.JSONBooleanIsTrue("a.options", []string{"defer-cutover"}) },
+	)
+}
+
 func TestMySQLDialectIndexHint(t *testing.T) {
 	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
 }
@@ -38,6 +45,52 @@ func TestMySQLDialectJoinedUpdate(t *testing.T) {
 			"c.apply_id = ? AND a.lease_token = ?",
 		),
 	)
+	// A placeholder assignment expression must render ahead of the predicate's
+	// placeholders, pinning the interface's assignments-then-predicate argument
+	// order at the rendering level.
+	assert.Equal(t,
+		"UPDATE apply_control_requests cr JOIN applies a ON a.id = cr.apply_id SET cr.status = ?, cr.completed_at = COALESCE(cr.completed_at, NOW()) WHERE cr.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedUpdate(
+			"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+			[]JoinedUpdateAssignment{
+				{Column: "status", Expr: "?"},
+				{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			},
+			"cr.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+func TestMySQLDialectJoinedUpdateRequiresAssignments(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate requires at least one assignment", func() {
+		MySQLDialect{}.JoinedUpdate("apply_comments", "c", "applies", "a", "a.id = c.apply_id", nil, "c.apply_id = ?")
+	})
+}
+
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestMySQLDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate joinCondition must not contain bind placeholders", func() {
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id AND a.state = ?",
+			[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
+// The dialect qualifies assignment columns with the target alias itself, so a
+// pre-qualified column would render an invalid double-qualified reference and
+// break on dialects with different assignment syntax.
+func TestMySQLDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate assignment columns must be unqualified", func() {
+		MySQLDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{{Column: "c.state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
 }
 
 // The MySQL joined DELETE names the target alias after DELETE so only the
@@ -50,6 +103,18 @@ func TestMySQLDialectJoinedDelete(t *testing.T) {
 			"ao.apply_id = ? AND a.lease_token = ?",
 		),
 	)
+}
+
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestMySQLDialectJoinedDeleteRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedDelete joinCondition must not contain bind placeholders", func() {
+		MySQLDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id AND a.state = ?",
+			"ao.apply_id = ?",
+		)
+	})
 }
 
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
@@ -206,6 +271,13 @@ func TestPostgresDialectRebind(t *testing.T) {
 	// string, so later placeholders still rebind.
 	assert.Equal(t, "SELECT abc$x$ FROM t WHERE id = $1",
 		d.Rebind("SELECT abc$x$ FROM t WHERE id = ?"))
+	// A digit-leading tag is not a dollar-quote delimiter — the server lexes
+	// $1 as a parameter placeholder — so a question mark between $1$ pairs is
+	// a real placeholder, while underscore-leading tags still quote.
+	assert.Equal(t, "SELECT $1$body$1$1$ WHERE id = $2",
+		d.Rebind("SELECT $1$body?$1$ WHERE id = ?"))
+	assert.Equal(t, "SELECT $_1$body ?$_1$ WHERE id = $1",
+		d.Rebind("SELECT $_1$body ?$_1$ WHERE id = ?"))
 }
 
 func TestPostgresDialect(t *testing.T) {
@@ -288,6 +360,31 @@ func TestPostgresDialectJoinedUpdateRequiresAssignments(t *testing.T) {
 	})
 }
 
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestPostgresDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate joinCondition must not contain bind placeholders", func() {
+		PostgresDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id AND a.state = ?",
+			[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
+// PostgreSQL SET clauses reference target columns unqualified; a pre-qualified
+// column would render an invalid alias-qualified assignment.
+func TestPostgresDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedUpdate assignment columns must be unqualified", func() {
+		PostgresDialect{}.JoinedUpdate(
+			"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
+			[]JoinedUpdateAssignment{{Column: "c.state", Expr: "?"}},
+			"c.apply_id = ?",
+		)
+	})
+}
+
 // The PostgreSQL joined DELETE uses DELETE … USING with the join condition in
 // the WHERE clause (USING has no ON clause), keeping argument order aligned
 // with the MySQL rendering.
@@ -299,4 +396,32 @@ func TestPostgresDialectJoinedDelete(t *testing.T) {
 			"ao.apply_id = ? AND a.lease_token = ?",
 		),
 	)
+}
+
+func TestPostgresDialectJoinedDeleteRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedDelete joinCondition must not contain bind placeholders", func() {
+		PostgresDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id AND a.state = ?",
+			"ao.apply_id = ?",
+		)
+	})
+}
+
+// The fence consumes exactly one placeholder (the token) in both renderings,
+// so a guarded statement's argument order is dialect-independent. MySQL's
+// joined DML already record-locks the joined row, so a plain equality
+// suffices; PostgreSQL must lock the row explicitly through the correlated
+// FOR UPDATE subquery.
+func TestMySQLDialectLeaseTokenFence(t *testing.T) {
+	assert.Equal(t, "a.lease_token = ?",
+		MySQLDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
+}
+
+func TestPostgresDialectLeaseTokenFence(t *testing.T) {
+	assert.Equal(t,
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
+	assert.Equal(t,
+		"owner_op.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = owner_op.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"))
 }

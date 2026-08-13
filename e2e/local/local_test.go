@@ -1007,7 +1007,11 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 	endpoint := schemabotURL(t)
 	ensureNoActiveChange(t, endpoint)
 
-	// Create 3 tables with enough rows for Spirit to take measurable time
+	// Create 3 tables. Only the first table needs enough rows for Spirit to
+	// take measurable time — the stop below must land while its copy is in
+	// flight. The later tables are stopped while still pending (0% progress),
+	// which is the scenario under test, so they stay small to keep the
+	// sequential resume within the completion wait.
 	table1 := uniqueTableName("resume_alpha")
 	table2 := uniqueTableName("resume_beta")
 	table3 := uniqueTableName("resume_gamma")
@@ -1017,7 +1021,7 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 
 	db := openTestappStaging(t)
 
-	for _, tbl := range []string{table1, table2, table3} {
+	for i, tbl := range []string{table1, table2, table3} {
 		_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
 			CREATE TABLE %s (
 				id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -1027,10 +1031,14 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 			)
 		`, tbl))
 		require.NoErrorf(t, err, "create table %s", tbl)
+		rowCount := 500000
+		if i > 0 {
+			rowCount = 1000
+		}
 		seedTestRows(t, db, tbl,
 			"name, amount",
 			"CONCAT('item_', seq), FLOOR(1 + RAND() * 10000)",
-			500000)
+			rowCount)
 	}
 
 	// Build schema dir with indexes on all 3 tables

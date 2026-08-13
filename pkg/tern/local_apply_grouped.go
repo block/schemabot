@@ -234,18 +234,7 @@ func (c *LocalClient) applyOperationIDForApplyTasks(ctx context.Context, apply *
 }
 
 func isTasklessVSchemaOnlyPlan(tasks []*storage.Task, plan *storage.Plan) bool {
-	if len(tasks) != 0 || plan == nil {
-		return false
-	}
-	if len(plan.FlatDDLChanges()) != 0 {
-		return false
-	}
-	for _, nsData := range plan.Namespaces {
-		if namespaceHasVSchemaArtifact(nsData) {
-			return true
-		}
-	}
-	return false
+	return len(tasks) == 0 && plan.IsVSchemaOnly()
 }
 
 func (c *LocalClient) completeTasklessGroupedApply(ctx context.Context, apply *storage.Apply, message string) error {

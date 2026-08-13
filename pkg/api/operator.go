@@ -1698,12 +1698,20 @@ func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, 
 		if err != nil {
 			return false, fmt.Errorf("load plan %d for task-less apply_operation %d (deployment %q): %w", apply.PlanID, op.ID, op.Deployment, err)
 		}
-		if plan != nil && op.OperationKind == storage.ApplyOperationKindWork && op.OperationKey == "" && len(plan.FlatDDLChanges()) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0 {
+		if op.IsTasklessVSchemaOnlyWork(plan) {
 			currentOp, getOpErr := s.storage.ApplyOperations().Get(ctx, op.ID)
 			if getOpErr != nil {
 				return false, fmt.Errorf("reload task-less apply_operation %d (deployment %q): %w", op.ID, op.Deployment, getOpErr)
 			}
-			if currentOp != nil && state.IsState(currentOp.State, state.ApplyOperation.Completed) {
+			// The drive owns a task-less operation's outcome, the same way it owns
+			// a group_finalizer's: there are no task rows to derive it from, so
+			// whatever terminal state the drive wrote is the result. Report it as
+			// written so the caller goes on to project the parent. Re-deriving from
+			// the parent instead would read the still-running parent of an
+			// operation-lease-only drive, take the "leave claimable" branch, and
+			// return updated=false — stranding a failed or stopped operation with
+			// its parent never projected and its target blocked.
+			if currentOp != nil && state.IsTerminalApplyState(currentOp.State) {
 				return true, nil
 			}
 			return s.persistOperationState(ctx, driverID, op, apply.State, apply.ErrorMessage)

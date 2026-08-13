@@ -173,7 +173,11 @@ func TestPGXStdlibValueContracts(t *testing.T) {
 // an operation lease, the joined UPDATE under a parent apply lease, the bulk
 // pending-stop self-join, and the joined DELETE. Each shape must succeed with
 // the owning lease token and fail closed (ErrApplyLeaseLost, row untouched)
-// with a stale one, matching the MySQL behavior the drivers rely on.
+// when the token already mismatches at execution time. The joined shapes must
+// also fail closed when a lease steal commits concurrently with the guarded
+// write: the lease-token fence locks the joined applies row, so the guarded
+// write waits out the steal and re-checks the token against the stolen value
+// (see PostgresDialect.LeaseTokenFence).
 func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_guards")
 	db, err := postgresconn.Open(dsn)
@@ -303,6 +307,53 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 		require.NoError(t, db.QueryRowContext(t.Context(),
 			`SELECT COUNT(*) FROM apply_operations WHERE apply_id = $1`, applyID).Scan(&remaining))
 		assert.Zero(t, remaining)
+	})
+
+	t.Run("apply lease fence fails closed against a concurrent steal", func(t *testing.T) {
+		applyID := seedApply(t, "apply-guard-steal", "tok-apply")
+		opID := seedOperation(t, applyID, "op-1", "pending", "")
+
+		// A competing driver steals the lease in a transaction that stays open
+		// past the guarded write's start, so the guarded write's statement
+		// snapshot still holds the pre-steal token.
+		steal, err := db.BeginTx(t.Context(), nil)
+		require.NoError(t, err)
+		committed := false
+		t.Cleanup(func() {
+			if !committed {
+				_ = steal.Rollback()
+			}
+		})
+		_, err = steal.ExecContext(t.Context(),
+			`UPDATE applies SET lease_token = 'tok-thief' WHERE id = $1`, applyID)
+		require.NoError(t, err)
+
+		// The displaced driver's guarded write must block on the fence's row
+		// lock instead of passing its token check against the stale snapshot.
+		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
+		result := make(chan error, 1)
+		go func() { result <- ops.MarkStarted(ownerCtx, opID) }()
+
+		require.Eventually(t, func() bool {
+			var waiting int
+			if err := db.QueryRowContext(t.Context(), `
+				SELECT COUNT(*) FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND query LIKE 'UPDATE apply_operations%'`).Scan(&waiting); err != nil {
+				return false
+			}
+			return waiting > 0
+		}, 15*time.Second, 25*time.Millisecond, "guarded write must block on the stolen row's lock")
+
+		require.NoError(t, steal.Commit())
+		committed = true
+
+		select {
+		case err := <-result:
+			require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		case <-time.After(15 * time.Second):
+			t.Fatal("guarded write did not return after the steal committed")
+		}
+		assert.Equal(t, "pending", operationState(t, opID))
 	})
 }
 

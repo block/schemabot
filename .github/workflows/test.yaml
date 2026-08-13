@@ -640,7 +640,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Most of the budget is vtcombo coming up: it initializes a sidecar database
+    # per shard of every keyspace the stack declares before the suite can start.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -684,14 +686,24 @@ jobs:
       - name: "Pod logs on failure"
         if: failure()
         run: |
+          # The operator's per-tick debug lines and the suite's progress polling
+          # fill a short tail on their own, so a deeper window is what keeps the
+          # drive that dispatched the work — the part worth reading — in the dump.
           echo "=== Control Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=3000 2>/dev/null || true
           echo "=== Data Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=1000 2>/dev/null || true
           echo "=== Etre ==="
           kubectl logs -n schemabot-e2e-vitess -l app=etre --tail=100 2>/dev/null || true
           echo "=== LocalScale ==="
           kubectl logs -n schemabot-e2e-vitess -l app=localscale --tail=200 2>/dev/null || true
+          # A restarted LocalScale serves the whole suite connection-refused, and
+          # the surviving container's logs show none of it — the reason the first
+          # one exited is only in the previous container and the pod's state.
+          echo "=== LocalScale (previous container) ==="
+          kubectl logs -n schemabot-e2e-vitess -l app=localscale --previous --tail=200 2>/dev/null || true
+          echo "=== LocalScale pod state ==="
+          kubectl describe pod -n schemabot-e2e-vitess -l app=localscale 2>/dev/null || true
           echo "=== Seed jobs ==="
           kubectl logs -n schemabot-e2e-vitess -l job-name=etre-seed --tail=50 2>/dev/null || true
           echo "=== All pods ==="

@@ -420,17 +420,18 @@ func WriteOptions(deferCutover bool, skipRevert bool) {
 	}
 }
 
-// WriteLintViolations writes lint violations if any.
+// WriteLintViolations writes advisory lint findings, mirroring the unsafe
+// changes list shape: a count in the header and "table: message" items.
 func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 	if len(warnings) == 0 {
 		return
 	}
-	fmt.Println("⚠️  Lint Warnings:")
+	fmt.Printf("\U0001f4a1 Lint Warnings (%d):\n", len(warnings))
 	for _, w := range warnings {
 		if w.Table != "" {
-			fmt.Printf("  - [%s] %s\n", w.Table, w.Message)
+			fmt.Printf("  • %s: %s\n", w.Table, w.Message)
 		} else {
-			fmt.Printf("  - %s\n", w.Message)
+			fmt.Printf("  • %s\n", w.Message)
 		}
 	}
 	fmt.Println()

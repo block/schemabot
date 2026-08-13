@@ -141,10 +141,14 @@ func changeTypeToProto(op ddl.StatementType) ternv1.ChangeType {
 	switch op {
 	case ddl.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
+	case ddl.StatementCreateIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
 	case ddl.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
 	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
+	case ddl.StatementDropIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}
@@ -175,6 +179,10 @@ func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
 		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
 		return ddl.StatementTypeToOp(ddl.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
 	default:
 		return "unknown"
 	}

@@ -476,7 +476,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	}
 
 	switch {
-	case isAutoPlannablePullRequestAction(payload.Action):
+	case isAutoPlannablePullRequest(payload):
 		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
 	case payload.Action == "closed":
 		return h.processDurablePullRequestClosed(ctx, event, payload)

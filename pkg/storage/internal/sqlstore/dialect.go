@@ -10,10 +10,8 @@ import (
 // Dialect abstracts the SQL-syntax differences between database families (MySQL
 // and, in the future, Postgres) that the state store depends on. This is an
 // incremental seam: the store still emits MySQL-style "?" placeholders, and
-// only the family-varying syntax (upsert clause, current-time and
-// relative-time expressions) routes through here. When a Postgres backend is
-// introduced its parameterized SQL will need a "?"-to-"$n" rebind at the store
-// boundary.
+// family-varying syntax routes through here. When a Postgres backend is introduced
+// its parameterized SQL will need a "?"-to-"$n" rebind at the store boundary.
 type Dialect interface {
 	// InsertIfAbsent returns the syntax that makes an INSERT a no-op when the
 	// named unique-key columns conflict. Modifier is placed between INSERT and
@@ -40,8 +38,9 @@ type Dialect interface {
 	RelativeTime(precision TimestampPrecision, direction RelativeTimeDirection, amount IntervalAmount, unit IntervalUnit) string
 	// JSONBooleanIsTrue returns a predicate that is true only when the JSON value
 	// at path is the boolean true. Missing paths, JSON null, SQL NULL, strings,
-	// numbers, objects, and arrays must all yield false. Path contains unescaped
-	// object keys, ordered from the root to the value.
+	// numbers, objects, and arrays must all yield false. Path contains plain
+	// identifier object keys (letters, digits, and underscores), ordered from the
+	// root to the value. Implementations panic when a key is not a plain identifier.
 	JSONBooleanIsTrue(expression string, path []string) string
 	// IndexHint returns an optional table-level hint that directs lookups through
 	// index. The returned text includes any required leading whitespace and is
@@ -52,13 +51,33 @@ type Dialect interface {
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
 	// dialects. joinCondition and predicate remain separate so dialects can place
-	// them in the clauses their syntax requires.
+	// them in the clauses their syntax requires. Because that placement differs
+	// per dialect, joinCondition must not contain bind placeholders: placeholders
+	// are permitted only in assignment expressions and predicate, and callers
+	// supply their arguments in that order. Implementations panic when
+	// assignments is empty, joinCondition contains a placeholder, or an
+	// assignment column is qualified.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
 	// JoinedDelete returns a DELETE that removes target rows selected through a
 	// join. Aliases qualify join and predicate expressions. joinCondition and
 	// predicate remain separate so dialects can place them in the clauses their
-	// syntax requires.
+	// syntax requires; because that placement differs per dialect, joinCondition
+	// must not contain bind placeholders — placeholders are permitted only in
+	// predicate. Implementations panic when joinCondition contains a
+	// placeholder.
 	JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string
+	// LeaseTokenFence returns a predicate fragment, for use inside a
+	// JoinedUpdate or JoinedDelete predicate, that passes only while the joined
+	// row — reached through joinAlias over joinTable and identified by its
+	// idColumn primary key — still carries the lease token bound to the
+	// fragment's single placeholder. The fence must serialize against a
+	// concurrent lease steal: a steal that commits while the guarded statement
+	// runs must fail the fence rather than let a stale token check pass, and a
+	// fence that wins the race must block the steal until the guarded write
+	// commits. Dialects whose joined DML record-locks the scanned joined rows
+	// achieve this with plain token equality; dialects whose joined DML reads
+	// the joined table without locks must lock the row explicitly.
+	LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string
 }
 
 // InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
@@ -208,12 +227,15 @@ func (d MySQLDialect) RelativeTime(precision TimestampPrecision, direction Relat
 // JSONBooleanIsTrue compares the extracted MySQL JSON value with JSON true
 // using null-safe equality so absent and null values do not match.
 func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
-	jsonPath := "$"
+	var jsonPath strings.Builder
+	jsonPath.WriteString("$")
 	for _, key := range path {
-		jsonPath += "." + strconv.Quote(key)
+		if !plainJSONIdentifier.MatchString(key) {
+			panic(fmt.Sprintf("sqlstore: JSON path key %q is not a plain identifier", key))
+		}
+		jsonPath.WriteString(`."` + key + `"`)
 	}
-	jsonPath = strings.ReplaceAll(jsonPath, "'", "''")
-	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath + "') <=> CAST('true' AS JSON))"
+	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath.String() + "') <=> CAST('true' AS JSON))"
 }
 
 // IndexHint returns a MySQL FORCE INDEX hint for the named index.
@@ -223,8 +245,17 @@ func (MySQLDialect) IndexHint(index string) string {
 
 // JoinedUpdate builds a MySQL multi-table UPDATE statement.
 func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
+	if len(assignments) == 0 {
+		panic("sqlstore: JoinedUpdate requires at least one assignment")
+	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
+	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
+		if strings.Contains(assignment.Column, ".") {
+			panic("sqlstore: JoinedUpdate assignment columns must be unqualified")
+		}
 		sets[i] = targetAlias + "." + assignment.Column + " = " + assignment.Expr
 	}
 	return "UPDATE " + targetTable + " " + targetAlias +
@@ -236,10 +267,20 @@ func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias,
 // JoinedDelete builds a MySQL multi-table DELETE statement that removes only
 // the target alias's rows.
 func (MySQLDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedDelete joinCondition must not contain bind placeholders")
+	}
 	return "DELETE " + targetAlias +
 		" FROM " + targetTable + " " + targetAlias +
 		" JOIN " + joinTable + " " + joinAlias + " ON " + joinCondition +
 		" WHERE " + predicate
+}
+
+// LeaseTokenFence renders a plain token-equality check: MySQL's multi-table
+// UPDATE and DELETE record-lock the scanned rows of the joined table, so the
+// equality alone serializes against a concurrent lease steal.
+func (MySQLDialect) LeaseTokenFence(_, joinAlias, _, tokenColumn string) string {
+	return joinAlias + "." + tokenColumn + " = ?"
 }
 
 func mysqlIntervalUnit(unit IntervalUnit) string {
@@ -305,10 +346,16 @@ func (PostgresDialect) Rebind(query string) string {
 			if end := strings.IndexByte(query[i+1:], '$'); end >= 0 {
 				delimiter := query[i : i+end+2]
 				tag := delimiter[1 : len(delimiter)-1]
+				// A dollar-quote tag follows identifier rules: letters,
+				// digits, and underscores, but never a leading digit — the
+				// server lexes a digit-leading run like $1 as a parameter
+				// placeholder, not a quote delimiter.
 				valid := true
 				for j := range len(tag) {
 					c := tag[j]
-					if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
+					isLetter := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+					isDigit := c >= '0' && c <= '9'
+					if (!isLetter && !isDigit) || (j == 0 && isDigit) {
 						valid = false
 						break
 					}
@@ -394,12 +441,28 @@ func (PostgresDialect) IndexHint(string) string { return "" }
 // placeholders still precede predicate placeholders, so the placeholder-free
 // join condition the interface requires keeps argument order identical to the
 // MySQL rendering.
+//
+// Locking of the joined rows differs from MySQL: a MySQL multi-table UPDATE
+// record-locks the scanned rows of the joined table, so a lease-token
+// predicate on the joined table serializes against a concurrent lease steal.
+// UPDATE … FROM reads the FROM rows from the MVCC snapshot without locking
+// them, so under READ COMMITTED a write guarded only by a joined-table token
+// check can pass the check and commit after a steal commits. Guards that
+// require steal serialization must build their token check with
+// LeaseTokenFence, whose PostgreSQL rendering locks the joined row, rather
+// than embed a plain token equality in the predicate.
 func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
 		panic("sqlstore: JoinedUpdate requires at least one assignment")
 	}
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedUpdate joinCondition must not contain bind placeholders")
+	}
 	sets := make([]string, len(assignments))
 	for i, assignment := range assignments {
+		if strings.Contains(assignment.Column, ".") {
+			panic("sqlstore: JoinedUpdate assignment columns must be unqualified")
+		}
 		sets[i] = assignment.Column + " = " + assignment.Expr
 	}
 	return "UPDATE " + targetTable + " " + targetAlias +
@@ -411,11 +474,33 @@ func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAli
 // JoinedDelete builds a PostgreSQL DELETE … USING statement. The join
 // condition moves into the WHERE clause alongside the residual predicate
 // (DELETE … USING has no ON clause), preserving the MySQL rendering's argument
-// order.
+// order. USING rows share UPDATE … FROM's locking semantics — read from the
+// MVCC snapshot without locks — so JoinedUpdate's lease-fencing caveat applies
+// here too: build steal-serializing token checks with LeaseTokenFence.
 func (PostgresDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedDelete joinCondition must not contain bind placeholders")
+	}
 	return "DELETE FROM " + targetTable + " " + targetAlias +
 		" USING " + joinTable + " " + joinAlias +
 		" WHERE (" + joinCondition + ") AND (" + predicate + ")"
+}
+
+// LeaseTokenFence locks the joined row while checking its token. UPDATE … FROM
+// and DELETE … USING read the joined table from the MVCC snapshot without
+// locks, so a plain token equality could pass with a stale value after a
+// concurrent steal commits. The correlated FOR UPDATE subquery record-locks
+// the joined row instead: under READ COMMITTED a lock wait re-evaluates the
+// subquery's predicate against the latest committed row version, so a steal
+// that commits first fails the fence, and a fence that locks first blocks the
+// steal until the guarded write commits — the serialization MySQL's
+// multi-table row locking provides.
+func (PostgresDialect) LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string {
+	return joinAlias + "." + idColumn +
+		" = (SELECT fence." + idColumn +
+		" FROM " + joinTable + " fence" +
+		" WHERE fence." + idColumn + " = " + joinAlias + "." + idColumn +
+		" AND fence." + tokenColumn + " = ? FOR UPDATE)"
 }
 
 // ExcludedValue returns the PostgreSQL reference to the proposed row value.

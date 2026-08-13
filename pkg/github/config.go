@@ -580,6 +580,26 @@ func isConfigFile(filename string) bool {
 	return path.Base(filename) == ConfigFileName
 }
 
+// isDiscoveryInputFile reports whether a changed file can make a pull request
+// resolve a database: FindConfigsForPRFiles reads changed configs directly and
+// walks up from changed schema files to the nearest config, and ignores
+// everything else.
+func isDiscoveryInputFile(filename string) bool {
+	return IsSchemaFile(filename) || isConfigFile(filename)
+}
+
+// hasDiscoveryInputFiles reports whether any changed file could resolve a
+// database. Callers use it to skip work entirely on the pull requests — most of
+// them, in a repository of any size — that touch no schema at all.
+func hasDiscoveryInputFiles(files []PRFile) bool {
+	for _, file := range files {
+		if isDiscoveryInputFile(file.Filename) {
+			return true
+		}
+	}
+	return false
+}
+
 func isRemovedPRFile(status string) bool {
 	return strings.EqualFold(status, "removed")
 }

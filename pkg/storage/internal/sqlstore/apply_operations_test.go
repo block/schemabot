@@ -2249,6 +2249,42 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFinalizerAfterWorkSibl
 	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
 }
 
+// A slash-less work key still belongs to the matching operation group, so its
+// finalizer remains blocked until that work completes.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsFinalizerAfterSlashlessWorkCompletes(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_op_slashless_finalizer", 1)
+
+	work, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce", OperationKind: storage.ApplyOperationKindWork,
+	})
+	require.NoError(t, err)
+	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, work, claimed.ID)
+
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, blocked, "group finalizer must wait for slash-less work in its group")
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, work))
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	assert.Equal(t, finalizer, claimed.ID)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsSameDeploymentShardWorkConcurrently
 // verifies that the per-shard work operations of one deployment fan out: a
 // later shard is claimable while an earlier shard of the same deployment is

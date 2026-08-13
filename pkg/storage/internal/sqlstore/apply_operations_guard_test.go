@@ -51,10 +51,10 @@ func TestOperationWriteGuardUpdateStatement(t *testing.T) {
 			want:    "UPDATE apply_operations ao JOIN applies a ON a.id = ao.apply_id SET ao.state = ?, ao.started_at = COALESCE(ao.started_at, NOW()), ao.updated_at = NOW() WHERE ao.id = ? AND ao.apply_id = ? AND a.lease_token = ?",
 		},
 		{
-			name:    "apply lease joins the parent applies row on PostgreSQL",
+			name:    "apply lease joins the parent applies row on PostgreSQL and locks it",
 			guard:   operationWriteGuard{kind: operationGuardApply, applyLease: storage.ApplyLease{Token: "tok"}},
 			dialect: PostgresDialect{},
-			want:    "UPDATE apply_operations ao SET state = ?, started_at = COALESCE(ao.started_at, NOW()), updated_at = NOW() FROM applies a WHERE (a.id = ao.apply_id) AND (ao.id = ? AND ao.apply_id = ? AND a.lease_token = ?)",
+			want:    "UPDATE apply_operations ao SET state = ?, started_at = COALESCE(ao.started_at, NOW()), updated_at = NOW() FROM applies a WHERE (a.id = ao.apply_id) AND (ao.id = ? AND ao.apply_id = ? AND a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE))",
 		},
 	}
 
