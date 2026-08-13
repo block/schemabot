@@ -651,6 +651,12 @@ func (s *capturingTernServer) getStartApplyID() string {
 	return s.startApplyID
 }
 
+func (s *capturingTernServer) startWasCalled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.startCalled
+}
+
 func (s *capturingTernServer) getStopApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -6484,4 +6490,356 @@ func TestRemoteApplyIdempotencyKey_OperationAttemptRotation(t *testing.T) {
 	applyOwn, scopeOwn := opScope(1, 1)
 	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyOwn, scopeOwn),
 		"this operation's own attempt advancing must rotate its key")
+}
+
+// A task-less operation has no task rows, so the operator's task-derived
+// projection can never move it: whatever terminal state the data plane reports
+// has to be written onto the operation row by the drive itself. Leaving any
+// terminal state unwritten holds the operation and its parent apply running
+// forever with the target blocked, so every terminal state is covered here —
+// including the resumable/non-resumable split, which decides whether a later
+// start finds a row it can claim.
+func TestGRPCClient_TasklessOperationTerminalWriterCoversEveryTerminalState(t *testing.T) {
+	const operationID = int64(91)
+
+	tests := []struct {
+		name            string
+		remoteState     string
+		errMsg          string
+		wantState       string
+		wantCompletedAt bool
+		wantErrMsg      string
+	}{
+		{
+			name:            "completed",
+			remoteState:     state.Apply.Completed,
+			wantState:       state.ApplyOperation.Completed,
+			wantCompletedAt: true,
+		},
+		{
+			name:            "failed carries the reason an operator triages from",
+			remoteState:     state.Apply.Failed,
+			errMsg:          "vschema apply rejected by vtctld",
+			wantState:       state.ApplyOperation.Failed,
+			wantCompletedAt: true,
+			wantErrMsg:      "vschema apply rejected by vtctld",
+		},
+		{
+			name:        "stopped stays resumable, so completed_at is left unset",
+			remoteState: state.Apply.Stopped,
+			wantState:   state.ApplyOperation.Stopped,
+		},
+		{
+			name:            "cancelled is terminal and not resumable",
+			remoteState:     state.Apply.Cancelled,
+			wantState:       state.ApplyOperation.Cancelled,
+			wantCompletedAt: true,
+		},
+		{
+			name:            "reverted is terminal and not resumable",
+			remoteState:     state.Apply.Reverted,
+			wantState:       state.ApplyOperation.Reverted,
+			wantCompletedAt: true,
+		},
+		{
+			name: "a non-terminal state leaves the operation claimable rather than settling it",
+			// failed_retryable is the one that matters: settling it would
+			// swallow a failure the operator is meant to be able to retry.
+			remoteState: state.Apply.FailedRetryable,
+			wantState:   state.ApplyOperation.Running,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &capturingTernServer{}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+
+			operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				operationID: {
+					ID:            operationID,
+					ApplyID:       12,
+					OperationKind: storage.ApplyOperationKindWork,
+					State:         state.ApplyOperation.Running,
+				},
+			}}
+			client.storage = &mockStorage{operations: operations}
+
+			require.NoError(t, client.persistTasklessOperationTerminalState(t.Context(), operationID, tt.remoteState, tt.errMsg))
+
+			op := operations.ops[operationID]
+			assert.True(t, state.IsState(op.State, tt.wantState),
+				"expected operation state %q, got %q", tt.wantState, op.State)
+			assert.Equal(t, tt.wantErrMsg, op.ErrorMessage)
+			if tt.wantCompletedAt {
+				assert.NotNil(t, op.CompletedAt, "a non-resumable terminal state stamps completed_at")
+			} else {
+				assert.Nil(t, op.CompletedAt, "a row that must stay claimable leaves completed_at unset")
+			}
+		})
+	}
+}
+
+// A task-less operation whose plan row is missing can never be dispatched: the
+// namespaces to apply are read from the plan. The claim has to terminalize
+// rather than be re-driven, which is what wrapping ErrNoTasksForApplyOperation
+// tells the operator to do — otherwise the operator re-claims and re-drives the
+// same operation on every poll forever.
+func TestErrPlanMissingForApplyOperationTerminalizesTheClaim(t *testing.T) {
+	require.ErrorIs(t, ErrPlanMissingForApplyOperation, ErrNoTasksForApplyOperation,
+		"the operator decides terminalize-vs-retry on this wrap")
+
+	wrapped := fmt.Errorf("plan 7 for apply_operation 9 (apply apply-x): %w", ErrPlanMissingForApplyOperation)
+	require.ErrorIs(t, wrapped, ErrNoTasksForApplyOperation,
+		"the contract has to survive the context each return site adds")
+}
+
+func TestGRPCClient_ResumeApplyOperationTerminalizesWhenThePlanRowIsMissing(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-must-not-dispatch"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              13,
+		ApplyIdentifier: "apply-missing-plan",
+		PlanID:          80,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	operationID := int64(64)
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{},
+		// GetByID returns (nil, nil) for a plan row that is gone.
+		plans: &mockPlanStore{},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKind: storage.ApplyOperationKindWork,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNoTasksForApplyOperation,
+		"a missing plan must terminalize the claim, not leave it to be re-driven forever")
+	assert.Nil(t, server.getApplyRequest(), "nothing may be dispatched without a plan to dispatch")
+}
+
+// An apply whose work was dispatched before per-operation remote ids existed
+// carries its remote id on the parent. Its sole operation must resume that
+// remote apply rather than dispatch again, or the first claim after an upgrade
+// runs the same schema change on the target a second time.
+func TestGRPCClient_SoleOperationResumesTheRemoteApplyRecordedOnTheParent(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-should-not-be-used"} // default Progress = COMPLETED
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              14,
+		ApplyIdentifier: "apply-parent-external-id",
+		PlanID:          81,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		ExternalID:      "remote-dispatched-before-upgrade",
+	}
+	operationID := int64(65)
+	vschema := `{"sharded":true}`
+	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {
+			ID:            operationID,
+			ApplyID:       apply.ID,
+			Deployment:    "commerce-deployment",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Running,
+			// No ExternalID: this operation predates per-operation remote ids.
+		},
+	}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-parent-external-id",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+		}},
+		operations: operations,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	ctx = storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: operationID,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.Nil(t, server.getApplyRequest(),
+		"the parent's remote apply id must be resumed, not dispatched over")
+	assert.Equal(t, "remote-dispatched-before-upgrade", server.getProgressRequest().GetApplyId(),
+		"the drive must poll the remote apply the parent recorded")
+}
+
+// Stopping a task-less operation is only half of the operator's control: the
+// start that follows has to reach the data plane. Nothing else re-enters the
+// drive for an operation with no task rows, so without an explicit start the
+// operation is re-claimed on every poll, reports the same stopped state, and
+// only a cancel frees the target.
+func TestGRPCClient_TasklessOperationStartsAgainAfterAnOperatorStop(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID: "remote-vschema-stopped",
+		// Stopped until Start lands; the server moves itself to COMPLETED after.
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              15,
+		ApplyIdentifier: "apply-vschema-stopped",
+		PlanID:          82,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(66)
+	vschema := `{"sharded":true}`
+	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {
+			ID:            operationID,
+			ApplyID:       apply.ID,
+			Deployment:    "commerce-deployment",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Stopped,
+			ExternalID:    "remote-vschema-stopped",
+		},
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ID:          1,
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	// The stored row is a separate value from the one the drive carries, so a
+	// reload during the drive returns what storage holds rather than the drive's
+	// own in-memory progress.
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: &storedApply},
+		tasks:   &mockTaskStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-vschema-stopped",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+		}},
+		operations:      operations,
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	ctx = storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: operationID,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.True(t, server.startWasCalled(), "the operator's start must reach the data plane")
+	assert.Equal(t, "remote-vschema-stopped", server.getStartApplyID())
+	assert.Nil(t, server.getApplyRequest(),
+		"a stopped operation is resumed, never dispatched a second time")
+	assert.True(t, state.IsState(operations.ops[operationID].State, state.ApplyOperation.Completed),
+		"the resumed operation settles on its own row, but is %q", operations.ops[operationID].State)
+}
+
+// A task-less operation the operator has not asked to resume stays stopped: the
+// drive must not restart work on the target on its own.
+func TestGRPCClient_StoppedTasklessOperationStaysStoppedWithoutAStartRequest(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-vschema-left-stopped",
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              16,
+		ApplyIdentifier: "apply-vschema-left-stopped",
+		PlanID:          83,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	operationID := int64(67)
+	vschema := `{"sharded":true}`
+	operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		operationID: {
+			ID:            operationID,
+			ApplyID:       apply.ID,
+			Deployment:    "commerce-deployment",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Stopped,
+			ExternalID:    "remote-vschema-left-stopped",
+		},
+	}}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-vschema-left-stopped",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce": {Files: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: vschema}},
+			},
+		}},
+		operations:      operations,
+		controlRequests: &testControlRequestStore{},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	ctx = storage.WithOperationLease(ctx, storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: operationID,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+
+	assert.False(t, server.startWasCalled(), "no operator start means no restart of the target")
+	assert.True(t, state.IsState(operations.ops[operationID].State, state.ApplyOperation.Stopped),
+		"the operation stays stopped, but is %q", operations.ops[operationID].State)
 }

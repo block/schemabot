@@ -1858,7 +1858,82 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		}
 	}
 
-	return c.pollForCompletion(ctx, apply, false, scope, false)
+	started, err := c.startStoppedTasklessRemoteApply(ctx, apply, scope, kind)
+	if err != nil {
+		return err
+	}
+	return c.pollForCompletion(ctx, apply, started, scope, false)
+}
+
+// startStoppedTasklessRemoteApply resumes a task-less operation the operator
+// stopped and has since asked to start again, reporting whether the remote was
+// started. A task-less operation has no task rows, so the drive owns its state
+// in both directions: nothing else asks the data plane to resume it. Without
+// this the poll below reads the same stopped state on every claim, the start
+// request stays pending, the operation is re-claimed forever, and only a cancel
+// frees the target.
+func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, kind string) (bool, error) {
+	op := scope.operation
+	if op == nil || !state.IsState(op.State, state.Apply.Stopped) {
+		return false, nil
+	}
+	startRequested, err := hasPendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return false, fmt.Errorf("check pending start for stopped %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
+	}
+	if !startRequested {
+		// The operator has not asked for it back. Polling reports the stored
+		// stopped state without touching the target.
+		c.applyLogger(apply).DebugContext(ctx, "stopped task-less operation has no pending start request; leaving it stopped",
+			append(apply.MutableLogAttrs(), "apply_operation_id", op.ID, "kind", kind)...)
+		return false, nil
+	}
+	if deferred, err := c.completePendingStopBeforeRemoteStart(ctx, apply, scope); err != nil || deferred {
+		return false, err
+	}
+
+	remoteID := scope.remoteApplyID(apply)
+	logger := c.applyLogger(apply)
+	// Only start what the data plane still holds stopped. A start racing the
+	// drive that recorded the stop would otherwise restart an apply the data
+	// plane has already resumed, or one it has since failed.
+	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	if err != nil {
+		return false, fmt.Errorf("check stopped %s apply_operation %d (remote apply %s) before start: %w", kind, op.ID, remoteID, err)
+	}
+	remoteState := ProtoStateToStorage(resp.State)
+	if !state.IsState(remoteState, state.Apply.Stopped) {
+		logger.InfoContext(ctx, "data plane no longer holds the task-less operation stopped; polling its current state instead of starting it",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", op.ID, "kind", kind,
+				"remote_apply_id", remoteID, "remote_state", resp.State.String())...)
+		return false, nil
+	}
+	if _, err := c.client.Start(ctx, &ternv1.StartRequest{ApplyId: remoteID, Environment: apply.Environment}); err != nil {
+		message := fmt.Sprintf("Remote start failed for the %s operation; it stays stopped and the command can be re-issued", kind)
+		logger.WarnContext(ctx, "remote start failed for a stopped task-less operation; leaving it stopped for operator retry",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", op.ID, "kind", kind,
+				"remote_apply_id", remoteID, "error", err)...)
+		c.logApplyWarning(ctx, apply, message)
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
+			return false, failErr
+		}
+		return false, fmt.Errorf("start stopped %s apply_operation %d (remote apply %s): %w", kind, op.ID, remoteID, err)
+	}
+	// The operation row still reads stopped, and it is the only thing the
+	// operator's projection can derive the parent from. Move it back to running
+	// so a resumed operation does not keep presenting as stopped.
+	if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, state.Apply.Running); err != nil {
+		return false, fmt.Errorf("update resumed %s apply_operation %d to running: %w", kind, op.ID, err)
+	}
+	op.State = state.Apply.Running
+	logger.InfoContext(ctx, "started a stopped task-less operation on the operator's request",
+		append(apply.MutableLogAttrs(),
+			"apply_operation_id", op.ID, "kind", kind, "remote_apply_id", remoteID)...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested,
+		fmt.Sprintf("Remote %s operation started by operator", kind), "", "")
+	return true, nil
 }
 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
