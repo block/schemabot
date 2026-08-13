@@ -58,6 +58,26 @@ type Dialect interface {
 	// assignments is empty, joinCondition contains a placeholder, or an
 	// assignment column is qualified.
 	JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string
+	// JoinedDelete returns a DELETE that removes target rows selected through a
+	// join. Aliases qualify join and predicate expressions. joinCondition and
+	// predicate remain separate so dialects can place them in the clauses their
+	// syntax requires; because that placement differs per dialect, joinCondition
+	// must not contain bind placeholders — placeholders are permitted only in
+	// predicate. Implementations panic when joinCondition contains a
+	// placeholder.
+	JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string
+	// LeaseTokenFence returns a predicate fragment, for use inside a
+	// JoinedUpdate or JoinedDelete predicate, that passes only while the joined
+	// row — reached through joinAlias over joinTable and identified by its
+	// idColumn primary key — still carries the lease token bound to the
+	// fragment's single placeholder. The fence must serialize against a
+	// concurrent lease steal: a steal that commits while the guarded statement
+	// runs must fail the fence rather than let a stale token check pass, and a
+	// fence that wins the race must block the steal until the guarded write
+	// commits. Dialects whose joined DML record-locks the scanned joined rows
+	// achieve this with plain token equality; dialects whose joined DML reads
+	// the joined table without locks must lock the row explicitly.
+	LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string
 }
 
 // InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
@@ -244,6 +264,25 @@ func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias,
 		" WHERE " + predicate
 }
 
+// JoinedDelete builds a MySQL multi-table DELETE statement that removes only
+// the target alias's rows.
+func (MySQLDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedDelete joinCondition must not contain bind placeholders")
+	}
+	return "DELETE " + targetAlias +
+		" FROM " + targetTable + " " + targetAlias +
+		" JOIN " + joinTable + " " + joinAlias + " ON " + joinCondition +
+		" WHERE " + predicate
+}
+
+// LeaseTokenFence renders a plain token-equality check: MySQL's multi-table
+// UPDATE and DELETE record-lock the scanned rows of the joined table, so the
+// equality alone serializes against a concurrent lease steal.
+func (MySQLDialect) LeaseTokenFence(_, joinAlias, _, tokenColumn string) string {
+	return joinAlias + "." + tokenColumn + " = ?"
+}
+
 func mysqlIntervalUnit(unit IntervalUnit) string {
 	switch unit {
 	case IntervalMicrosecond:
@@ -402,6 +441,16 @@ func (PostgresDialect) IndexHint(string) string { return "" }
 // placeholders still precede predicate placeholders, so the placeholder-free
 // join condition the interface requires keeps argument order identical to the
 // MySQL rendering.
+//
+// Locking of the joined rows differs from MySQL: a MySQL multi-table UPDATE
+// record-locks the scanned rows of the joined table, so a lease-token
+// predicate on the joined table serializes against a concurrent lease steal.
+// UPDATE … FROM reads the FROM rows from the MVCC snapshot without locking
+// them, so under READ COMMITTED a write guarded only by a joined-table token
+// check can pass the check and commit after a steal commits. Guards that
+// require steal serialization must build their token check with
+// LeaseTokenFence, whose PostgreSQL rendering locks the joined row, rather
+// than embed a plain token equality in the predicate.
 func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
 		panic("sqlstore: JoinedUpdate requires at least one assignment")
@@ -420,6 +469,38 @@ func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAli
 		" SET " + strings.Join(sets, ", ") +
 		" FROM " + joinTable + " " + joinAlias +
 		" WHERE (" + joinCondition + ") AND (" + predicate + ")"
+}
+
+// JoinedDelete builds a PostgreSQL DELETE … USING statement. The join
+// condition moves into the WHERE clause alongside the residual predicate
+// (DELETE … USING has no ON clause), preserving the MySQL rendering's argument
+// order. USING rows share UPDATE … FROM's locking semantics — read from the
+// MVCC snapshot without locks — so JoinedUpdate's lease-fencing caveat applies
+// here too: build steal-serializing token checks with LeaseTokenFence.
+func (PostgresDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
+	if strings.Contains(joinCondition, "?") {
+		panic("sqlstore: JoinedDelete joinCondition must not contain bind placeholders")
+	}
+	return "DELETE FROM " + targetTable + " " + targetAlias +
+		" USING " + joinTable + " " + joinAlias +
+		" WHERE (" + joinCondition + ") AND (" + predicate + ")"
+}
+
+// LeaseTokenFence locks the joined row while checking its token. UPDATE … FROM
+// and DELETE … USING read the joined table from the MVCC snapshot without
+// locks, so a plain token equality could pass with a stale value after a
+// concurrent steal commits. The correlated FOR UPDATE subquery record-locks
+// the joined row instead: under READ COMMITTED a lock wait re-evaluates the
+// subquery's predicate against the latest committed row version, so a steal
+// that commits first fails the fence, and a fence that locks first blocks the
+// steal until the guarded write commits — the serialization MySQL's
+// multi-table row locking provides.
+func (PostgresDialect) LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string {
+	return joinAlias + "." + idColumn +
+		" = (SELECT fence." + idColumn +
+		" FROM " + joinTable + " fence" +
+		" WHERE fence." + idColumn + " = " + joinAlias + "." + idColumn +
+		" AND fence." + tokenColumn + " = ? FOR UPDATE)"
 }
 
 // ExcludedValue returns the PostgreSQL reference to the proposed row value.

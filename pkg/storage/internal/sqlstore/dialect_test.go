@@ -93,6 +93,30 @@ func TestMySQLDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T)
 	})
 }
 
+// The MySQL joined DELETE names the target alias after DELETE so only the
+// target table's rows are removed, never the joined lease rows.
+func TestMySQLDialectJoinedDelete(t *testing.T) {
+	assert.Equal(t,
+		"DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE ao.apply_id = ? AND a.lease_token = ?",
+		MySQLDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			"ao.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
+func TestMySQLDialectJoinedDeleteRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedDelete joinCondition must not contain bind placeholders", func() {
+		MySQLDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id AND a.state = ?",
+			"ao.apply_id = ?",
+		)
+	})
+}
+
 // UpsertClause must produce a MySQL ON DUPLICATE KEY UPDATE clause that matches
 // the hand-written SQL the store used before the dialect seam, including the
 // column set, ordering, defaulted excluded values, and custom expressions. The
@@ -359,4 +383,45 @@ func TestPostgresDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing
 			"c.apply_id = ?",
 		)
 	})
+}
+
+// The PostgreSQL joined DELETE uses DELETE … USING with the join condition in
+// the WHERE clause (USING has no ON clause), keeping argument order aligned
+// with the MySQL rendering.
+func TestPostgresDialectJoinedDelete(t *testing.T) {
+	assert.Equal(t,
+		"DELETE FROM apply_operations ao USING applies a WHERE (a.id = ao.apply_id) AND (ao.apply_id = ? AND a.lease_token = ?)",
+		PostgresDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			"ao.apply_id = ? AND a.lease_token = ?",
+		),
+	)
+}
+
+func TestPostgresDialectJoinedDeleteRejectsJoinConditionPlaceholders(t *testing.T) {
+	require.PanicsWithValue(t, "sqlstore: JoinedDelete joinCondition must not contain bind placeholders", func() {
+		PostgresDialect{}.JoinedDelete(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id AND a.state = ?",
+			"ao.apply_id = ?",
+		)
+	})
+}
+
+// The fence consumes exactly one placeholder (the token) in both renderings,
+// so a guarded statement's argument order is dialect-independent. MySQL's
+// joined DML already record-locks the joined row, so a plain equality
+// suffices; PostgreSQL must lock the row explicitly through the correlated
+// FOR UPDATE subquery.
+func TestMySQLDialectLeaseTokenFence(t *testing.T) {
+	assert.Equal(t, "a.lease_token = ?",
+		MySQLDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
+}
+
+func TestPostgresDialectLeaseTokenFence(t *testing.T) {
+	assert.Equal(t,
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
+	assert.Equal(t,
+		"owner_op.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = owner_op.id AND fence.lease_token = ? FOR UPDATE)",
+		PostgresDialect{}.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"))
 }
