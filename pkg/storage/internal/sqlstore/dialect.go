@@ -394,6 +394,16 @@ func (PostgresDialect) IndexHint(string) string { return "" }
 // placeholders still precede predicate placeholders, so the placeholder-free
 // join condition the interface requires keeps argument order identical to the
 // MySQL rendering.
+//
+// Locking of the joined rows differs from MySQL: a MySQL multi-table UPDATE
+// record-locks the scanned rows of the joined table, so a lease-token
+// predicate on the joined table serializes against a concurrent lease steal.
+// UPDATE … FROM reads the FROM rows from the MVCC snapshot without locking
+// them, so under READ COMMITTED a write guarded only by a joined-table token
+// check can pass the check and commit after a steal commits. Guards that
+// require steal serialization on PostgreSQL must lock the joined row
+// explicitly (for example via a FOR UPDATE subquery in the predicate) rather
+// than rely on this rendering.
 func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
 		panic("sqlstore: JoinedUpdate requires at least one assignment")
@@ -411,7 +421,9 @@ func (PostgresDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAli
 // JoinedDelete builds a PostgreSQL DELETE … USING statement. The join
 // condition moves into the WHERE clause alongside the residual predicate
 // (DELETE … USING has no ON clause), preserving the MySQL rendering's argument
-// order.
+// order. USING rows share UPDATE … FROM's locking semantics — read from the
+// MVCC snapshot without locks — so JoinedUpdate's lease-fencing caveat applies
+// here too.
 func (PostgresDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias, joinCondition, predicate string) string {
 	return "DELETE FROM " + targetTable + " " + targetAlias +
 		" USING " + joinTable + " " + joinAlias +

@@ -81,10 +81,15 @@ func TestHeartbeatTableUpdatesStampUpdatedAt(t *testing.T) {
 			closeIdx := matchingCloseParen(src, loc[0])
 			require.GreaterOrEqual(t, closeIdx, 0,
 				"%s:%d: joined UPDATE on a heartbeat table without a closing parenthesis", name, line)
-			// The assignments may be assembled in a variable above the call, so
-			// the scan window runs from the start of the enclosing function to
-			// the end of the JoinedUpdate call.
-			window := src[funcIdx:closeIdx]
+			// When the call writes its assignments inline, the stamp must sit
+			// among those assignments — a wider window would let an unrelated
+			// updated_at literal elsewhere in a long function mask a dropped
+			// stamp. Only a call that assembles its assignments in a variable
+			// above widens the scan to the enclosing function.
+			window := src[loc[0]:closeIdx]
+			if !strings.Contains(window, "JoinedUpdateAssignment{") {
+				window = src[funcIdx:closeIdx]
+			}
 			assert.Contains(t, window, "updated_at",
 				"%s:%d: joined UPDATE on a heartbeat table must include an updated_at assignment; "+
 					"the staleness predicates read it as the liveness signal and no dialect-level "+
@@ -124,9 +129,17 @@ func matchingCloseParen(src string, start int) int {
 				}
 			}
 		case '/':
-			if i+1 < len(src) && src[i+1] == '/' {
+			if i+1 >= len(src) {
+				break
+			}
+			switch src[i+1] {
+			case '/':
 				for i++; i < len(src) && src[i] != '\n'; i++ {
 				}
+			case '*':
+				for i += 2; i+1 < len(src) && (src[i] != '*' || src[i+1] != '/'); i++ {
+				}
+				i++
 			}
 		}
 	}

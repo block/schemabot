@@ -377,6 +377,12 @@ type operationWriteGuard struct {
 // shapes the WHERE placeholders follow the SET placeholders, so callers append
 // the row ID and then args() to their SET arguments.
 //
+// The strength of the apply-lease guard is dialect-specific: the token check
+// serializes against a concurrent lease steal only where the rendering locks
+// the joined applies row (MySQL does; PostgreSQL's UPDATE … FROM does not —
+// see PostgresDialect.JoinedUpdate). The operation-lease guard checks the
+// token on the updated row itself, which every dialect locks.
+//
 // Assignment columns are unqualified (the dialect qualifies them where its
 // syntax requires); expressions that read current row values qualify them with
 // the "ao" alias, which is valid in every rendering. Every guarded write stamps
