@@ -85,6 +85,18 @@ var configDiscoveryFailedBlock = checkBlockReason{
 	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
 }
 
+// planPublishVerificationFailedBlock is used when the PR cannot be re-read to
+// confirm a plan is being published for the head commit and base branch it was
+// computed from. Publishing on an unverified PR is what that re-read exists to
+// prevent, so the aggregate check fails closed instead. GitHub's own retries
+// are already exhausted by the time this reason is reached, so it stands for
+// the failures retrying does not fix — revoked App permissions, a PR that is
+// gone, a response that cannot be read — which nothing else on the PR surfaces.
+var planPublishVerificationFailedBlock = checkBlockReason{
+	blockingReason: "plan_publish_verification_failed",
+	message:        "SchemaBot failed this check closed because it could not confirm this PR still has the commit and base branch its plan was computed from. Check SchemaBot's access to this repository, then retry the check.",
+}
+
 // managedDirMissingConfigBlock is used when a PR changes schema files under a
 // directory the server config manages (databases.<db>.allowed_dirs) but no
 // schemabot.yaml resolves for them — for example because the PR removed the
