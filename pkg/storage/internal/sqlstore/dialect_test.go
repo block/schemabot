@@ -271,6 +271,13 @@ func TestPostgresDialectRebind(t *testing.T) {
 	// string, so later placeholders still rebind.
 	assert.Equal(t, "SELECT abc$x$ FROM t WHERE id = $1",
 		d.Rebind("SELECT abc$x$ FROM t WHERE id = ?"))
+	// A digit-leading tag is not a dollar-quote delimiter — the server lexes
+	// $1 as a parameter placeholder — so a question mark between $1$ pairs is
+	// a real placeholder, while underscore-leading tags still quote.
+	assert.Equal(t, "SELECT $1$body$1$1$ WHERE id = $2",
+		d.Rebind("SELECT $1$body?$1$ WHERE id = ?"))
+	assert.Equal(t, "SELECT $_1$body ?$_1$ WHERE id = $1",
+		d.Rebind("SELECT $_1$body ?$_1$ WHERE id = ?"))
 }
 
 func TestPostgresDialect(t *testing.T) {
@@ -353,6 +360,9 @@ func TestPostgresDialectJoinedUpdateRequiresAssignments(t *testing.T) {
 	})
 }
 
+// A placeholder in the join condition would bind its argument into a
+// dialect-dependent position, silently shifting every subsequent binding, so
+// the seam rejects it outright.
 func TestPostgresDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.T) {
 	require.PanicsWithValue(t, "sqlstore: JoinedUpdate joinCondition must not contain bind placeholders", func() {
 		PostgresDialect{}.JoinedUpdate(
@@ -363,6 +373,8 @@ func TestPostgresDialectJoinedUpdateRejectsJoinConditionPlaceholders(t *testing.
 	})
 }
 
+// PostgreSQL SET clauses reference target columns unqualified; a pre-qualified
+// column would render an invalid alias-qualified assignment.
 func TestPostgresDialectJoinedUpdateRejectsQualifiedAssignmentColumns(t *testing.T) {
 	require.PanicsWithValue(t, "sqlstore: JoinedUpdate assignment columns must be unqualified", func() {
 		PostgresDialect{}.JoinedUpdate(

@@ -95,8 +95,11 @@ kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/vitess-stack.yaml"
 wait_for_ready_pods "app=mysql-control-plane"
 wait_for_ready_pods "app=mysql-data-plane"
 wait_for_ready_pods "app=etre"
-# vtcombo takes about a minute to start, so allow a little more than the others.
-wait_for_ready_pods "app=localscale" 240
+# vtcombo takes about a minute to boot, and only then does LocalScale start
+# waiting out its own 3-minute budget for every shard's sidecar to accept a DDL
+# submission — /health stays red until both finish. Wait past their sum, or a
+# cluster that was merely slow to come up reads as a broken stack.
+wait_for_ready_pods "app=localscale" 300
 
 echo "Waiting for seed jobs..."
 kubectl wait --for=condition=complete job/etre-mongo-init -n "$NAMESPACE" --timeout=180s

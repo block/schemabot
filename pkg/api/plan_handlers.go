@@ -1151,7 +1151,7 @@ func buildApplyOperationGroups(
 	}
 
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
-	allowTasklessWork := len(targets) == 1 && len(taskChanges) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0
+	allowTasklessWork := len(targets) == 1 && len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0
 	for _, target := range targets {
 		tasks := buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now)
 		groups = append(groups, &storage.ApplyOperationWithTasks{
@@ -1242,7 +1242,7 @@ func buildShardedApplyOperationGroups(
 		// by namespace at drive time), not from a synthetic task. A VSchema-only
 		// namespace with no shard work still gets a finalizer so its VSchema change
 		// is never dropped.
-		for _, namespace := range vschemaFinalizerNamespaces(plan) {
+		for _, namespace := range plan.VSchemaNamespaces() {
 			if err := validateOperationKeyPart("namespace", namespace); err != nil {
 				return nil, err
 			}
@@ -1258,20 +1258,6 @@ func buildShardedApplyOperationGroups(
 		}
 	}
 	return groups, nil
-}
-
-// vschemaFinalizerNamespaces returns, in sorted order, every namespace in the
-// plan that changes its VSchema — each needs a group_finalizer to apply the
-// VSchema after its shard work (if any) completes.
-func vschemaFinalizerNamespaces(plan *storage.Plan) []string {
-	var namespaces []string
-	for namespace, nsData := range plan.Namespaces {
-		if nsData != nil && nsData.Artifacts[vSchemaArtifactName] != "" {
-			namespaces = append(namespaces, namespace)
-		}
-	}
-	sort.Strings(namespaces)
-	return namespaces
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {

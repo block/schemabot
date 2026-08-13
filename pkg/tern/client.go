@@ -34,6 +34,15 @@ var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after hear
 // terminalizes the stale claim rather than retrying it forever.
 var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
 
+// ErrPlanMissingForApplyOperation is returned when a task-less operation's
+// parent apply points at a plan row that is absent. The plan is what decides
+// whether an operation with no tasks is a legitimate VSchema-only drive, so
+// without it the operation can never be dispatched. Like
+// ErrApplyOperationRowMissing it names its own cause while wrapping
+// ErrNoTasksForApplyOperation, so the operator terminalizes the claim instead of
+// re-driving an operation that no retry can advance.
+var ErrPlanMissingForApplyOperation = fmt.Errorf("plan not found for apply operation: %w", ErrNoTasksForApplyOperation)
+
 // ErrApplyTasksNotLoaded is returned by a whole-apply drive that loaded zero
 // tasks for an apply that owns task rows. Such an apply is undriveable, not
 // done: completing it would report success for schema changes that never ran,

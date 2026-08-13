@@ -121,15 +121,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const vSchemaArtifactName = "vschema.json"
-
-func namespaceHasVSchemaArtifact(nsData *storage.NamespacePlanData) bool {
-	if nsData == nil {
-		return false
-	}
-	return nsData.Artifacts[vSchemaArtifactName] != ""
-}
-
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
 	// Database is the name of this database.
@@ -869,7 +860,7 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
 	}
 	if vschema != nil && strings.TrimSpace(vschema.Raw) != "" {
-		artifacts[vSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
+		artifacts[storage.VSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
 	}
 
 	c.logger.Info("LocalClient.PullSchema: loaded live Vitess schema",
@@ -1350,11 +1341,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		// Only store VSchema artifacts when the Plan detected a change.
 		if sc.Metadata["vschema_changed"] == "true" {
 			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-				if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
+				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
 					if nsData.Artifacts == nil {
 						nsData.Artifacts = map[string]string{}
 					}
-					nsData.Artifacts[vSchemaArtifactName] = vs
+					nsData.Artifacts[storage.VSchemaArtifactName] = vs
 				}
 			}
 		}
@@ -1368,7 +1359,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Don't store empty plans — no DDL changes, no VSchema changes.
 	hasVSchemaChanges := false
 	for _, ns := range namespaces {
-		if namespaceHasVSchemaArtifact(ns) {
+		if ns.ChangesVSchema() {
 			hasVSchemaChanges = true
 			break
 		}
@@ -1827,16 +1818,16 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 		nsFiles := schemaFiles[ns]
 		vs := ""
 		if nsFiles != nil {
-			vs = nsFiles.Files[vSchemaArtifactName]
+			vs = nsFiles.Files[storage.VSchemaArtifactName]
 		}
 		if vs == "" {
-			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, vSchemaArtifactName)
+			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, storage.VSchemaArtifactName)
 		}
 		nsData := namespaces[ns]
 		if nsData.Artifacts == nil {
 			nsData.Artifacts = map[string]string{}
 		}
-		nsData.Artifacts[vSchemaArtifactName] = vs
+		nsData.Artifacts[storage.VSchemaArtifactName] = vs
 	}
 
 	return namespaces, nil

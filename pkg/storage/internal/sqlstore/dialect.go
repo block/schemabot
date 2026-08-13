@@ -327,10 +327,16 @@ func (PostgresDialect) Rebind(query string) string {
 			if end := strings.IndexByte(query[i+1:], '$'); end >= 0 {
 				delimiter := query[i : i+end+2]
 				tag := delimiter[1 : len(delimiter)-1]
+				// A dollar-quote tag follows identifier rules: letters,
+				// digits, and underscores, but never a leading digit — the
+				// server lexes a digit-leading run like $1 as a parameter
+				// placeholder, not a quote delimiter.
 				valid := true
 				for j := range len(tag) {
 					c := tag[j]
-					if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_' {
+					isLetter := c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+					isDigit := c >= '0' && c <= '9'
+					if (!isLetter && !isDigit) || (j == 0 && isDigit) {
 						valid = false
 						break
 					}

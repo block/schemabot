@@ -360,6 +360,12 @@ func (tc TableChange) UnsafeOptInReason() string {
 	return "unsafe schema change requires explicit opt-in"
 }
 
+// VSchemaArtifactName is the plan artifact holding a namespace's desired Vitess
+// VSchema. A namespace changes its VSchema exactly when its plan data carries
+// this artifact; it lives here, next to the plan data, so every plane asks that
+// question the same way.
+const VSchemaArtifactName = "vschema.json"
+
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
 // captured once for the namespace and applies to every table/artifact change in
 // Tables and Artifacts.
@@ -369,6 +375,14 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+}
+
+// ChangesVSchema reports whether this namespace carries a VSchema change.
+func (n *NamespacePlanData) ChangesVSchema() bool {
+	if n == nil {
+		return false
+	}
+	return n.Artifacts[VSchemaArtifactName] != ""
 }
 
 // ShardPlan records per-shard membership and drift captured at plan time for a
@@ -470,6 +484,33 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 		}
 	}
 	return result
+}
+
+// VSchemaNamespaces returns, in sorted order, every namespace in the plan that
+// changes its VSchema.
+func (p *Plan) VSchemaNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData.ChangesVSchema() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// IsVSchemaOnly reports whether the plan's only change is VSchema: no DDL, and
+// at least one namespace changing its VSchema. Such a plan produces no task
+// rows, so a drive that resolves no tasks for it is doing the right thing
+// rather than acting on an invalid claim.
+func (p *Plan) IsVSchemaOnly() bool {
+	if p == nil {
+		return false
+	}
+	return len(p.FlatDDLChanges()) == 0 && len(p.VSchemaNamespaces()) > 0
 }
 
 // UnsafeDDLChanges returns stored DDL changes that require explicit unsafe
@@ -777,6 +818,17 @@ type ApplyOperation struct {
 
 	// UpdatedAt is when the child row was last updated.
 	UpdatedAt time.Time
+}
+
+// IsTasklessVSchemaOnlyWork reports whether this operation is the one work shape
+// that legitimately carries no task rows: a whole-deployment work operation for
+// a VSchema-only plan. Every other task-less work operation is an invalid or
+// stale claim and must fail closed rather than dispatch.
+func (op *ApplyOperation) IsTasklessVSchemaOnlyWork(plan *Plan) bool {
+	if op == nil || op.OperationKind != ApplyOperationKindWork || op.OperationKey != "" {
+		return false
+	}
+	return plan.IsVSchemaOnly()
 }
 
 // Lease returns the ownership token for this apply_operation.

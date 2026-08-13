@@ -132,7 +132,7 @@ func TestLocalClient_PullSchemaLoadsVitessKeyspaceWithVSchemaArtifact(t *testing
 	ns := resp.Namespaces["commerce_sharded"]
 	require.NotNil(t, ns)
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", ns.Tables["users"])
-	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[vSchemaArtifactName])
+	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[storage.VSchemaArtifactName])
 	assert.Equal(t, "commerce_sharded", ns.NamespaceCatalog.Name)
 	assert.Equal(t, storage.DatabaseTypeVitess, ns.NamespaceCatalog.Engine)
 	assert.Equal(t, int32(1), ns.NamespaceCatalog.TableCount)
