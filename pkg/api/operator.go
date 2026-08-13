@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"time"
 
@@ -114,11 +115,66 @@ func (s *Service) StopOperator() {
 	s.operatorWake = nil
 	s.operatorMu.Unlock()
 
+	// Stop claiming first, so no driver picks up new work while the in-flight
+	// drives are being brought down.
 	close(stop)
+
+	// End the in-flight drives. A drive inside a claim only observes its
+	// context, so cancelling it is what returns it; it exits leaving its apply
+	// active for another driver rather than recording an operator stop.
 	if cancel != nil {
 		cancel()
 	}
 	s.recoveryWg.Wait()
+
+	// A drive returning does not stop the engine it started. An engine that runs
+	// its schema change in this process keeps copying and keeps the target's
+	// lock, while nothing renews the apply's lease any more. Bring those engines
+	// down before the process exits, so the lock is released rather than left
+	// held for peer drivers that would reclaim the apply and be refused.
+	s.haltEnginesForShutdown()
+}
+
+// shutdownHaltTimeout bounds how long shutdown waits for this process's engines
+// to come down. It must stay well inside storage.ApplyLeaseStaleAfter: once the
+// lease goes stale, peer drivers reclaim the apply, and a target still held by
+// an engine that has not come down refuses every one of them.
+const shutdownHaltTimeout = 20 * time.Second
+
+// haltEnginesForShutdown brings down every engine this process drives schema
+// changes with. Clients that delegate to a separate Tern service are skipped:
+// that service owns its engines and halts them on its own shutdown.
+//
+// Every client is attempted even after one fails, so one target that will not
+// come down does not leave the rest held.
+func (s *Service) haltEnginesForShutdown() {
+	// The drive contexts are already cancelled by this point, so the halt runs
+	// on a fresh bounded context rather than one that is guaranteed expired.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	defer cancel()
+
+	s.ternMu.Lock()
+	clients := slices.Collect(maps.Values(s.ternClients))
+	if s.defaultTernClient != nil {
+		clients = append(clients, s.defaultTernClient)
+	}
+	s.ternMu.Unlock()
+
+	for _, client := range clients {
+		halter, ok := client.(tern.ShutdownHalter)
+		if !ok {
+			s.logger.Debug("tern client drives its schema changes outside this process; nothing to halt for shutdown",
+				"endpoint", client.Endpoint())
+			continue
+		}
+		if err := halter.HaltForShutdown(ctx); err != nil {
+			metrics.RecordOperatorShutdownHaltFailure(ctx)
+			s.logger.Error("engine did not come down on shutdown; its target stays locked while this process no longer renews the apply's lease, so every driver that reclaims the apply will be refused the lock and burn a recovery attempt",
+				"endpoint", client.Endpoint(),
+				"halt_timeout", shutdownHaltTimeout,
+				"error", err)
+		}
+	}
 }
 
 func (s *Service) wakeOperator(applyIdentifier, database, environment string) {

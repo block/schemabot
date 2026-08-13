@@ -405,6 +405,28 @@ func (c *LocalClient) Close() error {
 	return nil
 }
 
+// HaltForShutdown brings this client's engine down when the engine runs its
+// schema-change work in this process, so the process can exit without leaving
+// the target held by work no lease is being renewed for.
+func (c *LocalClient) HaltForShutdown(ctx context.Context) error {
+	eng := c.getEngine()
+	if eng == nil {
+		c.logger.Debug("no engine to halt for shutdown",
+			"database", c.config.Database, "database_type", c.config.Type)
+		return nil
+	}
+	supported, err := engine.HaltEngineForShutdown(ctx, eng)
+	if !supported {
+		c.logger.Debug("engine drives its schema changes outside this process; nothing to halt for shutdown",
+			"database", c.config.Database, "database_type", c.config.Type, "engine", eng.Name())
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("halt engine %s for database %s (%s) on shutdown: %w", eng.Name(), c.config.Database, c.config.Type, err)
+	}
+	return nil
+}
+
 // credentials returns engine credentials from the client config.
 func (c *LocalClient) credentials() *engine.Credentials {
 	return &engine.Credentials{

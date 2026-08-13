@@ -128,6 +128,7 @@ type runningSchemaChange struct {
 // Compile-time check that Engine implements the interface.
 var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
+var _ engine.ShutdownHalter = (*Engine)(nil)
 var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
 
 // Config holds configuration for the Spirit engine.
@@ -309,6 +310,65 @@ func (e *Engine) Drain() {
 	e.mu.Lock()
 	e.runningSchemaChange = nil
 	e.mu.Unlock()
+}
+
+// HaltForShutdown brings this instance's in-flight schema change down so the
+// process can exit without leaving the target held. Spirit runs the copy in a
+// goroutine of this process and holds an advisory lock on the table for as long
+// as that goroutine lives, so a process that exits without halting it keeps the
+// lock while no longer renewing the apply's lease — every driver that then
+// reclaims the apply is refused the lock and burns a recovery attempt.
+//
+// This is not an operator stop. The tracked state is left alone so nothing
+// reads the halt as an operator's decision to park the apply: the schema change
+// is checkpointed and the apply stays active for another driver to claim and
+// resume.
+func (e *Engine) HaltForShutdown(ctx context.Context) error {
+	e.mu.Lock()
+	rm := e.runningSchemaChange
+	if rm == nil {
+		e.mu.Unlock()
+		return nil
+	}
+	runners := rm.runners
+	database := rm.database
+	tables := rm.tables
+	cancelRun := rm.cancelFunc
+	e.mu.Unlock()
+
+	logger := e.schemaChangeLogger(rm)
+
+	// Checkpoint before cancelling. Spirit checkpoints on its own interval, so
+	// without this the driver that reclaims the apply resumes from the last
+	// periodic checkpoint and recopies everything written since.
+	if len(runners) > 0 && runners[0] != nil {
+		if err := runners[0].DumpCheckpoint(ctx); err != nil {
+			logger.Warn("could not checkpoint before halting for shutdown; the schema change resumes from its last periodic checkpoint",
+				"database", database, "tables", tables, "error", err)
+		}
+	}
+
+	if cancelRun != nil {
+		cancelRun()
+	}
+
+	// Wait off the calling goroutine so a runner that will not come down bounds
+	// shutdown at ctx rather than blocking it forever. The wait goroutine ends
+	// with the runner it is waiting on.
+	done := make(chan struct{})
+	go func() {
+		rm.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Info("schema change halted for shutdown; the target's lock is released and the apply stays active for another driver",
+			"database", database, "tables", tables)
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("halt schema change on database %s tables %v for shutdown: still running after %w; the target may still be locked", database, tables, ctx.Err())
+	}
 }
 
 // copySettings returns the Spirit copy settings for the tracked schema change,
