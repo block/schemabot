@@ -378,6 +378,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if err != nil {
 		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
 	}
 
@@ -386,6 +387,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if err != nil {
 		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
 	}
 
@@ -429,6 +431,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	if len(configs) == 0 {
 		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+		// No config resolved means no slot to sweep, so the plan comments an
+		// earlier head left behind have nothing to retire them. Every exit below
+		// moves the check on without posting a comment, which would otherwise
+		// leave the PR showing a plan — and its apply prompt — for schema this
+		// head no longer proposes.
+		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		// An aggregate participant does not own the required check for the repo —
 		// the leader does — so on a PR that touches none of this deployment's
 		// schema it has nothing to report and stays silent, rather than posting a

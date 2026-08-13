@@ -496,3 +496,57 @@ func TestStalePlanCommentSweepKeepsApplyOwnedHeadExpanded(t *testing.T) {
 		"the sweep minimizes the unowned stale comment but the apply-owned shaA comment stays expanded")
 	assert.Equal(t, []string{"shaA"}, unminimizedHeads(t, st, repo, 42, "inventory", "mysql"))
 }
+
+// TestPRWideStalePlanCommentSweep covers the PR whose new head resolves no
+// schema config at all — the author dropped the schema change, or the commit
+// only ever touched unrelated files. There is no database left to key a slot
+// with, so the slot sweep cannot run, yet earlier heads' plan comments are
+// exactly what such a push leaves behind: still advertising that head's DDL and
+// its apply prompt while only the check run moves on. Every database's stale
+// comment collapses, the current head's stays expanded, and no comment is
+// posted.
+func TestPRWideStalePlanCommentSweep(t *testing.T) {
+	const repo = "org/plan-min-pr-wide-sweep"
+	h, st, fake := setupPlanCommentHandler(t, repo)
+
+	insertPlanCommentRow(t, st, repo, 42, "orders", "production,staging", "shaA", 9001, "IC_orders_shaA")
+	insertPlanCommentRow(t, st, repo, 42, "billing", "staging", "shaA", 9002, "IC_billing_shaA")
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaB", 9003, "IC_orders_shaB")
+	// A different PR in the same repo proves the sweep is scoped to one PR.
+	insertPlanCommentRow(t, st, repo, 77, "orders", "staging", "shaA", 9004, "IC_other_pr_shaA")
+	fake.setCurrentHead("shaB")
+
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	h.minimizeStalePlanCommentsForPR(t.Context(), client, repo, 42, "shaB")
+
+	assert.ElementsMatch(t, []string{"IC_orders_shaA", "IC_billing_shaA"}, fake.minimizedNodes(),
+		"every database's prior-head comment collapses, not just one slot's")
+	assert.Equal(t, []string{"shaB"}, unminimizedHeads(t, st, repo, 42, "orders", "mysql"),
+		"the current-head comment stays expanded")
+	assert.Empty(t, unminimizedHeads(t, st, repo, 42, "billing", "mysql"))
+	assert.Equal(t, []string{"shaA"}, unminimizedHeads(t, st, repo, 77, "orders", "mysql"),
+		"another PR's comments are untouched")
+	assert.Equal(t, 0, fake.createCount(), "the sweep posts no comment")
+}
+
+// TestPRWideStalePlanCommentSweepSkipsWhenHeadMoved covers the same
+// concurrent-push safety as the slot sweep, for the sweep that has no database
+// to key on: a delivery for a head the branch has already moved past must leave
+// every comment expanded, because nothing would replace what it hid.
+func TestPRWideStalePlanCommentSweepSkipsWhenHeadMoved(t *testing.T) {
+	const repo = "org/plan-min-pr-wide-head-moved"
+	h, st, fake := setupPlanCommentHandler(t, repo)
+
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_old_shaA")
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaC", 9002, "IC_live_shaC")
+	fake.setCurrentHead("shaC")
+
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	h.minimizeStalePlanCommentsForPR(t.Context(), client, repo, 42, "shaB")
+
+	assert.Empty(t, fake.minimizedNodes(),
+		"a sweep for a superseded head must not touch the PR")
+	assert.ElementsMatch(t, []string{"shaA", "shaC"}, unminimizedHeads(t, st, repo, 42, "orders", "mysql"))
+}
