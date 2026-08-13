@@ -8,14 +8,13 @@ package consumermodule
 
 import (
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/resource"
-	// Must match the semconv version imported by pkg/api/telemetry.go so the
-	// precondition below compares against schemabot's actual pin.
-	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 // TestSetupTelemetryWithNewerHostSDK proves that a host binary whose OTel SDK
@@ -29,17 +28,25 @@ func TestSetupTelemetryWithNewerHostSDK(t *testing.T) {
 	// non-empty schema URL that differs from schemabot's semconv pin,
 	// otherwise this module no longer produces a schema URL conflict and the
 	// test proves nothing. Bump the go.opentelemetry.io/otel/sdk requirement
-	// in this module's go.mod so it is ahead of the semconv version imported
-	// by pkg/api/telemetry.go.
+	// in this module's go.mod so it is ahead of schemabot's pin.
 	hostSchemaURL := resource.Default().SchemaURL()
 	require.NotEmpty(t, hostSchemaURL,
 		"host SDK default resource must carry a schema URL for the conflict scenario to exist")
-	require.NotEqual(t, semconv.SchemaURL, hostSchemaURL,
+	require.NotEqual(t, api.TelemetrySchemaURL, hostSchemaURL,
 		"host SDK default resource must carry a different schema URL than schemabot's semconv pin; bump this module's go.opentelemetry.io/otel/sdk requirement")
 
 	tel, err := api.SetupTelemetry(slog.Default())
 	require.NoError(t, err)
 	require.NotNil(t, tel)
+
+	// The merged resource must keep schemabot's service identity even when
+	// the base resource comes from the newer host SDK. The Prometheus
+	// exporter surfaces resource attributes on the target_info metric.
+	rec := httptest.NewRecorder()
+	tel.MetricsHandler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `service_name="schemabot"`,
+		"merged telemetry resource must retain schemabot's service.name")
 
 	require.NoError(t, tel.Shutdown(t.Context()))
 }

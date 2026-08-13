@@ -129,6 +129,8 @@ help: ## Show this help message
 lint: check-closeandlog check-webhookheaders ## Run all linters (golangci-lint + custom analyzers)
 	@echo "Running golangci-lint..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --timeout=5m
+	@echo "Running golangci-lint (consumer module)..."
+	@docker run --rm -v $$(pwd):/app -w /app/e2e/consumermodule golangci/golangci-lint:latest golangci-lint run --timeout=5m
 
 check-closeandlog: ## Run closeandlog analyzer (flags _ = x.Close() patterns)
 	@echo "Running closeandlog analyzer..."

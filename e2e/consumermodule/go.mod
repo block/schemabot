@@ -13,7 +13,6 @@ go 1.26.5
 require (
 	github.com/block/schemabot v0.0.0
 	github.com/stretchr/testify v1.11.1
-	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
 )
 
@@ -94,6 +93,7 @@ require (
 	github.com/wasilibs/go-pgquery v0.0.0-20260728010200-155ebad2880e // indirect
 	github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/otel v1.45.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.43.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 // indirect
@@ -129,5 +129,3 @@ replace github.com/block/schemabot => ../..
 replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260703150944-881ec2298245
 
 replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
-
-replace github.com/go-mysql-org/go-mysql => github.com/morgo/go-mysql v1.16.1-0.20260723231236-3aced1dddcf4

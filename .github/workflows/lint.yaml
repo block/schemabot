@@ -60,10 +60,18 @@ jobs:
         include:
           - name: default
             args: ""
+            dir: "."
           - name: integration
             args: --build-tags=integration
+            dir: "."
           - name: e2e
             args: --build-tags=e2e ./e2e/...
+            dir: "."
+          # The consumer module has its own go.mod, so root package patterns
+          # (./..., ./e2e/...) never reach it; lint it as its own module.
+          - name: consumer-module
+            args: ""
+            dir: e2e/consumermodule
     steps:
       - name: Checkout code
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
@@ -84,6 +92,7 @@ jobs:
         with:
           version: v2.11.4
           args: ${{ matrix.args }}
+          working-directory: ${{ matrix.dir }}
           # The action's built-in config-verify downloads the config JSON
           # schema from golangci-lint.run on every run, so a transient network
           # failure on the runner fails this merge-gating job with no lint
