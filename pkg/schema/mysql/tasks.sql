@@ -36,7 +36,7 @@ CREATE TABLE `tasks` (
   UNIQUE KEY `idx_task_identifier` (`task_identifier`),
   KEY `idx_apply_id` (`apply_id`),
   KEY `idx_apply_operation_id` (`apply_operation_id`),
-  KEY `idx_database` (`database_name`),
+  KEY `idx_database` (`database_name`,`database_type`,`environment`,`table_name`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
   KEY `idx_state` (`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

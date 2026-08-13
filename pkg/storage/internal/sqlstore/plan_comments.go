@@ -5,6 +5,7 @@ package sqlstore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -18,6 +19,7 @@ const planCommentColumns = `id, repository, pull_request, database_name, databas
 type planCommentStore struct {
 	db       *rebindDB
 	identity identityInserter
+	dialect  Dialect
 }
 
 // Insert stores a newly posted plan comment and sets comment.ID.
@@ -46,13 +48,38 @@ func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo stri
 	if err != nil {
 		return nil, fmt.Errorf("query unminimized plan comments for %s#%d database %s: %w", repo, pr, database, err)
 	}
+	return collectPlanComments(rows, fmt.Sprintf("%s#%d database %s", repo, pr, database))
+}
+
+// ListUnminimizedForRepoPR returns the not-yet-minimized comments for a whole
+// pull request, across every database, ordered by id ascending. The slot query
+// above answers "what did this database's newest comment supersede"; this one
+// answers "what is still expanded on this PR", which a caller that resolved no
+// database has no other way to ask. The (repository, pull_request) prefix of
+// the slot index serves it.
+func (s *planCommentStore) ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+planCommentColumns+`
+		FROM plan_comments
+		WHERE repository = ? AND pull_request = ? AND minimized_at IS NULL
+		ORDER BY id
+	`, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("query unminimized plan comments for %s#%d: %w", repo, pr, err)
+	}
+	return collectPlanComments(rows, fmt.Sprintf("%s#%d", repo, pr))
+}
+
+// collectPlanComments drains a plan comment result set. scope names what was
+// queried so a scan failure says which listing broke.
+func collectPlanComments(rows *sql.Rows, scope string) ([]*storage.PlanComment, error) {
 	defer utils.CloseAndLog(rows)
 
 	var comments []*storage.PlanComment
 	for rows.Next() {
 		comment, err := scanPlanComment(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan plan comment for %s#%d database %s: %w", repo, pr, database, err)
+			return nil, fmt.Errorf("scan plan comment for %s: %w", scope, err)
 		}
 		comments = append(comments, comment)
 	}
@@ -63,7 +90,9 @@ func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo stri
 // An already-minimized row is not an error.
 func (s *planCommentStore) MarkMinimized(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `
-		UPDATE plan_comments SET minimized_at = NOW()
+		UPDATE plan_comments
+		SET minimized_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`,
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE id = ? AND minimized_at IS NULL
 	`, id)
 	if err != nil {

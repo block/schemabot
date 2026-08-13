@@ -969,8 +969,8 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "[bad_table] Primary key uses signed integer type")
-		assert.Contains(t, rendered, "[users] Column uses utf8 charset")
+		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
+		assert.Contains(t, rendered, "- `users`: Column uses utf8 charset")
 		assert.Contains(t, rendered, "CREATE TABLE")
 	})
 
@@ -1001,7 +1001,7 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderMultiEnvPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "[bad_table] Primary key uses signed integer type")
+		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
 		assert.Contains(t, rendered, "CREATE TABLE")
 		// Identical plans get deduplicated — combined header
 		assert.Contains(t, rendered, "Staging & Production")

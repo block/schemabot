@@ -377,6 +377,12 @@ type operationWriteGuard struct {
 // shapes the WHERE placeholders follow the SET placeholders, so callers append
 // the row ID and then args() to their SET arguments.
 //
+// The apply-lease guard's token check is built with the dialect's
+// LeaseTokenFence, so it serializes against a concurrent lease steal on every
+// dialect: MySQL's joined rendering locks the applies row it scans, and
+// PostgreSQL's fence locks it explicitly. The operation-lease guard checks the
+// token on the updated row itself, which every dialect locks.
+//
 // Assignment columns are unqualified (the dialect qualifies them where its
 // syntax requires); expressions that read current row values qualify them with
 // the "ao" alias, which is valid in every rendering. Every guarded write stamps
@@ -391,7 +397,7 @@ func (g operationWriteGuard) updateStatement(d Dialect, assignments []JoinedUpda
 		return d.JoinedUpdate(
 			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
 			stamped,
-			"ao.id = ? AND ao.apply_id = ? AND a.lease_token = ?",
+			"ao.id = ? AND ao.apply_id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
 		)
 	}
 	sets := make([]string, len(stamped))
@@ -1213,7 +1219,8 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	//      keeps the operator holding the claim and polling for a manual cutover,
 	//      so the cutover worker must not steal it. defer_cutover lives in the
 	//      applies.options JSON (boolean, omitted when false), not a column; the
-	//      null-safe <=> CAST('true' AS JSON) means "exactly JSON true".
+	//      predicate matches exactly JSON boolean true per Dialect.JSONBooleanIsTrue,
+	//      so absent keys, JSON null, and non-boolean values do not match.
 	//
 	// The gate wraps BOTH claim branches (start and stale recovery): a stale
 	// cutting_over/revert_window row outside this population reached that state
@@ -1417,7 +1424,7 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 	}
 	query := s.dialect.JoinedDelete(
 		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
-		"ao.apply_id = ? AND a.lease_token = ?",
+		"ao.apply_id = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, lease.Token)
 	if err != nil {
@@ -1464,7 +1471,7 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 				{Column: "state", Expr: "?"},
 				{Column: "updated_at", Expr: "NOW()"},
 			},
-			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND owner_op.lease_token = ?",
+			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
 		)
 		result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
 		if err != nil {
@@ -1511,7 +1518,7 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 			{Column: "state", Expr: "?"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"ao.apply_id = ? AND ao.state = ? AND a.lease_token = ?",
+		"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
 	if err != nil {

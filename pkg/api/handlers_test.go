@@ -2316,7 +2316,7 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 	plan.Target = "commerce-target"
 	plan.Namespaces = map[string]*storage.NamespacePlanData{
 		"commerce": {
-			Artifacts: map[string]string{vSchemaArtifactName: "{\"sharded\":true}"},
+			Artifacts: map[string]string{storage.VSchemaArtifactName: "{\"sharded\":true}"},
 			Tables: []storage.TableChange{
 				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
 			},
@@ -2380,7 +2380,7 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 			},
 		},
 		"routing": {
-			Artifacts: map[string]string{vSchemaArtifactName: "{\"routing\":true}"},
+			Artifacts: map[string]string{storage.VSchemaArtifactName: "{\"routing\":true}"},
 		},
 	}
 	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", Changes: []storage.TableChange{{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}}}}

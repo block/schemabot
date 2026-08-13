@@ -83,6 +83,9 @@ type prWebhookPayloadOpts struct {
 	beforeSHA string
 	headSHA   string
 	headRef   string
+	// baseRefFrom is the branch the PR was retargeted away from. Setting it
+	// makes an "edited" delivery a retarget rather than a title or body edit.
+	baseRefFrom string
 }
 
 type checkRunWebhookPayloadOpts struct {
@@ -128,6 +131,13 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 	}
 	if opts.beforeSHA != "" {
 		payload["before"] = opts.beforeSHA
+	}
+	if opts.baseRefFrom != "" {
+		payload["changes"] = map[string]any{
+			"base": map[string]any{
+				"ref": map[string]any{"from": opts.baseRefFrom},
+			},
+		}
 	}
 
 	body, err := json.Marshal(payload)

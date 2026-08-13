@@ -109,6 +109,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
@@ -120,22 +121,13 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const vSchemaArtifactName = "vschema.json"
-
-func namespaceHasVSchemaArtifact(nsData *storage.NamespacePlanData) bool {
-	if nsData == nil {
-		return false
-	}
-	return nsData.Artifacts[vSchemaArtifactName] != ""
-}
-
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
 	// Database is the name of this database.
 	Database string
 
-	// Type is the database type. "mysql" and "vitess" have built-in engines; any
-	// other value requires a matching EngineFactories entry.
+	// Type is the database type. "mysql", "vitess", and "postgres" have built-in
+	// engines; any other value requires a matching EngineFactories entry.
 	Type string
 
 	// TargetDSN is the connection string to the target database for schema changes.
@@ -195,6 +187,7 @@ type LocalClient struct {
 	storage           storage.Storage
 	spiritEngine      engine.Engine
 	planetscaleEngine engine.Engine
+	postgresEngine    engine.Engine
 	customEngine      engine.Engine
 	psClientFunc      func(tokenName, tokenValue string) (psclient.PSClient, error)
 	logger            *slog.Logger
@@ -261,7 +254,15 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	var psEngine engine.Engine
 	var psClientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)
 	if cfg.Type == storage.DatabaseTypeVitess {
+		// api_url is optional in a database's configuration and names a private or
+		// emulated endpoint when it is set. Absent, the database is a real
+		// PlanetScale one, so fall back to the public endpoint the way the
+		// inventory-resolved path does — the client needs a base URL to address
+		// the API directly, and leaving it empty would refuse every apply.
 		apiURL := cfg.Metadata["api_url"]
+		if apiURL == "" {
+			apiURL = inventory.DefaultPlanetScaleAPIURL
+		}
 		psClientFunc = func(tokenName, tokenValue string) (psclient.PSClient, error) {
 			return psclient.NewPSClientWithBaseURL(tokenName, tokenValue, apiURL)
 		}
@@ -272,7 +273,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	// factory. This is the embedder extension point for engines this build does
 	// not include.
 	var customEngine engine.Engine
-	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess {
+	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess && cfg.Type != storage.DatabaseTypePostgres {
 		factory, ok := cfg.EngineFactories[cfg.Type]
 		if !ok {
 			return nil, fmt.Errorf("no engine registered for database type %q", cfg.Type)
@@ -306,6 +307,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
+		postgresEngine:    postgres.New(),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -364,10 +366,14 @@ func (c *LocalClient) protoEngine() ternv1.Engine {
 	}
 	// Fall back to the type default when there is no engine or its name has no
 	// proto representation.
-	if c.config.Type == storage.DatabaseTypeVitess {
+	switch c.config.Type {
+	case storage.DatabaseTypeVitess:
 		return ternv1.Engine_ENGINE_PLANETSCALE
+	case storage.DatabaseTypePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES
+	default:
+		return ternv1.Engine_ENGINE_SPIRIT
 	}
-	return ternv1.Engine_ENGINE_SPIRIT
 }
 
 func localPlanTarget(req *ternv1.PlanRequest, database string) string {
@@ -386,6 +392,8 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 		return ternv1.Engine_ENGINE_SPIRIT, nil
 	case storage.EngineStrata:
 		return ternv1.Engine_ENGINE_STRATA, nil
+	case storage.EnginePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES, nil
 	default:
 		return 0, fmt.Errorf("unknown engine: %s", name)
 	}
@@ -852,7 +860,7 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
 	}
 	if vschema != nil && strings.TrimSpace(vschema.Raw) != "" {
-		artifacts[vSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
+		artifacts[storage.VSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
 	}
 
 	c.logger.Info("LocalClient.PullSchema: loaded live Vitess schema",
@@ -1333,11 +1341,11 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		// Only store VSchema artifacts when the Plan detected a change.
 		if sc.Metadata["vschema_changed"] == "true" {
 			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-				if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
+				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
 					if nsData.Artifacts == nil {
 						nsData.Artifacts = map[string]string{}
 					}
-					nsData.Artifacts[vSchemaArtifactName] = vs
+					nsData.Artifacts[storage.VSchemaArtifactName] = vs
 				}
 			}
 		}
@@ -1351,7 +1359,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Don't store empty plans — no DDL changes, no VSchema changes.
 	hasVSchemaChanges := false
 	for _, ns := range namespaces {
-		if namespaceHasVSchemaArtifact(ns) {
+		if ns.ChangesVSchema() {
 			hasVSchemaChanges = true
 			break
 		}
@@ -1810,16 +1818,16 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 		nsFiles := schemaFiles[ns]
 		vs := ""
 		if nsFiles != nil {
-			vs = nsFiles.Files[vSchemaArtifactName]
+			vs = nsFiles.Files[storage.VSchemaArtifactName]
 		}
 		if vs == "" {
-			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, vSchemaArtifactName)
+			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, storage.VSchemaArtifactName)
 		}
 		nsData := namespaces[ns]
 		if nsData.Artifacts == nil {
 			nsData.Artifacts = map[string]string{}
 		}
-		nsData.Artifacts[vSchemaArtifactName] = vs
+		nsData.Artifacts[storage.VSchemaArtifactName] = vs
 	}
 
 	return namespaces, nil
@@ -2217,6 +2225,8 @@ func (c *LocalClient) getEngine() engine.Engine {
 		return c.spiritEngine
 	case storage.DatabaseTypeVitess:
 		return c.planetscaleEngine
+	case storage.DatabaseTypePostgres:
+		return c.postgresEngine
 	default:
 		// A registered engine for a non-built-in type (nil if none registered).
 		return c.customEngine

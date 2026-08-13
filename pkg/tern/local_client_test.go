@@ -132,7 +132,7 @@ func TestLocalClient_PullSchemaLoadsVitessKeyspaceWithVSchemaArtifact(t *testing
 	ns := resp.Namespaces["commerce_sharded"]
 	require.NotNil(t, ns)
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", ns.Tables["users"])
-	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[vSchemaArtifactName])
+	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[storage.VSchemaArtifactName])
 	assert.Equal(t, "commerce_sharded", ns.NamespaceCatalog.Name)
 	assert.Equal(t, storage.DatabaseTypeVitess, ns.NamespaceCatalog.Engine)
 	assert.Equal(t, int32(1), ns.NamespaceCatalog.TableCount)
@@ -3565,6 +3565,22 @@ func TestNewLocalClientBuiltinEngineIgnoresRegistry(t *testing.T) {
 	c, err := NewLocalClient(LocalConfig{Database: "db", Type: storage.DatabaseTypeMySQL}, nil, slog.Default())
 	require.NoError(t, err)
 	assert.NotNil(t, c.getEngine())
+}
+
+func TestNewLocalClientUsesPostgresEngine(t *testing.T) {
+	metadata := map[string]string{"cluster": "aurora-postgres"}
+	c, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypePostgres,
+		TargetDSN: "postgres://localhost:5432/orders",
+		Metadata:  metadata,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	assert.Equal(t, storage.EnginePostgres, c.getEngine().Name())
+	assert.Equal(t, "postgres://localhost:5432/orders", c.credentials().DSN)
+	assert.Equal(t, metadata, c.credentials().Metadata)
+	assert.Equal(t, ternv1.Engine_ENGINE_POSTGRES, c.protoEngine())
 }
 
 // A type with no built-in engine and no registered factory fails closed.

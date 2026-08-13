@@ -147,7 +147,7 @@ func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 
 	rendered := RenderRollbackPlanComment(data)
 	assert.Contains(t, rendered, "Lint Warnings")
-	assert.Contains(t, rendered, "[users] Dropping index may impact queries")
+	assert.Contains(t, rendered, "- `users`: Dropping index may impact queries")
 }
 
 func TestRenderRollbackConfirmNoLock(t *testing.T) {

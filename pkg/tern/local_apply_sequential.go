@@ -316,15 +316,44 @@ type atomicPollState struct {
 	warnedPerShardUnavailable bool
 }
 
-// startApplyHeartbeat starts a background goroutine that heartbeats the apply
-// on the client's heartbeat interval, preventing the operator from treating it
-// as crashed. A definitively lost lease cancels the drive so the displaced
-// driver stops executing. Transient heartbeat errors are retried on the next
-// tick — until they have persisted for the full storage.ApplyLeaseStaleAfter
-// window, at which point the lease is presumed lost (a peer operator can
-// already have reclaimed the stale row) and the drive is cancelled the same
-// way. Returns a cancel function that stops the heartbeat. Must be deferred by
-// the caller.
+// operationLeaseOnlyDrive reports the operation lease of a drive that holds an
+// operation lease and no parent apply lease — the capability shape of an
+// operation-scoped drive, which owns its operation row while the parent applies
+// row belongs to the parent lease and the rollout projection. It reads the same
+// signal ApplyStore.Heartbeat guards on, so a drive can never heartbeat a row
+// storage would refuse to let it write.
+func operationLeaseOnlyDrive(ctx context.Context) (storage.OperationLease, bool) {
+	opLease, hasOpLease := storage.OperationLeaseFromContext(ctx)
+	if !hasOpLease {
+		return storage.OperationLease{}, false
+	}
+	if _, hasApplyLease := storage.ApplyLeaseFromContext(ctx); hasApplyLease {
+		return storage.OperationLease{}, false
+	}
+	return opLease, true
+}
+
+// heartbeatDriveLease refreshes whichever lease keeps this drive claimed: an
+// operation-scoped drive heartbeats its own operation row, every other drive
+// heartbeats the parent applies row. Both renew the same staleness clock a peer
+// driver reclaims work on, so the drive's liveness is reported wherever its
+// claim actually lives.
+func (c *LocalClient) heartbeatDriveLease(ctx context.Context, apply *storage.Apply) error {
+	if opLease, operationScoped := operationLeaseOnlyDrive(ctx); operationScoped {
+		return c.storage.ApplyOperations().Heartbeat(ctx, opLease.OperationID)
+	}
+	return c.storage.Applies().Heartbeat(ctx, apply.ID)
+}
+
+// startApplyHeartbeat starts a background goroutine that heartbeats the drive's
+// claim on the client's heartbeat interval, preventing the operator from
+// treating it as crashed. A definitively lost lease cancels the drive so the
+// displaced driver stops executing. Transient heartbeat errors are retried on
+// the next tick — until they have persisted for the full
+// storage.ApplyLeaseStaleAfter window, at which point the lease is presumed
+// lost (a peer operator can already have reclaimed the stale row) and the drive
+// is cancelled the same way. Returns a cancel function that stops the
+// heartbeat. Must be deferred by the caller.
 func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Apply, cancelApply ...context.CancelFunc) context.CancelFunc {
 	hbCtx, cancel := context.WithCancel(ctx)
 	stopDrive := func() {
@@ -335,6 +364,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 		}
 		cancel()
 	}
+	_, operationScoped := operationLeaseOnlyDrive(ctx)
 	go func() {
 		ticker := time.NewTicker(c.heartbeatInterval)
 		defer ticker.Stop()
@@ -344,7 +374,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				err := c.storage.Applies().Heartbeat(hbCtx, apply.ID)
+				err := c.heartbeatDriveLease(hbCtx, apply)
 				if err == nil {
 					lastSuccess = time.Now()
 					continue
@@ -354,7 +384,7 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 					// cancellation fallout, not lease trouble.
 					return
 				}
-				if c.applyHeartbeatFailureStopsDrive(hbCtx, apply, err, lastSuccess) {
+				if c.applyHeartbeatFailureStopsDrive(hbCtx, apply, err, lastSuccess, operationScoped) {
 					stopDrive()
 					return
 				}
@@ -364,28 +394,39 @@ func (c *LocalClient) startApplyHeartbeat(ctx context.Context, apply *storage.Ap
 	return cancel
 }
 
-// applyHeartbeatFailureStopsDrive classifies a failed apply heartbeat write
-// and reports whether the driver must stop driving: either storage reported
-// the lease definitively lost, or heartbeat failures have persisted since
+// applyHeartbeatFailureStopsDrive classifies a failed drive heartbeat write and
+// reports whether the driver must stop driving: either storage reported the
+// lease definitively lost, or heartbeat failures have persisted since
 // lastSuccess for the full lease staleness window, so a peer operator can
 // already have reclaimed the stale row. A transient failure inside the window
-// keeps the drive running and is retried on the next tick.
-func (c *LocalClient) applyHeartbeatFailureStopsDrive(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time) bool {
+// keeps the drive running and is retried on the next tick. operationScoped
+// names which claim went stale in the logs — the two are reclaimed by different
+// paths, so an operator triaging a displaced drive needs to know which.
+func (c *LocalClient) applyHeartbeatFailureStopsDrive(ctx context.Context, apply *storage.Apply, hbErr error, lastSuccess time.Time, operationScoped bool) bool {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	logger = logger.With("heartbeat_scope", heartbeatScopeName(operationScoped))
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
-		logger.Warn("heartbeat failed because apply lease was lost; local driver will stop executing and writing apply state",
+		logger.Warn("heartbeat failed because the drive's lease was lost; local driver will stop executing and writing apply state",
 			append(apply.MutableLogAttrs(), "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_lost")
 		return true
 	}
 	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
-		logger.Warn("heartbeat has failed for the full lease staleness window; a peer operator can reclaim the apply, so this local driver will stop executing and writing apply state",
+		logger.Warn("heartbeat has failed for the full lease staleness window; a peer operator can reclaim the work, so this local driver will stop executing and writing apply state",
 			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, "lease_presumed_lost")
 		return true
 	}
 	logger.Warn("heartbeat failed; will retry", append(apply.MutableLogAttrs(), "error", hbErr)...)
 	return false
+}
+
+// heartbeatScopeName renders which row a drive heartbeats, for log triage.
+func heartbeatScopeName(operationScoped bool) string {
+	if operationScoped {
+		return "apply_operation"
+	}
+	return "apply"
 }
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).

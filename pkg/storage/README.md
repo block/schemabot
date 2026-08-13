@@ -1,6 +1,6 @@
 # storage
 
-Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/). The cross-dialect behavioral parity suite that every implementation must pass lives in [`storage/storagetest`](./storagetest/).
+Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/) and the PostgreSQL implementation in [`storage/postgresstore`](./postgresstore/). The cross-dialect behavioral parity suite that every implementation must pass lives in [`storage/storagetest`](./storagetest/).
 
 ## Interface Hierarchy
 
@@ -79,6 +79,6 @@ growth is bounded by webhook volume, not by retries.
 - **ApplyLog**: Level, event type, source (schemabot/spirit), message, state transitions
 - **ApplyControlRequest**: Durable control operation intent and processing status
 
-## MySQL Implementation
+## Implementations
 
-The `storage/mysqlstore` package implements all interfaces using a `*sql.DB` connection. Each store is a thin wrapper with SQL queries. Plans store their DDL and schema data as JSON in a `plan_data` column. The schema tables themselves are defined in [`pkg/schema`](../schema/) and applied on startup via `api.EnsureSchema()`.
+The [`storage/mysqlstore`](./mysqlstore/) and [`storage/postgresstore`](./postgresstore/) packages implement all interfaces using a `*sql.DB` connection. Both are thin public constructors over the shared dialect-parameterized core in `storage/internal/sqlstore`; each store is a thin wrapper with SQL queries. Plans store their DDL and schema data as JSON in a `plan_data` column. The schema tables themselves are defined in [`pkg/schema`](../schema/) and applied on startup via `api.EnsureSchema()`.

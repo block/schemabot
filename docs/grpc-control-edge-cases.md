@@ -17,6 +17,11 @@
   - [Cutover readiness is visible remotely before stored state catches up](#cutover-readiness-is-visible-remotely-before-stored-state-catches-up)
   - [Cutover RPC fails or times out](#cutover-rpc-fails-or-times-out)
   - [Stored cutover is already in progress](#stored-cutover-is-already-in-progress)
+  - [Deferred-cutover restart recovery state DAG](#deferred-cutover-restart-recovery-state-dag)
+  - [Start state: storage is `waiting_for_cutover`; Spirit sentinel still exists after restart](#start-state-storage-is-waiting_for_cutover-spirit-sentinel-still-exists-after-restart)
+  - [Start state: durable cutover request already exists before recovery starts](#start-state-durable-cutover-request-already-exists-before-recovery-starts)
+  - [Start state: storage is `waiting_for_cutover`; Spirit sentinel is absent after restart](#start-state-storage-is-waiting_for_cutover-spirit-sentinel-is-absent-after-restart)
+  - [Recovery UI states](#recovery-ui-states)
 - [Edge-case checklist](#edge-case-checklist)
 - [Review questions for new gRPC control changes](#review-questions-for-new-grpc-control-changes)
 

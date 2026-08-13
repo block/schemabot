@@ -137,6 +137,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
@@ -430,6 +431,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy)
+		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		multiEnvData.Plans[env] = &commentData
 	}

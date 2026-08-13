@@ -13,8 +13,6 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-const vSchemaArtifactName = "vschema.json"
-
 func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.PullSchemaResponse {
 	return &apitypes.PullSchemaResponse{
 		Database:    resp.Database,
@@ -272,8 +270,8 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 		}
 		if sc.Metadata["vschema_changed"] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
-				if vschema := nsFiles.Files[vSchemaArtifactName]; vschema != "" {
-					nsData.Artifacts = map[string]string{vSchemaArtifactName: vschema}
+				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {
+					nsData.Artifacts = map[string]string{storage.VSchemaArtifactName: vschema}
 				}
 			}
 		}
@@ -344,6 +342,10 @@ func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
 		return ddl.StatementTypeToOp(ddl.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
@@ -363,6 +365,10 @@ func changeTypeToProto(op string) ternv1.ChangeType {
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
 	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
+	case ddl.StatementCreateIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
+	case ddl.StatementDropIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}

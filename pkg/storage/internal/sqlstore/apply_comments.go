@@ -118,8 +118,6 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 		}
 		return nil
 	}
-	args := []any{applyID, commentState}
-	args = append(args, lease.Token)
 	query := s.dialect.JoinedUpdate(
 		"apply_comments", "c", "applies", "a", "a.id = c.apply_id",
 		[]JoinedUpdateAssignment{
@@ -127,9 +125,9 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 			{Column: "last_edited_at", Expr: "NOW()"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"c.apply_id = ? AND c.comment_state = ? AND a.lease_token = ?",
+		"c.apply_id = ? AND c.comment_state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -182,7 +180,7 @@ func (s *applyCommentStore) Supersede(ctx context.Context, applyID int64, commen
 			{Column: "superseded_at", Expr: "NOW()"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND a.lease_token = ?",
+		"c.apply_id = ? AND c.comment_state = ? AND c.superseded_at IS NULL AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {
@@ -224,7 +222,7 @@ func (s *applyCommentStore) ClearPendingFreeze(ctx context.Context, applyID int6
 			{Column: "pending_freeze_github_comment_id", Expr: "NULL"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND a.lease_token = ?",
+		"c.apply_id = ? AND c.comment_state = ? AND c.pending_freeze_github_comment_id IS NOT NULL AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, applyID, commentState, lease.Token)
 	if err != nil {

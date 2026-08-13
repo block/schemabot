@@ -32,8 +32,8 @@ type Storage struct {
 
 var _ storage.Storage = (*Storage)(nil)
 
-// New creates a MySQL storage instance.
-func New(db *sql.DB) *Storage {
+// NewMySQL creates a MySQL storage instance.
+func NewMySQL(db *sql.DB) *Storage {
 	dialect := MySQLDialect{}
 	return NewWithDependencies(Dependencies{
 		DB:         db,
@@ -81,7 +81,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		applyLogs:       &applyLogStore{db: rdb, identity: deps.Identity},
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
-		planComments:    &planCommentStore{db: rdb, identity: deps.Identity},
+		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},

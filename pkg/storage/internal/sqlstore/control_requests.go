@@ -158,7 +158,7 @@ func (s *controlRequestStore) CompletePending(ctx context.Context, applyID int64
 			{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?",
+		"cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, storage.ControlRequestCompleted, applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {
@@ -194,7 +194,7 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 			{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
-		"cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND a.lease_token = ?",
+		"cr.apply_id = ? AND cr.operation = ? AND cr.status = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 	)
 	result, err := s.db.ExecContext(ctx, query, storage.ControlRequestFailed, nullString(errorMessage), applyID, operation, storage.ControlRequestPending, lease.Token)
 	if err != nil {

@@ -119,13 +119,16 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 // drift fails the check closed ahead of the plan's own outcome: a deployment
 // whose live schema no longer matches the reviewed plan (or that could not be
 // confirmed to match) must block the PR even when the primary's diff is clean or
-// empty. A primary plan that reported errors likewise fails; otherwise changes
-// require an apply and an empty diff passes.
-func planCheckConclusion(hasChanges, hasPlanErrors, driftBlocked bool) string {
+// empty. A primary plan that reported errors or a PostgreSQL refusal likewise
+// fails. Destructive changes remain action-required: the apply path requires
+// the separate --allow-unsafe acknowledgement before they can proceed.
+func planCheckConclusion(hasChanges, hasPlanErrors, hasPostgresRefusal, driftBlocked bool) string {
 	switch {
 	case driftBlocked:
 		return checkConclusionFailure
 	case hasPlanErrors:
+		return checkConclusionFailure
+	case hasPostgresRefusal:
 		return checkConclusionFailure
 	case hasChanges:
 		return checkConclusionActionRequired
@@ -177,7 +180,8 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	hasChanges := planResp.HasChanges()
 	driftBlocked := drift.blocks()
 
-	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, driftBlocked)
+	hasPostgresRefusal := schema.Type == storage.DatabaseTypePostgres && planResp.HasBlockedChanges()
+	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, hasPostgresRefusal, driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
 	// plan facts: HasChanges stays "the reviewed primary plan has changes", and

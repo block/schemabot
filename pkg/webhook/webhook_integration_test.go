@@ -68,10 +68,12 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -332,6 +334,23 @@ type planFlowResult struct {
 	// "closed" before issuing the webhook request.
 	PRState atomic.Pointer[string]
 
+	// baseFiles is what the default branch holds, as repository path to blob
+	// SHA. It starts as the schema directory carrying the config at a blob of
+	// its own, so resolving a PR's schema file at the default branch tip walks
+	// the same directory levels a real repository has, and none of the PR's own
+	// files are found there. Tests add to it through baseHolds to model a
+	// changed-file list that carries a file the PR does not propose.
+	baseFiles atomic.Pointer[map[string]string]
+
+	// headTreeEntries is the repository at head, as the fixture described it.
+	headTreeEntries []*gh.TreeEntry
+
+	// BaseRef overrides the base branch served by /pulls/1. Nil (the default)
+	// serves "main". Tests that model a PR being retargeted install the new ref,
+	// optionally partway through a flow so the base a plan was computed against
+	// differs from the base it would be published on.
+	BaseRef atomic.Pointer[string]
+
 	// PRMerged marks the PR served by /pulls/1 as merged. GitHub reports a
 	// merged PR with state "closed" and merged true, so tests exercising the
 	// merged-PR rejection copy set this together with PRState "closed".
@@ -344,6 +363,28 @@ type planFlowResult struct {
 	// before issuing the webhook request. Nil preserves the default
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
+
+	// FailFirstPRRead makes the first /pulls/1 request answer with a 403 and
+	// serves every later one. Auto-plan reads the PR to snapshot its base
+	// branch before discovery, so this models a failure to establish which
+	// base a plan would be computed against, while leaving the reads that post
+	// the resulting check run working. The status has to be one the client
+	// treats as a semantic answer rather than an availability failure: a 5xx
+	// is retried, and the retry would serve the request and hide the failure
+	// the test is asking for.
+	FailFirstPRRead atomic.Bool
+
+	// FailPRReadsAfterFirstFetch makes /pulls/1 serve only its first request and
+	// answer every later one with a 403. Auto-plan snapshots the PR once at the
+	// top of discovery and re-reads it uncached before publishing, so this models
+	// SchemaBot losing access to the PR in between — the publish-time
+	// re-verification cannot be answered and the plan must not be published. The
+	// status is the non-retryable kind on purpose: the client already retries an
+	// availability failure, so what reaches that re-verification is a failure
+	// retrying does not fix.
+	FailPRReadsAfterFirstFetch atomic.Bool
+
+	prReadRequests atomic.Int64
 
 	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
 	// request and answer every later one with a 503. Config discovery fetches
@@ -489,6 +530,170 @@ func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[stri
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
 }
 
+// baseHolds adds the given repository paths to what the default branch already
+// carries: each at the blob head has for it when head has it too — a file the
+// PR's changed-file list carries but that merging it would not change — and at
+// a blob of its own otherwise, which is what a file the PR deletes looks like.
+func (r *planFlowResult) baseHolds(paths ...string) {
+	held := make(map[string]string, len(paths))
+	if existing := r.baseFiles.Load(); existing != nil {
+		maps.Copy(held, *existing)
+	}
+	for _, path := range paths {
+		held[path] = "basesha~" + path
+		for _, entry := range r.headTreeEntries {
+			if entry.GetPath() == path {
+				held[path] = entry.GetSHA()
+			}
+		}
+	}
+	r.baseFiles.Store(&held)
+}
+
+// baseTreeEntries is the repository as the default branch holds it.
+func (r *planFlowResult) baseTreeEntries() []*gh.TreeEntry {
+	held := r.baseFiles.Load()
+	if held == nil {
+		return nil
+	}
+	entries := make([]*gh.TreeEntry, 0, len(*held))
+	for path, blobSHA := range *held {
+		entries = append(entries, &gh.TreeEntry{Path: new(path), Type: new("blob"), SHA: new(blobSHA)})
+	}
+	slices.SortFunc(entries, func(a, b *gh.TreeEntry) int { return strings.Compare(a.GetPath(), b.GetPath()) })
+	return entries
+}
+
+// Synthesized tree identifiers for directories below a root level, one prefix
+// per branch so the head and the default branch resolve through distinct nodes.
+// Directory separators are encoded so an identifier stays one URL path segment,
+// as a real tree SHA is.
+const (
+	headSubtreeSHAPrefix = "subtree~"
+	baseSubtreeSHAPrefix = "basetree~"
+)
+
+// repositoryTreeFixture describes a repository to the tree endpoints at the two
+// commits a plan flow reads: the PR head, and the default branch tip that
+// discovery scopes the PR's changed files against. Both are given as the flat
+// path lists a recursive tree read returns.
+type repositoryTreeFixture struct {
+	headSHA     string
+	headEntries []*gh.TreeEntry
+	// baseEntries is what the default branch holds. Nil means it holds none of
+	// the head's files, so every changed file is the PR's own proposal.
+	baseEntries func() []*gh.TreeEntry
+	// defaultTip is the commit the default branch resolves to. Nil serves the
+	// PR's base commit, so the base branch appears unmoved.
+	defaultTip func() string
+}
+
+func (f repositoryTreeFixture) base() []*gh.TreeEntry {
+	if f.baseEntries == nil {
+		return nil
+	}
+	return f.baseEntries()
+}
+
+func (f repositoryTreeFixture) tip() string {
+	if f.defaultTip == nil {
+		return "def456"
+	}
+	return f.defaultTip()
+}
+
+// shallowTreeLevel serves one directory level. treeSHA is either a commit (a
+// root level) or a synthesized subtree identifier, and which commit it belongs
+// to decides which entry list the level is built from. A commit the fixture
+// does not name as the default branch tip is a head commit, so a test that
+// advances the PR head needs no fixture of its own.
+func (f repositoryTreeFixture) shallowTreeLevel(treeSHA string) []*gh.TreeEntry {
+	if encoded, isBase := strings.CutPrefix(treeSHA, baseSubtreeSHAPrefix); isBase {
+		return treeLevelFrom(f.base(), strings.ReplaceAll(encoded, "~", "/"), baseSubtreeSHAPrefix)
+	}
+	if encoded, isHead := strings.CutPrefix(treeSHA, headSubtreeSHAPrefix); isHead {
+		return treeLevelFrom(f.headEntries, strings.ReplaceAll(encoded, "~", "/"), headSubtreeSHAPrefix)
+	}
+	if treeSHA == f.tip() {
+		return treeLevelFrom(f.base(), "", baseSubtreeSHAPrefix)
+	}
+	return treeLevelFrom(f.headEntries, "", headSubtreeSHAPrefix)
+}
+
+// registerRepositoryTrees serves the repository reads a plan flow makes: the
+// default branch and its tip, and the git trees at head and at that tip. A
+// shallow read walks one directory level at a time; a recursive read wants the
+// whole tree flat. Both hit the same path, so serve what was asked for: the
+// recursive form is what config discovery reads, and the level form is what the
+// path resolvers walk.
+func registerRepositoryTrees(t *testing.T, mux *http.ServeMux, fixture repositoryTreeFixture) {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Repository{DefaultBranch: new("main")}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		tip := fixture.tip()
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
+		}))
+	})
+
+	serveTree := func(w http.ResponseWriter, r *http.Request, sha string) {
+		entries := fixture.headEntries
+		if r.URL.Query().Get("recursive") == "" {
+			entries = fixture.shallowTreeLevel(sha)
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       &sha,
+			Entries:   entries,
+			Truncated: new(false),
+		}))
+	}
+	// Go 1.22 ServeMux gives precedence to the more specific exact path, so the
+	// head commit keeps its own route and every other SHA falls through to the
+	// prefix — a test that advances the head needs no fixture per commit.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+fixture.headSHA, func(w http.ResponseWriter, r *http.Request) {
+		serveTree(w, r, fixture.headSHA)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
+		serveTree(w, r, r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):])
+	})
+}
+
+// treeLevelFrom returns the entries directly under dir, minting subtree
+// identifiers for deeper directories with subtreePrefix.
+func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.TreeEntry {
+	pathPrefix := ""
+	if dir != "" {
+		pathPrefix = dir + "/"
+	}
+	var level []*gh.TreeEntry
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		rest, under := strings.CutPrefix(entry.GetPath(), pathPrefix)
+		if !under || rest == "" {
+			continue
+		}
+		segment, deeper, isDir := strings.Cut(rest, "/")
+		if seen[segment] {
+			continue
+		}
+		seen[segment] = true
+		if isDir && deeper != "" {
+			level = append(level, &gh.TreeEntry{
+				Path: new(segment),
+				Type: new("tree"),
+				SHA:  new(subtreePrefix + strings.ReplaceAll(pathPrefix+segment, "/", "~")),
+			})
+			continue
+		}
+		level = append(level, &gh.TreeEntry{Path: new(segment), Type: new("blob"), SHA: new(entry.GetSHA())})
+	}
+	return level
+}
+
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
@@ -501,12 +706,29 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// PR info — head SHA can shift across calls via result.HeadSHAs (default
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		read := result.prReadRequests.Add(1)
+		if result.FailFirstPRRead.Load() && read == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
+		if result.FailPRReadsAfterFirstFetch.Load() && read > 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
 		sha := result.nextHeadSHA()
 		prState := "open"
 		if override := result.PRState.Load(); override != nil {
 			prState = *override
 		}
 		merged := result.PRMerged.Load()
+		baseRef := "main"
+		if override := result.BaseRef.Load(); override != nil {
+			baseRef = *override
+		}
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			State:  &prState,
 			Merged: &merged,
@@ -515,27 +737,13 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 				SHA: &sha,
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
+				Ref: &baseRef,
 				SHA: new("def456"),
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
 
-	// Base-branch freshness endpoints. By default the base ref still points
-	// at the PR's base commit, which is therefore also the merge base of the
-	// default head — the schema tree cannot differ from itself, so the
-	// base-schema freshness gate lets applies proceed.
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
-		tip := "def456"
-		if provider := result.BaseTip.Load(); provider != nil {
-			tip = (*provider)()
-		}
-		_ = json.NewEncoder(w).Encode(gh.Reference{
-			Ref:    new("refs/heads/main"),
-			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
-		})
-	})
 	registerFreshBaseComparison(t, mux, "abc123")
 
 	// PR changed files — report schema files changed (in namespace subdir)
@@ -588,41 +796,31 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 			Size: new(len(content)),
 		})
 	}
+	result.headTreeEntries = treeEntries
 
-	// Git tree (recursive). The exact-SHA handler preserves the historical
-	// "abc123" behavior for tests that only exercise one head; the prefix
-	// fallback serves the same tree for any other SHA so tests that simulate
-	// HEAD advancing (e.g. the cross-delivery freshness checks) don't need a
-	// custom fixture per SHA. Go 1.22 ServeMux gives precedence to the more
-	// specific exact path, so existing tests are unaffected.
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       new("abc123"),
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
-		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
-		if sha == "def456" {
-			// The base commit's shallow root tree. The base-schema freshness
-			// gate walks this level looking for the managed "schema"
-			// directory entry; serving it as a real tree entry exercises the
-			// gate's path resolution rather than the path-absent shortcut.
-			_ = json.NewEncoder(w).Encode(gh.Tree{
-				SHA: &sha,
-				Entries: []*gh.TreeEntry{
-					{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
-				},
-				Truncated: new(false),
-			})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       &sha,
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
+	// The default branch already has the schema directory and the config in it,
+	// at a blob of its own. Resolving one of the PR's schema files at the default
+	// branch tip then descends the directory levels a real repository has instead
+	// of stopping at an empty root, and still finds none of the PR's own files
+	// there — so every changed file remains the PR's own proposal.
+	if schemabotConfig != "" {
+		result.baseFiles.Store(&map[string]string{"schema/schemabot.yaml": "baseconfigsha001"})
+	}
+
+	// The repository at both commits a plan flow reads. By default the default
+	// branch tip is the PR's own base commit, so the base branch appears
+	// unmoved — the schema tree cannot differ from itself, and the base-schema
+	// freshness gate lets applies proceed.
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA:     "abc123",
+		headEntries: treeEntries,
+		baseEntries: result.baseTreeEntries,
+		defaultTip: func() string {
+			if provider := result.BaseTip.Load(); provider != nil {
+				return (*provider)()
+			}
+			return "def456"
+		},
 	})
 
 	// Blob content

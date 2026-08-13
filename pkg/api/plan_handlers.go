@@ -31,6 +31,8 @@ import (
 const applyOperationKeyMaxLen = 255
 const finalizerOperationKeySegment = "group_finalizer"
 
+const postgresVerdictUnavailableReason = "PostgreSQL classifier verdict unavailable; this change cannot be applied"
+
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
 	Database    string                         `json:"database"`
@@ -553,6 +555,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 		return nil, nil, err
 	}
+	if resolvedTarget.DatabaseType == storage.DatabaseTypePostgres {
+		blockPostgresPlanWithoutClassifierVerdicts(resp)
+	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
 	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
@@ -586,6 +591,38 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	// at rollup time.
 	planResp.Deployment = deployment
 	return resp, planResp, nil
+}
+
+// blockPostgresPlanWithoutClassifierVerdicts is the fail-closed seam for the
+// PostgreSQL classifier adapter. Until that adapter supplies authoritative
+// per-statement verdicts, no PostgreSQL statement is eligible to execute.
+func blockPostgresPlanWithoutClassifierVerdicts(resp *ternv1.PlanResponse) {
+	if resp == nil {
+		return
+	}
+	block := func(change *ternv1.TableChange) {
+		if change == nil {
+			return
+		}
+		change.ExecutionMode = "blocked"
+		change.ModeReason = postgresVerdictUnavailableReason
+	}
+	for _, schemaChange := range resp.Changes {
+		if schemaChange == nil {
+			continue
+		}
+		for _, tableChange := range schemaChange.TableChanges {
+			block(tableChange)
+		}
+	}
+	for _, shard := range resp.Shards {
+		if shard == nil {
+			continue
+		}
+		for _, tableChange := range shard.Changes {
+			block(tableChange)
+		}
+	}
 }
 
 type storedPlanRoute struct {
@@ -1114,7 +1151,7 @@ func buildApplyOperationGroups(
 	}
 
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
-	allowTasklessWork := len(targets) == 1 && len(taskChanges) == 0 && len(vschemaFinalizerNamespaces(plan)) > 0
+	allowTasklessWork := len(targets) == 1 && len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0
 	for _, target := range targets {
 		tasks := buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now)
 		groups = append(groups, &storage.ApplyOperationWithTasks{
@@ -1205,7 +1242,7 @@ func buildShardedApplyOperationGroups(
 		// by namespace at drive time), not from a synthetic task. A VSchema-only
 		// namespace with no shard work still gets a finalizer so its VSchema change
 		// is never dropped.
-		for _, namespace := range vschemaFinalizerNamespaces(plan) {
+		for _, namespace := range plan.VSchemaNamespaces() {
 			if err := validateOperationKeyPart("namespace", namespace); err != nil {
 				return nil, err
 			}
@@ -1221,20 +1258,6 @@ func buildShardedApplyOperationGroups(
 		}
 	}
 	return groups, nil
-}
-
-// vschemaFinalizerNamespaces returns, in sorted order, every namespace in the
-// plan that changes its VSchema — each needs a group_finalizer to apply the
-// VSchema after its shard work (if any) completes.
-func vschemaFinalizerNamespaces(plan *storage.Plan) []string {
-	var namespaces []string
-	for namespace, nsData := range plan.Namespaces {
-		if nsData != nil && nsData.Artifacts[vSchemaArtifactName] != "" {
-			namespaces = append(namespaces, namespace)
-		}
-	}
-	sort.Strings(namespaces)
-	return namespaces
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {
