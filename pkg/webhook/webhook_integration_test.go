@@ -361,11 +361,14 @@ type planFlowResult struct {
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
 
-	// FailFirstPRRead makes the first /pulls/1 request answer with a 503 and
+	// FailFirstPRRead makes the first /pulls/1 request answer with a 403 and
 	// serves every later one. Auto-plan reads the PR to snapshot its base
-	// branch before discovery, so this models a transient failure to establish
-	// which base a plan would be computed against, while leaving the reads that
-	// post the resulting check run working.
+	// branch before discovery, so this models a failure to establish which
+	// base a plan would be computed against, while leaving the reads that post
+	// the resulting check run working. The status has to be one the client
+	// treats as a semantic answer rather than an availability failure: a 5xx
+	// is retried, and the retry would serve the request and hide the failure
+	// the test is asking for.
 	FailFirstPRRead atomic.Bool
 	prReadRequests  atomic.Int64
 
@@ -687,7 +690,9 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
 		if result.FailFirstPRRead.Load() && result.prReadRequests.Add(1) == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
 			return
 		}
 		sha := result.nextHeadSHA()

@@ -1789,6 +1789,9 @@ func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
 		assert.Equal(t, checkStatusCompleted, cr.Status)
 		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion,
 			"a base branch that cannot be read must fail the check closed")
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, configDiscoveryFailedBlock.message, cr.Output.Summary,
+			"the check must report a discovery failure, not a plan result")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the discovery-failure check run")
 	}
