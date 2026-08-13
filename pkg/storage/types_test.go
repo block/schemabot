@@ -189,3 +189,139 @@ func TestEngineForType(t *testing.T) {
 		})
 	}
 }
+
+// The dispatch decision for a task-less claim rests entirely on these four
+// predicates: a whole-deployment work operation for a VSchema-only plan is the
+// one shape that legitimately resolves no tasks and may be dispatched, and every
+// other task-less work operation must fail closed as an invalid or stale claim.
+// Their boundaries — nil receivers, a nil plan, an absent versus empty artifact,
+// a per-table operation key — are what separate the two outcomes.
+func TestVSchemaPredicates(t *testing.T) {
+	vschemaNamespace := func() *NamespacePlanData {
+		return &NamespacePlanData{Artifacts: map[string]string{VSchemaArtifactName: `{"tables":{}}`}}
+	}
+
+	t.Run("ChangesVSchema", func(t *testing.T) {
+		tests := []struct {
+			name string
+			ns   *NamespacePlanData
+			want bool
+		}{
+			{"nil receiver", nil, false},
+			{"no artifacts at all", &NamespacePlanData{}, false},
+			{"nil artifact map", &NamespacePlanData{Artifacts: nil}, false},
+			{"artifact absent", &NamespacePlanData{Artifacts: map[string]string{"other.json": "{}"}}, false},
+			{"artifact present but empty", &NamespacePlanData{Artifacts: map[string]string{VSchemaArtifactName: ""}}, false},
+			{"artifact present", vschemaNamespace(), true},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				assert.Equal(t, tt.want, tt.ns.ChangesVSchema())
+			})
+		}
+	})
+
+	t.Run("VSchemaNamespaces", func(t *testing.T) {
+		assert.Nil(t, (*Plan)(nil).VSchemaNamespaces(), "a nil plan carries no namespaces")
+		assert.Nil(t, (&Plan{}).VSchemaNamespaces(), "a plan with no namespaces carries none")
+
+		plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+			"zeta":       vschemaNamespace(),
+			"alpha":      vschemaNamespace(),
+			"tables":     {Tables: []TableChange{{Table: "orders"}}},
+			"nil_entry":  nil,
+			"empty_vsch": {Artifacts: map[string]string{VSchemaArtifactName: ""}},
+		}}
+		assert.Equal(t, []string{"alpha", "zeta"}, plan.VSchemaNamespaces(),
+			"only namespaces carrying a VSchema artifact, in sorted order so dispatch is deterministic")
+	})
+
+	t.Run("IsVSchemaOnly", func(t *testing.T) {
+		tests := []struct {
+			name string
+			plan *Plan
+			want bool
+		}{
+			{"nil plan", nil, false},
+			{"empty plan", &Plan{}, false},
+			{
+				name: "DDL only",
+				plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+					"app": {Tables: []TableChange{{Table: "orders"}}},
+				}},
+				want: false,
+			},
+			{
+				name: "VSchema only",
+				plan: &Plan{Namespaces: map[string]*NamespacePlanData{"app": vschemaNamespace()}},
+				want: true,
+			},
+			{
+				name: "VSchema alongside DDL is not VSchema-only",
+				plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+					"app":   vschemaNamespace(),
+					"other": {Tables: []TableChange{{Table: "orders"}}},
+				}},
+				want: false,
+			},
+			{
+				name: "DDL in the same namespace as the VSchema change",
+				plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+					"app": {
+						Tables:    []TableChange{{Table: "orders"}},
+						Artifacts: map[string]string{VSchemaArtifactName: `{"tables":{}}`},
+					},
+				}},
+				want: false,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				assert.Equal(t, tt.want, tt.plan.IsVSchemaOnly())
+			})
+		}
+	})
+
+	t.Run("IsTasklessVSchemaOnlyWork", func(t *testing.T) {
+		vschemaOnlyPlan := &Plan{Namespaces: map[string]*NamespacePlanData{"app": vschemaNamespace()}}
+		ddlPlan := &Plan{Namespaces: map[string]*NamespacePlanData{
+			"app": {Tables: []TableChange{{Table: "orders"}}},
+		}}
+
+		tests := []struct {
+			name string
+			op   *ApplyOperation
+			plan *Plan
+			want bool
+		}{
+			{"nil operation", nil, vschemaOnlyPlan, false},
+			{"nil plan", &ApplyOperation{OperationKind: ApplyOperationKindWork}, nil, false},
+			{
+				name: "whole-deployment work on a VSchema-only plan",
+				op:   &ApplyOperation{OperationKind: ApplyOperationKindWork},
+				plan: vschemaOnlyPlan,
+				want: true,
+			},
+			{
+				name: "a keyed operation covers one table, so it is never the VSchema shape",
+				op:   &ApplyOperation{OperationKind: ApplyOperationKindWork, OperationKey: "app.orders"},
+				plan: vschemaOnlyPlan,
+			},
+			{
+				name: "a finalizer is not work",
+				op:   &ApplyOperation{OperationKind: ApplyOperationKindGroupFinalizer},
+				plan: vschemaOnlyPlan,
+			},
+			{
+				name: "work on a plan carrying DDL must fail closed rather than dispatch",
+				op:   &ApplyOperation{OperationKind: ApplyOperationKindWork},
+				plan: ddlPlan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				assert.Equal(t, tt.want, tt.op.IsTasklessVSchemaOnlyWork(tt.plan))
+			})
+		}
+	})
+}

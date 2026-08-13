@@ -1,7 +1,8 @@
 // Package sqlstore implements the storage interface over database/sql. It is
 // the shared dialect-parameterized core behind the public per-dialect
-// constructors (mysqlstore, and in the future postgresstore); it currently
-// emits MySQL-style SQL and is wired with MySQL dependencies.
+// constructors (mysqlstore and postgresstore); every store routes
+// family-varying SQL syntax, placeholder binding, and identity retrieval
+// through the injected dependencies.
 package sqlstore
 
 import (
@@ -12,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// Storage implements the storage.Storage interface using MySQL.
+// Storage implements the storage.Storage interface over database/sql.
 type Storage struct {
 	db              *rebindDB
 	locks           *lockStore
@@ -31,8 +32,8 @@ type Storage struct {
 
 var _ storage.Storage = (*Storage)(nil)
 
-// New creates a MySQL storage instance.
-func New(db *sql.DB) *Storage {
+// NewMySQL creates a MySQL storage instance.
+func NewMySQL(db *sql.DB) *Storage {
 	dialect := MySQLDialect{}
 	return NewWithDependencies(Dependencies{
 		DB:         db,
@@ -41,6 +42,19 @@ func New(db *sql.DB) *Storage {
 		Identity:   dialect,
 		Locker:     namedlock.MySQL{},
 		Classifier: NewMySQLErrorClassifier(),
+	})
+}
+
+// NewPostgres creates a PostgreSQL storage instance.
+func NewPostgres(db *sql.DB) *Storage {
+	dialect := PostgresDialect{}
+	return NewWithDependencies(Dependencies{
+		DB:         db,
+		Binder:     dialect,
+		Dialect:    dialect,
+		Identity:   dialect,
+		Locker:     namedlock.Postgres{},
+		Classifier: NewPostgresErrorClassifier(),
 	})
 }
 
@@ -54,9 +68,8 @@ type Dependencies struct {
 	Classifier ErrorClassifier
 }
 
-// NewWithDependencies creates a storage instance with partially parameterized
-// database dependencies. Stores that have not yet been parameterized retain
-// MySQL behavior.
+// NewWithDependencies creates a storage instance whose database-specific
+// behavior comes entirely from deps; no store hardwires a dialect.
 func NewWithDependencies(deps Dependencies) *Storage {
 	rdb := newRebindDB(deps.DB, deps.Binder)
 	return &Storage{
@@ -64,11 +77,11 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		locks:           &lockStore{db: rdb, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
 		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
-		tasks:           &taskStore{db: rdb, identity: MySQLDialect{}},
-		applyLogs:       &applyLogStore{db: rdb, identity: MySQLDialect{}},
-		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
+		tasks:           &taskStore{db: rdb, identity: deps.Identity},
+		applyLogs:       &applyLogStore{db: rdb, identity: deps.Identity},
+		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
-		planComments:    &planCommentStore{db: rdb, identity: MySQLDialect{}, dialect: deps.Dialect},
+		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},

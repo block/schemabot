@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -242,6 +243,15 @@ func buildShards(count int) []*vttestpb.Shard {
 		shards[i] = &vttestpb.Shard{Name: r}
 	}
 	return shards
+}
+
+// shardSidecarDBName is the sidecar database a shard's tablets use when the
+// cluster runs with per-shard sidecars. It mirrors the naming vtcombo writes
+// into the keyspace's topo record, so callers can address a shard's sidecar
+// without asking the cluster for it.
+func shardSidecarDBName(keyspace, shard string) string {
+	safeShard := strings.NewReplacer("-", "_", "/", "_").Replace(shard)
+	return fmt.Sprintf("_vt_%s_%s", keyspace, safeShard)
 }
 
 // startManagedClusters starts all managed clusters in parallel for fast startup.

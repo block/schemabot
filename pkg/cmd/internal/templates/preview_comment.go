@@ -40,6 +40,7 @@ func previewCommentAllOutput() {
 		fn   func()
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"PLAN COMMENT (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
@@ -129,6 +130,7 @@ func previewCommentPlanAllOutput() {
 		fn   func()
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},

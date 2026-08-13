@@ -23,7 +23,7 @@ import (
 
 func TestApplyStore_Create(t *testing.T) {
 	clearTables(t)
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	created := createTestApply(t, store, lock, "apply_create_test", 1)
@@ -34,7 +34,7 @@ func TestApplyStore_Create(t *testing.T) {
 func TestApplyStore_CreateRejectsChangedLockIntent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
 		DatabaseName:  "testdb",
@@ -72,7 +72,7 @@ func TestApplyStore_CreateRejectsChangedLockIntent(t *testing.T) {
 
 func TestApplyStore_CreateRejectsPendingPlanIntentWithoutOwner(t *testing.T) {
 	clearTables(t)
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	_, err := store.Applies().Create(t.Context(), &storage.Apply{
 		ApplyIdentifier:       "apply_plan_intent_without_owner",
@@ -88,7 +88,7 @@ func TestApplyStore_CreateRejectsPendingPlanIntentWithoutOwner(t *testing.T) {
 func TestApplyStore_CreateWithMatchingLockIntent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	tests := []struct {
 		name          string
@@ -140,7 +140,7 @@ func TestApplyStore_CreateWithMatchingLockIntent(t *testing.T) {
 func TestApplyStore_CreateRejectsIntentAgainstUnpinnedLock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
 		DatabaseName: "testdb",
@@ -170,7 +170,7 @@ func TestApplyStore_CreateRejectsIntentAgainstUnpinnedLock(t *testing.T) {
 func TestApplyStore_CreateDuplicate(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -209,7 +209,7 @@ func TestApplyStore_CreateDuplicate(t *testing.T) {
 func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	now := time.Now()
@@ -282,7 +282,7 @@ func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 func TestApplyStore_CreateWithTasksAndOperationsCommitsAtomically(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
 	now := time.Now()
@@ -362,7 +362,7 @@ func TestApplyStore_CreateWithTasksAndOperationsCommitsAtomically(t *testing.T) 
 func TestApplyStore_CreateWithGroupedOperationsLinksTasksPerOperation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 	apply := newGroupedCreateApply(now, "apply_grouped_multi")
 	groups := []*storage.ApplyOperationWithTasks{
@@ -409,7 +409,7 @@ func TestApplyStore_CreateWithGroupedOperationsLinksTasksPerOperation(t *testing
 func TestApplyStore_CreateWithGroupedOperationsSingleGroupMatchesSingleOperationCreate(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	// The two applies share the same operation (deployment, target) shape but
@@ -472,7 +472,7 @@ func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			clearTables(t)
 			ctx := t.Context()
-			store := New(testDB)
+			store := NewMySQL(testDB)
 			apply := newGroupedCreateApply(time.Now(), "apply_grouped_invalid_"+strings.ReplaceAll(tt.name, " ", "_"))
 
 			_, err := store.Applies().CreateWithGroupedOperations(ctx, apply, tt.groups)
@@ -494,7 +494,7 @@ func TestApplyStore_CreateWithGroupedOperationsRejectsInvalidGroups(t *testing.T
 func TestApplyStore_CreateWithGroupedOperationsAllowsTaskLessFinalizer(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	apply := newGroupedCreateApply(now, "apply_grouped_taskless_finalizer")
@@ -538,7 +538,7 @@ func TestApplyStore_CreateWithGroupedOperationsAllowsTaskLessFinalizer(t *testin
 func TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeployment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	groupedApply := func(identifier, primary string) *storage.Apply {
@@ -581,7 +581,7 @@ func TestApplyStore_CreateWithGroupedOperationsBlocksOverlapOnSecondaryDeploymen
 func TestApplyStore_ClaimStoppedFanOutRefusedWhenSecondaryDeploymentActive(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	stopped := newGroupedCreateApply(now, "apply_fanout_stopped")
@@ -684,7 +684,7 @@ func newGroupedCreateTask(now time.Time, deployment, table string) *storage.Task
 func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnTaskFailure(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
 	now := time.Now()
@@ -736,7 +736,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnTaskFailure(t *testin
 func TestApplyStore_CreateWithTasksAndOperationsRejectsMultiOpWithoutTaskMapping(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
 	now := time.Now()
@@ -783,7 +783,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsMultiOpWithoutTaskMapping
 func TestApplyStore_CreateWithTasksAndOperationsRejectsTaskApplyOperationIDMismatch(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
 	now := time.Now()
@@ -833,7 +833,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsTaskApplyOperationIDMisma
 func TestApplyStore_CreateWithTasksAndOperationsRejectsTasksWithApplyOperationIDWhenNoOperations(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
 	now := time.Now()
@@ -870,7 +870,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsTasksWithApplyOperationID
 func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
 	now := time.Now()
@@ -909,7 +909,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *t
 func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	active := createTestApply(t, store, lock, "apply_active", 1)
@@ -982,7 +982,7 @@ func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
 func TestApplyStore_CreateScopesActiveApplyByDeployment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1018,7 +1018,7 @@ func TestApplyStore_CreateScopesActiveApplyByDeployment(t *testing.T) {
 func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1082,7 +1082,7 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 func TestApplyStore_CreateAllowsConcurrentActiveAppliesForDifferentTargets(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	type applyTarget struct {
 		database    string
@@ -1168,7 +1168,7 @@ func TestApplyStore_CreateAllowsConcurrentActiveAppliesForDifferentTargets(t *te
 func TestApplyStore_Get(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1191,7 +1191,7 @@ func TestApplyStore_Get(t *testing.T) {
 func TestApplyStore_GetByApplyIdentifier(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1217,7 +1217,7 @@ func TestApplyStore_GetByApplyIdentifier(t *testing.T) {
 func TestApplyStore_IdempotencyKey(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1294,7 +1294,7 @@ func TestApplyStore_IdempotencyKey(t *testing.T) {
 func TestApplyStore_GetByPlan(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1316,7 +1316,7 @@ func TestApplyStore_GetByPlan(t *testing.T) {
 func TestApplyStore_GetByLock(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -1340,7 +1340,7 @@ func TestApplyStore_GetByLock(t *testing.T) {
 func TestApplyStore_GetByDatabase(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Create locks for different databases
 	lock1 := createTestLock(t, store, "db1", "mysql", "staging")
@@ -1360,7 +1360,7 @@ func TestApplyStore_GetByDatabase(t *testing.T) {
 func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "recentdb", "mysql", "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_staging_old", 210, state.Apply.Completed, "staging")
@@ -1398,7 +1398,7 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 func TestApplyStore_GetRecentPutsInFlightWorkFirst(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	lock := createTestLock(t, store, "activitydb", "mysql", "staging")
@@ -1432,7 +1432,7 @@ func TestApplyStore_GetRecentPutsInFlightWorkFirst(t *testing.T) {
 func TestApplyStore_GetRecentOrdersInFlightByStart(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	// One database admits one in-flight apply, so concurrent rollouts are always
@@ -1471,7 +1471,7 @@ func TestApplyStore_GetRecentOrdersInFlightByStart(t *testing.T) {
 func TestApplyStore_GetRecentSinksAbandonedApplies(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	abandonedLock := createTestLock(t, store, "abandoned_a", "mysql", "staging")
@@ -1503,7 +1503,7 @@ func TestApplyStore_GetRecentSinksAbandonedApplies(t *testing.T) {
 func TestApplyStore_GetRecentTreatsOperationActivityAsInFlight(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	lock := createTestLock(t, store, "opactivitydb", "mysql", "staging")
@@ -1571,7 +1571,7 @@ func insertOperationWithUpdatedAt(t *testing.T, applyID int64, deployment, opSta
 func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "windowdb", "mysql", "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_stale", 220, state.Apply.Completed, "staging")
@@ -1608,7 +1608,7 @@ func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 func TestApplyStore_GetRecentOrdersSettledWorkByFinish(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	lock := createTestLock(t, store, "settled", "mysql", "staging")
@@ -1639,7 +1639,7 @@ func TestApplyStore_GetRecentOrdersSettledWorkByFinish(t *testing.T) {
 func TestApplyStore_GetRecentWindowKeepsOperationActivity(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	lock := createTestLock(t, store, "window_fanout", "mysql", "staging")
@@ -1669,7 +1669,7 @@ func TestApplyStore_GetRecentWindowKeepsOperationActivity(t *testing.T) {
 func TestApplyStore_GetRecentScopesActivityToDeployment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	// Two fanned-out applies. In one deployment the first is still working and
@@ -1707,7 +1707,7 @@ func TestApplyStore_GetRecentScopesActivityToDeployment(t *testing.T) {
 func TestApplyStore_GetRecentDeploymentWindowScopesActivity(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	now := time.Now()
 
 	lock := createTestLock(t, store, "scoped_window", "mysql", "staging")
@@ -1739,7 +1739,7 @@ func TestApplyStore_GetRecentDeploymentWindowScopesActivity(t *testing.T) {
 func TestApplyStore_GetRecentActiveOnly(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_a", "mysql", "staging"),
 		"apply_active_running", 300, state.Apply.Running, "staging")
@@ -1775,7 +1775,7 @@ func TestApplyStore_GetRecentActiveOnly(t *testing.T) {
 func TestApplyStore_CountRecentByState(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "countdb", "mysql", "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_one", 230, state.Apply.Completed, "staging")
@@ -1813,7 +1813,7 @@ func TestApplyStore_CountRecentByState(t *testing.T) {
 func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "recentdeploydb", "mysql", "staging")
 	createTestApplyWithStateEnvDeployment(t, store, lock, "apply_recent_parent_deployment", 214, state.Apply.Completed, "staging", "deploy-a")
@@ -1847,7 +1847,7 @@ func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testin
 func TestApplyStore_Update(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_update", 300)
@@ -1870,7 +1870,7 @@ func TestApplyStore_Update(t *testing.T) {
 func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	active := createTestApply(t, store, lock, "apply_update_active", 301)
@@ -1887,7 +1887,7 @@ func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
 func TestApplyStore_UpdateNonExistent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := &storage.Apply{
 		ID:    99999,
@@ -1905,7 +1905,7 @@ func TestApplyStore_UpdateNonExistent(t *testing.T) {
 func TestApplyStore_UpdateDerivedState(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas", 800, state.Apply.Running, "staging")
@@ -1965,7 +1965,7 @@ func TestApplyStore_UpdateDerivedStateNoOpUnderChangedRows(t *testing.T) {
 func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas_lease", 801, state.Apply.Pending, "staging")
@@ -2029,7 +2029,7 @@ func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	opLeaseCtx := func(applyID, opID int64, token string) context.Context {
 		return storage.WithOperationLease(ctx, storage.OperationLease{
@@ -2105,7 +2105,7 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 func TestApplyStore_UpdateDerivedStateStampsStartedAt(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_started_stamp", 905, state.Apply.Running, "staging")
@@ -2143,7 +2143,7 @@ func TestApplyStore_UpdateDerivedStateStampsStartedAt(t *testing.T) {
 func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_oplease", 906, state.Apply.Running, "staging")
@@ -2181,7 +2181,7 @@ func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
 func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_heartbeat_oplease", 907, state.Apply.Running, "staging")
@@ -2215,7 +2215,7 @@ func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
 func TestApplyStore_GetInProgress(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -2249,7 +2249,7 @@ func TestApplyStore_GetInProgress(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDClaimsPendingWithTasks(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_pending", 600, state.Apply.Pending, "staging")
@@ -2281,7 +2281,7 @@ func TestApplyStore_ClaimApplyByIDClaimsPendingWithTasks(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_running", 601, state.Apply.Running, "staging")
@@ -2310,7 +2310,7 @@ func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_done", 602, state.Apply.Completed, "staging")
@@ -2332,7 +2332,7 @@ func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) 
 func TestApplyStore_ClaimApplyByIDClaimsRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_retryable", 603, state.Apply.FailedRetryable, "staging")
@@ -2370,7 +2370,7 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 	t.Run("failure outside the freshness window", func(t *testing.T) {
 		clearTables(t)
 		ctx := t.Context()
-		store := New(testDB)
+		store := NewMySQL(testDB)
 
 		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_old_retryable", 604, state.Apply.FailedRetryable, "staging")
@@ -2395,7 +2395,7 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 	t.Run("recovery budget exhausted", func(t *testing.T) {
 		clearTables(t)
 		ctx := t.Context()
-		store := New(testDB)
+		store := NewMySQL(testDB)
 
 		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_spent_retryable", 605, state.Apply.FailedRetryable, "staging")
@@ -2434,7 +2434,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
 		t.Run(setupState, func(t *testing.T) {
 			clearTables(t)
 			ctx := t.Context()
-			store := New(testDB)
+			store := NewMySQL(testDB)
 
 			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_setup_"+setupState, int64(701+i), setupState, "staging")
@@ -2481,7 +2481,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
 		t.Run(revertState, func(t *testing.T) {
 			clearTables(t)
 			ctx := t.Context()
-			store := New(testDB)
+			store := NewMySQL(testDB)
 
 			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_revert_"+revertState, 703, revertState, "staging")
@@ -2527,7 +2527,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_for_cutover", 1, state.Apply.WaitingForCutover, "staging")
@@ -2563,7 +2563,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	_, err := store.Applies().ClaimApplyByID(ctx, 1, "")
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
@@ -2595,7 +2595,7 @@ func addClaimByIDTask(t *testing.T, store *Storage, apply *storage.Apply, taskID
 func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_lease", 507, state.Apply.Pending, "staging")
@@ -2675,7 +2675,7 @@ func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDRequiresTasksForPendingApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_claim", 502, state.Apply.Pending, "staging")
@@ -2729,7 +2729,7 @@ func TestApplyStore_ClaimApplyByIDRequiresTasksForPendingApply(t *testing.T) {
 func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Each pending apply needs a distinct target: apply creation rejects a
 	// second active apply for the same database/type/environment, and pending is
@@ -2839,7 +2839,7 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 // forever.
 func TestApplyStore_ClaimApplyByIDClaimsTasklessPendingApplyWithOperation(t *testing.T) {
 	clearTables(t)
-	store := New(testDB)
+	store := NewMySQL(testDB)
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_vschema_only_byid", 503, state.Apply.Pending, "staging")
 	now := time.Now()
@@ -2861,7 +2861,7 @@ func TestApplyStore_ClaimApplyByIDClaimsTasklessPendingApplyWithOperation(t *tes
 func TestApplyStore_ClaimApplyByIDClaimsPendingControlRequestWithoutTasks(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_start_request", 503, state.Apply.Pending, "staging")
@@ -2893,7 +2893,7 @@ func TestApplyStore_ClaimApplyByIDClaimsPendingControlRequestWithoutTasks(t *tes
 func TestApplyStore_ClaimApplyByIDClaimsWaitingForDeployStartControlRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_deploy_start_request", 505, state.Apply.WaitingForDeploy, "staging")
@@ -2952,7 +2952,7 @@ func TestApplyStore_ClaimApplyByIDClaimsWaitingForDeployStartControlRequest(t *t
 func TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	active := createTestApplyWithStateAndEnv(t, store, lock, "apply_active_running", 1, state.Apply.Running, "staging")
@@ -2999,7 +2999,7 @@ func TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive(t *testing.T) {
 func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_clear", 1, state.Apply.Stopped, "staging")
@@ -3042,7 +3042,7 @@ func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_failed_start", 1, state.Apply.Stopped, "staging")
@@ -3095,7 +3095,7 @@ func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *tes
 func TestApplyStore_ClaimApplyByIDDoesNotClaimFreshRunningStopControlRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_running_stop_request", 505, state.Apply.Running, "staging")
@@ -3116,7 +3116,7 @@ func TestApplyStore_ClaimApplyByIDDoesNotClaimFreshRunningStopControlRequest(t *
 func TestApplyStore_ClaimApplyByIDConcurrentPendingClaims(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	now := time.Now()
@@ -3166,7 +3166,7 @@ func TestApplyStore_ClaimApplyByIDConcurrentPendingClaims(t *testing.T) {
 		t.Cleanup(func() {
 			require.NoError(t, db.Close())
 		})
-		stores[i] = New(db)
+		stores[i] = NewMySQL(db)
 	}
 
 	start := make(chan struct{})
@@ -3216,7 +3216,7 @@ func TestApplyStore_ClaimApplyByIDConcurrentPendingClaims(t *testing.T) {
 func TestApplyStore_ExpireRetryable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_expired", 501, state.Apply.FailedRetryable, "staging")
@@ -3286,7 +3286,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_old_expired", 502, state.Apply.FailedRetryable, "staging")
@@ -3323,7 +3323,7 @@ func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_ops_expired", 510, state.Apply.FailedRetryable, "staging")
@@ -3366,7 +3366,7 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	now := time.Now()
 	startedAt := now.Add(-time.Minute)
@@ -3480,7 +3480,7 @@ func seedApplyMissingSummary(t *testing.T, store *Storage, name, applyState stri
 func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	recent := seedApplyMissingSummary(t, store, "apply_stopped_recent", state.Apply.Stopped, 700)
 	stale := seedApplyMissingSummary(t, store, "apply_stopped_stale", state.Apply.Stopped, 701)
@@ -3503,7 +3503,7 @@ func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *
 func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	freshClaim := seedApplyMissingSummary(t, store, "apply_claim_fresh", state.Apply.Completed, 710)
 	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID)
@@ -3537,7 +3537,7 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	superseded := seedApplyMissingSummary(t, store, "apply_summary_superseded", state.Apply.Completed, 720)
 	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
@@ -3563,7 +3563,7 @@ func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing
 func TestApplyStore_GetByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Create locks for different PRs
 	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 100)
@@ -3583,7 +3583,7 @@ func TestApplyStore_GetByPR(t *testing.T) {
 func TestApplyStore_Delete(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_delete", 600)
@@ -3603,7 +3603,7 @@ func TestApplyStore_Delete(t *testing.T) {
 func TestApplyStore_DeleteByPR(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Create locks for different PRs
 	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 100)
@@ -3636,7 +3636,7 @@ func TestApplyStore_DeleteByPR(t *testing.T) {
 func TestApplyStore_Delete_RemovesApplyOperations(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_delete_ops", 610)
@@ -3662,7 +3662,7 @@ func TestApplyStore_Delete_RemovesApplyOperations(t *testing.T) {
 func TestApplyStore_DeleteByPR_RemovesApplyOperations(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 110)
 	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "staging", "org/repo", 210)
@@ -3692,7 +3692,7 @@ func TestApplyStore_DeleteByPR_RemovesApplyOperations(t *testing.T) {
 func TestApplyStore_Options(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -3733,7 +3733,7 @@ func TestApplyStore_Options(t *testing.T) {
 func TestApplyStore_UpdateOptions(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := &storage.Apply{
@@ -3778,7 +3778,7 @@ func TestApplyStore_UpdateOptions(t *testing.T) {
 func TestApplyStore_AllFields(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 
@@ -3931,7 +3931,7 @@ func TestApplyStore_Create_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().Create(t.Context(), &storage.Apply{
 		ApplyIdentifier: "test",
 		State:           state.Apply.Pending,
@@ -3944,7 +3944,7 @@ func TestApplyStore_Get_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().Get(t.Context(), 1)
 	require.Error(t, err)
 }
@@ -3954,7 +3954,7 @@ func TestApplyStore_GetByApplyIdentifier_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().GetByApplyIdentifier(t.Context(), "test")
 	require.Error(t, err)
 }
@@ -3964,7 +3964,7 @@ func TestApplyStore_GetByLock_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().GetByLock(t.Context(), 1)
 	require.Error(t, err)
 }
@@ -3974,7 +3974,7 @@ func TestApplyStore_GetInProgress_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().GetInProgress(t.Context())
 	require.Error(t, err)
 }
@@ -3984,7 +3984,7 @@ func TestApplyStore_Update_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Applies().Update(t.Context(), &storage.Apply{ID: 1, State: "running"})
 	require.Error(t, err)
 }
@@ -3994,7 +3994,7 @@ func TestApplyStore_Delete_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Applies().Delete(t.Context(), 1)
 	require.Error(t, err)
 }
@@ -4004,7 +4004,7 @@ func TestApplyStore_DeleteByPR_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.Applies().DeleteByPR(t.Context(), "org/repo", 123)
 	require.Error(t, err)
 }
@@ -4014,7 +4014,7 @@ func TestApplyStore_GetByDatabase_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().GetByDatabase(t.Context(), "db", "mysql", "staging")
 	require.Error(t, err)
 }
@@ -4024,7 +4024,7 @@ func TestApplyStore_GetByPR_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().GetByPR(t.Context(), "org/repo", 123)
 	require.Error(t, err)
 }
@@ -4034,7 +4034,7 @@ func TestApplyStore_GetByPlan_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.Applies().GetByPlan(t.Context(), 123)
 	require.Error(t, err)
 }
@@ -4048,7 +4048,7 @@ func TestApplyStore_GetByPlan_DBError(t *testing.T) {
 func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon", 1, state.Apply.Running, "staging")
@@ -4093,7 +4093,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApp
 func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedPausedApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_paused", 1, state.Apply.Paused, "staging")
@@ -4146,7 +4146,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp(t 
 		t.Run(tc.name, func(t *testing.T) {
 			clearTables(t)
 			ctx := t.Context()
-			store := New(testDB)
+			store := NewMySQL(testDB)
 
 			lock := createTestLock(t, store, "testdb", "mysql", "staging")
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_active", 1, state.Apply.Running, "staging")
@@ -4187,7 +4187,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp(t 
 func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsPendingApplyWithStop(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_pending", 1, state.Apply.Pending, "staging")
@@ -4219,7 +4219,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsPendingApplyWithSto
 func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingStop(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_nostop", 1, state.Apply.Running, "staging")
@@ -4290,7 +4290,7 @@ func createStrandedStopApply(t *testing.T, store *Storage, lock *storage.Lock, a
 // the operations and release the target.
 func TestApplyStore_FindNextApplyForOperationProjection_ClaimsSettledOperationOrphan(t *testing.T) {
 	clearTables(t)
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	apply := stageOperationProjectionOrphan(t, store, "apply_op_projection", state.Apply.Running,
 		2*storage.ApplyLeaseStaleAfter, state.ApplyOperation.Completed, state.ApplyOperation.Completed)
@@ -4337,7 +4337,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApp
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			clearTables(t)
-			store := New(testDB)
+			store := NewMySQL(testDB)
 
 			stageOperationProjectionOrphan(t, store, "apply_op_projection_skip", state.Apply.Running, tc.staleBy, tc.opStates...)
 
@@ -4355,7 +4355,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApp
 func TestApplyStore_FindNextApplyForOperationProjection_SkipsTerminalAndChildlessApplies(t *testing.T) {
 	t.Run("terminal apply", func(t *testing.T) {
 		clearTables(t)
-		store := New(testDB)
+		store := NewMySQL(testDB)
 
 		stageOperationProjectionOrphan(t, store, "apply_op_projection_terminal", state.Apply.Completed,
 			2*storage.ApplyLeaseStaleAfter, state.ApplyOperation.Completed)
@@ -4367,7 +4367,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsTerminalAndChildles
 
 	t.Run("apply with no operations", func(t *testing.T) {
 		clearTables(t)
-		store := New(testDB)
+		store := NewMySQL(testDB)
 
 		stageOperationProjectionOrphan(t, store, "apply_op_projection_childless", state.Apply.Running,
 			2*storage.ApplyLeaseStaleAfter)
@@ -4383,7 +4383,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsTerminalAndChildles
 // nobody holds, leaving the apply writable by any driver.
 func TestApplyStore_FindNextApplyForOperationProjection_RequiresOwner(t *testing.T) {
 	clearTables(t)
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	_, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "")
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
@@ -4400,7 +4400,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_RequiresOwner(t *testing
 func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimGatedOnLeaseStaleness(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createStrandedStopApply(t, store, lock, "apply_stop_recon_lease", 1)
@@ -4437,7 +4437,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimGatedOnLeaseStalen
 func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimableWhenStopReissued(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createStrandedStopApply(t, store, lock, "apply_stop_recon_reissue", 1)
@@ -4484,7 +4484,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimableWhenStopReissu
 func TestApplyStore_FindNextApplyForStopReconciliation_FreshLeaseDoesNotBlockOtherApplies(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	olderLock := createTestLock(t, store, "testdb", "mysql", "staging")
 	older := createStrandedStopApply(t, store, olderLock, "apply_stop_recon_older", 1)
@@ -4515,7 +4515,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_FreshLeaseDoesNotBlockOth
 func TestApplyStore_SetRevertSkipped(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "vitess", "staging")
 	apply := createTestApply(t, store, lock, "apply_revert_skipped", 1)

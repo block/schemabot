@@ -1,5 +1,6 @@
 // Package storage defines the storage interface for SchemaBot.
-// Currently implemented by the MySQL backend (pkg/storage/mysqlstore).
+// Implemented by the MySQL backend (pkg/storage/mysqlstore) and the
+// PostgreSQL backend (pkg/storage/postgresstore).
 package storage
 
 import (
@@ -750,6 +751,13 @@ type PlanCommentStore interface {
 	// (repository, pull_request, database) slot, ordered by id ascending. The
 	// caller decides which of them a newly posted comment supersedes.
 	ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
+
+	// ListUnminimizedForRepoPR returns the not-yet-minimized comments for a
+	// whole pull request, across every database, ordered by id ascending. A
+	// caller that resolved no database — a delivery that discovers no schema
+	// config, or one whose discovery failed — still has to retire the plan
+	// comments an earlier head left expanded, and has no slot to key.
+	ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*PlanComment, error)
 
 	// MarkMinimized stamps minimized_at after the GitHub minimize call
 	// succeeded. An already-minimized row is not an error.

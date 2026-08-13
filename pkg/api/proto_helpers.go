@@ -13,8 +13,6 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-const vSchemaArtifactName = "vschema.json"
-
 func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.PullSchemaResponse {
 	return &apitypes.PullSchemaResponse{
 		Database:    resp.Database,
@@ -272,8 +270,8 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 		}
 		if sc.Metadata["vschema_changed"] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
-				if vschema := nsFiles.Files[vSchemaArtifactName]; vschema != "" {
-					nsData.Artifacts = map[string]string{vSchemaArtifactName: vschema}
+				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {
+					nsData.Artifacts = map[string]string{storage.VSchemaArtifactName: vschema}
 				}
 			}
 		}

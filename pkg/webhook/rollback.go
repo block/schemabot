@@ -18,7 +18,6 @@ import (
 
 const (
 	rollbackPendingPlanPrefix = "rollback:"
-	vSchemaArtifactName       = "vschema.json"
 
 	// rollbackLockReleaseTimeout bounds the lock release that runs after a
 	// rollback will not proceed. The release runs detached from the command's
@@ -798,10 +797,5 @@ func planHasChanges(plan *storage.Plan) bool {
 	if len(plan.FlatDDLChanges()) > 0 {
 		return true
 	}
-	for _, nsData := range plan.Namespaces {
-		if nsData != nil && nsData.Artifacts[vSchemaArtifactName] != "" {
-			return true
-		}
-	}
-	return false
+	return len(plan.VSchemaNamespaces()) > 0
 }

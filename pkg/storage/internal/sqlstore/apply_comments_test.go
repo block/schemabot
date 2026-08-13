@@ -17,7 +17,7 @@ import (
 func TestApplyCommentStore_Upsert(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_upsert", 1)
@@ -87,7 +87,7 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 func TestApplyCommentStore_Get(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Get non-existent should return nil
 	comment, err := store.ApplyComments().Get(ctx, 99999, state.Comment.Progress)
@@ -98,7 +98,7 @@ func TestApplyCommentStore_Get(t *testing.T) {
 func TestApplyCommentStore_ListByApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_getbyapply", 1)
@@ -141,7 +141,7 @@ func TestApplyCommentStore_ListByApply(t *testing.T) {
 func TestApplyCommentStore_ListByApply_Isolation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply1 := createTestApply(t, store, lock, "apply_iso_1", 1)
@@ -169,7 +169,7 @@ func TestApplyCommentStore_ListByApply_Isolation(t *testing.T) {
 func TestApplyCommentStore_DeleteByApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply1 := createTestApply(t, store, lock, "apply_comment_del1", 1)
@@ -206,7 +206,7 @@ func TestApplyCommentStore_DeleteByApply(t *testing.T) {
 func TestApplyCommentStore_Supersede(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_supersede", 1)
@@ -252,7 +252,7 @@ func TestApplyCommentStore_Supersede(t *testing.T) {
 func TestApplyCommentStore_PendingFreeze(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_pending_freeze", 1)
@@ -304,7 +304,7 @@ func TestApplyCommentStore_PendingFreeze(t *testing.T) {
 func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_unique", 1)
@@ -341,7 +341,7 @@ func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_lease", 1)
@@ -406,7 +406,7 @@ func TestApplyCommentStore_Upsert_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.ApplyComments().Upsert(t.Context(), &storage.ApplyComment{
 		ApplyID: 1, CommentState: "progress", GitHubCommentID: 100,
 	})
@@ -418,7 +418,7 @@ func TestApplyCommentStore_Get_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.ApplyComments().Get(t.Context(), 1, "progress")
 	require.Error(t, err)
 }
@@ -428,7 +428,7 @@ func TestApplyCommentStore_ListByApply_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = store.ApplyComments().ListByApply(t.Context(), 1)
 	require.Error(t, err)
 }
@@ -438,7 +438,7 @@ func TestApplyCommentStore_DeleteByApply_DBError(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
-	store := New(db)
+	store := NewMySQL(db)
 	err = store.ApplyComments().DeleteByApply(t.Context(), 1)
 	require.Error(t, err)
 }
@@ -454,7 +454,7 @@ func TestApplyCommentStore_DeleteByApply_DBError(t *testing.T) {
 func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_claim", 1)
@@ -523,7 +523,7 @@ func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
 func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_reclaim", 1)
@@ -569,7 +569,7 @@ func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
 func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_release", 1)
@@ -615,7 +615,7 @@ func backdateSummaryClaim(t *testing.T, applyID int64) {
 func TestApplyCommentStore_MutationsStampUpdatedAt(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_updated_at_stamp", 1)
@@ -688,7 +688,7 @@ func TestApplyCommentStore_MutationsStampUpdatedAt(t *testing.T) {
 func TestApplyCommentStore_ClaimConversionRestartsStaleWindow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "testdb", "mysql", "staging")
 	apply := createTestApply(t, store, lock, "apply_comment_claim_fresh", 1)

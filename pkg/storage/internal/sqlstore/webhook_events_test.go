@@ -20,7 +20,7 @@ import (
 func TestWebhookEventStore_CreateDeduplicatesDeliveryID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	event := &storage.WebhookEvent{
 		DeliveryID:  "delivery-1",
@@ -59,7 +59,7 @@ func TestWebhookEventStore_CreateDeduplicatesDeliveryID(t *testing.T) {
 func TestWebhookEventStore_CreateDeduplicatesByProviderAndDeliveryID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -75,7 +75,7 @@ func TestWebhookEventStore_CreateDeduplicatesByProviderAndDeliveryID(t *testing.
 func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	_, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
 		DeliveryID:  "delivery-head-1",
@@ -125,7 +125,7 @@ func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailedSynthesized(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	for i, tc := range []struct {
 		state       string
@@ -171,7 +171,7 @@ func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailedSynthesized(t 
 func TestWebhookEventStore_HasEventForHeadRequiresAutoPlanPullRequestRow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	for i, tc := range []struct {
 		name   string
@@ -208,7 +208,7 @@ func TestWebhookEventStore_HasEventForHeadRequiresAutoPlanPullRequestRow(t *test
 func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -239,7 +239,7 @@ func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 func TestWebhookEventStore_FindNextClaimsPayloadWiderThanSortBuffer(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	var sortBufferSize int
 	require.NoError(t, testDB.QueryRowContext(ctx, `SELECT @@sort_buffer_size`).Scan(&sortBufferSize))
@@ -267,7 +267,7 @@ func TestWebhookEventStore_FindNextClaimsPayloadWiderThanSortBuffer(t *testing.T
 func TestWebhookEventStore_FindNextRequiresOwnerWithoutLeaseLostSentinel(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	claimed, err := store.WebhookEvents().FindNext(ctx, "", time.Minute)
 	require.Nil(t, claimed)
@@ -278,7 +278,7 @@ func TestWebhookEventStore_FindNextRequiresOwnerWithoutLeaseLostSentinel(t *test
 func TestWebhookEventStore_FindNextSkipsFreshLeaseAndReclaimsExpiredLease(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -307,7 +307,7 @@ func TestWebhookEventStore_FindNextSkipsFreshLeaseAndReclaimsExpiredLease(t *tes
 func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -346,7 +346,7 @@ func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
 func TestWebhookEventStore_LeaseTokenGuardsWrites(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -365,7 +365,7 @@ func TestWebhookEventStore_LeaseTokenGuardsWrites(t *testing.T) {
 func TestWebhookEventStore_CreateReopensTerminalDelivery(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
 	require.NoError(t, err)
@@ -418,7 +418,7 @@ func TestWebhookEventStore_CreateReopensTerminalDelivery(t *testing.T) {
 func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
 	require.NoError(t, err)
@@ -463,7 +463,7 @@ func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
 func TestWebhookEventStore_CreateDedupesProcessingWithLiveLease(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
 	require.NoError(t, err)
@@ -490,7 +490,7 @@ func TestWebhookEventStore_CreateDedupesProcessingWithLiveLease(t *testing.T) {
 func TestWebhookEventStore_ReleaseRefundsAttemptAndRequeues(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -524,7 +524,7 @@ func TestWebhookEventStore_ReleaseRefundsAttemptAndRequeues(t *testing.T) {
 func TestWebhookEventStore_ReleaseKeepsStartedAtAfterFirstAttempt(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -557,7 +557,7 @@ func TestWebhookEventStore_ReleaseKeepsStartedAtAfterFirstAttempt(t *testing.T) 
 func TestWebhookEventStore_TerminalWritesReturnNotFoundAfterDelete(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -577,7 +577,7 @@ func TestWebhookEventStore_TerminalWritesReturnNotFoundAfterDelete(t *testing.T)
 func TestWebhookEventStore_CreateRejectsNonPendingState(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// A row created directly in "processing" would have NULL lease columns:
 	// never claimable, never expiring, yet deduplicating every future
@@ -604,7 +604,7 @@ func TestWebhookEventStore_CreateRejectsNonPendingState(t *testing.T) {
 func TestWebhookEventStore_FindNextStopsReclaimingAtAttemptsCeiling(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -660,7 +660,7 @@ func TestWebhookEventStore_HeartbeatTreatsUnchangedMatchingLeaseAsSuccess(t *tes
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = db.ExecContext(ctx, `SET timestamp = 1700000000`)
 	require.NoError(t, err)
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
@@ -692,7 +692,7 @@ func TestWebhookEventStore_TerminalWritesAreIdempotentOnRetry(t *testing.T) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	store := New(db)
+	store := NewMySQL(db)
 	_, err = db.ExecContext(ctx, `SET timestamp = 1700000000`)
 	require.NoError(t, err)
 
@@ -720,7 +720,7 @@ func TestWebhookEventStore_TerminalWritesAreIdempotentOnRetry(t *testing.T) {
 func TestWebhookEventStore_SubSecondLeaseIsNotImmediatelyReclaimable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
 	require.NoError(t, err)
@@ -741,7 +741,7 @@ func TestWebhookEventStore_SubSecondLeaseIsNotImmediatelyReclaimable(t *testing.
 func TestWebhookEventStore_InboxStatsBacklogMatchesClaimable(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// A cap-exhausted retryable row whose retry window has long elapsed. FindNext
 	// never reclaims it, so it must not inflate the backlog age.
@@ -793,7 +793,7 @@ func TestWebhookEventStore_InboxStatsBacklogMatchesClaimable(t *testing.T) {
 func TestWebhookEventStore_InboxStats(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Empty inbox: every state present at zero, no backlog, nothing stuck.
 	empty, err := store.WebhookEvents().InboxStats(ctx)
@@ -857,7 +857,7 @@ func TestWebhookEventStore_InboxStats(t *testing.T) {
 func TestWebhookEventStore_TerminateStuckProcessing(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	// Seed three processing rows, then drive each into the exact state under
 	// test via SQL so the assertions don't depend on FindNext claim ordering.

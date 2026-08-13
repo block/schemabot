@@ -16,7 +16,7 @@ import (
 func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	planID, err := store.Plans().Create(ctx, &storage.Plan{
 		PlanIdentifier: "plan_shards",
@@ -89,7 +89,7 @@ func TestPlanStore_RoundTripsShardPlans(t *testing.T) {
 func TestPlanStore_LoadsPlansWithoutShardPlans(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	_, err := store.Plans().Create(ctx, &storage.Plan{
 		PlanIdentifier: "plan_no_shards",
@@ -121,7 +121,7 @@ func TestPlanStore_LoadsPlansWithoutShardPlans(t *testing.T) {
 func TestPlanStore_RoundTripsNilPlanDataAsNull(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	_, err := store.Plans().Create(ctx, &storage.Plan{
 		PlanIdentifier: "plan_nil_data",

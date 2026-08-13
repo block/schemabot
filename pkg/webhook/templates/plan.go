@@ -694,7 +694,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
-		reason := ui.CleanLintReason(c.Reason)
+		reason := ui.CodeQuoteIdentifiers(ui.CleanLintReason(c.Reason))
 		if reason != "" {
 			fmt.Fprintf(sb, "- %s: %s\n", table, reason)
 		} else {
@@ -776,16 +776,77 @@ func unsafeDropIndexUsageTargets(changes []UnsafeChangeData) (actionTarget, invi
 	return "", "", "", false
 }
 
+// lintWarningsFoldThreshold is the warning count above which the lint section
+// collapses into a details block grouped by table. Short lists stay inline so
+// a single advisory finding never needs a click; long lists stop dominating
+// the plan comment while the count stays visible in the header.
+const lintWarningsFoldThreshold = 5
+
+// writeLintViolations writes advisory lint findings. Lint warnings never block
+// an apply, so they render with a lighter marker than the unsafe-change Issues
+// section but share its visual language: a bold count in the header, backticked
+// table prefixes, and identifiers as inline code.
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
-	sb.WriteString("\u26a0\ufe0f **Lint Warnings**:\n")
-	for _, w := range warnings {
-		warningText := w.Message
-		if w.Table != "" {
-			warningText = fmt.Sprintf("[%s] %s", w.Table, w.Message)
+	n := len(warnings)
+
+	if n <= lintWarningsFoldThreshold {
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: **%d** advisory %s\n", n, pluralize("finding", n))
+		for _, w := range warnings {
+			message := ui.CodeQuoteIdentifiers(w.Message)
+			if w.Table != "" {
+				fmt.Fprintf(sb, "- `%s`: %s\n", w.Table, message)
+			} else {
+				fmt.Fprintf(sb, "- %s\n", message)
+			}
 		}
-		fmt.Fprintf(sb, "- %s\n", warningText)
+		sb.WriteString("\n")
+		return
 	}
-	sb.WriteString("\n")
+
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// header bolds with <b> tags instead of asterisks.
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: <b>%d</b> advisory %s</summary>\n\n", n, pluralize("finding", n))
+	for _, group := range groupLintWarningsByTable(warnings) {
+		if group.table != "" {
+			fmt.Fprintf(sb, "**`%s`**\n", group.table)
+		}
+		for _, message := range group.messages {
+			fmt.Fprintf(sb, "- %s\n", ui.CodeQuoteIdentifiers(message))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("</details>\n\n")
+}
+
+type lintWarningGroup struct {
+	table    string
+	messages []string
+}
+
+// groupLintWarningsByTable groups warnings by table in first-appearance order,
+// preserving message order within each table. Warnings without a table come
+// out as a leading group with an empty table name.
+func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
+	index := make(map[string]int)
+	var groups []lintWarningGroup
+	for _, w := range warnings {
+		i, ok := index[w.Table]
+		if !ok {
+			i = len(groups)
+			index[w.Table] = i
+			groups = append(groups, lintWarningGroup{table: w.Table})
+		}
+		groups[i].messages = append(groups[i].messages, w.Message)
+	}
+	// Untabled warnings read as general notes; surface them first rather
+	// than wherever they happened to appear in the linter output.
+	for i, g := range groups {
+		if g.table == "" && i > 0 {
+			groups = append([]lintWarningGroup{g}, append(groups[:i:i], groups[i+1:]...)...)
+			break
+		}
+	}
+	return groups
 }
 
 func writeErrors(sb *strings.Builder, errors []string) {

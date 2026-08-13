@@ -113,28 +113,63 @@ func (h *Handler) minimizeStalePlanComments(ctx context.Context, client *ghclien
 		return
 	}
 
-	// With no newly posted comment anchoring the sweep, headSHA must be the
-	// PR's current head before anything is hidden. The sweep's head comes from
-	// the delivery's cached PR fetch, so a concurrent push can make it stale:
-	// sweeping on the old head would collapse the newer head's live comment
-	// with nothing replacing it, and no un-minimize path exists. Verify
-	// against a fresh fetch and leave the slot alone when the branch has
-	// moved on — the newer head's own plan outcome sweeps the slot instead.
-	freshPR, err := client.FetchPullRequestNoCache(ctx, repo, pr)
-	if err != nil {
-		h.logger.Error("failed to verify PR head for stale plan comment sweep; prior plan comments stay expanded until the next supersede sweep",
-			"repo", repo, "pr", pr, "database", database, "database_type", databaseType,
-			"head_sha", headSHA, "error", err)
-		return
-	}
-	if freshPR.HeadSHA != headSHA {
-		h.logger.Info("skipping stale plan comment sweep because the PR head moved past this plan outcome; the current head's own plan outcome sweeps the slot",
-			"repo", repo, "pr", pr, "database", database, "database_type", databaseType,
-			"head_sha", headSHA, "current_head_sha", freshPR.HeadSHA)
+	if !h.planSweepHeadIsCurrent(ctx, client, repo, pr, headSHA,
+		"database", database, "database_type", databaseType) {
 		return
 	}
 
 	h.minimizePlanCommentsForSlot(ctx, client, repo, pr, database, databaseType, headSHA, nil)
+}
+
+// minimizeStalePlanCommentsForPR collapses every plan comment still expanded on
+// the PR that renders a head other than the current one, without needing a
+// database to key a slot. A delivery that discovers no schema config — or whose
+// discovery failed — has no slot to sweep, yet an earlier head's plan comment is
+// exactly what it leaves behind: still showing that head's DDL and its apply
+// prompt, with only the check run moving on. Same-head comments stay expanded,
+// so this never hides the plan for the commit the PR is currently at.
+func (h *Handler) minimizeStalePlanCommentsForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
+	if headSHA == "" {
+		h.logger.Info("skipping PR-wide stale plan comment sweep because the delivery carries no head to compare against",
+			"repo", repo, "pr", pr)
+		return
+	}
+
+	if !h.planSweepHeadIsCurrent(ctx, client, repo, pr, headSHA) {
+		return
+	}
+
+	priors, err := h.service.Storage().PlanComments().ListUnminimizedForRepoPR(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to list the PR's plan comments; superseded plan comments stay expanded until the next supersede sweep",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return
+	}
+	h.minimizeSupersededPlanCommentRows(ctx, client, priors, headSHA, nil)
+}
+
+// planSweepHeadIsCurrent reports whether headSHA is still the PR's head, for a
+// sweep with no newly posted comment anchoring it. The sweep's head comes from
+// the delivery's cached PR fetch, so a concurrent push can make it stale:
+// sweeping on the old head would collapse the newer head's live comment with
+// nothing replacing it, and no un-minimize path exists. On a fetch failure or a
+// moved head nothing is hidden — the newer head's own plan outcome sweeps
+// instead. attrs name what is being swept.
+func (h *Handler) planSweepHeadIsCurrent(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, attrs ...any) bool {
+	sweepAttrs := append([]any{"repo", repo, "pr", pr, "head_sha", headSHA}, attrs...)
+
+	freshPR, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to verify PR head for stale plan comment sweep; prior plan comments stay expanded until the next supersede sweep",
+			append(sweepAttrs, "error", err)...)
+		return false
+	}
+	if freshPR.HeadSHA != headSHA {
+		h.logger.Info("skipping stale plan comment sweep because the PR head moved past this plan outcome; the current head's own plan outcome sweeps instead",
+			append(sweepAttrs, "current_head_sha", freshPR.HeadSHA)...)
+		return false
+	}
+	return true
 }
 
 // minimizePlanCommentsForSlot sweeps the slot's unminimized plan comments and
@@ -161,6 +196,15 @@ func (h *Handler) minimizePlanCommentsForSlot(ctx context.Context, client *ghcli
 		return
 	}
 
+	h.minimizeSupersededPlanCommentRows(ctx, client, priors, headSHA, posted)
+}
+
+// minimizeSupersededPlanCommentRows collapses the superseded comments among
+// priors. posted is the newly posted comment when the sweep follows a post: its
+// own row is skipped and supersession follows planCommentSupersedes. When
+// posted is nil the sweep follows an outcome with no new comment, and only
+// comments from heads other than headSHA are superseded.
+func (h *Handler) minimizeSupersededPlanCommentRows(ctx context.Context, client *ghclient.InstallationClient, priors []*storage.PlanComment, headSHA string, posted *storage.PlanComment) {
 	for _, prior := range priors {
 		// Skip the comment that was just posted (its row is in the list too).
 		if posted != nil && (prior.ID == posted.ID || prior.GitHubCommentID == posted.GitHubCommentID) {
