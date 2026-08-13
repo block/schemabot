@@ -155,6 +155,25 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 	)
 }
 
+// RecordPlanDropOwnership counts one planned drop's ownership verdict.
+// Outcomes: "unowned" (no other pull request is attributed the object, so the
+// drop renders normally), "owned" (an open pull request is attributed it, so
+// the drop is annotated and the apply prompt withheld), "storage_error" and
+// "pr_state_error" (the lookup could not decide, so the drop is annotated as
+// unresolved — investigate storage or GitHub API health respectively).
+// Sustained error outcomes mean operators are being held back from legitimate
+// drops; a rising "owned" count means pull requests are applying and merging
+// far apart.
+func RecordPlanDropOwnership(ctx context.Context, repo, database, environment, outcome string) {
+	addCounter(ctx, "schemabot.plan_drop_ownership.total",
+		"Total number of planned drops classified by object-ownership lookup outcome", "{drop}",
+		attribute.String("repository", repo),
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordPlanDuration records the duration of a plan operation.
 func RecordPlanDuration(ctx context.Context, duration time.Duration, repo, database, deployment, environment, status string) {
 	recordHistogram(ctx, "schemabot.plan.duration_seconds", duration.Seconds(),

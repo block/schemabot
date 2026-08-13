@@ -141,6 +141,43 @@ schemabot unlock
 </details>
 
 <details>
+<summary><a name="mysql-plan-heldback-drop"></a><strong>MySQL Plan (Held-back Drop)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD COLUMN `notes` text;
+
+DROP TABLE `reconcile_state`;
+```
+
+🛑 **Held back**: **1** drop that may not be this PR's to make
+- `reconcile_state`: last changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), still open
+
+A plan diffs this PR's schema files against the live database, so an object another PR applied before merging reads here as one to drop. Merge that PR, or add the object's definition to this PR's schema files, then re-plan.
+
+⚠️ **Issues**: **1** unsafe change detected
+- `reconcile_state`: DROP TABLE removes all data
+
+**Destructive drop guidance:**
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
+
+📋 **Plan**: **1** table to alter, **1** table to drop
+
+
+---
+
+⛔ **No apply command is offered** for this plan. Resolve the drops listed above first.
+
+</details>
+
+<details>
 <summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
 
 

@@ -81,6 +81,37 @@ func PreviewCommentPlanBlocked() string {
 	})
 }
 
+// PreviewCommentPlanHeldBackDrop renders a sample plan whose drop targets an
+// object another open pull request applied but has not merged yet, so the entry
+// is annotated with its owner and the apply prompt is withheld.
+func PreviewCommentPlanHeldBackDrop() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD COLUMN `notes` TEXT;",
+					"DROP TABLE `reconcile_state`;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "reconcile_state", Reason: "DROP TABLE removes all data"},
+		},
+		OwnedDrops: []OwnedDropData{
+			{Table: "reconcile_state", Repository: previewRepository, PullRequest: 4821},
+		},
+	})
+}
+
 // PreviewCommentPlanDirect renders a sample locked apply-confirmation comment
 // for a plan whose refused statement the direct execution policy routes to
 // native MySQL DDL (execution-mode verdict "direct"), showing the disclosure

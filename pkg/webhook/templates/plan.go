@@ -51,6 +51,19 @@ type DirectChangeData struct {
 	Shards []string
 }
 
+// OwnedDropData is a planned drop of an object that stored task history
+// attributes to a pull request other than the one being planned. Repository and
+// PullRequest name the owner when the lookup resolved an open one; Unresolved
+// marks a drop whose ownership could not be established, which is annotated the
+// same way — the lookup fails toward ownership rather than presenting a drop
+// SchemaBot cannot vouch for as one this pull request proposes.
+type OwnedDropData struct {
+	Table       string
+	Repository  string
+	PullRequest int
+	Unresolved  bool
+}
+
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
 	Database     string
@@ -78,6 +91,10 @@ type PlanCommentData struct {
 
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
+
+	// Drops of objects another pull request owns, or whose ownership could not
+	// be established. Their presence withholds the apply prompt.
+	OwnedDrops []OwnedDropData
 
 	// Options
 	DeferCutover bool
@@ -164,6 +181,13 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
+	// Drops of objects another pull request owns. Shown on the locked apply
+	// comment too, for the same reason as the direct-execution disclosure: it
+	// must sit on the comment the confirmation acts on.
+	if len(data.OwnedDrops) > 0 {
+		writeOwnedDrops(&sb, data.OwnedDrops)
+	}
+
 	// Direct-execution changes — statements the policy routes to native DDL.
 	// Shown on the locked apply comment too: confirming the apply is the
 	// operator's consent to their blocking, non-revertible semantics, so the
@@ -199,7 +223,8 @@ func RenderPlanComment(data PlanCommentData) string {
 	// Footer
 	sb.WriteString("\n---\n\n")
 
-	if data.IsLocked {
+	switch {
+	case data.IsLocked:
 		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
 		if data.Tenant != "" {
 			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
@@ -226,7 +251,9 @@ func RenderPlanComment(data PlanCommentData) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
-	} else {
+	case data.ApplyPromptWithheld():
+		writeApplyPromptWithheld(&sb)
+	default:
 		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
@@ -237,10 +264,45 @@ func RenderPlanComment(data PlanCommentData) string {
 	return sb.String()
 }
 
+// ApplyPromptWithheld reports whether the comment must not offer an apply
+// command. A plan that would drop an object another pull request owns is not
+// one an operator should be able to run by pasting a single line: the drop
+// follows from that pull request not having merged yet, not from a change this
+// pull request proposes.
+func (d PlanCommentData) ApplyPromptWithheld() bool {
+	return len(d.OwnedDrops) > 0
+}
+
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string) {
 	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// writeApplyPromptWithheld replaces the apply instruction on a plan whose drops
+// are attributed elsewhere, so the comment never renders a one-line command
+// that would destroy another pull request's object.
+func writeApplyPromptWithheld(sb *strings.Builder) {
+	sb.WriteString("⛔ **No apply command is offered** for this plan. Resolve the drops listed above first.\n")
+}
+
+// writeOwnedDrops writes the section for drops of objects that stored task
+// history attributes to another pull request. SchemaBot plans a full diff of
+// the pull request's schema files against the live database, so an object an
+// unmerged pull request already applied reads as one this pull request wants
+// gone — which is what this section exists to contradict.
+func writeOwnedDrops(sb *strings.Builder, drops []OwnedDropData) {
+	n := len(drops)
+	fmt.Fprintf(sb, "🛑 **Held back**: **%d** %s that may not be this PR's to make\n", n, pluralize("drop", n))
+	for _, d := range drops {
+		if d.Unresolved {
+			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
+			continue
+		}
+		fmt.Fprintf(sb, "- `%s`: last changed by [%s#%d](https://github.com/%s/pull/%d), still open\n",
+			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+	}
+	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so an object another PR applied before merging reads here as one to drop. Merge that PR, or add the object's definition to this PR's schema files, then re-plan.\n\n")
 }
 
 // writePlanMetadata writes the metadata line for plan comments.
@@ -946,6 +1008,12 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeBlockedChanges(sb, plan.BlockedChanges)
 	}
 
+	// Drops of objects another pull request owns — resolved per environment,
+	// since the task history that attributes them is per environment.
+	if len(plan.OwnedDrops) > 0 {
+		writeOwnedDrops(sb, plan.OwnedDrops)
+	}
+
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
 	if len(plan.DirectChanges) > 0 {
@@ -998,8 +1066,13 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	}
 
-	// Apply instructions for environments with changes
+	// Apply instructions for environments with changes. A held-back drop in any
+	// environment withholds the whole sequence: the instructions walk the
+	// environments in order, so offering the ones that are clear would still
+	// lead the operator into the environment that is not.
 	switch {
+	case anyApplyPromptWithheld(data):
+		writeApplyPromptWithheld(sb)
 	case len(envsWithChanges) >= 2:
 		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
@@ -1022,6 +1095,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot plan", env, data.Tenant))
 		}
 	}
+}
+
+// anyApplyPromptWithheld reports whether any environment's plan withholds the
+// apply prompt.
+func anyApplyPromptWithheld(data MultiEnvPlanCommentData) bool {
+	for _, plan := range data.Plans {
+		if plan != nil && plan.ApplyPromptWithheld() {
+			return true
+		}
+	}
+	return false
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {

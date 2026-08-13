@@ -752,3 +752,66 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	crossApply.ApplyOperationID = &otherOpID // belongs to otherApply, not the leased apply
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
 }
+
+// The object-ownership lookup answers "which pull requests have changed this
+// object in this deployment target?" — the question the plan path asks before
+// rendering a drop. It is scoped to one database, database type, and
+// environment; it collapses a pull request's many tasks into one row carrying
+// its most recent activity; and it excludes CLI-originated tasks, which carry
+// no pull request to attribute anything to.
+func TestTaskStore_FindObjectOwners(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_object_owners", 1)
+
+	createTask := func(identifier, table, environment, repo string, pr int, createdAt time.Time) {
+		_, err := store.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: identifier,
+			ApplyID:        apply.ID,
+			PlanID:         apply.PlanID,
+			Database:       apply.Database,
+			DatabaseType:   apply.DatabaseType,
+			Engine:         storage.EngineSpirit,
+			Repository:     repo,
+			PullRequest:    pr,
+			Environment:    environment,
+			State:          state.Task.Completed,
+			TableName:      table,
+			DDL:            "CREATE TABLE `" + table + "` (`id` bigint unsigned NOT NULL)",
+			DDLAction:      "CREATE",
+			CreatedAt:      createdAt,
+			UpdatedAt:      createdAt,
+		})
+		require.NoError(t, err)
+	}
+
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	createTask("task_owner_first", "reconcile_state", "staging", "octocat/hello-world", 7, base)
+	createTask("task_owner_second", "reconcile_state", "staging", "octocat/hello-world", 7, base.Add(30*time.Minute))
+	createTask("task_owner_other_pr", "reconcile_state", "staging", "octocat/hello-world", 9, base.Add(time.Minute))
+	createTask("task_owner_other_env", "reconcile_state", "production", "octocat/hello-world", 11, base)
+	createTask("task_owner_other_table", "users", "staging", "octocat/hello-world", 13, base)
+	createTask("task_owner_cli", "reconcile_state", "staging", "", 0, base)
+
+	ref := storage.ObjectRef{
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  "staging",
+		TableName:    "reconcile_state",
+	}
+	owners, err := store.Tasks().FindObjectOwners(ctx, ref)
+	require.NoError(t, err)
+	require.Len(t, owners, 2, "one row per pull request, and never the CLI-originated task")
+	assert.Equal(t, "octocat/hello-world", owners[0].Repository)
+	assert.Equal(t, 7, owners[0].PullRequest, "the pull request seen most recently comes first")
+	assert.Equal(t, base.Add(30*time.Minute).UTC(), owners[0].LastSeen.UTC())
+	assert.Equal(t, 9, owners[1].PullRequest)
+
+	ref.TableName = "audit_log"
+	owners, err = store.Tasks().FindObjectOwners(ctx, ref)
+	require.NoError(t, err)
+	assert.Empty(t, owners, "an object no task names has no owner")
+}
