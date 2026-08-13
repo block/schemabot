@@ -759,7 +759,7 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 // environment; it collapses a pull request's many tasks into one row carrying
 // its most recent activity; and it excludes CLI-originated tasks, which carry
 // no pull request to attribute anything to.
-func TestTaskStore_FindObjectOwners(t *testing.T) {
+func TestTaskStore_FindTableOwners(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := New(testDB)
@@ -796,13 +796,13 @@ func TestTaskStore_FindObjectOwners(t *testing.T) {
 	createTask("task_owner_other_table", "users", "staging", "octocat/hello-world", 13, base)
 	createTask("task_owner_cli", "reconcile_state", "staging", "", 0, base)
 
-	ref := storage.ObjectRef{
+	ref := storage.TableRef{
 		Database:     apply.Database,
 		DatabaseType: apply.DatabaseType,
 		Environment:  "staging",
 		TableName:    "reconcile_state",
 	}
-	owners, err := store.Tasks().FindObjectOwners(ctx, ref)
+	owners, err := store.Tasks().FindTableOwners(ctx, ref)
 	require.NoError(t, err)
 	require.Len(t, owners, 2, "one row per pull request, and never the CLI-originated task")
 	assert.Equal(t, "octocat/hello-world", owners[0].Repository)
@@ -811,7 +811,7 @@ func TestTaskStore_FindObjectOwners(t *testing.T) {
 	assert.Equal(t, 9, owners[1].PullRequest)
 
 	ref.TableName = "audit_log"
-	owners, err = store.Tasks().FindObjectOwners(ctx, ref)
+	owners, err = store.Tasks().FindTableOwners(ctx, ref)
 	require.NoError(t, err)
 	assert.Empty(t, owners, "an object no task names has no owner")
 }

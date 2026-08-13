@@ -11,16 +11,20 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// annotateOwnedDrops fills in the plan comment's held-back drops: the objects
+// annotateOwnedDrops fills in the plan comment's held-back drops: the tables
 // the plan would drop that SchemaBot cannot vouch for as this pull request's to
 // drop.
 //
+// A held-back drop is always a whole table. Stored task history names the table
+// a task changed and nothing finer, so a destructive change to a table that
+// survives — a dropped column or index — is outside what this can attribute.
+//
 // SchemaBot's workflow is schema-first — a pull request applies its schema
 // change and merges afterwards — so between those two moments the live database
-// carries an object no merged tree describes. A plan is a full declarative diff
+// carries a table no merged tree describes. A plan is a full declarative diff
 // of the planning pull request's schema files against that live database, so
-// the object reads as one to drop. Stored task history knows better: it records
-// which pull request last changed each object.
+// the table reads as one to drop. Stored task history knows better: it records
+// which pull request last changed each table.
 //
 // The lookup fails toward ownership. A storage failure, or a pull-request state
 // lookup that fails, annotates the drop as unresolved rather than letting it
@@ -34,7 +38,7 @@ func (h *Handler) annotateOwnedDrops(ctx context.Context, client *ghclient.Insta
 		return
 	}
 	for _, table := range tables {
-		ref := storage.ObjectRef{
+		ref := storage.TableRef{
 			Database:     data.Database,
 			DatabaseType: data.DatabaseType,
 			Environment:  environment,
@@ -49,11 +53,11 @@ func (h *Handler) annotateOwnedDrops(ctx context.Context, client *ghclient.Insta
 
 // classifyPlannedDrop decides whether one planned drop must be held back, and
 // how it should read. annotate is false only when the lookup positively
-// established that no other pull request has an open claim on the object.
-func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.InstallationClient, ref storage.ObjectRef, repo string, pr int, table string) (drop templates.OwnedDropData, annotate bool) {
-	owners, err := h.service.Storage().Tasks().FindObjectOwners(ctx, ref)
+// established that no other pull request has an open claim on the table.
+func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.InstallationClient, ref storage.TableRef, repo string, pr int, table string) (drop templates.OwnedDropData, annotate bool) {
+	owners, err := h.service.Storage().Tasks().FindTableOwners(ctx, ref)
 	if err != nil {
-		h.logger.Error("planned drop will be held back: object-ownership lookup failed",
+		h.logger.Error("planned drop will be held back: table-ownership lookup failed",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table, "error", err)
 		metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
@@ -84,7 +88,7 @@ func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.Inst
 				"owner_merged", info.Merged)
 			continue
 		}
-		h.logger.Warn("planned drop will be held back: an open pull request last changed this object",
+		h.logger.Warn("planned drop will be held back: an open pull request last changed this table",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table,
 			"owner_repo", owner.Repository, "owner_pr", owner.PullRequest)
@@ -97,7 +101,7 @@ func (h *Handler) classifyPlannedDrop(ctx context.Context, client *ghclient.Inst
 	}
 
 	if checked == 0 {
-		h.logger.Debug("planned drop is this pull request's to make: no other pull request is attributed the object",
+		h.logger.Debug("planned drop is this pull request's to make: no other pull request is attributed the table",
 			"repo", repo, "pr", pr, "database", ref.Database, "environment", ref.Environment, "table", table)
 	}
 	metrics.RecordPlanDropOwnership(ctx, repo, ref.Database, ref.Environment, "unowned")

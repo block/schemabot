@@ -159,7 +159,7 @@ DROP TABLE `reconcile_state`;
 🛑 **Held back**: **1** drop that may not be this PR's to make
 - `reconcile_state`: last changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), still open
 
-A plan diffs this PR's schema files against the live database, so an object another PR applied before merging reads here as one to drop. Merge that PR, or add the object's definition to this PR's schema files, then re-plan.
+A plan diffs this PR's schema files against the live database, so a table another PR applied before merging reads here as one to drop. Merge that PR, or add the table's definition to this PR's schema files, then re-plan.
 
 ⚠️ **Issues**: **1** unsafe change detected
 - `reconcile_state`: DROP TABLE removes all data

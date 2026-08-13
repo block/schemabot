@@ -51,7 +51,7 @@ type DirectChangeData struct {
 	Shards []string
 }
 
-// OwnedDropData is a planned drop of an object that stored task history
+// OwnedDropData is a planned drop of a table that stored task history
 // attributes to a pull request other than the one being planned. Repository and
 // PullRequest name the owner when the lookup resolved an open one; Unresolved
 // marks a drop whose ownership could not be established, which is annotated the
@@ -92,7 +92,7 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
-	// Drops of objects another pull request owns, or whose ownership could not
+	// Drops of tables another pull request owns, or whose ownership could not
 	// be established. Their presence withholds the apply prompt.
 	OwnedDrops []OwnedDropData
 
@@ -181,7 +181,7 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
-	// Drops of objects another pull request owns. Shown on the locked apply
+	// Drops of tables another pull request owns. Shown on the locked apply
 	// comment too, for the same reason as the direct-execution disclosure: it
 	// must sit on the comment the confirmation acts on.
 	if len(data.OwnedDrops) > 0 {
@@ -265,7 +265,7 @@ func RenderPlanComment(data PlanCommentData) string {
 }
 
 // ApplyPromptWithheld reports whether the comment must not offer an apply
-// command. A plan that would drop an object another pull request owns is not
+// command. A plan that would drop a table another pull request owns is not
 // one an operator should be able to run by pasting a single line: the drop
 // follows from that pull request not having merged yet, not from a change this
 // pull request proposes.
@@ -281,14 +281,14 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 
 // writeApplyPromptWithheld replaces the apply instruction on a plan whose drops
 // are attributed elsewhere, so the comment never renders a one-line command
-// that would destroy another pull request's object.
+// that would destroy another pull request's table.
 func writeApplyPromptWithheld(sb *strings.Builder) {
 	sb.WriteString("⛔ **No apply command is offered** for this plan. Resolve the drops listed above first.\n")
 }
 
-// writeOwnedDrops writes the section for drops of objects that stored task
+// writeOwnedDrops writes the section for drops of tables that stored task
 // history attributes to another pull request. SchemaBot plans a full diff of
-// the pull request's schema files against the live database, so an object an
+// the pull request's schema files against the live database, so a table an
 // unmerged pull request already applied reads as one this pull request wants
 // gone — which is what this section exists to contradict.
 func writeOwnedDrops(sb *strings.Builder, drops []OwnedDropData) {
@@ -302,7 +302,7 @@ func writeOwnedDrops(sb *strings.Builder, drops []OwnedDropData) {
 		fmt.Fprintf(sb, "- `%s`: last changed by [%s#%d](https://github.com/%s/pull/%d), still open\n",
 			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
 	}
-	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so an object another PR applied before merging reads here as one to drop. Merge that PR, or add the object's definition to this PR's schema files, then re-plan.\n\n")
+	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a table another PR applied before merging reads here as one to drop. Merge that PR, or add the table's definition to this PR's schema files, then re-plan.\n\n")
 }
 
 // writePlanMetadata writes the metadata line for plan comments.
@@ -1008,7 +1008,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeBlockedChanges(sb, plan.BlockedChanges)
 	}
 
-	// Drops of objects another pull request owns — resolved per environment,
+	// Drops of tables another pull request owns — resolved per environment,
 	// since the task history that attributes them is per environment.
 	if len(plan.OwnedDrops) > 0 {
 		writeOwnedDrops(sb, plan.OwnedDrops)

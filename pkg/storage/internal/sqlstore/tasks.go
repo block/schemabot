@@ -519,11 +519,11 @@ func (s *taskStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 	return scanTasks(rows)
 }
 
-// FindObjectOwners returns the pull requests stored tasks attribute an object
+// FindTableOwners returns the pull requests stored tasks attribute a table
 // to. The aggregate runs in SQL rather than over a loaded task list because it
-// is on the plan path: one query per object the plan would drop, served by the
+// is on the plan path: one query per table the plan would drop, served by the
 // tasks index on (database_name, database_type, environment, table_name).
-func (s *taskStore) FindObjectOwners(ctx context.Context, ref storage.ObjectRef) ([]storage.ObjectOwner, error) {
+func (s *taskStore) FindTableOwners(ctx context.Context, ref storage.TableRef) ([]storage.TableOwner, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT repository, pull_request, MAX(created_at)
 		FROM tasks
@@ -533,22 +533,22 @@ func (s *taskStore) FindObjectOwners(ctx context.Context, ref storage.ObjectRef)
 		ORDER BY MAX(created_at) DESC
 	`, ref.Database, ref.DatabaseType, ref.Environment, ref.TableName)
 	if err != nil {
-		return nil, fmt.Errorf("query object owners for %s.%s (%s, %s): %w",
+		return nil, fmt.Errorf("query table owners for %s.%s (%s, %s): %w",
 			ref.Database, ref.TableName, ref.DatabaseType, ref.Environment, err)
 	}
 	defer utils.CloseAndLog(rows)
 
-	var owners []storage.ObjectOwner
+	var owners []storage.TableOwner
 	for rows.Next() {
-		var owner storage.ObjectOwner
+		var owner storage.TableOwner
 		if err := rows.Scan(&owner.Repository, &owner.PullRequest, &owner.LastSeen); err != nil {
-			return nil, fmt.Errorf("scan object owner for %s.%s (%s, %s): %w",
+			return nil, fmt.Errorf("scan table owner for %s.%s (%s, %s): %w",
 				ref.Database, ref.TableName, ref.DatabaseType, ref.Environment, err)
 		}
 		owners = append(owners, owner)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read object owners for %s.%s (%s, %s): %w",
+		return nil, fmt.Errorf("read table owners for %s.%s (%s, %s): %w",
 			ref.Database, ref.TableName, ref.DatabaseType, ref.Environment, err)
 	}
 	return owners, nil

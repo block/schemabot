@@ -288,6 +288,6 @@ type ownershipLookupFailureTasks struct {
 	storage.TaskStore
 }
 
-func (s *ownershipLookupFailureTasks) FindObjectOwners(context.Context, storage.ObjectRef) ([]storage.ObjectOwner, error) {
+func (s *ownershipLookupFailureTasks) FindTableOwners(context.Context, storage.TableRef) ([]storage.TableOwner, error) {
 	return nil, errors.New(ownershipLookupFailureMessage)
 }

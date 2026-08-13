@@ -156,7 +156,7 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 }
 
 // RecordPlanDropOwnership counts one planned drop's ownership verdict.
-// Outcomes: "unowned" (no other pull request is attributed the object, so the
+// Outcomes: "unowned" (no other pull request is attributed the table, so the
 // drop renders normally), "owned" (an open pull request is attributed it, so
 // the drop is annotated and the apply prompt withheld), "storage_error" and
 // "pr_state_error" (the lookup could not decide, so the drop is annotated as
@@ -166,7 +166,7 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 // far apart.
 func RecordPlanDropOwnership(ctx context.Context, repo, database, environment, outcome string) {
 	addCounter(ctx, "schemabot.plan_drop_ownership.total",
-		"Total number of planned drops classified by object-ownership lookup outcome", "{drop}",
+		"Total number of planned drops classified by table-ownership lookup outcome", "{drop}",
 		attribute.String("repository", repo),
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
