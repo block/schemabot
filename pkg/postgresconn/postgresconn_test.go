@@ -116,6 +116,58 @@ func TestWithConnectTimeout(t *testing.T) {
 	assert.Equal(t, time.Duration(0), cfg.ConnectTimeout)
 }
 
+// Sessions are pinned to timezone=UTC so server-side now() is UTC on any
+// server default, keeping storage's timestamp comparisons consistent across
+// pods. An explicit timezone in the DSN wins, in either DSN form and in any
+// GUC-name case, and the pin never duplicates an existing setting under a
+// different spelling.
+func TestConnectionConfigPinsUTCTimezone(t *testing.T) {
+	// PGTZ is a libpq env fallback that pgx maps into RuntimeParams and
+	// therefore counts as an explicit setting; clear it so the assertions
+	// below reflect the DSN alone.
+	t.Setenv("PGTZ", "")
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot password=secret dbname=app")
+	require.NoError(t, err)
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?timezone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", cfg.RuntimeParams["timezone"])
+
+	cfg, err = connectionConfig("host=localhost user=schemabot timezone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", cfg.RuntimeParams["timezone"])
+
+	// PostgreSQL matches GUC names case-insensitively, and pgx preserves the
+	// DSN's key case: the documented TimeZone spelling must win without the
+	// pin adding a second, conflicting timezone entry.
+	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?TimeZone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", cfg.RuntimeParams["TimeZone"])
+	assert.NotContains(t, cfg.RuntimeParams, "timezone")
+
+	cfg, err = connectionConfig("host=localhost user=schemabot TimeZone=America/New_York")
+	require.NoError(t, err)
+	assert.Equal(t, "America/New_York", cfg.RuntimeParams["TimeZone"])
+	assert.NotContains(t, cfg.RuntimeParams, "timezone")
+}
+
+// PGTZ follows libpq fallback semantics: it reaches RuntimeParams before the
+// pin runs, so it is honored as an explicit operator setting rather than
+// overridden to UTC.
+func TestConnectionConfigHonorsPGTZ(t *testing.T) {
+	t.Setenv("PGTZ", "America/Los_Angeles")
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+	require.NoError(t, err)
+	assert.Equal(t, "America/Los_Angeles", cfg.RuntimeParams["timezone"])
+}
+
 // stubConn is the minimal driver.Conn a fake dial can hand back.
 type stubConn struct{}
 

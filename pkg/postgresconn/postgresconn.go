@@ -1,8 +1,9 @@
-// Package postgresconn opens SchemaBot-managed PostgreSQL connections with
-// the same guarantees mysqlconn provides for MySQL: centralized DSN
-// normalization (required TLS for RDS targets) and a storage pool whose
-// credentials survive secret rotation. Use Open for target-database
-// connections and OpenReloadable for the single long-lived storage pool.
+// Package postgresconn opens SchemaBot-managed PostgreSQL connections:
+// centralized DSN normalization (required TLS for RDS targets, mirroring the
+// TLS mode mysqlconn injects for RDS MySQL), a UTC session timezone unless
+// the DSN sets one, and a storage pool whose credentials survive secret
+// rotation. Use Open for target-database connections and OpenReloadable for
+// the single long-lived storage pool.
 package postgresconn
 
 import (
@@ -300,8 +301,9 @@ func dsnParseError(err error) error {
 	return fmt.Errorf("parse PostgreSQL DSN: %w", err)
 }
 
-// connectionConfig parses a normalized DSN (see ConnectionDSN) and applies
-// caller-supplied options to the resulting config.
+// connectionConfig parses a normalized DSN (see ConnectionDSN), pins the
+// session timezone to UTC, and applies caller-supplied options to the
+// resulting config.
 func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	normalized, err := ConnectionDSN(dsn)
 	if err != nil {
@@ -311,10 +313,35 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if err != nil {
 		return nil, dsnParseError(err)
 	}
+	// Sessions default to timezone=UTC so server-side now() evaluates in UTC
+	// regardless of the server's TimeZone setting. Storage compares plain
+	// timestamp columns against now() in lease-expiry and staleness
+	// predicates, so a non-UTC session would skew those comparisons. An
+	// explicit timezone wins: GUC names are case-insensitive on the server,
+	// and pgx preserves DSN key case in RuntimeParams, so the check must be
+	// case-insensitive too or ?TimeZone=... would coexist with the pin in the
+	// startup packet in nondeterministic map order. PGTZ also lands in
+	// RuntimeParams at parse time (libpq env fallback semantics), so an
+	// exported PGTZ counts as an explicit setting and skips the pin.
+	if !hasRuntimeParam(cfg.RuntimeParams, "timezone") {
+		cfg.RuntimeParams["timezone"] = "UTC"
+	}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	return cfg, nil
+}
+
+// hasRuntimeParam reports whether params carries key under PostgreSQL's
+// case-insensitive GUC name matching, so TimeZone and timezone are the same
+// parameter.
+func hasRuntimeParam(params map[string]string, key string) bool {
+	for k := range params {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // ConnectionDSN returns a PostgreSQL DSN with required transport settings
