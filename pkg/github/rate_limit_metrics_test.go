@@ -148,6 +148,45 @@ func TestGitHubRateLimitTransportRecordsTransportFailures(t *testing.T) {
 	assert.Empty(t, rateLimitValues)
 }
 
+// A 404 is a semantic answer, not an API failure: SchemaBot routinely probes
+// paths (schemabot.yaml config lookups, reloading deleted PRs) whose expected
+// answer is "not there". The request counter must label these not_found so
+// error dashboards and alerts see only real GitHub failures.
+func TestGitHubRateLimitTransportRecordsNotFoundStatus(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
+	})
+
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)),
+			Request:    req,
+		}, nil
+	}), 12345, func() string { return "schemabot-block" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/contents/service/schemabot.yaml", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusNotFound, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationFetchFileContent, attrs["operation"])
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, attrs["category"])
+	assert.Equal(t, "octocat/hello-world", attrs["repository"])
+	assert.Equal(t, "schemabot-block", attrs["github_app"])
+}
+
 func collectGitHubRequestCounter(t *testing.T, reader *sdkmetric.ManualReader) (int64, map[string]string) {
 	t.Helper()
 

@@ -415,5 +415,8 @@ func gitHubResponseStatus(resp *http.Response) string {
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		return metrics.GitHubRequestStatusSuccess
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		return metrics.GitHubRequestStatusNotFound
+	}
 	return metrics.GitHubRequestStatusError
 }

@@ -1227,6 +1227,13 @@ const (
 
 const (
 	GitHubRequestStatusError = "error"
+	// GitHubRequestStatusNotFound marks requests GitHub answered with HTTP 404.
+	// SchemaBot routinely asks questions whose expected answer is 404 — probing
+	// directories for schemabot.yaml config files, or reloading a PR that has
+	// since been deleted — so these are semantic "no" answers, not API failures.
+	// Keeping them out of GitHubRequestStatusError lets dashboards and alerts
+	// track real GitHub errors without excluding whole operations.
+	GitHubRequestStatusNotFound = "not_found"
 	// GitHubRequestStatusTransportError marks requests that never produced an
 	// HTTP response: dials that failed, TLS errors, and requests cut off by a
 	// context deadline. These are the signature of GitHub (or the network path
@@ -1414,6 +1421,7 @@ func isKnownGitHubRequestCategory(category string) bool {
 func isKnownGitHubRequestStatus(status string) bool {
 	switch status {
 	case GitHubRequestStatusError,
+		GitHubRequestStatusNotFound,
 		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,
 		GitHubRequestStatusUnknown:
