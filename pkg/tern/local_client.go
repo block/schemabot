@@ -631,7 +631,11 @@ func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequ
 // built-in pull path to the configured engine's SchemaPuller capability. An
 // engine that does not implement the capability fails closed with
 // ErrPullSchemaUnsupportedType, which the gRPC server surfaces as
-// codes.Unimplemented.
+// codes.Unimplemented. A nil response from an engine that does implement the
+// capability is a broken engine contract, not a missing capability: it is
+// deliberately surfaced as an internal error rather than the unsupported
+// sentinel, so an engine defect stays loud instead of reading as an expected
+// unsupported-type condition.
 func (c *LocalClient) pullSchemaFromEngine(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	puller, ok := c.getEngine().(SchemaPuller)
 	if !ok {

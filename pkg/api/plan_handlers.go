@@ -60,7 +60,7 @@ type unsupportedPullSchemaError struct {
 }
 
 func (e *unsupportedPullSchemaError) Error() string {
-	return fmt.Sprintf("pull schema supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, e.DatabaseType)
+	return fmt.Sprintf("pull schema is not supported for %s databases on this deployment", e.DatabaseType)
 }
 
 // pullSchemaUnsupportedByDataPlane reports whether a pull failure means the
