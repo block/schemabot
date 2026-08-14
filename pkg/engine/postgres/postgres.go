@@ -26,9 +26,14 @@ import (
 
 // Engine implements engine.Engine for PostgreSQL databases.
 type Engine struct {
-	mu       sync.Mutex
-	wg       sync.WaitGroup
-	progress *engine.ProgressResult
+	mu sync.Mutex
+	wg sync.WaitGroup
+	// progress is the tracked schema change's latest state, keyed by
+	// progressKey (the apply's ResumeState.MigrationContext). One engine is
+	// shared for the lifetime of a target, so Progress must answer for the
+	// apply the caller identifies — never for whichever apply wrote last.
+	progress    *engine.ProgressResult
+	progressKey string
 }
 
 // New creates a new PostgreSQL engine.
@@ -138,7 +143,7 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				// fails at apply.
 				if _, tierErr := preflight.RequiredTier([]string{sql}); tierErr != nil {
 					stepMode = engine.ExecutionModeBlocked
-					stepReason = fmt.Sprintf("statement for table %q is not a shape the native-safe path executes", table)
+					stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 				}
 			}
 			changes = append(changes, engine.TableChange{
@@ -164,19 +169,23 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		return "", ""
 	}
 
-	verdict := string(statement.Disposition)
+	// Planner explanations are deliberately not copied to operator-facing
+	// text, and neither is the planner's own vocabulary: each known
+	// disposition maps to a sentence in SchemaBot's words, since the operator
+	// reading it has never heard of the planning library.
 	switch statement.Disposition {
 	case router.DispositionUnavailable:
 		if statement.Backend == router.BackendCopyAndSwap {
 			return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table)
 		}
-	case router.DispositionRewriteRequired, router.DispositionRefuse:
-		// These known dispositions use the stable typed value below. Planner
-		// explanations are deliberately not copied to operator-facing text.
+		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table)
+	case router.DispositionRewriteRequired:
+		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table)
+	case router.DispositionRefuse:
+		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table)
 	default:
-		verdict = "unrecognized"
+		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table)
 	}
-	return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has blocked verdict %q", table, verdict)
 }
 
 func destructiveReason(destructive bool, table string) string {
@@ -195,46 +204,53 @@ func sortedKeys[V any](values map[string]V) []string {
 	return keys
 }
 
-// Drain blocks until every background apply goroutine has finished. Resume
-// and recovery paths call this before re-planning so a statement still in
-// flight from a lost lease cannot race the next drive's view of the schema.
+// Drain blocks until every background apply goroutine has finished, then
+// clears the tracked schema change so the next Progress reports the idle
+// sentinel. Resume and recovery paths call this before re-planning so a
+// statement still in flight from a lost lease cannot race the next drive's
+// view of the schema, and so the next poll reads a clean engine instead of
+// the previous change's terminal snapshot.
 func (e *Engine) Drain() {
 	e.wg.Wait()
+	e.mu.Lock()
+	e.progress = nil
+	e.progressKey = ""
+	e.mu.Unlock()
 }
 
 // Stop pauses a running schema change.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("stop is not supported for PostgreSQL schema changes")
 }
 
 // Cancel terminates a running schema change.
 func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("cancel is not supported for PostgreSQL schema changes")
 }
 
 // Start resumes a stopped schema change.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("start is not supported for PostgreSQL schema changes")
 }
 
 // Cutover triggers the final table swap.
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("cutover is not supported for PostgreSQL schema changes")
 }
 
 // Revert rolls back a completed schema change during the revert window.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("revert is not supported for PostgreSQL schema changes")
 }
 
 // SkipRevert ends the revert window early, making changes permanent.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("skip-revert is not supported for PostgreSQL schema changes")
 }
 
 // Volume adjusts the schema change speed.
 func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
+	return nil, fmt.Errorf("volume is not supported for PostgreSQL schema changes")
 }
 
 // Compile-time check that Engine implements engine.Engine.

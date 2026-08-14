@@ -193,9 +193,17 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	// the database must resolve credentials per task (credentialsForTask)
 	// before this probe, or under schema overrides it would address the
 	// canonical name instead of the physical schema.
+	//
+	// The task identifier rides along for engines that key progress by apply
+	// identity (postgres): a probe about work the engine is still running
+	// must see its live state and keep blocking, while an unrecognized
+	// identity reads the idle sentinel and resolves as abandoned. Engines
+	// that ignore identity (Spirit) or require resume metadata instead
+	// (PlanetScale) behave exactly as before.
 	result, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    database,
 		Credentials: c.credentials(),
+		ResumeState: &engine.ResumeState{MigrationContext: t.TaskIdentifier},
 	})
 	if err != nil {
 		// result may be nil when err is non-nil, so it must not be dereferenced here.

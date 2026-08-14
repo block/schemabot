@@ -3,6 +3,8 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -73,6 +75,75 @@ func TestClassifyRefusal(t *testing.T) {
 	}
 }
 
+// TestProgressIsKeyedToTheRequestingApply proves the engine answers Progress
+// for the apply the caller identifies, not for whichever apply wrote last:
+// one engine is shared for a target's lifetime, so a mismatched identity must
+// read the idle sentinel instead of another schema change's state.
+func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""))
+
+	tracked, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateCompleted, tracked.State)
+	require.Len(t, tracked.Tables, 1)
+	assert.Equal(t, "t_a", tracked.Tables[0].Table)
+
+	other, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-b"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, other.State)
+	assert.Equal(t, "No active schema change", other.Message)
+	assert.False(t, other.State.IsTerminal(), "another apply's identity must never read a terminal state")
+
+	anonymous, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, anonymous.State)
+}
+
+// TestStaleApplyCannotOverwriteTrackedProgress proves a background writer
+// from a superseded apply cannot replace the tracked apply's state: once a
+// newer apply claims the engine, the stale terminal write is discarded.
+func TestStaleApplyCannotOverwriteTrackedProgress(t *testing.T) {
+	eng := New()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""))
+
+	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
+	eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), logger)
+
+	tracked, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-b"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateRunning, tracked.State)
+	require.Len(t, tracked.Tables, 1)
+	assert.Equal(t, "t_b", tracked.Tables[0].Table)
+}
+
+// TestDrainClearsTrackedSchemaChange proves a drain leaves the engine idle:
+// resume paths drain precisely so the next poll reads the idle sentinel
+// instead of the previous change's terminal snapshot.
+func TestDrainClearsTrackedSchemaChange(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""))
+
+	eng.Drain()
+
+	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, progress.State)
+	assert.Equal(t, "No active schema change", progress.Message)
+}
+
 // TestValidateOptimisticApplyRefusesNonNativeShape proves acceptance-time
 // validation refuses statement shapes the native-safe path cannot execute,
 // without touching the target database.
@@ -91,5 +162,5 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 	_, err := validateOptimisticApply(req)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not a shape the native-safe path executes")
+	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }

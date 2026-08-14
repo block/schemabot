@@ -43,7 +43,7 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Equal(t, "users", change.Table)
 	assert.Contains(t, change.DDL, "CREATE TABLE public.users")
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
-	assert.Equal(t, `statement for table "users" is not a shape the native-safe path executes`, change.ModeReason)
+	assert.Equal(t, `statement for table "users" is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible`, change.ModeReason)
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
@@ -57,7 +57,7 @@ func TestEngineApplyNativeSafe(t *testing.T) {
 	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN email text"))
 	require.NoError(t, err)
 	assert.True(t, result.Accepted)
-	progress := awaitPostgresProgress(t, eng)
+	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateCompleted, progress.State)
 	assert.Equal(t, 100, progress.Progress)
 	assert.Equal(t, "completed", progress.Metadata["phase"])
@@ -88,10 +88,10 @@ func TestEngineApplyPrivilegeRefusal(t *testing.T) {
 	eng := New()
 	_, err = eng.Apply(t.Context(), applyRequest(limitedDSN.String(), "users", "ALTER TABLE public.users ADD COLUMN email text"))
 	require.NoError(t, err)
-	progress := awaitPostgresProgress(t, eng)
+	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
-	assert.Equal(t, engine.ExecutionModeBlocked, progress.Metadata["execution_mode"])
-	assert.Equal(t, "insufficient-privileges", progress.Metadata["refusal_reason"])
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a refusal is permanent; the drive must not offer a retry")
 	assert.Contains(t, progress.ErrorMessage, "GRANT")
 }
 
@@ -103,11 +103,10 @@ func TestEngineApplyTableNotFoundRefusal(t *testing.T) {
 	eng := New()
 	_, err := eng.Apply(t.Context(), applyRequest(dsn, "missing_users", "ALTER TABLE public.missing_users ADD COLUMN email text"))
 	require.NoError(t, err)
-	progress := awaitPostgresProgress(t, eng)
+	progress := awaitPostgresProgress(t, eng, "missing_users")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
-	assert.Equal(t, engine.ExecutionModeBlocked, progress.Metadata["execution_mode"])
-	assert.Equal(t, "table-not-found", progress.Metadata["refusal_reason"])
+	assert.False(t, progress.Retryable, "a refusal is permanent; the drive must not offer a retry")
 	assert.Contains(t, progress.ErrorMessage, "missing_users")
 }
 
@@ -119,10 +118,54 @@ func TestEngineApplyOperationalFailure(t *testing.T) {
 	unreachableDSN := "postgres://postgres:postgres@127.0.0.1:1/failure_test?sslmode=disable"
 	_, err := eng.Apply(t.Context(), applyRequest(unreachableDSN, "users", "ALTER TABLE public.users ADD COLUMN email text"))
 	require.NoError(t, err)
-	progress := awaitPostgresProgress(t, eng)
+	progress := awaitPostgresProgress(t, eng, "users")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "failed", progress.Metadata["phase"])
-	assert.Empty(t, progress.Metadata["execution_mode"])
+	assert.True(t, progress.Retryable, "an operational failure must reach the retryable task state, not cancel the apply's remaining work")
+}
+
+// TestEngineSharedAcrossAppliesKeepsProgressPerApply proves the engine
+// answers Progress for the apply the caller identifies. One engine lives for
+// a target's lifetime, so after a second apply claims it, the first apply's
+// identity must read the idle sentinel — never the other apply's state — and
+// Drain must leave the engine idle for the next drive's clean poll.
+func TestEngineSharedAcrossAppliesKeepsProgressPerApply(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "shared_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.t_a (id bigint PRIMARY KEY);
+		CREATE TABLE public.t_b (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "t_a", "ALTER TABLE public.t_a ADD COLUMN a text"))
+	require.NoError(t, err)
+	first := awaitPostgresProgress(t, eng, "t_a")
+	assert.Equal(t, engine.StateCompleted, first.State)
+
+	// Before the second apply exists, polling its identity must not surface
+	// the first apply's terminal state.
+	other, err := eng.Progress(t.Context(), progressRequestFor("t_b"))
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, other.State)
+	assert.Equal(t, "No active schema change", other.Message)
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "t_b", "ALTER TABLE public.t_b ADD COLUMN b text"))
+	require.NoError(t, err)
+	second := awaitPostgresProgress(t, eng, "t_b")
+	assert.Equal(t, engine.StateCompleted, second.State)
+	require.Len(t, second.Tables, 1)
+	assert.Equal(t, "t_b", second.Tables[0].Table)
+
+	// The superseded apply's identity now reads idle, and a drain leaves the
+	// engine idle for every identity.
+	stale, err := eng.Progress(t.Context(), progressRequestFor("t_a"))
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, stale.State)
+	eng.Drain()
+	drained, err := eng.Progress(t.Context(), progressRequestFor("t_b"))
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, drained.State)
+	assert.Equal(t, "No active schema change", drained.Message)
 }
 
 // TestEngineApplyRefusesNonNativeShape proves a statement shape the
@@ -133,9 +176,12 @@ func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
 	eng := New()
 	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "CREATE TABLE public.users (id bigint PRIMARY KEY)"))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not a shape the native-safe path executes")
+	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
 
+// applyRequest builds a single-statement apply request with the same identity
+// shape the drive layer uses: the task identifier stamped into
+// ResumeState.MigrationContext keys the engine's progress to this apply.
 func applyRequest(dsn, table, statement string) *engine.ApplyRequest {
 	return &engine.ApplyRequest{
 		Database: "app",
@@ -144,17 +190,26 @@ func applyRequest(dsn, table, statement string) *engine.ApplyRequest {
 			TableChanges: []engine.TableChange{{Table: table, DDL: statement}},
 		}},
 		Credentials: &engine.Credentials{DSN: dsn},
+		ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)},
 	}
 }
 
-func awaitPostgresProgress(t *testing.T, eng *Engine) *engine.ProgressResult {
+func applyTaskID(table string) string {
+	return "task-" + table
+}
+
+func progressRequestFor(table string) *engine.ProgressRequest {
+	return &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)}}
+}
+
+func awaitPostgresProgress(t *testing.T, eng *Engine, table string) *engine.ProgressResult {
 	t.Helper()
 	var result *engine.ProgressResult
 	// assert then require so the failure message formats the last polled
 	// progress instead of the pre-poll nil value.
 	finished := assert.Eventually(t, func() bool {
 		var err error
-		result, err = eng.Progress(t.Context(), &engine.ProgressRequest{})
+		result, err = eng.Progress(t.Context(), progressRequestFor(table))
 		require.NoError(t, err)
 		return result.State.IsTerminal()
 	}, postgresApplyDeadline, 10*time.Millisecond)

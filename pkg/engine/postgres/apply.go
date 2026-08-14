@@ -51,14 +51,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	started := time.Now()
-	e.setProgress(progressResult(engine.StateRunning, "preflight", started, change, ""))
+	key := progressIdentity(req.ResumeState)
+	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""))
 	bgCtx := context.WithoutCancel(ctx)
 	dsn := req.Credentials.DSN
 	logger := req.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e.wg.Go(func() { e.runOptimisticApply(bgCtx, dsn, change, started, logger) })
+	e.wg.Go(func() { e.runOptimisticApply(bgCtx, dsn, change, key, started, logger) })
 
 	return &engine.ApplyResult{
 		Accepted:    true,
@@ -88,27 +89,26 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	// synchronous check exists so a statement shape the native-safe path
 	// cannot execute is refused at acceptance, before any work is queued.
 	if _, err := preflight.RequiredTier([]string{tc.DDL}); err != nil {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement is not a shape the native-safe path executes", tc.Table)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
 }
 
-func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nativeApply, started time.Time, logger *slog.Logger) {
+func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nativeApply, key string, started time.Time, logger *slog.Logger) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
 	err := executeOptimistic(ctx, dsn, change)
 	if err == nil {
-		e.setProgress(progressResult(engine.StateCompleted, "completed", started, change, ""))
+		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
 		return
 	}
 
 	if r := classifyRefusal(err, change.table); r != nil {
-		result := progressResult(engine.StateFailed, "refused", started, change, r.detail)
-		result.Metadata["execution_mode"] = engine.ExecutionModeBlocked
-		result.Metadata["refusal_reason"] = r.reason
-		e.setProgress(result)
+		// The taxonomy's reason survives in the operator-facing detail; no
+		// metadata carries it because nothing downstream consumes one yet.
+		e.publishProgress(key, progressResult(engine.StateFailed, "refused", started, change, r.detail), logger)
 		return
 	}
 
@@ -119,13 +119,20 @@ func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nati
 		// native-safe and merely lost a bounded race with concurrent lock
 		// holders. Surface the typed detail as a retryable failure — marking
 		// it blocked would falsely tell the operator retrying cannot succeed.
-		e.setProgress(progressResult(engine.StateFailed, "failed", started, change,
-			budgetErr.Error()+"; retry once lock contention subsides"))
+		result := progressResult(engine.StateFailed, "failed", started, change,
+			budgetErr.Error()+"; retry once lock contention subsides")
+		result.Retryable = true
+		e.publishProgress(key, result, logger)
 		return
 	}
 
 	logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
-	e.setProgress(progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs"))
+	result := progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs")
+	// Operational failures are retryable by definition: classifyRefusal
+	// returned nil, so nothing about the plan, target, or provisioning makes
+	// a retry futile — the drive must not cancel the apply's remaining work.
+	result.Retryable = true
+	e.publishProgress(key, result, logger)
 }
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
@@ -157,7 +164,11 @@ func classifyRefusal(err error, table string) *refusal {
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		return &refusal{reason: "table-too-large", detail: sizeErr.Error()}
+		// Name whose limit this is: read cold, the size text sounds like a
+		// property of PostgreSQL or of the change, when it is SchemaBot's
+		// own conservatism for the native-safe path.
+		return &refusal{reason: "table-too-large",
+			detail: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
 	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return &refusal{reason: "table-not-found",
@@ -204,12 +215,21 @@ func executeOptimistic(ctx context.Context, rawDSN string, change nativeApply) e
 	return nil
 }
 
-// Progress reports phase, elapsed time, and statement position. Rich server
-// progress is intentionally absent until the PostgreSQL executor exposes it.
-func (e *Engine) Progress(_ context.Context, _ *engine.ProgressRequest) (*engine.ProgressResult, error) {
+// Progress reports phase, elapsed time, and statement position for the apply
+// the caller identifies via ResumeState.MigrationContext. A caller asking
+// about an apply the engine is not tracking gets the idle sentinel: one
+// engine is shared for the lifetime of a target, so answering with whichever
+// apply wrote last would report another schema change's state — including a
+// terminal one — for work that is still in flight. Rich server progress is
+// intentionally absent until the PostgreSQL executor exposes it.
+func (e *Engine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	var key string
+	if req != nil {
+		key = progressIdentity(req.ResumeState)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.progress == nil {
+	if e.progress == nil || key != e.progressKey {
 		// The exact idle message is a cross-engine contract: stale-task
 		// recovery compares against it verbatim to auto-resolve work
 		// abandoned by a crashed server.
@@ -222,6 +242,17 @@ func (e *Engine) Progress(_ context.Context, _ *engine.ProgressRequest) (*engine
 		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
 	}
 	return &result, nil
+}
+
+// progressIdentity extracts the apply identity that keys engine progress.
+// The drive layer stamps the task identifier into
+// ResumeState.MigrationContext on both Apply and Progress requests, so the
+// two sides of the comparison come from the same source.
+func progressIdentity(rs *engine.ResumeState) string {
+	if rs == nil {
+		return ""
+	}
+	return rs.MigrationContext
 }
 
 func progressResult(state engine.State, phase string, started time.Time, change nativeApply, detail string) *engine.ProgressResult {
@@ -249,9 +280,28 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 	return result
 }
 
-func (e *Engine) setProgress(result *engine.ProgressResult) {
+// claimProgress records an accepted apply as the engine's tracked schema
+// change. Only Apply calls this: acceptance is the moment the engine's
+// single progress slot changes hands.
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.progressKey = key
+	e.progress = result
+}
+
+// publishProgress stores a background apply's progress unless a newer apply
+// has claimed the engine since. A stale writer must never overwrite the
+// tracked apply's state, so the dropped write is logged and discarded — the
+// superseded apply's poller reads the idle sentinel instead.
+func (e *Engine) publishProgress(key string, result *engine.ProgressResult, logger *slog.Logger) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if key != e.progressKey {
+		logger.Warn("PostgreSQL apply progress discarded: a newer apply claimed the engine",
+			"task_id", key, "state", result.State, "tracked_task_id", e.progressKey)
+		return
+	}
 	e.progress = result
 }
 

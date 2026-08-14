@@ -2892,7 +2892,7 @@ func TestExecuteApplyRejectsStoredTableDropWithoutOptIn(t *testing.T) {
 func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Namespaces["testdb"].Tables[0].ExecutionMode = "blocked"
-	plan.Namespaces["testdb"].Tables[0].ModeReason = `statement for table "users" has blocked verdict "refuse"`
+	plan.Namespaces["testdb"].Tables[0].ModeReason = `statement for table "users" is refused: it cannot be executed safely as written`
 
 	applies := &capturingApplyStore{}
 	tasks := &capturingTaskStore{}
@@ -2916,7 +2916,7 @@ func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	assert.Nil(t, resp)
 	assert.Zero(t, applyID)
 	assert.Contains(t, err.Error(), "blocked change")
-	assert.Contains(t, err.Error(), `blocked verdict "refuse"`)
+	assert.Contains(t, err.Error(), "cannot be executed safely as written")
 	assert.Nil(t, applies.apply)
 	assert.Empty(t, tasks.tasks)
 }
