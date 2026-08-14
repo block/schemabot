@@ -98,10 +98,14 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 //     reopen can't race a real driver, and the lease-token guard on
 //     MarkCompleted/MarkFailed still rejects a returning zombie driver.
 //   - permanently failed (dead-lettered) rows: Redeliver is the one sanctioned
-//     lever for them. The reconciler cannot resurrect a dead-lettered head —
-//     HasEventForHead reports it covered, so synthesis never re-Creates its
-//     GUID — which leaves the reopen reachable only through an operator's
-//     explicit redelivery, where a fresh attempt budget is the point.
+//     lever that reopens them, and only organic GUIDs have one — a synthesized
+//     GUID has no corresponding GitHub delivery, so its dead-lettered row is
+//     never reopened and its head advances only through a fresh delivery (a
+//     new head push or a check re-run). The reconciler cannot resurrect a
+//     dead-lettered head — HasEventForHead reports it covered, so synthesis
+//     never re-Creates its GUID — which leaves the reopen reachable only
+//     through an operator's explicit redelivery, where a fresh attempt budget
+//     is the point.
 //
 // pending/retryable rows and processing rows with a live (unexpired) lease are
 // genuinely in flight, so they dedup (return false). last_error is kept for

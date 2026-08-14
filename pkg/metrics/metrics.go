@@ -1543,7 +1543,11 @@ var knownWebhookInboxStates = func() map[string]bool {
 // given state. A rising pending/processing depth means dispatch is falling
 // behind ingestion; a rising failed_retryable depth means deliveries are
 // retrying; a rising completed/failed depth means terminal rows are accumulating
-// and retention has not reclaimed them.
+// and retention has not reclaimed them. A rising failed_permanent depth means
+// deliveries are being dead-lettered — each such row is a permanently dropped
+// delivery that will never retry and needs explicit operator action (GitHub
+// Redeliver for an organic delivery; a new head push or check re-run for a
+// synthesized one).
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -1625,12 +1629,15 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 // unrecognized value folds to "unknown". Outcomes:
 //   - "completed": processing succeeded and the row was marked completed.
 //   - "failed": processing exhausted the retry budget; the row is terminal
-//     but stays eligible for reconciler resurrection and GitHub Redeliver.
+//     but recoverable — GitHub Redeliver reopens an organic row, and the
+//     reconciler resurrects a synthesized row. Each lever applies only to
+//     its own GUID class; no single row has both.
 //   - "failed_permanent": processing proved the delivery can never succeed
-//     for its head, so the row was dead-lettered; only GitHub Redeliver
-//     re-runs it. A sustained rate means PRs are hitting a deterministic
-//     limit (for example GitHub's per-PR file-listing cap) — find the
-//     delivery in the driver logs and inspect its last_error.
+//     for its head, so the row was dead-lettered; GitHub Redeliver re-runs
+//     an organic row, while a synthesized row needs a fresh delivery (a new
+//     head push or a check re-run). A sustained rate means PRs are hitting a
+//     deterministic limit (for example GitHub's per-PR file-listing cap) —
+//     find the delivery in the driver logs and inspect its last_error.
 //   - "retrying": processing failed retryably; the row waits for its retry
 //     window.
 //   - "released": the pool shut down mid-flight and refunded the claim.
@@ -1697,7 +1704,10 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook
 // reconciler found without a live inbox delivery — no row at all, or only a
-// terminally failed one. A nonzero rate means deliveries are being lost
+// plain-failed synthesized one. A dead-lettered row or a plain-failed organic
+// row covers its head, so neither counts as missing (the dead-letter is
+// deliberately terminal; the organic failure has GitHub Redeliver as its
+// lever). A nonzero rate means deliveries are being lost
 // upstream of the inbox (edge auth, GitHub send failures); with synthesis
 // enabled each miss also triggers a recovery delivery, counted by
 // RecordWebhookReconcileSynthesizedEvent, so investigate the upstream loss.

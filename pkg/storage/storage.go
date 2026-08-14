@@ -226,8 +226,10 @@ type WebhookEventStore interface {
 	// GitHub's "Redeliver" button — which reuses the original delivery GUID —
 	// is a real remediation for a terminal delivery instead of a permanent
 	// no-op. Redeliver is also the only lever that revives a permanently
-	// failed row: the reconciler never re-Creates its GUID because
-	// HasEventForHead reports the dead-lettered head as covered.
+	// failed row — the reconciler never re-Creates its GUID because
+	// HasEventForHead reports the dead-lettered head as covered — and it
+	// exists only for organic GUIDs; a synthesized dead-lettered row stays
+	// terminal, its head advancing only through a fresh delivery.
 	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
 
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
@@ -278,8 +280,10 @@ type WebhookEventStore interface {
 	// MarkFailedPermanent dead-letters a claimed event: the driver proved the
 	// delivery can never succeed for its head, so no retry, reconciler
 	// synthesis, or attempt-budget reset may revive it. The row counts as head
-	// coverage in HasEventForHead; only an explicit GitHub Redeliver reopens
-	// it.
+	// coverage in HasEventForHead. Only an explicit GitHub Redeliver reopens
+	// the row itself, and only an organic delivery has one — a synthesized
+	// delivery has no GitHub delivery to redeliver, so its head moves forward
+	// only through a fresh delivery (a new head push or a check re-run).
 	MarkFailedPermanent(ctx context.Context, id int64, leaseToken string, errMsg string) error
 
 	// Release returns a claimed event to pending and refunds the attempt its

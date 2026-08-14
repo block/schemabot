@@ -273,9 +273,13 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// or an undecodable row), so it dead-letters immediately: the
 			// permanently failed row counts as head coverage, which stops the
 			// reconciler from synthesizing a recovery delivery that would replay
-			// the same failure every pass. GitHub Redeliver remains the operator
-			// lever to re-run it after the underlying cause is fixed.
-			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; GitHub Redeliver is the only lever that re-runs it",
+			// the same failure every pass. The operator lever after fixing the
+			// underlying cause depends on the delivery's origin: GitHub
+			// Redeliver re-runs an organic delivery, but a reconciler-
+			// synthesized delivery has no GitHub delivery to redeliver — its
+			// head moves forward only through a fresh delivery, from a new
+			// head push or a re-run of the failing SchemaBot check.
+			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
 				"attempts", event.Attempts, "error", processErr)
@@ -581,8 +585,13 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 // transient GitHub API errors. The permanent class is GitHub's per-PR
 // file-listing cap (ErrPRFilesIncomplete): every retry repeats the identical
 // truncated listing, and the head already carries a failing config discovery
-// check telling the author the change is too large to review. Only a new head
-// (or an explicit redelivery) can change the outcome.
+// check telling the author the change is too large to review. The outcome is
+// near-deterministic rather than strictly so: the listing is computed against
+// the merge base, which can move without a new push (for example when a
+// stacked base PR merges) and drop the head back under the cap — but no
+// covered pull_request event fires for that, so recovering such a head still
+// takes a new push, a check re-run, or an explicit redelivery. That is an
+// accepted cost of not burning retry budget on the common case.
 func autoPlanFailureIsPermanent(err error) bool {
 	return errors.Is(err, ghclient.ErrPRFilesIncomplete)
 }
