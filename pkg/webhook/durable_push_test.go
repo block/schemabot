@@ -160,7 +160,7 @@ func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
 
 // A push row with an empty repo or an empty head SHA is a corrupted/replayed
 // row (the deletion sentinel is an all-zeros SHA, not an empty one), so the
-// driver fails it terminally — even when the corruption also blanks the fields
+// driver dead-letters it — even when the corruption also blanks the fields
 // a routine skip would match, such as the ref and default branch — rather than
 // silently completing it as a non-default-branch or unregistered-repo skip.
 func TestDurablePushDriverFailsMalformedRowTerminally(t *testing.T) {
@@ -210,12 +210,12 @@ func TestDurablePushDriverFailsMalformedRowTerminally(t *testing.T) {
 			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 			select {
-			case failure := <-store.failed:
-				require.Nil(t, failure.retryAfter, "a malformed push row must not be retried")
+			case failure := <-store.failedPermanent:
 				require.Contains(t, failure.errMsg, "missing repo or head SHA")
 			default:
-				t.Fatal("expected malformed push delivery to be marked failed")
+				t.Fatal("expected malformed push delivery to be dead-lettered")
 			}
+			require.Empty(t, store.failed, "a malformed push row is deterministic and must not burn retry budget")
 			require.Empty(t, store.completed)
 		})
 	}

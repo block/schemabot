@@ -97,6 +97,15 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 //     immediate recovery lever. An expired lease means no live owner, so the
 //     reopen can't race a real driver, and the lease-token guard on
 //     MarkCompleted/MarkFailed still rejects a returning zombie driver.
+//   - permanently failed (dead-lettered) rows: Redeliver is the one sanctioned
+//     lever that reopens them, and only organic GUIDs have one — a synthesized
+//     GUID has no corresponding GitHub delivery, so its dead-lettered row is
+//     never reopened and its head advances only through a fresh delivery (a
+//     new head push or a check re-run). The reconciler cannot resurrect a
+//     dead-lettered head — HasEventForHead reports it covered, so synthesis
+//     never re-Creates its GUID — which leaves the reopen reachable only
+//     through an operator's explicit redelivery, where a fresh attempt budget
+//     is the point.
 //
 // pending/retryable rows and processing rows with a live (unexpired) lease are
 // genuinely in flight, so they dedup (return false). last_error is kept for
@@ -108,9 +117,9 @@ func (s *webhookEventStore) reopenTerminalWebhookEvent(ctx context.Context, prov
 			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
 			retry_after = NULL, completed_at = NULL, started_at = NULL, updated_at = NOW()
 		WHERE provider = ? AND delivery_id = ?
-			AND (state IN (?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
+			AND (state IN (?, ?, ?) OR (state = ? AND lease_expires_at <= `+s.dialect.CurrentTimestamp(TimestampPrecisionMicrosecond)+`))
 	`, storage.WebhookEventPending, payload, receivedAt, provider, deliveryID,
-		storage.WebhookEventFailed, storage.WebhookEventCompleted, storage.WebhookEventProcessing)
+		storage.WebhookEventFailed, storage.WebhookEventFailedPermanent, storage.WebhookEventCompleted, storage.WebhookEventProcessing)
 	if err != nil {
 		return false, fmt.Errorf("reopen webhook delivery for redelivery (provider=%s, delivery_id=%s): %w", provider, deliveryID, err)
 	}
@@ -173,11 +182,15 @@ func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repos
 	// organic row still covers its head: its GitHub Redeliver lever is the
 	// operator's remediation, and synthesizing over it would loop a
 	// deterministically failing head through a fresh claim budget every
-	// pass. Only a terminally failed synthesized row (the
+	// pass. Only a plain failed synthesized row (the
 	// SynthesizedWebhookDeliveryIDPrefix GUID form) fails to cover — there
 	// is no Redeliver lever for a synthesized GUID, so the reconciler must
 	// be able to synthesize a fresh recovery delivery, which lands in
-	// Create's duplicate-GUID branch and reopens the failed row.
+	// Create's duplicate-GUID branch and reopens the failed row. A
+	// permanently failed (dead-lettered) row covers its head in either GUID
+	// form: the driver proved no retry can plan that head, so resurrecting
+	// it would replay the same deterministic failure on every reconcile
+	// pass.
 	args := []any{provider, repository, pullRequest, headSHA}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
 	args = append(args, storage.WebhookEventFailed, storage.SynthesizedWebhookDeliveryIDPrefix+"%")
@@ -343,6 +356,28 @@ func (s *webhookEventStore) MarkFailed(ctx context.Context, id int64, leaseToken
 	`, state, nullString(errMsg), retryAfter, retryAfter == nil, id, leaseToken)
 	if err != nil {
 		return fmt.Errorf("mark webhook event %d failed: %w", id, err)
+	}
+	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
+}
+
+// MarkFailedPermanent dead-letters a claimed event whose failure the driver
+// proved deterministic for its head: the row leaves every retry and
+// reconciler-synthesis path (HasEventForHead reports the head covered) and is
+// revived only by an explicit GitHub Redeliver through Create's
+// duplicate-GUID reopen.
+//
+// Idempotent for the same lease token, on the same rationale as MarkCompleted:
+// the token is retained and completed_at is COALESCE-preserved.
+func (s *webhookEventStore) MarkFailedPermanent(ctx context.Context, id int64, leaseToken string, errMsg string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_events
+		SET state = ?, last_error = ?, retry_after = NULL,
+			completed_at = COALESCE(completed_at, NOW()),
+			updated_at = NOW()
+		WHERE id = ? AND lease_token = ?
+	`, storage.WebhookEventFailedPermanent, nullString(errMsg), id, leaseToken)
+	if err != nil {
+		return fmt.Errorf("mark webhook event %d permanently failed: %w", id, err)
 	}
 	return s.checkWebhookEventLeaseResult(ctx, result, id, leaseToken)
 }

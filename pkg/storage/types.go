@@ -1385,13 +1385,27 @@ const (
 	WebhookProviderGitHub = "github"
 )
 
-// Durable webhook event states.
+// Durable webhook event states. Two states are terminal failures with
+// different recovery semantics:
+//
+//   - WebhookEventFailed: the delivery exhausted its retry budget (or a
+//     reconciler sweep terminalized a wedged row), but a later attempt could
+//     still succeed — the cause was transient or unproven. GitHub Redeliver
+//     reopens it, and when the row is synthesized
+//     (SynthesizedWebhookDeliveryIDPrefix) the reconciler re-synthesizes its
+//     head instead, since no Redeliver lever exists for a synthesized GUID.
+//   - WebhookEventFailedPermanent: the driver proved the delivery can never
+//     succeed for its head (a deterministic failure such as GitHub's per-PR
+//     file-listing cap), so it is dead-lettered. It counts as head coverage in
+//     HasEventForHead regardless of GUID form, which keeps the reconciler from
+//     resurrecting it; only an explicit GitHub Redeliver reopens it.
 const (
 	WebhookEventPending         = "pending"
 	WebhookEventProcessing      = "processing"
 	WebhookEventCompleted       = "completed"
 	WebhookEventFailedRetryable = "failed_retryable"
 	WebhookEventFailed          = "failed"
+	WebhookEventFailedPermanent = "failed_permanent"
 )
 
 // SynthesizedWebhookDeliveryIDPrefix marks delivery GUIDs minted by the
@@ -1421,6 +1435,7 @@ var WebhookEventStatesAll = []string{
 	WebhookEventFailedRetryable,
 	WebhookEventCompleted,
 	WebhookEventFailed,
+	WebhookEventFailedPermanent,
 }
 
 // WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox

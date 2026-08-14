@@ -333,6 +333,45 @@ func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T)
 	require.Equal(t, 0, row.Attempts)
 }
 
+// TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead pins the dead-letter
+// contract at the reconciler: a synthesized recovery row the driver proved can
+// never succeed for its head covers that head, so the enforcing scan neither
+// reports it missing nor reopens it — reopening would replay the identical
+// deterministic failure through a fresh claim budget every pass. The head is
+// only planned again when a new push mints a new head SHA.
+func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha")
+	_, err := store.Create(t.Context(), &storage.WebhookEvent{
+		Provider:    storage.WebhookProviderGitHub,
+		DeliveryID:  guid,
+		Event:       "pull_request",
+		Action:      webhookReconcileSynthesizedAction,
+		Repository:  "octocat/hello-world",
+		PullRequest: 7,
+		HeadSHA:     "head-sha",
+		State:       storage.WebhookEventFailedPermanent,
+		Attempts:    1,
+		Payload:     []byte(`{}`),
+	})
+	require.NoError(t, err)
+	h, mux := newReconcileTestHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, WithWebhookReconcileSynthesis())
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+		writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+	})
+
+	scanned, missing, synthesized := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+
+	require.Equal(t, 1, scanned)
+	require.Equal(t, 0, missing, "a dead-lettered recovery row must cover its head")
+	require.Equal(t, 0, synthesized)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, guid)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, storage.WebhookEventFailedPermanent, row.State, "the dead-lettered row must stay dead-lettered")
+	require.Equal(t, 1, row.Attempts)
+}
+
 // TestWebhookReconcilerFailedOrganicRowCoversHead pins the organic side of
 // the terminal-failure contract: a terminally failed organic delivery still
 // covers its head, because the operator's remediation for it is GitHub

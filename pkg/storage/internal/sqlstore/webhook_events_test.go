@@ -121,8 +121,11 @@ func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 // lever exists for it — synthesizing over it would loop a deterministically
 // failing head through a fresh claim budget every pass — while a failed
 // synthesized row must not cover, because there is no Redeliver lever for a
-// synthesized GUID and re-synthesis is the only recovery path.
-func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailedSynthesized(t *testing.T) {
+// synthesized GUID and re-synthesis is the only recovery path. A dead-lettered
+// row covers regardless of origin: the driver proved the head can never
+// succeed, so re-synthesis would replay the identical failure every
+// reconciler pass.
+func TestWebhookEventStore_HasEventForHeadExcludesFailedStateSynthesized(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -137,8 +140,10 @@ func TestWebhookEventStore_HasEventForHeadExcludesTerminallyFailedSynthesized(t 
 		{storage.WebhookEventFailedRetryable, false, true},
 		{storage.WebhookEventCompleted, false, true},
 		{storage.WebhookEventFailed, false, true},
+		{storage.WebhookEventFailedPermanent, false, true},
 		{storage.WebhookEventPending, true, true},
 		{storage.WebhookEventFailed, true, false},
+		{storage.WebhookEventFailedPermanent, true, true},
 	} {
 		deliveryID := fmt.Sprintf("delivery-state-%d", i)
 		if tc.synthesized {
@@ -341,6 +346,65 @@ func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
 	// The lease token is retained on terminal rows so a committed-but-unacked
 	// retry of MarkCompleted stays idempotent rather than reporting a lost lease.
 	assert.Equal(t, reclaimed.LeaseToken, completed.LeaseToken)
+}
+
+// A dead-lettered delivery is terminal and sticky: MarkFailedPermanent records
+// the error that proved the head can never succeed, FindNext never reclaims
+// the row, and only a redelivery of the same GUID (GitHub Redeliver) reopens
+// it with a fresh claim budget.
+func TestWebhookEventStore_MarkFailedPermanentDeadLetters(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	require.ErrorIs(t, store.WebhookEvents().MarkFailedPermanent(ctx, claimed.ID, "stale-token", "unused"), storage.ErrWebhookEventLeaseLost)
+	require.NoError(t, store.WebhookEvents().MarkFailedPermanent(ctx, claimed.ID, claimed.LeaseToken, "PR file listing hit the GitHub cap"))
+
+	deadLettered, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, deadLettered)
+	assert.Equal(t, storage.WebhookEventFailedPermanent, deadLettered.State)
+	assert.Equal(t, "PR file listing hit the GitHub cap", deadLettered.LastError)
+	assert.Nil(t, deadLettered.RetryAfter)
+	assert.NotNil(t, deadLettered.CompletedAt)
+	// The lease token is retained on terminal rows so a committed-but-unacked
+	// retry of MarkFailedPermanent stays idempotent rather than reporting a
+	// lost lease.
+	assert.Equal(t, claimed.LeaseToken, deadLettered.LeaseToken)
+	require.NoError(t, store.WebhookEvents().MarkFailedPermanent(ctx, claimed.ID, claimed.LeaseToken, "PR file listing hit the GitHub cap"))
+
+	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.Nil(t, reclaimed, "a dead-lettered row must never be reclaimed")
+
+	// GitHub Redeliver reuses the delivery GUID and is the one lever that
+	// revives a dead-lettered delivery — after the author shrinks the PR or the
+	// deterministic cause is otherwise fixed.
+	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":2}`)})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+	assert.Equal(t, storage.WebhookEventPending, reopened.State)
+	assert.Equal(t, 0, reopened.Attempts)
+	assert.Empty(t, reopened.LeaseToken)
+	assert.Nil(t, reopened.CompletedAt)
+	assert.JSONEq(t, `{"attempt":2}`, string(reopened.Payload))
+
+	revived, err := store.WebhookEvents().FindNext(ctx, "driver-c", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, revived, "a redelivered dead-lettered row must be claimable again")
+	assert.Equal(t, 1, revived.Attempts)
 }
 
 func TestWebhookEventStore_LeaseTokenGuardsWrites(t *testing.T) {
