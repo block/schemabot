@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -23,7 +24,11 @@ import (
 )
 
 // Engine implements engine.Engine for PostgreSQL databases.
-type Engine struct{}
+type Engine struct {
+	mu       sync.Mutex
+	wg       sync.WaitGroup
+	progress *engine.ProgressResult
+}
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -174,16 +179,6 @@ func sortedKeys[V any](values map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-// Apply starts executing a schema change plan.
-func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
-}
-
-// Progress returns the current status of a schema change.
-func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
-	return nil, fmt.Errorf("postgres engine not implemented")
 }
 
 // Stop pauses a running schema change.
