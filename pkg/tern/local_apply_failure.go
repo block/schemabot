@@ -93,9 +93,11 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	} else {
 		// Each paused attempt is recorded with the budget it spent, so the apply
 		// log shows recovery burning through its attempts rather than only the
-		// silence between them.
+		// silence between them. The count is the apply's own attempt counter,
+		// which a recovery claim advances — reporting the drive number instead
+		// would run past the budget it is measured against.
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Apply paused for operator retry (attempt %d of %d): %s", apply.Attempt+1, storage.MaxRecoveryAttempts, errMsg),
+			fmt.Sprintf("Apply paused for operator retry (%d of %d recovery attempts used): %s", apply.Attempt, storage.MaxRecoveryAttempts, errMsg),
 			previousState, state.Apply.FailedRetryable)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)

@@ -855,6 +855,11 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
 	stopHeartbeat := c.startParentApplyHeartbeat(resumeCtx, apply, suppressParent, cancelResume)
 	pollDetached = true
+	// The detached poll deliberately outlives the caller's context, so its log
+	// wiring has to as well: a callback holding the caller's context records
+	// nothing once that context is cancelled, and the engine lines for the rest
+	// of the schema change are exactly the ones worth keeping.
+	stopEngineLogging = c.setupSpiritLogging(resumeCtx, apply, tasks)
 	go func() {
 		defer cancelResume()
 		defer stopHeartbeat()

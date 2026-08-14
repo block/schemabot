@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -70,7 +71,9 @@ func TestFailApplyWithTasksRecordsTheFailureInTheApplyLog(t *testing.T) {
 
 // A retryable failure is the state operator recovery keeps re-driving, so each
 // paused attempt records the budget it spent. Without it the apply log shows
-// only the gaps between attempts, and the retry budget drains invisibly.
+// only the gaps between attempts, and the retry budget drains invisibly. The
+// count reported is the apply's own attempt counter, so it can never exceed the
+// budget it is measured against.
 func TestMarkApplyRetryableWithTasksRecordsTheSpentAttempt(t *testing.T) {
 	apply := failureLogTestApply(state.Apply.Running, 3)
 	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Running}
@@ -81,10 +84,24 @@ func TestMarkApplyRetryableWithTasksRecordsTheSpentAttempt(t *testing.T) {
 	require.Len(t, logs.entries, 1)
 	entry := logs.entries[0]
 	assert.Equal(t, storage.LogLevelWarn, entry.Level, "a paused attempt is not yet a permanent failure")
-	assert.Contains(t, entry.Message, "attempt 4 of 10")
+	assert.Contains(t, entry.Message, "3 of 10 recovery attempts used")
 	assert.Contains(t, entry.Message, "target refused the connection")
 	assert.Equal(t, state.Apply.Running, entry.OldState)
 	assert.Equal(t, state.Apply.FailedRetryable, entry.NewState)
+}
+
+// The last drive operator recovery is allowed to make still reports a count
+// inside the budget, so an operator reading the apply log sees the retry budget
+// reach its limit rather than a figure that exceeds it.
+func TestMarkApplyRetryableWithTasksReportsTheFinalAttemptWithinBudget(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Running, storage.MaxRecoveryAttempts)
+	client, logs := newFailureLogTestClient(apply, nil)
+
+	client.markApplyRetryableWithTasks(t.Context(), apply, nil, "target refused the connection")
+
+	require.Len(t, logs.entries, 1)
+	assert.Contains(t, logs.entries[0].Message,
+		fmt.Sprintf("%d of %d recovery attempts used", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
 }
 
 // An apply that another driver already settled is not this drive's to fail: the
