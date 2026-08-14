@@ -1226,9 +1226,14 @@ const (
 )
 
 const (
-	GitHubRequestStatusError   = "error"
-	GitHubRequestStatusSuccess = "success"
-	GitHubRequestStatusUnknown = gitHubMetricValueUnknown
+	GitHubRequestStatusError = "error"
+	// GitHubRequestStatusTransportError marks requests that never produced an
+	// HTTP response: dials that failed, TLS errors, and requests cut off by a
+	// context deadline. These are the signature of GitHub (or the network path
+	// to it) being unreachable, so they must be counted rather than dropped.
+	GitHubRequestStatusTransportError = "transport_error"
+	GitHubRequestStatusSuccess        = "success"
+	GitHubRequestStatusUnknown        = gitHubMetricValueUnknown
 )
 
 const (
@@ -1409,6 +1414,7 @@ func isKnownGitHubRequestCategory(category string) bool {
 func isKnownGitHubRequestStatus(status string) bool {
 	switch status {
 	case GitHubRequestStatusError,
+		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,
 		GitHubRequestStatusUnknown:
 		return true

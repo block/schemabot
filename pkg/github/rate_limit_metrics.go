@@ -58,6 +58,8 @@ func (t *githubMetricsTransport) RoundTrip(req *http.Request) (*http.Response, e
 	resp, err := t.base.RoundTrip(req)
 	if resp != nil {
 		recordGitHubResponseHeaders(req.Context(), req, resp, t.installationID, t.githubApp())
+	} else if err != nil {
+		recordGitHubTransportFailure(req.Context(), req, t.installationID, t.githubApp())
 	}
 	return resp, err
 }
@@ -67,6 +69,27 @@ func (t *githubMetricsTransport) githubApp() string {
 		return ""
 	}
 	return t.appSlug()
+}
+
+// recordGitHubTransportFailure counts a request that never produced an HTTP
+// response, so header-based attribution is unavailable and no rate-limit
+// sample exists. Without this sample a GitHub outage would look like a quiet
+// period instead of an error spike.
+func recordGitHubTransportFailure(ctx context.Context, req *http.Request, installationID int64, githubApp string) {
+	metricCtx, hasMetricCtx := githubRateLimitContextFrom(ctx)
+	if !hasMetricCtx {
+		metricCtx = githubRateLimitContextFromRequest(req)
+	}
+
+	metrics.RecordGitHubRequest(ctx, metrics.GitHubRequestSample{
+		Operation:      metricCtx.operation,
+		Category:       gitHubRequestCategory(metricCtx.operation),
+		Resource:       gitHubRateLimitResource(githubRateLimitResourceFromRequest(req)),
+		Repository:     metricCtx.repository,
+		GitHubApp:      githubApp,
+		InstallationID: installationID,
+		Status:         metrics.GitHubRequestStatusTransportError,
+	})
 }
 
 func recordGitHubResponseHeaders(ctx context.Context, req *http.Request, resp *http.Response, installationID int64, githubApp string) {
@@ -337,6 +360,10 @@ func githubRateLimitResourceFromHeaders(req *http.Request, resp *http.Response) 
 	if resource != "" {
 		return resource
 	}
+	return githubRateLimitResourceFromRequest(req)
+}
+
+func githubRateLimitResourceFromRequest(req *http.Request) string {
 	if req.URL != nil && strings.HasSuffix(req.URL.Path, "/graphql") {
 		return metrics.GitHubRateLimitResourceGraphQL
 	}

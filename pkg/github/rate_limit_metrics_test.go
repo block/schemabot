@@ -107,6 +107,73 @@ func TestGitHubRateLimitTransportInfersGraphQLResourceAndUsed(t *testing.T) {
 	assert.NotContains(t, attrs, "installation_id")
 }
 
+// A request that never produces an HTTP response (dial failure, TLS error,
+// context deadline) must still be counted as a GitHub request, with a status
+// that distinguishes transport failure from an HTTP error response. Rate-limit
+// gauges must not be recorded since no headers exist.
+func TestGitHubRateLimitTransportRecordsTransportFailures(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(context.WithoutCancel(t.Context())))
+	})
+
+	rt := newGitHubMetricsTransport(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, context.DeadlineExceeded
+	}), 12345, func() string { return "schemabot-block" })
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.github.com/repos/octocat/hello-world/pulls/1", nil)
+	require.NoError(t, err)
+
+	resp, err := rt.RoundTrip(req)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.Nil(t, resp)
+
+	count, attrs := collectGitHubRequestCounter(t, reader)
+	assert.Equal(t, int64(1), count)
+	assert.Equal(t, metrics.GitHubRequestStatusTransportError, attrs["status"])
+	assert.Equal(t, metrics.GitHubOperationFetchPullRequest, attrs["operation"])
+	assert.Equal(t, metrics.GitHubRequestCategoryRead, attrs["category"])
+	assert.Equal(t, metrics.GitHubRateLimitResourceCore, attrs["resource"])
+	assert.Equal(t, "octocat/hello-world", attrs["repository"])
+	assert.Equal(t, "schemabot-block", attrs["github_app"])
+
+	rateLimitValues := collectGitHubRateLimitMetricValues(t, reader)
+	assert.Empty(t, rateLimitValues)
+}
+
+func collectGitHubRequestCounter(t *testing.T, reader *sdkmetric.ManualReader) (int64, map[string]string) {
+	t.Helper()
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	attrs := make(map[string]string)
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.github.requests_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "%s should be an int64 sum", m.Name)
+			require.Len(t, sum.DataPoints, 1, "%s should have one data point", m.Name)
+			dp := sum.DataPoints[0]
+			total = dp.Value
+			for _, kv := range dp.Attributes.ToSlice() {
+				attrs[string(kv.Key)] = attributeValueString(kv.Value)
+			}
+		}
+	}
+	return total, attrs
+}
+
 func TestGitHubRateLimitContextFromRequestClassifiesRESTRoutes(t *testing.T) {
 	tests := []struct {
 		name       string
