@@ -37,10 +37,26 @@ func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1
 		// The caller only ever sees a sanitized Unavailable, so this log is the
 		// only record of why a deployment stopped reporting healthy — without it
 		// the control plane marks the deployment down with no attributable cause.
-		slog.WarnContext(ctx, "tern health check failed; reporting deployment unavailable to caller", "error", err)
+		if callerAbandonedHealthCheck(ctx, err) {
+			slog.DebugContext(ctx, "tern health check abandoned by its caller", "error", err)
+		} else {
+			slog.WarnContext(ctx, "tern health check failed; reporting deployment unavailable to caller", "error", err)
+		}
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
 	return &ternv1.HealthResponse{Status: "ok"}, nil
+}
+
+// callerAbandonedHealthCheck reports whether a failed health check ended because
+// the caller hung up rather than because the deployment is unhealthy. A control
+// plane shutting down or dropping the connection teaches this side nothing, and
+// the caller already records it.
+//
+// An expired deadline is deliberately excluded: it means the health check itself
+// outran the caller's budget, which is a genuine unhealthy signal, and this side
+// is the only one that knows what the check was waiting on.
+func callerAbandonedHealthCheck(ctx context.Context, err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)
 }
 
 func (s *Server) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {

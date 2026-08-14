@@ -273,6 +273,67 @@ func TestServerHealthLogsUnderlyingFailure(t *testing.T) {
 	assert.Contains(t, logged, "connection refused")
 }
 
+// A caller that hangs up mid-check — a control plane shutting down, a dropped
+// connection — says nothing about deployment health and is already recorded on
+// the caller's side, so it must not raise a warning here. An expired deadline is
+// the opposite case and stays at warn: the check outran its budget.
+func TestServerHealthDowngradesCallerCancellation(t *testing.T) {
+	testCases := []struct {
+		name      string
+		clientErr error
+		cancelCtx bool
+		wantLevel string
+		wantMsg   string
+	}{
+		{
+			name:      "caller cancelled",
+			clientErr: context.Canceled,
+			cancelCtx: true,
+			wantLevel: "DEBUG",
+			wantMsg:   "tern health check abandoned by its caller",
+		},
+		{
+			name:      "deadline exceeded",
+			clientErr: context.DeadlineExceeded,
+			wantLevel: "WARN",
+			wantMsg:   "tern health check failed",
+		},
+		{
+			name:      "backend failure",
+			clientErr: errors.New("ping: connection refused"),
+			wantLevel: "WARN",
+			wantMsg:   "tern health check failed",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			server := NewServer(healthErrorClient{err: tc.clientErr})
+
+			_, err := server.Health(ctx, &ternv1.HealthRequest{})
+
+			require.Error(t, err)
+			assert.Equal(t, codes.Unavailable, status.Code(err), "the caller sees the same sanitized error either way")
+
+			logged := logs.String()
+			assert.Contains(t, logged, "level="+tc.wantLevel)
+			assert.Contains(t, logged, tc.wantMsg)
+		})
+	}
+}
+
 // A healthy deployment is polled every 30s per environment; logging those would
 // bury the apply-path logs an operator reads during a schema change.
 func TestServerHealthDoesNotLogWhenHealthy(t *testing.T) {
