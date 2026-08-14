@@ -1014,6 +1014,9 @@ func (s *Service) createStoredApply(
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
 		return nil, 0, err
 	}
+	if err := rejectBlockedStoredPlan(plan); err != nil {
+		return nil, 0, err
+	}
 
 	// The plan already carries the resolved primary (deployment, target) from
 	// plan time, and is authoritative for single-deployment applies and the
@@ -1118,6 +1121,25 @@ func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.Ap
 	}
 	change := unsafeChanges[0]
 	return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
+}
+
+// rejectBlockedStoredPlan refuses to queue an apply for a plan carrying an
+// engine-blocked change. A blocked verdict means the engine deterministically
+// refuses the statement, and the drive layer rebuilds engine requests from
+// task rows that do not carry the verdict — so the only place the verdict can
+// reliably gate execution is before the apply is queued. There is no opt-in:
+// the schema change itself must be rewritten and re-planned.
+func rejectBlockedStoredPlan(plan *storage.Plan) error {
+	blocked := plan.BlockedChanges()
+	if len(blocked) == 0 {
+		return nil
+	}
+	change := blocked[0]
+	reason := change.ModeReason
+	if reason == "" {
+		reason = "the engine refuses this statement"
+	}
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", plan.PlanIdentifier, change.Table, reason)
 }
 
 // applyTaskChanges returns the per-table DDL changes that become apply tasks.

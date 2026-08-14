@@ -348,6 +348,13 @@ func (tc TableChange) RequiresUnsafeOptIn() bool {
 	return tc.IsUnsafe || strings.EqualFold(tc.Operation, "drop")
 }
 
+// EngineBlocked reports whether the planner marked this change blocked: the
+// engine deterministically refuses the statement, so an apply that includes
+// it is guaranteed to fail.
+func (tc TableChange) EngineBlocked() bool {
+	return strings.EqualFold(tc.ExecutionMode, "blocked")
+}
+
 // UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
 // table-drop reason for older/malformed plans that only persisted the operation.
 func (tc TableChange) UnsafeOptInReason() string {
@@ -531,6 +538,30 @@ func (p *Plan) UnsafeDDLChanges() []TableChange {
 				tc.Namespace = shard.Namespace
 			}
 			appendUnsafe(tc)
+		}
+	}
+	return result
+}
+
+// BlockedChanges returns stored DDL changes carrying the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before queueing operator work.
+func (p *Plan) BlockedChanges() []TableChange {
+	var result []TableChange
+	for _, tc := range p.FlatDDLChanges() {
+		if tc.EngineBlocked() {
+			result = append(result, tc)
+		}
+	}
+	for _, shard := range p.Shards {
+		for _, tc := range shard.Changes {
+			if tc.EngineBlocked() {
+				if tc.Namespace == "" {
+					tc.Namespace = shard.Namespace
+				}
+				result = append(result, tc)
+			}
 		}
 	}
 	return result

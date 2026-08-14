@@ -42,29 +42,36 @@ func TestExecutionVerdict(t *testing.T) {
 			wantReason: `statement for table "users" requires copy-and-swap, which is unavailable`,
 		},
 		{
+			name: "unavailable without copy-and-swap backend",
+			statement: pgplan.Statement{Route: planner.RouteNative, Backend: router.BackendNative,
+				Disposition: router.DispositionUnavailable},
+			wantMode:   engine.ExecutionModeBlocked,
+			wantReason: `statement for table "users" requires an execution path SchemaBot's PostgreSQL support does not provide yet`,
+		},
+		{
 			name:       "rewrite required",
 			statement:  pgplan.Statement{Disposition: router.DispositionRewriteRequired},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has blocked verdict "rewrite-required"`,
+			wantReason: `statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
 		},
 		{
 			name:       "refuse",
 			statement:  pgplan.Statement{Route: planner.RouteRefuse, Disposition: router.DispositionRefuse},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has blocked verdict "refuse"`,
+			wantReason: `statement for table "users" is refused: it cannot be executed safely as written`,
 		},
 		{
 			name:       "unrecognized disposition",
 			statement:  pgplan.Statement{Disposition: router.Disposition("future")},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has blocked verdict "unrecognized"`,
+			wantReason: `statement for table "users" has an unrecognized planner verdict`,
 		},
 		{
 			name: "execute without authoritative steps",
 			statement: pgplan.Statement{Route: planner.RouteNative, Backend: router.BackendNative,
 				Disposition: router.DispositionExecute},
 			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has blocked verdict "unrecognized"`,
+			wantReason: `statement for table "users" has an unrecognized planner verdict`,
 		},
 	}
 
