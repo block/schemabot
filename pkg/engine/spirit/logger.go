@@ -18,8 +18,20 @@ type spiritLogFilter struct {
 	table    string                                     // Table attr attached via Logger.With, used when a record carries none
 }
 
+// routesToApplyLog reports whether a line at this level is recorded in the
+// apply log stream. Routing is bound to the apply being driven, not to how
+// verbose the process's own logs are configured to be.
+func (f *spiritLogFilter) routesToApplyLog(level slog.Level) bool {
+	return level >= slog.LevelInfo && f.onLogRef != nil && *f.onLogRef != nil
+}
+
+// Enabled answers for both of the filter's consumers, because slog skips
+// building the record entirely when it reports false. The apply log stream and
+// the process logs choose independently: a deployment that runs its own logs at
+// warn still records the engine's account of the schema change, which is the
+// only account an operator reads from the CLI or a failed apply's summary.
 func (f *spiritLogFilter) Enabled(ctx context.Context, level slog.Level) bool {
-	return f.handler.Enabled(ctx, level)
+	return f.routesToApplyLog(level) || f.handler.Enabled(ctx, level)
 }
 
 func (f *spiritLogFilter) Handle(ctx context.Context, r slog.Record) error {
@@ -31,7 +43,7 @@ func (f *spiritLogFilter) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	// Route INFO+ logs to ApplyLogStore
-	if f.onLogRef != nil && *f.onLogRef != nil && r.Level >= slog.LevelInfo {
+	if f.routesToApplyLog(r.Level) {
 		// Extract table name and error/reason from slog attributes. Record
 		// attrs (call-site) take precedence over the logger-level table attr
 		// captured in WithAttrs — slog routes Logger.With attrs through the
@@ -55,6 +67,13 @@ func (f *spiritLogFilter) Handle(ctx context.Context, r slog.Record) error {
 		(*f.onLogRef)(r.Level, tableName, msg)
 	}
 
+	// The process logs keep their own verbosity. A record built only because
+	// the apply log stream wanted it is not one this handler agreed to emit,
+	// and passing it through would raise a deployment's log volume as a side
+	// effect of an apply being driven.
+	if !f.handler.Enabled(ctx, r.Level) {
+		return nil
+	}
 	return f.handler.Handle(ctx, r)
 }
 

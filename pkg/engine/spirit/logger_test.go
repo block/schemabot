@@ -1,7 +1,7 @@
 package spirit
 
 import (
-	"io"
+	"bytes"
 	"log/slog"
 	"sync"
 	"testing"
@@ -22,24 +22,42 @@ type capturedLog struct {
 // Spirit runner output into the apply log stream.
 func newFilterLogger(t *testing.T) (*slog.Logger, func() []capturedLog) {
 	t.Helper()
+	logger, captured, _ := newFilterLoggerAt(t, slog.LevelDebug, true)
+	return logger, captured
+}
+
+// newFilterLoggerAt builds the same filter with the process handler pinned to
+// handlerLevel and, optionally, no apply-log callback installed. It returns the
+// process handler's own output alongside the routed lines so a test can tell
+// the filter's two consumers apart.
+func newFilterLoggerAt(t *testing.T, handlerLevel slog.Level, routeToApplyLog bool) (*slog.Logger, func() []capturedLog, func() string) {
+	t.Helper()
 	var mu sync.Mutex
 	var captured []capturedLog
+	var processLogs bytes.Buffer
 	onLog := func(level slog.Level, table, msg string) {
 		mu.Lock()
 		defer mu.Unlock()
 		captured = append(captured, capturedLog{level: level, table: table, msg: msg})
 	}
+	if !routeToApplyLog {
+		onLog = nil
+	}
 	debug := false
 	filter := &spiritLogFilter{
-		handler:  slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}),
+		handler:  slog.NewTextHandler(&processLogs, &slog.HandlerOptions{Level: handlerLevel}),
 		debugRef: &debug,
 		onLogRef: &onLog,
 	}
 	return slog.New(filter), func() []capturedLog {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]capturedLog(nil), captured...)
-	}
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]capturedLog(nil), captured...)
+		}, func() string {
+			mu.Lock()
+			defer mu.Unlock()
+			return processLogs.String()
+		}
 }
 
 // TestSpiritLogFilter_TableFromLoggerWith verifies that a table attached via
@@ -99,6 +117,44 @@ func TestSpiritLogFilter_ErrorAttrAppendedToMessage(t *testing.T) {
 	assert.Equal(t, "baristas", logs[0].table)
 	assert.Equal(t, "fatal error processing GTID rows event: row has 8 values", logs[0].msg)
 	assert.Equal(t, slog.LevelError, logs[0].level)
+}
+
+// The apply log stream is the account of a schema change an operator reads from
+// the CLI and from a failed apply's summary comment, so the engine's lines reach
+// it on their own terms: a deployment that runs its own logs at warn still gets
+// a complete stream, and the lines it admits for that stream stay out of the
+// process logs it configured not to show them.
+func TestSpiritLogFilter_RoutesToApplyLogBelowTheProcessLogLevel(t *testing.T) {
+	logger, captured, processLogs := newFilterLoggerAt(t, slog.LevelError, true)
+
+	logger.With("table", "orders").Info("copy rows complete")
+
+	logs := captured()
+	require.Len(t, logs, 1)
+	assert.Equal(t, "copy rows complete", logs[0].msg)
+	assert.Equal(t, "orders", logs[0].table)
+	assert.Empty(t, processLogs(),
+		"a line admitted for the apply log stream must not raise the process log volume")
+}
+
+// Lines the process logs do admit still reach both consumers.
+func TestSpiritLogFilter_RoutesAndEmitsWhenBothConsumersWantTheLine(t *testing.T) {
+	logger, captured, processLogs := newFilterLoggerAt(t, slog.LevelError, true)
+
+	logger.With("table", "orders").Error("fatal error processing GTID rows event")
+
+	require.Len(t, captured(), 1)
+	assert.Contains(t, processLogs(), "fatal error processing GTID rows event")
+}
+
+// With no apply being driven there is no stream to record into, so the process
+// log level alone decides — the filter never widens what a deployment emits.
+func TestSpiritLogFilter_ProcessLogLevelDecidesWithoutAnApplyLogCallback(t *testing.T) {
+	logger, _, processLogs := newFilterLoggerAt(t, slog.LevelError, false)
+
+	logger.With("table", "orders").Info("copy rows complete")
+
+	assert.Empty(t, processLogs())
 }
 
 func TestUniqueTableList(t *testing.T) {
