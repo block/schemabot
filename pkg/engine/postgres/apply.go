@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strconv"
 	"time"
 
@@ -22,6 +23,16 @@ const (
 	optimisticTableSizeLimit = int64(1 << 30)
 	optimisticLockTimeout    = 3 * time.Second
 	optimisticStatementLimit = 30 * time.Second
+
+	// optimisticApplyCeiling bounds one whole background apply client-side:
+	// pool dial, preflight, and every execution attempt with its backoff.
+	// Server-side statement/lock timeouts bound queries once a session is
+	// healthy, but they cannot unwedge a hung dial or a black-holed
+	// connection — the ceiling guarantees the drive always reaches a
+	// terminal progress state. Generously above the worst legitimate run
+	// (retry attempts x statement limit plus backoffs) so it only fires on
+	// genuine hangs.
+	optimisticApplyCeiling = 5 * time.Minute
 )
 
 type nativeApply struct {
@@ -77,6 +88,10 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 }
 
 func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nativeApply, started time.Time, logger *slog.Logger) {
+	// The context arrives detached from the caller (an accepted apply must
+	// survive the request), so boundedness comes from the ceiling instead.
+	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
+	defer cancel()
 	err := executeOptimistic(ctx, dsn, change)
 	if err == nil {
 		e.setProgress(progressResult(engine.StateCompleted, "completed", started, change, ""))
@@ -153,6 +168,7 @@ func (e *Engine) Progress(_ context.Context, _ *engine.ProgressRequest) (*engine
 	}
 	result := *e.progress
 	result.Metadata = cloneMetadata(e.progress.Metadata)
+	result.Tables = cloneTables(e.progress.Tables)
 	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil && !result.State.IsTerminal() {
 		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
 	}
@@ -193,5 +209,27 @@ func (e *Engine) setProgress(result *engine.ProgressResult) {
 func cloneMetadata(metadata map[string]string) map[string]string {
 	cloned := make(map[string]string, len(metadata))
 	maps.Copy(cloned, metadata)
+	return cloned
+}
+
+// cloneTables deep-copies table progress so callers can never mutate the
+// engine's stored progress through the returned slice, its time pointers, or
+// its shard breakdowns.
+func cloneTables(tables []engine.TableProgress) []engine.TableProgress {
+	if tables == nil {
+		return nil
+	}
+	cloned := slices.Clone(tables)
+	for i := range cloned {
+		if cloned[i].StartedAt != nil {
+			startedAt := *cloned[i].StartedAt
+			cloned[i].StartedAt = &startedAt
+		}
+		if cloned[i].CompletedAt != nil {
+			completedAt := *cloned[i].CompletedAt
+			cloned[i].CompletedAt = &completedAt
+		}
+		cloned[i].Shards = slices.Clone(cloned[i].Shards)
+	}
 	return cloned
 }

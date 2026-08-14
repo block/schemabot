@@ -3,7 +3,6 @@
 package postgres
 
 import (
-	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -120,11 +119,14 @@ func applyRequest(dsn, table, statement string) *engine.ApplyRequest {
 func awaitPostgresProgress(t *testing.T, eng *Engine) *engine.ProgressResult {
 	t.Helper()
 	var result *engine.ProgressResult
-	require.Eventually(t, func() bool {
+	// assert then require so the failure message formats the last polled
+	// progress instead of the pre-poll nil value.
+	finished := assert.Eventually(t, func() bool {
 		var err error
 		result, err = eng.Progress(t.Context(), &engine.ProgressRequest{})
 		require.NoError(t, err)
 		return result.State.IsTerminal()
-	}, postgresApplyDeadline, 10*time.Millisecond, fmt.Sprintf("PostgreSQL apply did not finish; last progress: %+v", result))
+	}, postgresApplyDeadline, 10*time.Millisecond)
+	require.True(t, finished, "PostgreSQL apply did not finish; last progress: %+v", result)
 	return result
 }
