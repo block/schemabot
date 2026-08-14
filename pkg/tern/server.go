@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -33,6 +34,10 @@ func (s *Server) Register(srv *grpc.Server) {
 
 func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1.HealthResponse, error) {
 	if err := s.client.Health(ctx); err != nil {
+		// The caller only ever sees a sanitized Unavailable, so this log is the
+		// only record of why a deployment stopped reporting healthy — without it
+		// the control plane marks the deployment down with no attributable cause.
+		slog.WarnContext(ctx, "tern health check failed; reporting deployment unavailable to caller", "error", err)
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
 	return &ternv1.HealthResponse{Status: "ok"}, nil

@@ -1,9 +1,11 @@
 package tern
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -237,4 +239,53 @@ func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
 			assert.Contains(t, err.Error(), "apply_id is required")
 		})
 	}
+}
+
+type healthErrorClient struct {
+	Client
+	err error
+}
+
+func (c healthErrorClient) Health(context.Context) error {
+	return c.err
+}
+
+// The health RPC answers the control plane's deployment-health poll and
+// deliberately returns a sanitized Unavailable, so the underlying cause never
+// reaches the caller. It must be logged server-side, with the real error
+// attached, or an unhealthy deployment is unexplainable from logs alone.
+func TestServerHealthLogsUnderlyingFailure(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	server := NewServer(healthErrorClient{err: errors.New("dial tcp 10.0.0.1:3306: connect: connection refused")})
+
+	_, err := server.Health(t.Context(), &ternv1.HealthRequest{})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	assert.NotContains(t, err.Error(), "3306", "the caller must only see the sanitized message")
+
+	logged := logs.String()
+	assert.Contains(t, logged, "tern health check failed")
+	assert.Contains(t, logged, "connection refused")
+}
+
+// A healthy deployment is polled every 30s per environment; logging those would
+// bury the apply-path logs an operator reads during a schema change.
+func TestServerHealthDoesNotLogWhenHealthy(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	server := NewServer(healthErrorClient{})
+
+	resp, err := server.Health(t.Context(), &ternv1.HealthRequest{})
+
+	require.NoError(t, err)
+	assert.Equal(t, "ok", resp.GetStatus())
+	assert.Empty(t, logs.String())
 }
