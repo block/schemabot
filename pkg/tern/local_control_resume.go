@@ -1679,7 +1679,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 
 	logger.Error("engine apply failed during recovery",
 		"error", err)
-	c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("recovery failed: %v", err))
+	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 	if startRequested {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
 			return failErr

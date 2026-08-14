@@ -2920,7 +2920,7 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
-	assert.True(t, hasLogMessageContaining(logs, "Recovery failed: engine apply failed: engine refused grouped resume"))
+	assert.True(t, hasLogMessageContaining(logs, "Apply failed: engine apply failed: engine refused grouped resume"))
 }
 
 // This scenario covers restart recovery of a grouped Vitess apply whose opaque

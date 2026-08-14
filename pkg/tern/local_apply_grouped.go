@@ -134,7 +134,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	}
 
 	if !result.Accepted {
-		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("engine did not accept the apply: %s", result.Message))
+		c.failApplyWithTasks(ctx, apply, tasks, result.Message)
 		return
 	}
 
