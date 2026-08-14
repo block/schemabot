@@ -84,6 +84,12 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
 	}
+	// The same tier derivation runs again inside the background apply; this
+	// synchronous check exists so a statement shape the native-safe path
+	// cannot execute is refused at acceptance, before any work is queued.
+	if _, err := preflight.RequiredTier([]string{tc.DDL}); err != nil {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement is not a shape the native-safe path executes", tc.Table)
+	}
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
 }
 
@@ -98,30 +104,70 @@ func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nati
 		return
 	}
 
-	var privilegeErr *preflight.PrivilegeError
-	if errors.As(err, &privilegeErr) {
-		detail := fmt.Sprintf("insufficient privileges; provision with: %s", privilegeErr.Grant)
-		if privilegeErr.Hint != "" {
-			detail += "; " + privilegeErr.Hint
-		}
-		result := progressResult(engine.StateFailed, "refused", started, change, detail)
+	if r := classifyRefusal(err, change.table); r != nil {
+		result := progressResult(engine.StateFailed, "refused", started, change, r.detail)
 		result.Metadata["execution_mode"] = engine.ExecutionModeBlocked
-		result.Metadata["refusal_reason"] = "insufficient-privileges"
+		result.Metadata["refusal_reason"] = r.reason
 		e.setProgress(result)
 		return
 	}
 
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) {
-		result := progressResult(engine.StateFailed, "refused", started, change, budgetErr.Error())
-		result.Metadata["execution_mode"] = engine.ExecutionModeBlocked
-		result.Metadata["refusal_reason"] = "not-native-safe-budget-exceeded"
-		e.setProgress(result)
+		// classifyRefusal consumed the statement-budget cause, so the budget
+		// exceeded here is the lock budget: the statement itself is
+		// native-safe and merely lost a bounded race with concurrent lock
+		// holders. Surface the typed detail as a retryable failure — marking
+		// it blocked would falsely tell the operator retrying cannot succeed.
+		e.setProgress(progressResult(engine.StateFailed, "failed", started, change,
+			budgetErr.Error()+"; retry once lock contention subsides"))
 		return
 	}
 
 	logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
 	e.setProgress(progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs"))
+}
+
+// refusal is a typed apply outcome that retrying cannot fix: the schema
+// change, the target table, or role provisioning must change first.
+type refusal struct {
+	reason string
+	detail string
+}
+
+// classifyRefusal maps pg-sprite's typed refusal inputs to permanent
+// refusals. A nil result means the failure is operational — a retry may
+// succeed once conditions change. Lock-budget exhaustion is deliberately
+// operational: the statement is native-safe and only lost a bounded race
+// with concurrent lock holders. Every detail string here is built from typed
+// error fields and identifiers, never from wrapped server output, so it is
+// safe to render on operator-facing surfaces.
+func classifyRefusal(err error, table string) *refusal {
+	var privilegeErr *preflight.PrivilegeError
+	if errors.As(err, &privilegeErr) {
+		detail := fmt.Sprintf("insufficient privileges; provision with: %s", privilegeErr.Grant)
+		if privilegeErr.Hint != "" {
+			detail += "; " + privilegeErr.Hint
+		}
+		return &refusal{reason: "insufficient-privileges", detail: detail}
+	}
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &refusal{reason: "not-native-safe-budget-exceeded", detail: budgetErr.Error()}
+	}
+	var sizeErr *preflight.SizeError
+	if errors.As(err, &sizeErr) {
+		return &refusal{reason: "table-too-large", detail: sizeErr.Error()}
+	}
+	if errors.Is(err, preflight.ErrTableNotFound) {
+		return &refusal{reason: "table-not-found",
+			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}
+	}
+	if errors.Is(err, preflight.ErrNotTable) {
+		return &refusal{reason: "not-a-table",
+			detail: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
+	}
+	return nil
 }
 
 func executeOptimistic(ctx context.Context, rawDSN string, change nativeApply) error {
@@ -164,7 +210,10 @@ func (e *Engine) Progress(_ context.Context, _ *engine.ProgressRequest) (*engine
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
-		return &engine.ProgressResult{State: engine.StatePending, Message: "No active PostgreSQL schema change"}, nil
+		// The exact idle message is a cross-engine contract: stale-task
+		// recovery compares against it verbatim to auto-resolve work
+		// abandoned by a crashed server.
+		return &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"}, nil
 	}
 	result := *e.progress
 	result.Metadata = cloneMetadata(e.progress.Metadata)

@@ -12,6 +12,7 @@ import (
 	"github.com/block/pg-sprite/pkg/diffplan"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
@@ -127,14 +128,27 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 			if table == "" {
 				table = report.Table
 			}
+			stepMode, stepReason := mode, reason
+			if stepMode == "" {
+				// The apply path derives a privilege tier for every statement
+				// it executes, and that derivation refuses shapes outside the
+				// native-safe set. Run the same authority here so the verdict
+				// the operator reviews matches what the engine will do,
+				// instead of emitting an executable plan that deterministically
+				// fails at apply.
+				if _, tierErr := preflight.RequiredTier([]string{sql}); tierErr != nil {
+					stepMode = engine.ExecutionModeBlocked
+					stepReason = fmt.Sprintf("statement for table %q is not a shape the native-safe path executes", table)
+				}
+			}
 			changes = append(changes, engine.TableChange{
 				Table:         table,
 				Operation:     operation,
 				DDL:           sql,
 				IsUnsafe:      statement.Destructive,
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
-				ExecutionMode: mode,
-				ModeReason:    reason,
+				ExecutionMode: stepMode,
+				ModeReason:    stepReason,
 			})
 		}
 	}
@@ -181,6 +195,13 @@ func sortedKeys[V any](values map[string]V) []string {
 	return keys
 }
 
+// Drain blocks until every background apply goroutine has finished. Resume
+// and recovery paths call this before re-planning so a statement still in
+// flight from a lost lease cannot race the next drive's view of the schema.
+func (e *Engine) Drain() {
+	e.wg.Wait()
+}
+
 // Stop pauses a running schema change.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	return nil, fmt.Errorf("postgres engine not implemented")
@@ -218,3 +239,6 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 
 // Compile-time check that Engine implements engine.Engine.
 var _ engine.Engine = (*Engine)(nil)
+
+// Compile-time check that Engine implements engine.Drainer.
+var _ engine.Drainer = (*Engine)(nil)

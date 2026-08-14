@@ -64,6 +64,31 @@ func TestPlanUnsafeDDLChanges(t *testing.T) {
 	assert.Equal(t, "DROP PRIMARY KEY rebuilds the table", changes[2].UnsafeOptInReason())
 }
 
+// TestPlanBlockedChanges verifies blocked-verdict extraction across
+// namespace-level and per-shard changes, including shard namespace backfill,
+// so apply gates see every change that guarantees a failed apply.
+func TestPlanBlockedChanges(t *testing.T) {
+	plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+		"testdb": {Tables: []TableChange{
+			{Namespace: "testdb", Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: "requires copy-and-swap"},
+			{Namespace: "testdb", Table: "orders", Operation: "alter"},
+			{Namespace: "testdb", Table: "products", Operation: "alter", ExecutionMode: "direct"},
+		}},
+	}, Shards: []ShardPlan{{
+		Namespace: "testdb",
+		Shard:     "-80",
+		Changes:   []TableChange{{Table: "accounts", Operation: "alter", ExecutionMode: "BLOCKED"}},
+	}}}
+
+	changes := plan.BlockedChanges()
+
+	require.Len(t, changes, 2)
+	assert.Equal(t, "users", changes[0].Table)
+	assert.Equal(t, "requires copy-and-swap", changes[0].ModeReason)
+	assert.Equal(t, "accounts", changes[1].Table)
+	assert.Equal(t, "testdb", changes[1].Namespace)
+}
+
 // TestReleasesPausedRollout verifies the one-way release latch semantics: a
 // pending or completed release request releases a paused rollout, while a
 // failed release, any non-release operation, and a nil request do not (the

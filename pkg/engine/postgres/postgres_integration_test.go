@@ -17,8 +17,10 @@ import (
 
 const postgresApplyDeadline = 10 * time.Second
 
-// TestEnginePlanCreateTable proves the adapter derives an executable CREATE
-// TABLE plan from desired state when the live PostgreSQL table is absent.
+// TestEnginePlanCreateTable proves a CREATE TABLE derived from desired state
+// is planned with a blocked verdict: the native-safe path cannot execute that
+// shape, so the plan the operator reviews must say so instead of emitting an
+// executable change that deterministically fails at apply.
 func TestEnginePlanCreateTable(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "plan_test")
 	req := &engine.PlanRequest{
@@ -40,7 +42,8 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Equal(t, "public", result.Changes[0].Namespace)
 	assert.Equal(t, "users", change.Table)
 	assert.Contains(t, change.DDL, "CREATE TABLE public.users")
-	assert.Empty(t, change.ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Equal(t, `statement for table "users" is not a shape the native-safe path executes`, change.ModeReason)
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
@@ -92,17 +95,45 @@ func TestEngineApplyPrivilegeRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "GRANT")
 }
 
-// TestEngineApplyOperationalFailure proves an execution-path error remains a
-// failed operation rather than being misclassified as a safety refusal.
-func TestEngineApplyOperationalFailure(t *testing.T) {
+// TestEngineApplyTableNotFoundRefusal proves a change targeting a table that
+// does not exist on the target is a permanent refusal — retrying cannot
+// succeed until the schema change is re-planned — not a retryable failure.
+func TestEngineApplyTableNotFoundRefusal(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "failure_test")
 	eng := New()
 	_, err := eng.Apply(t.Context(), applyRequest(dsn, "missing_users", "ALTER TABLE public.missing_users ADD COLUMN email text"))
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng)
 	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.Equal(t, engine.ExecutionModeBlocked, progress.Metadata["execution_mode"])
+	assert.Equal(t, "table-not-found", progress.Metadata["refusal_reason"])
+	assert.Contains(t, progress.ErrorMessage, "missing_users")
+}
+
+// TestEngineApplyOperationalFailure proves an execution-path error — here an
+// unreachable target — remains a failed operation rather than being
+// misclassified as a safety refusal.
+func TestEngineApplyOperationalFailure(t *testing.T) {
+	eng := New()
+	unreachableDSN := "postgres://postgres:postgres@127.0.0.1:1/failure_test?sslmode=disable"
+	_, err := eng.Apply(t.Context(), applyRequest(unreachableDSN, "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng)
+	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "failed", progress.Metadata["phase"])
 	assert.Empty(t, progress.Metadata["execution_mode"])
+}
+
+// TestEngineApplyRefusesNonNativeShape proves a statement shape the
+// native-safe path cannot execute is refused synchronously at acceptance,
+// before any background work starts.
+func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "shape_test")
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "CREATE TABLE public.users (id bigint PRIMARY KEY)"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a shape the native-safe path executes")
 }
 
 func applyRequest(dsn, table, statement string) *engine.ApplyRequest {
