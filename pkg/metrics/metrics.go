@@ -1794,6 +1794,27 @@ func RecordWebhookReconcileStuckTerminated(ctx context.Context, count int64) {
 		EnvironmentAttribute(""))
 }
 
+// RecordPRFileCapExceeded counts auto-plan runs that failed closed because the
+// pull request changes more files than GitHub will report for a single PR, so
+// SchemaBot never saw the whole diff. This is a deterministic property of the
+// PR, not an outage: the same PR fails the same way on every attempt, so the
+// signal is "how often do PRs in this repository grow past the cap", not "is
+// GitHub degraded".
+//
+// Every over-cap PR gets the same cap-specific blocking check. schemaVisible
+// records whether the visible prefix of the listing showed a schema or config
+// file: true means the PR plausibly carries a schema change that cannot be
+// planned until it moves to a PR small enough for GitHub to report in full,
+// false means the visible files look like a pure refactor (the withheld tail
+// is not inspectable either way).
+func RecordPRFileCapExceeded(ctx context.Context, repo string, schemaVisible bool) {
+	addCounter(ctx, "schemabot.github.pr_file_cap_exceeded_total",
+		"Total number of auto-plan runs that failed closed because the PR exceeds GitHub's per-PR changed-file cap", "{pull_request}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.Bool("schema_visible", schemaVisible))
+}
+
 var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,

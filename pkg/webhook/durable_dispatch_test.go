@@ -2,14 +2,17 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -408,6 +411,8 @@ func TestAutoPlanFailureIsPermanent(t *testing.T) {
 
 	assert.False(t, autoPlanFailureIsPermanent(errors.New("github unavailable: connection refused")),
 		"a transient GitHub failure must stay retryable")
+	assert.False(t, autoPlanFailureIsPermanent(fmt.Errorf("list PR files: %w", ghclient.ErrGitHubUnavailable)),
+		"a classified GitHub outage must stay retryable")
 	assert.False(t, autoPlanFailureIsPermanent(context.DeadlineExceeded),
 		"a timeout must stay retryable")
 }
@@ -470,6 +475,86 @@ func TestDurableWebhookDriverFailsUnparseableTenantTerminally(t *testing.T) {
 	}
 	require.Empty(t, store.failed, "a corrupted persisted tenant is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
+}
+
+// servePRFileListPastCap registers a PR-files endpoint that keeps handing out
+// another page, the way GitHub answers a pull request whose diff is larger than
+// it will report in full: SchemaBot walks pages until it reaches the per-PR file
+// cap and then refuses to plan from the partial list. The fake never encodes the
+// cap's value, so it cannot go stale, and it stops paginating far past the cap so
+// a lost cap check fails the test instead of hanging it.
+//
+// visibleSchemaPath, when non-empty, is served as the first file of the first
+// page, so the truncated listing SchemaBot sees contains that schema change.
+// When empty, every reported file is a plain source file — the shape of a large
+// refactor PR with no visible schema change.
+func servePRFileListPastCap(t *testing.T, mux *http.ServeMux, pr int, pages *atomic.Int64, visibleSchemaPath string) {
+	t.Helper()
+	const (
+		filesPerPage = 100
+		lastPage     = 500
+	)
+	mux.HandleFunc(fmt.Sprintf("GET /repos/octocat/hello-world/pulls/%d/files", pr), func(w http.ResponseWriter, r *http.Request) {
+		pages.Add(1)
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if err != nil || page < 1 {
+			page = 1
+		}
+		files := make([]map[string]any, filesPerPage)
+		for i := range files {
+			files[i] = map[string]any{
+				"filename": fmt.Sprintf("apps/service/src/file_%d_%d.go", page, i),
+				"status":   "modified",
+			}
+		}
+		if page == 1 && visibleSchemaPath != "" {
+			files[0] = map[string]any{
+				"filename": visibleSchemaPath,
+				"status":   "modified",
+			}
+		}
+		if page < lastPage {
+			w.Header().Set("Link", fmt.Sprintf(`<%s?page=%d>; rel="next"`, r.URL.Path, page+1))
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(files))
+	})
+}
+
+// checksDisabledRepoConfig scopes a driver test to the delivery's retry
+// classification: with check publishing off, the run stops at the discovery
+// failure instead of reaching the aggregate publish path.
+func checksDisabledRepoConfig() *api.ServerConfig {
+	return &api.ServerConfig{Repos: map[string]api.RepoConfig{
+		"octocat/hello-world": {EnableChecks: new(false)},
+	}}
+}
+
+// A pull request that changes more files than GitHub will report for a single
+// PR dead-letters on its first attempt instead of retrying. The cap is a
+// property of the PR, so every retry would list the same truncated diff, spend
+// the retry budget, and end in a terminal-drop log that reads like a lost
+// delivery.
+func TestDurableWebhookDriverFailsPRFileCapTerminally(t *testing.T) {
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveCheckRunPRHead(t, mux, "head-sha")
+	var filePages atomic.Int64
+	servePRFileListPastCap(t, mux, 7, &filePages, "")
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, checksDisabledRepoConfig(), factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failedPermanent:
+		require.Contains(t, failure.errMsg, "reached GitHub API limit")
+		require.Contains(t, failure.errMsg, "config discovery is incomplete")
+	default:
+		t.Fatal("expected an over-cap PR to be dead-lettered")
+	}
+	require.Empty(t, store.failed, "GitHub's per-PR file cap is deterministic and must not burn retry budget")
+	require.Empty(t, store.completed, "a delivery SchemaBot could not plan must not be completed")
+	require.Positive(t, filePages.Load(), "the driver must have listed PR files before failing closed")
 }
 
 func TestDurableWebhookDriverRetriesBootstrapFailure(t *testing.T) {
