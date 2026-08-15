@@ -520,6 +520,62 @@ func TestResumeExistingDeployRequest_DeferredCutoverDeclinesRecoveredInstantDDL(
 	}
 }
 
+// Instant DDL has no revert window, so a recovered deploy request carrying an
+// instant decision must not take it when the change is unsafe — the change
+// would land with no way to revert it. The row-copy path keeps the revert
+// window, so the recorded decision is narrowed and the deploy still starts.
+func TestResumeExistingDeployRequest_UnsafeChangesDeclineRecoveredInstantDDL(t *testing.T) {
+	tests := []struct {
+		name        string
+		changes     []engine.SchemaChange
+		wantInstant bool
+	}{
+		{
+			name: "a DROP COLUMN declines the recorded instant decision",
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "ALTER TABLE `users` DROP COLUMN `email`"}},
+			}},
+			wantInstant: false,
+		},
+		{
+			name: "a DROP TABLE declines the recorded instant decision",
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "DROP TABLE `users`"}},
+			}},
+			wantInstant: false,
+		},
+		{
+			name: "a safe additive change keeps it",
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)"}},
+			}},
+			wantInstant: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/61"},
+			}
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-drop", DeployRequestID: 61, IsInstant: true}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Changes = tt.changes
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			require.NoError(t, err)
+			require.Equal(t, 1, client.deployCalls)
+			require.NotNil(t, client.lastDeploy)
+			assert.Equal(t, tt.wantInstant, client.lastDeploy.InstantDDL)
+		})
+	}
+}
+
 // A deferred deploy request recovered on resume must wait for the
 // operator-triggered deploy rather than being started automatically.
 func TestResumeExistingDeployRequest_DeferredIsNotDeployed(t *testing.T) {
