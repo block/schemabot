@@ -498,15 +498,19 @@ func newWebhookRedriveGitHubClient(app webhookRedriveApp, logger *slog.Logger) (
 	if privateKey == "" {
 		return nil, fmt.Errorf("app %q private key resolved to empty value", app.name)
 	}
-	appsTransport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, app.id, []byte(privateKey))
+	// A crawl issues many list/detail/redeliver calls per run, so the base
+	// transport composes the same layers every other GitHub client here uses:
+	// the metrics transport innermost so each attempt lands in the request
+	// metrics (labeled with the configured app name), wrapped by the shared
+	// secondary-rate-limit handling (bounded sleep on a 403 secondary limit)
+	// rather than issuing bare requests that would trip the limit mid-crawl.
+	baseTransport := ghclient.NewRateLimitedTransport(
+		ghclient.NewMetricsTransport(http.DefaultTransport, 0, func() string { return app.name }))
+	appsTransport, err := ghinstallation.NewAppsTransport(baseTransport, app.id, []byte(privateKey))
 	if err != nil {
 		return nil, fmt.Errorf("create GitHub App transport for app %q: %w", app.name, err)
 	}
-	// A crawl issues many list/detail/redeliver calls per run, so wrap the
-	// transport with the shared secondary-rate-limit handling (bounded sleep
-	// on a 403 secondary limit) that every other GitHub client here uses,
-	// rather than issuing bare requests that would trip the limit mid-crawl.
-	client := gh.NewClient(&http.Client{Transport: ghclient.NewRateLimitedTransport(appsTransport), Timeout: 30 * time.Second})
+	client := gh.NewClient(&http.Client{Transport: appsTransport, Timeout: 30 * time.Second})
 	logger.Info("created GitHub App webhook redrive client", "app_name", app.name, "app_id", app.id)
 	return client, nil
 }
