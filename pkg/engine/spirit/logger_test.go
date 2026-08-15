@@ -2,8 +2,10 @@ package spirit
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,29 +37,32 @@ func newFilterLoggerAt(t *testing.T, handlerLevel slog.Level, routeToApplyLog bo
 	var mu sync.Mutex
 	var captured []capturedLog
 	var processLogs bytes.Buffer
-	onLog := func(level slog.Level, table, msg string) {
+	var onLog atomic.Pointer[logCallback]
+	if routeToApplyLog {
+		cb := logCallback(func(level slog.Level, table, msg string) {
+			mu.Lock()
+			defer mu.Unlock()
+			captured = append(captured, capturedLog{level: level, table: table, msg: msg})
+		})
+		onLog.Store(&cb)
+	}
+	var debug atomic.Bool
+	filter := &spiritLogFilter{
+		handler: slog.NewTextHandler(&processLogs, &slog.HandlerOptions{Level: handlerLevel}),
+		debug:   &debug,
+		onLog:   &onLog,
+	}
+	routedLines := func() []capturedLog {
 		mu.Lock()
 		defer mu.Unlock()
-		captured = append(captured, capturedLog{level: level, table: table, msg: msg})
+		return append([]capturedLog(nil), captured...)
 	}
-	if !routeToApplyLog {
-		onLog = nil
+	emittedProcessLogs := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return processLogs.String()
 	}
-	debug := false
-	filter := &spiritLogFilter{
-		handler:  slog.NewTextHandler(&processLogs, &slog.HandlerOptions{Level: handlerLevel}),
-		debugRef: &debug,
-		onLogRef: &onLog,
-	}
-	return slog.New(filter), func() []capturedLog {
-			mu.Lock()
-			defer mu.Unlock()
-			return append([]capturedLog(nil), captured...)
-		}, func() string {
-			mu.Lock()
-			defer mu.Unlock()
-			return processLogs.String()
-		}
+	return slog.New(filter), routedLines, emittedProcessLogs
 }
 
 // TestSpiritLogFilter_TableFromLoggerWith verifies that a table attached via
@@ -161,4 +166,100 @@ func TestUniqueTableList(t *testing.T) {
 	assert.Equal(t, "customers", uniqueTableList([]string{"customers"}))
 	assert.Equal(t, "customers, drinks", uniqueTableList([]string{"customers", "drinks", "customers"}))
 	assert.Equal(t, "", uniqueTableList(nil))
+}
+
+// A drive that finishes hands the engine back by unwiring its apply-log
+// callback, and a Spirit runner still winding down keeps logging through the
+// same filter. Reading the callback and the debug toggle out of the engine
+// concurrently with those writes must stay safe: the log line either reaches
+// the callback that was installed or is dropped, never dereferences a
+// half-written slot.
+func TestSpiritLogFilter_UnwiringTheCallbackWhileLoggingIsSafe(t *testing.T) {
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	spiritLogger := eng.spiritLogger.With("table", "orders")
+
+	var routed atomic.Int64
+	cb := func(slog.Level, string, string) { routed.Add(1) }
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		defer close(done)
+		for range 2000 {
+			spiritLogger.Info("copy rows complete")
+			spiritLogger.Debug("replication event")
+		}
+	})
+	wg.Go(func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			eng.SetLogCallback(cb)
+			eng.SetDebugLogs(true)
+			eng.SetLogCallback(nil)
+			eng.SetDebugLogs(false)
+		}
+	})
+	wg.Wait()
+
+	assert.LessOrEqual(t, routed.Load(), int64(2000),
+		"only the info lines route, and each of them at most once")
+}
+
+// A drive hands the engine over by clearing its apply-log callback rather than
+// leaving the finished drive's callback installed. A cleared slot is not an
+// installed one: lines that arrive after it record nothing, and the filter
+// never calls through the emptied slot.
+func TestSpiritLogFilter_ClearedCallbackRecordsNothing(t *testing.T) {
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	spiritLogger := eng.spiritLogger.With("table", "orders")
+
+	var routed atomic.Int64
+	eng.SetLogCallback(func(slog.Level, string, string) { routed.Add(1) })
+	spiritLogger.Info("copy rows complete")
+	require.Equal(t, int64(1), routed.Load(), "an installed callback records the line")
+
+	eng.SetLogCallback(nil)
+	assert.NotPanics(t, func() { spiritLogger.Info("apply complete") })
+	assert.Equal(t, int64(1), routed.Load(), "a cleared callback records nothing further")
+}
+
+// The filter a Spirit runner actually writes through is built by the engine —
+// once at construction, and again per schema change when the caller supplies a
+// logger carrying its triage identity. Both must route to the apply log stream
+// on a deployment whose own logs sit above info, because that stream is the
+// account an operator reads from the CLI and from a failed apply's summary.
+func TestEngineBuildsSpiritLoggersThatRouteAboveTheProcessLogLevel(t *testing.T) {
+	var processLogs bytes.Buffer
+	quiet := func() *slog.Logger {
+		return slog.New(slog.NewTextHandler(&processLogs, &slog.HandlerOptions{Level: slog.LevelError}))
+	}
+
+	eng := New(Config{Logger: quiet()})
+
+	var mu sync.Mutex
+	var routed []capturedLog
+	eng.SetLogCallback(func(level slog.Level, table, msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		routed = append(routed, capturedLog{level: level, table: table, msg: msg})
+	})
+
+	_, changeSpiritLogger := eng.resolveChangeLoggers(quiet())
+
+	eng.spiritLogger.With("table", "orders").Info("copy rows complete")
+	changeSpiritLogger.With("table", "drinks").Info("apply complete")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, routed, 2)
+	assert.Equal(t, "orders", routed[0].table)
+	assert.Equal(t, "copy rows complete", routed[0].msg)
+	assert.Equal(t, "drinks", routed[1].table)
+	assert.Equal(t, "apply complete", routed[1].msg)
+	assert.Empty(t, processLogs.String(),
+		"neither logger may raise the volume of the process logs the deployment configured")
 }

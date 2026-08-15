@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
@@ -55,10 +56,13 @@ type Engine struct {
 	// configured default Spirit copy settings; they are immutable after New.
 	// Each schema change starts from these defaults and carries its own working
 	// copy on runningSchemaChange, which Volume retunes for that change only.
-	targetChunkTime     time.Duration
-	threads             int
-	lockWaitTimeout     time.Duration
-	debugLogs           bool
+	targetChunkTime time.Duration
+	threads         int
+	lockWaitTimeout time.Duration
+	// debugLogs is toggled at runtime and read from the Spirit log filter on
+	// every line a running schema change emits, so it is read without taking
+	// the engine lock a logging path must never contend on.
+	debugLogs           atomic.Bool
 	disablePendingDrops bool
 
 	// Resolved Settings applied to every Spirit run; immutable after New.
@@ -68,8 +72,12 @@ type Engine struct {
 
 	cpuHint int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
-	// Log callback for routing Spirit logs to ApplyLogStore (with table context)
-	onLog func(level slog.Level, table, msg string)
+	// onLog routes Spirit logs to the ApplyLogStore, with table context. It is
+	// swapped as drives hand the engine over and read from the log filter on
+	// every line, so it is held in an atomic slot: a caller clearing it while a
+	// runner is still logging must not race the read, and a load that hands back
+	// a callback must hand back one whole enough to call.
+	onLog atomic.Pointer[logCallback]
 
 	// Running schema change state
 	mu                  sync.Mutex
@@ -190,19 +198,19 @@ func New(cfg Config) *Engine {
 		targetChunkTime:      targetChunkTime,
 		threads:              threads,
 		lockWaitTimeout:      lockWaitTimeout,
-		debugLogs:            cfg.DebugLogs,
 		disablePendingDrops:  cfg.DisablePendingDrops,
 		checkpointMaxAge:     checkpointMaxAge,
 		checksumYieldTimeout: checksumYieldTimeout,
 		autoscaling:          autoscaling,
 	}
+	eng.debugLogs.Store(cfg.DebugLogs)
 
 	// Create Spirit logger with filter that checks debugLogs at runtime
 	// and routes logs to ApplyLogStore via onLog callback
 	eng.spiritLogger = slog.New(&spiritLogFilter{
-		handler:  logger.Handler(),
-		debugRef: &eng.debugLogs,
-		onLogRef: &eng.onLog,
+		handler: logger.Handler(),
+		debug:   &eng.debugLogs,
+		onLog:   &eng.onLog,
 	})
 
 	return eng
@@ -224,9 +232,9 @@ func (e *Engine) resolveChangeLoggers(reqLogger *slog.Logger) (logger, spiritLog
 		return e.logger, e.spiritLogger
 	}
 	return reqLogger, slog.New(&spiritLogFilter{
-		handler:  reqLogger.Handler(),
-		debugRef: &e.debugLogs,
-		onLogRef: &e.onLog,
+		handler: reqLogger.Handler(),
+		debug:   &e.debugLogs,
+		onLog:   &e.onLog,
 	})
 }
 
@@ -272,25 +280,19 @@ func (e *Engine) changeSpiritLogger() *slog.Logger {
 // Only INFO level and above are routed (DEBUG logs are filtered).
 // The callback receives the log level, table name (if available), and message.
 // Set to nil to disable log routing.
-func (e *Engine) SetLogCallback(cb func(level slog.Level, table, msg string)) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.onLog = cb
+func (e *Engine) SetLogCallback(cb logCallback) {
+	e.onLog.Store(&cb)
 }
 
 // SetDebugLogs enables or disables verbose Spirit debug logs at runtime.
 // When disabled, noisy logs like "Received unknown event type" are filtered.
 func (e *Engine) SetDebugLogs(enabled bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.debugLogs = enabled
+	e.debugLogs.Store(enabled)
 }
 
 // DebugLogs returns whether verbose Spirit debug logs are enabled.
 func (e *Engine) DebugLogs() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.debugLogs
+	return e.debugLogs.Load()
 }
 
 // Drain waits for any in-flight migration goroutine to complete and clears the
