@@ -35,7 +35,7 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
@@ -62,7 +62,7 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -87,7 +87,7 @@ func TestBuildPlanCommentData_CarriesSatisfiedShard(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "the satisfied shard is carried, not dropped")
@@ -116,7 +116,7 @@ func TestBuildPlanCommentData_MalformedShardSurfacesError(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 1, "the malformed shard is not carried into the rendered shards")
@@ -152,7 +152,7 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan contains unsafe table changes")
 	require.Len(t, data.UnsafeChanges, 1)
@@ -177,7 +177,7 @@ func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -205,7 +205,7 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
@@ -241,7 +241,7 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)

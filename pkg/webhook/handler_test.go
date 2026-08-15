@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -287,6 +288,33 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}))
 
 		assert.NotContains(t, body, "Support:")
+	})
+}
+
+// The agent hint reaches a plan comment on the plan data the handler builds,
+// the same way the deployment's tenant does, so a deployment that configures
+// none renders the comment it always rendered.
+func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{}
+
+	t.Run("no hint configured", func(t *testing.T) {
+		h := &Handler{service: api.New(nil, &api.ServerConfig{}, nil, testLogger())}
+
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+
+		assert.Empty(t, data.AgentHint)
+		assert.NotContains(t, templates.RenderPlanComment(data), "<!-- 💡 ")
+	})
+
+	t.Run("hint configured", func(t *testing.T) {
+		hint := "Agents: comment `schemabot help` for the command reference."
+		h := &Handler{service: api.New(nil, &api.ServerConfig{AgentHint: hint}, nil, testLogger())}
+
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+
+		assert.Equal(t, hint, data.AgentHint)
+		assert.Contains(t, templates.RenderPlanComment(data), "<!-- 💡 "+hint+" -->")
 	})
 }
 

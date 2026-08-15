@@ -21,6 +21,7 @@
 - [Spirit Run Settings](#spirit-run-settings)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
+- [Agent Hint](#agent-hint)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
@@ -584,6 +585,30 @@ support_channel:
 Both `name` and `url` are required when `support_channel` is configured. The
 URL must be an absolute `http` or `https` link with no credentials, whitespace,
 or Markdown link delimiters. When omitted, SchemaBot comments are unchanged.
+
+## Agent Hint
+
+SchemaBot can append an opt-in hint to plan comments pointing AI agents at the
+preferred way to drive SchemaBot, such as a skill or internal tool to install.
+
+```yaml
+agent_hint: "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+```
+
+The hint is appended to plan comments as an HTML comment:
+
+```html
+<!-- 💡 Agents: fetch the SchemaBot command reference by commenting `schemabot help`. -->
+```
+
+GitHub never renders HTML comments, so the PR page is unchanged for human
+readers. Agents read comment bodies as raw markdown through the API and
+receive the hint verbatim — so the copy can address them directly with
+imperative instructions.
+
+The hint must be a single bounded line and must not contain an HTML comment
+terminator (`-->` or `--!>`), which would end the comment early and render the
+rest of the hint on the PR page. When omitted, plan comments are unchanged.
 
 ## Repository Allowlist
 

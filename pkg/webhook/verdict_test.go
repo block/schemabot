@@ -26,7 +26,7 @@ func TestBuildPlanCommentData_BlockedChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.BlockedChanges, 1)
 	assert.Equal(t, "users", data.BlockedChanges[0].Table)
@@ -57,7 +57,7 @@ func TestBuildPlanCommentData_PerShardBlocked(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.BlockedChanges, 1, "the same refused statement on two shards is grouped, not repeated")
 	assert.Equal(t, "mutes", data.BlockedChanges[0].Table)
@@ -76,7 +76,7 @@ func TestBuildPlanCommentData_NoBlockedChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.Empty(t, data.BlockedChanges)
 }
@@ -97,7 +97,7 @@ func TestBuildPlanCommentData_DirectChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.DirectChanges, 1)
 	assert.Equal(t, "users", data.DirectChanges[0].Table)
@@ -129,7 +129,7 @@ func TestBuildPlanCommentData_PerShardDirect(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.DirectChanges, 1, "the same direct statement on two shards is grouped, not repeated")
 	assert.Equal(t, "mutes", data.DirectChanges[0].Table)

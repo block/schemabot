@@ -78,6 +78,11 @@ type PlanCommentData struct {
 	IsMySQL      bool
 	ApplyID      string
 
+	// AgentHint is the deployment's configured guidance for AI agents reading
+	// the plan. Empty on deployments that configure none, which render an
+	// unchanged comment.
+	AgentHint string
+
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
 	Errors         []string
@@ -168,7 +173,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	// No changes — short-circuit with a single clean message
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
-		return sb.String()
+		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
 	// Detailed changes
@@ -260,7 +265,7 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeApplyInstruction(&sb, applyCmd)
 	}
 
-	return sb.String()
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -885,6 +890,11 @@ type MultiEnvPlanCommentData struct {
 	RequestedBy  string
 	Tenant       string
 
+	// AgentHint is the deployment's configured guidance for AI agents reading
+	// the plan. Empty on deployments that configure none, which render an
+	// unchanged comment.
+	AgentHint string
+
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
 
@@ -927,7 +937,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	// If no environments have changes and no errors, show simple message
 	if envsWithChanges == 0 && !hasErrors {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
-		return sb.String()
+		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
 	// Check if all environments have identical plans (for deduplication)
@@ -960,7 +970,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	sb.WriteString("---\n\n")
 	writeMultiEnvFooter(&sb, data)
 
-	return sb.String()
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
 func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool) {
@@ -999,6 +1009,9 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 	}
 	if merged.Tenant == "" {
 		merged.Tenant = data.Tenant
+	}
+	if merged.AgentHint == "" {
+		merged.AgentHint = data.AgentHint
 	}
 	return merged, true
 }

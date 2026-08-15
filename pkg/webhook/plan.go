@@ -136,7 +136,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 	// Build plan comment data
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy)
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
@@ -341,6 +341,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	multiEnvData := templates.MultiEnvPlanCommentData{
 		RequestedBy:  requestedBy,
 		Tenant:       tenant,
+		AgentHint:    h.agentHint(),
 		Environments: environments,
 		Plans:        make(map[string]*templates.PlanCommentData),
 		Errors:       make(map[string]string),
@@ -430,7 +431,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			headSHA = sha
 		}
 
-		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		multiEnvData.Plans[env] = &commentData
@@ -740,11 +741,12 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 }
 
 // buildPlanCommentData converts plan results into template data.
-func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy string) templates.PlanCommentData {
+func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
 		Database:     schema.Database,
 		Environment:  environment,
 		Tenant:       tenant,
+		AgentHint:    agentHint,
 		HeadSHA:      schema.HeadSHA,
 		Repository:   schema.Repository,
 		RequestedBy:  requestedBy,

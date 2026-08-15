@@ -262,7 +262,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// No changes (neither table DDL nor a VSchema update) — post a regular plan
 	// comment (no lock, no confirm footer)
 	if !planResp.HasChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	}
@@ -272,7 +272,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
@@ -292,7 +292,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 
 	// Block unsafe changes unless --allow-unsafe was specified
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
@@ -327,7 +327,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Build plan comment data with lock info. The attributed-change disclosure sits
 	// on this comment for the same reason as the direct-execution one: it must
 	// be on the comment the confirmation acts on.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
