@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,6 +44,16 @@ type githubMetricsTransport struct {
 	appSlug        func() string
 }
 
+// NewMetricsTransport wraps base so every GitHub request attempt — responses
+// and transport failures alike — is recorded in the GitHub request metrics.
+// installationID may be zero for App-JWT clients; appSlug supplies the
+// github_app label and may be nil when no app identity is available. Compose
+// it under retry layers (as the innermost transport) so every attempt is
+// counted.
+func NewMetricsTransport(base http.RoundTripper, installationID int64, appSlug func() string) http.RoundTripper {
+	return newGitHubMetricsTransport(base, installationID, appSlug)
+}
+
 func newGitHubMetricsTransport(base http.RoundTripper, installationID int64, appSlug func() string) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
@@ -59,7 +70,7 @@ func (t *githubMetricsTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if resp != nil {
 		recordGitHubResponseHeaders(req.Context(), req, resp, t.installationID, t.githubApp())
 	} else if err != nil {
-		recordGitHubTransportFailure(req.Context(), req, t.installationID, t.githubApp())
+		recordGitHubTransportFailure(req.Context(), req, err, t.installationID, t.githubApp())
 	}
 	return resp, err
 }
@@ -75,7 +86,7 @@ func (t *githubMetricsTransport) githubApp() string {
 // response, so header-based attribution is unavailable and no rate-limit
 // sample exists. Without this sample a GitHub outage would look like a quiet
 // period instead of an error spike.
-func recordGitHubTransportFailure(ctx context.Context, req *http.Request, installationID int64, githubApp string) {
+func recordGitHubTransportFailure(ctx context.Context, req *http.Request, rtErr error, installationID int64, githubApp string) {
 	metricCtx, hasMetricCtx := githubRateLimitContextFrom(ctx)
 	if !hasMetricCtx {
 		metricCtx = githubRateLimitContextFromRequest(req)
@@ -88,8 +99,20 @@ func recordGitHubTransportFailure(ctx context.Context, req *http.Request, instal
 		Repository:     metricCtx.repository,
 		GitHubApp:      githubApp,
 		InstallationID: installationID,
-		Status:         metrics.GitHubRequestStatusTransportError,
+		Status:         gitHubTransportFailureStatus(rtErr),
 	})
+}
+
+// gitHubTransportFailureStatus separates requests SchemaBot abandoned itself
+// (context cancellation, e.g. graceful shutdown) from requests GitHub or the
+// network failed. Only the latter signal unreachability; recording
+// cancellations under their own status keeps the transport_error signal
+// alertable without dropping the sample.
+func gitHubTransportFailureStatus(rtErr error) string {
+	if errors.Is(rtErr, context.Canceled) {
+		return metrics.GitHubRequestStatusCancelled
+	}
+	return metrics.GitHubRequestStatusTransportError
 }
 
 func recordGitHubResponseHeaders(ctx context.Context, req *http.Request, resp *http.Response, installationID int64, githubApp string) {
@@ -106,7 +129,7 @@ func recordGitHubResponseHeaders(ctx context.Context, req *http.Request, resp *h
 		Repository:     metricCtx.repository,
 		GitHubApp:      githubApp,
 		InstallationID: installationID,
-		Status:         gitHubResponseStatus(resp),
+		Status:         gitHubResponseStatus(resp, metricCtx.operation),
 	})
 
 	limit, hasLimit := parseGitHubRateLimitHeader(resp.Header, headerRateLimitLimit)
@@ -408,14 +431,20 @@ func gitHubRequestCategory(operation string) string {
 	}
 }
 
-func gitHubResponseStatus(resp *http.Response) string {
+func gitHubResponseStatus(resp *http.Response, operation string) string {
 	if resp == nil {
 		return metrics.GitHubRequestStatusUnknown
 	}
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		return metrics.GitHubRequestStatusSuccess
 	}
-	if resp.StatusCode == http.StatusNotFound {
+	// Only read operations get the not_found relabel: reads routinely probe
+	// paths whose expected answer is 404 (schemabot.yaml lookups, deleted
+	// PRs). A 404 on an auth or write operation is a genuine failure — a
+	// suspended App installation answers every token exchange with 404 — and
+	// must stay visible to error-rate alerts.
+	if resp.StatusCode == http.StatusNotFound &&
+		gitHubRequestCategory(operation) == metrics.GitHubRequestCategoryRead {
 		return metrics.GitHubRequestStatusNotFound
 	}
 	return metrics.GitHubRequestStatusError
