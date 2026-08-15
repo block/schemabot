@@ -88,11 +88,18 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite action ignored"})
 		return
 	}
-	if !h.checkSuiteRecovery || !h.durableWebhookDispatch {
+	if !h.checkSuiteRecovery {
 		h.logger.Debug("check_suite delivery ignored because check-suite recovery is disabled",
-			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID,
-			"recovery_enabled", h.checkSuiteRecovery, "durable_dispatch", h.durableWebhookDispatch)
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite recovery disabled"})
+		return
+	}
+	if !h.durableWebhookDispatch {
+		// Recovery rides the durable inbox: without dispatch there is no
+		// driver to claim the synthesized row, so the delivery is ignored.
+		h.logger.Debug("check_suite delivery ignored because durable webhook dispatch is disabled",
+			"repo", repo, "head_sha", headSHA, "delivery_id", deliveryID)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "durable webhook dispatch disabled"})
 		return
 	}
 	if repo == "" || headSHA == "" {

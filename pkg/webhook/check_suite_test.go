@@ -250,6 +250,30 @@ func TestCheckSuiteWebhookIgnoredWhenRecoveryDisabled(t *testing.T) {
 	require.Nil(t, row)
 }
 
+// Recovery rides the durable inbox, so with dispatch disabled the delivery is
+// acknowledged and dropped — and the response names the dispatch gate, not
+// recovery, so an operator triages the right kill switch.
+func TestCheckSuiteWebhookIgnoredWhenDurableDispatchDisabled(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: store}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithCheckSuiteRecovery())
+
+	req := buildCheckSuiteWebhookRequest(t, "requested", "suite-sha", "feature", 7)
+	req.Header.Set(headerDeliveryID, "delivery-cs-1")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `{"message":"durable webhook dispatch disabled"}`, rr.Body.String())
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-cs-1")
+	require.NoError(t, err)
+	require.Nil(t, row)
+}
+
 // A delivery from a repository outside the allowlist is acknowledged without
 // occupying an inbox row.
 func TestCheckSuiteWebhookRejectsUnregisteredRepo(t *testing.T) {
