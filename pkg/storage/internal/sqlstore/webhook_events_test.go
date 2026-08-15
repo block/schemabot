@@ -426,7 +426,7 @@ func TestWebhookEventStore_SupersedeIfCoveredNeverSupersedesClosed(t *testing.T)
 func TestWebhookEventStore_SupersedeIfCoveredNeverSupersedesNonPullRequestEvents(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	createCoalescingEvent(t, store, "check-run-old", "check_run", "created", "block/example", 7, "old-head", time.Minute, storage.WebhookEventPending, 0, "")
 	createCoalescingEvent(t, store, "plan-new", "pull_request", "synchronize", "block/example", 7, "new-head", 0, storage.WebhookEventPending, 0, "")
