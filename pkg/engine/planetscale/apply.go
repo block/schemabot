@@ -803,8 +803,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Deploy — prefer instant when eligible, unless the cutover was deferred or
 	// the change is unsafe, both of which need the row-copy path (the gate to
 	// hold, and the revert window to undo the change).
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
 	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
-	if unsafe {
+	if instantEligible && unsafe {
 		e.logger.Info("declining instant DDL on resume because the change is unsafe — the row copy keeps a revert window",
 			"database", req.Database,
 			"deploy_request", dr.Number,
