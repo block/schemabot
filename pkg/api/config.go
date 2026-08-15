@@ -1925,6 +1925,19 @@ func (e *DatabaseNotConfiguredError) Error() string {
 	return fmt.Sprintf("database %q is not configured on this server", e.Database)
 }
 
+// EnvironmentNotConfiguredError reports that a configured database has no
+// entry for the requested environment. Callers use it to distinguish a
+// caller-supplied environment miss from server-side configuration failures
+// such as an invalid deployments map.
+type EnvironmentNotConfiguredError struct {
+	Database    string
+	Environment string
+}
+
+func (e *EnvironmentNotConfiguredError) Error() string {
+	return fmt.Sprintf("database %q environment %q is not configured on this server", e.Database, e.Environment)
+}
+
 // DatabaseEnvironments returns the environments configured server-side for a
 // database, ordered by the database's effective promotion order. Returns
 // *DatabaseNotConfiguredError when the database has no registry entry.
@@ -2056,11 +2069,11 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 	}
 	dbConfig := c.Database(database)
 	if dbConfig == nil {
-		return nil, fmt.Errorf("database %q is not configured on this server", database)
+		return nil, &DatabaseNotConfiguredError{Database: database}
 	}
 	envConfig, ok := dbConfig.Environments[environment]
 	if !ok {
-		return nil, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
+		return nil, &EnvironmentNotConfiguredError{Database: database, Environment: environment}
 	}
 
 	if envConfig.HasLocalDSN() {

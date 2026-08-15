@@ -38,7 +38,7 @@ const postgresVerdictUnavailableReason = "PostgreSQL classifier verdict unavaila
 type PlanRequest struct {
 	Database    string                         `json:"database"`
 	Environment string                         `json:"environment"`
-	Type        string                         `json:"type"` // "mysql" or "vitess"
+	Type        string                         `json:"type"` // database type; must match the server's configured type for the database
 	SchemaFiles map[string]*ternv1.SchemaFiles `json:"schema_files"`
 	Repository  string                         `json:"repository,omitempty"`
 	PullRequest *int32                         `json:"pull_request,omitempty"`
@@ -76,6 +76,16 @@ type databaseTypeMismatchError struct {
 
 func (e *databaseTypeMismatchError) Error() string {
 	return fmt.Sprintf("database %q type %q does not match server config type %q", e.Database, e.RequestType, e.ConfigType)
+}
+
+// requestedRouteNotConfigured reports whether err means the request named a
+// database or environment this server has no configuration for. Both are the
+// same class of defect — the caller asked for a route that does not exist —
+// so the handlers map them to 400 rather than a server failure.
+func requestedRouteNotConfigured(err error) bool {
+	var dbNotConfigured *DatabaseNotConfiguredError
+	var envNotConfigured *EnvironmentNotConfiguredError
+	return errors.As(err, &dbNotConfigured) || errors.As(err, &envNotConfigured)
 }
 
 // RemoteDeploymentUnavailableError carries routing metadata for remote
@@ -126,6 +136,11 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		var typeMismatchErr *databaseTypeMismatchError
 		if errors.As(err, &typeMismatchErr) {
 			s.logger.Warn("pull schema rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if requestedRouteNotConfigured(err) {
+			s.logger.Warn("pull schema rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -405,6 +420,11 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		var typeMismatchErr *databaseTypeMismatchError
 		if errors.As(err, &typeMismatchErr) {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if requestedRouteNotConfigured(err) {
+			s.logger.Warn("plan rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
