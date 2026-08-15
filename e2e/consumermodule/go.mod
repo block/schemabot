@@ -19,24 +19,24 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/alecthomas/kong v1.16.0 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.43.4 // indirect
+	github.com/aws/aws-sdk-go-v2 v1.43.5 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.32.14 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.35 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.35 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.36 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.36 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.6 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.30 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.15 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.35 // indirect
-	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.41.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.15 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.19 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
-	github.com/aws/smithy-go v1.27.6 // indirect
+	github.com/aws/smithy-go v1.27.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/block/pg-sprite v0.0.0-20260811232538-d552ec6df816 // indirect
+	github.com/block/pg-sprite v0.0.0-20260814025010-d6cf677e4feb // indirect
 	github.com/block/spirit v0.16.1-0.20260808013537-864cf2ee6b6b // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
