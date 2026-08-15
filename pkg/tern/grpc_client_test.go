@@ -1692,6 +1692,107 @@ func TestGRPCClient_ResumeApplyOperationReflectsFinalizerTerminalStateOntoOperat
 	}
 }
 
+func TestGRPCClient_GroupFinalizerDispatchFailureStaysOffParentApply(t *testing.T) {
+	// A group_finalizer is claimed under an operation lease — including when it is
+	// the apply's sole operation — so a rejected remote dispatch is that
+	// operation's failure alone. The drive must never write the parent
+	// applies.state: a permanent rejection lands on the operation row (the
+	// operator's projection then moves the parent), and a retryable rejection
+	// leaves both rows untouched so the operation stays claimable. A drive that
+	// failed the parent directly would flap a multi-deployment apply on one
+	// operation's error and race the projection CAS.
+	cases := []struct {
+		name          string
+		code          codes.Code
+		message       string
+		wantOpState   string
+		wantOpFailure bool
+	}{
+		{
+			name:        "retryable rejection leaves the operation claimable",
+			code:        codes.Internal,
+			message:     "an active apply already exists for this database",
+			wantOpState: state.ApplyOperation.Pending,
+		},
+		{
+			name:          "permanent rejection fails the operation row only",
+			code:          codes.FailedPrecondition,
+			message:       "strata apply rejected: malformed dispatch shape",
+			wantOpState:   state.ApplyOperation.Failed,
+			wantOpFailure: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{applyErr: status.Error(tc.code, tc.message)}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+
+			apply := &storage.Apply{
+				ID:              8,
+				ApplyIdentifier: "apply-finalizer-reject",
+				PlanID:          99,
+				Database:        "commerce",
+				DatabaseType:    storage.DatabaseTypeStrata,
+				Environment:     "staging",
+				State:           state.Apply.Pending,
+			}
+			apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+			finalizerID := int64(51)
+			operations := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				finalizerID: {
+					ID:            finalizerID,
+					ApplyID:       apply.ID,
+					Deployment:    "commerce-deployment",
+					OperationKey:  "commerce/group_finalizer",
+					OperationKind: storage.ApplyOperationKindGroupFinalizer,
+					State:         state.ApplyOperation.Pending,
+				},
+			}}
+			client.storage = &mockStorage{
+				applies: &mockApplyStore{apply: apply},
+				tasks:   &mockTaskStore{getByApplyIDErr: errors.New("finalizer drive must not load whole-apply tasks")},
+				plans: &mockPlanStore{plan: &storage.Plan{
+					ID:             apply.PlanID,
+					PlanIdentifier: "plan-finalizer",
+					SchemaFiles: schema.SchemaFiles{
+						"commerce": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+					},
+					Namespaces: map[string]*storage.NamespacePlanData{
+						"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+					},
+				}},
+				operations: operations,
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			ctx = storage.WithOperationLease(ctx, storage.OperationLease{
+				ApplyID:     apply.ID,
+				OperationID: finalizerID,
+				Token:       "op-lease",
+			})
+			err := client.ResumeApplyOperation(ctx, apply, finalizerID)
+			require.Error(t, err, "a rejected finalizer dispatch must surface to the operator")
+			require.NotNil(t, server.getApplyRequest(), "expected the finalizer dispatch to be attempted")
+
+			assert.Equal(t, state.Apply.Pending, apply.State,
+				"an operation-scoped dispatch failure must not move the parent applies.state")
+			assert.Empty(t, apply.ErrorMessage, "the parent apply must not carry the operation's failure message")
+
+			op := operations.ops[finalizerID]
+			assert.Equal(t, tc.wantOpState, op.State)
+			if tc.wantOpFailure {
+				assert.Contains(t, op.ErrorMessage, tc.message)
+				assert.NotNil(t, op.CompletedAt, "a permanently failed operation row is stamped completed_at")
+			} else {
+				assert.Empty(t, op.ErrorMessage, "a retryable rejection leaves no failure on the claimable operation row")
+				assert.Nil(t, op.CompletedAt)
+			}
+		})
+	}
+}
+
 func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *testing.T) {
 	// On a multi-deployment apply under the barrier cutover policy, the remote
 	// copy drive must instruct Tern to park at the cutover barrier (defer_cutover)
