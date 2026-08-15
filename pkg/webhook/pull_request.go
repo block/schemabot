@@ -399,7 +399,15 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// and the server-managed-directory safety check below.
 	changedFiles, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
+			// The schema_visible label records whether the truncated prefix
+			// already shows a schema or config path. Both shapes get the same
+			// cap-specific blocking check — the withheld tail is not
+			// inspectable either way — but the label lets operators see how
+			// many cap hits look schema-related versus pure refactors.
+			metrics.RecordPRFileCapExceeded(ctx, repo, ghclient.HasDiscoveryInputFiles(changedFiles))
+		}
+		h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
@@ -429,7 +437,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
 	if err != nil {
-		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
 		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
@@ -679,17 +687,46 @@ func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo strin
 	return managed
 }
 
+// logConfigDiscoveryFailure logs an auto-plan config-discovery failure at the
+// severity its cause deserves, naming the discovery step that failed. A PR past
+// GitHub's per-PR changed-file cap is deterministic — GitHub reports the same
+// oversized diff the same truncated way on every attempt — so it is a warning
+// about the PR, not a SchemaBot or GitHub error an operator can act on. Every
+// other cause stays an error worth investigating.
+func (h *Handler) logConfigDiscoveryFailure(step, repo string, pr int, headSHA, source, deliveryID string, err error) {
+	attrs := []any{
+		"step", step, "repo", repo, "pr", pr, "head_sha", headSHA,
+		"source", source, "delivery_id", deliveryID, "error", err,
+	}
+	if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
+		h.logger.Warn("auto-plan will not plan this PR because it changes more files than GitHub will report for a single pull request; SchemaBot cannot see the full diff and fails the check closed", attrs...)
+		return
+	}
+	h.logger.Error("auto-plan config discovery failed", attrs...)
+}
+
 func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {
+	// The causes stay apart because operators triage them differently: GitHub
+	// being unavailable is an outage to wait out, a PR past GitHub's per-PR
+	// changed-file cap is a property of the PR that no retry can change, and
+	// anything else is a configuration problem to investigate.
+	block := configDiscoveryFailedBlock
+	discoveryStatus := "error"
+	switch {
+	case errors.Is(discoveryErr, ghclient.ErrPRFilesIncomplete):
+		// A deterministic cap is a block, not an error: reporting it as one
+		// keeps it out of the discovery-error signal.
+		block = prFileCapExceededBlock
+		discoveryStatus = "blocked"
+	case ghclient.IsUnavailableError(discoveryErr):
+		block = githubConfigDiscoveryUnavailableBlock
+	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "schema_config_discovery",
 		Repository: repo,
-		Status:     "error",
+		Status:     discoveryStatus,
 	})
 
-	block := configDiscoveryFailedBlock
-	if ghclient.IsUnavailableError(discoveryErr) {
-		block = githubConfigDiscoveryUnavailableBlock
-	}
 	h.logger.Info("posting failing aggregate for config discovery failure",
 		"repo", repo, "pr", pr, "head_sha", headSHA,
 		"blocking_reason", block.blockingReason)

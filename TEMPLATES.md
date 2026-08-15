@@ -1607,6 +1607,17 @@ Apply in progress
 
 </details>
 
+
+## Aggregate Check — Blocked: PR File Cap Exceeded
+
+<details>
+<summary><strong>Aggregate Check — Blocked: PR File Cap Exceeded</strong></summary>
+
+Plan failed
+
+SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, and the incomplete changed-file list it returns includes files under schema or SchemaBot config paths. SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.
+</details>
+
 ## Locking
 
 ### PR Comments

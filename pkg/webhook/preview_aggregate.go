@@ -43,3 +43,11 @@ func PreviewAggregateSummary() string {
 	title, summary := aggregateSummary(checks, conclusion)
 	return title + "\n\n" + summary
 }
+
+// PreviewAggregateCheckFileCapBlocked renders the failing aggregate-check
+// output published when a PR changes more files than GitHub will report for a
+// single pull request: the fixed failure title plus the cap message telling
+// the author to split the PR so SchemaBot can see the full changed-file list.
+func PreviewAggregateCheckFileCapBlocked() string {
+	return "Plan failed\n\n" + prFileCapExceededBlock.message
+}
