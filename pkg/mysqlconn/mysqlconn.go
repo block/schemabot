@@ -108,23 +108,25 @@ func reloadConnectionDSN(reload func() (string, error), opts ...Option) string {
 	return reloadedDSN
 }
 
-// ConnectionDSN returns a MySQL DSN with required transport settings applied,
-// plus any caller-supplied options (for example WithConnectTimeout). Options
-// are applied on every return path so they take effect regardless of whether
-// the DSN also needs RDS TLS enhancement.
+// ConnectionDSN returns a MySQL DSN with required connection settings applied
+// (RDS TLS, client-side parameter interpolation), plus any caller-supplied
+// options (for example WithConnectTimeout). Settings and options are applied
+// on every return path so they take effect regardless of whether the DSN also
+// needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("parse DSN: %w", err)
 	}
 	// An explicit TLS config or a non-RDS host needs no TLS enhancement; apply
-	// options directly to the parsed config and reassemble.
+	// the required settings and options directly to the parsed config and
+	// reassemble.
 	if cfg.TLSConfig != "" {
-		return applyOptions(dsn, cfg, opts...), nil
+		return requiredSettingsDSN(cfg, opts...), nil
 	}
 	tlsMode, ok := tlsModeForHost(cfg.Addr)
 	if !ok {
-		return applyOptions(dsn, cfg, opts...), nil
+		return requiredSettingsDSN(cfg, opts...), nil
 	}
 	dbConfig := dbconn.NewDBConfig()
 	dbConfig.TLSMode = tlsMode
@@ -132,28 +134,32 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("enhance RDS DSN with TLS: %w", err)
 	}
-	if len(opts) == 0 {
-		return connectionDSN, nil
-	}
-	// Re-parse the enhanced DSN so options layer on top of the injected TLS
-	// settings rather than discarding them.
+	// Re-parse the enhanced DSN so the required settings and options layer on
+	// top of the injected TLS settings rather than discarding them.
 	enhanced, err := mysql.ParseDSN(connectionDSN)
 	if err != nil {
 		return "", fmt.Errorf("parse enhanced DSN: %w", err)
 	}
-	return applyOptions(connectionDSN, enhanced, opts...), nil
+	return requiredSettingsDSN(enhanced, opts...), nil
 }
 
-// applyOptions runs each option against cfg and returns the reassembled DSN.
-// When no options are supplied it returns raw unchanged, preserving the
-// original DSN string exactly (FormatDSN may otherwise reorder parameters).
-func applyOptions(raw string, cfg *mysql.Config, opts ...Option) string {
-	if len(opts) == 0 {
-		return raw
-	}
+// requiredSettingsDSN applies any caller-supplied options, then the settings
+// every SchemaBot-managed MySQL connection needs, and returns the reassembled
+// DSN. Required settings are applied after options so no option can override
+// them.
+func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	// Interpolate query parameters client-side instead of using server-side
+	// prepared statements. database/sql prepares, executes once, and closes on
+	// every parameterized query, so server-side preparation buys no statement
+	// reuse — it costs extra round trips and consumes the server-global
+	// max_prepared_stmt_count budget, which other clients of a shared target
+	// can exhaust (MySQL error 1461). The Go MySQL driver escapes interpolated
+	// values and refuses to interpolate under charsets where escaping is
+	// unsafe.
+	cfg.InterpolateParams = true
 	return cfg.FormatDSN()
 }
 

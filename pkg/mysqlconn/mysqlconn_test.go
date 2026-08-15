@@ -13,38 +13,37 @@ import (
 
 func TestConnectionDSN(t *testing.T) {
 	tests := []struct {
-		name       string
-		dsn        string
-		wantTLS    string
-		wantSame   bool
-		wantErrSub string
+		name          string
+		dsn           string
+		wantTLS       string
+		wantParseTime bool
+		wantErrSub    string
 	}{
 		{
-			name:    "RDS host gets TLS",
-			dsn:     "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true",
-			wantTLS: "rds",
+			name:          "RDS host gets TLS",
+			dsn:           "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true",
+			wantTLS:       "rds",
+			wantParseTime: true,
 		},
 		{
-			name:     "non-RDS host is unchanged",
-			dsn:      "root:secret@tcp(localhost:3306)/app?parseTime=true",
-			wantSame: true,
+			name:          "non-RDS host gets no TLS",
+			dsn:           "root:secret@tcp(localhost:3306)/app?parseTime=true",
+			wantParseTime: true,
 		},
 		{
-			name:     "database alias is unchanged",
-			dsn:      "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
-			wantSame: true,
+			name:          "database alias gets no TLS",
+			dsn:           "spirit:secret@tcp(database.example.com:3306)/app?parseTime=true",
+			wantParseTime: true,
 		},
 		{
-			name:     "explicit TLS is preserved",
-			dsn:      "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=skip-verify",
-			wantTLS:  "skip-verify",
-			wantSame: true,
+			name:    "explicit TLS is preserved",
+			dsn:     "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=skip-verify",
+			wantTLS: "skip-verify",
 		},
 		{
-			name:     "explicit disabled TLS is preserved",
-			dsn:      "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=false",
-			wantTLS:  "false",
-			wantSame: true,
+			name:    "explicit disabled TLS is preserved",
+			dsn:     "spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?tls=false",
+			wantTLS: "false",
 		},
 		{
 			name:       "invalid DSN returns context",
@@ -63,13 +62,15 @@ func TestConnectionDSN(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			if tt.wantSame {
-				assert.Equal(t, tt.dsn, got)
-			}
-
 			cfg, err := mysql.ParseDSN(got)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantTLS, cfg.TLSConfig)
+			// Client-side parameter interpolation is a required setting on
+			// every SchemaBot-managed connection, so parameterized queries
+			// never create server-side prepared statements.
+			assert.True(t, cfg.InterpolateParams)
+			// Caller-supplied params survive the reassembly.
+			assert.Equal(t, tt.wantParseTime, cfg.ParseTime)
 			_, err = mysql.NewConnector(cfg)
 			require.NoError(t, err)
 		})
