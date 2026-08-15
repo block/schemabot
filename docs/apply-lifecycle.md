@@ -155,13 +155,17 @@ fresh driver, continuing from engine checkpoints rather than starting over.
 
 Not every failure is final. Some failures are *transient*: the schema change
 itself is fine, but something around it hiccupped — a dropped connection to the
-data plane, a network blip, a pod restart mid-drive. Nothing about the work
+data plane, a network blip, an unclean kill mid-drive. Nothing about the work
 needs to change; it just needs to be picked up again. Those failures move the
 apply to `failed_retryable` instead of `failed`, and recovery is automatic: a
 recovery driver reclaims the apply and continues it from where it left off,
 using engine checkpoints so completed work is not redone. Failures where
 retrying cannot help — the engine rejected a statement, the target refused the
 change — skip this state and go straight to permanent `failed`.
+
+A clean shutdown is not one of these failures. A process that stops on purpose
+hands its claims back and leaves the apply active, so a peer driver resumes it
+without the apply ever passing through `failed_retryable` or spending budget.
 
 Each automatic pickup consumes one **recovery attempt** from a fixed budget —
 currently **10 attempts**, on top of the original run. The attempt counter is

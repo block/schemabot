@@ -732,6 +732,8 @@ Claims use `FOR UPDATE SKIP LOCKED` so multiple operator drivers can run concurr
 
 A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
 
+The staleness window covers unclean kills. When a process shuts down cleanly it brings its in-process engines down first — releasing each target's lock — and then hands its claims back explicitly, so the work is claimable on the next poll rather than after the window. Claims whose engine did not come down are the exception: they are left to go stale, because a driver handed a target this process still holds the lock on would only be refused.
+
 Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the operator. The wake path is only a latency optimization: it nudges one driver to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the operator is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
 
 ```

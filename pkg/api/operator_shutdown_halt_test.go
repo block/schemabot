@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"slices"
@@ -39,6 +40,18 @@ func (c *haltingTernClient) HaltForShutdown(context.Context) error {
 		c.order.record("halt")
 	}
 	return c.haltErr
+}
+
+// thisProcessLeaseOwner builds the lease owner a driver in this process writes,
+// which is what marks a claim as one this process may hand back.
+func thisProcessLeaseOwner(driverID int) string {
+	return fmt.Sprintf("%s/driver-%d", storage.LeaseOwnerProcess(), driverID)
+}
+
+// enginesAllDown is the halt outcome of a clean shutdown, where every claim is
+// safe to hand back.
+func enginesAllDown() engineHaltOutcome {
+	return engineHaltOutcome{failedDeployments: map[string]bool{}}
 }
 
 // shutdownOrderRecorder records shutdown's externally visible steps in the order
@@ -186,12 +199,12 @@ func TestReleaseHeldClaimsHandsBackAnActiveApply(t *testing.T) {
 	apply := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
 		Environment: "staging", State: state.Apply.Running,
-		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
 	}
 	applies := &capturingApplyStore{apply: apply}
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
 
-	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), logAttrs: apply.IdentityLogAttrs()}})
+	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), deployment: apply.Deployment, logAttrs: apply.IdentityLogAttrs()}}, enginesAllDown())
 
 	released := applies.releasedClaimLeases()
 	require.Len(t, released, 1, "the claim on a still-active apply is handed back")
@@ -205,12 +218,12 @@ func TestReleaseHeldClaimsLeavesSettledAppliesAlone(t *testing.T) {
 	apply := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
 		Environment: "staging", State: state.Apply.Completed,
-		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
 	}
 	applies := &capturingApplyStore{apply: apply}
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
 
-	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), logAttrs: apply.IdentityLogAttrs()}})
+	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), deployment: apply.Deployment, logAttrs: apply.IdentityLogAttrs()}}, enginesAllDown())
 
 	assert.Empty(t, applies.releasedClaimLeases(), "a settled apply is not handed back")
 }
@@ -222,7 +235,7 @@ func TestTrackHeldClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
 	apply := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
-		Environment: "staging", LeaseOwner: "driver-0", LeaseToken: "held-token",
+		Environment: "staging", LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
 	}
 
 	done := svc.trackHeldClaim(apply)
@@ -235,7 +248,7 @@ func TestTrackHeldClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
 	// A peer rotates the lease onto itself mid-drive.
 	rotated := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
-		Environment: "staging", LeaseOwner: "driver-1", LeaseToken: "rotated-token",
+		Environment: "staging", LeaseOwner: thisProcessLeaseOwner(1), LeaseToken: "rotated-token",
 	}
 	svc.trackHeldClaim(rotated)
 
@@ -266,11 +279,11 @@ func TestStopOperatorHandsClaimsBackOnlyAfterEnginesAreDown(t *testing.T) {
 	apply := &storage.Apply{
 		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
 		Environment: "staging", State: state.Apply.Running,
-		LeaseOwner: "departing/driver-0", LeaseToken: "held-token",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
 	}
 	operation := &storage.ApplyOperation{
 		ID: 7, ApplyID: 123, Deployment: DefaultDeployment,
-		LeaseOwner: "departing/driver-0", LeaseToken: "held-operation-token",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-operation-token",
 	}
 	svc, client, applies, operations := newShutdownOrderTestService(t, apply)
 	svc.trackHeldClaim(apply)
@@ -291,11 +304,11 @@ func TestStopOperatorHandsClaimsBackOnlyAfterEnginesAreDown(t *testing.T) {
 func TestReleaseHeldOperationClaimsHandsBackAClaimedOperation(t *testing.T) {
 	operation := &storage.ApplyOperation{
 		ID: 7, ApplyID: 123, Deployment: DefaultDeployment,
-		LeaseOwner: "departing/driver-0", LeaseToken: "held-operation-token",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-operation-token",
 	}
 	svc, _, _, operations := newShutdownOrderTestService(t, &storage.Apply{ID: 123, ApplyIdentifier: "apply-123"})
 
-	svc.releaseHeldOperationClaims([]heldOperationClaim{{lease: operation.Lease(), logAttrs: operation.LogAttrs()}})
+	svc.releaseHeldOperationClaims([]heldOperationClaim{{lease: operation.Lease(), deployment: operation.Deployment, logAttrs: operation.LogAttrs()}}, enginesAllDown())
 
 	released := operations.releasedLeases()
 	require.Len(t, released, 1)
@@ -310,7 +323,7 @@ func TestTrackHeldOperationClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
 	operation := &storage.ApplyOperation{
 		ID: 7, ApplyID: 123, Deployment: DefaultDeployment,
-		LeaseOwner: "driver-0", LeaseToken: "held-operation-token",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-operation-token",
 	}
 
 	done := svc.trackHeldOperationClaim(operation, operation.Lease())
@@ -321,7 +334,7 @@ func TestTrackHeldOperationClaimRegistersOnlyTheClaimsInFlight(t *testing.T) {
 	// A peer rotates the operation lease onto itself mid-drive.
 	rotated := &storage.ApplyOperation{
 		ID: 7, ApplyID: 123, Deployment: DefaultDeployment,
-		LeaseOwner: "driver-1", LeaseToken: "rotated-operation-token",
+		LeaseOwner: thisProcessLeaseOwner(1), LeaseToken: "rotated-operation-token",
 	}
 	svc.trackHeldOperationClaim(rotated, rotated.Lease())
 
@@ -341,4 +354,153 @@ func TestTrackHeldOperationClaimIgnoresAnInvalidLease(t *testing.T) {
 
 	assert.Empty(t, svc.heldOperationClaimsSnapshot())
 	done()
+}
+
+// A drive that reaches its parent apply through an operation lease reads the
+// parent without claiming it, so the row can carry a peer's lease while that
+// peer drives its own sibling operations. Handing that lease back would backdate
+// it out from under the peer, so only claims this process wrote are registered.
+func TestTrackHeldClaimIgnoresAnotherProcessesLease(t *testing.T) {
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
+	apply := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders", Environment: "staging",
+		LeaseOwner: "peer-host/4242/driver-0", LeaseToken: "peer-token",
+	}
+
+	done := svc.trackHeldClaim(apply)
+
+	assert.Empty(t, svc.heldClaimsSnapshot())
+	done()
+}
+
+// An engine that will not come down still holds its target's lock. Handing its
+// claim back would put a peer driver onto that target within seconds and have it
+// refused, burning a recovery attempt — worse than letting the claim go stale,
+// which at least costs only the staleness window. The claims of engines that did
+// come down are handed back as usual.
+func TestReleaseHeldClaimsKeepsClaimsWhoseEngineIsStillUp(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders", Deployment: "west",
+		Environment: "staging", State: state.Apply.Running,
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
+	}
+	applies := &capturingApplyStore{apply: apply}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
+	wedged := engineHaltOutcome{failedDeployments: map[string]bool{"west": true}}
+
+	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), deployment: "west", logAttrs: apply.IdentityLogAttrs()}}, wedged)
+
+	assert.Empty(t, applies.releasedClaimLeases(), "a claim whose engine is still up is left to go stale")
+
+	svc.releaseHeldClaims([]heldClaim{{lease: apply.Lease(), deployment: "east", logAttrs: apply.IdentityLogAttrs()}}, wedged)
+
+	assert.Len(t, applies.releasedClaimLeases(), 1, "a claim whose engine came down is still handed back")
+}
+
+// The same gate covers operation claims, which are what a peer driver actually
+// claims work through.
+func TestReleaseHeldOperationClaimsKeepsClaimsWhoseEngineIsStillUp(t *testing.T) {
+	operation := &storage.ApplyOperation{
+		ID: 7, ApplyID: 123, Deployment: "west",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-operation-token",
+	}
+	svc, _, _, operations := newShutdownOrderTestService(t, &storage.Apply{ID: 123, ApplyIdentifier: "apply-123"})
+	wedged := engineHaltOutcome{failedDeployments: map[string]bool{"west": true}}
+
+	svc.releaseHeldOperationClaims([]heldOperationClaim{{lease: operation.Lease(), deployment: "west", logAttrs: operation.LogAttrs()}}, wedged)
+
+	assert.Empty(t, operations.releasedLeases(), "a claim whose engine is still up is left to go stale")
+}
+
+// A halt failure this process cannot attribute to a deployment leaves no claim
+// provably safe, so none are handed back.
+func TestEngineHaltOutcomeHoldsEveryClaimOnAnUnattributedFailure(t *testing.T) {
+	unattributed := engineHaltOutcome{failedDeployments: map[string]bool{}, unattributedFailure: true}
+
+	assert.False(t, unattributed.haltedCleanly("west"))
+	assert.False(t, unattributed.haltedCleanly(""))
+}
+
+// An apply with no deployment recorded is served by the default deployment, and
+// is gated on that deployment's engine.
+func TestEngineHaltOutcomeTreatsAnUnsetDeploymentAsTheDefault(t *testing.T) {
+	wedged := engineHaltOutcome{failedDeployments: map[string]bool{DefaultDeployment: true}}
+
+	assert.False(t, wedged.haltedCleanly(""))
+	assert.True(t, wedged.haltedCleanly("west"))
+}
+
+// A drive already past its stop-channel check can still take a claim after
+// shutdown begins. Deregistering it on the way out would leave it in neither the
+// map nor any snapshot, so it would be handed back by nobody and idle for the
+// whole staleness window. Once shutdown starts collecting, a returning drive
+// leaves its claim behind.
+func TestClaimsTakenDuringShutdownAreStillHandedBack(t *testing.T) {
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
+	apply := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders", Environment: "staging",
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
+	}
+	operation := &storage.ApplyOperation{
+		ID: 7, ApplyID: 123, Deployment: DefaultDeployment,
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-operation-token",
+	}
+
+	svc.beginClaimDrain()
+	svc.trackHeldClaim(apply)()
+	svc.trackHeldOperationClaim(operation, operation.Lease())()
+
+	held, heldOperations := svc.drainHeldClaims()
+	require.Len(t, held, 1, "a claim taken and returned during shutdown is still handed back")
+	assert.Equal(t, apply.Lease(), held[0].lease)
+	require.Len(t, heldOperations, 1)
+	assert.Equal(t, operation.Lease(), heldOperations[0].lease)
+
+	// The drain does not outlive the shutdown that opened it: a later drive
+	// deregisters normally again.
+	svc.trackHeldClaim(apply)()
+	assert.Empty(t, svc.heldClaimsSnapshot())
+}
+
+// Handing one claim back must not be abandoned because reading another failed:
+// every remaining claim would keep its lease for the full staleness window.
+func TestReleaseHeldClaimsContinuesPastAnUnreadableApply(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
+		Environment: "staging", State: state.Apply.Running,
+		LeaseOwner: thisProcessLeaseOwner(0), LeaseToken: "held-token",
+	}
+	applies := &capturingApplyStore{apply: apply}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
+
+	// The first two claims name applies this store cannot produce — one read
+	// error, one missing row — and the third is the live one.
+	unreadable := heldClaim{lease: storage.ApplyLease{ApplyID: 404, Owner: thisProcessLeaseOwner(0), Token: "gone-token"}}
+	svc.releaseHeldClaims([]heldClaim{
+		unreadable,
+		{lease: apply.Lease(), deployment: apply.Deployment, logAttrs: apply.IdentityLogAttrs()},
+	}, enginesAllDown())
+
+	released := applies.releasedClaimLeases()
+	require.Len(t, released, 1, "a claim after an unreadable one is still handed back")
+	assert.Equal(t, "held-token", released[0].Token)
+}
+
+// A claim a peer driver has already rotated onto itself is not this process's to
+// hand back, and the token-scoped release reports that rather than backdating
+// the peer's lease.
+func TestReleaseHeldClaimsLeavesARotatedClaimAlone(t *testing.T) {
+	apply := &storage.Apply{
+		ID: 123, ApplyIdentifier: "apply-123", Database: "orders",
+		Environment: "staging", State: state.Apply.Running,
+		LeaseOwner: "peer-host/4242/driver-0", LeaseToken: "rotated-token",
+	}
+	applies := &capturingApplyStore{apply: apply}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, applies)
+	stale := storage.ApplyLease{ApplyID: 123, Owner: thisProcessLeaseOwner(0), Token: "held-token"}
+
+	svc.releaseHeldClaims([]heldClaim{{lease: stale, logAttrs: apply.IdentityLogAttrs()}}, enginesAllDown())
+
+	assert.Empty(t, applies.releasedClaimLeases(), "the peer's lease is left untouched")
+	assert.Equal(t, "rotated-token", apply.LeaseToken)
 }
