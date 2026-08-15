@@ -778,9 +778,9 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				latestCompletedAt = sh.completedAt
 			}
 
-			// Resolve effective shard state: running + ready_to_complete = ready_to_complete
+			// Resolve effective shard state from Vitess's authoritative readiness signal.
 			shardState := sh.status
-			if sh.status == state.Vitess.Running && sh.readyToComplete {
+			if sh.readyToComplete && !state.IsTerminalVitessState(sh.status) {
 				shardState = state.Vitess.ReadyToComplete
 			}
 
