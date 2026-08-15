@@ -546,8 +546,9 @@ func TestDurableCheckSuiteMixedCoverageSynthesizesOnlyUncovered(t *testing.T) {
 	require.NotNil(t, uncovered, "the uncovered sibling must still be recovered")
 }
 
-// A malformed check_suite payload cannot be decoded, so the driver fails it
-// terminally (no retry) rather than crash-looping the fleet on a poison row.
+// A malformed check_suite payload cannot be decoded, so the driver
+// dead-letters it (no retry) rather than crash-looping the fleet on a
+// poison row.
 func TestDurableCheckSuiteDriverFailsMalformedTerminally(t *testing.T) {
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
 		Provider:   storage.WebhookProviderGitHub,
@@ -560,12 +561,12 @@ func TestDurableCheckSuiteDriverFailsMalformedTerminally(t *testing.T) {
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 	select {
-	case failure := <-store.failed:
-		require.Nil(t, failure.retryAfter, "malformed payload must not be retried")
+	case failure := <-store.failedPermanent:
 		require.Contains(t, failure.errMsg, "decode durable check_suite delivery")
 	default:
-		t.Fatal("expected malformed check_suite event to be marked failed")
+		t.Fatal("expected malformed check_suite delivery to be dead-lettered")
 	}
+	require.Empty(t, store.failed, "a malformed payload is deterministic and must not burn retry budget")
 	require.Empty(t, store.completed)
 }
 
