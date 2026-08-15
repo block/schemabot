@@ -397,15 +397,15 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
 	})
-	assert.Contains(t, copying, "⏸ Paused by throttler: replica-lag 12s > 10s")
+	assert.Contains(t, copying, "🚦 Throttled: replica-lag 12s > 10s")
 
 	noReason := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true,
 	})
-	assert.Contains(t, noReason, "⏸ Paused by throttler")
-	assert.NotContains(t, noReason, "Paused by throttler:")
+	assert.Contains(t, noReason, "🚦 Throttled")
+	assert.NotContains(t, noReason, "Throttled:")
 
 	checksumming := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
@@ -413,20 +413,20 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		Throttled: true, ThrottleReason: "threads-running 130 > 128",
 	})
 	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21%)")
-	assert.Contains(t, checksumming, "⏸ Paused by throttler: threads-running 130 > 128")
+	assert.Contains(t, checksumming, "🚦 Throttled: threads-running 130 > 128")
 
 	notThrottled := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 	})
-	assert.NotContains(t, notThrottled, "Paused by throttler")
+	assert.NotContains(t, notThrottled, "Throttled")
 
 	completed := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Completed,
 		RowsCopied: 100000, RowsTotal: 100000, PercentComplete: 100,
 		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
 	})
-	assert.NotContains(t, completed, "Paused by throttler", "a terminal table never renders a stale throttle flag")
+	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
 }
 
 func TestFormatTableProgress_InstantDDL(t *testing.T) {

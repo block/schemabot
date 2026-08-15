@@ -2862,7 +2862,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
-⏸ Paused by throttler: replica-lag 12s > 10s
+🚦 Throttled: replica-lag 12s > 10s
 
 **`products`**: ⏳ Queued
 
@@ -5040,7 +5040,7 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,100,000 / 5,000,000
-       • ⏸ Paused by throttler: replica-lag 12s > 10s
+       • 🚦 Throttled: replica-lag 12s > 10s
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;

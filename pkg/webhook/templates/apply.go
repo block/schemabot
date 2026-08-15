@@ -967,22 +967,23 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 	}
 }
 
-// writeThrottleLine notes that the engine's throttler is pausing the table's
-// active phase, so a stalled bar reads as a deliberate pause rather than a
-// hang. The drive clears the stored flag when the pause lifts, so the line
-// disappears on the next refresh. The reason is sanitized at the engine
-// boundary before it is stored, so it is safe to render in markdown. The
-// pause is its own paragraph so it never merges into the preceding progress
-// detail line, whichever markdown line-break mode renders the comment.
+// writeThrottleLine notes that the engine's throttler is holding back the
+// table's active phase, so a stalled bar reads as deliberate backpressure —
+// slowed, not stopped — never to be confused with an operator stop. The drive
+// clears the stored flag when the throttle lifts, so the line disappears on
+// the next refresh. The reason is sanitized at the engine boundary before it
+// is stored, so it is safe to render in markdown. The line is its own
+// paragraph so it never merges into the preceding progress detail line,
+// whichever markdown line-break mode renders the comment.
 func writeThrottleLine(sb *strings.Builder, table TableProgressData) {
 	if !table.Throttled {
 		return
 	}
 	if table.ThrottleReason != "" {
-		fmt.Fprintf(sb, "\n⏸ Paused by throttler: %s\n", table.ThrottleReason)
+		fmt.Fprintf(sb, "\n🚦 Throttled: %s\n", table.ThrottleReason)
 		return
 	}
-	sb.WriteString("\n⏸ Paused by throttler\n")
+	sb.WriteString("\n🚦 Throttled\n")
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
