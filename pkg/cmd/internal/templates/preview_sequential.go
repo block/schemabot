@@ -120,7 +120,7 @@ func previewSeqThrottledOutput() {
 			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
 			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Running,
 				RowsCopied: 3100000, RowsTotal: 5000000, PercentComplete: 62,
-				Throttled: true, ThrottleReason: "replica-lag 12s > 10s"},
+				Throttled: true, ThrottleReason: "commit-latency 112.4ms >= 100ms"},
 			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}

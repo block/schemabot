@@ -1186,7 +1186,7 @@ func PreviewCommentApplyThrottled() string {
 	tables[1].PercentComplete = 62
 	tables[1].ETASeconds = 195
 	tables[1].Throttled = true
-	tables[1].ThrottleReason = "replica-lag 12s > 10s"
+	tables[1].ThrottleReason = "commit-latency 112.4ms >= 100ms"
 	tables[2].Status = state.Task.Pending
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
