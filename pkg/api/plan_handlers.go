@@ -26,6 +26,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 const applyOperationKeyMaxLen = 255
@@ -59,7 +60,7 @@ type unsupportedPullSchemaError struct {
 }
 
 func (e *unsupportedPullSchemaError) Error() string {
-	return fmt.Sprintf("pull schema supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, e.DatabaseType)
+	return fmt.Sprintf("pull schema is not supported for %s databases on this deployment", e.DatabaseType)
 }
 
 // RemoteDeploymentUnavailableError carries routing metadata for remote
@@ -169,12 +170,6 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
 	}
-	if resolvedTarget.DatabaseType != storage.DatabaseTypeMySQL && resolvedTarget.DatabaseType != storage.DatabaseTypeVitess {
-		unsupportedErr := &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
-		span.RecordError(unsupportedErr)
-		span.SetStatus(otelcodes.Error, "unsupported database type")
-		return nil, unsupportedErr
-	}
 	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
 	if err != nil {
 		span.RecordError(err)
@@ -242,6 +237,17 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 					Target:     resolvedTarget.Target,
 					Err:        pullErr,
 				}
+			}
+			// Whether pull is supported is the data plane's answer — it
+			// depends on which engine backs the deployment — so the 501 is
+			// derived from the pull attempt instead of gating on database
+			// type. One sentinel check covers both routes: the local client
+			// returns ErrPullSchemaUnsupportedType directly, and the gRPC
+			// client re-derives the same sentinel from the remote data
+			// plane's own unsupported verdict (infrastructure Unimplemented
+			// errors deliberately fall through as ordinary failures).
+			if errors.Is(pullErr, tern.ErrPullSchemaUnsupportedType) {
+				return nil, &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
 			}
 			return nil, pullErr
 		}

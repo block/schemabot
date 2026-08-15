@@ -59,6 +59,16 @@ var (
 	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
 )
 
+// SchemaPuller is the optional engine capability that answers PullSchema for
+// database types without a built-in pull path. An engine supplied through
+// LocalConfig.EngineFactories advertises live-schema pull support by
+// implementing it; LocalClient delegates pull requests for its type to the
+// capability and fails closed with ErrPullSchemaUnsupportedType when the
+// engine does not provide it.
+type SchemaPuller interface {
+	PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+}
+
 // Client defines the interface for schema change operations.
 // Uses proto-generated types for type safety.
 type Client interface {

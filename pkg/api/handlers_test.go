@@ -1585,34 +1585,87 @@ func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
 	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[1].CatalogDetail)
 }
 
-func TestExecutePullSchemaRejectsUnsupportedType(t *testing.T) {
-	cfg := &ServerConfig{
-		Databases: map[string]DatabaseConfig{
-			"orders": {
-				Type: storage.DatabaseTypeStrata,
-				Environments: map[string]EnvironmentConfig{
-					"production": {Target: "orders-production", Deployment: "primary"},
-				},
-			},
+// Whether pull is supported for a database type is the data plane's answer:
+// the control plane dispatches the pull and converts the data plane's
+// "unsupported" reply — the local client's typed sentinel, or its gRPC
+// mapping (codes.Unimplemented) from a remote deployment — into the typed
+// error the HTTP layer renders as 501. Other pull failures pass through
+// untouched.
+func TestExecutePullSchemaConvertsDataPlaneUnsupported(t *testing.T) {
+	tests := []struct {
+		name        string
+		client      *mockTernClient
+		unsupported bool
+	}{
+		{
+			name:        "local client sentinel",
+			client:      &mockTernClient{pullSchemaErr: fmt.Errorf("engine does not support schema pull: %w", tern.ErrPullSchemaUnsupportedType)},
+			unsupported: true,
 		},
-		TernDeployments: TernConfig{
-			"primary": {"production": "tern.example.com:80"},
+		{
+			// The gRPC client re-derives the sentinel from the remote data
+			// plane's own unsupported verdict, so the remote route surfaces
+			// here as a wrapped sentinel just like the local one.
+			name:        "remote sentinel re-derived by the gRPC client",
+			client:      &mockTernClient{isRemote: true, pullSchemaErr: fmt.Errorf("remote data plane does not support pull schema for database orders: %w", tern.ErrPullSchemaUnsupportedType)},
+			unsupported: true,
+		},
+		{
+			// A bare Unimplemented carries no data-plane verdict about the
+			// database type — it can come from a proxy mapping an HTTP 404 or
+			// a data plane too old to serve the RPC — so it must fail as an
+			// ordinary error, never as a 501 capability answer.
+			name:        "remote unimplemented without sentinel is not converted",
+			client:      &mockTernClient{isRemote: true, pullSchemaErr: status.Error(codes.Unimplemented, "unexpected HTTP status code received from server: 404")},
+			unsupported: false,
+		},
+		{
+			name:        "local unimplemented code without sentinel is not converted",
+			client:      &mockTernClient{pullSchemaErr: status.Error(codes.Unimplemented, "method PullSchema not implemented")},
+			unsupported: false,
+		},
+		{
+			name:        "unrelated pull failure passes through",
+			client:      &mockTernClient{pullSchemaErr: errors.New("dial tcp: connection refused")},
+			unsupported: false,
 		},
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorage{}, cfg, map[string]tern.Client{
-		"primary/production": &mockTernClient{},
-	}, logger)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"orders": {
+						Type: storage.DatabaseTypeStrata,
+						Environments: map[string]EnvironmentConfig{
+							"production": {Target: "orders-production", Deployment: "primary"},
+						},
+					},
+				},
+				TernDeployments: TernConfig{
+					"primary": {"production": "tern.example.com:80"},
+				},
+			}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorage{}, cfg, map[string]tern.Client{
+				"primary/production": tt.client,
+			}, logger)
 
-	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
-		Database:    "orders",
-		Environment: "production",
-		Type:        storage.DatabaseTypeStrata,
-	})
+			_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+				Database:    "orders",
+				Environment: "production",
+				Type:        storage.DatabaseTypeStrata,
+			})
 
-	var unsupportedErr *unsupportedPullSchemaError
-	require.ErrorAs(t, err, &unsupportedErr)
-	assert.Equal(t, storage.DatabaseTypeStrata, unsupportedErr.DatabaseType)
+			require.Error(t, err)
+			var unsupportedErr *unsupportedPullSchemaError
+			if tt.unsupported {
+				require.ErrorAs(t, err, &unsupportedErr)
+				assert.Equal(t, storage.DatabaseTypeStrata, unsupportedErr.DatabaseType)
+			} else {
+				assert.False(t, errors.As(err, &unsupportedErr), "pull failure must not be misreported as unsupported: %v", err)
+			}
+		})
+	}
 }
 
 // A multi-deployment environment pulls its live schema from the primary

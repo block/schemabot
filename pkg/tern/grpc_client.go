@@ -331,7 +331,26 @@ func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*te
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
-	return c.client.PullSchema(ctx, req)
+	resp, err := c.client.PullSchema(ctx, req)
+	if err != nil && remotePullSchemaUnsupported(err) {
+		return nil, fmt.Errorf("remote data plane does not support pull schema for database %s: %w: %w", req.GetDatabase(), ErrPullSchemaUnsupportedType, err)
+	}
+	return resp, err
+}
+
+// remotePullSchemaUnsupported reports whether a remote PullSchema failure is
+// the data plane's own unsupported-type verdict, so the caller can re-derive
+// ErrPullSchemaUnsupportedType and classify local and remote pulls the same
+// way. The tern server maps that sentinel to codes.Unimplemented with the
+// sentinel text in the status message, so both must match here: the code alone
+// also arrives from infrastructure — a proxy mapping an HTTP 404, or a data
+// plane too old to serve the RPC — and says nothing about the database type.
+func remotePullSchemaUnsupported(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	return st.Code() == codes.Unimplemented && strings.Contains(st.Message(), ErrPullSchemaUnsupportedType.Error())
 }
 
 func (c *GRPCClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
