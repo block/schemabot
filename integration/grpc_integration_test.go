@@ -464,9 +464,9 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 // duplicate rows. The control plane never polls the engine directly, so the PR
 // comment and CLI can only name the table whose engine error caused the failure
 // if the remote's per-table error reaches SchemaBot's own stored task row. The
-// driver that holds the apply's lease is the only writer of that row, so driving
-// the apply to terminal must be sufficient on its own: the failed table carries
-// the engine error on its task record, not just on the apply record.
+// driver that holds the apply's lease is the only writer of that reason, so
+// driving the apply to terminal must be sufficient on its own: the failed table
+// carries the engine error on its task record, not just on the apply record.
 func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	ctx := t.Context()
 
@@ -482,9 +482,10 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdentifier(appDBName))
 	require.NoError(t, err, "create app database")
 	t.Cleanup(func() {
-		// Cleanup runs after the test context is cancelled, so it needs a context
-		// that outlives it.
-		dropCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		// Cleanup runs after the test context is cancelled, so the drop detaches
+		// from it: a context derived from a cancelled parent is born cancelled and
+		// the database would outlive the run.
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
 		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
 			t.Logf("cleanup: drop database %s: %v", appDBName, err)
@@ -624,8 +625,10 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	require.NotEmpty(t, storedApply.ErrorMessage, "failed apply record should carry the engine error")
 
 	// Step 5: The failed table's own engine error must be on SchemaBot's stored
-	// task row — the record the PR comment and CLI render from — written there by
-	// the driver, with no read-path repair involved.
+	// task row — the record the PR comment and CLI render from. Progress reads
+	// mirror per-table state and counters from the remote but never the reason,
+	// so a reason on this row can only have been written by the driver holding
+	// the apply's lease.
 	tasks, err := schemabotStorage.Tasks().GetByApplyID(ctx, storedApply.ID)
 	require.NoError(t, err, "get tasks by apply ID")
 	require.NotEmpty(t, tasks, "expected task records for apply %s", applyID)
