@@ -150,12 +150,12 @@ jobs:
           # own runner rather than setting the wall time for everything else.
           - shard: ./integration
             match: "-E"
-          # Its exact complement — spread across ./pkg, ./cmd and ./e2e, so it
-          # is named by exclusion rather than by a path prefix. The two greps
-          # are inverses of one another, so every package lands in exactly one
-          # lane and a newly added package is picked up here without touching
-          # this file.
-          - shard: everything else
+          # Every other integration-tagged package: tests that live beside the
+          # code they cover, spread across ./pkg, ./cmd and ./e2e. Selected as
+          # the exact inverse of the grep above, so every package lands in
+          # exactly one lane and a newly added package is picked up here
+          # without touching this file.
+          - shard: per-package
             match: "-vE"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
