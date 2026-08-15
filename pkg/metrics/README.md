@@ -196,7 +196,7 @@ Operation values:
 | `aggregate_check_sync` | SchemaBot tried to make the visible aggregate GitHub Check Run match stored per-database check state. The status label says whether it created/updated, skipped, blocked, or failed. |
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
 | `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a driver restart, crash, or race. |
-| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
+| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. `status="blocked"` means discovery could not run against a complete changed-file list — today that is a PR over GitHub's per-PR file cap — so the aggregate fails closed instead of planning from a partial diff. |
 | `schema_config_source_policy` | SchemaBot evaluated whether a discovered `schemabot.yaml` path is inside this repository's server-owned `allowed_dirs` boundary. `status="skipped"` means the config is outside the managed paths and was ignored; `status="error"` means the config is in a managed path but cannot be routed safely. |
 | `schema_config_environment_validation` | SchemaBot found schema changes but none of the database's server-configured environments are allowed for this deployment, so it failed the aggregate check closed. |
 
@@ -207,6 +207,16 @@ still matters. For example, commit A can add a schema change and start an apply,
 then commit B can remove that schema change before the apply finishes. SchemaBot
 blocks the aggregate Check Run for commit B until an operator decides whether
 the target environment needs another apply, a rollback, or manual reconciliation.
+
+`status="blocked"` for `operation="schema_config_discovery"` is a different
+signal: it counts PRs so large that GitHub will not report their full
+changed-file list, so it tracks PR size rather than stored-state trouble. It is
+deterministic per PR — the same PR blocks on every delivery until it is split —
+and the author is told to split the PR, so no operator action is needed unless
+the rate is high enough to suggest a repository routinely opening PRs SchemaBot
+cannot plan. Pair it with `schemabot.github.pr_file_cap_exceeded_total`, whose
+`schema_visible` label says how many of those PRs looked schema-related.
+
 A spike in `status="error"` usually points to storage or GitHub API failures and
 should be investigated before relying on branch-protection state.
 
