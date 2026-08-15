@@ -545,6 +545,7 @@ Run output remains human-readable and may change.
 | `rollback_completed` | Per-database row | A rollback succeeded, so the target environment no longer contains the PR's desired schema. |
 | `github_schema_config_discovery_unavailable` | Aggregate row | SchemaBot knew the PR head SHA, but GitHub was unavailable while SchemaBot inspected changed files or repository contents. |
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
+| `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
@@ -559,6 +560,11 @@ the failed SchemaBot check to trigger SchemaBot discovery and auto-plan again
 for the current PR head. SchemaBot ignores Check Run re-run events for older
 commits after the PR head has moved, so stale re-runs cannot publish status for
 the current branch protection gate.
+
+Re-run does not help a check blocked with `pr_file_cap_exceeded`. GitHub returns
+the same truncated changed-file list every time, so the check fails closed again;
+the PR has to be split before SchemaBot can plan it. The check output says so
+rather than offering a retry.
 
 Use these PR comment commands for normal retry paths:
 

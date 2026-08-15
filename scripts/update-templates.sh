@@ -161,6 +161,7 @@ render_markdown_section() {
 # === Paired sections (PR + CLI) ===
 render_paired_section "Plan & Status"  "comment_plan_all"       "cli_plan_all"
 render_markdown_section "Aggregate Check — Details summary" "aggregate_check_summary"
+render_markdown_section "Aggregate Check — Blocked: PR File Cap Exceeded" "aggregate_check_file_cap_blocked"
 render_paired_section "Locking"        "comment_locking_all"    "cli_locking_all"
 render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
 
