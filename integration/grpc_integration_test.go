@@ -320,16 +320,25 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	ctx := t.Context()
 
-	// Create a unique target database for this test
+	// Create a unique target database for this test. The close cleanup is
+	// registered before the drop cleanup so it runs after it (cleanups run
+	// LIFO): the drop still has a live handle.
 	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
-	defer utils.CloseAndLog(targetDB)
+	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 
 	appDBName := fmt.Sprintf("taskst_%d", time.Now().UnixNano()%100000)
 	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
 	require.NoError(t, err, "create app database")
 	t.Cleanup(func() {
-		_, _ = targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+appDBName)
+		// Cleanup runs after the test context is cancelled, so the drop detaches
+		// from it: a context derived from a cancelled parent is born cancelled and
+		// the database would outlive the run.
+		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+appDBName); err != nil {
+			t.Logf("cleanup: drop database %s: %v", appDBName, err)
+		}
 	})
 
 	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
