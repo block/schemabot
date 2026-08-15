@@ -40,8 +40,9 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 		// Handles the race where storage is updated but Spirit hasn't fully finished.
 		if attempt < 9 {
 			c.logger.Debug("found potentially stale active task, retrying",
-				"task_id", blocking.taskIdentifier, "apply_id", blocking.applyIdentifier,
-				"apply_state", blocking.applyState, "attempt", attempt)
+				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
+				"apply_id", blocking.applyIdentifier, "apply_state", blocking.applyState,
+				"attempt", attempt)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
@@ -83,7 +84,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		// keeps blocking (fail closed).
 		apply, ok := c.applyForConflictCheck(ctx, t)
 		if !ok {
-			return blockingTask{taskIdentifier: t.TaskIdentifier}
+			return newBlockingTask(t, nil)
 		}
 
 		// A pending task of a terminal apply can never start; cancel it so it
@@ -97,28 +98,41 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue // Task was stale; engine confirmed it's done.
 		}
 
-		c.logger.Debug("conflict check: task is active",
-			"task_id", t.TaskIdentifier, "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)
-		return blockingTask{
-			taskIdentifier:  t.TaskIdentifier,
-			applyIdentifier: apply.ApplyIdentifier,
-			applyState:      apply.State,
-		}
+		c.logger.Debug("conflict check: task is active", append(t.LogAttrs(),
+			"apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return newBlockingTask(t, apply)
 	}
 	return blockingTask{}
 }
 
 // blockingTask names the active work that refuses a new apply on a database,
-// in the terms an operator needs to clear it: which task blocks, which apply
-// owns that task, and what that apply is doing.
+// in the terms an operator needs to clear it: what is being changed, which task
+// tracks it, which apply owns that task, and what that apply is doing.
 //
 // applyIdentifier and applyState are empty when the apply could not be loaded.
 // That task still blocks — the conflict check fails closed — so the conflict is
 // reported by task alone rather than being suppressed.
 type blockingTask struct {
 	taskIdentifier  string
+	table           string
+	shard           string
 	applyIdentifier string
 	applyState      string
+}
+
+// newBlockingTask records the conflicting task, and the apply that owns it when
+// that apply could be loaded.
+func newBlockingTask(t *storage.Task, apply *storage.Apply) blockingTask {
+	b := blockingTask{
+		taskIdentifier: t.TaskIdentifier,
+		table:          t.TableName,
+		shard:          t.Shard,
+	}
+	if apply != nil {
+		b.applyIdentifier = apply.ApplyIdentifier
+		b.applyState = apply.State
+	}
+	return b
 }
 
 // blocks reports whether a conflicting task was found.
@@ -128,15 +142,28 @@ func (b blockingTask) blocks() bool { return b.taskIdentifier != "" }
 // where to go to clear it.
 func (b blockingTask) describe() string {
 	if b.applyIdentifier == "" {
-		return fmt.Sprintf("blocking task %s, whose apply could not be loaded", b.taskIdentifier)
+		return b.subject() + " is held by an apply that could not be loaded"
 	}
 
-	described := fmt.Sprintf("blocking task %s on apply %s (%s)",
-		b.taskIdentifier, b.applyIdentifier, b.applyState)
+	described := fmt.Sprintf("%s is held by apply %s (%s)",
+		b.subject(), b.applyIdentifier, b.applyState)
 	if resolution := b.resolution(); resolution != "" {
 		return described + "; " + resolution
 	}
 	return described
+}
+
+// subject names the work being done, leading with the table an operator
+// recognizes and keeping the task identifier as the handle for the CLI. A
+// multi-table atomic change records no table, so it is named by task alone.
+func (b blockingTask) subject() string {
+	if b.table == "" {
+		return fmt.Sprintf("task %s", b.taskIdentifier)
+	}
+	if b.shard == "" {
+		return fmt.Sprintf("table %s (task %s)", b.table, b.taskIdentifier)
+	}
+	return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
 }
 
 // resolution states what clears the database, which differs by what the holding

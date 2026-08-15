@@ -555,10 +555,11 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 }
 
 // The refusal an apply gets when another holds the database is the whole of what
-// an operator sees when their apply dies on arrival, so it has to name the apply
-// to act on and what frees the database. A stopped apply keeps its database by
-// design, so a refusal naming only the task leaves an operator with an
-// identifier they cannot act on and no indication that a decision is owed.
+// an operator sees when their apply dies on arrival, so it has to name what is
+// being changed, the apply to act on, and what frees the database. A stopped
+// apply keeps its database by design, so a refusal naming only the task leaves
+// an operator with an identifier they cannot act on and no indication that a
+// decision is owed.
 func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -569,35 +570,59 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			name: "a stopped apply holds its database until an operator decides its fate",
 			blocking: blockingTask{
 				taskIdentifier:  "task-holding",
+				table:           "xfers",
 				applyIdentifier: "apply-holding",
 				applyState:      state.Apply.Stopped,
 			},
-			want: []string{"task-holding", "apply-holding", "stopped", "started or cancelled"},
+			want: []string{"table xfers", "task-holding", "apply-holding", "stopped", "started or cancelled"},
 		},
 		{
 			name: "a running apply releases its database on its own",
 			blocking: blockingTask{
 				taskIdentifier:  "task-holding",
+				table:           "xfers",
 				applyIdentifier: "apply-holding",
 				applyState:      state.Apply.Running,
 			},
-			want: []string{"task-holding", "apply-holding", "running", "releases the database when it finishes"},
+			want: []string{"table xfers", "task-holding", "apply-holding", "running", "releases the database when it finishes"},
 		},
 		{
 			name: "a post-copy phase is still the running family",
 			blocking: blockingTask{
 				taskIdentifier:  "task-holding",
+				table:           "xfers",
 				applyIdentifier: "apply-holding",
 				applyState:      state.Apply.CatchingUp,
 			},
 			want: []string{"apply-holding", "releases the database when it finishes"},
 		},
 		{
-			name: "an apply that could not be loaded still reports the task it blocks on",
+			name: "a sharded change names the shard, since only that shard is held",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				shard:           "-40",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.Running,
+			},
+			want: []string{"table xfers shard -40", "task-holding", "apply-holding"},
+		},
+		{
+			name: "a multi-table atomic change records no table, so the task names it",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.Running,
+			},
+			want: []string{"task task-holding is held by apply apply-holding"},
+		},
+		{
+			name: "an apply that could not be loaded still reports what it blocks on",
 			blocking: blockingTask{
 				taskIdentifier: "task-holding",
+				table:          "xfers",
 			},
-			want: []string{"task-holding", "could not be loaded"},
+			want: []string{"table xfers", "task-holding", "could not be loaded"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -623,9 +648,9 @@ func TestBlockingTaskOffersNoResolutionForAnUncertainState(t *testing.T) {
 }
 
 // A stopped apply keeps its task and its database so it stays resumable. A new
-// apply on that database is refused, and the refusal must carry the stopped
-// apply's identifier so an operator can start or cancel it rather than being
-// left with a task identifier alone.
+// apply on that database is refused, and the refusal must carry the table being
+// changed and the stopped apply's identifier so an operator can see what is held
+// and start or cancel it, rather than being left with a task identifier alone.
 func TestConflictCheckReportsTheStoppedApplyHoldingTheDatabase(t *testing.T) {
 	stopped := &storage.Task{
 		ID:             1,
@@ -660,9 +685,12 @@ func TestConflictCheckReportsTheStoppedApplyHoldingTheDatabase(t *testing.T) {
 
 	require.True(t, blocking.blocks(), "a stopped task holds the database and refuses a new apply")
 	assert.Equal(t, "task-stopped", blocking.taskIdentifier)
+	assert.Equal(t, "users", blocking.table, "the refusal names the table being changed")
 	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier,
 		"the refusal names the apply an operator acts on, not only the task")
 	assert.Equal(t, state.Apply.Stopped, blocking.applyState)
+	assert.Contains(t, blocking.describe(), "table users",
+		"the table an operator recognizes leads the refusal")
 	assert.Contains(t, blocking.describe(), "started or cancelled",
 		"a stopped apply owes the operator a decision, so the refusal says so")
 }
