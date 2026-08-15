@@ -38,7 +38,7 @@ const postgresVerdictUnavailableReason = "PostgreSQL classifier verdict unavaila
 type PlanRequest struct {
 	Database    string                         `json:"database"`
 	Environment string                         `json:"environment"`
-	Type        string                         `json:"type"` // "mysql" or "vitess"
+	Type        string                         `json:"type"` // database type; must match the server's configured type for the database
 	SchemaFiles map[string]*ternv1.SchemaFiles `json:"schema_files"`
 	Repository  string                         `json:"repository,omitempty"`
 	PullRequest *int32                         `json:"pull_request,omitempty"`
@@ -61,6 +61,31 @@ type unsupportedPullSchemaError struct {
 
 func (e *unsupportedPullSchemaError) Error() string {
 	return fmt.Sprintf("pull schema is not supported for %s databases on this deployment", e.DatabaseType)
+}
+
+// databaseTypeMismatchError reports a request whose declared database type
+// disagrees with the server's configured type for that database. The declared
+// type is a caller assertion checked against server config — the one source
+// of truth for the type vocabulary — so a mismatch is a caller defect (400),
+// not a server failure.
+type databaseTypeMismatchError struct {
+	Database    string
+	RequestType string
+	ConfigType  string
+}
+
+func (e *databaseTypeMismatchError) Error() string {
+	return fmt.Sprintf("database %q type %q does not match server config type %q", e.Database, e.RequestType, e.ConfigType)
+}
+
+// requestedRouteNotConfigured reports whether err means the request named a
+// database or environment this server has no configuration for. Both are the
+// same class of defect — the caller asked for a route that does not exist —
+// so the handlers map them to 400 rather than a server failure.
+func requestedRouteNotConfigured(err error) bool {
+	var dbNotConfigured *DatabaseNotConfiguredError
+	var envNotConfigured *EnvironmentNotConfiguredError
+	return errors.As(err, &dbNotConfigured) || errors.As(err, &envNotConfigured)
 }
 
 // RemoteDeploymentUnavailableError carries routing metadata for remote
@@ -101,14 +126,6 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
 		return
 	}
-	if req.Type != "" {
-		switch req.Type {
-		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
-		default:
-			s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", "+storage.DatabaseTypeStrata+", or "+storage.DatabaseTypePostgres)
-			return
-		}
-	}
 	if _, err := pullCatalogDetail(req.CatalogDetail); err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -116,6 +133,17 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.ExecutePullSchema(r.Context(), req)
 	if err != nil {
+		var typeMismatchErr *databaseTypeMismatchError
+		if errors.As(err, &typeMismatchErr) {
+			s.logger.Warn("pull schema rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if requestedRouteNotConfigured(err) {
+			s.logger.Warn("pull schema rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		var unsupportedErr *unsupportedPullSchemaError
 		if errors.As(err, &unsupportedErr) {
 			s.logger.Warn("pull schema rejected for unsupported database type", "database", req.Database, "environment", req.Environment, "type", unsupportedErr.DatabaseType)
@@ -165,7 +193,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		return nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	if req.Type != "" && req.Type != resolvedTarget.DatabaseType {
-		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
+		typeErr := &databaseTypeMismatchError{Database: req.Database, RequestType: req.Type, ConfigType: resolvedTarget.DatabaseType}
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
@@ -370,10 +398,8 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "environment is required")
 		return
 	}
-	switch req.Type {
-	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
-	default:
-		s.writeError(w, http.StatusBadRequest, "type must be "+storage.DatabaseTypeMySQL+", "+storage.DatabaseTypeVitess+", "+storage.DatabaseTypeStrata+", or "+storage.DatabaseTypePostgres)
+	if req.Type == "" {
+		s.writeError(w, http.StatusBadRequest, "type is required")
 		return
 	}
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
@@ -391,6 +417,17 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.ExecutePlan(r.Context(), req)
 	if err != nil {
+		var typeMismatchErr *databaseTypeMismatchError
+		if errors.As(err, &typeMismatchErr) {
+			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if requestedRouteNotConfigured(err) {
+			s.logger.Warn("plan rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		var policyErr *SourcePolicyError
 		if errors.As(err, &policyErr) {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
@@ -450,7 +487,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 	deployment = resolvedTarget.Deployment
 	if req.Type != resolvedTarget.DatabaseType {
-		typeErr := fmt.Errorf("database %q type %q does not match server config type %q", req.Database, req.Type, resolvedTarget.DatabaseType)
+		typeErr := &databaseTypeMismatchError{Database: req.Database, RequestType: req.Type, ConfigType: resolvedTarget.DatabaseType}
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
