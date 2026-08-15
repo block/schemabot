@@ -478,6 +478,31 @@ func TestFindAllConfigsForPRFailsClosedOnIncompletePRFileList(t *testing.T) {
 	assert.False(t, errors.Is(err, ErrNoConfig))
 }
 
+// A PR over the cap still yields the prefix GitHub did report, returned
+// alongside the sentinel. No caller may plan from that prefix — it is a partial
+// diff — but it is the only evidence of what the PR touches, so the cap report
+// uses it to tell whether any schema or config file was even visible.
+func TestFetchPRFilesReturnsTheVisiblePrefixWithTheCapSentinel(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+
+	files := make([]*gh.CommitFile, maxGitHubPRFiles)
+	for i := range files {
+		files[i] = &gh.CommitFile{Filename: new("docs/readme.md"), Status: new("modified")}
+	}
+	files[0] = &gh.CommitFile{Filename: new("apps/widgets/schema/main/users.sql"), Status: new("modified")}
+	registerPullRequestFiles(t, mux, files)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	visible, err := ic.FetchPRFiles(t.Context(), "octocat/hello-world", 1)
+
+	require.ErrorIs(t, err, ErrPRFilesIncomplete)
+	require.Len(t, visible, maxGitHubPRFiles,
+		"the cap report needs the files GitHub did list, not an empty slice")
+	assert.Equal(t, "apps/widgets/schema/main/users.sql", visible[0].Filename)
+	assert.True(t, HasDiscoveryInputFiles(visible),
+		"a schema file inside the visible prefix must be detectable from what the sentinel returns")
+}
+
 func TestFetchSchemaFilesOptimizedWalksSchemaDirectoryOnly(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/apps/widgets/schema", []*gh.RepositoryContent{

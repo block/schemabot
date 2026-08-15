@@ -418,6 +418,33 @@ func TestDurableCheckRunDriverReplansCurrentHead(t *testing.T) {
 	require.Equal(t, int64(1), fileListCalls.Load(), "a current rerequest must run config discovery")
 }
 
+// A rerequest on a PR that changes more files than GitHub will report for a
+// single PR dead-letters on its first attempt: re-running discovery cannot
+// return the rest of the diff, so the delivery must not spend its retry budget
+// proving it.
+func TestDurableCheckRunDriverFailsPRFileCapTerminally(t *testing.T) {
+	store := newScriptedWebhookEventStore(durableCheckRunRerequestEvent(t))
+	ghClient, mux := setupGitHubServer(t)
+	serveCheckRunPRHead(t, mux, "head-sha")
+	var filePages atomic.Int64
+	servePRFileListPastCap(t, mux, 7, &filePages, "apps/orders/schema/users.sql")
+	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghClient, testLogger())}
+	h := newDurableDriverHandler(t, store, checksDisabledRepoConfig(), factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	select {
+	case failure := <-store.failedPermanent:
+		require.Contains(t, failure.errMsg, "auto-plan for durable check_run rerequest")
+		require.Contains(t, failure.errMsg, "reached GitHub API limit")
+	default:
+		t.Fatal("expected an over-cap rerequest to be dead-lettered")
+	}
+	require.Empty(t, store.failed, "GitHub's per-PR file cap is deterministic and must not burn retry budget")
+	require.Empty(t, store.completed, "a rerequest SchemaBot could not plan must not be completed")
+	require.Positive(t, filePages.Load(), "the driver must have listed PR files before failing closed")
+}
+
 // A bootstrap failure on a valid check_run rerequest stays retryable so a
 // transient installation-token outage does not drop the re-plan.
 func TestDurableCheckRunDriverRetriesBootstrapFailure(t *testing.T) {

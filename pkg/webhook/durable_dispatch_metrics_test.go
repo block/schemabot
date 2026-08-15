@@ -85,6 +85,32 @@ func TestDurableWebhookDispatchMetricsFirstClaimCompleted(t *testing.T) {
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "completed")
 }
 
+// A delivery that spent time deferred by a not-before time measures dispatch
+// lag from when it became dispatchable, not from receipt: the grace period is
+// by design, and counting it as lag would saturate the histogram's upper
+// percentiles and mask real backlog regressions.
+func TestDurableWebhookDispatchMetricsDeferredClaimMeasuresLagFromDueTime(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	notBefore := time.Now().Add(-10 * time.Second)
+	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
+		Provider:   storage.WebhookProviderGitHub,
+		DeliveryID: "delivery-metrics-deferred",
+		Event:      "issue_comment",
+		Payload:    []byte(`{}`),
+		ReceivedAt: time.Now().Add(-90 * time.Second),
+		RetryAfter: &notBefore,
+	})
+	h := newDurableDriverHandler(t, store, nil, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Len(t, store.completed, 1)
+	lagPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.inbox_dispatch_lag_seconds")
+	require.Len(t, lagPoints, 1, "first claim must record inbox dispatch lag")
+	assert.GreaterOrEqual(t, lagPoints[0].Sum, 10.0, "lag must count the wait since the not-before time")
+	assert.Less(t, lagPoints[0].Sum, 60.0, "lag must not count the deferral's grace period since receipt")
+}
+
 // A retry claim measures the retry window, not backlog latency, so only the
 // first claim records inbox dispatch lag.
 func TestDurableWebhookDispatchMetricsRetryClaimSkipsInboxLag(t *testing.T) {
