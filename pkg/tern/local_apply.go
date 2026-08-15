@@ -31,33 +31,39 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blockingTaskID := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
-		if blockingTaskID == "" {
+		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
+		if !blocking.blocks() {
 			return nil
 		}
 
 		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
 		// Handles the race where storage is updated but Spirit hasn't fully finished.
 		if attempt < 9 {
-			c.logger.Debug("found potentially stale active task, retrying", "task_id", blockingTaskID, "attempt", attempt)
+			c.logger.Debug("found potentially stale active task, retrying",
+				"task_id", blocking.taskIdentifier, "apply_id", blocking.applyIdentifier,
+				"apply_state", blocking.applyState, "attempt", attempt)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		return fmt.Errorf("schema change already in progress for database %q (plan %s): blocking task %s", plan.Database, plan.PlanIdentifier, blockingTaskID)
+		// The refusal is what the operator sees when an apply dies on arrival, so
+		// it names the apply holding the database rather than only the task, which
+		// on its own gives them nothing to act on.
+		return fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
+			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
 	return nil
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.
-// Returns the blocking task's identifier, or "" if no conflict exists.
+// Returns the conflict, or a zero blockingTask when no conflict exists.
 // As a side effect, resolves stale tasks by checking engine state.
 //
 // dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
 // when both the candidate apply and an existing task target a non-empty shard,
 // a different shard does not conflict, so a sharded fan-out runs its shards
 // concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) string {
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) blockingTask {
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
@@ -77,7 +83,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		// keeps blocking (fail closed).
 		apply, ok := c.applyForConflictCheck(ctx, t)
 		if !ok {
-			return t.TaskIdentifier
+			return blockingTask{taskIdentifier: t.TaskIdentifier}
 		}
 
 		// A pending task of a terminal apply can never start; cancel it so it
@@ -91,10 +97,63 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue // Task was stale; engine confirmed it's done.
 		}
 
-		c.logger.Debug("conflict check: task is active", "task_id", t.TaskIdentifier)
-		return t.TaskIdentifier
+		c.logger.Debug("conflict check: task is active",
+			"task_id", t.TaskIdentifier, "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)
+		return blockingTask{
+			taskIdentifier:  t.TaskIdentifier,
+			applyIdentifier: apply.ApplyIdentifier,
+			applyState:      apply.State,
+		}
 	}
-	return ""
+	return blockingTask{}
+}
+
+// blockingTask names the active work that refuses a new apply on a database,
+// in the terms an operator needs to clear it: which task blocks, which apply
+// owns that task, and what that apply is doing.
+//
+// applyIdentifier and applyState are empty when the apply could not be loaded.
+// That task still blocks — the conflict check fails closed — so the conflict is
+// reported by task alone rather than being suppressed.
+type blockingTask struct {
+	taskIdentifier  string
+	applyIdentifier string
+	applyState      string
+}
+
+// blocks reports whether a conflicting task was found.
+func (b blockingTask) blocks() bool { return b.taskIdentifier != "" }
+
+// describe renders the conflict for an operator: what holds the database, and
+// where to go to clear it.
+func (b blockingTask) describe() string {
+	if b.applyIdentifier == "" {
+		return fmt.Sprintf("blocking task %s, whose apply could not be loaded", b.taskIdentifier)
+	}
+
+	described := fmt.Sprintf("blocking task %s on apply %s (%s)",
+		b.taskIdentifier, b.applyIdentifier, b.applyState)
+	if resolution := b.resolution(); resolution != "" {
+		return described + "; " + resolution
+	}
+	return described
+}
+
+// resolution states what clears the database, which differs by what the holding
+// apply is doing: a stopped apply keeps its database until an operator decides
+// its fate, while a running one releases it on its own. Other active states
+// (pending, cutting over, recovering) get no resolution line rather than a
+// guess — the state is still named, and inventing an action for a state whose
+// next move is not certain would send an operator the wrong way.
+func (b blockingTask) resolution() string {
+	switch {
+	case state.IsState(b.applyState, state.Apply.Stopped):
+		return "a stopped apply keeps its database until it is started or cancelled"
+	case state.IsRunningApplyState(b.applyState):
+		return "it releases the database when it finishes"
+	default:
+		return ""
+	}
 }
 
 // applyForConflictCheck loads the parent apply the conflict-check resolvers
