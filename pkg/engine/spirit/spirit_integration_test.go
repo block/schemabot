@@ -38,6 +38,38 @@ var (
 	sharedContainer testcontainers.Container
 )
 
+// copyProgressPollDeadline bounds the wait for a table copy to get underway.
+// Tests that act on a schema change mid-copy need the copy observably in
+// flight, so one that never starts is a failed test rather than one that waits
+// indefinitely.
+const copyProgressPollDeadline = 30 * time.Second
+
+// waitForCopyProgress blocks until the schema change reports at least
+// wantRowsCopied rows copied, returning how many had been copied. It fails
+// rather than returning early: an operation that lands before the copy is
+// underway exercises none of the mid-copy behavior its caller asserts on.
+func waitForCopyProgress(t *testing.T, eng *Engine, wantRowsCopied int64) int64 {
+	t.Helper()
+
+	deadline := time.Now().Add(copyProgressPollDeadline)
+	for time.Now().Before(deadline) {
+		progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		require.NotEqual(t, engine.StateFailed, progress.State,
+			"the schema change failed before its copy could be observed: %s", progress.ErrorMessage)
+		require.NotEqual(t, engine.StateCompleted, progress.State,
+			"the copy finished before it could be acted on; seed more rows so it stays in flight")
+
+		if len(progress.Tables) > 0 && progress.Tables[0].RowsCopied >= wantRowsCopied {
+			return progress.Tables[0].RowsCopied
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("copy did not reach %d rows within %s", wantRowsCopied, copyProgressPollDeadline)
+	return 0
+}
+
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
@@ -2226,22 +2258,7 @@ func TestEngine_Stop_DuringAlterWithPendingDrop(t *testing.T) {
 
 	// Wait until the ALTER copy is observably in-flight before stopping, so the
 	// stop lands mid-ALTER (the DROP phase has not yet started).
-	deadline := time.Now().Add(30 * time.Second)
-	copying := false
-	for time.Now().Before(deadline) {
-		progress, perr := eng.Progress(ctx, &engine.ProgressRequest{})
-		require.NoError(t, perr, "Progress()")
-		require.NotEqual(t, engine.StateFailed, progress.State, "apply failed before stop: %s", progress.ErrorMessage)
-		if progress.State == engine.StateCompleted {
-			t.Skip("schema change completed before it could be stopped mid-flight")
-		}
-		if len(progress.Tables) > 0 && progress.Tables[0].RowsCopied > 0 {
-			copying = true
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	require.True(t, copying, "ALTER copy did not become observably in-flight within deadline")
+	waitForCopyProgress(t, eng, 1)
 
 	stopResult, err := eng.Stop(ctx, &engine.ControlRequest{Database: "testdb"})
 	require.NoError(t, err, "Stop()")
