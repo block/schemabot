@@ -18,16 +18,9 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-const (
-	// haltCheckpointPollDeadline bounds the wait for the copy to get underway.
-	// The halt has to land while rows are still being copied, so a copy that
-	// never starts is a failed test rather than one that waits indefinitely.
-	haltCheckpointPollDeadline = 30 * time.Second
-
-	// haltDeadline bounds the halt itself, which checkpoints the copy and then
-	// waits for its goroutine to exit.
-	haltDeadline = 30 * time.Second
-)
+// haltDeadline bounds the halt itself, which checkpoints the copy and then
+// waits for its goroutine to exit.
+const haltDeadline = 30 * time.Second
 
 // A driver that shuts down mid-copy must leave the schema change resumable by
 // whichever driver reclaims the apply. Spirit writes checkpoints on its own
@@ -74,9 +67,15 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	})
 	require.NoError(t, err, "Apply()")
 	defer eng.Drain()
+	// Drain waits on the copy goroutine with nothing cancelling it, so a test
+	// that fails before it halts would wait out the whole copy. Halting first
+	// bounds that unwind.
+	defer haltForCleanup(t, eng)
 	require.True(t, applyResult.Accepted, "apply not accepted: %s", applyResult.Message)
 
-	rowsCopied := waitForCopyProgress(t, eng)
+	// Enough rows that the copy is unambiguously underway, but far short of the
+	// seeded total so the halt still lands mid-copy.
+	rowsCopied := waitForCopyProgress(t, eng, 2000)
 	t.Logf("halting after %d rows copied", rowsCopied)
 
 	checkpointTable := utils.CheckpointTableName(tableName)
@@ -89,36 +88,29 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	defer cancelHalt()
 	require.NoError(t, eng.HaltForShutdown(haltCtx), "HaltForShutdown()")
 
-	assert.Positive(t, checkpointRowCount(t, db, checkpointTable),
+	// Spirit keeps one checkpoint row per run, so the halt's own dump is the
+	// only write that can account for it.
+	require.Equal(t, 1, checkpointRowCount(t, db, checkpointTable),
 		"halting checkpoints the copy before cancelling it, so the reclaiming driver resumes from where the copy stopped rather than recopying from the last periodic checkpoint")
+
+	// The checkpoint has to carry resume state, not just exist: a copier
+	// watermark says which chunks are already copied, and a binlog position
+	// says where the reclaiming driver picks up the changes made since.
+	copierWatermark, binlogPosition := latestCheckpoint(t, db, checkpointTable)
+	assert.NotEmpty(t, copierWatermark, "the checkpoint records how far the copy got")
+	assert.NotEmpty(t, binlogPosition, "the checkpoint records where to resume reading changes")
 }
 
-// waitForCopyProgress blocks until the schema change reports copied rows,
-// returning how many had been copied. It fails rather than returning zero: a
-// halt before the copy starts would checkpoint nothing and pass the assertions
-// it is meant to exercise.
-func waitForCopyProgress(t *testing.T, eng *Engine) int64 {
+// haltForCleanup brings a still-running schema change down so a test that fails
+// before halting unwinds promptly instead of waiting out the whole copy.
+func haltForCleanup(t *testing.T, eng *Engine) {
 	t.Helper()
 
-	// Enough rows that the copy is unambiguously underway, but far short of the
-	// seeded total so the halt still lands mid-copy.
-	const wantRowsCopied = 2000
-
-	deadline := time.Now().Add(haltCheckpointPollDeadline)
-	for time.Now().Before(deadline) {
-		progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
-		require.NoError(t, err, "Progress()")
-		require.NotEqual(t, engine.StateCompleted, progress.State,
-			"the copy finished before it could be halted; seed more rows so it stays in flight")
-
-		if len(progress.Tables) > 0 && progress.Tables[0].RowsCopied >= wantRowsCopied {
-			return progress.Tables[0].RowsCopied
-		}
-		time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), haltDeadline)
+	defer cancel()
+	if err := eng.HaltForShutdown(ctx); err != nil {
+		t.Logf("halting the schema change during cleanup: %v", err)
 	}
-
-	t.Fatalf("copy did not reach %d rows within %s", wantRowsCopied, haltCheckpointPollDeadline)
-	return 0
 }
 
 // checkpointRowCount returns how many checkpoints Spirit has written for the
@@ -135,4 +127,16 @@ func checkpointRowCount(t *testing.T, db *sql.DB, checkpointTable string) int {
 		fmt.Sprintf("SELECT COUNT(*) FROM `%s`", checkpointTable)).Scan(&count),
 		"count checkpoints in %s", checkpointTable)
 	return count
+}
+
+// latestCheckpoint returns the resume state Spirit recorded in its most recent
+// checkpoint for the table: how far the copy got, and where a reclaiming driver
+// picks up the changes made since.
+func latestCheckpoint(t *testing.T, db *sql.DB, checkpointTable string) (copierWatermark, binlogPosition string) {
+	t.Helper()
+
+	require.NoError(t, db.QueryRowContext(t.Context(), fmt.Sprintf(
+		"SELECT copier_watermark, binlog_position FROM `%s` ORDER BY id DESC LIMIT 1", checkpointTable),
+	).Scan(&copierWatermark, &binlogPosition), "read latest checkpoint from %s", checkpointTable)
+	return copierWatermark, binlogPosition
 }
