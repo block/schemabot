@@ -197,7 +197,11 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          pkgs=$(go list -tags=integration ./... | grep -v /localscale | grep "$MATCH" '/integration(/|$)')
+          all=$(go list -tags=integration ./...)
+          # grep exits non-zero when a lane matches nothing, which under
+          # `set -e` would abort here with a bare exit status. Absorb that so
+          # the named check below is what reports an empty lane.
+          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$MATCH" '/integration(/|$)' || true)
           # An empty lane would hand `go test` no packages and silently test the
           # working directory instead, reporting success for work never run.
           if [ -z "$pkgs" ]; then
