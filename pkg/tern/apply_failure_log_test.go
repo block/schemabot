@@ -70,11 +70,11 @@ func TestFailApplyWithTasksRecordsTheFailureInTheApplyLog(t *testing.T) {
 }
 
 // A retryable failure is the state operator recovery keeps re-driving, so each
-// paused attempt records the budget it spent. Without it the apply log shows
+// paused attempt records the budget it has left. Without it the apply log shows
 // only the gaps between attempts, and the retry budget drains invisibly. The
-// count reported is the apply's own attempt counter, so it can never exceed the
-// budget it is measured against.
-func TestMarkApplyRetryableWithTasksRecordsTheSpentAttempt(t *testing.T) {
+// countdown is derived from the apply's own attempt counter, so it can never
+// run past the budget it is measured against.
+func TestMarkApplyRetryableWithTasksRecordsTheRemainingBudget(t *testing.T) {
 	apply := failureLogTestApply(state.Apply.Running, 3)
 	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Running}
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{task})
@@ -84,16 +84,17 @@ func TestMarkApplyRetryableWithTasksRecordsTheSpentAttempt(t *testing.T) {
 	require.Len(t, logs.entries, 1)
 	entry := logs.entries[0]
 	assert.Equal(t, storage.LogLevelWarn, entry.Level, "a paused attempt is not yet a permanent failure")
-	assert.Contains(t, entry.Message, "3 of 10 recovery attempts used")
+	assert.Contains(t, entry.Message,
+		fmt.Sprintf("%d of %d recovery attempts remaining", storage.MaxRecoveryAttempts-3, storage.MaxRecoveryAttempts))
 	assert.Contains(t, entry.Message, "target refused the connection")
 	assert.Equal(t, state.Apply.Running, entry.OldState)
 	assert.Equal(t, state.Apply.FailedRetryable, entry.NewState)
 }
 
-// The last drive operator recovery is allowed to make still reports a count
-// inside the budget, so an operator reading the apply log sees the retry budget
-// reach its limit rather than a figure that exceeds it.
-func TestMarkApplyRetryableWithTasksReportsTheFinalAttemptWithinBudget(t *testing.T) {
+// The last drive operator recovery is allowed to make reports an exhausted
+// budget, so an operator reading the apply log sees the retry budget reach its
+// limit rather than a figure that runs past it.
+func TestMarkApplyRetryableWithTasksReportsAnExhaustedBudget(t *testing.T) {
 	apply := failureLogTestApply(state.Apply.Running, storage.MaxRecoveryAttempts)
 	client, logs := newFailureLogTestClient(apply, nil)
 
@@ -101,7 +102,7 @@ func TestMarkApplyRetryableWithTasksReportsTheFinalAttemptWithinBudget(t *testin
 
 	require.Len(t, logs.entries, 1)
 	assert.Contains(t, logs.entries[0].Message,
-		fmt.Sprintf("%d of %d recovery attempts used", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
+		fmt.Sprintf("0 of %d recovery attempts remaining", storage.MaxRecoveryAttempts))
 }
 
 // An apply that another driver already settled is not this drive's to fail: the
@@ -115,4 +116,60 @@ func TestFailApplyWithTasksLeavesASettledApplyUnrecorded(t *testing.T) {
 
 	assert.Empty(t, logs.entries)
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
+}
+
+// The default sequential MySQL path is the one most applies take, so a table
+// that fails there reaches the operator through the apply's own log stream like
+// every other path — with the cause named, and with the budget countdown when
+// the failure is one recovery will re-drive.
+func TestFinalizeSequentialApplyRecordsAPermanentFailure(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Running, 0)
+	failed := &storage.Task{
+		ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders",
+		State: state.Task.Failed, ErrorMessage: "engine refused the statement",
+	}
+	client, logs := newFailureLogTestClient(apply, []*storage.Task{failed})
+
+	client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{failed}, failed, false)
+
+	require.Len(t, logs.entries, 1)
+	entry := logs.entries[0]
+	assert.Equal(t, storage.LogLevelError, entry.Level)
+	assert.Contains(t, entry.Message, "Apply failed:")
+	assert.Contains(t, entry.Message, "orders")
+	assert.Contains(t, entry.Message, "engine refused the statement")
+	assert.Equal(t, state.Apply.Running, entry.OldState)
+	assert.Equal(t, state.Apply.Failed, entry.NewState)
+}
+
+func TestFinalizeSequentialApplyRecordsARetryablePause(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Running, 3)
+	failed := &storage.Task{
+		ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders",
+		State: state.Task.FailedRetryable, ErrorMessage: "target refused the connection",
+	}
+	client, logs := newFailureLogTestClient(apply, []*storage.Task{failed})
+
+	client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{failed}, failed, false)
+
+	require.Len(t, logs.entries, 1)
+	entry := logs.entries[0]
+	assert.Equal(t, storage.LogLevelWarn, entry.Level)
+	assert.Contains(t, entry.Message,
+		fmt.Sprintf("%d of %d recovery attempts remaining", storage.MaxRecoveryAttempts-3, storage.MaxRecoveryAttempts))
+	assert.Contains(t, entry.Message, "target refused the connection")
+	assert.Equal(t, state.Apply.FailedRetryable, entry.NewState)
+}
+
+// A sequential apply that succeeds or that an operator stopped is not a failure,
+// and recording one would report a cause that does not exist.
+func TestFinalizeSequentialApplyRecordsNothingWithoutAFailure(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Running, 0)
+	done := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Completed}
+	client, logs := newFailureLogTestClient(apply, []*storage.Task{done})
+
+	client.finalizeSequentialApply(t.Context(), apply, []*storage.Task{done}, nil, false)
+
+	assert.Empty(t, logs.entries)
+	assert.Equal(t, state.Apply.Completed, apply.State)
 }

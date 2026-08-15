@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -221,7 +222,7 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 
 	// The call site passes only the message — every identity attr must come
 	// from the bound logger.
-	noStore := requireLogLine(t, lines, "operator: no apply log store configured; apply claim will not appear in apply logs")
+	noStore := requireLogLine(t, lines, "operator: no apply log store configured; the apply's own log will not state that a driver claimed it to resume it")
 	assertDriveIdentity(noStore)
 
 	resumedLine := requireLogLine(t, lines, "operator: resumed apply")
@@ -269,7 +270,8 @@ func TestExpireRetryableApplies_RecordsWhyRecoveryStoppedInTheApplyLog(t *testin
 	entry := applyLogs.logs[0]
 	assert.Equal(t, storage.LogLevelError, entry.Level)
 	assert.Equal(t, int64(42), entry.ApplyID)
-	assert.Contains(t, entry.Message, "10 of 10 attempts")
+	assert.Contains(t, entry.Message,
+		fmt.Sprintf("%d of %d attempts", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
 	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
 	assert.Equal(t, state.Apply.FailedRetryable, entry.OldState)
 	assert.Equal(t, state.Apply.Failed, entry.NewState)

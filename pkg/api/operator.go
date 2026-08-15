@@ -249,28 +249,36 @@ func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 // state with nothing stating why. Best-effort: a failed append must not stop
 // the driver from expiring the remaining applies.
 func (s *Service) logApplyExpiration(ctx context.Context, apply *storage.Apply, reason storage.RetryableExpirationReason) {
-	logStore := s.storage.ApplyLogs()
-	if logStore == nil {
-		s.logger.Warn("operator: no apply log store configured; apply expiry will not appear in apply logs",
-			apply.LogAttrs()...)
-		return
-	}
-	message := fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
-		apply.Attempt, storage.MaxRecoveryAttempts, reason)
-	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
-	defer cancel()
-	if err := logStore.Append(logCtx, &storage.ApplyLog{
+	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelError,
 		EventType: storage.LogEventError,
 		Source:    storage.LogSourceSchemaBot,
-		Message:   message,
+		Message: fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
+			apply.Attempt, storage.MaxRecoveryAttempts, reason),
 		OldState:  state.Apply.FailedRetryable,
 		NewState:  state.Apply.Failed,
 		CreatedAt: s.clock.Now(),
-	}); err != nil {
-		s.logger.Warn("operator: failed to log apply expiry; the apply's own log will not state why recovery stopped",
-			append(apply.LogAttrs(), "error", err)...)
+	}, "why recovery stopped", apply.LogAttrs()...)
+}
+
+// appendApplyLog writes one entry to the apply's own log stream, bounded so a
+// slow store cannot stall the driver. It is best-effort by contract: every
+// caller has already done the work the entry describes, and an entry that
+// cannot be written must not undo it. record names what an operator loses when
+// the entry does not land, so the warning says which part of the apply's
+// account is missing rather than only that a write failed.
+func (s *Service) appendApplyLog(ctx context.Context, logger *slog.Logger, entry *storage.ApplyLog, record string, logAttrs ...any) {
+	logStore := s.storage.ApplyLogs()
+	if logStore == nil {
+		logger.Warn("operator: no apply log store configured; the apply's own log will not state "+record, logAttrs...)
+		return
+	}
+	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
+	defer cancel()
+	if err := logStore.Append(logCtx, entry); err != nil {
+		logger.Warn("operator: failed to append to the apply log; the apply's own log will not state "+record,
+			append(slices.Clone(logAttrs), "error", err)...)
 	}
 }
 
@@ -1449,14 +1457,7 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 // append must not block the resume, so the error is logged on the caller's
 // drive-scoped logger and the claim proceeds.
 func (s *Service) logApplyResumeClaim(ctx context.Context, logger *slog.Logger, driverID int, apply *storage.Apply) {
-	logStore := s.storage.ApplyLogs()
-	if logStore == nil {
-		logger.Warn("operator: no apply log store configured; apply claim will not appear in apply logs")
-		return
-	}
-	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
-	defer cancel()
-	if err := logStore.Append(logCtx, &storage.ApplyLog{
+	s.appendApplyLog(ctx, logger, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelInfo,
 		EventType: storage.LogEventInfo,
@@ -1465,10 +1466,7 @@ func (s *Service) logApplyResumeClaim(ctx context.Context, logger *slog.Logger, 
 		OldState:  apply.State,
 		NewState:  apply.State,
 		CreatedAt: s.clock.Now(),
-	}); err != nil {
-		logger.Warn("operator: failed to log apply claim; apply claim will not appear in apply logs",
-			"error", err)
-	}
+	}, "that a driver claimed it to resume it")
 }
 
 // failClaimedApplyAfterDrivePanic contains an engine-drive panic to the
@@ -1581,16 +1579,7 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 // state without server logs. Best-effort: a failed append must not block
 // containment.
 func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, apply *storage.Apply, previousState, errMsg string) {
-	logStore := s.storage.ApplyLogs()
-	if logStore == nil {
-		s.logger.Warn("operator: no apply log store configured; the drive panic will not appear in apply logs",
-			append(apply.LogAttrs(),
-				"driver", driverID)...)
-		return
-	}
-	logCtx, cancel := context.WithTimeout(ctx, ApplyClaimLogTimeout)
-	defer cancel()
-	if err := logStore.Append(logCtx, &storage.ApplyLog{
+	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     storage.LogLevelError,
 		EventType: storage.LogEventError,
@@ -1599,12 +1588,7 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 		OldState:  previousState,
 		NewState:  apply.State,
 		CreatedAt: s.clock.Now(),
-	}); err != nil {
-		s.logger.Warn("operator: failed to log drive panic failure; the failure will not appear in apply logs",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"error", err)...)
-	}
+	}, "that a contained drive panic failed it", append(apply.LogAttrs(), "driver", driverID)...)
 }
 
 // startApplyOperationHeartbeat refreshes the claimed operation row's lease while

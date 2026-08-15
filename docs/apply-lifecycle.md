@@ -221,10 +221,13 @@ budget and window are per-apply — a new apply starts with a full budget.
 1. **Confirm the state.** Check the apply's status (CLI status command, or the
    summary comment on the PR). `failed_retryable` needs no action — recovery
    retries it automatically. Only permanent `failed` needs you.
-2. **Read the failure.** The apply's error message and the server logs (keyed
-   by the apply identifier) say what the engine rejected or what broke.
-   Fix the underlying cause if there is one — an invalid statement, a
-   permissions problem, an unreachable target.
+2. **Read the failure.** The apply's own log stream carries the cause, each
+   paused attempt with the recovery budget it had left, and the reason recovery
+   gave up — read it from the CLI (`schemabot logs <apply>`) or the PR summary
+   comment, no infrastructure access required. The server logs, keyed by the
+   apply identifier, are there when you need what happened around the apply
+   rather than to it. Fix the underlying cause if there is one — an invalid
+   statement, a permissions problem, an unreachable target.
 3. **Plan again.** Run a fresh plan against the same schema and environment
    (`schemabot plan`, or a new `schemabot plan` PR comment). The plan reflects
    whatever the failed apply already completed: tables that landed are not in
