@@ -1240,9 +1240,32 @@ const (
 )
 
 const (
-	GitHubRequestStatusError   = "error"
-	GitHubRequestStatusSuccess = "success"
-	GitHubRequestStatusUnknown = gitHubMetricValueUnknown
+	// GitHubRequestStatusCancelled marks requests abandoned by SchemaBot
+	// itself: the request context was cancelled before a response arrived,
+	// typically during graceful shutdown. Keeping these out of
+	// GitHubRequestStatusTransportError stops every deploy from producing a
+	// blip on the unreachability signal operators alert on.
+	GitHubRequestStatusCancelled = "cancelled"
+	GitHubRequestStatusError     = "error"
+	// GitHubRequestStatusNotFound marks read-operation requests GitHub
+	// answered with HTTP 404. SchemaBot routinely asks read questions whose
+	// expected answer is 404 — probing directories for schemabot.yaml config
+	// files, or reloading a PR that has since been deleted — so these are
+	// semantic "no" answers, not API failures. Keeping them out of
+	// GitHubRequestStatusError lets dashboards and alerts track real GitHub
+	// errors without excluding whole operations. A 404 on an auth or write
+	// operation is a genuine failure (a suspended App installation answers
+	// every token exchange with 404) and stays GitHubRequestStatusError.
+	GitHubRequestStatusNotFound = "not_found"
+	// GitHubRequestStatusTransportError marks requests that never produced an
+	// HTTP response: dials that failed, TLS errors, and requests cut off by a
+	// context deadline. These are the signature of GitHub (or the network path
+	// to it) being unreachable, so they must be counted rather than dropped.
+	// Requests SchemaBot cancelled itself are recorded as
+	// GitHubRequestStatusCancelled instead.
+	GitHubRequestStatusTransportError = "transport_error"
+	GitHubRequestStatusSuccess        = "success"
+	GitHubRequestStatusUnknown        = gitHubMetricValueUnknown
 )
 
 const (
@@ -1265,9 +1288,11 @@ var (
 	seenUnknownWebhookMetricLabels sync.Map
 )
 
-// GitHubRequestSample describes a GitHub API response observed by SchemaBot.
-// Category distinguishes reads from content-generating writes so dashboards can
-// track pressure against GitHub's secondary write limits.
+// GitHubRequestSample describes a GitHub API request attempt observed by
+// SchemaBot — one sample per attempt, whether it produced an HTTP response or
+// failed in transport. Category distinguishes reads from content-generating
+// writes so dashboards can track pressure against GitHub's secondary write
+// limits.
 type GitHubRequestSample struct {
 	Operation      string
 	Category       string
@@ -1278,7 +1303,8 @@ type GitHubRequestSample struct {
 	InstallationID int64
 }
 
-// RecordGitHubRequest increments the number of GitHub API responses observed.
+// RecordGitHubRequest increments the number of GitHub API request attempts
+// observed, including attempts that never produced an HTTP response.
 func RecordGitHubRequest(ctx context.Context, sample GitHubRequestSample) {
 	sample.Operation = normalizeGitHubOperation(sample.Operation)
 	sample.Category = normalizeGitHubRequestCategory(sample.Category)
@@ -1292,7 +1318,7 @@ func RecordGitHubRequest(ctx context.Context, sample GitHubRequestSample) {
 	)
 
 	addCounter(ctx, "schemabot.github.requests_total",
-		"Total GitHub API responses observed by SchemaBot", "{request}",
+		"Total GitHub API request attempts observed by SchemaBot", "{request}",
 		attrs...)
 }
 
@@ -1422,7 +1448,10 @@ func isKnownGitHubRequestCategory(category string) bool {
 
 func isKnownGitHubRequestStatus(status string) bool {
 	switch status {
-	case GitHubRequestStatusError,
+	case GitHubRequestStatusCancelled,
+		GitHubRequestStatusError,
+		GitHubRequestStatusNotFound,
+		GitHubRequestStatusTransportError,
 		GitHubRequestStatusSuccess,
 		GitHubRequestStatusUnknown:
 		return true
