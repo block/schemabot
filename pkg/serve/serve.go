@@ -542,7 +542,7 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
-	tern.NewServer(client).Register(gs)
+	tern.NewServer(client, s.logger).Register(gs)
 	return nil
 }
 

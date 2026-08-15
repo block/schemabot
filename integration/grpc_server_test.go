@@ -18,7 +18,7 @@ import (
 
 // newGRPCServer creates a new gRPC server wrapping a Client.
 func newGRPCServer(client tern.Client) *tern.Server {
-	return tern.NewServer(client)
+	return tern.NewServer(client, slog.Default())
 }
 
 // registerGRPCServer registers the tern server on the given grpc.Server.

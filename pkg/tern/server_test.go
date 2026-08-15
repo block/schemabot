@@ -1,9 +1,11 @@
 package tern
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -73,7 +75,7 @@ func TestServerProgressMapsMissingApplyDataToNotFound(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(progressErrorClient{err: tc.err})
+			server := NewServer(progressErrorClient{err: tc.err}, slog.Default())
 
 			_, err := server.Progress(t.Context(), &ternv1.ProgressRequest{
 				ApplyId:     "missing",
@@ -97,7 +99,7 @@ func TestServerLogsMapsErrorsToStatusCode(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(logsErrorClient{err: tc.err})
+			server := NewServer(logsErrorClient{err: tc.err}, slog.Default())
 			_, err := server.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-123"})
 			require.Error(t, err)
 			assert.Equal(t, tc.want, status.Code(err))
@@ -128,7 +130,7 @@ func TestServerApplyMapsEngineRetryabilityToStatusCode(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(applyErrorClient{err: tc.err})
+			server := NewServer(applyErrorClient{err: tc.err}, slog.Default())
 
 			_, err := server.Apply(t.Context(), &ternv1.ApplyRequest{PlanId: "plan-123"})
 			require.Error(t, err)
@@ -162,7 +164,7 @@ func TestServerPullSchemaMapsKnownErrorsToStatusCode(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(pullSchemaErrorClient{err: tc.err})
+			server := NewServer(pullSchemaErrorClient{err: tc.err}, slog.Default())
 
 			_, err := server.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
 			require.Error(t, err)
@@ -172,7 +174,7 @@ func TestServerPullSchemaMapsKnownErrorsToStatusCode(t *testing.T) {
 }
 
 func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
-	server := NewServer(noopControlClient{})
+	server := NewServer(noopControlClient{}, slog.Default())
 
 	testCases := []struct {
 		name string
@@ -237,4 +239,138 @@ func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
 			assert.Contains(t, err.Error(), "apply_id is required")
 		})
 	}
+}
+
+type healthErrorClient struct {
+	Client
+	err error
+}
+
+func (c healthErrorClient) Health(context.Context) error {
+	return c.err
+}
+
+// newHealthTestServer builds a server whose logs land in the returned buffer, so
+// a test can assert on the health-check causes the RPC itself never returns.
+func newHealthTestServer(client Client) (*Server, *bytes.Buffer) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return NewServer(client, logger), &logs
+}
+
+// The health RPC answers the control plane's deployment-health poll and
+// deliberately returns a sanitized Unavailable, so the underlying cause never
+// reaches the caller. It must be logged server-side, with the real error
+// attached, or an unhealthy deployment is unexplainable from logs alone.
+func TestServerHealthLogsUnderlyingFailure(t *testing.T) {
+	server, logs := newHealthTestServer(healthErrorClient{err: errors.New("dial tcp 10.0.0.1:3306: connect: connection refused")})
+
+	_, err := server.Health(t.Context(), &ternv1.HealthRequest{})
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	assert.NotContains(t, err.Error(), "3306", "the caller must only see the sanitized message")
+
+	logged := logs.String()
+	assert.Contains(t, logged, "tern health check failed")
+	assert.Contains(t, logged, "connection refused")
+}
+
+// An embedder that wires no logger still gets the cause: the only record of why
+// a deployment reports unhealthy must not depend on the server being configured.
+func TestServerHealthFallsBackToTheDefaultLogger(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	server := NewServer(healthErrorClient{err: errors.New("ping: connection refused")}, nil)
+
+	_, err := server.Health(t.Context(), &ternv1.HealthRequest{})
+
+	require.Error(t, err)
+	assert.Contains(t, logs.String(), "connection refused")
+}
+
+// A caller that hangs up mid-check — a control plane shutting down, a dropped
+// connection — says nothing about deployment health and is already recorded on
+// the caller's side, so it must not raise a warning here. The request context is
+// what decides that: an error shaped like a cancellation proves nothing on its
+// own, and an expired deadline is the opposite case and stays at warn, because
+// the check outran its budget.
+func TestServerHealthDowngradesCallerCancellation(t *testing.T) {
+	testCases := []struct {
+		name      string
+		clientErr error
+		cancelCtx bool
+		wantLevel string
+		wantMsg   string
+	}{
+		{
+			name:      "caller cancelled",
+			clientErr: context.Canceled,
+			cancelCtx: true,
+			wantLevel: "DEBUG",
+			wantMsg:   "tern health check abandoned by its caller",
+		},
+		{
+			name:      "caller cancelled after a real failure",
+			clientErr: errors.New("ping: connection refused"),
+			cancelCtx: true,
+			wantLevel: "DEBUG",
+			wantMsg:   "tern health check abandoned by its caller",
+		},
+		{
+			name:      "cancellation error without a hangup",
+			clientErr: context.Canceled,
+			wantLevel: "WARN",
+			wantMsg:   "tern health check failed",
+		},
+		{
+			name:      "deadline exceeded",
+			clientErr: context.DeadlineExceeded,
+			wantLevel: "WARN",
+			wantMsg:   "tern health check failed",
+		},
+		{
+			name:      "backend failure",
+			clientErr: errors.New("ping: connection refused"),
+			wantLevel: "WARN",
+			wantMsg:   "tern health check failed",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			server, logs := newHealthTestServer(healthErrorClient{err: tc.clientErr})
+
+			_, err := server.Health(ctx, &ternv1.HealthRequest{})
+
+			require.Error(t, err)
+			assert.Equal(t, codes.Unavailable, status.Code(err), "the caller sees the same sanitized error either way")
+
+			logged := logs.String()
+			assert.Contains(t, logged, "level="+tc.wantLevel)
+			assert.Contains(t, logged, tc.wantMsg)
+		})
+	}
+}
+
+// A healthy deployment is polled continuously by the control plane; logging
+// those would bury the apply-path logs an operator reads during a schema change.
+func TestServerHealthDoesNotLogWhenHealthy(t *testing.T) {
+	server, logs := newHealthTestServer(healthErrorClient{})
+
+	resp, err := server.Health(t.Context(), &ternv1.HealthRequest{})
+
+	require.NoError(t, err)
+	assert.Equal(t, "ok", resp.GetStatus())
+	assert.Empty(t, logs.String())
 }
