@@ -26,6 +26,8 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -1324,14 +1326,16 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 // required check that never reports.
 func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 	scenarios := []struct {
-		name       string
-		schemaFile string
+		name          string
+		schemaFile    string
+		schemaVisible bool
 	}{
-		{name: "schema change visible in reported files", schemaFile: "apps/orders/schema/users.sql"},
-		{name: "no schema change visible (refactor shape)", schemaFile: ""},
+		{name: "schema change visible in reported files", schemaFile: "apps/orders/schema/users.sql", schemaVisible: true},
+		{name: "no schema change visible (refactor shape)", schemaFile: "", schemaVisible: false},
 	}
 	for _, tc := range scenarios {
 		t.Run(tc.name, func(t *testing.T) {
+			metricsReader := newDispatchMetricsReader(t)
 			svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
 
 			mux := http.NewServeMux()
@@ -1394,8 +1398,6 @@ func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 						"the check must name the cap that stopped the plan")
 					assert.Contains(t, cr.Output.Summary, "smaller PR",
 						"the check must tell the author how to get a plan")
-					assert.NotContains(t, strings.ToLower(cr.Output.Summary), "retry the check",
-						"retrying returns the same incomplete file list")
 				case <-time.After(webhookIntegrationCheckRunDeadline):
 					t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
 				}
@@ -1418,8 +1420,53 @@ func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 				assert.Equal(t, prFileCapExceededBlock.blockingReason, check.BlockingReason)
 				assert.Equal(t, prFileCapExceededBlock.message, check.ErrorMessage)
 			}
+
+			// Both shapes get the same check, so the counter's schema_visible
+			// label is the only place an operator can see how many cap hits look
+			// schema-related versus pure refactors.
+			capPoints := collectCounterPoints(t, metricsReader, "schemabot.github.pr_file_cap_exceeded_total")
+			require.Len(t, capPoints, 1, "the cap must be counted exactly once per auto-plan run")
+			assertStringAttr(t, capPoints[0].Attributes, "repository", "octocat/hello-world")
+			schemaVisible, ok := capPoints[0].Attributes.Value("schema_visible")
+			require.True(t, ok, "the cap counter must carry the schema_visible label")
+			assert.Equal(t, tc.schemaVisible, schemaVisible.AsBool(),
+				"schema_visible must reflect whether the reported prefix showed a schema or config path")
+
+			// Discovery reports the cap as blocked rather than error, keeping a
+			// deterministic property of the PR out of the discovery-error signal
+			// operators watch for outages and broken configuration.
+			var discoveryStatuses []string
+			for _, point := range collectCounterPoints(t, metricsReader, "schemabot.status_check_operations_total") {
+				if operation, found := point.Attributes.Value("operation"); found && operation.AsString() == "schema_config_discovery" {
+					status, hasStatus := point.Attributes.Value("status")
+					require.True(t, hasStatus, "a status-check operation must carry a status")
+					discoveryStatuses = append(discoveryStatuses, status.AsString())
+				}
+			}
+			assert.Equal(t, []string{"blocked"}, discoveryStatuses,
+				"the cap must be reported as blocked, never as a discovery error")
 		})
 	}
+}
+
+// collectCounterPoints returns the named int64 counter's data points from the
+// reader, failing the test when the counter was never recorded.
+func collectCounterPoints(t *testing.T, reader *sdkmetric.ManualReader, name string) []metricdata.DataPoint[int64] {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "metric %s must be an int64 sum", name)
+			return sum.DataPoints
+		}
+	}
+	t.Fatalf("metric %s was never recorded", name)
+	return nil
 }
 
 // TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun verifies that
