@@ -281,6 +281,23 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 	}
 }
 
+// logEngineResumeOnce records a timeline event the first time a drive claim
+// observes the engine reattached to a durable checkpoint instead of starting
+// the copy fresh. One event per drive claim is intentional: every claim that
+// resumes (pod restart, lease handover, operator start after a stop) is a
+// real engine resume the operator should see on the timeline. eventLogged is
+// the per-drive latch; the durable checkpoint itself lives in the engine.
+func (c *LocalClient) logEngineResumeOnce(ctx context.Context, logger *slog.Logger, apply *storage.Apply, resumed bool, eventLogged *bool) {
+	if !resumed || *eventLogged {
+		return
+	}
+	*eventLogged = true
+	const msg = "Engine resumed from checkpoint; row copy continues from durable progress"
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		msg, "", "")
+	logger.Info("engine resumed from checkpoint")
+}
+
 // setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
 // Returns a cleanup function that must be deferred.
 func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func() {

@@ -260,6 +260,64 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 	assert.Contains(t, result, "1 checksumming")
 }
 
+// A table paused by the engine's throttler names the pause and its trigger in
+// the PR comment, so a stalled progress bar reads as a deliberate slowdown
+// (e.g. replica lag) rather than a hang. The reason is sanitized at the engine
+// boundary, and the line renders only on active tables — a throttled flag on a
+// terminal table would be stale.
+func TestRenderApplyStatusComment_Throttled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "running",
+				RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+				Throttled: true, ThrottleReason: "replica-lag 12s > 10s"},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏸ Paused by throttler: replica-lag 12s > 10s")
+
+	data.Tables[0].ThrottleReason = ""
+	noReason := RenderApplyStatusComment(data)
+	assert.Contains(t, noReason, "⏸ Paused by throttler")
+	assert.NotContains(t, noReason, "Paused by throttler:")
+
+	data.Tables[0].Throttled = false
+	notThrottled := RenderApplyStatusComment(data)
+	assert.NotContains(t, notThrottled, "Paused by throttler")
+}
+
+// A throttled checksum verify surfaces the pause alongside the verify
+// progress, since the checksum is the other phase the engine's throttler
+// paces.
+func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming",
+				ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
+				Throttled: true, ThrottleReason: "threads-running 130 > 128"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, result, "⏸ Paused by throttler: threads-running 130 > 128")
+}
+
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 	tests := []struct {
 		name                string

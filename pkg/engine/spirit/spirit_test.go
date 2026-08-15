@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -245,6 +246,46 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Equal(t, int64(1000), got[0].ChecksumRowsTotal)
 	})
 
+	// Spirit's throttle status is runner-wide but only meaningful to tables
+	// participating in the paced phase: a table still copying, or every table
+	// during the checksum verify. A table whose copy finished while others
+	// still copy must not render as paused by their throttling.
+	t.Run("throttle reaches copying tables, not completed ones", func(t *testing.T) {
+		prog := status.Progress{
+			Throttle: status.ThrottleStatus{Throttled: true, Reason: "replica-lag 12s > 10s"},
+			Tables: []status.TableProgress{
+				{TableName: "users", RowsCopied: 45000, RowsTotal: 100000},
+				{TableName: "orders", RowsCopied: 1000, RowsTotal: 1000, IsComplete: true},
+			},
+		}
+		got := buildSpiritTableProgress(prog, status.CopyRows, ddlByTable, tableNamespace)
+		require.Len(t, got, 2)
+
+		copying := got[0]
+		assert.True(t, copying.Throttled)
+		assert.Equal(t, "replica-lag 12s > 10s", copying.ThrottleReason)
+
+		completed := got[1]
+		assert.False(t, completed.Throttled, "a finished copy is not paused by another table's throttle")
+		assert.Empty(t, completed.ThrottleReason)
+	})
+
+	// The checksum verify runs only after every copy completes, so a throttled
+	// verify is stamped on the completed tables — otherwise it would never
+	// surface at all.
+	t.Run("throttle reaches completed tables during checksum", func(t *testing.T) {
+		prog := status.Progress{
+			Throttle: status.ThrottleStatus{Throttled: true, Reason: "threads-running 130 > 128"},
+			Tables: []status.TableProgress{
+				{TableName: "users", RowsCopied: 1000, RowsTotal: 1000, IsComplete: true},
+			},
+		}
+		got := buildSpiritTableProgress(prog, status.Checksum, ddlByTable, tableNamespace)
+		require.Len(t, got, 1)
+		assert.True(t, got[0].Throttled)
+		assert.Equal(t, "threads-running 130 > 128", got[0].ThrottleReason)
+	})
+
 	notReady := []struct {
 		name string
 		eta  status.ETA
@@ -264,4 +305,33 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 			assert.Equal(t, int64(0), got[0].ETASeconds)
 		})
 	}
+}
+
+// TestSanitizeThrottleReason verifies that an engine-produced throttle reason
+// is safe for the operator surfaces that render it: whitespace runs collapse,
+// markdown table separators are neutralized, and overlong text is clamped so
+// a reason can never break a PR comment table or a CLI row.
+func TestSanitizeThrottleReason(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain reason passes through", "replica-lag 12s > 10s", "replica-lag 12s > 10s"},
+		{"empty stays empty", "", ""},
+		{"newlines and runs collapse to single spaces", "replica-lag\n12s >\t\t10s", "replica-lag 12s > 10s"},
+		{"table separators are neutralized", "signal a > 1 | signal b > 2", "signal a > 1 / signal b > 2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, sanitizeThrottleReason(tt.in))
+		})
+	}
+
+	t.Run("overlong reason is clamped with an ellipsis", func(t *testing.T) {
+		long := strings.Repeat("replica-lag 12s > 10s; ", 20)
+		got := sanitizeThrottleReason(long)
+		assert.LessOrEqual(t, len(got), 200)
+		assert.True(t, strings.HasSuffix(got, "…"))
+	})
 }

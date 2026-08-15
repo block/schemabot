@@ -3294,6 +3294,8 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ETASeconds = int(remoteTask.EtaSeconds)
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
+			storedTask.Throttled = remoteTask.Throttled
+			storedTask.ThrottleReason = remoteTask.ThrottleReason
 		}
 		// Adopt the remote task's own failure reason (for example an engine
 		// preflight rejection) so the operation row derived from the stored task

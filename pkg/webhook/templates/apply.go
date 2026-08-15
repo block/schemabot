@@ -29,7 +29,12 @@ type TableProgressData struct {
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	IsInstant           bool
+	// The engine's throttler is pausing this table's active phase (row copy
+	// or checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool
+	ThrottleReason string
+	IsInstant      bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying or
@@ -727,6 +732,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
 			writeDDLLine(sb, table.DDL)
 		}
+		writeThrottleLine(sb, table)
 
 	case state.Task.PostChecksum:
 		// The verify passed and the engine is draining the changes that
@@ -930,6 +936,7 @@ func isCopyingShardStatus(status string) bool {
 
 // renderRunningTable renders a table that is actively copying rows.
 func renderRunningTable(sb *strings.Builder, table TableProgressData) {
+	defer writeThrottleLine(sb, table)
 	if table.RowsTotal > 0 {
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
 			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy\n", table.TableName, ui.ProgressBarActivity())
@@ -958,6 +965,22 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**: Running...\n", table.TableName)
 		writeDDLLine(sb, table.DDL)
 	}
+}
+
+// writeThrottleLine notes that the engine's throttler is pausing the table's
+// active phase, so a stalled bar reads as a deliberate pause rather than a
+// hang. The drive clears the stored flag when the pause lifts, so the line
+// disappears on the next refresh. The reason is sanitized at the engine
+// boundary before it is stored, so it is safe to render in markdown.
+func writeThrottleLine(sb *strings.Builder, table TableProgressData) {
+	if !table.Throttled {
+		return
+	}
+	if table.ThrottleReason != "" {
+		fmt.Fprintf(sb, "⏸ Paused by throttler: %s\n", table.ThrottleReason)
+		return
+	}
+	sb.WriteString("⏸ Paused by throttler\n")
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {

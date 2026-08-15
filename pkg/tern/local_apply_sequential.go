@@ -296,6 +296,11 @@ type atomicPollState struct {
 	// revertSkipped is set after SkipRevert is called to prevent repeated calls.
 	revertSkipped bool
 
+	// resumeEventLogged is set after this drive claim records the
+	// engine-resumed-from-checkpoint timeline event, so the flag the engine
+	// reports on every subsequent poll produces one event per claim.
+	resumeEventLogged bool
+
 	// cutoverTriggerLogged is set after the drive records the auto-cutover
 	// trigger event, so retries of a not-yet-accepted cutover do not fill the
 	// user-visible timeline with duplicate triggers.
@@ -449,6 +454,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
 	var consecutiveErrors int
+	var resumeEventLogged bool
 
 	for {
 		select {
@@ -528,6 +534,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				continue
 			}
 			consecutiveErrors = 0
+			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
 
 			now := time.Now()
 			prevState := task.State
@@ -556,6 +563,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				task.ETASeconds = int(tp.ETASeconds)
 				task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 				task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+				task.Throttled = tp.Throttled
+				task.ThrottleReason = tp.ThrottleReason
 				task.IsInstant = tp.IsInstant
 			}
 

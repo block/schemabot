@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
@@ -793,12 +794,13 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	}
 
 	return &engine.ProgressResult{
-		State:        state,
-		Message:      message,
-		ErrorMessage: rm.errorMessage,
-		Retryable:    state == engine.StateFailed,
-		Tables:       tableProgress,
-		ResumeState:  req.ResumeState,
+		State:                 state,
+		Message:               message,
+		ErrorMessage:          rm.errorMessage,
+		Retryable:             state == engine.StateFailed,
+		Tables:                tableProgress,
+		ResumeState:           req.ResumeState,
+		ResumedFromCheckpoint: spiritProgress.Resume,
 	}, nil
 }
 
@@ -857,9 +859,43 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		// runs, so the estimate is stamped on all tables unconditionally.
 		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
 		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
+		// Spirit's throttle status is likewise runner-wide and already scoped to
+		// the paced phases (the row copy and the checksum verify; zero-valued
+		// everywhere else). Stamp it on the tables participating in that paced
+		// work — a table still copying, or every table during the verify — so a
+		// completed table is never rendered as paused by another table's copy.
+		if tableInPacedPhase(st.IsComplete, spiritState) {
+			tp.Throttled = prog.Throttle.Throttled
+			tp.ThrottleReason = sanitizeThrottleReason(prog.Throttle.Reason)
+		}
 		tableProgress = append(tableProgress, tp)
 	}
 	return tableProgress
+}
+
+// tableInPacedPhase reports whether a table is doing work the runner's
+// throttler paces: its own row copy while incomplete, or the runner-wide
+// checksum verify (which runs only after every copy finished).
+func tableInPacedPhase(copyComplete bool, spiritState status.State) bool {
+	return !copyComplete || spiritState == status.Checksum
+}
+
+// sanitizeThrottleReason bounds an engine-produced throttle reason for the
+// operator surfaces that render it (PR comment tables, CLI rows): newlines and
+// table separators are neutralized and the text is clamped, so a reason can
+// never break markdown layout no matter what a throttler reports.
+func sanitizeThrottleReason(reason string) string {
+	reason = strings.Join(strings.Fields(reason), " ")
+	reason = strings.ReplaceAll(reason, "|", "/")
+	const maxLen = 200
+	if len(reason) > maxLen {
+		cut := maxLen - len("…")
+		for cut > 0 && !utf8.RuneStart(reason[cut]) {
+			cut--
+		}
+		reason = reason[:cut] + "…"
+	}
+	return reason
 }
 
 // spiritPostCopyPhase reports whether the runner is in one of the active
