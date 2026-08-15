@@ -392,3 +392,23 @@ func TestDurableWebhookDispatchMetricsLeaseLostOutcome(t *testing.T) {
 	require.Len(t, durationPoints, 1)
 	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "lease_lost")
 }
+
+// A claim discarded in favor of a newer covering delivery for the same PR
+// records exactly one duration observation with the superseded outcome, so
+// coalescing stays visible in the started/outcome ledger.
+func TestDurableWebhookDispatchMetricsSupersededOutcome(t *testing.T) {
+	reader := newDispatchMetricsReader(t)
+	store := newScriptedWebhookEventStore(durablePullRequestEvent(t))
+	store.coveringSuccessor = true
+	store.supersedeCovered = true
+	factory, _ := newLiveHeadGitHubFactory(t, "newer-head", "open")
+	h := newDurableDriverHandler(t, store, nil, factory)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	require.Empty(t, store.completed)
+	require.Empty(t, store.failed)
+	durationPoints := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+	require.Len(t, durationPoints, 1)
+	assertStringAttr(t, durationPoints[0].Attributes, "outcome", "superseded")
+}
