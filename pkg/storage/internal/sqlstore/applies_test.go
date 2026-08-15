@@ -25,7 +25,7 @@ func TestApplyStore_Create(t *testing.T) {
 	clearTables(t)
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	created := createTestApply(t, store, lock, "apply_create_test", 1)
 
 	require.NotZero(t, created.ID)
@@ -172,7 +172,7 @@ func TestApplyStore_CreateDuplicate(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_dup_test",
@@ -211,7 +211,7 @@ func TestApplyStore_CreateWithTasksCommitsQueueAtomically(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_create_with_tasks",
@@ -284,7 +284,7 @@ func TestApplyStore_CreateWithTasksAndOperationsCommitsAtomically(t *testing.T) 
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_create_with_ops",
@@ -686,7 +686,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnTaskFailure(t *testin
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_rollback_on_task_failure",
@@ -738,7 +738,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsMultiOpWithoutTaskMapping
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_multi_op_no_mapping",
@@ -785,7 +785,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsTaskApplyOperationIDMisma
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_op_id_mismatch",
@@ -835,7 +835,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRejectsTasksWithApplyOperationID
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_tasks_no_ops",
@@ -872,7 +872,7 @@ func TestApplyStore_CreateWithTasksAndOperationsRollsBackOnOperationFailure(t *t
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_rollback_on_op_failure",
@@ -911,7 +911,7 @@ func TestApplyStore_CreateBlocksActiveApplyForSameTarget(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	active := createTestApply(t, store, lock, "apply_active", 1)
 
 	_, err := store.Applies().Create(ctx, &storage.Apply{
@@ -984,7 +984,7 @@ func TestApplyStore_CreateScopesActiveApplyByDeployment(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	newApply := func(identifier, deployment string, planID int64) *storage.Apply {
 		return &storage.Apply{
@@ -1020,7 +1020,7 @@ func TestApplyStore_CreateWaitsForApplyTargetLock(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// Hold the same target lock that the create path must acquire. The creates
 	// below use the public store API; a result before release means active
@@ -1110,7 +1110,7 @@ func TestApplyStore_CreateAllowsConcurrentActiveAppliesForDifferentTargets(t *te
 	for _, target := range targets {
 		key := target.database + "/" + target.dbType
 		if _, ok := locks[key]; !ok {
-			locks[key] = createTestLock(t, store, target.database, target.dbType, target.environment)
+			locks[key] = createTestLock(t, store, target.database, target.dbType)
 		}
 	}
 
@@ -1170,7 +1170,7 @@ func TestApplyStore_Get(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// Get non-existent should return nil
 	apply, err := store.Applies().Get(ctx, 99999)
@@ -1193,7 +1193,7 @@ func TestApplyStore_GetByApplyIdentifier(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// Get non-existent should return nil
 	apply, err := store.Applies().GetByApplyIdentifier(ctx, "nonexistent")
@@ -1219,7 +1219,7 @@ func TestApplyStore_IdempotencyKey(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// Empty key is never deduplicated: many applies store NULL and coexist.
 	// Terminal state keeps the active-apply target guard from rejecting the
@@ -1296,7 +1296,7 @@ func TestApplyStore_GetByPlan(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// Get non-existent should return nil
 	apply, err := store.Applies().GetByPlan(ctx, 99999)
@@ -1318,7 +1318,7 @@ func TestApplyStore_GetByLock(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// GetByLock with no applies should return empty slice
 	applies, err := store.Applies().GetByLock(ctx, lock.ID)
@@ -1343,8 +1343,8 @@ func TestApplyStore_GetByDatabase(t *testing.T) {
 	store := NewMySQL(testDB)
 
 	// Create locks for different databases
-	lock1 := createTestLock(t, store, "db1", "mysql", "staging")
-	lock2 := createTestLock(t, store, "db2", "mysql", "staging")
+	lock1 := createTestLock(t, store, "db1", "mysql")
+	lock2 := createTestLock(t, store, "db2", "mysql")
 
 	// Create applies
 	createTestApply(t, store, lock1, "apply_db1", 200)
@@ -1362,7 +1362,7 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "recentdb", "mysql", "staging")
+	lock := createTestLock(t, store, "recentdb", "mysql")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_staging_old", 210, state.Apply.Completed, "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_production", 211, state.Apply.Completed, "production")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_recent_staging_new", 212, state.Apply.Completed, "staging")
@@ -1401,7 +1401,7 @@ func TestApplyStore_GetRecentPutsInFlightWorkFirst(t *testing.T) {
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	lock := createTestLock(t, store, "activitydb", "mysql", "staging")
+	lock := createTestLock(t, store, "activitydb", "mysql")
 	longRunning := createTestApplyWithStateAndEnv(t, store, lock, "apply_long_running", 230, state.Apply.Running, "staging")
 	finishedRecently := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished_recently", 231, state.Apply.Completed, "staging")
 	finishedEarlier := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished_earlier", 232, state.Apply.Completed, "staging")
@@ -1437,11 +1437,11 @@ func TestApplyStore_GetRecentOrdersInFlightByStart(t *testing.T) {
 
 	// One database admits one in-flight apply, so concurrent rollouts are always
 	// against different databases.
-	oldest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_a", "mysql", "staging"),
+	oldest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_a", "mysql"),
 		"apply_running_oldest", 250, state.Apply.Running, "staging")
-	middle := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_b", "mysql", "staging"),
+	middle := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_b", "mysql"),
 		"apply_running_middle", 251, state.Apply.Running, "staging")
-	newest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_c", "mysql", "staging"),
+	newest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_c", "mysql"),
 		"apply_running_newest", 252, state.Apply.Running, "staging")
 
 	setApplyStartedAt(t, oldest.ID, now.Add(-48*time.Hour))
@@ -1474,8 +1474,8 @@ func TestApplyStore_GetRecentSinksAbandonedApplies(t *testing.T) {
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	abandonedLock := createTestLock(t, store, "abandoned_a", "mysql", "staging")
-	liveLock := createTestLock(t, store, "abandoned_b", "mysql", "staging")
+	abandonedLock := createTestLock(t, store, "abandoned_a", "mysql")
+	liveLock := createTestLock(t, store, "abandoned_b", "mysql")
 	abandoned := createTestApplyWithStateAndEnv(t, store, abandonedLock, "apply_abandoned", 260, state.Apply.FailedRetryable, "staging")
 	running := createTestApplyWithStateAndEnv(t, store, liveLock, "apply_still_running", 261, state.Apply.Running, "staging")
 	finished := createTestApplyWithStateAndEnv(t, store, abandonedLock, "apply_finished", 262, state.Apply.Completed, "staging")
@@ -1506,7 +1506,7 @@ func TestApplyStore_GetRecentTreatsOperationActivityAsInFlight(t *testing.T) {
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	lock := createTestLock(t, store, "opactivitydb", "mysql", "staging")
+	lock := createTestLock(t, store, "opactivitydb", "mysql")
 	fannedOut := createTestApplyWithStateAndEnv(t, store, lock, "apply_fanned_out", 240, state.Apply.Running, "staging")
 	finished := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished", 241, state.Apply.Completed, "staging")
 
@@ -1573,7 +1573,7 @@ func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "windowdb", "mysql", "staging")
+	lock := createTestLock(t, store, "windowdb", "mysql")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_stale", 220, state.Apply.Completed, "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fresh", 221, state.Apply.Completed, "staging")
 
@@ -1611,7 +1611,7 @@ func TestApplyStore_GetRecentOrdersSettledWorkByFinish(t *testing.T) {
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	lock := createTestLock(t, store, "settled", "mysql", "staging")
+	lock := createTestLock(t, store, "settled", "mysql")
 	earlier := createTestApplyWithStateAndEnv(t, store, lock, "apply_settled_earlier", 280, state.Apply.Completed, "staging")
 	later := createTestApplyWithStateAndEnv(t, store, lock, "apply_settled_later", 281, state.Apply.Completed, "staging")
 
@@ -1642,7 +1642,7 @@ func TestApplyStore_GetRecentWindowKeepsOperationActivity(t *testing.T) {
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	lock := createTestLock(t, store, "window_fanout", "mysql", "staging")
+	lock := createTestLock(t, store, "window_fanout", "mysql")
 	fannedOut := createTestApplyWithStateAndEnv(t, store, lock, "apply_window_fanout", 270, state.Apply.Running, "staging")
 	insertOperationWithUpdatedAt(t, fannedOut.ID, "deploy-a", state.ApplyOperation.Running, now)
 	setApplyUpdatedAt(t, fannedOut.ID, now.Add(-2*time.Hour))
@@ -1674,9 +1674,9 @@ func TestApplyStore_GetRecentScopesActivityToDeployment(t *testing.T) {
 
 	// Two fanned-out applies. In one deployment the first is still working and
 	// the second went quiet hours ago; in the other it is the other way round.
-	first := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_a", "mysql", "staging"),
+	first := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_a", "mysql"),
 		"apply_scoped_first", 290, state.Apply.Running, "staging")
-	second := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_b", "mysql", "staging"),
+	second := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_b", "mysql"),
 		"apply_scoped_second", 291, state.Apply.Running, "staging")
 
 	insertOperationWithUpdatedAt(t, first.ID, "deploy-east", state.ApplyOperation.Running, now)
@@ -1710,7 +1710,7 @@ func TestApplyStore_GetRecentDeploymentWindowScopesActivity(t *testing.T) {
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	lock := createTestLock(t, store, "scoped_window", "mysql", "staging")
+	lock := createTestLock(t, store, "scoped_window", "mysql")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_scoped_window", 292, state.Apply.Running, "staging")
 	insertOperationWithUpdatedAt(t, apply.ID, "deploy-east", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
 	insertOperationWithUpdatedAt(t, apply.ID, "deploy-west", state.ApplyOperation.Running, now)
@@ -1741,20 +1741,20 @@ func TestApplyStore_GetRecentActiveOnly(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_a", "mysql", "staging"),
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_a", "mysql"),
 		"apply_active_running", 300, state.Apply.Running, "staging")
-	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_b", "mysql", "staging"),
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_b", "mysql"),
 		"apply_active_retryable", 301, state.Apply.FailedRetryable, "staging")
-	unknownState := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_c", "mysql", "staging"),
+	unknownState := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_c", "mysql"),
 		"apply_active_unknown", 302, state.Apply.Completed, "staging")
 	_, err := testDB.ExecContext(ctx,
 		"UPDATE `applies` SET state = ?, updated_at = updated_at WHERE id = ?", "some_future_state", unknownState.ID)
 	require.NoError(t, err)
 
 	// Settled work that must not appear.
-	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_d", "mysql", "staging"),
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_d", "mysql"),
 		"apply_active_completed", 303, state.Apply.Completed, "staging")
-	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_e", "mysql", "staging"),
+	createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "active_e", "mysql"),
 		"apply_active_stopped", 304, state.Apply.Stopped, "staging")
 
 	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
@@ -1777,7 +1777,7 @@ func TestApplyStore_CountRecentByState(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "countdb", "mysql", "staging")
+	lock := createTestLock(t, store, "countdb", "mysql")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_one", 230, state.Apply.Completed, "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_completed_two", 231, state.Apply.Completed, "staging")
 	createTestApplyWithStateAndEnv(t, store, lock, "apply_count_failed", 232, state.Apply.Failed, "staging")
@@ -1815,7 +1815,7 @@ func TestApplyStore_GetRecentDeploymentFilterMatchesParentAndOperation(t *testin
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "recentdeploydb", "mysql", "staging")
+	lock := createTestLock(t, store, "recentdeploydb", "mysql")
 	createTestApplyWithStateEnvDeployment(t, store, lock, "apply_recent_parent_deployment", 214, state.Apply.Completed, "staging", "deploy-a")
 
 	operationMatch := createTestApplyWithStateEnvDeployment(t, store, lock, "apply_recent_operation_deployment", 215, state.Apply.Completed, "staging", "deploy-parent")
@@ -1849,7 +1849,7 @@ func TestApplyStore_Update(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_update", 300)
 
 	// Update state
@@ -1872,7 +1872,7 @@ func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	active := createTestApply(t, store, lock, "apply_update_active", 301)
 	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_completed", 302, state.Apply.Completed, "staging")
 
@@ -1907,7 +1907,7 @@ func TestApplyStore_UpdateDerivedState(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas", 800, state.Apply.Running, "staging")
 
 	// Matching expected state swaps and writes the projected fields.
@@ -1943,7 +1943,7 @@ func TestApplyStore_UpdateDerivedStateNoOpUnderChangedRows(t *testing.T) {
 	ctx := t.Context()
 	store := newChangedRowsStore(t)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas_noop", 802, state.Apply.Running, "staging")
 
 	// Re-deriving the same running state with no other field change is a no-op
@@ -1967,7 +1967,7 @@ func TestApplyStore_UpdateDerivedStateLeaseGuard(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_derived_cas_lease", 801, state.Apply.Pending, "staging")
 
 	task := &storage.Task{
@@ -2040,7 +2040,7 @@ func TestApplyStore_UpdateDerivedStateOperationLeaseGuard(t *testing.T) {
 	// Each running apply needs its own target so the active-apply uniqueness
 	// check does not reject the second one.
 	runningApply := func(identifier, env string, planID int64) *storage.Apply {
-		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, env)
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 		return createTestApplyWithStateAndEnv(t, store, lock, identifier, planID, state.Apply.Running, env)
 	}
 
@@ -2107,7 +2107,7 @@ func TestApplyStore_UpdateDerivedStateStampsStartedAt(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_started_stamp", 905, state.Apply.Running, "staging")
 
 	initial, err := store.Applies().Get(ctx, apply.ID)
@@ -2145,7 +2145,7 @@ func TestApplyStore_UpdateRejectsOperationLeaseOnlyContext(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_oplease", 906, state.Apply.Running, "staging")
 	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
 	stampOperationLease(t, opID, "driver", "op-token")
@@ -2183,7 +2183,7 @@ func TestApplyStore_HeartbeatRejectsOperationLeaseOnlyContext(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_heartbeat_oplease", 907, state.Apply.Running, "staging")
 	opID := createApplyOperationForLeaseTest(t, store, apply.ID, "primary")
 	stampOperationLease(t, opID, "driver", "op-token")
@@ -2217,7 +2217,7 @@ func TestApplyStore_GetInProgress(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	pending := createTestApply(t, store, lock, "apply_pending", 400)
 	running := createTestApplyWithStateAndEnv(t, store, lock, "apply_running", 401, state.Apply.Running, "production")
@@ -2251,7 +2251,7 @@ func TestApplyStore_ClaimApplyByIDClaimsPendingWithTasks(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_pending", 600, state.Apply.Pending, "staging")
 	addClaimByIDTask(t, store, apply, "task_claim_by_id")
 
@@ -2283,7 +2283,7 @@ func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_running", 601, state.Apply.Running, "staging")
 
 	fresh, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
@@ -2312,7 +2312,7 @@ func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) 
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_done", 602, state.Apply.Completed, "staging")
 
 	claimed, err := store.Applies().ClaimApplyByID(ctx, completed.ID, "operator-a")
@@ -2334,7 +2334,7 @@ func TestApplyStore_ClaimApplyByIDClaimsRetryable(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_retryable", 603, state.Apply.FailedRetryable, "staging")
 	apply.ErrorMessage = "transient engine failure"
 	require.NoError(t, store.Applies().Update(ctx, apply))
@@ -2372,7 +2372,7 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 		ctx := t.Context()
 		store := NewMySQL(testDB)
 
-		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_old_retryable", 604, state.Apply.FailedRetryable, "staging")
 		_, err := testDB.ExecContext(ctx, `
 			UPDATE applies
@@ -2397,7 +2397,7 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 		ctx := t.Context()
 		store := NewMySQL(testDB)
 
-		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_spent_retryable", 605, state.Apply.FailedRetryable, "staging")
 		_, err := testDB.ExecContext(ctx, `
 			UPDATE applies SET attempt = ? WHERE id = ?
@@ -2436,7 +2436,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleSetupPhase(t *testing.T) {
 			ctx := t.Context()
 			store := NewMySQL(testDB)
 
-			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess)
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_setup_"+setupState, int64(701+i), setupState, "staging")
 			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "setup-phase states only occur for the PlanetScale engine")
 
@@ -2483,7 +2483,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleRevertPhase(t *testing.T) {
 			ctx := t.Context()
 			store := NewMySQL(testDB)
 
-			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+			lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess)
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_revert_"+revertState, 703, revertState, "staging")
 			require.Equal(t, storage.EnginePlanetScale, apply.Engine, "revert-phase states only occur for the PlanetScale engine")
 
@@ -2529,7 +2529,7 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_for_cutover", 1, state.Apply.WaitingForCutover, "staging")
 
 	freshClaim, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
@@ -2597,7 +2597,7 @@ func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_lease", 507, state.Apply.Pending, "staging")
 	task := &storage.Task{
 		TaskIdentifier: "task_lease_users",
@@ -2677,7 +2677,7 @@ func TestApplyStore_ClaimApplyByIDRequiresTasksForPendingApply(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_claim", 502, state.Apply.Pending, "staging")
 
 	// A pending apply record can be visible before its task rows are written.
@@ -2736,7 +2736,7 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	// an active state.
 	seedPending := func(t *testing.T, applyID string, planID int64, withTask bool) *storage.Apply {
 		t.Helper()
-		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeMySQL, "staging")
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeMySQL)
 		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
 		if withTask {
 			now := time.Now()
@@ -2763,7 +2763,7 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	// operation row alone makes it claimable, so the stuck scan must surface it.
 	seedPendingVSchemaOnly := func(t *testing.T, applyID string, planID int64) *storage.Apply {
 		t.Helper()
-		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeVitess, "staging")
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeVitess)
 		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Pending, "staging")
 		now := time.Now()
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -2801,7 +2801,7 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	backdate(t, noChildren.ID, 40*time.Minute)
 
 	// Old terminal apply → not pending, excluded.
-	completedLock := createTestLock(t, store, "db_completed", storage.DatabaseTypeMySQL, "staging")
+	completedLock := createTestLock(t, store, "db_completed", storage.DatabaseTypeMySQL)
 	completed := createTestApplyWithStateAndEnv(t, store, completedLock, "apply_old_completed", 9005, state.Apply.Completed, "staging")
 	backdate(t, completed.ID, 40*time.Minute)
 
@@ -2840,7 +2840,7 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 func TestApplyStore_ClaimApplyByIDClaimsTasklessPendingApplyWithOperation(t *testing.T) {
 	clearTables(t)
 	store := NewMySQL(testDB)
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_vschema_only_byid", 503, state.Apply.Pending, "staging")
 	now := time.Now()
 	_, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
@@ -2863,7 +2863,7 @@ func TestApplyStore_ClaimApplyByIDClaimsPendingControlRequestWithoutTasks(t *tes
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_start_request", 503, state.Apply.Pending, "staging")
 	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:   apply.ID,
@@ -2895,7 +2895,7 @@ func TestApplyStore_ClaimApplyByIDClaimsWaitingForDeployStartControlRequest(t *t
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeVitess)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_waiting_deploy_start_request", 505, state.Apply.WaitingForDeploy, "staging")
 	_, err := testDB.ExecContext(ctx, `
 		UPDATE applies
@@ -2954,7 +2954,7 @@ func TestApplyStore_ClaimStoppedStartRefusedWhenTargetActive(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	active := createTestApplyWithStateAndEnv(t, store, lock, "apply_active_running", 1, state.Apply.Running, "staging")
 	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_blocked", 2, state.Apply.Stopped, "staging")
 
@@ -3001,7 +3001,7 @@ func TestApplyStore_ClaimStoppedStartSucceedsWhenTargetClear(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_clear", 1, state.Apply.Stopped, "staging")
 
 	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -3044,7 +3044,7 @@ func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *tes
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_failed_start", 1, state.Apply.Stopped, "staging")
 
 	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
@@ -3097,7 +3097,7 @@ func TestApplyStore_ClaimApplyByIDDoesNotClaimFreshRunningStopControlRequest(t *
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_running_stop_request", 505, state.Apply.Running, "staging")
 	_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:   apply.ID,
@@ -3118,7 +3118,7 @@ func TestApplyStore_ClaimApplyByIDConcurrentPendingClaims(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_concurrent_pending_claim",
@@ -3218,7 +3218,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_expired", 501, state.Apply.FailedRetryable, "staging")
 	apply.Attempt = maxRecoveryAttempts
 	require.NoError(t, store.Applies().Update(ctx, apply))
@@ -3288,7 +3288,7 @@ func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_old_expired", 502, state.Apply.FailedRetryable, "staging")
 	_, err := testDB.ExecContext(ctx, `
 		UPDATE applies
@@ -3325,7 +3325,7 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_ops_expired", 510, state.Apply.FailedRetryable, "staging")
 	apply.Attempt = maxRecoveryAttempts
 	require.NoError(t, store.Applies().Update(ctx, apply))
@@ -3371,7 +3371,7 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 	now := time.Now()
 	startedAt := now.Add(-time.Minute)
 
-	githubLock := createTestLockWithPR(t, store, "github_db", storage.DatabaseTypeMySQL, "staging", "org/repo", 123)
+	githubLock := createTestLockWithPR(t, store, "github_db", storage.DatabaseTypeMySQL, "org/repo", 123)
 	githubApply := &storage.Apply{
 		ApplyIdentifier: "apply_missing_summary_github",
 		LockID:          githubLock.ID,
@@ -3398,7 +3398,7 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 		GitHubCommentID: 1001,
 	}))
 
-	cliLock := createTestLockWithPR(t, store, "cli_db", storage.DatabaseTypeMySQL, "staging", "", 0)
+	cliLock := createTestLockWithPR(t, store, "cli_db", storage.DatabaseTypeMySQL, "", 0)
 	cliApply := &storage.Apply{
 		ApplyIdentifier: "apply_missing_summary_cli",
 		LockID:          cliLock.ID,
@@ -3441,7 +3441,7 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 func seedApplyMissingSummary(t *testing.T, store *Storage, name, applyState string, planID int64) *storage.Apply {
 	t.Helper()
 	ctx := t.Context()
-	lock := createTestLockWithPR(t, store, name+"_db", storage.DatabaseTypeMySQL, "staging", "org/repo", 123)
+	lock := createTestLockWithPR(t, store, name+"_db", storage.DatabaseTypeMySQL, "org/repo", 123)
 	apply := &storage.Apply{
 		ApplyIdentifier: name,
 		LockID:          lock.ID,
@@ -3566,8 +3566,8 @@ func TestApplyStore_GetByPR(t *testing.T) {
 	store := NewMySQL(testDB)
 
 	// Create locks for different PRs
-	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 100)
-	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "staging", "org/repo", 200)
+	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "org/repo", 100)
+	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "org/repo", 200)
 
 	// Create applies
 	createTestApply(t, store, lock1, "apply_pr100", 500)
@@ -3585,7 +3585,7 @@ func TestApplyStore_Delete(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_delete", 600)
 
 	// Delete should succeed
@@ -3606,9 +3606,9 @@ func TestApplyStore_DeleteByPR(t *testing.T) {
 	store := NewMySQL(testDB)
 
 	// Create locks for different PRs
-	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 100)
-	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "staging", "org/repo", 100)
-	lock3 := createTestLockWithPR(t, store, "db3", "mysql", "staging", "org/repo", 200)
+	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "org/repo", 100)
+	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "org/repo", 100)
+	lock3 := createTestLockWithPR(t, store, "db3", "mysql", "org/repo", 200)
 
 	// Create applies
 	createTestApply(t, store, lock1, "apply_pr100_1", 701)
@@ -3638,7 +3638,7 @@ func TestApplyStore_Delete_RemovesApplyOperations(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_delete_ops", 610)
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a",
@@ -3664,8 +3664,8 @@ func TestApplyStore_DeleteByPR_RemovesApplyOperations(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "staging", "org/repo", 110)
-	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "staging", "org/repo", 210)
+	lock1 := createTestLockWithPR(t, store, "db1", "mysql", "org/repo", 110)
+	lock2 := createTestLockWithPR(t, store, "db2", "mysql", "org/repo", 210)
 	apply1 := createTestApply(t, store, lock1, "apply_pr110", 711)
 	apply2 := createTestApply(t, store, lock2, "apply_pr210", 712)
 
@@ -3694,7 +3694,7 @@ func TestApplyStore_Options(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	// Create apply with options
 	apply := &storage.Apply{
@@ -3735,7 +3735,7 @@ func TestApplyStore_UpdateOptions(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_update_options_test",
 		LockID:          lock.ID,
@@ -3780,7 +3780,7 @@ func TestApplyStore_AllFields(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 
 	now := time.Now().Truncate(time.Second)
 	apply := &storage.Apply{
@@ -3850,15 +3850,13 @@ func TestApplyStore_AllFields(t *testing.T) {
 // The fixture helpers delegate to storagetest so this package's tests and the
 // cross-dialect parity suite always build identical Lock/Apply row shapes.
 
-func createTestLock(t *testing.T, store *Storage, dbName, dbType, env string) *storage.Lock {
+func createTestLock(t *testing.T, store *Storage, dbName, dbType string) *storage.Lock {
 	t.Helper()
-	_ = env // unused, but kept for API compatibility with tests
 	return storagetest.CreateLock(t, store, dbName, dbType)
 }
 
-func createTestLockWithPR(t *testing.T, store *Storage, dbName, dbType, env, repo string, pr int) *storage.Lock {
+func createTestLockWithPR(t *testing.T, store *Storage, dbName, dbType, repo string, pr int) *storage.Lock {
 	t.Helper()
-	_ = env // unused, but kept for API compatibility with tests
 	return storagetest.CreateLockWithPR(t, store, dbName, dbType, repo, pr)
 }
 
@@ -4050,7 +4048,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedContinueApp
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon", 1, state.Apply.Running, "staging")
 
 	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -4095,7 +4093,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsStrandedPausedApply
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_paused", 1, state.Apply.Paused, "staging")
 
 	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -4148,7 +4146,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithActiveOp(t 
 			ctx := t.Context()
 			store := NewMySQL(testDB)
 
-			lock := createTestLock(t, store, "testdb", "mysql", "staging")
+			lock := createTestLock(t, store, "testdb", "mysql")
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_active", 1, state.Apply.Running, "staging")
 
 			runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -4189,7 +4187,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsPendingApplyWithSto
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_pending", 1, state.Apply.Pending, "staging")
 
 	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -4221,7 +4219,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingS
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stop_recon_nostop", 1, state.Apply.Running, "staging")
 
 	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -4242,7 +4240,7 @@ func stageOperationProjectionOrphan(t *testing.T, store *Storage, identifier, pa
 	t.Helper()
 	ctx := t.Context()
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApplyWithStateAndEnv(t, store, lock, identifier, 1, parentState, "staging")
 	for i, opState := range opStates {
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -4402,7 +4400,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimGatedOnLeaseStalen
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createStrandedStopApply(t, store, lock, "apply_stop_recon_lease", 1)
 
 	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-a")
@@ -4439,7 +4437,7 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ReclaimableWhenStopReissu
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createStrandedStopApply(t, store, lock, "apply_stop_recon_reissue", 1)
 
 	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "operator-a")
@@ -4486,9 +4484,9 @@ func TestApplyStore_FindNextApplyForStopReconciliation_FreshLeaseDoesNotBlockOth
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	olderLock := createTestLock(t, store, "testdb", "mysql", "staging")
+	olderLock := createTestLock(t, store, "testdb", "mysql")
 	older := createStrandedStopApply(t, store, olderLock, "apply_stop_recon_older", 1)
-	newerLock := createTestLock(t, store, "testdb2", "mysql", "staging")
+	newerLock := createTestLock(t, store, "testdb2", "mysql")
 	newer := createStrandedStopApply(t, store, newerLock, "apply_stop_recon_newer", 2)
 
 	// Make the queue order deterministic at column precision.
@@ -4517,7 +4515,7 @@ func TestApplyStore_SetRevertSkipped(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "vitess", "staging")
+	lock := createTestLock(t, store, "testdb", "vitess")
 	apply := createTestApply(t, store, lock, "apply_revert_skipped", 1)
 
 	got, err := store.Applies().Get(ctx, apply.ID)
@@ -4552,7 +4550,7 @@ func TestApplyStore_ReleaseClaim_ReleasedApplyIsImmediatelyReclaimable(t *testin
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_release_claim", 701, state.Apply.Running, "staging")
 
 	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?`, apply.ID)
@@ -4588,7 +4586,7 @@ func TestApplyStore_ReleaseClaim_MismatchedTokenIsNoOp(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_release_stale_token", 702, state.Apply.Running, "staging")
 
 	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?`, apply.ID)

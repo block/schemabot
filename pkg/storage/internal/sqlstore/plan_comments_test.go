@@ -126,7 +126,7 @@ func TestApplyStore_ExistsForDatabaseHead(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	createTestApply(t, store, lock, "apply_exists_head", planID)
 
 	exists, err = store.Applies().ExistsForDatabaseHead(ctx, "org/repo", 123, "testdb", "mysql", "shaA")

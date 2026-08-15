@@ -24,7 +24,7 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_task_oplease", 1)
 
 	// Parent apply holds a current lease throughout; a successful update proves
@@ -106,9 +106,9 @@ func TestTaskStore_CountByApplyID(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	applyWithTasks := createTestApply(t, store, lock, "apply_count_tasks", 1)
-	tasklessLock := createTestLock(t, store, "otherdb", "mysql", "staging")
+	tasklessLock := createTestLock(t, store, "otherdb", "mysql")
 	applyTaskless := createTestApply(t, store, tasklessLock, "apply_count_taskless", 2)
 
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -160,7 +160,7 @@ func TestTaskStore_GetByApplyOperationID(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_tasks_by_op", 1)
 
 	opA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -240,7 +240,7 @@ func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "resolute", "vitess", "staging")
+	lock := createTestLock(t, store, "resolute", "vitess")
 	apply := createTestApply(t, store, lock, "apply_shard_tasks", 1)
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", Target: "resolute",
@@ -320,7 +320,7 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testapp", "mysql", "staging")
+	lock := createTestLock(t, store, "testapp", "mysql")
 	apply := createTestApply(t, store, lock, "apply_throttle", 1)
 
 	now := time.Now()
@@ -367,7 +367,7 @@ func TestTaskStore_GetByApplyOperationIDIncludesMatchingShardedWorkTask(t *testi
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
+	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata)
 	apply := createTestApply(t, store, lock, "apply_sharded_work_tasks", 1)
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID:       apply.ID,
@@ -427,7 +427,7 @@ func TestTaskStore_GetByApplyIDReturnsTasksInCreationOrder(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_tasks_creation_order", 1)
 
 	op, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -472,7 +472,7 @@ func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata, "staging")
+	lock := createTestLock(t, store, "resolute", storage.DatabaseTypeStrata)
 	apply := createTestApply(t, store, lock, "apply_shard_drive_tasks", 1)
 
 	// A sharded work operation: its shard-tagged row for the keyed shard is the
@@ -498,7 +498,7 @@ func TestTaskStore_GetByApplyIDIncludesShardScopedDriveTasks(t *testing.T) {
 	// A work operation of a different apply with the same key. tasks has no
 	// foreign-key constraint on apply_operation_id, so a row mis-associated
 	// with another apply's operation must still be excluded from drive work.
-	otherLock := createTestLock(t, store, "resolute_other", storage.DatabaseTypeStrata, "staging")
+	otherLock := createTestLock(t, store, "resolute_other", storage.DatabaseTypeStrata)
 	otherApply := createTestApply(t, store, otherLock, "apply_other_shard_drive", 1)
 	foreignOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID:       otherApply.ID,
@@ -553,7 +553,7 @@ func TestTaskStore_UnshardedTaskHasEmptyShard(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_unsharded", 1)
 
 	now := time.Now()
@@ -592,7 +592,7 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "resolute", "vitess", "staging")
+	lock := createTestLock(t, store, "resolute", "vitess")
 	apply := createTestApply(t, store, lock, "apply_upsert_shard", 1)
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", Target: "resolute",
@@ -708,7 +708,7 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "resolute", "vitess", "staging")
+	lock := createTestLock(t, store, "resolute", "vitess")
 	apply := createTestApply(t, store, lock, "apply_upsert_shard_applylease", 1)
 	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", Target: "resolute",
@@ -791,7 +791,7 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	// A shard task whose operation belongs to a different apply is rejected:
 	// tasks has no FK constraints, so the apply-lease guard alone would not catch
 	// an inconsistent (apply_id, apply_operation_id) pair.
-	otherLock := createTestLock(t, store, "other_resolute", "vitess", "staging")
+	otherLock := createTestLock(t, store, "other_resolute", "vitess")
 	otherApply := createTestApply(t, store, otherLock, "apply_other_applylease", apply.PlanID)
 	otherOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: otherApply.ID, Deployment: "region-a", Target: "resolute",
@@ -813,7 +813,7 @@ func TestTaskStore_FindTableOwners(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_object_owners", 1)
 
 	createTask := func(identifier, table, environment, repo string, pr int, createdAt time.Time) {
@@ -874,7 +874,7 @@ func TestTaskStore_FindTableOwnersReturnsARecencyWindow(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_object_owner_window", 1)
 
 	base := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
