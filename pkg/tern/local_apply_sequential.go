@@ -648,6 +648,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		}
 		return
 	}
+	previousState := apply.State
 	switch {
 	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
 		apply.State = state.Apply.FailedRetryable
@@ -671,6 +672,16 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+	} else {
+		// A sequential apply's failure reaches the operator through the same
+		// apply log stream as every other path, so a failed table does not read
+		// as an apply that went terminal for no stated reason.
+		switch apply.State {
+		case state.Apply.Failed:
+			c.logApplyFailure(ctx, apply, previousState, apply.ErrorMessage)
+		case state.Apply.FailedRetryable:
+			c.logApplyPausedForRetry(ctx, apply, previousState, apply.ErrorMessage)
+		}
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {

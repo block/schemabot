@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
@@ -72,4 +73,37 @@ func TestSpiritApplyLogFunc_MultiTableLineAttributedToApply(t *testing.T) {
 	require.Len(t, logs.logs, 1)
 	assert.Equal(t, "[drinks, orders] apply complete", logs.logs[0].Message)
 	assert.Nil(t, logs.logs[0].TaskID)
+}
+
+// The engine's log wiring is bound to the context it was built on. A resume
+// that hands its polling to a goroutine outliving the caller therefore rewires
+// on that goroutine's own context: a callback still holding the caller's
+// cancelled context records nothing, and the engine lines for the rest of the
+// schema change — the ones an operator reads when it fails — are exactly the
+// ones that would be lost.
+func TestSpiritApplyLogFunc_BoundContextDecidesWhatSurvivesTheCaller(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		storage: &mockStorage{logs: logs},
+		logger:  slog.Default(),
+	}
+
+	apply := &storage.Apply{ID: 3}
+	tasks := []*storage.Task{{ID: 11, TableName: "orders"}}
+
+	callerCtx, cancelCaller := context.WithCancel(t.Context())
+	boundToCaller := client.spiritApplyLogFunc(callerCtx, apply, tasks)
+	boundToDetachedPoll := client.spiritApplyLogFunc(context.WithoutCancel(callerCtx), apply, tasks)
+
+	cancelCaller()
+
+	boundToCaller(slog.LevelInfo, "orders", "copy rows complete")
+	assert.Empty(t, logs.logs, "a callback holding the caller's cancelled context records nothing")
+
+	boundToDetachedPoll(slog.LevelError, "orders", "fatal error processing GTID rows event")
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, "[orders] fatal error processing GTID rows event", logs.logs[0].Message)
+	assert.Equal(t, storage.LogLevelError, logs.logs[0].Level)
+	require.NotNil(t, logs.logs[0].TaskID)
+	assert.Equal(t, tasks[0].ID, *logs.logs[0].TaskID)
 }

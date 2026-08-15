@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -221,7 +222,7 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 
 	// The call site passes only the message — every identity attr must come
 	// from the bound logger.
-	noStore := requireLogLine(t, lines, "operator: no apply log store configured; apply claim will not appear in apply logs")
+	noStore := requireLogLine(t, lines, "operator: no apply log store configured; the apply's own log will not state that a driver claimed it to resume it")
 	assertDriveIdentity(noStore)
 
 	resumedLine := requireLogLine(t, lines, "operator: resumed apply")
@@ -240,6 +241,40 @@ type expiringApplyStore struct {
 
 func (s *expiringApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
 	return s.expirations, nil
+}
+
+// Expiry is what makes a retryable failure permanent, so it belongs in the
+// apply's own log stream: that stream is what the CLI and the PR summary
+// render, and an apply whose last entry is a paused attempt reads as one that
+// went terminal for no stated reason.
+func TestExpireRetryableApplies_RecordsWhyRecoveryStoppedInTheApplyLog(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Environment:     "staging",
+		State:           state.Apply.Failed,
+		Attempt:         storage.MaxRecoveryAttempts,
+	}
+	applyLogs := &capturingApplyLogStore{}
+	svc := New(&mockStorageWithApplyStores{
+		applies: &expiringApplyStore{expirations: []*storage.RetryableApplyExpiration{
+			{Apply: apply, Reason: storage.RetryableExpirationAttemptBudget},
+		}},
+		applyLogs: applyLogs,
+	}, testServerConfig(), nil, slog.Default())
+
+	svc.expireRetryableApplies(t.Context(), 1)
+
+	require.Len(t, applyLogs.logs, 1)
+	entry := applyLogs.logs[0]
+	assert.Equal(t, storage.LogLevelError, entry.Level)
+	assert.Equal(t, int64(42), entry.ApplyID)
+	assert.Contains(t, entry.Message,
+		fmt.Sprintf("%d of %d attempts", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
+	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
+	assert.Equal(t, state.Apply.FailedRetryable, entry.OldState)
+	assert.Equal(t, state.Apply.Failed, entry.NewState)
 }
 
 // A retryable-apply expiry is a control-plane lifecycle transition an operator

@@ -820,7 +820,12 @@ type mockApplyLogStore struct {
 	recentLimit int
 }
 
-func (m *mockApplyLogStore) Append(_ context.Context, log *storage.ApplyLog) error {
+// Append records the line the way the real store does: a cancelled context is
+// a failed write, not a silently dropped one.
+func (m *mockApplyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("append apply log for apply %d: %w", log.ApplyID, err)
+	}
 	stored := *log
 	m.logs = append(m.logs, &stored)
 	return nil
