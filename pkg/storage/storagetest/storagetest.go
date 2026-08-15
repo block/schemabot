@@ -9,6 +9,16 @@
 // calling Run from its integration tests. Per-family Test functions are also
 // exported so a family can be exercised in isolation while it is being
 // brought up on a new implementation.
+//
+// Timestamp assertions: stored timestamp precision is dialect-specific
+// (MySQL datetime is whole-second; PostgreSQL timestamp is microsecond), so
+// a written time.Time round-trips second-truncated on one dialect and exact
+// on another. Parity families must never assert exact equality between a
+// written time.Time and its stored round-trip. Compare stored times by
+// ordering, by require.WithinDuration with at least one second of tolerance,
+// or by truncating both sides to the coarsest dialect precision — and never
+// give a lease, claim, or cutoff assertion a sub-second margin that only one
+// dialect can represent.
 package storagetest
 
 import (
