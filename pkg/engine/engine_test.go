@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -187,4 +188,57 @@ func TestIsTransientTransportError(t *testing.T) {
 			assert.Equal(t, tt.want, IsTransientTransportError(tt.err))
 		})
 	}
+}
+
+// remoteWorkEngine models an engine whose schema change runs outside this
+// process: it declares no shutdown-halt capability because nothing it started
+// is affected by this process exiting.
+type remoteWorkEngine struct{ Engine }
+
+// haltableEngine models an engine that runs its schema change in this process.
+type haltableEngine struct {
+	Engine
+	haltErr error
+	halts   int
+}
+
+func (e *haltableEngine) HaltForShutdown(context.Context) error {
+	e.halts++
+	return e.haltErr
+}
+
+// Halting an engine on shutdown exists to release resources this process holds
+// on a target. An engine whose work runs elsewhere holds none, so shutdown must
+// report there is nothing to halt rather than treating the missing capability as
+// an error and blocking the process from exiting.
+func TestHaltEngineForShutdownSkipsEnginesWithNoInProcessWork(t *testing.T) {
+	supported, err := HaltEngineForShutdown(t.Context(), &remoteWorkEngine{})
+
+	require.NoError(t, err)
+	assert.False(t, supported, "an engine whose work runs elsewhere declares nothing to halt")
+}
+
+// An engine that runs its work in this process is halted, and a halt that does
+// not complete is reported to the caller rather than swallowed: the target may
+// still be held while the process stops renewing the apply's lease.
+func TestHaltEngineForShutdownReportsTheHaltResult(t *testing.T) {
+	t.Run("halted", func(t *testing.T) {
+		eng := &haltableEngine{}
+
+		supported, err := HaltEngineForShutdown(t.Context(), eng)
+
+		require.NoError(t, err)
+		assert.True(t, supported)
+		assert.Equal(t, 1, eng.halts)
+	})
+
+	t.Run("halt failed", func(t *testing.T) {
+		eng := &haltableEngine{haltErr: fmt.Errorf("runner still copying")}
+
+		supported, err := HaltEngineForShutdown(t.Context(), eng)
+
+		require.Error(t, err)
+		assert.True(t, supported)
+		assert.Contains(t, err.Error(), "runner still copying")
+	})
 }

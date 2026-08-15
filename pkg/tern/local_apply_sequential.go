@@ -56,6 +56,9 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 		}
 
 		action := c.checkTaskReady(ctx, logger, task)
+		if action == taskHandover {
+			return
+		}
 		if action == taskStopped {
 			stoppedByUser = true
 			break
@@ -81,7 +84,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			failedTask = task
 			break
 		}
-		if action == taskAbort {
+		if action == taskAbort || action == taskHandover {
 			return
 		}
 		if action == taskStopped {
@@ -103,12 +106,19 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 // taskAction indicates the outcome of a single task execution step.
 type taskAction int
 
+// taskStopped and taskHandover both end the loop early without further work, but
+// they mean opposite things and must not be merged: taskStopped is an operator
+// decision that the apply should durably rest in the stopped state until someone
+// starts it again, while taskHandover is this process giving up the drive with
+// the apply still active, to be reclaimed and resumed. Recording a handover as an
+// operator stop would park every apply a shutdown interrupts.
 const (
 	taskContinue taskAction = iota // Task completed successfully, proceed to next
 	taskFailed                     // Task failed, stop processing
 	taskStopped                    // Task/apply was stopped by user, stop processing
 	taskSkip                       // Task should be skipped (error fetching state)
 	taskAbort                      // Current owner should exit without changing final state
+	taskHandover                   // This drive's context was cancelled; the apply stays active for another driver to claim
 )
 
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
@@ -116,9 +126,9 @@ const (
 // identity-bound drive logger so these lines stay filterable by apply/PR.
 func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, task *storage.Task) taskAction {
 	if ctx.Err() != nil {
-		logger.Info("apply context cancelled, stopping sequential loop",
+		logger.Info("drive context cancelled before task start; handing the apply back for another driver to claim",
 			"task_id", task.TaskIdentifier, "table", task.TableName)
-		return taskStopped
+		return taskHandover
 	}
 	freshTask, err := c.storage.Tasks().Get(ctx, task.TaskIdentifier)
 	if err != nil {
@@ -175,7 +185,7 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 }
 
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
-// Returns the outcome: taskContinue (completed), taskFailed, or taskStopped.
+// Returns the outcome: taskContinue (completed), taskFailed, taskStopped, taskAbort, or taskHandover.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string, creds *engine.Credentials) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -233,7 +243,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	// Apply returned. (Spirit reports per-database and returns no resume state, so
 	// this stays nil and its behaviour is unchanged.)
 	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds, result.ResumeState)
-	if pollAction == taskAbort || pollAction == taskStopped {
+	if pollAction == taskAbort || pollAction == taskStopped || pollAction == taskHandover {
 		return pollAction
 	}
 
@@ -443,7 +453,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	for {
 		select {
 		case <-ctx.Done():
-			return taskStopped
+			logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
+				"task_id", task.TaskIdentifier, "table", task.TableName)
+			return taskHandover
 		case <-ticker.C:
 			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",

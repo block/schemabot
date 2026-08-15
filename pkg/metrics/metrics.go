@@ -986,6 +986,20 @@ func RecordOperatorClaimFailure(ctx context.Context, reason string) {
 	)
 }
 
+// RecordOperatorShutdownHaltFailure counts engines that did not come down when
+// this process shut down. The process stops renewing its applies' leases as it
+// exits, so an engine still holding a target's lock will refuse every driver
+// that reclaims that apply, and each refusal burns a recovery attempt until the
+// apply is exhausted. A nonzero rate means shutdowns are leaving targets held:
+// check the halt-failure logs for the endpoint, then whether the affected
+// applies were reclaimed and refused.
+func RecordOperatorShutdownHaltFailure(ctx context.Context) {
+	addCounter(ctx, "schemabot.operator.shutdown_halt_failures",
+		"Total number of engines that did not come down during operator shutdown", "{failure}",
+		EnvironmentAttribute(""),
+	)
+}
+
 // RecordOperatorStuckPendingApplies records how many pending applies are older
 // than the stuck threshold while still carrying the child rows that make them
 // claimable — work a driver should already have picked up. Apply creation

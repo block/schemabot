@@ -4541,3 +4541,88 @@ func TestApplyStore_SetRevertSkipped(t *testing.T) {
 	assert.Equal(t, apply.State, got.State, "SetRevertSkipped must not change other apply fields")
 	assert.Equal(t, before.UpdatedAt, got.UpdatedAt, "SetRevertSkipped preserves the lease heartbeat (updated_at)")
 }
+
+// A process shutting down hands back the applies its drivers were driving, so
+// a peer driver picks the work up on its next poll instead of waiting out the
+// staleness window on a claim that will never be used again. The release clears
+// the lease, leaves the apply's state alone, and makes the row immediately
+// re-claimable through the same path that recovers a crashed driver's work.
+func TestApplyStore_ReleaseClaim_ReleasedApplyIsImmediatelyReclaimable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_release_claim", 701, state.Apply.Running, "staging")
+
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "departing-driver")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	released, err := store.Applies().ReleaseClaim(ctx, claimed.Lease())
+	require.NoError(t, err)
+	assert.True(t, released, "release guarded on the held token must succeed")
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Empty(t, persisted.LeaseOwner, "release must clear the lease owner")
+	assert.Empty(t, persisted.LeaseToken, "release must clear the lease token")
+	assert.Nil(t, persisted.LeaseAcquiredAt, "release must clear lease_acquired_at")
+	assert.Equal(t, state.Apply.Running, persisted.State, "release must not change the apply's state")
+
+	reclaimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "next-driver")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released apply must be re-claimable on the next poll without aging")
+	assert.Equal(t, "next-driver", reclaimed.LeaseOwner)
+	assert.Equal(t, state.Apply.Running, reclaimed.State, "re-claim recovers the apply without changing its state")
+}
+
+// Once another driver has taken the lease, the previous holder's release must
+// not clear the new owner's claim or perturb its heartbeat — a departing
+// process must never hand back work that already moved on.
+func TestApplyStore_ReleaseClaim_MismatchedTokenIsNoOp(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_release_stale_token", 702, state.Apply.Running, "staging")
+
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "current-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	staleLease := claimed.Lease()
+	staleLease.Token = "rotated-away-" + staleLease.Token
+
+	released, err := store.Applies().ReleaseClaim(ctx, staleLease)
+	require.NoError(t, err)
+	assert.False(t, released, "a mismatched token must not release another owner's lease")
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "current-owner", persisted.LeaseOwner, "the current owner's lease must be untouched")
+	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
+
+	refused, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "another-driver")
+	require.NoError(t, err)
+	assert.Nil(t, refused, "the apply must stay leased to the current owner after a mismatched release")
+}
+
+// A lease with no token authorizes no write, so a release attempted with one is
+// refused rather than silently clearing whatever lease the row currently holds.
+func TestApplyStore_ReleaseClaim_InvalidLeaseIsRefused(t *testing.T) {
+	clearTables(t)
+	store := NewMySQL(testDB)
+
+	released, err := store.Applies().ReleaseClaim(t.Context(), storage.ApplyLease{ApplyID: 1})
+
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.False(t, released)
+}

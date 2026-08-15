@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -440,6 +441,41 @@ func (r *TargetRouter) Close() error {
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close target router clients: %w", closeErr)
+	}
+	return nil
+}
+
+// HaltForShutdown halts every resolved client that drives its schema changes in
+// this process. A router serves targets resolved per request, so its cached
+// clients are the only handle a shutting-down process has on the engines it
+// started; halting them here is what keeps a dynamically-routed target from
+// staying held after this process stops renewing its applies' leases.
+//
+// Every client is attempted even after one fails, so one target that will not
+// come down does not leave the rest held, and the failures are reported
+// together.
+func (r *TargetRouter) HaltForShutdown(ctx context.Context) error {
+	r.mu.Lock()
+	clients := make([]Client, 0, len(r.clientsByTarget))
+	for _, client := range r.clientsByTarget {
+		clients = append(clients, client)
+	}
+	r.mu.Unlock()
+
+	var errs []error
+	for _, client := range clients {
+		halter, ok := client.(ShutdownHalter)
+		if !ok {
+			r.logger.Debug("routed client drives its schema changes outside this process; nothing to halt for shutdown",
+				"endpoint", client.Endpoint())
+			continue
+		}
+		if err := halter.HaltForShutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("halt routed clients for shutdown: %w", errors.Join(errs...))
 	}
 	return nil
 }

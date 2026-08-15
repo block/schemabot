@@ -77,6 +77,39 @@ type Drainer interface {
 	Drain()
 }
 
+// ShutdownHalter is an optional capability for engines whose schema-change work
+// runs inside this process. Such an engine holds resources on the target — for
+// Spirit, an advisory lock on the table it is copying — for exactly as long as
+// its in-process work lives, and that work outlives the drive that started it.
+// Without a way to bring it down, a shutting-down process stops renewing the
+// apply's lease while still holding the target, and peer drivers reclaim work
+// they cannot execute.
+//
+// An engine whose work runs elsewhere (a remote online-DDL service) must not
+// implement this: its schema change is unaffected by this process going away,
+// and the lease handover alone is the correct behavior.
+type ShutdownHalter interface {
+	// HaltForShutdown brings this instance's in-flight schema change down now,
+	// checkpointed so another driver can resume it, and returns once the engine
+	// no longer holds the target's resources. It is not an operator stop: it
+	// records no operator intent and leaves the apply active for reclaim.
+	// It returns an error if the work has not come down by the time ctx expires,
+	// so a caller can report that the target may still be held.
+	HaltForShutdown(ctx context.Context) error
+}
+
+// HaltEngineForShutdown brings eng's in-process schema-change work down when it
+// has any, and reports whether the engine implements the capability at all. An
+// engine that does not is one whose work is unaffected by this process exiting,
+// so there is nothing to halt and nothing to wait for.
+func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err error) {
+	halter, ok := eng.(ShutdownHalter)
+	if !ok {
+		return false, nil
+	}
+	return true, halter.HaltForShutdown(ctx)
+}
+
 // DeferredCutoverSignalChecker is an optional capability for engines that can
 // persist deferred-cutover intent in the target data plane. SchemaBot uses this
 // during restart recovery to decide whether it must reattach to a deferred

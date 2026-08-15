@@ -157,3 +157,17 @@ type Client interface {
 	// Close releases any resources held by the client.
 	Close() error
 }
+
+// ShutdownHalter is an optional capability for clients whose engines drive
+// schema changes inside this process. A halting client brings that in-process
+// work down so the process can exit without leaving a target held while it has
+// stopped renewing the apply's lease. Clients that delegate to a separate Tern
+// service do not implement it: that service owns its own engines and halts them
+// on its own shutdown.
+type ShutdownHalter interface {
+	// HaltForShutdown brings this client's in-flight schema-change work down,
+	// checkpointed so another driver can resume it, and returns once its engine
+	// no longer holds the target. It is not an operator stop: the applies it
+	// halts stay active for reclaim.
+	HaltForShutdown(ctx context.Context) error
+}

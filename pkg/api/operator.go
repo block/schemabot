@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -114,11 +116,367 @@ func (s *Service) StopOperator() {
 	s.operatorWake = nil
 	s.operatorMu.Unlock()
 
+	// Stop claiming first, so no driver picks up new work while the in-flight
+	// drives are being brought down.
 	close(stop)
+
+	// From here on a drive that returns leaves its claim registered. A drive
+	// already past its stop-channel check can still take a claim after this
+	// point, and a claim that registered and deregistered inside the shutdown
+	// would otherwise be in neither the map nor any snapshot — handed back by
+	// nobody, and idle for the whole staleness window.
+	s.beginClaimDrain()
+
+	// End the in-flight drives. A drive inside a claim only observes its
+	// context, so cancelling it is what returns it; it exits leaving its apply
+	// active for another driver rather than recording an operator stop.
 	if cancel != nil {
 		cancel()
 	}
 	s.recoveryWg.Wait()
+
+	// A drive returning does not stop the engine it started. An engine that runs
+	// its schema change in this process keeps copying and keeps the target's
+	// lock, while nothing renews the apply's lease any more. Bring those engines
+	// down before the process exits, so the lock is released rather than left
+	// held for peer drivers that would reclaim the apply and be refused.
+	halted := s.haltEnginesForShutdown()
+
+	// Every drive has returned, so this collects the claims taken before the
+	// stop signal and the late ones alike.
+	held, heldOperations := s.drainHeldClaims()
+
+	// Only now, with the targets released, hand the claims back. Releasing them
+	// any earlier would invite a peer driver onto a target this process still
+	// held; leaving them to go stale instead would idle the work for the whole
+	// staleness window.
+	// Hand the parent applies back before their operations. A driver reaches
+	// work through its apply_operation, so releasing the operation first invites
+	// a peer to claim it while this process still holds the parent apply — the
+	// peer then finds an unclaimable parent and has to reconcile its way out
+	// instead of simply resuming.
+	s.releaseHeldClaims(held, halted)
+	s.releaseHeldOperationClaims(heldOperations, halted)
+}
+
+// beginClaimDrain puts claim tracking into shutdown mode: a drive returning
+// from here on leaves its claim registered for drainHeldClaims to collect.
+func (s *Service) beginClaimDrain() {
+	s.heldClaimsMu.Lock()
+	s.heldClaimsDraining = true
+	s.heldClaimsMu.Unlock()
+
+	s.heldOperationClaimsMu.Lock()
+	s.heldOperationClaimsDraining = true
+	s.heldOperationClaimsMu.Unlock()
+}
+
+// drainHeldClaims takes every registered claim and leaves tracking ready for a
+// later StartOperator, which is what lets a service be stopped and started
+// again without the drain outliving the shutdown that opened it.
+func (s *Service) drainHeldClaims() ([]heldClaim, []heldOperationClaim) {
+	s.heldClaimsMu.Lock()
+	applies := slices.Collect(maps.Values(s.heldClaims))
+	clear(s.heldClaims)
+	s.heldClaimsDraining = false
+	s.heldClaimsMu.Unlock()
+
+	s.heldOperationClaimsMu.Lock()
+	operations := slices.Collect(maps.Values(s.heldOperationClaims))
+	clear(s.heldOperationClaims)
+	s.heldOperationClaimsDraining = false
+	s.heldOperationClaimsMu.Unlock()
+
+	return applies, operations
+}
+
+// heldClaim is an apply lease a driver is driving under, carried alongside the
+// apply's triage identity. Shutdown reloads each apply before handing its claim
+// back, and the reload is exactly the step that can fail — so the identity is
+// captured at claim time, when the apply is in hand, rather than looked up when
+// it may be unavailable.
+type heldClaim struct {
+	lease storage.ApplyLease
+	// deployment routes the claim to the engine that holds its target's lock, so
+	// shutdown can tell whether that engine came down before handing it back.
+	deployment string
+	logAttrs   []any
+}
+
+// trackHeldClaim registers the claim a drive is running under and returns the
+// function that deregisters it when the drive returns. Shutdown snapshots the
+// registered claims so it can hand back the ones still being driven when the
+// process goes away.
+func (s *Service) trackHeldClaim(apply *storage.Apply) func() {
+	lease := apply.Lease()
+	if !lease.Valid() {
+		// An invalid lease authorizes no write, so there is no claim to hand
+		// back. The drive's own lease validation reports the cause.
+		return func() {}
+	}
+	if !storage.LeaseOwnedByThisProcess(lease.Owner) {
+		// An operation-lease drive reads its parent apply without claiming it,
+		// so the row can carry a peer's lease. Handing that back would backdate
+		// a lease this process never held, out from under the peer still
+		// driving its own sibling operations.
+		s.logger.Debug("operator: parent apply is leased to another process; its claim is that process's to hand back",
+			append(apply.IdentityLogAttrs(), "lease_owner", lease.Owner)...)
+		return func() {}
+	}
+	s.heldClaimsMu.Lock()
+	if s.heldClaims == nil {
+		s.heldClaims = make(map[int64]heldClaim)
+	}
+	s.heldClaims[lease.ApplyID] = heldClaim{lease: lease, deployment: apply.Deployment, logAttrs: apply.IdentityLogAttrs()}
+	s.heldClaimsMu.Unlock()
+
+	return func() {
+		s.heldClaimsMu.Lock()
+		defer s.heldClaimsMu.Unlock()
+		if s.heldClaimsDraining {
+			// Shutdown is collecting the claims to hand back, and a drive
+			// returning now still leaves its apply active for a peer to pick up.
+			return
+		}
+		// Delete only this claim: a peer that rotated the lease onto itself is
+		// recorded under a different token, and this drive must not deregister
+		// a claim it no longer owns.
+		if current, ok := s.heldClaims[lease.ApplyID]; ok && current.lease.Token == lease.Token {
+			delete(s.heldClaims, lease.ApplyID)
+		}
+	}
+}
+
+// heldClaimsSnapshot returns the claims this process is currently driving under.
+func (s *Service) heldClaimsSnapshot() []heldClaim {
+	s.heldClaimsMu.Lock()
+	defer s.heldClaimsMu.Unlock()
+	return slices.Collect(maps.Values(s.heldClaims))
+}
+
+// releaseHeldClaims hands back the claims this process was driving under, so a
+// peer driver picks the work up on its next poll rather than waiting out the
+// staleness window. An apply that settled while shutdown was in progress is
+// left alone: it has nothing to hand over, and backdating its heartbeat would
+// misreport when it finished.
+func (s *Service) releaseHeldClaims(claims []heldClaim, halted engineHaltOutcome) {
+	if len(claims) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	defer cancel()
+
+	for _, claim := range claims {
+		attrs := append(slices.Clone(claim.logAttrs), "lease_owner", claim.lease.Owner)
+		if !halted.haltedCleanly(claim.deployment) {
+			s.logger.Warn("operator: this apply's engine did not come down, so its claim is left to go stale; handing it back now would put a driver onto a target this process still holds the lock on",
+				attrs...)
+			continue
+		}
+		apply, err := s.storage.Applies().Get(ctx, claim.lease.ApplyID)
+		if err != nil {
+			s.logger.Error("operator: could not read a claimed apply while handing back claims on shutdown; the apply stays claimed until its lease goes stale, delaying the driver that would resume it",
+				append(attrs, "error", err)...)
+			continue
+		}
+		if apply == nil {
+			s.logger.Debug("operator: a claimed apply no longer exists; nothing to hand back", attrs...)
+			continue
+		}
+		if state.IsTerminalApplyState(apply.State) {
+			s.logger.Debug("operator: claimed apply settled before shutdown handed its claim back",
+				append(apply.LogAttrs(), "lease_owner", claim.lease.Owner)...)
+			continue
+		}
+		released, err := s.storage.Applies().ReleaseClaim(ctx, claim.lease)
+		if err != nil {
+			s.logger.Error("operator: could not hand back a claimed apply on shutdown; the apply stays claimed until its lease goes stale, delaying the driver that would resume it",
+				append(apply.LogAttrs(), "lease_owner", claim.lease.Owner, "error", err)...)
+			continue
+		}
+		if !released {
+			s.logger.Debug("operator: a claimed apply's lease had already moved on; nothing to hand back",
+				append(apply.LogAttrs(), "lease_owner", claim.lease.Owner)...)
+			continue
+		}
+		s.logger.Info("operator: handed a claimed apply back on shutdown; it is claimable again on the next poll",
+			append(apply.LogAttrs(), "lease_owner", claim.lease.Owner)...)
+	}
+}
+
+// heldOperationClaim is an operation lease a driver is driving under, carried
+// alongside the operation's triage identity for the same reason heldClaim
+// carries the apply's: shutdown hands the claim back without reloading the row.
+type heldOperationClaim struct {
+	lease storage.OperationLease
+	// deployment routes the claim to the engine that holds its target's lock,
+	// the same gate the parent apply's claim passes through.
+	deployment string
+	logAttrs   []any
+}
+
+// trackHeldOperationClaim registers the operation claim a drive is running
+// under and returns the function that deregisters it when the drive returns.
+// Every claimed drive passes through here, so this is the one registration that
+// covers single-operation, multi-operation, and task-less operation drives.
+func (s *Service) trackHeldOperationClaim(op *storage.ApplyOperation, lease storage.OperationLease) func() {
+	if !lease.Valid() {
+		// An invalid lease authorizes no write, so there is no claim to hand
+		// back. The caller's own lease validation reports the cause.
+		return func() {}
+	}
+	s.heldOperationClaimsMu.Lock()
+	if s.heldOperationClaims == nil {
+		s.heldOperationClaims = make(map[int64]heldOperationClaim)
+	}
+	s.heldOperationClaims[lease.OperationID] = heldOperationClaim{lease: lease, deployment: op.Deployment, logAttrs: op.LogAttrs()}
+	s.heldOperationClaimsMu.Unlock()
+
+	return func() {
+		s.heldOperationClaimsMu.Lock()
+		defer s.heldOperationClaimsMu.Unlock()
+		if s.heldOperationClaimsDraining {
+			// Shutdown is collecting the claims to hand back, and a drive
+			// returning now still leaves its operation active for a peer.
+			return
+		}
+		// Delete only this claim: a peer that rotated the lease onto itself is
+		// recorded under a different token, and this drive must not deregister
+		// a claim it no longer owns.
+		if current, ok := s.heldOperationClaims[lease.OperationID]; ok && current.lease.Token == lease.Token {
+			delete(s.heldOperationClaims, lease.OperationID)
+		}
+	}
+}
+
+// heldOperationClaimsSnapshot returns the operation claims this process is
+// currently driving under.
+func (s *Service) heldOperationClaimsSnapshot() []heldOperationClaim {
+	s.heldOperationClaimsMu.Lock()
+	defer s.heldOperationClaimsMu.Unlock()
+	return slices.Collect(maps.Values(s.heldOperationClaims))
+}
+
+// releaseHeldOperationClaims hands back the operation claims this process was
+// driving under. A driver's next poll reaches an apply through
+// FindNextApplyOperation, so an operation left claimed idles the work for the
+// whole staleness window even when the parent apply is already claimable.
+func (s *Service) releaseHeldOperationClaims(claims []heldOperationClaim, halted engineHaltOutcome) {
+	if len(claims) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	defer cancel()
+
+	for _, claim := range claims {
+		attrs := append(slices.Clone(claim.logAttrs), "lease_owner", claim.lease.Owner)
+		if !halted.haltedCleanly(claim.deployment) {
+			s.logger.Warn("operator: this operation's engine did not come down, so its claim is left to go stale; handing it back now would put a driver onto a target this process still holds the lock on",
+				attrs...)
+			continue
+		}
+		released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, claim.lease)
+		if err != nil {
+			s.logger.Error("operator: could not hand back a claimed apply_operation on shutdown; the operation stays claimed until its lease goes stale, delaying the driver that would resume it",
+				append(attrs, "error", err)...)
+			continue
+		}
+		if !released {
+			s.logger.Debug("operator: a claimed apply_operation's lease had already moved on; nothing to hand back", attrs...)
+			continue
+		}
+		s.logger.Info("operator: handed a claimed apply_operation back on shutdown; it is claimable again on the next poll", attrs...)
+	}
+}
+
+// shutdownHaltTimeout bounds how long shutdown waits for this process's engines
+// to come down. It must stay well inside storage.ApplyLeaseStaleAfter: once the
+// lease goes stale, peer drivers reclaim the apply, and a target still held by
+// an engine that has not come down refuses every one of them.
+const shutdownHaltTimeout = 20 * time.Second
+
+// haltEnginesForShutdown brings down every engine this process drives schema
+// changes with. Clients that delegate to a separate Tern service are skipped:
+// that service owns its engines and halts them on its own shutdown.
+//
+// Every client is attempted even after one fails, so one target that will not
+// come down does not leave the rest held.
+// engineHaltOutcome records which of this process's engines came down. Handing a
+// claim back is only safe once the engine holding its target's lock is down, so
+// shutdown consults this before releasing each claim.
+type engineHaltOutcome struct {
+	// failedDeployments names the deployments whose engine did not come down.
+	failedDeployments map[string]bool
+	// unattributedFailure records a halt failure on a client this process cannot
+	// attribute to a deployment, which leaves no claim provably safe.
+	unattributedFailure bool
+}
+
+// haltedCleanly reports whether the engine serving this deployment is down, and
+// so whether a peer driver can safely be handed its work.
+func (o engineHaltOutcome) haltedCleanly(deployment string) bool {
+	if o.unattributedFailure {
+		return false
+	}
+	if deployment == "" {
+		deployment = DefaultDeployment
+	}
+	return !o.failedDeployments[deployment]
+}
+
+func (s *Service) haltEnginesForShutdown() engineHaltOutcome {
+	// The drive contexts are already cancelled by this point, so the halt runs
+	// on a fresh bounded context rather than one that is guaranteed expired.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	defer cancel()
+
+	s.ternMu.Lock()
+	clients := maps.Clone(s.ternClients)
+	defaultClient := s.defaultTernClient
+	s.ternMu.Unlock()
+
+	outcome := engineHaltOutcome{failedDeployments: make(map[string]bool)}
+	for key, client := range clients {
+		if err := s.haltEngine(ctx, client); err != nil {
+			outcome.failedDeployments[deploymentFromTernClientKey(key)] = true
+		}
+	}
+	if defaultClient != nil {
+		if err := s.haltEngine(ctx, defaultClient); err != nil {
+			outcome.unattributedFailure = true
+		}
+	}
+	return outcome
+}
+
+// haltEngine brings one client's in-process engines down. A client that drives
+// its schema changes elsewhere owns no engines here, so it reports no failure.
+func (s *Service) haltEngine(ctx context.Context, client tern.Client) error {
+	halter, ok := client.(tern.ShutdownHalter)
+	if !ok {
+		s.logger.Debug("tern client drives its schema changes outside this process; nothing to halt for shutdown",
+			"endpoint", client.Endpoint())
+		return nil
+	}
+	if err := halter.HaltForShutdown(ctx); err != nil {
+		metrics.RecordOperatorShutdownHaltFailure(ctx)
+		s.logger.Error("engine did not come down on shutdown; its target stays locked while this process no longer renews the apply's lease, so its claims are left in place to go stale rather than handed to a driver that would be refused the lock",
+			"endpoint", client.Endpoint(),
+			"halt_timeout", shutdownHaltTimeout,
+			"error", err)
+		return err
+	}
+	return nil
+}
+
+// deploymentFromTernClientKey recovers the deployment from a tern client's
+// registry key, which is the deployment and environment joined by a slash.
+func deploymentFromTernClientKey(key string) string {
+	deployment, _, found := strings.Cut(key, "/")
+	if !found {
+		return key
+	}
+	return deployment
 }
 
 func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
@@ -326,6 +684,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_lease_token")
 		return
 	}
+	// Registered once here, before the branch: every drive below runs under this
+	// operation lease, and shutdown has to hand it back whichever path it took.
+	defer s.trackHeldOperationClaim(op, opLease)()
 
 	// Branch on the operation count. A single-operation apply keeps the legacy
 	// parent-lease drive byte-for-byte. A multi-operation apply drives under the
@@ -1243,6 +1604,7 @@ type resumeClaimedApplyOptions struct {
 
 func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, operationDeployment string, opts resumeClaimedApplyOptions) (bool, error) {
 	lease := apply.Lease()
+	defer s.trackHeldClaim(apply)()
 	start := s.clock.Now()
 
 	// Bind the apply's identity once so every line of this drive is
