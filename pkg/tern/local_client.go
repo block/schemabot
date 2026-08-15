@@ -1716,6 +1716,54 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 	return out, nil
 }
 
+// vschemaOnlyDispatchNamespaces returns, deduplicated in dispatch order, the
+// namespaces of a VSchema-only dispatch — one where every ddl_change carries
+// CHANGE_TYPE_VSCHEMA — or nil when the dispatch carries any table DDL or no
+// changes at all. This is the shape the control plane's task-less VSchema
+// dispatch sends (a group_finalizer, or a VSchema-only plan's whole-deployment
+// work operation); a mixed set is a work dispatch and returns nil so the caller
+// treats it as one.
+func vschemaOnlyDispatchNamespaces(changes []*ternv1.TableChange) []string {
+	if len(changes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(changes))
+	namespaces := make([]string, 0, len(changes))
+	for _, ch := range changes {
+		if ch == nil || ch.ChangeType != ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+			return nil
+		}
+		namespace := strings.TrimSpace(ch.Namespace)
+		if namespace == "" {
+			return nil
+		}
+		if _, ok := seen[namespace]; ok {
+			continue
+		}
+		seen[namespace] = struct{}{}
+		namespaces = append(namespaces, namespace)
+	}
+	return namespaces
+}
+
+// finalizerDispatchNamespace validates a group_finalizer dispatch's namespace
+// set against the stored plan and returns the single namespace the finalizer
+// applies. The control plane dispatches one finalizer per namespace, so a
+// VSchema-only dispatch that arrives alongside a plan carrying table DDL must
+// name exactly one namespace, and the plan must hold that namespace's VSchema
+// artifact — otherwise the drive would have nothing to apply and the operation
+// would fail only after it was created.
+func finalizerDispatchNamespace(plan *storage.Plan, namespaces []string) (string, error) {
+	if len(namespaces) != 1 {
+		return "", fmt.Errorf("group_finalizer dispatch names %d namespaces (%v), expected exactly 1", len(namespaces), namespaces)
+	}
+	namespace := namespaces[0]
+	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
+		return "", fmt.Errorf("group_finalizer dispatch for namespace %q: %w", namespace, err)
+	}
+	return namespace, nil
+}
+
 // shardScopedDispatchOperationKey builds the operation key for a shard-scoped
 // dispatch's single operation. The control plane's per-shard fan-out dispatches
 // one (namespace, shard, table)'s changes per operation, so every change in the
@@ -2004,16 +2052,30 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	// Determine the dispatch's shard scope. A sharded engine's work is dispatched
+	// Determine the dispatch's scope. A sharded engine's work is dispatched
 	// one apply_operation per shard, so a request that carries target shards is
 	// scoped to that single shard: it drives the operation's own DDL changes
 	// (req.DdlChanges) and tags its tasks with the shard, so the engine receives
-	// exactly one target shard. A whole-deployment or non-sharded apply carries no
-	// target shard and uses the stored plan unchanged — keeping that path
-	// byte-for-byte as before. More than one target shard is a malformed dispatch
-	// (the per-shard fan-out emits one shard per operation) and fails closed.
+	// exactly one target shard. More than one target shard is a malformed
+	// dispatch (the per-shard fan-out emits one shard per operation) and fails
+	// closed.
+	//
+	// A dispatch with no target shards whose changes are all VSchema-typed is a
+	// group_finalizer: it applies one namespace's VSchema and deliberately
+	// carries no shard (the VSchema is namespace-level). When the stored plan
+	// also carries table DDL, that DDL belongs to the finalizer's sibling shard
+	// work operations — falling back to the plan here would resurrect it as
+	// shard-less work tasks, which a sharded engine rejects and which would run
+	// unscoped work on a non-sharded one. Create the task-less finalizer
+	// operation instead so the drive applies the namespace VSchema from the
+	// plan.
+	//
+	// Every other no-target-shard dispatch (a whole-deployment or non-sharded
+	// apply, including a VSchema-only plan's task-less work operation) uses the
+	// stored plan unchanged — keeping that path byte-for-byte as before.
 	ddlChanges := plan.FlatDDLChanges()
 	dispatchShard := ""
+	finalizerNamespace := ""
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {
@@ -2025,6 +2087,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		}
 		dispatchShard = shard
 		ddlChanges = scoped
+	} else if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 && len(ddlChanges) > 0 {
+		namespace, err := finalizerDispatchNamespace(plan, namespaces)
+		if err != nil {
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
+		finalizerNamespace = namespace
+		ddlChanges = nil
 	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
@@ -2159,11 +2228,20 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// Without the key, the operator's claim would load no drive tasks for the
 	// apply and the dispatched work would never run.
 	operationKey := ""
+	operationKind := ""
 	if dispatchShard != "" {
 		operationKey, err = shardScopedDispatchOperationKey(ddlChanges, dispatchShard)
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
+	}
+	// A group_finalizer dispatch creates a task-less finalizer operation: the
+	// finalizer key names the namespace the drive reconstructs the VSchema
+	// change from, and the kind routes the claim to the finalizer drive instead
+	// of failing closed on the empty task set.
+	if finalizerNamespace != "" {
+		operationKey = finalizerNamespace + finalizerOperationKeySuffix
+		operationKind = storage.ApplyOperationKindGroupFinalizer
 	}
 
 	// Dual-write one apply_operations row alongside the applies row in the
@@ -2177,12 +2255,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// apply path), so the store applies its safe defaults (rolling cutover,
 	// halt on failure).
 	operations := []*storage.ApplyOperation{{
-		Deployment:   apply.Deployment,
-		OperationKey: operationKey,
-		Target:       plan.Target,
-		State:        state.ApplyOperation.Pending,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		Deployment:    apply.Deployment,
+		OperationKey:  operationKey,
+		OperationKind: operationKind,
+		Target:        plan.Target,
+		State:         state.ApplyOperation.Pending,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}}
 
 	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
