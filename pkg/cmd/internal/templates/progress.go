@@ -69,6 +69,24 @@ func volumeBoxRow(volume int, applyState string) (BoxRow, bool) {
 	return BoxRow{"Volume", fmt.Sprintf("%d/%d", volume, storage.MaxVolume)}, true
 }
 
+// retryBoxRow renders the automatic-retry state of an interrupted apply: how
+// much of the retry budget the next attempt consumes, and the clock time that
+// attempt becomes eligible. The wait is shown as a time rather than a countdown
+// because a watch redraws far more often than the backoff advances. It is
+// omitted once the wait has elapsed — the retry is then due and naming a time in
+// the past would read as a missed deadline — and outside the retrying state,
+// where a spent attempt counter carries no signal.
+func retryBoxRow(data ProgressData) (BoxRow, bool) {
+	if !state.IsState(data.State, state.Apply.FailedRetryable) {
+		return BoxRow{}, false
+	}
+	retry := fmt.Sprintf("attempt %d/%d", data.Attempt+1, storage.MaxRecoveryAttempts)
+	if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(time.Now()) {
+		retry += " · next " + due.Local().Format("15:04:05 MST")
+	}
+	return BoxRow{"Retry", retry}, true
+}
+
 // WriteProgress writes the schema change progress to stdout.
 func WriteProgress(data ProgressData) {
 	// No active schema change
@@ -106,6 +124,9 @@ func WriteProgress(data ProgressData) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", displayState})
+	if row, ok := retryBoxRow(data); ok {
+		rows = append(rows, row)
+	}
 	if row, ok := volumeBoxRow(data.Volume, data.State); ok {
 		rows = append(rows, row)
 	}

@@ -448,6 +448,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	overlayApplyOptions(httpResp, apply)
 
+	overlayRetryBudget(httpResp, apply)
+
 	setRevertSkippedMetadata(httpResp, apply)
 
 	// Overlay per-table timestamps from task records. The proto response
@@ -472,6 +474,21 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 
 	s.writeJSON(w, http.StatusOK, httpResp)
+}
+
+// overlayRetryBudget surfaces the apply's automatic-retry state: how much of the
+// budget an interrupted apply has spent and when its next attempt becomes
+// eligible. Both are control-plane bookkeeping — the claim path owns them — so
+// they are read from the stored apply on every progress path, including the one
+// whose per-table detail comes from a remote engine.
+func overlayRetryBudget(resp *apitypes.ProgressResponse, apply *storage.Apply) {
+	if apply == nil {
+		return
+	}
+	resp.Attempt = int32(apply.Attempt)
+	if apply.RetryAfter != nil {
+		resp.RetryAfter = apply.RetryAfter.Format(time.RFC3339)
+	}
 }
 
 // setRevertSkippedMetadata surfaces the skip-revert flag from the apply's stored
@@ -1130,6 +1147,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		httpResp.ErrorMessage = apply.ErrorMessage
 	}
 	overlayApplyOptions(httpResp, apply)
+	overlayRetryBudget(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
 	operations, deploymentByOperationID, released := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations

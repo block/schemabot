@@ -24,13 +24,13 @@ import (
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
-	state, error_message, options, attempt,
+	state, error_message, options, attempt, retry_after,
 	lease_owner, lease_token, lease_acquired_at,
 	created_at, started_at, completed_at, updated_at, revert_skipped_at`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
 	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.idempotency_key, a.engine,
-	a.state, a.error_message, a.options, a.attempt,
+	a.state, a.error_message, a.options, a.attempt, a.retry_after,
 	a.lease_owner, a.lease_token, a.lease_acquired_at,
 	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
 
@@ -50,6 +50,26 @@ const (
 	applyTargetLockWait           = 10 * time.Second
 	applyTargetLockReleaseTimeout = 5 * time.Second
 )
+
+// retryBackoffDeadline renders the time an apply admitted on this attempt may be
+// claimed again. The deadline is computed by the database rather than bound as a
+// Go timestamp so the wait never depends on the app and database clocks agreeing,
+// and so a sub-second Go value cannot round up into a second-resolution column
+// and hold back a retry that carries no wait at all.
+func retryBackoffDeadline(dialect Dialect, attempt int) string {
+	backoff := uint64(storage.RetryBackoff(attempt).Microseconds())
+	return dialect.RelativeTime(TimestampPrecisionDefault, AfterCurrentTime, LiteralIntervalAmount(backoff), IntervalMicrosecond)
+}
+
+// retryBackoffElapsed renders the predicate that holds a failed_retryable apply
+// unclaimable until the backoff armed by its last attempt has run out. It gates
+// the retryable claim clause only: a stale-active claim is crash recovery and a
+// control-request claim is an operator command, and neither should be made to
+// wait on a retry the operator is not asking for. A NULL retry_after means no
+// wait was armed, so the row is claimable immediately.
+func retryBackoffElapsed(dialect Dialect, alias string) string {
+	return "(" + alias + ".retry_after IS NULL OR " + alias + ".retry_after <= " + dialect.CurrentTimestamp(TimestampPrecisionDefault) + ")"
+}
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
@@ -1449,7 +1469,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
 				))
 				OR (a.state IN (%s) AND a.updated_at < %s)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s AND %s)
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -1482,7 +1502,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, retryBackoffElapsed(s.dialect, "a"), staleClaimCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1765,7 +1785,7 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 	}
 
 	if isStartingClaim(apply.State) {
-		claimed, err := transitionClaimToState(ctx, tx, apply, state.Apply.Running, owner, leaseToken)
+		claimed, err := transitionClaimToState(ctx, dialect, tx, apply, state.Apply.Running, owner, leaseToken)
 		if err != nil {
 			return claimLostRace, err
 		}
@@ -1818,7 +1838,7 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker 
 		return refuseStoppedClaimForActiveTarget(ctx, tx, apply, owner, database, dbType, environment)
 	}
 
-	claimed, err := transitionClaimToState(ctx, tx, apply, state.Apply.Resuming, owner, leaseToken)
+	claimed, err := transitionClaimToState(ctx, dialect, tx, apply, state.Apply.Resuming, owner, leaseToken)
 	if err != nil {
 		return claimLostRace, err
 	}
@@ -1846,16 +1866,25 @@ func isStartingClaim(applyState string) bool {
 // landing between the SELECT and this UPDATE; a zero rows-affected result means
 // another driver already moved the row, so the caller backs off cleanly. Reports
 // false on that lost race.
-func transitionClaimToState(ctx context.Context, tx *rebindTx, apply *storage.Apply, targetState, owner, leaseToken string) (bool, error) {
-	result, err := tx.ExecContext(ctx, `
+//
+// A retryable claim also arms retry_after for the attempt after this one, so a
+// failure that reproduces instantly waits before burning the next unit of the
+// budget. Arming it here — when the attempt is admitted, not when it fails —
+// measures the wait from the start of the attempt, so an attempt that ran
+// longer than its own backoff has already spaced itself out and retries as soon
+// as it fails.
+func transitionClaimToState(ctx context.Context, dialect Dialect, tx *rebindTx, apply *storage.Apply, targetState, owner, leaseToken string) (bool, error) {
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
 		SET state = ?, updated_at = NOW(),
 		    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(),
 		    attempt = CASE WHEN ? = ? THEN attempt + 1 ELSE attempt END,
+		    retry_after = CASE WHEN ? = ? THEN %s ELSE retry_after END,
 		    completed_at = NULL,
 		    error_message = CASE WHEN ? = ? THEN '' ELSE error_message END
 		WHERE id = ? AND state = ?
-	`, targetState, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
+	`, retryBackoffDeadline(dialect, apply.Attempt+1)),
+		targetState, owner, leaseToken, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.State, state.Apply.FailedRetryable, apply.ID, apply.State)
 	if err != nil {
 		return false, fmt.Errorf("claim apply %d (%s) in state %s: %w", apply.ID, apply.ApplyIdentifier, apply.State, err)
 	}
@@ -2340,7 +2369,7 @@ func scanApplies(rows *sql.Rows) ([]*storage.Apply, error) {
 // scanApplyInto scans apply data from any scanner (Row or Rows).
 func scanApplyInto(s scanner) (*storage.Apply, error) {
 	var apply storage.Apply
-	var leaseAcquiredAt, startedAt, completedAt, revertSkippedAt sql.NullTime
+	var retryAfter, leaseAcquiredAt, startedAt, completedAt, revertSkippedAt sql.NullTime
 	var idempotencyKey sql.NullString
 	var options []byte
 
@@ -2349,7 +2378,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Database, &apply.DatabaseType,
 		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &idempotencyKey, &apply.Engine,
-		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
+		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt, &retryAfter,
 		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt,
 	)
@@ -2359,6 +2388,10 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 
 	apply.IdempotencyKey = idempotencyKey.String
 	apply.Options = options
+
+	if retryAfter.Valid {
+		apply.RetryAfter = &retryAfter.Time
+	}
 
 	if leaseAcquiredAt.Valid {
 		apply.LeaseAcquiredAt = &leaseAcquiredAt.Time

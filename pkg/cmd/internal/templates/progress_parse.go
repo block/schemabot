@@ -26,10 +26,16 @@ type ProgressData struct {
 	ErrorMessage   string
 	StartedAt      string // RFC3339 format
 	CompletedAt    string // RFC3339 format
-	Operations     []ProgressOperation
-	Tables         []TableProgress
-	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
-	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
+	// Attempt is how many automatic redispatches an interrupted apply has
+	// already spent of its retry budget.
+	Attempt int
+	// RetryAfter is the RFC3339 time the next automatic retry becomes eligible.
+	// Empty when no wait is in force and the retry is due.
+	RetryAfter string
+	Operations []ProgressOperation
+	Tables     []TableProgress
+	Options    map[string]string // Apply options (defer_cutover, skip_revert, etc.)
+	Metadata   map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
 	// Volume is the apply's current volume level (1=slowest, 11=fastest).
 	// Zero means the operator never set one, so the display stays quiet.
 	Volume int
@@ -149,6 +155,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		ErrorMessage: result.ErrorMessage,
 		StartedAt:    result.StartedAt,
 		CompletedAt:  result.CompletedAt,
+		Attempt:      int(result.Attempt),
+		RetryAfter:   result.RetryAfter,
 		Options:      result.Options,
 		Metadata:     result.Metadata,
 		Volume:       int(result.Volume),

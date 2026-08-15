@@ -985,6 +985,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								a.state = ?
 								AND a.attempt < ?
 								AND a.updated_at >= %s
+								AND %s
 							)
 							OR (
 								a.state IN (%s)
@@ -997,7 +998,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, retryBackoffElapsed(s.dialect, "a"), activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1133,9 +1134,22 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				ad.Attempt++
 			}
 
-			if _, err := tx.ExecContext(ctx, `
+			// Arming the parent's retry backoff needs the attempt this redispatch
+			// consumes, so the current value is read inside the claim
+			// transaction. A sibling operation of the same apply can consume its
+			// own unit of the budget between this read and the UPDATE, leaving
+			// the computed wait one step short — bounded by the cap, and re-armed
+			// by the next claim either way.
+			var parentAttempt int
+			if err := tx.QueryRowContext(ctx, `
+				SELECT attempt FROM applies WHERE id = ?
+			`, ad.ApplyID).Scan(&parentAttempt); err != nil {
+				return nil, fmt.Errorf("read retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+			}
+
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 				UPDATE applies
-				SET attempt = attempt + 1, updated_at = NOW()
+				SET attempt = attempt + 1, retry_after = %s, updated_at = NOW()
 				WHERE id = ?
 					AND state = ?
 					AND attempt < ?
@@ -1143,7 +1157,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						SELECT 1 FROM apply_operations o
 						WHERE o.apply_id = applies.id AND o.id <> ?
 					)
-			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
+			`, retryBackoffDeadline(s.dialect, parentAttempt+1)),
+				ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
 				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
 			}
 		}

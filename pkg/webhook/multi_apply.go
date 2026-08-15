@@ -168,6 +168,9 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
 	}
+	if apply.RetryAfter != nil {
+		data.RetryAfter = apply.RetryAfter.Format(time.RFC3339)
+	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
 	}

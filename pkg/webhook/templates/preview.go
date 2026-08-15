@@ -7,6 +7,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -1414,7 +1415,8 @@ func PreviewCommentApplyFailedBeforeRowCopy() string {
 
 // PreviewCommentApplyRetrying renders an apply comment where the middle table
 // was interrupted by a retryable failure and the driver is redispatching it,
-// with the attempt counter showing how much of the retry budget is used.
+// with the attempt counter showing how much of the retry budget is used and the
+// clock time the next attempt becomes eligible.
 func PreviewCommentApplyRetrying() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Completed
@@ -1425,7 +1427,8 @@ func PreviewCommentApplyRetrying() string {
 	tables[1].ErrorMessage = PreviewErrorMiddleFailed
 	tables[2].Status = state.Task.Pending
 	data := sampleApplyData(state.Apply.FailedRetryable, tables)
-	data.Attempt = 1
+	data.Attempt = 3
+	data.RetryAfter = NowFunc().Add(storage.RetryBackoff(data.Attempt + 1)).UTC().Format(time.RFC3339)
 	return RenderApplyStatusComment(data)
 }
 

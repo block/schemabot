@@ -814,6 +814,15 @@ type ProgressResponse struct {
 	PullRequest string `json:"pull_request,omitempty"` // PR URL (blank for CLI context)
 	StartedAt   string `json:"started_at,omitempty"`
 	CompletedAt string `json:"completed_at,omitempty"`
+	// Attempt is how many automatic redispatches an interrupted apply has
+	// already consumed of its retry budget. Zero on an apply that has not been
+	// redispatched.
+	Attempt int32 `json:"attempt,omitempty"`
+	// RetryAfter is the RFC3339 time the next automatic retry becomes eligible.
+	// An interrupted apply backs off between attempts, so this distinguishes an
+	// apply that is waiting from one that is due and about to be picked up.
+	// Empty when no wait is in force.
+	RetryAfter string `json:"retry_after,omitempty"`
 	// Operations carries per-deployment operation rows for multi-deployment applies.
 	// Empty for single-deployment applies.
 	Operations   []*ProgressOperationResponse `json:"operations,omitempty"`

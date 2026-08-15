@@ -2416,6 +2416,114 @@ func TestApplyStore_ClaimApplyByIDRefusesUnrecoverableRetryable(t *testing.T) {
 	})
 }
 
+// A failure that reproduces instantly would otherwise spend the whole recovery
+// budget in seconds, on exactly the failures a little time was most likely to
+// clear. Each admitted attempt arms a wait for the next one, and the retryable
+// claim arm honours it: the apply is unclaimable until the wait elapses, then
+// claimable again with a longer wait armed for the attempt after that.
+func TestApplyStore_ClaimApplyByIDBacksOffBetweenRetries(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_backoff", 620, state.Apply.FailedRetryable, "staging")
+
+	// The first two attempts carry no wait, so a transient blip clears without
+	// an operator noticing a pause.
+	for attempt := 1; attempt <= 2; attempt++ {
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err, "attempt %d", attempt)
+		require.NotNil(t, claimed, "attempt %d must be admitted without a wait", attempt)
+		require.NoError(t, failRetryable(t, apply.ID))
+	}
+
+	blocked, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	assert.Nil(t, blocked, "a retry armed with a wait must not be admitted before the wait elapses")
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted.RetryAfter, "an admitted attempt arms the wait for the next one")
+	assert.True(t, persisted.RetryAfter.After(time.Now()), "the armed wait is in the future")
+
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET retry_after = NOW() - INTERVAL 1 SECOND WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the retry is admitted once its wait has elapsed")
+	assert.Equal(t, 3, claimed.Attempt)
+}
+
+// The backoff paces automatic retries, not operators. A start request is an
+// explicit instruction to run now, and a stale lease means a driver died
+// mid-attempt rather than an attempt failing — neither should be made to wait
+// out a retry the operator did not ask for.
+func TestApplyStore_ClaimApplyByIDIgnoresBackoffOutsideAutomaticRetry(t *testing.T) {
+	t.Run("operator start request", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := NewMySQL(testDB)
+
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_backoff_start", 621, state.Apply.Stopped, "staging")
+		require.NoError(t, armRetryBackoff(t, apply.ID))
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   apply.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "an operator start runs now regardless of an armed retry wait")
+	})
+
+	t.Run("stale lease recovery", func(t *testing.T) {
+		clearTables(t)
+		ctx := t.Context()
+		store := NewMySQL(testDB)
+
+		lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL, "staging")
+		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_backoff_stale", 622, state.Apply.Running, "staging")
+		require.NoError(t, armRetryBackoff(t, apply.ID))
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies
+			SET lease_owner = 'dead-driver', lease_token = 'token', updated_at = NOW() - INTERVAL 1 HOUR
+			WHERE id = ?
+		`, apply.ID)
+		require.NoError(t, err)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "crash recovery must not wait out an armed retry backoff")
+	})
+}
+
+// failRetryable returns a claimed apply to failed_retryable, the state a drive
+// leaves behind when its attempt fails with a recoverable error.
+func failRetryable(t *testing.T, applyID int64) error {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE applies SET state = ?, lease_owner = '', lease_token = '', updated_at = NOW() WHERE id = ?
+	`, state.Apply.FailedRetryable, applyID)
+	return err
+}
+
+// armRetryBackoff puts a retry wait well into the future, so a claim that is
+// admitted anyway proves it does not consult the backoff.
+func armRetryBackoff(t *testing.T, applyID int64) error {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE applies SET retry_after = NOW() + INTERVAL 1 HOUR WHERE id = ?
+	`, applyID)
+	return err
+}
+
 // ClaimApplyByID is how the operation-level claim loop acquires the parent apply
 // lease after leasing a stale operation row. When a PlanetScale driver crashes
 // mid-setup the operation row stays running (stale) while the parent apply sits

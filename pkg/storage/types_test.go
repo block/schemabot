@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -349,4 +350,30 @@ func TestVSchemaPredicates(t *testing.T) {
 			})
 		}
 	})
+}
+
+// The retry backoff spends the recovery budget over a window long enough to
+// outlast a rolling restart or a brief target outage, without making the first
+// interruptions of a transient blip feel stalled: the first attempts are
+// immediate, the wait then steps up and holds flat at the cap.
+func TestRetryBackoff(t *testing.T) {
+	// A first interruption has no attempt to compute a wait from and retries at
+	// once; the attempt it consumes arms no wait either, so a transient blip
+	// gets two immediate retries before the pacing starts.
+	assert.Zero(t, RetryBackoff(1))
+	assert.Equal(t, 30*time.Second, RetryBackoff(2))
+	assert.Equal(t, 60*time.Second, RetryBackoff(3))
+	assert.Equal(t, 90*time.Second, RetryBackoff(4), "the wait holds at the cap")
+	assert.Equal(t, 90*time.Second, RetryBackoff(MaxRecoveryAttempts))
+
+	// An instantly-reproducing failure spends the whole budget on waits, which
+	// must add up to minutes of wall clock rather than the seconds the same
+	// failure would otherwise burn it in. The wait armed by the last attempt is
+	// never consumed — the budget is already spent — so the window is the sum of
+	// the waits before it.
+	var window time.Duration
+	for attempt := 1; attempt < MaxRecoveryAttempts; attempt++ {
+		window += RetryBackoff(attempt)
+	}
+	assert.Equal(t, 10*time.Minute+30*time.Second, window)
 }

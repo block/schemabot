@@ -84,7 +84,16 @@ type ApplyStatusCommentData struct {
 
 	// Attempt is the apply's operator redispatch count so far; the retry the
 	// comment announces is Attempt+1 of storage.MaxRecoveryAttempts.
-	Attempt     int
+	Attempt int
+
+	// RetryAfter is the RFC3339 time the next automatic retry becomes eligible.
+	// An interrupted apply backs off between attempts, and the comment is not
+	// re-rendered while it waits, so the wait is shown as a clock time rather
+	// than a countdown that would freeze at whatever it read when posted. Empty
+	// when no wait is in force and the retry is due as soon as a driver picks
+	// the apply up.
+	RetryAfter string
+
 	StartedAt   string // RFC3339 format
 	CompletedAt string // RFC3339 format
 	Tables      []TableProgressData
@@ -411,6 +420,26 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
+// nextRetrySegment renders the clock time an interrupted apply's next attempt
+// becomes eligible, as a trailing segment of the table's retry line. It renders
+// nothing when no wait is in force or the wait has already elapsed: the retry is
+// then due now, and naming a time in the past would read as a missed deadline
+// rather than as work about to be picked up.
+func nextRetrySegment(retryAfter string) string {
+	if retryAfter == "" {
+		return ""
+	}
+	due, err := time.Parse(time.RFC3339, retryAfter)
+	if err != nil {
+		return ""
+	}
+	// NowFunc (not time.Now) so previews and tests render deterministically.
+	if !due.After(NowFunc()) {
+		return ""
+	}
+	return " · next " + due.UTC().Format("15:04 UTC")
+}
+
 // writeCutoverSummary writes a readiness summary for cutover states,
 // showing how many tables are ready for cutover vs not yet ready.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
@@ -623,7 +652,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table, data.Attempt, data.ErrorMessage)
+			renderTableProgress(sb, table, applyRetry{attempt: data.Attempt, retryAfter: data.RetryAfter}, data.ErrorMessage)
 		}
 	}
 }
@@ -683,12 +712,19 @@ func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
 }
 
+// applyRetry is the apply-level retry state an interrupted table row reports:
+// how much of the retry budget is spent, and when the next attempt is due.
+type applyRetry struct {
+	attempt    int
+	retryAfter string // RFC3339 format
+}
+
 // renderTableProgress renders a single table's progress as markdown.
 // Mirrors the CLI's writeTableProgressWithState logic but outputs markdown
 // instead of ANSI. applyError is the apply-level error message the comment
 // renders as its own block, so a failed table's identical error is not
 // repeated below the row.
-func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int, applyError string) {
+func renderTableProgress(sb *strings.Builder, table TableProgressData, retry applyRetry, applyError string) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -781,8 +817,8 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
-			table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Retrying · attempt %d/%d%s\n",
+			table.TableName, bar, retry.attempt+1, storage.MaxRecoveryAttempts, nextRetrySegment(retry.retryAfter))
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
 			writeTableErrorLine(sb, table.ErrorMessage)

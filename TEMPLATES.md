@@ -3259,7 +3259,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically (attempt 2/10)
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Retrying · attempt 4/10 · next 14:31 UTC
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
