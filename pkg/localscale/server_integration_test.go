@@ -626,6 +626,22 @@ func deploy(t *testing.T, ctx context.Context, number uint64, instantDDL bool) *
 	return dr
 }
 
+// settleDeploy waits for a deployed deploy request to finish and, when it
+// parks in the revert window, skips the revert. Only one deploy can be active
+// per database, so a test that deploys must settle its deploy request before
+// the next deploy against the shared database can proceed.
+func settleDeploy(t *testing.T, ctx context.Context, number uint64) {
+	t.Helper()
+	settled := waitForDeployState(t, ctx, number, drState.CompletePendingRevert, drState.Complete)
+	if settled.DeploymentState == drState.CompletePendingRevert {
+		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: number,
+		})
+		require.NoError(t, err, "SkipRevertDeployRequest")
+		waitForDeployState(t, ctx, number, drState.Complete)
+	}
+}
+
 // testShardedVSchema returns the base sharded VSchema from testdata, optionally
 // with extra vindexes added. Each extra vindex is "name:type" (e.g., "xxhash:xxhash").
 func testShardedVSchema(extraVindexes ...string) json.RawMessage {
