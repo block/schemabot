@@ -143,7 +143,7 @@ const (
 	PreviewCommentApplyCompleted               PreviewType = "comment_apply_completed"                 // Apply completed (all tables done)
 	PreviewCommentApplyFailed                  PreviewType = "comment_apply_failed"                    // Apply failed (1 done, 1 failed, 1 cancelled)
 	PreviewCommentApplyFailedBeforeRowCopy     PreviewType = "comment_apply_failed_before_row_copy"    // Apply failed before row copy (preflight rejection, per-table error)
-	PreviewCommentApplyRetrying                PreviewType = "comment_apply_retrying"                  // Apply interrupted, retrying automatically (attempt counter)
+	PreviewCommentApplyRetrying                PreviewType = "comment_apply_retrying"                  // Apply interrupted, retrying automatically (attempt counter + next attempt time)
 	PreviewCommentApplyStopped                 PreviewType = "comment_apply_stopped"                   // Apply stopped (1 done, 1 stopped)
 	PreviewCommentApplyWaitingCutover          PreviewType = "comment_apply_waiting_cutover"           // Waiting for cutover (deferred, operator triggers)
 	PreviewCommentApplyWaitingCutoverAutomatic PreviewType = "comment_apply_waiting_cutover_automatic" // Waiting for cutover (non-deferred, drive triggers)

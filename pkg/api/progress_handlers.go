@@ -477,16 +477,23 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 }
 
 // overlayRetryBudget surfaces the apply's automatic-retry state: how much of the
-// budget an interrupted apply has spent and when its next attempt becomes
-// eligible. Both are control-plane bookkeeping — the claim path owns them — so
-// they are read from the stored apply on every progress path, including the one
-// whose per-table detail comes from a remote engine.
+// budget it has spent and, while it is waiting to be retried, when its next
+// attempt becomes eligible. Both are control-plane bookkeeping — the claim path
+// owns them — so they are read from the stored apply on every progress path,
+// including the one whose per-table detail comes from a remote engine.
+//
+// The spent budget is reported in every state: on a permanently failed apply it
+// is the record of how many recoveries were tried. The wait is reported only
+// while the apply is retrying, because the stored deadline outlives the state
+// that gave it meaning — a claim leaves the armed deadline behind on the row it
+// resumes, and reporting that on a running or completed apply would name a
+// retry that is not coming.
 func overlayRetryBudget(resp *apitypes.ProgressResponse, apply *storage.Apply) {
 	if apply == nil {
 		return
 	}
 	resp.Attempt = int32(apply.Attempt)
-	if apply.RetryAfter != nil {
+	if apply.RetryAfter != nil && state.IsState(apply.State, state.Apply.FailedRetryable) {
 		resp.RetryAfter = apply.RetryAfter.Format(time.RFC3339)
 	}
 }

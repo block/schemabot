@@ -820,8 +820,9 @@ type ProgressResponse struct {
 	Attempt int32 `json:"attempt,omitempty"`
 	// RetryAfter is the RFC3339 time the next automatic retry becomes eligible.
 	// An interrupted apply backs off between attempts, so this distinguishes an
-	// apply that is waiting from one that is due and about to be picked up.
-	// Empty when no wait is in force.
+	// apply that is waiting from one that is due and about to be picked up. Set
+	// only while the apply is retrying and a wait was armed; empty otherwise,
+	// including on an apply that has already been redispatched.
 	RetryAfter string `json:"retry_after,omitempty"`
 	// Operations carries per-deployment operation rows for multi-deployment applies.
 	// Empty for single-deployment applies.

@@ -1165,6 +1165,14 @@ func TestRenderApplyStatusComment_FailedRetryableNextRetry(t *testing.T) {
 
 	data.RetryAfter = ""
 	assert.Contains(t, RenderApplyStatusComment(data), "🔄 Retrying · attempt 3/10\n")
+
+	// A claim leaves the armed deadline behind on the row it resumes, so once
+	// the apply is moving again the stored time must not be named.
+	data.RetryAfter = now.Add(2 * time.Minute).Format(time.RFC3339)
+	data.State = state.Apply.Running
+	resumed := RenderApplyStatusComment(data)
+	assert.Contains(t, resumed, "🔄 Retrying · attempt 3/10\n")
+	assert.NotContains(t, resumed, "next ")
 }
 
 // Every apply state must render a human-readable headline. Raw snake_case

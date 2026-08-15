@@ -652,7 +652,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table, applyRetry{attempt: data.Attempt, retryAfter: data.RetryAfter}, data.ErrorMessage)
+			renderTableProgress(sb, table, applyRetryFor(data), data.ErrorMessage)
 		}
 	}
 }
@@ -717,6 +717,18 @@ func tableStatePriority(tableStatus string) int {
 type applyRetry struct {
 	attempt    int
 	retryAfter string // RFC3339 format
+}
+
+// applyRetryFor reports the retry state an interrupted table row may show. The
+// wait is carried only while the apply is retrying: a claim leaves the armed
+// deadline behind on the row it resumes, so once the apply is moving again the
+// stored time names a retry that is not coming.
+func applyRetryFor(data ApplyStatusCommentData) applyRetry {
+	retry := applyRetry{attempt: data.Attempt}
+	if state.IsState(data.State, state.Apply.FailedRetryable) {
+		retry.retryAfter = data.RetryAfter
+	}
+	return retry
 }
 
 // renderTableProgress renders a single table's progress as markdown.

@@ -53,12 +53,17 @@ const (
 
 // retryBackoffDeadline renders the time an apply admitted on this attempt may be
 // claimed again. The deadline is computed by the database rather than bound as a
-// Go timestamp so the wait never depends on the app and database clocks agreeing,
-// and so a sub-second Go value cannot round up into a second-resolution column
-// and hold back a retry that carries no wait at all.
+// Go timestamp so the wait never depends on the app and database clocks agreeing.
+//
+// Both the deadline and the predicate that reads it back are expressed at the
+// precision the retry policy is written in, and retry_after stores that same
+// precision on every dialect. A backoff rounded to a coarser column would shift
+// the wait by up to that rounding step — in the direction that holds back a
+// retry carrying no wait at all — and the shift would depend on which dialect
+// the deployment runs.
 func retryBackoffDeadline(dialect Dialect, attempt int) string {
 	backoff := uint64(storage.RetryBackoff(attempt).Microseconds())
-	return dialect.RelativeTime(TimestampPrecisionDefault, AfterCurrentTime, LiteralIntervalAmount(backoff), IntervalMicrosecond)
+	return dialect.RelativeTime(TimestampPrecisionMicrosecond, AfterCurrentTime, LiteralIntervalAmount(backoff), IntervalMicrosecond)
 }
 
 // retryBackoffElapsed renders the predicate that holds a failed_retryable apply
@@ -68,7 +73,7 @@ func retryBackoffDeadline(dialect Dialect, attempt int) string {
 // wait on a retry the operator is not asking for. A NULL retry_after means no
 // wait was armed, so the row is claimable immediately.
 func retryBackoffElapsed(dialect Dialect, alias string) string {
-	return "(" + alias + ".retry_after IS NULL OR " + alias + ".retry_after <= " + dialect.CurrentTimestamp(TimestampPrecisionDefault) + ")"
+	return "(" + alias + ".retry_after IS NULL OR " + alias + ".retry_after <= " + dialect.CurrentTimestamp(TimestampPrecisionMicrosecond) + ")"
 }
 
 // applyStore implements storage.ApplyStore using MySQL.

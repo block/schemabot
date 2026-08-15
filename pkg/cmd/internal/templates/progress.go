@@ -81,7 +81,7 @@ func retryBoxRow(data ProgressData) (BoxRow, bool) {
 		return BoxRow{}, false
 	}
 	retry := fmt.Sprintf("attempt %d/%d", data.Attempt+1, storage.MaxRecoveryAttempts)
-	if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(time.Now()) {
+	if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(nowFunc()) {
 		retry += " · next " + due.Local().Format("15:04:05 MST")
 	}
 	return BoxRow{"Retry", retry}, true
