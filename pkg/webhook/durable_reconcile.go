@@ -231,7 +231,11 @@ pages:
 			missing++
 			metrics.RecordWebhookReconcileMissingEvent(ctx, repo)
 			if !h.webhookReconcileSynthesis {
-				h.logger.Warn("webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
+				// Report-only mode re-reports the same missing head on every
+				// pass until synthesis is enabled or an organic delivery
+				// arrives, so the per-head line is info; the metric and the
+				// per-pass summary carry the operator signal.
+				h.logger.Info("webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
 					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "updated_at", pr.UpdatedAt)
 				continue
 			}

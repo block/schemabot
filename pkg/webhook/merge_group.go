@@ -320,7 +320,7 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			Environment: target.environment,
 			Status:      "success",
 		})
-		h.logger.Info("passing aggregate check posted",
+		h.logger.Info("posted passing aggregate",
 			"repo", repo, "head_sha", headSHA, "check_name", target.name,
 			"environment", target.environment, "operation", content.operation)
 	}

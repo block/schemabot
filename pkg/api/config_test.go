@@ -3305,7 +3305,22 @@ func TestServerConfig_ResolveGitHubAppForRepo(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppForRepo("org-z/unknown")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not declared in the repos config")
+		assert.ErrorIs(t, err, ErrRepoNotConfigured)
+		assert.Contains(t, err.Error(), `repository "org-z/unknown"`)
+	})
+
+	t.Run("multi-app declared repo with broken app mapping is not ErrRepoNotConfigured", func(t *testing.T) {
+		// Construct directly (bypassing Validate) to exercise the resolver's
+		// defensive path: a declared repo whose App mapping is broken must not
+		// be classified as unmanaged traffic.
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": validApp},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-gone"}},
+		}
+		_, err := cfg.ResolveGitHubAppForRepo("org/repo")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrRepoNotConfigured)
+		assert.Contains(t, err.Error(), `unknown github_app "app-gone"`)
 	})
 
 	t.Run("multi-app errors when repo missing github_app", func(t *testing.T) {

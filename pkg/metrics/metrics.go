@@ -1482,7 +1482,10 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 
 // RecordWebhookEvent increments the webhook events counter.
 // Unknown event types and actions are normalized to "unknown" to prevent unbounded cardinality.
-// Repo is not allowlisted since it's bounded by the repos configured in SchemaBot.
+// Repo is not allowlisted since it's bounded by the repos configured in SchemaBot;
+// callers recording a status for a repo outside the configured set (e.g.
+// repo_not_configured) must pass repo as "" so unbounded repo names never
+// become attribute values.
 // appName is the resolved GitHub App name (bounded by config), or "unknown" if
 // the request could not be attributed to a configured App (e.g. unknown App ID
 // header). Pass "" in legacy single-App mode and the metric will record

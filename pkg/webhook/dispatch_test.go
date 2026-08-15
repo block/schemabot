@@ -1,9 +1,12 @@
 package webhook
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,6 +36,13 @@ func signWebhookBody(secret, body []byte) string {
 // specific App.
 func newMultiAppTestHandler(t *testing.T) (*Handler, map[string][]byte) {
 	t.Helper()
+	return newMultiAppTestHandlerWithLogger(t, testLogger())
+}
+
+// newMultiAppTestHandlerWithLogger is newMultiAppTestHandler with a
+// caller-supplied logger, for tests that assert on emitted log records.
+func newMultiAppTestHandlerWithLogger(t *testing.T, logger *slog.Logger) (*Handler, map[string][]byte) {
+	t.Helper()
 	secrets := map[string][]byte{
 		"app-a": []byte("secret-a"),
 		"app-b": []byte("secret-b"),
@@ -55,8 +65,8 @@ func newMultiAppTestHandler(t *testing.T) (*Handler, map[string][]byte) {
 			"org-b/repo-y": {GitHubApp: "app-b"},
 		},
 	}
-	svc := api.New(&emptyStorage{}, cfg, nil, testLogger())
-	h := NewHandlerWithDispatch(svc, ghclient.NewClientSet(clients), secrets, appByID, testLogger())
+	svc := api.New(&emptyStorage{}, cfg, nil, logger)
+	h := NewHandlerWithDispatch(svc, ghclient.NewClientSet(clients), secrets, appByID, logger)
 	return h, secrets
 }
 
@@ -170,6 +180,60 @@ func TestDispatch_RejectsUnknownRepoInMultiAppMode(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusUnauthorized, rr.Code)
+}
+
+// TestDispatch_OwnershipRejectionSeverity exercises the two causes behind an
+// ownership rejection. A delivery for a repo with no config entry at all is
+// routine traffic from an unmanaged repository (a shared App forwards
+// deliveries for every repo it is installed on) and logs at debug so it never
+// floods the warn stream; a delivery signed by the wrong App for a declared
+// repo is config drift or a hostile install and logs at warn. Both fail
+// closed with the same rejection either way.
+func TestDispatch_OwnershipRejectionSeverity(t *testing.T) {
+	scenarios := []struct {
+		name      string
+		repo      string
+		wantLevel slog.Level
+	}{
+		{name: "unmanaged repo logs at debug", repo: "unknown-org/unknown-repo", wantLevel: slog.LevelDebug},
+		{name: "declared repo signed by wrong App logs at warn", repo: "org-b/repo-y", wantLevel: slog.LevelWarn},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			h, secrets := newMultiAppTestHandlerWithLogger(t, logger)
+
+			req := newPingRequest(t, 1001, secrets["app-a"], tc.repo)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusUnauthorized, rr.Code)
+
+			record := findLogRecord(t, logs.Bytes(), "webhook rejected: signing App does not own repo")
+			assert.Equal(t, tc.wantLevel.String(), record["level"])
+			assert.Equal(t, tc.repo, record["repo"], "the log record must carry the rejected repo for triage")
+			assert.Equal(t, "app-a", record["app_name"])
+		})
+	}
+}
+
+// findLogRecord parses JSON-encoded slog output and returns the first record
+// with the given message, failing the test when none matches.
+func findLogRecord(t *testing.T, logs []byte, msg string) map[string]any {
+	t.Helper()
+	for line := range strings.Lines(string(logs)) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &record), "log output must be one JSON record per line: %s", line)
+		if record["msg"] == msg {
+			return record
+		}
+	}
+	t.Fatalf("no log record with message %q in:\n%s", msg, logs)
+	return nil
 }
 
 func TestDispatch_LegacySingleAppStillWorks(t *testing.T) {
