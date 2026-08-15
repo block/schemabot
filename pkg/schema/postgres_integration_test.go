@@ -4,7 +4,6 @@ package schema
 
 import (
 	"database/sql"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -61,12 +60,21 @@ func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 			assert.Equal(t, wantType, pgCol.dataType,
 				"table %s: column %s type differs (mysql type=%q)", parsed.TableName, col.Name, col.Type)
 
+			assert.Equal(t, col.AutoInc, pgCol.identity,
+				"table %s: column %s identity differs (mysql auto_increment=%v)",
+				parsed.TableName, col.Name, col.AutoInc)
+
 			// PostgreSQL identity columns report no column_default because their
-			// sequence is represented by identity metadata rather than a default.
+			// sequence is represented by identity metadata (asserted above)
+			// rather than a default.
 			if !col.AutoInc {
-				assert.Equal(t, normalizedMySQLDefault(col), normalizedPostgresDefault(pgCol.columnDefault),
-					"table %s: column %s default differs (mysql default=%v, postgres default=%v)",
-					parsed.TableName, col.Name, col.Default, pgCol.columnDefault)
+				mysqlDefault := "<nil>"
+				if col.Default != nil {
+					mysqlDefault = *col.Default
+				}
+				assert.Equal(t, normalizedMySQLDefault(col), normalizedPostgresDefault(col, pgCol.columnDefault),
+					"table %s: column %s default differs (mysql default=%s, postgres default=%v)",
+					parsed.TableName, col.Name, mysqlDefault, pgCol.columnDefault)
 			}
 
 			if col.Type == "varchar" {
@@ -92,6 +100,7 @@ type postgresColumn struct {
 	dataType      string
 	charMaxLen    sql.NullInt64
 	columnDefault sql.NullString
+	identity      bool
 }
 
 // postgresColumns returns column name → definition for a table in the public
@@ -100,7 +109,7 @@ func postgresColumns(t *testing.T, db *sql.DB, tableName string) map[string]post
 	t.Helper()
 
 	rows, err := db.QueryContext(t.Context(),
-		`SELECT column_name, is_nullable, data_type, character_maximum_length, column_default
+		`SELECT column_name, is_nullable, data_type, character_maximum_length, column_default, is_identity
 		 FROM information_schema.columns
 		 WHERE table_schema = 'public' AND table_name = $1`,
 		tableName,
@@ -110,67 +119,15 @@ func postgresColumns(t *testing.T, db *sql.DB, tableName string) map[string]post
 
 	columns := make(map[string]postgresColumn)
 	for rows.Next() {
-		var colName, isNullable string
+		var colName, isNullable, isIdentity string
 		var col postgresColumn
-		require.NoError(t, rows.Scan(&colName, &isNullable, &col.dataType, &col.charMaxLen, &col.columnDefault))
+		require.NoError(t, rows.Scan(&colName, &isNullable, &col.dataType, &col.charMaxLen, &col.columnDefault, &isIdentity))
 		col.nullable = isNullable == "YES"
+		col.identity = isIdentity == "YES"
 		columns[colName] = col
 	}
 	require.NoError(t, rows.Err())
 	return columns
-}
-
-type columnDefault struct {
-	value   string
-	present bool
-}
-
-var postgresDefaultCast = regexp.MustCompile(`(?i)::(?:character varying|text|bigint|integer|boolean|jsonb|timestamp without time zone)$`)
-
-func normalizedMySQLDefault(col statement.Column) columnDefault {
-	if col.Default == nil || strings.EqualFold(strings.TrimSpace(*col.Default), "NULL") {
-		return columnDefault{}
-	}
-
-	value := strings.TrimSpace(*col.Default)
-	if col.Type == "tinyint" && col.Length != nil && *col.Length == 1 {
-		switch value {
-		case "0":
-			value = "false"
-		case "1":
-			value = "true"
-		}
-	}
-	return columnDefault{value: normalizeDefaultValue(value), present: true}
-}
-
-func normalizedPostgresDefault(value sql.NullString) columnDefault {
-	if !value.Valid {
-		return columnDefault{}
-	}
-
-	normalized := strings.TrimSpace(value.String)
-	for postgresDefaultCast.MatchString(normalized) {
-		normalized = postgresDefaultCast.ReplaceAllString(normalized, "")
-	}
-	if strings.EqualFold(normalized, "NULL") {
-		return columnDefault{}
-	}
-	if len(normalized) >= 2 && normalized[0] == '\'' && normalized[len(normalized)-1] == '\'' {
-		normalized = strings.ReplaceAll(normalized[1:len(normalized)-1], "''", "'")
-	}
-	return columnDefault{value: normalizeDefaultValue(normalized), present: true}
-}
-
-func normalizeDefaultValue(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "current_timestamp", "current_timestamp()", "now()":
-		return "current_timestamp"
-	case "true", "false":
-		return strings.ToLower(strings.TrimSpace(value))
-	default:
-		return value
-	}
 }
 
 // expectedPostgresColumnType returns the information_schema data_type the
