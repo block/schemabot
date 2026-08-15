@@ -6,9 +6,9 @@ import "strings"
 // Progress bar colors (emoji).
 const (
 	ColorBlue   = "🟦" // In progress (copying rows)
-	ColorYellow = "🟨" // Waiting for cutover
+	ColorYellow = "🟨" // Healthy wait (waiting for cutover, revert window open)
 	ColorGreen  = "🟩" // Complete
-	ColorOrange = "🟧" // Operator-halted (stopped, cancelled, reverted)
+	ColorOrange = "🟧" // Halted (stopped, cancelled, reverted, retrying after an interruption)
 	ColorRed    = "🟥" // Failed
 	ColorEmpty  = "⬜" // Unfilled
 )

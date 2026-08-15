@@ -485,7 +485,7 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 		}
 
 		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBar(45, ui.ColorYellow)+" Retrying")
+		assert.Contains(t, output, ui.ProgressBar(45, ui.ColorOrange)+" Retrying")
 	})
 
 	t.Run("without progress", func(t *testing.T) {
@@ -497,7 +497,7 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 
 		output := FormatTableProgress(tp)
 		assert.Contains(t, output, "users: Retrying")
-		assert.NotContains(t, output, ui.ColorYellow)
+		assert.NotContains(t, output, ui.ColorOrange)
 	})
 }
 

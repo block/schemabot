@@ -445,7 +445,7 @@ func FormatProgressState(s string) string {
 	case state.Apply.Completed:
 		return ANSIGreen + "✓ Completed" + ANSIReset
 	case state.Apply.FailedRetryable:
-		return ANSIYellow + "↻ Retrying" + ANSIReset
+		return ANSIOrange + "↻ Retrying" + ANSIReset
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
@@ -627,7 +627,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	case state.Apply.FailedRetryable:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			retryPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-			bar := ui.ProgressBar(retryPercent, ui.ColorYellow)
+			bar := ui.ProgressBar(retryPercent, ui.ColorOrange)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Retrying\n", t.TableName, bar)
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Retrying\n", t.TableName)
@@ -1396,7 +1396,7 @@ func stateColorFunc(s string) func(string) string {
 	case state.Apply.Failed:
 		return colorWrap(ANSIRed)
 	case state.Apply.FailedRetryable:
-		return colorWrap(ANSIYellow)
+		return colorWrap(ANSIOrange)
 	case state.Apply.Running, state.Apply.RunningDegraded,
 		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		return colorWrap(ANSICyan)

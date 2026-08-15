@@ -4762,7 +4762,7 @@ Single table progress (default):
 
   ── testapp ──
 
-     ~ users: 🟨🟨🟨🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ Retrying
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ Retrying
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 

@@ -828,7 +828,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, retry app
 		}
 
 	case state.Task.FailedRetryable:
-		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
+		bar := ui.ProgressBar(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied), ui.ColorOrange)
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Retrying · attempt %d/%d%s\n",
 			table.TableName, bar, retry.attempt+1, storage.MaxRecoveryAttempts, nextRetrySegment(retry.retryAfter))
 		writeDDLLine(sb, table.DDL)
