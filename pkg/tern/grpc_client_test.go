@@ -4563,7 +4563,7 @@ func TestGRPCClient_SyncRemoteProgressMirrorsRowCopySnapshot(t *testing.T) {
 	assert.Equal(t, 340, task.ETASeconds)
 	assert.Equal(t, int64(200), task.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), task.ChecksumRowsTotal)
-	assert.True(t, task.Throttled, "throttle pause mirrors from the remote table progress")
+	assert.True(t, task.Throttled, "throttle state mirrors from the remote table progress")
 	assert.Equal(t, "replica-lag 12s > 10s", task.ThrottleReason)
 }
 

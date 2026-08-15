@@ -3948,7 +3948,7 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(90), tp.EtaSeconds, "ETA comes from the stored task row")
 	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
-	assert.True(t, tp.Throttled, "throttle pause comes from the stored task row")
+	assert.True(t, tp.Throttled, "throttle state comes from the stored task row")
 	assert.Equal(t, "replica-lag 12s > 10s", tp.ThrottleReason)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
 }
