@@ -142,16 +142,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Shard names are the answer to "which lane ran my test?", so they
+          # name the packages they select rather than describing the split.
+          #
           # The cross-package suite under ./integration is the longest single
           # lane and cannot be shortened by package parallelism, so it gets its
           # own runner rather than setting the wall time for everything else.
-          - shard: suite
-            select: "-E"
-          # Its exact complement. The two selectors are inverses of one another,
-          # so every package lands in exactly one lane and a newly added package
-          # is picked up here without touching this file.
-          - shard: packages
-            select: "-vE"
+          - shard: ./integration
+            match: "-E"
+          # Its exact complement — spread across ./pkg, ./cmd and ./e2e, so it
+          # is named by exclusion rather than by a path prefix. The two greps
+          # are inverses of one another, so every package lands in exactly one
+          # lane and a newly added package is picked up here without touching
+          # this file.
+          - shard: everything else
+            match: "-vE"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -188,17 +193,23 @@ jobs:
         # goroutine dump naming the culprit instead of the runner cancelling the
         # job and leaving a bare "cancelled" that reads like a plain failure.
         env:
-          SELECT: ${{ matrix.select }}
+          MATCH: ${{ matrix.match }}
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          pkgs=$(go list -tags=integration ./... | grep -v /localscale | grep "$SELECT" '/integration(/|$)')
+          pkgs=$(go list -tags=integration ./... | grep -v /localscale | grep "$MATCH" '/integration(/|$)')
           # An empty lane would hand `go test` no packages and silently test the
           # working directory instead, reporting success for work never run.
           if [ -z "$pkgs" ]; then
-            echo "::error::shard '${{ matrix.shard }}' selected no packages"
+            echo "::error::shard '$SHARD' selected no packages"
             exit 1
           fi
-          echo "$pkgs" | wc -l | xargs echo "packages in this shard:"
+          # Print the selection so a reader can confirm which lane owns a given
+          # test from the log itself, rather than inferring it from the shard
+          # name and this file's grep expressions.
+          echo "::group::shard '$SHARD' runs $(echo "$pkgs" | wc -l | tr -d ' ') packages"
+          echo "$pkgs" | sed 's|^github.com/block/schemabot|.|'
+          echo "::endgroup::"
           go test -tags=integration -timeout=8m -count=1 -p=2 $pkgs
 
   localscale-matrix:
