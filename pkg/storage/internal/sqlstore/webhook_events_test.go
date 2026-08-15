@@ -246,7 +246,7 @@ func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
 func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	future := time.Now().Add(time.Hour)
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
@@ -316,7 +316,7 @@ func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
 func TestWebhookEventStore_DeferredRowAgeMeasuredFromDueTime(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	future := time.Now().Add(time.Hour)
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
@@ -368,7 +368,7 @@ func TestWebhookEventStore_DeferredRowAgeMeasuredFromDueTime(t *testing.T) {
 func TestWebhookEventStore_CreateReopenIgnoresIncomingNotBefore(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := New(testDB)
+	store := NewMySQL(testDB)
 
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
 		DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`),
