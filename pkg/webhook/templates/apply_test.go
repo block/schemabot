@@ -283,11 +283,12 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "⏸ Paused by throttler: replica-lag 12s > 10s")
+	assert.Contains(t, result, "\n\n⏸ Paused by throttler: replica-lag 12s > 10s",
+		"the pause is its own paragraph, not a continuation of the progress detail line")
 
 	data.Tables[0].ThrottleReason = ""
 	noReason := RenderApplyStatusComment(data)
-	assert.Contains(t, noReason, "⏸ Paused by throttler")
+	assert.Contains(t, noReason, "\n\n⏸ Paused by throttler")
 	assert.NotContains(t, noReason, "Paused by throttler:")
 
 	data.Tables[0].Throttled = false
@@ -315,7 +316,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
-	assert.Contains(t, result, "⏸ Paused by throttler: threads-running 130 > 128")
+	assert.Contains(t, result, "\n\n⏸ Paused by throttler: threads-running 130 > 128")
 }
 
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {

@@ -2861,6 +2861,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+
 ⏸ Paused by throttler: replica-lag 12s > 10s
 
 **`products`**: ⏳ Queued
