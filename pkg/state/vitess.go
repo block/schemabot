@@ -26,8 +26,12 @@ var Vitess = struct {
 	Complete:  string(vitessstatus.OnlineDDLStatusComplete),
 	Failed:    string(vitessstatus.OnlineDDLStatusFailed),
 	// ReadyToComplete is a derived state, not a Vitess OnlineDDLStatus enum value.
-	// SchemaBot synthesizes it when a migration is running with ready_to_complete=1
-	// in SHOW VITESS_MIGRATIONS output.
+	// SchemaBot synthesizes it when a schema change in any non-terminal status
+	// reports ready_to_complete=1 in SHOW VITESS_MIGRATIONS output — typically
+	// running, but also queued/requested/ready for immediate operations
+	// (CREATE/DROP TABLE) that set the flag before being scheduled. Terminal
+	// statuses (complete/failed/cancelled) are never promoted, even when the
+	// flag remains set.
 	ReadyToComplete: "ready_to_complete",
 }
 
