@@ -4,6 +4,7 @@ package schema
 
 import (
 	"database/sql"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -18,7 +19,7 @@ import (
 // TestPostgresSchemaFilesExecuteAndMirrorMySQL executes every embedded
 // postgres schema file against a real PostgreSQL server, then verifies each
 // table mirrors its MySQL counterpart column-for-column: same column names,
-// same nullability, the declared type mapping, and identical varchar widths.
+// same nullability, defaults, the declared type mapping, and identical varchar widths.
 // The MySQL side is parsed from the embedded files; the PostgreSQL side is
 // read back from information_schema after the DDL runs, so the comparison
 // covers what the server actually created, not what the file claims.
@@ -60,6 +61,14 @@ func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 			assert.Equal(t, wantType, pgCol.dataType,
 				"table %s: column %s type differs (mysql type=%q)", parsed.TableName, col.Name, col.Type)
 
+			// PostgreSQL identity columns report no column_default because their
+			// sequence is represented by identity metadata rather than a default.
+			if !col.AutoInc {
+				assert.Equal(t, normalizedMySQLDefault(col), normalizedPostgresDefault(pgCol.columnDefault),
+					"table %s: column %s default differs (mysql default=%v, postgres default=%v)",
+					parsed.TableName, col.Name, col.Default, pgCol.columnDefault)
+			}
+
 			if col.Type == "varchar" {
 				require.NotNil(t, col.Length, "table %s: mysql varchar column %s has no length", parsed.TableName, col.Name)
 				if assert.True(t, pgCol.charMaxLen.Valid, "table %s: postgres column %s has no character maximum length", parsed.TableName, col.Name) {
@@ -79,9 +88,10 @@ func TestPostgresSchemaFilesExecuteAndMirrorMySQL(t *testing.T) {
 // postgresColumn is one column definition read back from information_schema
 // after the DDL ran, so assertions cover what the server actually created.
 type postgresColumn struct {
-	nullable   bool
-	dataType   string
-	charMaxLen sql.NullInt64
+	nullable      bool
+	dataType      string
+	charMaxLen    sql.NullInt64
+	columnDefault sql.NullString
 }
 
 // postgresColumns returns column name → definition for a table in the public
@@ -90,7 +100,7 @@ func postgresColumns(t *testing.T, db *sql.DB, tableName string) map[string]post
 	t.Helper()
 
 	rows, err := db.QueryContext(t.Context(),
-		`SELECT column_name, is_nullable, data_type, character_maximum_length
+		`SELECT column_name, is_nullable, data_type, character_maximum_length, column_default
 		 FROM information_schema.columns
 		 WHERE table_schema = 'public' AND table_name = $1`,
 		tableName,
@@ -102,12 +112,65 @@ func postgresColumns(t *testing.T, db *sql.DB, tableName string) map[string]post
 	for rows.Next() {
 		var colName, isNullable string
 		var col postgresColumn
-		require.NoError(t, rows.Scan(&colName, &isNullable, &col.dataType, &col.charMaxLen))
+		require.NoError(t, rows.Scan(&colName, &isNullable, &col.dataType, &col.charMaxLen, &col.columnDefault))
 		col.nullable = isNullable == "YES"
 		columns[colName] = col
 	}
 	require.NoError(t, rows.Err())
 	return columns
+}
+
+type columnDefault struct {
+	value   string
+	present bool
+}
+
+var postgresDefaultCast = regexp.MustCompile(`(?i)::(?:character varying|text|bigint|integer|boolean|jsonb|timestamp without time zone)$`)
+
+func normalizedMySQLDefault(col statement.Column) columnDefault {
+	if col.Default == nil || strings.EqualFold(strings.TrimSpace(*col.Default), "NULL") {
+		return columnDefault{}
+	}
+
+	value := strings.TrimSpace(*col.Default)
+	if col.Type == "tinyint" && col.Length != nil && *col.Length == 1 {
+		switch value {
+		case "0":
+			value = "false"
+		case "1":
+			value = "true"
+		}
+	}
+	return columnDefault{value: normalizeDefaultValue(value), present: true}
+}
+
+func normalizedPostgresDefault(value sql.NullString) columnDefault {
+	if !value.Valid {
+		return columnDefault{}
+	}
+
+	normalized := strings.TrimSpace(value.String)
+	for postgresDefaultCast.MatchString(normalized) {
+		normalized = postgresDefaultCast.ReplaceAllString(normalized, "")
+	}
+	if strings.EqualFold(normalized, "NULL") {
+		return columnDefault{}
+	}
+	if len(normalized) >= 2 && normalized[0] == '\'' && normalized[len(normalized)-1] == '\'' {
+		normalized = strings.ReplaceAll(normalized[1:len(normalized)-1], "''", "'")
+	}
+	return columnDefault{value: normalizeDefaultValue(normalized), present: true}
+}
+
+func normalizeDefaultValue(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "current_timestamp", "current_timestamp()", "now()":
+		return "current_timestamp"
+	case "true", "false":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return value
+	}
 }
 
 // expectedPostgresColumnType returns the information_schema data_type the
