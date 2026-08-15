@@ -26,9 +26,32 @@ func controlStatus(accepted bool) string {
 	return "rejected"
 }
 
+// controlErrorMetricStatus classifies a failed control operation for the
+// control-operation metric. The three outcomes want different operator
+// responses: "error" is a failure to investigate, "rejected" is a request the
+// operator must reissue differently, and "satisfied" is a request the apply's
+// state already covers — a repeat command, which needs no response at all and
+// must not inflate the rejection rate operators alert on.
+func controlErrorMetricStatus(err error) string {
+	switch {
+	case IsControlOperationSatisfied(err):
+		return "satisfied"
+	case controlOperationHTTPStatus(err) < http.StatusInternalServerError:
+		return "rejected"
+	default:
+		return "error"
+	}
+}
+
 type controlOperationHTTPError struct {
 	status int
 	err    error
+	// satisfied marks a rejection whose cause is the operator's own intent
+	// already being the apply's state — a cancel on a cancelled apply, a stop on
+	// a stopped one. The request cannot proceed, but nothing went wrong and
+	// there is nothing for the operator to do differently, so callers report it
+	// as an outcome rather than escalating it as a failure.
+	satisfied bool
 }
 
 func (e *controlOperationHTTPError) Error() string {
@@ -46,6 +69,28 @@ func controlConflictf(format string, args ...any) error {
 		status: http.StatusConflict,
 		err:    fmt.Errorf(format, args...),
 	}
+}
+
+// controlSatisfiedf marks an operator request the apply's current state already
+// satisfies. It carries the same conflict status as controlConflictf — the
+// request still cannot proceed — but callers can tell the two apart, because a
+// command whose effect is already in place is not one the operator needs to
+// retry, escalate, or hear about through a failure comment.
+func controlSatisfiedf(format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status:    http.StatusConflict,
+		err:       fmt.Errorf(format, args...),
+		satisfied: true,
+	}
+}
+
+// IsControlOperationSatisfied reports whether a control operation was rejected
+// because the apply is already in the state the operator asked for. Callers use
+// it to answer informationally instead of routing the operator to support for a
+// command that got them exactly what they wanted.
+func IsControlOperationSatisfied(err error) bool {
+	var httpErr *controlOperationHTTPError
+	return errors.As(err, &httpErr) && httpErr.satisfied
 }
 
 func controlOperationHTTPStatus(err error) int {
@@ -465,11 +510,7 @@ func (s *Service) handleCutover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.rejectControlIfStopPending(r.Context(), "cutover", apply); err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, status)
+		metrics.RecordControlOperation(r.Context(), "cutover", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 		s.writeControlError(w, "cutover", apply, err)
 		return
 	}
@@ -709,11 +750,7 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	}
 	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, caller)
 	if err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, status)
+		metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 		return nil, 0, err
 	}
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
@@ -895,17 +932,19 @@ func (s *Service) ExecuteCancel(ctx context.Context, req apitypes.ControlRequest
 
 func (s *Service) executeCancelForApply(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) (*apitypes.CancelResponse, int, error) {
 	caller = resolveCaller(ctx, caller)
+	// A stopped apply is terminal but still cancellable — stopping leaves the
+	// change half-applied, and cancel is how an operator settles it.
+	if state.IsState(apply.State, state.Apply.Cancelled) {
+		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "satisfied")
+		return nil, 0, controlSatisfiedf("the schema change is already cancelled")
+	}
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, controlConflictf("schema change is already terminal (current state: %s)", apply.State)
 	}
 	resp, responseStatus, err := s.queueCancelForApplyOwner(ctx, apply, caller)
 	if err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, status)
+		metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 		return nil, 0, err
 	}
 	metrics.RecordControlOperation(ctx, "cancel", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
@@ -1057,6 +1096,9 @@ func (s *Service) completeImmediateCancelRequestIfCancelled(ctx context.Context,
 func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.StopResponse, string, error) {
 	if resp, responseStatus, found, err := s.pendingStopResponseIfPresent(ctx, apply); err != nil || found {
 		return resp, responseStatus, err
+	}
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		return nil, "", controlSatisfiedf("the schema change is already stopped")
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
@@ -1261,19 +1303,11 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 		return nil, 0, err
 	}
 	if err := s.completeResolvedStopBeforeStart(ctx, client, apply, caller); err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 		return nil, 0, err
 	}
 	if err := s.rejectControlIfStopPending(ctx, "start", apply); err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 		return nil, 0, err
 	}
 
@@ -1306,11 +1340,7 @@ func (s *Service) executeStartForApply(ctx context.Context, client tern.Client, 
 		err = startNotAllowedForState(apply)
 	}
 	if err != nil {
-		status := "error"
-		if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-			status = "rejected"
-		}
-		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, status)
+		metrics.RecordControlOperation(ctx, "start", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 		return nil, 0, err
 	}
 
@@ -1775,11 +1805,7 @@ func (s *Service) acceptedReleaseResponse(ctx context.Context, apply *storage.Ap
 }
 
 func (s *Service) recordReleaseRejectionMetric(ctx context.Context, apply *storage.Apply, err error) {
-	status := "error"
-	if controlOperationHTTPStatus(err) < http.StatusInternalServerError {
-		status = "rejected"
-	}
-	metrics.RecordControlOperation(ctx, "release", apply.Database, apply.Deployment, apply.Environment, status)
+	metrics.RecordControlOperation(ctx, "release", apply.Database, apply.Deployment, apply.Environment, controlErrorMetricStatus(err))
 }
 
 // releaseControlRequestMetadata is the (currently empty) metadata payload stored

@@ -112,6 +112,37 @@ func RenderVolumeInvalidLevel() string {
 		storage.MinVolume, storage.MaxVolume))
 }
 
+// ControlCommandSatisfiedData contains data for the reply to a control command
+// the apply's current state already satisfies.
+type ControlCommandSatisfiedData struct {
+	Command     string
+	ApplyID     string
+	Environment string
+	RequestedBy string
+	// Detail names the state that already covers the command, as a clause the
+	// reply reads back — e.g. "the schema change is already cancelled".
+	Detail string
+}
+
+// RenderControlCommandSatisfied renders the reply to a control command the
+// apply's current state already covers — a cancel on a cancelled apply, a stop
+// on a stopped one. The operator got the outcome they asked for, so this
+// deliberately carries no support-channel link and no failure framing: routing
+// someone to support for a command that worked sends them chasing an incident
+// that does not exist.
+func RenderControlCommandSatisfied(data ControlCommandSatisfiedData) string {
+	body := fmt.Sprintf("## ✅ Nothing to %s\n\n", data.Command) +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID)
+	if data.Environment != "" {
+		body += fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	}
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	return body + fmt.Sprintf("\nThe `%s` command had no effect because %s. Nothing further is needed.\n",
+		data.Command, data.Detail)
+}
+
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
 // comment stop command records durable stop intent.
 func RenderStopCommandAccepted(data StopCommandAcceptedData) string {

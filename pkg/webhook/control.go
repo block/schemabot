@@ -33,6 +33,33 @@ func (h *Handler) logControlCommandError(command, repo string, pr int, applyID, 
 	}
 }
 
+// postControlCommandSatisfied answers a control command the apply's state
+// already covers — a cancel on a cancelled apply, a stop on a stopped one.
+// Reissuing a control command is how an operator confirms one landed, so the
+// second one is expected traffic: it gets an informational reply with no
+// support-channel link, and an INFO log rather than the WARN a rejection earns.
+// Treating a satisfied intent as a failure sends an operator who already got
+// what they wanted looking for an incident that does not exist.
+func (h *Handler) postControlCommandSatisfied(
+	repo string, pr int, installationID int64, requestedBy string,
+	result CommandResult, actionName string, err error,
+) {
+	h.logger.Info(actionName+" PR command was already satisfied by the schema change's current state",
+		"repo", repo,
+		"pr", pr,
+		"apply_id", result.ApplyID,
+		"environment", result.Environment,
+		"requested_by", requestedBy,
+		"detail", err.Error())
+	h.postComment(repo, pr, installationID, templates.RenderControlCommandSatisfied(templates.ControlCommandSatisfiedData{
+		Command:     actionName,
+		ApplyID:     result.ApplyID,
+		Environment: result.Environment,
+		RequestedBy: requestedBy,
+		Detail:      err.Error(),
+	}))
+}
+
 func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int, installationID int64, requestedBy string, result CommandResult, command string) (*storage.Apply, bool) {
 	if result.ApplyID == "" {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
@@ -188,6 +215,10 @@ func runControlCommand[R any](
 		Caller:      caller,
 	})
 	if err != nil {
+		if api.IsControlOperationSatisfied(err) {
+			h.postControlCommandSatisfied(repo, pr, installationID, requestedBy, result, actionName, err)
+			return nil
+		}
 		h.logControlCommandError(actionName, repo, pr, result.ApplyID, result.Environment, requestedBy, err)
 		h.postCommandError(repo, pr, installationID, actionName, result.Environment, requestedBy, err.Error())
 		return nil
