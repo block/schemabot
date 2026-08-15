@@ -593,6 +593,18 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 	return op, nil
 }
 
+// ReleaseClaim hands the operation back the way the real store does: the row
+// becomes claimable again, so a later find leases it out afresh.
+func (s *queuedOperationClaimStore) ReleaseClaim(_ context.Context, lease storage.OperationLease) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.claimed || lease.Token != "op-lease-token" {
+		return false, nil
+	}
+	s.claimed = false
+	return true, nil
+}
+
 func (s *queuedOperationClaimStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
 	return s.capturedOperation(), nil
 }

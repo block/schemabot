@@ -161,6 +161,13 @@ type Service struct {
 	// staleness window on a claim this process will never use again.
 	heldClaimsMu sync.Mutex
 	heldClaims   map[int64]heldClaim
+	// heldOperationClaims tracks the operation leases this process's drivers are
+	// currently driving under, keyed by apply_operation id. Every claimed drive
+	// holds one; a single-operation drive holds a parent apply lease as well.
+	// Both have to be handed back for the work to be claimable again, because
+	// the operation claim is what the next poll looks at first.
+	heldOperationClaimsMu sync.Mutex
+	heldOperationClaims   map[int64]heldOperationClaim
 
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
@@ -285,6 +292,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
 		heldClaims:           make(map[int64]heldClaim),
+		heldOperationClaims:  make(map[int64]heldOperationClaim),
 	}
 }
 

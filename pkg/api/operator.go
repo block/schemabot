@@ -123,6 +123,7 @@ func (s *Service) StopOperator() {
 	// deregisters its claim as it returns, so after the cancel there is nothing
 	// left to record, and these are exactly the claims that need handing back.
 	held := s.heldClaimsSnapshot()
+	heldOperations := s.heldOperationClaimsSnapshot()
 
 	// End the in-flight drives. A drive inside a claim only observes its
 	// context, so cancelling it is what returns it; it exits leaving its apply
@@ -143,7 +144,13 @@ func (s *Service) StopOperator() {
 	// any earlier would invite a peer driver onto a target this process still
 	// held; leaving them to go stale instead would idle the work for the whole
 	// staleness window.
+	// Hand the parent applies back before their operations. A driver reaches
+	// work through its apply_operation, so releasing the operation first invites
+	// a peer to claim it while this process still holds the parent apply — the
+	// peer then finds an unclaimable parent and has to reconcile its way out
+	// instead of simply resuming.
 	s.releaseHeldClaims(held)
+	s.releaseHeldOperationClaims(heldOperations)
 }
 
 // heldClaim is an apply lease a driver is driving under, carried alongside the
@@ -235,6 +242,78 @@ func (s *Service) releaseHeldClaims(claims []heldClaim) {
 		}
 		s.logger.Info("operator: handed a claimed apply back on shutdown; it is claimable again on the next poll",
 			append(apply.LogAttrs(), "lease_owner", claim.lease.Owner)...)
+	}
+}
+
+// heldOperationClaim is an operation lease a driver is driving under, carried
+// alongside the operation's triage identity for the same reason heldClaim
+// carries the apply's: shutdown hands the claim back without reloading the row.
+type heldOperationClaim struct {
+	lease    storage.OperationLease
+	logAttrs []any
+}
+
+// trackHeldOperationClaim registers the operation claim a drive is running
+// under and returns the function that deregisters it when the drive returns.
+// Every claimed drive passes through here, so this is the one registration that
+// covers single-operation, multi-operation, and task-less operation drives.
+func (s *Service) trackHeldOperationClaim(op *storage.ApplyOperation, lease storage.OperationLease) func() {
+	if !lease.Valid() {
+		// An invalid lease authorizes no write, so there is no claim to hand
+		// back. The caller's own lease validation reports the cause.
+		return func() {}
+	}
+	s.heldOperationClaimsMu.Lock()
+	if s.heldOperationClaims == nil {
+		s.heldOperationClaims = make(map[int64]heldOperationClaim)
+	}
+	s.heldOperationClaims[lease.OperationID] = heldOperationClaim{lease: lease, logAttrs: op.LogAttrs()}
+	s.heldOperationClaimsMu.Unlock()
+
+	return func() {
+		s.heldOperationClaimsMu.Lock()
+		// Delete only this claim: a peer that rotated the lease onto itself is
+		// recorded under a different token, and this drive must not deregister
+		// a claim it no longer owns.
+		if current, ok := s.heldOperationClaims[lease.OperationID]; ok && current.lease.Token == lease.Token {
+			delete(s.heldOperationClaims, lease.OperationID)
+		}
+		s.heldOperationClaimsMu.Unlock()
+	}
+}
+
+// heldOperationClaimsSnapshot returns the operation claims this process is
+// currently driving under.
+func (s *Service) heldOperationClaimsSnapshot() []heldOperationClaim {
+	s.heldOperationClaimsMu.Lock()
+	defer s.heldOperationClaimsMu.Unlock()
+	return slices.Collect(maps.Values(s.heldOperationClaims))
+}
+
+// releaseHeldOperationClaims hands back the operation claims this process was
+// driving under. A driver's next poll reaches an apply through
+// FindNextApplyOperation, so an operation left claimed idles the work for the
+// whole staleness window even when the parent apply is already claimable.
+func (s *Service) releaseHeldOperationClaims(claims []heldOperationClaim) {
+	if len(claims) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownHaltTimeout)
+	defer cancel()
+
+	for _, claim := range claims {
+		attrs := append(slices.Clone(claim.logAttrs), "lease_owner", claim.lease.Owner)
+		released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, claim.lease)
+		if err != nil {
+			s.logger.Error("operator: could not hand back a claimed apply_operation on shutdown; the operation stays claimed until its lease goes stale, delaying the driver that would resume it",
+				append(attrs, "error", err)...)
+			continue
+		}
+		if !released {
+			s.logger.Debug("operator: a claimed apply_operation's lease had already moved on; nothing to hand back", attrs...)
+			continue
+		}
+		s.logger.Info("operator: handed a claimed apply_operation back on shutdown; it is claimable again on the next poll", attrs...)
 	}
 }
 
@@ -485,6 +564,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_lease_token")
 		return
 	}
+	// Registered once here, before the branch: every drive below runs under this
+	// operation lease, and shutdown has to hand it back whichever path it took.
+	defer s.trackHeldOperationClaim(op, opLease)()
 
 	// Branch on the operation count. A single-operation apply keeps the legacy
 	// parent-lease drive byte-for-byte. A multi-operation apply drives under the
