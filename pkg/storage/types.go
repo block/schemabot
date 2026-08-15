@@ -1437,6 +1437,12 @@ const (
 	WebhookEventFailedRetryable = "failed_retryable"
 	WebhookEventFailed          = "failed"
 	WebhookEventFailedPermanent = "failed_permanent"
+
+	// WebhookEventSuperseded is the terminal state for an auto-plan delivery
+	// discarded at claim time because a newer covering delivery exists for the
+	// same pull request (see WebhookEventStore.SupersedeIfCovered). The row's
+	// work was never performed; the covering successor performs it instead.
+	WebhookEventSuperseded = "superseded"
 )
 
 // SynthesizedWebhookDeliveryIDPrefix marks delivery GUIDs minted by the
@@ -1457,6 +1463,14 @@ const SynthesizedWebhookDeliveryIDPrefix = "recon:"
 // enqueue rows the dispatcher completes without planning.
 var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
 
+// PullRequestClosedAction is the pull_request action GitHub delivers when a PR
+// is closed (merged or not). A closed delivery participates asymmetrically in
+// claim-time coalescing (SupersedeIfCovered): a later closed delivery covers
+// older unprocessed auto-plan deliveries — planning a closed PR is pointless —
+// but a closed delivery itself is never superseded, because its cleanup must
+// always run.
+const PullRequestClosedAction = "closed"
+
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a
 // series is always present even when a state is momentarily empty.
@@ -1467,6 +1481,7 @@ var WebhookEventStatesAll = []string{
 	WebhookEventCompleted,
 	WebhookEventFailed,
 	WebhookEventFailedPermanent,
+	WebhookEventSuperseded,
 }
 
 // WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox

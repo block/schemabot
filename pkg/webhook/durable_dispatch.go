@@ -19,6 +19,12 @@ import (
 const (
 	durableWebhookRetryDelay = time.Minute
 
+	// durableSupersedeHeadCheckTimeout bounds the live-head fetch that gates
+	// claim-time coalescing. The fetch runs before the delivery's heartbeat
+	// starts, so it must stay well inside the claim lease — on timeout the
+	// delivery simply processes normally instead of coalescing.
+	durableSupersedeHeadCheckTimeout = 10 * time.Second
+
 	// maxDurableWebhookAttempts caps how many times a delivery is claimed
 	// before a retryable failure is recorded as terminal. Attempts increment on
 	// claim, so an unclassified permanent error (e.g. a misconfigured GitHub
@@ -226,6 +232,12 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		metrics.RecordWebhookInboxDispatchLag(ctx, appName, event.Event, event.Repository, time.Since(lagSince))
 	}
 
+	if event.Event == "pull_request" && isAutoPlannablePullRequestAction(event.Action) {
+		if h.supersedeCoveredAutoPlan(ctx, driverID, store, event, appName, claimedAt) {
+			return
+		}
+	}
+
 	runCtx, cancelRun := context.WithCancel(ctx)
 	stopHeartbeat := h.startDurableWebhookHeartbeat(runCtx, driverID, event, cancelRun)
 	process := h.processDurableWebhookEvent
@@ -360,6 +372,115 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 	h.logger.Info("durable webhook driver completed delivery",
 		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+}
+
+// supersedeCoveredAutoPlan coalesces a freshly claimed auto-plannable
+// pull_request delivery against newer deliveries for the same PR: when a
+// covering successor exists (one that will plan the PR again or close it)
+// and GitHub confirms the claimed head is no longer the PR's current head,
+// the claimed delivery is marked superseded instead of planning a stale head.
+// It reports whether the claim was finished here — superseded, or ownership
+// lost while superseding — so the caller skips processing. A storage or
+// GitHub error keeps the claim alive: coalescing is an optimization, and
+// re-planning a possibly-stale head is idempotent, so the delivery processes
+// normally rather than failing on a coalescing check error.
+func (h *Handler) supersedeCoveredAutoPlan(ctx context.Context, driverID int, store storage.WebhookEventStore, event *storage.WebhookEvent, appName string, claimedAt time.Time) bool {
+	covered, err := store.HasCoveringSuccessor(ctx, event)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not check the delivery for a covering successor; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	if !covered {
+		return false
+	}
+	if !h.claimedAutoPlanHeadConfirmedStale(ctx, driverID, event) {
+		return false
+	}
+	superseded, err := store.SupersedeIfCovered(ctx, event)
+	if err != nil {
+		if errors.Is(err, storage.ErrWebhookEventLeaseLost) || errors.Is(err, storage.ErrWebhookEventNotFound) {
+			metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "lease_lost", time.Since(claimedAt))
+			h.logger.Warn("durable webhook driver lost the delivery lease while checking for a covering successor; another driver owns the delivery or the row is gone",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest)
+			return true
+		}
+		h.logger.Warn("durable webhook driver could not check the delivery for a covering successor; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	if !superseded {
+		return false
+	}
+	metrics.RecordWebhookDispatchDuration(ctx, appName, event.Event, event.Repository, "superseded", time.Since(claimedAt))
+	metrics.RecordWebhookEvent(ctx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_superseded")
+	h.logger.Info("durable webhook driver superseded stale auto-plan delivery; a newer delivery for the same pull request covers it",
+		"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+		"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+		"head_sha", event.HeadSHA)
+	return true
+}
+
+// claimedAutoPlanHeadConfirmedStale reports whether GitHub confirms the
+// claimed delivery's head is no longer worth planning: the PR is closed, or
+// its current head has moved past the claimed one. A covering successor's
+// newer received_at proves only arrival recency, not push order — GitHub does
+// not guarantee delivery order, and an operator Redeliver refreshes
+// received_at on an old-head row — so without this confirmation a
+// stale-arriving delivery could supersede the delivery that carries the PR's
+// real current head, and in configurations without reconciler synthesis
+// nothing would ever plan that head again. The live PR is the authority.
+// Every uncertain outcome — missing head SHA, unresolvable installation, a
+// GitHub failure — answers false so the delivery processes normally:
+// re-planning a possibly-stale head is idempotent, discarding the current
+// head's plan is not always recoverable.
+func (h *Handler) claimedAutoPlanHeadConfirmedStale(ctx context.Context, driverID int, event *storage.WebhookEvent) bool {
+	if event.HeadSHA == "" {
+		h.logger.Warn("durable webhook driver cannot verify head currency for a claimed delivery without a head SHA; processing it normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest)
+		return false
+	}
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not resolve the installation to verify head currency; processing the delivery normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest, "error", err)
+		return false
+	}
+	client, err := h.clientForRepo(event.Repository, installationID)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not create a GitHub client to verify head currency; processing the delivery normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"installation_id", installationID, "error", err)
+		return false
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, durableSupersedeHeadCheckTimeout)
+	defer cancel()
+	// FetchPullRequestNoCache: a cached PR snapshot could predate the push
+	// that made the claimed head stale — or, worse, postdate the claimed
+	// delivery while the claimed head is still current — so only a live
+	// fetch can authorize discarding the claim.
+	prInfo, err := client.FetchPullRequestNoCache(fetchCtx, event.Repository, event.PullRequest)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not fetch the live pull request to verify head currency; processing the delivery normally",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"head_sha", event.HeadSHA, "error", err)
+		return false
+	}
+	if !prInfo.IsClosed() && prInfo.HeadSHA == event.HeadSHA {
+		h.logger.Info("durable webhook driver kept a claimed delivery that carries the pull request's current head; a newer-arriving delivery cannot cover it",
+			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+			"head_sha", event.HeadSHA)
+		return false
+	}
+	return true
 }
 
 // safeProcessDurableWebhookEvent runs process with panic recovery. The legacy
@@ -505,7 +626,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 	switch {
 	case isAutoPlannablePullRequest(payload):
 		return h.processDurablePullRequestAutoPlan(ctx, event, payload)
-	case payload.Action == "closed":
+	case payload.Action == storage.PullRequestClosedAction:
 		return h.processDurablePullRequestClosed(ctx, event, payload)
 	default:
 		h.logger.Info("durable pull_request delivery ignored because action needs no work",
