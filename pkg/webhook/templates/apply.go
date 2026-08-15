@@ -724,15 +724,15 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		// show how far the verify has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)\n", table.TableName, ui.ProgressBarRowCopy(pct), pct)
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)%s\n", table.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
 		} else {
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...%s\n", table.TableName, ui.ProgressBarRowCopy(100), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 		}
-		writeThrottleLine(sb, table)
+		writeThrottleTooltip(sb, table)
 
 	case state.Task.PostChecksum:
 		// The verify passed and the engine is draining the changes that
@@ -936,10 +936,10 @@ func isCopyingShardStatus(status string) bool {
 
 // renderRunningTable renders a table that is actively copying rows.
 func renderRunningTable(sb *strings.Builder, table TableProgressData) {
-	defer writeThrottleLine(sb, table)
+	defer writeThrottleTooltip(sb, table)
 	if table.RowsTotal > 0 {
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
-			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy\n", table.TableName, ui.ProgressBarActivity())
+			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", table.TableName, ui.ProgressBarActivity(), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
 			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
@@ -951,39 +951,44 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 			// Row total is known but the copy hasn't reported progress yet
 			// (VReplication / Spirit ramp-up). A 0% bar reads as stuck, so show
 			// a starting indicator and the row total instead.
-			fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...%s\n", table.TableName, throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			writeRowsAndETA(sb, table)
 			return
 		}
 		bar := ui.ProgressBarRowCopy(pct)
-		fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", table.TableName, bar, pct)
+		fmt.Fprintf(sb, "**`%s`**: %s %d%%%s\n", table.TableName, bar, pct, throttledSuffix(table))
 		writeDDLLine(sb, table.DDL)
 		writeRowsAndETA(sb, table)
 	} else {
 		// No row data yet (initializing or instant DDL)
-		fmt.Fprintf(sb, "**`%s`**: Running...\n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: Running...%s\n", table.TableName, throttledSuffix(table))
 		writeDDLLine(sb, table.DDL)
 	}
 }
 
-// writeThrottleLine notes that the engine's throttler is holding back the
-// table's active phase, so a stalled bar reads as deliberate backpressure —
-// slowed, not stopped — never to be confused with an operator stop. The drive
-// clears the stored flag when the throttle lifts, so the line disappears on
-// the next refresh. The reason is sanitized at the engine boundary before it
-// is stored, so it is safe to render in markdown. The line is its own
-// paragraph so it never merges into the preceding progress detail line,
-// whichever markdown line-break mode renders the comment.
-func writeThrottleLine(sb *strings.Builder, table TableProgressData) {
+// throttledSuffix annotates a paced-phase header when the engine's throttler
+// is holding the phase back, so a slow bar reads as deliberate backpressure —
+// slowed, not stopped — right where the eye checks progress, and never to be
+// confused with an operator stop. The drive clears the stored flag when the
+// throttle lifts, so the annotation disappears on the next refresh.
+func throttledSuffix(table TableProgressData) string {
 	if !table.Throttled {
+		return ""
+	}
+	return " (throttled)"
+}
+
+// writeThrottleTooltip explains the header's "(throttled)" annotation with the
+// engine's reason, using the same tooltip idiom as the estimate-exceeded note.
+// The reason is sanitized at the engine boundary before it is stored, so it is
+// safe to render in markdown. When the engine reports throttled without a
+// reason, the header annotation stands alone.
+func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
+	if !table.Throttled || table.ThrottleReason == "" {
 		return
 	}
-	if table.ThrottleReason != "" {
-		fmt.Fprintf(sb, "\n🚦 Throttled: %s\n", table.ThrottleReason)
-		return
-	}
-	sb.WriteString("\n🚦 Throttled\n")
+	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", table.ThrottleReason)
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {

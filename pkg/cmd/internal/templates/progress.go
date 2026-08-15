@@ -507,19 +507,19 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// verify has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
 			pct := ui.ClampPercent(int(t.ChecksumRowsChecked * 100 / t.ChecksumRowsTotal))
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)\n", t.TableName, ui.ProgressBarRowCopy(pct), pct)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)%s\n", t.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
 			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
 		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...\n", t.TableName, ui.ProgressBarRowCopy(100))
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...%s\n", t.TableName, ui.ProgressBarRowCopy(100), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
 		}
-		writeThrottleLine(&b, t)
+		writeThrottleTooltip(&b, t)
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
 		return b.String()
@@ -693,7 +693,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// Parsed successfully - show emoji progress bar with structured data
 			displayPercent := ui.RowCopyDisplayPercent(info.Percent, info.RowsCopied)
 			bar := ui.ProgressBarRowCopy(displayPercent)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, displayPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
 			}
@@ -716,7 +716,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// (Vitess VReplication / Spirit ramp-up — can take a while on a large
 		// table). Show a starting indicator and the row total instead of a 0%
 		// bar that reads as stuck.
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Starting copy...\n", t.TableName)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Starting copy...%s\n", t.TableName, throttledSuffix(t))
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -730,7 +730,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%\n", t.TableName, bar, displayPercent)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
 
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
@@ -749,18 +749,18 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		op := ddl.OpToStatementType(t.ChangeType)
 		switch {
 		case t.IsInstant:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...%s\n", t.TableName, bar, throttledSuffix(t))
 		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...\n", t.TableName, bar)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...%s\n", t.TableName, bar, throttledSuffix(t))
 		default:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...\n", t.TableName, bar)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...%s\n", t.TableName, bar, throttledSuffix(t))
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
 	}
 
-	writeThrottleLine(&b, t)
+	writeThrottleTooltip(&b, t)
 	if len(t.Shards) == 0 {
 		b.WriteString("\n")
 	}
@@ -768,20 +768,27 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	return b.String()
 }
 
-// writeThrottleLine notes that the engine's throttler is holding back the
-// table's active phase, so a stalled bar reads as deliberate backpressure —
-// slowed, not stopped — never to be confused with an operator stop. The drive
-// clears the stored flag when the throttle lifts, so the line disappears on
-// the next refresh.
-func writeThrottleLine(b *strings.Builder, t TableProgress) {
+// throttledSuffix annotates a paced-phase header when the engine's throttler
+// is holding the phase back, so a slow bar reads as deliberate backpressure —
+// slowed, not stopped — right where the eye checks progress, and never to be
+// confused with an operator stop. The drive clears the stored flag when the
+// throttle lifts, so the annotation disappears on the next refresh.
+func throttledSuffix(t TableProgress) string {
 	if !t.Throttled {
+		return ""
+	}
+	return " (throttled)"
+}
+
+// writeThrottleTooltip explains the header's "(throttled)" annotation with the
+// engine's reason, using the same dimmed tooltip idiom as the estimate-exceeded
+// note. When the engine reports throttled without a reason, the header
+// annotation stands alone.
+func writeThrottleTooltip(b *strings.Builder, t TableProgress) {
+	if !t.Throttled || t.ThrottleReason == "" {
 		return
 	}
-	if t.ThrottleReason != "" {
-		fmt.Fprintf(b, indentDetail+"🚦 Throttled: %s\n", t.ThrottleReason)
-		return
-	}
-	fmt.Fprint(b, indentDetail+"🚦 Throttled\n")
+	fmt.Fprintf(b, indentDetail+"%sℹ️ Throttled: %s%s\n", ANSIDim, t.ThrottleReason, ANSIReset)
 }
 
 func recoveringIsCopyingRows(t TableProgress) bool {
@@ -798,12 +805,13 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 
 func formatEstimateExceededTable(t TableProgress, rowsCopied int64, activityBar, activityLabel string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, activityBar, activityLabel)
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, activityBar, activityLabel, throttledSuffix(t))
 	if t.DDL != "" {
 		b.WriteString(formatProgressDDL(t.DDL))
 	}
 	fmt.Fprintf(&b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(rowsCopied))
 	fmt.Fprintf(&b, indentDetail+"%sℹ️ %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
+	writeThrottleTooltip(&b, t)
 	return b.String()
 }
 

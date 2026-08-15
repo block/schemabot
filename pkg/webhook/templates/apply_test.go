@@ -260,11 +260,12 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 	assert.Contains(t, result, "1 checksumming")
 }
 
-// A table paused by the engine's throttler names the pause and its trigger in
-// the PR comment, so a stalled progress bar reads as a deliberate slowdown
+// A table slowed by the engine's throttler carries a "(throttled)" annotation
+// on its header line — right where the eye checks progress — with the trigger
+// explained in a tooltip bullet, so a slow bar reads as deliberate backpressure
 // (e.g. replica lag) rather than a hang. The reason is sanitized at the engine
-// boundary, and the line renders only on active tables — a throttled flag on a
-// terminal table would be stale.
+// boundary, and the annotation renders only on active tables — a throttled flag
+// on a terminal table would be stale.
 func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -282,23 +283,25 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "\n\n🚦 Throttled: replica-lag 12s > 10s",
-		"the pause is its own paragraph, not a continuation of the progress detail line")
+	assert.Contains(t, result, "45% (throttled)",
+		"the annotation lands on the header line next to the percent")
+	assert.Contains(t, result, "- ℹ️ _Throttled: replica-lag 12s > 10s_",
+		"the reason renders as a tooltip bullet under the detail list")
 
 	data.Tables[0].ThrottleReason = ""
 	noReason := RenderApplyStatusComment(data)
-	assert.Contains(t, noReason, "\n\n🚦 Throttled")
-	assert.NotContains(t, noReason, "Throttled:")
+	assert.Contains(t, noReason, "45% (throttled)")
+	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	data.Tables[0].Throttled = false
 	notThrottled := RenderApplyStatusComment(data)
+	assert.NotContains(t, notThrottled, "(throttled)")
 	assert.NotContains(t, notThrottled, "Throttled")
 }
 
-// A throttled checksum verify surfaces the pause alongside the verify
-// progress, since the checksum is the other phase the engine's throttler
-// paces.
+// A throttled checksum verify carries the same header annotation and tooltip
+// alongside the verify progress, since the checksum is the other phase the
+// engine's throttler paces.
 func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -315,8 +318,8 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
-	assert.Contains(t, result, "\n\n🚦 Throttled: threads-running 130 > 128")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21%) (throttled)")
+	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 130 > 128_")
 }
 
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {

@@ -387,38 +387,42 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
 }
 
-// A table paused by the engine's throttler names the pause and its trigger,
-// so a stalled progress bar reads as a deliberate slowdown (e.g. replica lag)
-// rather than a hang. The line renders for the active copy and checksum
-// phases only — a throttled flag on a terminal table would be stale.
+// A table slowed by the engine's throttler carries a "(throttled)" annotation
+// on its header line with the trigger explained in a dimmed tooltip, so a slow
+// progress bar reads as deliberate backpressure (e.g. replica lag) rather than
+// a hang. The annotation renders for the active copy and checksum phases only —
+// a throttled flag on a terminal table would be stale.
 func TestFormatTableProgress_Throttled(t *testing.T) {
 	copying := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
 	})
-	assert.Contains(t, copying, "🚦 Throttled: replica-lag 12s > 10s")
+	assert.Contains(t, copying, "45% (throttled)",
+		"the annotation lands on the header line next to the percent")
+	assert.Contains(t, copying, "ℹ️ Throttled: replica-lag 12s > 10s")
 
 	noReason := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true,
 	})
-	assert.Contains(t, noReason, "🚦 Throttled")
-	assert.NotContains(t, noReason, "Throttled:")
+	assert.Contains(t, noReason, "45% (throttled)")
+	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	checksumming := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 		Throttled: true, ThrottleReason: "threads-running 130 > 128",
 	})
-	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21%)")
-	assert.Contains(t, checksumming, "🚦 Throttled: threads-running 130 > 128")
+	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21%) (throttled)")
+	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 130 > 128")
 
 	notThrottled := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 	})
+	assert.NotContains(t, notThrottled, "(throttled)")
 	assert.NotContains(t, notThrottled, "Throttled")
 
 	completed := FormatTableProgress(TableProgress{
