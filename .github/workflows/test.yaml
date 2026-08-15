@@ -133,11 +133,25 @@ jobs:
         run: make test-unit
 
   integration:
-    name: "Integration Tests"
+    name: "Integration Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The cross-package suite under ./integration is the longest single
+          # lane and cannot be shortened by package parallelism, so it gets its
+          # own runner rather than setting the wall time for everything else.
+          - shard: suite
+            select: "-E"
+          # Its exact complement. The two selectors are inverses of one another,
+          # so every package lands in exactly one lane and a newly added package
+          # is picked up here without touching this file.
+          - shard: packages
+            select: "-vE"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -169,7 +183,23 @@ jobs:
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
         # MySQL, starving operator claim loops and causing spurious pending-apply
         # timeouts. Two lanes keeps wall time within the job budget.
-        run: go test -tags=integration -timeout=10m -count=1 -p=2 $(go list -tags=integration ./... | grep -v /localscale)
+        #
+        # Go's own timeout sits below the job's, so a hung test panics with a
+        # goroutine dump naming the culprit instead of the runner cancelling the
+        # job and leaving a bare "cancelled" that reads like a plain failure.
+        env:
+          SELECT: ${{ matrix.select }}
+        run: |
+          set -euo pipefail
+          pkgs=$(go list -tags=integration ./... | grep -v /localscale | grep "$SELECT" '/integration(/|$)')
+          # An empty lane would hand `go test` no packages and silently test the
+          # working directory instead, reporting success for work never run.
+          if [ -z "$pkgs" ]; then
+            echo "::error::shard '${{ matrix.shard }}' selected no packages"
+            exit 1
+          fi
+          echo "$pkgs" | wc -l | xargs echo "packages in this shard:"
+          go test -tags=integration -timeout=8m -count=1 -p=2 $pkgs
 
   localscale-matrix:
     name: "LocalScale Matrix"
@@ -816,6 +846,34 @@ jobs:
           fi
           if [ "$LOCALSCALE_RESULT" != "success" ]; then
             echo "::error::localscale result=$LOCALSCALE_RESULT"
+            exit 1
+          fi
+
+  integration-rollup:
+    name: "Integration Tests"
+    needs: [changes, integration]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; integration intentionally skipped."
+            exit 0
+          fi
+          # A matrix result is success only when every shard succeeded, so this
+          # cannot pass on a partial run.
+          if [ "$INTEGRATION_RESULT" != "success" ]; then
+            echo "::error::integration result=$INTEGRATION_RESULT"
             exit 1
           fi
 
