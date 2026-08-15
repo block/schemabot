@@ -3,6 +3,7 @@
 package spirit
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -17,10 +18,16 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// haltCheckpointPollDeadline bounds the wait for the copy to get underway. The
-// halt has to land while rows are still being copied, so a copy that never
-// starts is a failed test rather than one that waits indefinitely.
-const haltCheckpointPollDeadline = 30 * time.Second
+const (
+	// haltCheckpointPollDeadline bounds the wait for the copy to get underway.
+	// The halt has to land while rows are still being copied, so a copy that
+	// never starts is a failed test rather than one that waits indefinitely.
+	haltCheckpointPollDeadline = 30 * time.Second
+
+	// haltDeadline bounds the halt itself, which checkpoints the copy and then
+	// waits for its goroutine to exit.
+	haltDeadline = 30 * time.Second
+)
 
 // A driver that shuts down mid-copy must leave the schema change resumable by
 // whichever driver reclaims the apply. Spirit writes checkpoints on its own
@@ -76,7 +83,11 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	require.Zero(t, checkpointRowCount(t, db, checkpointTable),
 		"the copy has not run long enough for Spirit's periodic checkpoint, so any checkpoint after the halt is the halt's own")
 
-	require.NoError(t, eng.HaltForShutdown(ctx), "HaltForShutdown()")
+	// Bound the halt: it waits for the copy goroutine to exit, so one that will
+	// not come down fails here rather than hanging until the package timeout.
+	haltCtx, cancelHalt := context.WithTimeout(ctx, haltDeadline)
+	defer cancelHalt()
+	require.NoError(t, eng.HaltForShutdown(haltCtx), "HaltForShutdown()")
 
 	assert.Positive(t, checkpointRowCount(t, db, checkpointTable),
 		"halting checkpoints the copy before cancelling it, so the reclaiming driver resumes from where the copy stopped rather than recopying from the last periodic checkpoint")
