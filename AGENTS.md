@@ -39,7 +39,7 @@ Three test layers, each with its own make target and CI job:
 
 Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2E tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all three layers are the only safe way to evolve SchemaBot.
 
-CI mirrors local dev exactly — each job runs the corresponding make target.
+CI mirrors local dev — each job runs the corresponding make target. The Integration job is the exception: it splits the packages across two runners, leaves out the LocalScale packages that have their own job, and gives Go a timeout below the job's so a hung test panics with a goroutine dump naming the culprit. `make test-integration` runs everything in one pass on the make target's own timeout, so a CI-only timeout will not necessarily reproduce locally.
 
 ## Git
 
