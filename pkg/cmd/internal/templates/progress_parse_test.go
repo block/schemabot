@@ -2,6 +2,7 @@ package templates
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -94,6 +95,38 @@ func TestVolumeBoxRow(t *testing.T) {
 			assert.Equal(t, tc.want, row.Value)
 		})
 	}
+}
+
+// The retry row reports how much of the budget the next attempt spends and when
+// it becomes eligible, so an operator can tell an apply that is waiting from one
+// that is wedged. It appears only while the apply is retrying, and names a time
+// only while one is still ahead.
+func TestRetryBoxRow(t *testing.T) {
+	now := time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC)
+	originalNow, originalZone := nowFunc, localZone
+	t.Cleanup(func() { nowFunc, localZone = originalNow, originalZone })
+	nowFunc = func() time.Time { return now }
+	localZone = time.UTC
+
+	row, ok := retryBoxRow(ProgressData{
+		State:      state.Apply.FailedRetryable,
+		Attempt:    3,
+		RetryAfter: now.Add(90 * time.Second).Format(time.RFC3339),
+	})
+	require.True(t, ok)
+	assert.Equal(t, "Retry", row.Label)
+	assert.Equal(t, "attempt 4/10 · next 14:31:30 UTC", row.Value)
+
+	due, ok := retryBoxRow(ProgressData{
+		State:      state.Apply.FailedRetryable,
+		Attempt:    3,
+		RetryAfter: now.Add(-time.Second).Format(time.RFC3339),
+	})
+	require.True(t, ok)
+	assert.Equal(t, "attempt 4/10", due.Value, "an elapsed wait names no time — the retry is due")
+
+	_, ok = retryBoxRow(ProgressData{State: state.Apply.Running, Attempt: 3})
+	assert.False(t, ok, "a spent attempt counter carries no signal outside the retrying state")
 }
 
 func TestParseProgressResponseWithoutOperationsKeepsDeploymentEmpty(t *testing.T) {

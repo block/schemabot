@@ -35,8 +35,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	switch previewType {
 	// Basic types
 	case templates.PreviewPlan, templates.PreviewProgress, templates.PreviewWaitingForDeploy, templates.PreviewWaitingForCutover,
-		templates.PreviewCuttingOver, templates.PreviewCompleted, templates.PreviewFailed,
-		templates.PreviewStopped, templates.PreviewStates:
+		templates.PreviewCuttingOver, templates.PreviewCompleted, templates.PreviewRetrying,
+		templates.PreviewFailed, templates.PreviewStopped, templates.PreviewStates:
 		templates.PreviewCLIOutput(previewType)
 	// Lock types
 	case templates.PreviewLockAcquired, templates.PreviewLockConflict,
@@ -173,6 +173,7 @@ Basic Types:
   waiting_for_cutover   Show sample waiting for cutover output
   cutting_over          Show sample cutting over output
   completed             Show sample completed output
+  retrying              Show sample interrupted output (waiting on an automatic retry)
   failed                Show sample failed output
   stopped               Show sample stopped output (mid-apply stop)
   states                Show state display formatting

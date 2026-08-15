@@ -56,6 +56,11 @@ func FormatKeyspaceHeader(ns string) string {
 // nowFunc returns the current time. Overridden in previews for deterministic output.
 var nowFunc = time.Now
 
+// localZone is the zone absolute clock times render in — an operator reads them
+// against the wall clock in front of them. Overridden in previews so a rendered
+// snapshot does not depend on the zone of the machine that produced it.
+var localZone = time.Local
+
 // volumeBoxRow returns the detail-box row for an operator-set volume level.
 // The level only matters while the engine is actively working (copying,
 // draining, or verifying — volume stays adjustable through the post-copy
@@ -67,6 +72,15 @@ func volumeBoxRow(volume int, applyState string) (BoxRow, bool) {
 		return BoxRow{}, false
 	}
 	return BoxRow{"Volume", fmt.Sprintf("%d/%d", volume, storage.MaxVolume)}, true
+}
+
+// showsFailureCause reports whether the progress view prints the apply's error
+// beneath the detail box. A permanently failed apply and an interrupted one ask
+// the operator the same question — what went wrong, and is it worth waiting on —
+// and only the raw message answers it. Other states have no cause to explain.
+func showsFailureCause(applyState string) bool {
+	return state.IsState(applyState, state.Apply.Failed) ||
+		state.IsState(applyState, state.Apply.FailedRetryable)
 }
 
 // retryBoxRow renders the automatic-retry state of an interrupted apply: how
@@ -82,7 +96,7 @@ func retryBoxRow(data ProgressData) (BoxRow, bool) {
 	}
 	retry := fmt.Sprintf("attempt %d/%d", data.Attempt+1, storage.MaxRecoveryAttempts)
 	if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(nowFunc()) {
-		retry += " · next " + due.Local().Format("15:04:05 MST")
+		retry += " · next " + due.In(localZone).Format("15:04:05 MST")
 	}
 	return BoxRow{"Retry", retry}, true
 }
@@ -181,7 +195,7 @@ func WriteProgress(data ProgressData) {
 	WriteBox(rows, "State", colorFn)
 
 	// Error below the box
-	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
+	if showsFailureCause(data.State) && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 

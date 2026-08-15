@@ -13,6 +13,7 @@ var previewTime = time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC)
 // SetPreviewMode configures the package to use fixed timestamps for deterministic output.
 func SetPreviewMode() {
 	nowFunc = func() time.Time { return previewTime }
+	localZone = time.UTC
 	ui.NowFunc = func() time.Time { return previewTime }
 }
 
@@ -26,6 +27,7 @@ const (
 	PreviewWaitingForCutover PreviewType = "waiting_for_cutover"
 	PreviewCuttingOver       PreviewType = "cutting_over"
 	PreviewCompleted         PreviewType = "completed"
+	PreviewRetrying          PreviewType = "retrying"
 	PreviewFailed            PreviewType = "failed"
 	PreviewStopped           PreviewType = "stopped"
 	PreviewStates            PreviewType = "states"

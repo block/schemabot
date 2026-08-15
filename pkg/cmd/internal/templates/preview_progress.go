@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"vitess.io/vitess/go/vt/key"
 )
 
@@ -866,6 +867,34 @@ func previewFailedOutput() {
 				TableName: "users", Namespace: "testapp",
 				DDL:    "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status: state.Apply.Failed,
+			},
+		},
+	}
+	WriteProgress(data)
+}
+
+// previewRetryingOutput shows an apply between automatic recovery attempts: the
+// drive was interrupted mid-copy, part of the retry budget is spent, and the
+// next attempt is armed for a fixed time. The Retry row is what tells an
+// operator this apply is waiting rather than wedged. The next-attempt time is
+// derived from the real backoff policy so the preview cannot drift from it.
+func previewRetryingOutput() {
+	data := ProgressData{
+		State:        state.Apply.FailedRetryable,
+		Engine:       "Spirit",
+		ApplyID:      "apply-a1b2c3d4e5f6",
+		StartedAt:    previewTime.Add(-4 * time.Minute).Format(time.RFC3339),
+		ErrorMessage: "connection reset by peer",
+		Attempt:      3,
+		RetryAfter:   previewTime.Add(storage.RetryBackoff(4)).Format(time.RFC3339),
+		Tables: []TableProgress{
+			{
+				TableName: "users", Namespace: "testapp",
+				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
+				Status:          state.Task.FailedRetryable,
+				RowsCopied:      156342,
+				RowsTotal:       397453,
+				PercentComplete: 39,
 			},
 		},
 	}

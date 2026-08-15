@@ -4745,6 +4745,31 @@ Single table progress (default):
 </details>
 
 <details>
+<summary><a name="mysql-single-table-retrying"></a><strong>MySQL: Single Table Retrying</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6                 │
+│  State:     Retrying                           │
+│  Retry:     attempt 4/10 · next 14:31:30 UTC   │
+│  Started:   Jan 15 14:26:00 UTC                │
+│  Duration:  4m                                 │
+└────────────────────────────────────────────────┘
+
+  connection reset by peer
+
+
+  ── testapp ──
+
+     ~ users: 🟨🟨🟨🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ Retrying
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+
+```
+</details>
+
+<details>
 <summary><a name="mysql-single-table-failed"></a><strong>MySQL: Single Table Failed</strong></summary>
 
 ```
