@@ -637,7 +637,17 @@ func settleDeploy(t *testing.T, ctx context.Context, number uint64) {
 		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
 			Organization: testOrg, Database: testDB, Number: number,
 		})
-		require.NoError(t, err, "SkipRevertDeployRequest")
+		if err != nil {
+			// The revert window can expire between observing complete_pending_revert
+			// and the skip-revert call, in which case the deploy request is already
+			// complete and equally settled. Any other skip-revert failure is real.
+			read, readErr := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+				Organization: testOrg, Database: testDB, Number: number,
+			})
+			require.NoError(t, readErr, "GetDeployRequest after SkipRevertDeployRequest failed: %v", err)
+			require.Equal(t, drState.Complete, read.DeploymentState,
+				"SkipRevertDeployRequest failed and deploy request %d did not settle on its own: %v", number, err)
+		}
 		waitForDeployState(t, ctx, number, drState.Complete)
 	}
 }
