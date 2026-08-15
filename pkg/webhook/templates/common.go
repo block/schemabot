@@ -228,11 +228,11 @@ func stripControlText(msg string) string {
 	}, msg)
 }
 
-// sanitizeInlineError makes an untrusted error safe for a single-line comment
+// SanitizeInlineError makes an untrusted error safe for a single-line Markdown
 // context — a list item or an inline "— …" suffix: full comment sanitization
 // plus collapsing whitespace runs (including line breaks) so the message
 // cannot escape the enclosing Markdown line.
-func sanitizeInlineError(msg string) string {
+func SanitizeInlineError(msg string) string {
 	return strings.Join(strings.Fields(sanitizeCommentError(msg)), " ")
 }
 
@@ -247,7 +247,7 @@ const maxCellErrorLen = 255
 // before the call site's HTML escaping, so entity expansion can render wider
 // than the clamp; the clamp is a layout mitigation, not a hard boundary.
 func sanitizeCellError(msg string) string {
-	msg = strings.ReplaceAll(sanitizeInlineError(msg), "|", "/")
+	msg = strings.ReplaceAll(SanitizeInlineError(msg), "|", "/")
 	if runes := []rune(msg); len(runes) > maxCellErrorLen {
 		msg = string(runes[:maxCellErrorLen-1]) + "…"
 	}

@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func (h *Handler) shouldPublishChecks(ctx context.Context, repo string, operation string) bool {
@@ -816,6 +818,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 					"blocking_reason", blockingReason)
 			}
 		}
+		summary = sanitizeCheckRunErrorSummary(summary)
 
 		opts := ghclient.CheckRunOptions{
 			Name:       ec.name,
@@ -873,6 +876,10 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		h.logger.Info("posted failing aggregate",
 			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
 	}
+}
+
+func sanitizeCheckRunErrorSummary(summary string) string {
+	return html.EscapeString(templates.SanitizeInlineError(summary))
 }
 
 // clearAggregateBlocksForVerifiedPR releases stored aggregate blocking reasons

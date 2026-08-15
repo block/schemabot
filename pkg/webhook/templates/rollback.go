@@ -134,7 +134,7 @@ func RenderRollbackRejected(data RollbackRejectedData) string {
 // inside the `**Reason**: `...“ code span: full inline sanitization plus
 // neutralizing backticks so the reason cannot close the span.
 func sanitizedRollbackRejectionReason(reason string) string {
-	return strings.ReplaceAll(sanitizeInlineError(reason), "`", "'")
+	return strings.ReplaceAll(SanitizeInlineError(reason), "`", "'")
 }
 
 // RenderRollbackBlockedByLock renders the message posted when a rollback cannot
@@ -214,7 +214,7 @@ func RenderRollbackAlreadyRolledBackLockHeld(database, environment, lockOwner, t
 func RenderRollbackNotAccepted(database, environment, errorMessage string) string {
 	header := fmt.Sprintf("## Rollback Not Accepted\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n", database, environment)
-	if msg := sanitizeInlineError(errorMessage); msg != "" {
+	if msg := SanitizeInlineError(errorMessage); msg != "" {
 		return header + "The rollback was not accepted: " + html.EscapeString(msg)
 	}
 	return header + "The rollback was not accepted."
