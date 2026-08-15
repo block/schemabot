@@ -202,7 +202,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	applyCmd += " --allow-unsafe"
 	fmt.Fprintf(&sb, "```\n%s\n```\n", applyCmd)
 
-	return offerSupportChannel(sb.String())
+	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an
@@ -244,7 +244,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 	}
 	sb.WriteString("\nRewrite these statements as a supported schema change, or contact your SchemaBot operators for help.\n")
 
-	return sb.String()
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
 // RenderApplyStarted renders the initial body of the live progress comment when

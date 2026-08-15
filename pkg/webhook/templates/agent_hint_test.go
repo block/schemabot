@@ -11,6 +11,23 @@ const testAgentHint = "Agents: comment `schemabot help` for the command referenc
 
 const testAgentHintFooter = "<!-- 💡 Agents: comment `schemabot help` for the command reference. -->"
 
+func multiEnvPlanData(plans map[string]*PlanCommentData) MultiEnvPlanCommentData {
+	environments := make([]string, 0, len(plans))
+	for _, environment := range []string{"staging", "production"} {
+		if _, ok := plans[environment]; ok {
+			environments = append(environments, environment)
+		}
+	}
+	return MultiEnvPlanCommentData{
+		Database:     "orders",
+		SchemaName:   "orders",
+		IsMySQL:      true,
+		AgentHint:    testAgentHint,
+		Environments: environments,
+		Plans:        plans,
+	}
+}
+
 func planData() PlanCommentData {
 	return PlanCommentData{
 		Database:    "orders",
@@ -31,30 +48,35 @@ func planData() PlanCommentData {
 func TestPlanCommentsCarryTheAgentHint(t *testing.T) {
 	assert.Contains(t, RenderPlanComment(planData()), testAgentHintFooter, "plan comment")
 	assert.Contains(t, RenderRollbackPlanComment(planData()), testAgentHintFooter, "rollback plan comment")
-	assert.Contains(t, RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "orders",
-		SchemaName:   "orders",
-		IsMySQL:      true,
-		AgentHint:    testAgentHint,
-		Environments: []string{"staging", "production"},
-		Plans: map[string]*PlanCommentData{
-			"staging":    {Environment: "staging"},
-			"production": {Environment: "production"},
-		},
-	}), testAgentHintFooter, "multi-env plan comment")
+	assert.Contains(t, RenderMultiEnvPlanComment(multiEnvPlanData(map[string]*PlanCommentData{
+		"staging":    {Environment: "staging"},
+		"production": {Environment: "production"},
+	})), testAgentHintFooter, "multi-env plan comment")
+}
+
+// The everyday multi-env shape — several environments each with pending
+// changes — renders a different exit path from the no-changes shortcut, and
+// carries the hint down both.
+func TestMultiEnvPlanCommentCarriesTheAgentHintWithChanges(t *testing.T) {
+	staging := planData()
+	production := planData()
+	production.Environment = "production"
+
+	rendered := RenderMultiEnvPlanComment(multiEnvPlanData(map[string]*PlanCommentData{
+		"staging":    &staging,
+		"production": &production,
+	}))
+
+	assert.Contains(t, rendered, "ADD COLUMN `email`", "the plan sections must render")
+	assert.Contains(t, rendered, testAgentHintFooter)
 }
 
 // A multi-env plan for a single environment renders through the plan renderer,
 // so the hint configured on the multi-env data has to reach it.
 func TestMultiEnvPlanCommentCarriesTheAgentHintForOneEnvironment(t *testing.T) {
-	rendered := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "orders",
-		SchemaName:   "orders",
-		IsMySQL:      true,
-		AgentHint:    testAgentHint,
-		Environments: []string{"staging"},
-		Plans:        map[string]*PlanCommentData{"staging": {Environment: "staging"}},
-	})
+	rendered := RenderMultiEnvPlanComment(multiEnvPlanData(map[string]*PlanCommentData{
+		"staging": {Environment: "staging"},
+	}))
 
 	assert.Contains(t, rendered, testAgentHintFooter)
 }
@@ -65,6 +87,28 @@ func TestPlanCommentCarriesTheAgentHintWithNoChanges(t *testing.T) {
 	data.Changes = nil
 
 	assert.Contains(t, RenderPlanComment(data), testAgentHintFooter)
+}
+
+// A rollback plan that finds the database already matching the original schema
+// is still a plan comment an agent acts on, and keeps the hint.
+func TestRollbackPlanCommentCarriesTheAgentHintWithNoChanges(t *testing.T) {
+	data := planData()
+	data.Changes = nil
+
+	assert.Contains(t, RenderRollbackPlanComment(data), testAgentHintFooter)
+}
+
+// An apply the engine refuses — destructive changes needing --allow-unsafe, or
+// statements it cannot run at all — answers a command an agent just issued and
+// coaches the next one, so it carries the hint like any other plan comment.
+func TestBlockedApplyCommentsCarryTheAgentHint(t *testing.T) {
+	unsafe := planData()
+	unsafe.UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "DROP COLUMN"}}
+	assert.Contains(t, RenderUnsafeChangesBlocked(unsafe), testAgentHintFooter, "unsafe changes blocked")
+
+	blocked := planData()
+	blocked.BlockedChanges = []BlockedChangeData{{Table: "users", Reason: "unsupported statement"}}
+	assert.Contains(t, RenderBlockedChangesApplyRejected(blocked), testAgentHintFooter, "apply rejected")
 }
 
 // The locked apply comment is the same plan renderer under a held lock, and it
@@ -90,14 +134,14 @@ func TestPlanCommentsAreUnchangedWithoutAnAgentHint(t *testing.T) {
 
 	assert.NotContains(t, RenderPlanComment(data), "<!-- 💡 ")
 	assert.NotContains(t, RenderRollbackPlanComment(data), "<!-- 💡 ")
-	assert.NotContains(t, RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
-		Database:     "orders",
-		Environments: []string{"staging", "production"},
-		Plans: map[string]*PlanCommentData{
-			"staging":    {Environment: "staging"},
-			"production": {Environment: "production"},
-		},
-	}), "<!-- 💡 ")
+	noHint := multiEnvPlanData(map[string]*PlanCommentData{
+		"staging":    {Environment: "staging"},
+		"production": {Environment: "production"},
+	})
+	noHint.AgentHint = ""
+	assert.NotContains(t, RenderMultiEnvPlanComment(noHint), "<!-- 💡 ")
+	assert.NotContains(t, RenderUnsafeChangesBlocked(data), "<!-- 💡 ")
+	assert.NotContains(t, RenderBlockedChangesApplyRejected(data), "<!-- 💡 ")
 }
 
 // The hint is delivered inside an HTML comment, which GitHub never renders, so

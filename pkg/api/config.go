@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -1666,18 +1667,25 @@ func validateSupportChannel(c SupportChannelConfig) error {
 // the hint on the PR page.
 const maxAgentHintChars = 300
 
+// htmlCommentTerminators end an HTML comment. A hint containing one would
+// close the comment early and render its tail on the PR page: the HTML parsing
+// spec ends a comment on the bang form as well as the plain one.
+var htmlCommentTerminators = []string{"-->", "--!>"}
+
 func validateAgentHint(hint string) error {
 	if hint == "" {
 		return nil
 	}
-	if len(hint) > maxAgentHintChars {
-		return fmt.Errorf("agent_hint must be at most %d characters (got %d)", maxAgentHintChars, len(hint))
+	if count := utf8.RuneCountInString(hint); count > maxAgentHintChars {
+		return fmt.Errorf("agent_hint must be at most %d characters (got %d)", maxAgentHintChars, count)
 	}
 	if strings.ContainsAny(hint, "\r\n") {
 		return fmt.Errorf("agent_hint must be a single line")
 	}
-	if strings.Contains(hint, "-->") {
-		return fmt.Errorf("agent_hint must not contain \"-->\": it would terminate the HTML comment the hint is delivered in")
+	for _, terminator := range htmlCommentTerminators {
+		if strings.Contains(hint, terminator) {
+			return fmt.Errorf("agent_hint must not contain %q: it would terminate the HTML comment the hint is delivered in", terminator)
+		}
 	}
 	if strings.TrimSpace(hint) != hint {
 		return fmt.Errorf("agent_hint contains leading or trailing whitespace")

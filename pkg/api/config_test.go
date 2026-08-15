@@ -3798,6 +3798,15 @@ func TestAgentHintConfig(t *testing.T) {
 		assert.ErrorContains(t, err, "agent_hint must be at most")
 	})
 
+	t.Run("hint bound counts characters, not bytes", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = strings.Repeat("é", maxAgentHintChars)
+		require.NoError(t, cfg.Validate(), "a hint at the limit is accepted whatever its bytes cost")
+
+		cfg.AgentHint = strings.Repeat("é", maxAgentHintChars+1)
+		assert.ErrorContains(t, cfg.Validate(), "agent_hint must be at most")
+	})
+
 	t.Run("hint must be a single line", func(t *testing.T) {
 		cfg := validConfig()
 		cfg.AgentHint = "line one\nline two"
@@ -3806,10 +3815,16 @@ func TestAgentHintConfig(t *testing.T) {
 	})
 
 	t.Run("hint must not terminate its HTML comment", func(t *testing.T) {
-		cfg := validConfig()
-		cfg.AgentHint = "install the skill --> then re-read this PR"
-		err := cfg.Validate()
-		assert.ErrorContains(t, err, "agent_hint must not contain")
+		// Both forms end a comment in a spec-compliant parser, so a hint
+		// carrying either would render its tail on the PR page.
+		for _, hint := range []string{
+			"install the skill --> then re-read this PR",
+			"install the skill --!> then re-read this PR",
+		} {
+			cfg := validConfig()
+			cfg.AgentHint = hint
+			assert.ErrorContains(t, cfg.Validate(), "agent_hint must not contain", "hint %q", hint)
+		}
 	})
 
 	t.Run("hint must not have surrounding whitespace", func(t *testing.T) {
