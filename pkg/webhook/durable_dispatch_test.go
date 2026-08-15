@@ -284,6 +284,14 @@ func (s *scriptedWebhookEventStore) FindNext(_ context.Context, owner string, _ 
 	claimed.LeaseOwner = owner
 	claimed.LeaseToken = fmt.Sprintf("token-%d", claimed.ID)
 	claimed.Attempts = event.Attempts + 1
+	// Mirror the real claim contract: the claim consumes retry_after and the
+	// returned event carries ClaimableSince, the later of receipt and the
+	// consumed not-before time.
+	claimed.ClaimableSince = claimed.ReceivedAt
+	if claimed.RetryAfter != nil && claimed.RetryAfter.After(claimed.ClaimableSince) {
+		claimed.ClaimableSince = *claimed.RetryAfter
+	}
+	claimed.RetryAfter = nil
 	return &claimed, nil
 }
 
