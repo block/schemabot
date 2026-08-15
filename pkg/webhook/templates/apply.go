@@ -715,7 +715,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Catching up on accumulated changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
 		writeDDLLine(sb, table.DDL)
 		if table.RowsCopied > 0 {
-			fmt.Fprintf(sb, "Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
+			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
 		}
 
 	case state.Task.Checksumming:
@@ -726,7 +726,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
 			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)\n", table.TableName, ui.ProgressBarRowCopy(pct), pct)
 			writeDDLLine(sb, table.DDL)
-			fmt.Fprintf(sb, "Rows verified: %s / %s\n",
+			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
 		} else {
 			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
@@ -741,7 +741,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Data verified, applying final changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
 		writeDDLLine(sb, table.DDL)
 		if table.RowsCopied > 0 {
-			fmt.Fprintf(sb, "Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
+			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
 		}
 
 	case state.Task.WaitingForCutover:
@@ -1021,7 +1021,7 @@ func renderStoppedTable(sb *strings.Builder, table TableProgressData) {
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
-		fmt.Fprintf(sb, "Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal))
 	}
@@ -1041,12 +1041,12 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 	}
 	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
 	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "Rows: %s / %s \u00b7 ETA: %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s \u00b7 ETA: %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal),
 			ui.FormatETA(table.ETASeconds))
 	} else {
-		fmt.Fprintf(sb, "Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal))
 	}
