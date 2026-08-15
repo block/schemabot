@@ -933,7 +933,10 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 
 func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string, error) {
 	if c.psClientFunc == nil {
-		return nil, "", "", fmt.Errorf("PlanetScale client is not configured for database %s: %w", c.config.Database, ErrPullSchemaUnsupportedType)
+		// A vitess database supports pull; a missing PlanetScale client is a
+		// configuration defect, surfaced as an internal error rather than the
+		// unsupported-type sentinel so it cannot read as "pull not supported".
+		return nil, "", "", fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
 	}
 	org := c.config.Metadata["organization"]
 	if org == "" {

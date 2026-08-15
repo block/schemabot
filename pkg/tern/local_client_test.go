@@ -3737,14 +3737,35 @@ func TestLocalClient_PullSchemaTypeMismatchBeforeDelegation(t *testing.T) {
 	require.ErrorIs(t, err, ErrPullSchemaInvalidRequest)
 }
 
+// An engine that implements the capability but fails its pull surfaces the
+// failure as an ordinary error with database context — never as the
+// unsupported-type sentinel, which would misreport an engine defect as a
+// missing capability.
+func TestLocalClient_PullSchemaEngineErrorIsNotUnsupported(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeSchemaPullEngine{
+		pullErr: errors.New("topo server unreachable"),
+	})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.ErrorContains(t, err, "topo server unreachable")
+	assert.ErrorContains(t, err, "orders")
+}
+
 // An engine that returns neither a response nor an error is a broken
 // capability; the client fails closed instead of handing callers a nil pull.
+// The failure is an internal error, never the unsupported-type sentinel: the
+// engine does implement the capability, so a broken contract must stay loud
+// rather than read as an expected 501.
 func TestLocalClient_PullSchemaEngineNilResponseFailsClosed(t *testing.T) {
 	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeSchemaPullEngine{})
 
 	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
 
 	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
 	assert.Contains(t, err.Error(), "nil response")
 }
 

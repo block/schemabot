@@ -1561,13 +1561,25 @@ func TestExecutePullSchemaConvertsDataPlaneUnsupported(t *testing.T) {
 			unsupported: true,
 		},
 		{
-			name:        "remote unimplemented",
-			client:      &mockTernClient{isRemote: true, pullSchemaErr: status.Error(codes.Unimplemented, "pull schema unsupported database type")},
+			// The gRPC client re-derives the sentinel from the remote data
+			// plane's own unsupported verdict, so the remote route surfaces
+			// here as a wrapped sentinel just like the local one.
+			name:        "remote sentinel re-derived by the gRPC client",
+			client:      &mockTernClient{isRemote: true, pullSchemaErr: fmt.Errorf("remote data plane does not support pull schema for database orders: %w", tern.ErrPullSchemaUnsupportedType)},
 			unsupported: true,
 		},
 		{
+			// A bare Unimplemented carries no data-plane verdict about the
+			// database type — it can come from a proxy mapping an HTTP 404 or
+			// a data plane too old to serve the RPC — so it must fail as an
+			// ordinary error, never as a 501 capability answer.
+			name:        "remote unimplemented without sentinel is not converted",
+			client:      &mockTernClient{isRemote: true, pullSchemaErr: status.Error(codes.Unimplemented, "unexpected HTTP status code received from server: 404")},
+			unsupported: false,
+		},
+		{
 			name:        "local unimplemented code without sentinel is not converted",
-			client:      &mockTernClient{pullSchemaErr: status.Error(codes.Unimplemented, "pull schema unsupported database type")},
+			client:      &mockTernClient{pullSchemaErr: status.Error(codes.Unimplemented, "method PullSchema not implemented")},
 			unsupported: false,
 		},
 		{

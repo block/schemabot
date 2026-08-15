@@ -63,19 +63,6 @@ func (e *unsupportedPullSchemaError) Error() string {
 	return fmt.Sprintf("pull schema is not supported for %s databases on this deployment", e.DatabaseType)
 }
 
-// pullSchemaUnsupportedByDataPlane reports whether a pull failure means the
-// resolved data plane does not support pull for this database type: the local
-// client's typed sentinel, or its gRPC mapping (codes.Unimplemented) from a
-// remote data plane. Whether pull is supported is the data plane's answer —
-// it depends on which engine backs the deployment — so the control plane
-// derives the 501 from the pull attempt instead of gating on database type.
-func pullSchemaUnsupportedByDataPlane(pullErr error, isRemoteTarget bool) bool {
-	if errors.Is(pullErr, tern.ErrPullSchemaUnsupportedType) {
-		return true
-	}
-	return isRemoteTarget && grpcstatus.Code(pullErr) == grpccodes.Unimplemented
-}
-
 // RemoteDeploymentUnavailableError carries routing metadata for remote
 // schema change service availability failures so callers can render actionable
 // operator-facing errors without parsing strings.
@@ -251,7 +238,15 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 					Err:        pullErr,
 				}
 			}
-			if pullSchemaUnsupportedByDataPlane(pullErr, isRemoteTarget) {
+			// Whether pull is supported is the data plane's answer — it
+			// depends on which engine backs the deployment — so the 501 is
+			// derived from the pull attempt instead of gating on database
+			// type. One sentinel check covers both routes: the local client
+			// returns ErrPullSchemaUnsupportedType directly, and the gRPC
+			// client re-derives the same sentinel from the remote data
+			// plane's own unsupported verdict (infrastructure Unimplemented
+			// errors deliberately fall through as ordinary failures).
+			if errors.Is(pullErr, tern.ErrPullSchemaUnsupportedType) {
 				return nil, &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
 			}
 			return nil, pullErr

@@ -218,6 +218,51 @@ func newRetryTestClient(t *testing.T, server ternv1.TernServer) *GRPCClient {
 	return client
 }
 
+// staticPullErrTernServer answers PullSchema with a fixed error, standing in
+// for a remote data plane whose pull verdict the client must classify.
+type staticPullErrTernServer struct {
+	ternv1.UnimplementedTernServer
+	pullErr error
+}
+
+func (s *staticPullErrTernServer) PullSchema(context.Context, *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	return nil, s.pullErr
+}
+
+// A remote data plane that answers pull with its own unsupported-type verdict
+// (the tern server maps ErrPullSchemaUnsupportedType to codes.Unimplemented
+// with the sentinel text in the status message) is re-derived client-side as
+// the same sentinel, so callers classify local and remote pulls identically.
+func TestGRPCClientPullSchemaRederivesRemoteUnsupportedVerdict(t *testing.T) {
+	server := &staticPullErrTernServer{
+		pullErr: status.Error(codes.Unimplemented, "pull schema for database orders type strata: engine does not support schema pull: "+ErrPullSchemaUnsupportedType.Error()),
+	}
+	client := newRetryTestClient(t, server)
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.ErrorContains(t, err, "orders")
+}
+
+// An Unimplemented without the data plane's unsupported-type verdict — a
+// proxy mapping an HTTP 404, or a data plane too old to serve the RPC — says
+// nothing about the database type and must surface as an ordinary failure,
+// never as the unsupported-type sentinel.
+func TestGRPCClientPullSchemaKeepsInfrastructureUnimplemented(t *testing.T) {
+	server := &staticPullErrTernServer{
+		pullErr: status.Error(codes.Unimplemented, "unexpected HTTP status code received from server: 404 (Not Found)"),
+	}
+	client := newRetryTestClient(t, server)
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Equal(t, codes.Unimplemented, status.Code(err))
+}
+
 // A transient UNAVAILABLE on the network path in front of a remote deployment
 // must not fail a plan request: the client retries idempotent RPCs and
 // returns the successful response.
