@@ -864,8 +864,10 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		// everywhere else). Stamp it on the tables participating in that paced
 		// work — a table still copying, or every table during the verify — so a
 		// completed table is never rendered as paused by another table's copy.
-		if tableInPacedPhase(st.IsComplete, spiritState) {
-			tp.Throttled = prog.Throttle.Throttled
+		// The reason is stamped only with the flag, keeping the contract that
+		// an unthrottled table carries no reason.
+		if tableInPacedPhase(st.IsComplete, spiritState) && prog.Throttle.Throttled {
+			tp.Throttled = true
 			tp.ThrottleReason = sanitizeThrottleReason(prog.Throttle.Reason)
 		}
 		tableProgress = append(tableProgress, tp)

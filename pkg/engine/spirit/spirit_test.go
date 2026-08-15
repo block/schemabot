@@ -270,6 +270,19 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Empty(t, completed.ThrottleReason)
 	})
 
+	// The reason travels only with the flag: an unthrottled table carries no
+	// reason, even if the runner reports leftover reason text.
+	t.Run("a reason without the throttled flag is not stamped", func(t *testing.T) {
+		prog := status.Progress{
+			Throttle: status.ThrottleStatus{Throttled: false, Reason: "replica-lag 2s > 10s"},
+			Tables:   []status.TableProgress{{TableName: "users", RowsCopied: 45000, RowsTotal: 100000}},
+		}
+		got := buildSpiritTableProgress(prog, status.CopyRows, ddlByTable, tableNamespace)
+		require.Len(t, got, 1)
+		assert.False(t, got[0].Throttled)
+		assert.Empty(t, got[0].ThrottleReason)
+	})
+
 	// The checksum verify runs only after every copy completes, so a throttled
 	// verify is stamped on the completed tables — otherwise it would never
 	// surface at all.
