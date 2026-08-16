@@ -50,6 +50,35 @@ func newDurableIssueCommentEnqueueHandler(t *testing.T, events storage.WebhookEv
 	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch())
 }
 
+func TestIssueCommentGateBlockParity(t *testing.T) {
+	parser := NewCommandParser()
+	h := &Handler{}
+	tests := []struct {
+		name    string
+		comment string
+		want    issueCommentGateBlockReason
+	}{
+		{name: "apply passes", comment: "schemabot apply -e production", want: issueCommentGatePass},
+		{name: "apply-confirm passes", comment: "schemabot apply-confirm -e production", want: issueCommentGatePass},
+		{name: "unlock passes without environment", comment: "schemabot unlock", want: issueCommentGatePass},
+		{name: "invalid tenant", comment: "schemabot apply -e production -t", want: issueCommentGateInvalidTenant},
+		{name: "invalid environment", comment: "schemabot apply -e production--yes", want: issueCommentGateInvalidEnvironment},
+		{name: "missing environment", comment: "schemabot apply", want: issueCommentGateMissingEnvironment},
+		{name: "rollback missing apply ID", comment: "schemabot rollback -e production", want: issueCommentGateMissingApplyID},
+		{name: "unsupported auto-confirm", comment: "schemabot apply-confirm -e production -y", want: issueCommentGateAutoConfirm},
+		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover", want: issueCommentGateDeferCutover},
+		{name: "unsupported database", comment: "schemabot stop -e production -d accounts", want: issueCommentGateDatabase},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parser.ParseCommand(tt.comment)
+			reason := h.issueCommentGateBlock("octocat/hello-world", result, parser, tt.comment)
+
+			require.Equal(t, tt.want, reason)
+		})
+	}
+}
+
 // durableIssueCommentEvent returns a claimable issue_comment inbox row for a
 // command comment, mirroring what the HTTP path enqueues. ReceivedAt is set
 // the way the store populates it on insert, so drivers that bound their work
