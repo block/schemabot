@@ -139,6 +139,78 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[0].State)
 	})
 
+	t.Run("queued shard ready to complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Queued, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[0].State)
+	})
+
+	t.Run("queued and running shards all ready to complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Queued, ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: state.Vitess.Running, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
+	})
+
+	t.Run("not-ready queued shard keeps table queued", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Queued, ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: state.Vitess.Queued},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Queued, tables[0].State)
+	})
+
+	t.Run("requested and ready shards ready to complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Requested, ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: state.Vitess.Ready, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 2)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[1].State)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
+	})
+
+	t.Run("terminal shard ignores stale ready flag", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Failed, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, state.Vitess.Failed, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
+	})
+
+	t.Run("cancelled shard ignores stale ready flag", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Cancelled, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, state.Vitess.Cancelled, tables[0].Shards[0].State)
+		// Worst-state table aggregation folds cancelled into failed.
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
+	})
+
 	t.Run("multiple tables", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "0", Table: "orders", Status: "complete", RowsCopied: 100, TableRows: 100},

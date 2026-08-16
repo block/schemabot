@@ -196,6 +196,7 @@ stateDiagram-v2
     queued --> ready
     ready --> running
     ready --> cancelled
+    queued --> ready_to_complete
     running --> complete
     running --> ready_to_complete
     running --> failed
@@ -209,7 +210,7 @@ stateDiagram-v2
 Each shard executes the same DDL independently via vreplication (or instant DDL). Key behavior:
 
 - **All shards copy independently.** Each shard has its own `rows_copied`, `table_rows`, `progress` (0-100), and `eta_seconds`. Shards progress at different rates.
-- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. SchemaBot normalizes `running + ready_to_complete` to `waiting_for_cutover`.
+- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. Immediate operations (CREATE/DROP TABLE) set the flag while still `queued`, since there is nothing to copy. SchemaBot normalizes any non-terminal status with `ready_to_complete=1` to `waiting_for_cutover`; terminal statuses (`complete`/`failed`/`cancelled`) always win over a stale flag.
 - **Cutover is per-shard.** Each shard attempts cutover independently with its own `cutover_attempts` counter. PlanetScale's deploy request layer coordinates when to trigger cutover across all shards, but the actual table swap happens per-shard.
 - **`postpone_completion` defers cutover.** PlanetScale uses `postpone_completion=1` so shards stay in `running` (with `ready_to_complete=1`) until an explicit `CompleteMigration` operation is performed. SchemaBot creates deploy requests with the deploy-request layer's auto-cutover disabled, so the drive — the sole cutover actor — triggers completion once all shards are ready. With `--defer-cutover`, the drive holds here until the user runs `schemabot cutover`.
 - **Cutover retries with backoff.** When cutover fails (e.g., MDL lock timeout), `cutover_attempts` increments and vreplication restarts. Vitess uses exponential backoff between attempts. `force_cutover` bypasses backoff and kills competing locks.
@@ -223,12 +224,13 @@ Each shard executes the same DDL independently via vreplication (or instant DDL)
 
 | Vitess migration state | `ready_to_complete` | SchemaBot normalized state |
 |---|---|---|
-| `queued` / `ready` | - | `pending` |
+| `requested` / `queued` / `ready` | `0` | `pending` |
+| `requested` / `queued` / `ready` | `1` | `waiting_for_cutover` (immediate operations) |
 | `running` | `0` | `running` (copying rows) |
 | `running` | `1` | `waiting_for_cutover` |
 | `complete` | - | `completed` |
-| `failed` | - | `failed` |
-| `cancelled` | - | `cancelled` |
+| `failed` | - | `failed` (a stale `ready_to_complete=1` is ignored) |
+| `cancelled` | - | `cancelled` (a stale `ready_to_complete=1` is ignored) |
 
 ### PlanetScale deploy request states
 
