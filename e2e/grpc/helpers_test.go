@@ -78,8 +78,11 @@ func grpcPost(t *testing.T, path string, body any) *http.Response {
 		require.NoError(t, err, "marshal request body")
 		bodyReader = bytes.NewReader(data)
 	}
+	// The caller reads resp.Body after this helper returns, and the transport
+	// surfaces a cancelled request context as a body read error once the body
+	// outgrows its buffer — so the context must outlive the helper.
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bodyReader)
 	require.NoError(t, err, "create request")
 	req.Header.Set("Content-Type", "application/json")
@@ -92,8 +95,11 @@ func grpcPost(t *testing.T, path string, body any) *http.Response {
 func grpcGet(t *testing.T, path string) *http.Response {
 	t.Helper()
 	baseURL := grpcSchemabotURL(t)
+	// The caller reads resp.Body after this helper returns, and the transport
+	// surfaces a cancelled request context as a body read error once the body
+	// outgrows its buffer — so the context must outlive the helper.
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	require.NoError(t, err, "create request")
 	resp, err := http.DefaultClient.Do(req)
