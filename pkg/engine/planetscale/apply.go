@@ -80,17 +80,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return e.resumeApply(ctx, client, org, req)
 	}
 
-	// emitEvent logs a lifecycle event and sends it to the caller for apply_logs recording.
-	emitEvent := func(event engine.ApplyEvent) {
-		attrs := []any{"database", req.Database}
-		for k, v := range event.Metadata {
-			attrs = append(attrs, k, v)
-		}
-		e.logger.Info(event.Message, attrs...)
-		if req.OnEvent != nil {
-			req.OnEvent(event)
-		}
-	}
+	emitEvent := e.eventEmitter(req)
 
 	// Track in-flight apply metadata for progress queries during setup.
 	migCtx := ""
@@ -344,10 +334,6 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"deploy_state", dr.DeploymentState,
 	)
 
-	// State the trade the decline bought, since the operator sees only that an
-	// eligible change took the slow path. Unsafety outranks the deferred
-	// cutover as the stated reason: it declines instant DDL even when nothing
-	// was deferred.
 	if instantEligible && !useInstant {
 		if unsafe {
 			e.logger.Info("declining instant DDL because the change is unsafe — the row copy keeps a revert window",
@@ -355,18 +341,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 				"deploy_request", dr.Number,
 				"reason", unsafeReason,
 			)
-			emitEvent(engine.ApplyEvent{
-				Message: fmt.Sprintf("Deploying with a row copy rather than instant DDL: %s. The row copy keeps a revert window open to undo the change.", unsafeReason),
-			})
 		} else {
 			e.logger.Info("declining instant DDL so the deferred cutover has a gate to hold",
 				"database", req.Database,
 				"deploy_request", dr.Number,
 			)
-			emitEvent(engine.ApplyEvent{
-				Message: "Deploying with a row copy rather than instant DDL: instant DDL swaps the schema as soon as the deploy runs, and this cutover was deferred.",
-			})
 		}
+		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
 	}
 
 	drElapsed := time.Since(drStart).Round(time.Second)
@@ -695,6 +676,37 @@ func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClie
 	return changes, nil
 }
 
+// eventEmitter returns a closure that logs a lifecycle event and sends it to
+// the caller for apply_logs recording.
+func (e *Engine) eventEmitter(req *engine.ApplyRequest) func(engine.ApplyEvent) {
+	return func(event engine.ApplyEvent) {
+		attrs := []any{"database", req.Database}
+		for k, v := range event.Metadata {
+			attrs = append(attrs, k, v)
+		}
+		e.logger.Info(event.Message, attrs...)
+		if req.OnEvent != nil {
+			req.OnEvent(event)
+		}
+	}
+}
+
+// rowCopyDeclineEvent is the operator-facing event for an instant-eligible
+// change that takes the row-copy path instead. It states the trade the decline
+// bought, since the operator otherwise sees only that an eligible change took
+// the slow path. Unsafety outranks the deferred cutover as the stated reason:
+// it declines instant DDL even when nothing was deferred.
+func rowCopyDeclineEvent(unsafe bool, unsafeReason string) engine.ApplyEvent {
+	if unsafe {
+		return engine.ApplyEvent{
+			Message: fmt.Sprintf("Deploying with a row copy rather than instant DDL: %s. The row copy keeps a revert window open to undo the change.", unsafeReason),
+		}
+	}
+	return engine.ApplyEvent{
+		Message: "Deploying with a row copy rather than instant DDL: instant DDL swaps the schema as soon as the deploy runs, and this cutover was deferred.",
+	}
+}
+
 // resumeApply resumes a schema change after restart.
 // Handles two crash scenarios:
 //   - Branch exists, no deploy request: diff branch against desired schema, apply remaining DDL, then create and deploy the deploy request
@@ -705,16 +717,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
 
-	emitEvent := func(event engine.ApplyEvent) {
-		attrs := []any{"database", req.Database}
-		for k, v := range event.Metadata {
-			attrs = append(attrs, k, v)
-		}
-		e.logger.Info(event.Message, attrs...)
-		if req.OnEvent != nil {
-			req.OnEvent(event)
-		}
-	}
+	emitEvent := e.eventEmitter(req)
 
 	e.logger.Info("resuming apply",
 		"branch", meta.BranchName,
@@ -805,14 +808,22 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// hold, and the revert window to undo the change).
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
 	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
-	if instantEligible && unsafe {
-		e.logger.Info("declining instant DDL on resume because the change is unsafe — the row copy keeps a revert window",
-			"database", req.Database,
-			"deploy_request", dr.Number,
-			"reason", unsafeReason,
-		)
-	}
 	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on resume because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+				"reason", unsafeReason,
+			)
+		} else {
+			e.logger.Info("declining instant DDL on resume so the deferred cutover has a gate to hold",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+			)
+		}
+		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
 
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
@@ -966,6 +977,15 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			} else {
 				e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
 					"database", req.Database, "deploy_request", dr.Number)
+			}
+			e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
+			// Re-encode so stored state carries the narrowed decision: metadata
+			// persisted with the stale IsInstant would let a later consumer of the
+			// stored value (a deferred Start, a subsequent resume) widen back to
+			// instant after this drive declined it.
+			meta.IsInstant = useInstant
+			if updatedMeta, err = encodePSMetadata(meta); err != nil {
+				return nil, fmt.Errorf("encode narrowed metadata for deploy request #%d: %w", dr.Number, err)
 			}
 		}
 

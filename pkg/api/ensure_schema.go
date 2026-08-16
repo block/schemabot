@@ -349,7 +349,14 @@ type refusedStorageChange struct {
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
 // statements safe to execute and the unsafe statements to refuse, using
-// Spirit's unsafe vocabulary (ddl.UnsafeStatement). The Spirit diff emits an
+// Spirit's unsafe vocabulary (ddl.UnsafeStatement). The vocabulary is
+// Spirit's, not a local list: every statement its UnsafeLinter flags as
+// destroying data — dropping a table, column, partition, or primary key,
+// truncating or coalescing partitions, discarding a tablespace — is refused,
+// while structural statements that lose nothing (DROP INDEX, renames) are
+// allowed. A statement Spirit's parser cannot classify fails startup rather
+// than executing unclassified — classification uncertainty must never widen
+// what the bootstrap will execute. The Spirit diff emits an
 // unsafe statement when the live storage database holds a table or column the
 // starting binary's embedded schema does not declare — during a rolling
 // deploy or rollback that surplus state usually belongs to a newer binary,

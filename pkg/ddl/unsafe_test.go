@@ -20,7 +20,7 @@ func TestUnsafeStatement(t *testing.T) {
 		{name: "DROP TABLE", stmt: "DROP TABLE `users`", contains: []string{"DROP TABLE"}},
 		{name: "ALTER TABLE DROP COLUMN names the column", stmt: "ALTER TABLE `users` DROP COLUMN `email`", contains: []string{"DROP COLUMN", "email"}},
 		{name: "DROP COLUMN mixed with additive clauses", stmt: "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20), DROP COLUMN `fax`", contains: []string{"DROP COLUMN", "fax"}},
-		{name: "DROP PARTITION", stmt: "ALTER TABLE `events` DROP PARTITION p2020", contains: []string{"Unsafe"}},
+		{name: "DROP PARTITION", stmt: "ALTER TABLE `events` DROP PARTITION p2020", contains: []string{"DROP PARTITION"}},
 	}
 	for _, tt := range unsafeCases {
 		t.Run(tt.name, func(t *testing.T) {
