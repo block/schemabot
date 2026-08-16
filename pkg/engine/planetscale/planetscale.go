@@ -145,9 +145,13 @@
 //
 // # Instant DDL
 //
-// PlanetScale auto-detects instant DDL eligibility. When eligible and neither
-// enableRevert nor deferCutover is set, instant DDL is used automatically.
-// Instant DDL completes immediately without a row copy phase.
+// PlanetScale auto-detects instant DDL eligibility. When eligible, instant DDL
+// is used automatically — unless the cutover was deferred (instant DDL swaps
+// the schema the moment the deploy runs, so there is no gate to hold) or the
+// change is unsafe in Spirit's vocabulary (DROP TABLE, DROP COLUMN, and other
+// data-destroying operations — instant DDL has no revert window, so an unsafe
+// change must take the row-copy path to stay revertible). Instant DDL
+// completes immediately without a row copy phase.
 //
 // # VSchema
 //

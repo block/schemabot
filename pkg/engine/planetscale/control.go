@@ -176,6 +176,11 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		"deploy_request", meta.DeployRequestID,
 		"instant_ddl", meta.IsInstant,
 	)
+	// The stored IsInstant is trusted as-is: a ControlRequest carries no schema
+	// changes to re-classify against, and every writer of this metadata (fresh
+	// apply, resume, recovered deploy request) records the already-gated decision
+	// — an unsafe or cutover-deferred change is stored with IsInstant=false, so
+	// starting from stored state cannot widen the decision.
 	dr, deployErr := e.deployDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID, meta.IsInstant)
 	if deployErr != nil {
 		return nil, deployErr
