@@ -614,6 +614,25 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 // apply's target reservation and idempotency key are untouched — the attach
 // adds work to the reservation the apply already holds.
 func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storage.Apply, operation *storage.ApplyOperation, tasks []*storage.Task) error {
+	if apply == nil {
+		return fmt.Errorf("attach operation: apply is nil")
+	}
+	if operation == nil {
+		return fmt.Errorf("attach operation to apply %s: operation is nil", apply.ApplyIdentifier)
+	}
+	// A group_finalizer carries no tasks — it applies namespace-level work
+	// reconstructed from the plan at drive time. Every work operation must
+	// have at least one task so operation-scoped drives fail closed on bad
+	// scoping.
+	if len(tasks) == 0 && operation.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+		return fmt.Errorf("attach operation %s to apply %s: work operation has no tasks", operation.OperationKey, apply.ApplyIdentifier)
+	}
+	for _, task := range tasks {
+		if task == nil {
+			return fmt.Errorf("attach operation %s to apply %s: operation has a nil task", operation.OperationKey, apply.ApplyIdentifier)
+		}
+	}
+
 	const opName = "attach operation to apply"
 	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
 	if err != nil {

@@ -2163,16 +2163,11 @@ func (c *LocalClient) findApplyOperationByKey(ctx context.Context, apply *storag
 	if store == nil {
 		return nil, fmt.Errorf("apply operation store is not configured")
 	}
-	ops, err := store.ListByApply(ctx, apply.ID)
+	op, err := store.GetByApplyDeploymentAndOperationKey(ctx, apply.ID, c.config.Database, operationKey)
 	if err != nil {
-		return nil, fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, fmt.Errorf("get apply_operation (deployment=%s, operation_key=%s) for apply %s: %w", c.config.Database, operationKey, apply.ApplyIdentifier, err)
 	}
-	for _, op := range ops {
-		if op.Deployment == c.config.Database && op.OperationKey == operationKey {
-			return op, nil
-		}
-	}
-	return nil, nil
+	return op, nil
 }
 
 // dispatchIntoExistingApply resolves a dispatch whose idempotency key already

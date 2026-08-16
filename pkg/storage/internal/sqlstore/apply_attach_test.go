@@ -192,3 +192,24 @@ func TestApplyStore_AttachOperationWithTasksMissingApply(t *testing.T) {
 	err := store.Applies().AttachOperationWithTasks(ctx, missing, operation, tasks)
 	require.ErrorIs(t, err, storage.ErrApplyNotFound)
 }
+
+// A work operation must carry at least one task so an operation-scoped drive
+// fails closed on bad scoping; only a group_finalizer may attach task-less.
+func TestApplyStore_AttachOperationWithTasksRequiresTasksForWork(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	apply := createAttachFixtureApply(t, store)
+
+	operation, _ := attachSiblingOperation("payments/80-/users", "80-")
+	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, nil)
+	require.ErrorContains(t, err, "work operation has no tasks")
+
+	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, listErr)
+	assert.Len(t, ops, 1, "the rejected attach must not insert its operation")
+
+	finalizer, _ := attachSiblingOperation("payments/finalizer", "80-")
+	finalizer.OperationKind = storage.ApplyOperationKindGroupFinalizer
+	require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, apply, finalizer, nil))
+}
