@@ -32,31 +32,34 @@ func isTinyintBool(col statement.Column) bool {
 	return col.Type == "tinyint" && col.Length != nil && *col.Length == 1
 }
 
-// isStringColumn reports whether the mysql column holds string values, so a
-// quoted default is a genuine string literal rather than MySQL's canonical
-// quoting of a typed value (SHOW CREATE TABLE quotes numeric defaults too,
-// e.g. bigint DEFAULT '0').
-func isStringColumn(col statement.Column) bool {
+// isNumericColumn reports whether the mysql column holds numeric values,
+// whose quoted defaults are only MySQL's canonical spelling of a typed value
+// (SHOW CREATE TABLE quotes numeric defaults too, e.g. bigint DEFAULT '0').
+// The numeric set is closed and small, so it is the one enumerated: a quoted
+// default on any unlisted type is treated as a genuine string literal and
+// preserved verbatim, which fails safe when a new column type appears.
+func isNumericColumn(col statement.Column) bool {
 	switch col.Type {
-	case "varchar", "text":
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint",
+		"decimal", "numeric", "float", "double", "bit":
 		return true
 	}
 	return false
 }
 
 // normalizedMySQLDefault canonicalizes the default of a TiDB-parsed mysql
-// column. A quoted literal on a string-typed column is compared verbatim:
+// column. A quoted literal on a non-numeric column is compared verbatim:
 // trimming or keyword-folding it would conflate genuinely different defaults
 // such as 'NULL' vs a dropped default, or a blank ' ' vs an empty string. On
-// non-string columns the quotes are only MySQL's canonical spelling of a
-// typed value, so the value is trimmed and folded normally.
+// numeric columns the quotes are only MySQL's canonical spelling of a typed
+// value, so the value is trimmed and folded normally.
 func normalizedMySQLDefault(col statement.Column) columnDefault {
 	if col.Default == nil {
 		return columnDefault{}
 	}
 
 	value := *col.Default
-	if !col.DefaultIsString || !isStringColumn(col) {
+	if !col.DefaultIsString || isNumericColumn(col) {
 		value = strings.TrimSpace(value)
 		if strings.EqualFold(value, "NULL") {
 			return columnDefault{}
@@ -96,15 +99,21 @@ func normalizedPostgresDefault(col statement.Column, value sql.NullString) colum
 	return columnDefault{value: normalizeDefaultValue(col, normalized), present: true}
 }
 
+// currentTimestampKeyword matches every dialect spelling of the
+// current-timestamp default — CURRENT_TIMESTAMP, CURRENT_TIMESTAMP(n),
+// now() — with an optional fractional-second precision. The precision is
+// folded away because precision parity is already asserted through the
+// column type itself.
+var currentTimestampKeyword = regexp.MustCompile(`(?i)^(?:current_timestamp|now)(?:\(\d*\))?$`)
+
 // normalizeDefaultValue folds dialect-specific spellings of the same default
 // into one canonical form. Folding is gated on the column type so
 // string-typed defaults that merely look like keywords (e.g. a varchar
 // DEFAULT 'now()' or 'TRUE') compare verbatim.
 func normalizeDefaultValue(col statement.Column, value string) string {
 	switch {
-	case col.Type == "datetime":
-		switch strings.ToLower(value) {
-		case "current_timestamp", "current_timestamp()", "now()":
+	case strings.HasPrefix(col.Type, "datetime"), strings.HasPrefix(col.Type, "timestamp"):
+		if currentTimestampKeyword.MatchString(value) {
 			return "current_timestamp"
 		}
 	case isTinyintBool(col):
@@ -141,8 +150,18 @@ func TestNormalizedMySQLDefault(t *testing.T) {
 			want: columnDefault{value: "NULL", present: true},
 		},
 		{
+			name: "char literal 'NULL' stays a present value",
+			col:  statement.Column{Type: "char", Length: intPtr(2), Default: strPtr("NULL"), DefaultIsString: true},
+			want: columnDefault{value: "NULL", present: true},
+		},
+		{
 			name: "string literal whitespace is preserved",
 			col:  statement.Column{Type: "varchar", Length: intPtr(64), Default: strPtr(" "), DefaultIsString: true},
+			want: columnDefault{value: " ", present: true},
+		},
+		{
+			name: "char literal whitespace is preserved",
+			col:  statement.Column{Type: "char", Length: intPtr(2), Default: strPtr(" "), DefaultIsString: true},
 			want: columnDefault{value: " ", present: true},
 		},
 		{
@@ -173,6 +192,16 @@ func TestNormalizedMySQLDefault(t *testing.T) {
 		{
 			name: "datetime current_timestamp() folds",
 			col:  statement.Column{Type: "datetime", Default: strPtr("CURRENT_TIMESTAMP()")},
+			want: columnDefault{value: "current_timestamp", present: true},
+		},
+		{
+			name: "datetime(6) current_timestamp(6) folds with precision",
+			col:  statement.Column{Type: "datetime", Length: intPtr(6), Default: strPtr("CURRENT_TIMESTAMP(6)")},
+			want: columnDefault{value: "current_timestamp", present: true},
+		},
+		{
+			name: "timestamp current_timestamp folds",
+			col:  statement.Column{Type: "timestamp", Default: strPtr("CURRENT_TIMESTAMP")},
 			want: columnDefault{value: "current_timestamp", present: true},
 		},
 		{
@@ -261,6 +290,12 @@ func TestNormalizedPostgresDefault(t *testing.T) {
 			name:  "datetime CURRENT_TIMESTAMP folds",
 			col:   statement.Column{Type: "datetime"},
 			value: sql.NullString{String: "CURRENT_TIMESTAMP", Valid: true},
+			want:  columnDefault{value: "current_timestamp", present: true},
+		},
+		{
+			name:  "timestamp now() folds to current_timestamp",
+			col:   statement.Column{Type: "timestamp"},
+			value: sql.NullString{String: "now()", Valid: true},
 			want:  columnDefault{value: "current_timestamp", present: true},
 		},
 		{
