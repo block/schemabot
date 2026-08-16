@@ -1994,9 +1994,6 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
 }
 
-// The drive's auto-cutover records one trigger in the timeline per drive and
-// retries quietly while the engine backend stages the cutover. A rejection
-// that outlives the staging window records a one-time timeline error and
 // A drive claim that reattaches to the engine's durable checkpoint records one
 // timeline event, so an operator can tell a resumed copy from a fresh start.
 // The engine reports the resume flag on every subsequent poll; the per-drive
@@ -2029,6 +2026,9 @@ func TestLocalClient_LogEngineResumeOnce(t *testing.T) {
 	assert.Len(t, logs.logs, 1, "the flag on every later poll produces one event per drive claim")
 }
 
+// The drive's auto-cutover records one trigger in the timeline per drive and
+// retries quietly while the engine backend stages the cutover. A rejection
+// that outlives the staging window records a one-time timeline error and
 // escalates to Error logging on every further tick, so a backend that never
 // stages the cutover is visible to operators instead of idling; the retry
 // loop itself never stops, and an accepted cutover resets the escalation.
