@@ -2328,9 +2328,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		}
 		c.logger.Info("Progress: serving task-less apply from operations",
 			"apply_id", req.ApplyId, "operation_count", len(ops), "state", apply.State)
+		settled, err := c.settledControlRequests(ctx, apply)
+		if err != nil {
+			c.logger.Error("progress: serving a task-less apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+				append(apply.LogAttrs(), "error", err)...)
+		}
 		return &ternv1.ProgressResponse{
-			State:  storageStateToProto(apply.State),
-			Engine: c.protoEngine(),
+			State:                  storageStateToProto(apply.State),
+			Engine:                 c.protoEngine(),
+			SettledControlRequests: settled,
 		}, nil
 	}
 
@@ -2554,6 +2560,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// The apply record's engine is the source of truth (set at apply creation time).
 	if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && apply != nil {
 		resp.ApplyId = apply.ApplyIdentifier
+		settled, err := c.settledControlRequests(ctx, apply)
+		if err != nil {
+			c.logger.Error("progress: serving an apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+				append(apply.LogAttrs(), "error", err)...)
+		}
+		resp.SettledControlRequests = settled
 		if eng, err := engineNameToProto(apply.Engine); err != nil {
 			return nil, fmt.Errorf("invalid engine on apply %s: %w", apply.ApplyIdentifier, err)
 		} else {
@@ -2648,6 +2660,42 @@ func (c *LocalClient) loadStoredShardsByTable(ctx context.Context, apply *storag
 		}
 	}
 	return byTable
+}
+
+// settledControlRequests projects the apply's terminal control requests onto the
+// progress response. A control RPC is accepted when the request is queued, not
+// when it takes effect, so this is how the plane that accepted one learns
+// whether the operation actually landed — without it, a rejection recorded here
+// never leaves this plane.
+//
+// Callers on the progress path degrade rather than propagate: the field is
+// advisory, and the same settled rows are reported on every poll until the
+// operator retries the operation, so a failed load costs one tick of notice and
+// self-heals. Failing the RPC instead would throw away the state and task
+// progress the caller drives the apply from, over a field it only displays.
+func (c *LocalClient) settledControlRequests(ctx context.Context, apply *storage.Apply) ([]*ternv1.SettledControlRequest, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available for apply %s", apply.ApplyIdentifier)
+	}
+	requests, err := controlStore.ListSettled(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load settled control requests for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	settled := make([]*ternv1.SettledControlRequest, 0, len(requests))
+	for _, req := range requests {
+		entry := &ternv1.SettledControlRequest{
+			Operation:    string(req.Operation),
+			Status:       string(req.Status),
+			ErrorMessage: req.ErrorMessage,
+			RequestedBy:  req.RequestedBy,
+		}
+		if req.CompletedAt != nil {
+			entry.SettledAt = req.CompletedAt.UTC().Format(time.RFC3339)
+		}
+		settled = append(settled, entry)
+	}
+	return settled, nil
 }
 
 // loadStoredDisplayMetadata reads a Vitess apply's deploy display fields

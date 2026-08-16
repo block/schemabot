@@ -570,6 +570,7 @@ type capturingTernServer struct {
 	progressTables    []*ternv1.TableProgress
 	progressVolume    int32
 	progressError     string
+	progressSettled   []*ternv1.SettledControlRequest
 	progressErr       error
 	startErr          error
 	cancelErr         error
@@ -676,6 +677,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	tables := s.progressTables
 	volume := s.progressVolume
 	errorMessage := s.progressError
+	settled := s.progressSettled
 	err := s.progressErr
 	s.mu.Unlock()
 	if err != nil {
@@ -684,7 +686,13 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	if !psSet {
 		ps = ternv1.State_STATE_COMPLETED
 	}
-	return &ternv1.ProgressResponse{State: ps, Tables: tables, Volume: volume, ErrorMessage: errorMessage}, nil
+	return &ternv1.ProgressResponse{
+		State:                  ps,
+		Tables:                 tables,
+		Volume:                 volume,
+		ErrorMessage:           errorMessage,
+		SettledControlRequests: settled,
+	}, nil
 }
 func (s *capturingTernServer) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
 	return &ternv1.LogsResponse{}, nil
@@ -2240,6 +2248,77 @@ func TestGRPCClient_ProcessPendingCancelControlRequestCompletesWholeApply(t *tes
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.Nil(t, cancelReq)
+}
+
+// A cancel that reconciles a terminal remote ends the drive, so the regular
+// poll loop never runs again. A control command the data plane settled after
+// the last regular poll — here a volume change its engine refused — reaches the
+// operator only if the cancel path's own progress read mirrors it; otherwise the
+// operator is left believing a command they were told was accepted took effect.
+func TestGRPCClient_CancelPathMirrorsSettledControlRejections(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_CANCELLED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Cancelled,
+		}},
+		progressSettled: []*ternv1.SettledControlRequest{{
+			Operation:    string(storage.ControlOperationVolume),
+			Status:       string(storage.ControlRequestFailed),
+			ErrorMessage: "throttle endpoint returned 404",
+			RequestedBy:  "cli:alice",
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-mirror",
+		ExternalID:      "remote-grpc-cancel-mirror",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	require.True(t, handled)
+
+	rejected, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationVolume)
+	require.NoError(t, err)
+	require.NotNil(t, rejected, "the rejection the data plane settled must survive the drive that ends here")
+	assert.Equal(t, storage.ControlRequestFailed, rejected.Status)
+	assert.Contains(t, rejected.ErrorMessage, "throttle endpoint returned 404")
+	assert.Equal(t, "cli:alice", rejected.RequestedBy)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Volume was accepted but not applied"),
+		"the operator must find the rejection on the schema change's log")
 }
 
 func TestGRPCClient_ProcessPendingCancelOperationLeavesApplyCancelPending(t *testing.T) {

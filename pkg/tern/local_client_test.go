@@ -490,7 +490,10 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	return &mockApplyLogStore{}
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
-	return s.controlRequests
+	if s.controlRequests != nil {
+		return s.controlRequests
+	}
+	return &testControlRequestStore{}
 }
 func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
@@ -618,6 +621,17 @@ func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int6
 	return nil, nil
 }
 
+func (s *testControlRequestStore) ListSettled(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	var settled []*storage.ApplyControlRequest
+	for _, req := range s.requests {
+		if req.ApplyID != applyID || req.Status == storage.ControlRequestPending {
+			continue
+		}
+		settled = append(settled, cloneTestControlRequest(req))
+	}
+	return settled, nil
+}
+
 func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
 	for _, req := range s.requests {
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
@@ -635,6 +649,36 @@ func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, 
 		}
 	}
 	return nil
+}
+
+// RecordRemoteFailure mirrors the store's contract: a pending row is a live
+// request this plane has not forwarded yet, so a settled report describes a
+// superseded attempt and is ignored; anything else takes the remote reason.
+func (s *testControlRequestStore) RecordRemoteFailure(_ context.Context, req *storage.ApplyControlRequest) (bool, error) {
+	for _, existing := range s.requests {
+		if existing.ApplyID != req.ApplyID || existing.Operation != req.Operation {
+			continue
+		}
+		if existing.Status == storage.ControlRequestPending {
+			return false, nil
+		}
+		if existing.Status == storage.ControlRequestFailed &&
+			existing.ErrorMessage == req.ErrorMessage &&
+			existing.RequestedBy == req.RequestedBy {
+			return false, nil
+		}
+		existing.Status = storage.ControlRequestFailed
+		existing.ErrorMessage = req.ErrorMessage
+		if req.RequestedBy != "" {
+			existing.RequestedBy = req.RequestedBy
+		}
+		return true, nil
+	}
+	stored := cloneTestControlRequest(req)
+	stored.ID = int64(len(s.requests) + 1)
+	stored.Status = storage.ControlRequestFailed
+	s.requests = append(s.requests, stored)
+	return true, nil
 }
 
 func cloneTestControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {

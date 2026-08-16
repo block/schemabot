@@ -951,6 +951,19 @@ const (
 	ControlOperationVolume ControlOperation = "volume"
 )
 
+// Valid reports whether the operation is one SchemaBot recognizes. Control
+// operations cross the control-plane / data-plane boundary as strings, so a
+// value read off the wire is checked here before it reaches storage.
+func (o ControlOperation) Valid() bool {
+	switch o {
+	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+		ControlOperationRelease, ControlOperationVolume:
+		return true
+	}
+	return false
+}
+
 // MinVolume and MaxVolume bound the volume scale shared by every engine:
 // 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
 const (
@@ -978,6 +991,49 @@ func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
 		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
 	}
 	return data, nil
+}
+
+// mirroredControlRequestMetadataKey marks a control request row this plane never
+// queued: the row exists only because another plane reported the operation
+// rejected, as happens for a pure proxy like volume where the request lives
+// entirely in the serving plane. Such a row has no local lifecycle to reset it,
+// so it is the mirror's to clear when the operation later succeeds. Rows this
+// plane queued itself carry no marker and are only ever cleared by their own
+// request lifecycle.
+const mirroredControlRequestMetadataKey = "mirrored_remote_rejection"
+
+// MirroredControlRequestMetadata returns the metadata stamped on a control
+// request row created solely to carry another plane's rejection.
+func MirroredControlRequestMetadata() []byte {
+	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
+}
+
+// ForwardingControlRequestCaller is the requester recorded for a control
+// request that reached this plane over the data-plane RPC boundary. The control
+// RPCs carry no operator identity, so this names the path the request arrived
+// on rather than the person who issued it.
+const ForwardingControlRequestCaller = "tern-grpc"
+
+// ControlRequestNamesAnOperator reports whether a requester identifies the
+// operator who issued the command. Only such a value is worth showing in the
+// PR notice, whose whole purpose is telling an operator which of their commands
+// did not take effect.
+func ControlRequestNamesAnOperator(requestedBy string) bool {
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+}
+
+// IsMirroredRemoteRejection reports whether this row exists only to carry
+// another plane's rejection, so no local request lifecycle will ever clear it.
+func (r *ApplyControlRequest) IsMirroredRemoteRejection() bool {
+	if r == nil || len(r.Metadata) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return false
+	}
+	marked, _ := payload[mirroredControlRequestMetadataKey].(bool)
+	return marked
 }
 
 // DecodeVolumeControlRequestMetadata parses the desired volume level from a

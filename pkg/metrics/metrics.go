@@ -740,11 +740,12 @@ var knownControlOperations = map[string]bool{
 	"volume":        true,
 	"revert":        true,
 	"skip_revert":   true,
+	"release":       true,
 	"rollback_plan": true,
 }
 
 // RecordControlOperation increments the control operations counter.
-// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, rollback_plan.
+// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, release, rollback_plan.
 // Status should be "success" or "error".
 func RecordControlOperation(ctx context.Context, operation, database, deployment, environment, status string) {
 	if !knownControlOperations[operation] {
@@ -773,6 +774,26 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	addCounter(ctx, "schemabot.remote_control_requests.stale_resends_total",
 		"Total retransmissions of remote control requests still unconsumed by the data plane past the stale threshold", "{resend}",
 		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordRemoteControlRequestRejected counts control requests the data plane
+// accepted and its own driver then failed — the operator was told the command
+// was queued and the effect never landed. A non-zero rate names the operation
+// and engine that is refusing operator commands: chart it by operation to see
+// which control surface is unsupported or broken on that engine, and read the
+// apply log entry recorded alongside it for the engine's own reason.
+func RecordRemoteControlRequestRejected(ctx context.Context, operation, engine, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_control_requests.rejected_total",
+		"Total remote control requests the data plane accepted and then failed", "{rejection}",
+		attribute.String("operation", operation),
+		attribute.String("engine", engine),
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
 		EnvironmentAttribute(environment),

@@ -39,6 +39,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
+| `schemabot.remote_control_requests.rejected_total` | Counter | operation, engine, database, deployment, environment | Control requests a remote data plane accepted and its own driver then failed, mirrored back so the operator learns the command never took effect — see [Control Operations](#control-operations) |
+| `schemabot.remote_control_requests.stale_resends_total` | Counter | operation, database, deployment, environment | Retransmissions of a stop/cancel request the data plane accepted but has not consumed past the stale threshold — see [Control Operations](#control-operations) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
@@ -95,9 +97,11 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
-**operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `rollback_plan`
+**operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `release`, `rollback_plan`
 
 **status** (control): `success`, `error`, `rejected`
+
+**engine** (control): the engine that rejected the command, as recorded on the apply (for example `spirit`, `planetscale`)
 
 **operation** (locks): `acquire`, `release`
 
@@ -290,7 +294,25 @@ Operation values:
 | `volume` | Change the engine's throttling or volume setting for an apply. |
 | `revert` | Request that the engine revert an apply. |
 | `skip_revert` | Skip the post-deploy revert window for an apply. |
+| `release` | Release a rollout paused after a failure so the remaining work proceeds. |
 | `rollback_plan` | Generate a rollback plan from a previous completed apply. |
+
+`schemabot.remote_control_requests.rejected_total` counts the same operations
+from the other side: a control request the data plane acknowledged and its own
+driver then failed. Acceptance only means the request was queued, so without
+this mirror the operator is told the command succeeded and never learns the
+effect did not land. A non-zero rate names the operation and `engine` that is
+refusing operator commands — chart it by operation to see which control surface
+is unsupported or broken on that engine, and read the apply log entry recorded
+alongside it for the engine's own reason.
+
+`schemabot.remote_control_requests.stale_resends_total` counts the case in
+between: the data plane accepted a stop or cancel and has neither consumed nor
+failed it past the stale threshold, so the control plane retransmits it. A
+rejection is an answer; this is silence. A non-zero rate means an accepted
+operator command is not taking effect and the apply will not converge until the
+data plane's own driver can consume it — its logs carry the failing consume
+error.
 
 ### Lock Operations
 
