@@ -1585,12 +1585,17 @@ var knownWebhookInboxStates = func() map[string]bool {
 // RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
 // given state. A rising pending/processing depth means dispatch is falling
 // behind ingestion; a rising failed_retryable depth means deliveries are
-// retrying; a rising completed/failed depth means terminal rows are accumulating
-// and retention has not reclaimed them. A rising failed_permanent depth means
-// deliveries are being dead-lettered — each such row is a permanently dropped
-// delivery that will never retry and needs explicit operator action (GitHub
-// Redeliver for an organic delivery; a new head push or check re-run for a
-// synthesized one).
+// retrying; a rising completed/failed/superseded depth means terminal rows are
+// accumulating and retention has not reclaimed them. A rising failed_permanent
+// depth means deliveries are being dead-lettered — each such row is a
+// permanently dropped delivery that will never retry and needs explicit
+// operator action (GitHub Redeliver for an organic delivery; a new head push
+// or check re-run for a synthesized one).
+//
+// One caveat on pending: a row created with a not-before time sits in pending
+// by design until it becomes due, so steady nonzero pending depth alone does
+// not imply dispatch lag — cross-check the oldest-claimable-age gauge, which
+// counts only dispatchable rows.
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -1603,9 +1608,11 @@ func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 }
 
 // RecordWebhookInboxOldestClaimableAge records how long the oldest
-// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
-// inbox's backlog latency: a value climbing past the dispatch cadence means work
-// is acked but not being picked up.
+// ready-to-claim-but-unclaimed inbox row has been claimable, in seconds. Age
+// counts from when the row became claimable — the later of receipt and its
+// not-before/retry time — so a deliberately deferred row does not report its
+// grace period as backlog. It is the inbox's backlog latency: a value climbing
+// past the dispatch cadence means work is acked but not being picked up.
 func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
 	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
 		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
@@ -1637,16 +1644,19 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 }
 
 // RecordWebhookInboxDispatchLag records how long an accepted delivery waited
-// in the durable inbox before a driver first claimed it. This is the
-// per-delivery counterpart of the oldest-claimable-age gauge: the gauge shows
-// the backlog's worst case right now, while this histogram shows the lag every
-// delivery actually experienced. A distribution drifting past the dispatch
-// poll cadence means accepted deliveries are waiting on driver capacity —
-// investigate driver-pool sizing and claim-query health. One caveat: a
-// shutdown-released claim refunds its attempt, so the delivery's reclaim
-// counts as the first attempt again and records another sample measured from
-// the original receipt — deploy churn therefore adds extra, longer samples
-// without any driver-capacity problem. Unknown event types fold to "unknown"
+// dispatchable in the durable inbox before a driver first claimed it — from
+// when the row became eligible (receipt, or its not-before time for a
+// deliberately deferred row), so a deferral's grace period never counts as
+// lag. This is the per-delivery counterpart of the oldest-claimable-age
+// gauge: the gauge shows the backlog's worst case right now, while this
+// histogram shows the lag every delivery actually experienced. A distribution
+// drifting past the dispatch poll cadence means accepted deliveries are
+// waiting on driver capacity — investigate driver-pool sizing and claim-query
+// health. One caveat: a shutdown-released claim refunds its attempt, so the
+// delivery's reclaim counts as the first attempt again and records another
+// sample measured from the original eligibility time — deploy churn therefore
+// adds extra, longer samples without any driver-capacity problem. Unknown
+// event types fold to "unknown"
 // and negative lags (cross-pod clock skew between the enqueueing and claiming
 // replica) clamp to zero so the histogram stays trustworthy. appName is the
 // resolved GitHub App name used only for fold-log attribution; it is not a
@@ -1660,7 +1670,7 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 		lag = 0
 	}
 	recordHistogram(ctx, "schemabot.webhook.inbox_dispatch_lag_seconds", lag.Seconds(),
-		"Time from webhook receipt to the delivery's first dispatch claim",
+		"Time a webhook delivery spent dispatchable before its first dispatch claim",
 		EnvironmentAttribute(""),
 		attribute.String("event_type", eventType),
 		attribute.String("repository", repo),
@@ -1683,6 +1693,9 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     find the delivery in the driver logs and inspect its last_error.
 //   - "retrying": processing failed retryably; the row waits for its retry
 //     window.
+//   - "superseded": the claimed auto-plan delivery was discarded without
+//     processing because a newer covering delivery exists for the same pull
+//     request; the successor performs the work.
 //   - "released": the pool shut down mid-flight and refunded the claim.
 //   - "lease_lost": the driver lost delivery ownership (heartbeat failure or
 //     a lease-token mismatch recording the finish); another driver owns the
@@ -1695,6 +1708,7 @@ var knownWebhookDispatchOutcomes = map[string]bool{
 	"failed":           true,
 	"failed_permanent": true,
 	"retrying":         true,
+	"superseded":       true,
 	"released":         true,
 	"lease_lost":       true,
 	"finish_error":     true,
@@ -1746,14 +1760,18 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 }
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook
-// reconciler found without a live inbox delivery — no row at all, or only a
-// plain-failed synthesized one. A dead-lettered row or a plain-failed organic
-// row covers its head, so neither counts as missing (the dead-letter is
-// deliberately terminal; the organic failure has GitHub Redeliver as its
-// lever). A nonzero rate means deliveries are being lost
-// upstream of the inbox (edge auth, GitHub send failures); with synthesis
+// reconciler found without a live inbox delivery — no row at all, or only
+// rows that cannot attest coverage (plain-failed synthesized rows, or
+// superseded rows whose work was discarded by claim-time coalescing). A
+// dead-lettered row or a plain-failed organic row covers its head, so neither
+// counts as missing (the dead-letter is deliberately terminal; the organic
+// failure has GitHub Redeliver as its lever). A nonzero rate usually means
+// deliveries are being lost upstream of the inbox (edge auth, GitHub send
+// failures), but a head covered only by superseded rows is a
+// coalescing-created miss with no upstream loss — check the superseded
+// dispatch outcome for the repo before blaming delivery. With synthesis
 // enabled each miss also triggers a recovery delivery, counted by
-// RecordWebhookReconcileSynthesizedEvent, so investigate the upstream loss.
+// RecordWebhookReconcileSynthesizedEvent.
 func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 	addCounter(ctx, "schemabot.webhook.reconcile_missing_events_total",
 		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
@@ -1768,9 +1786,10 @@ func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 // thrash: "first" is the healthy case — a genuinely lost delivery recovered
 // once, so investigate the upstream loss (edge auth, GitHub send failures)
 // rather than the recovery — while "resynthesis" means a previously
-// synthesized row terminally failed and was reopened, so a sustained
-// resynthesis rate is the same head failing repeatedly after recovery —
-// investigate that head's processing failure, not delivery loss.
+// synthesized row terminally failed or was superseded and was reopened, so a
+// sustained resynthesis rate is the same head repeatedly failing or being
+// discarded after recovery — investigate that head's processing, not
+// delivery loss.
 func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string, resynthesis bool) {
 	outcome := "first"
 	if resynthesis {
