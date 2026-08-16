@@ -39,6 +39,7 @@ func (s *durableWebhookTestStorage) WebhookEvents() storage.WebhookEventStore {
 
 type recordingWebhookEventStore struct {
 	mu     sync.Mutex
+	nextID int64
 	events map[string]*storage.WebhookEvent
 }
 
@@ -69,6 +70,11 @@ func (s *recordingWebhookEventStore) Create(_ context.Context, event *storage.We
 		}
 		return false, nil
 	}
+	// Mirror the real store's insert contract: a fresh insert populates the
+	// caller's event.ID, while the reopen branch above leaves it zero — the
+	// discriminator callers use to tell the two apart.
+	s.nextID++
+	event.ID = s.nextID
 	copy := *event
 	copy.Payload = append([]byte(nil), event.Payload...)
 	if copy.State == "" {

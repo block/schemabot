@@ -599,6 +599,8 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 		return h.processDurablePullRequest(ctx, event)
 	case "check_run":
 		return h.processDurableCheckRun(ctx, event)
+	case "check_suite":
+		return h.processDurableCheckSuite(ctx, event)
 	case "merge_group":
 		return h.processDurableMergeGroup(ctx, event)
 	case "push":

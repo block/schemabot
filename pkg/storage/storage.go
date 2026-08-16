@@ -236,6 +236,11 @@ type WebhookEventStore interface {
 	// time passes. Producers of deferred work — a redundant convergence signal
 	// that should lose the race to the primary delivery — set it to schedule
 	// dispatch; nil means immediately claimable. A redelivery reopen clears it.
+	//
+	// Only a fresh insert populates event.ID; a reopen returns inserted=true
+	// with event.ID left zero, so callers whose behavior differs between the
+	// two — a deferred producer whose not-before time a reopen discards, for
+	// example — can tell them apart.
 	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
 
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.

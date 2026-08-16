@@ -67,9 +67,16 @@ GitHub sends POST /webhook
   |     |
   |     +-- Release locks held by the PR and delete stored check state
   |
-  +-- check_run
+  +-- check_run.rerequested
+  |     |
+  |     +-- Re-plan the PR head when a human clicks "Re-run" on a
+  |         SchemaBot check
+  |
+  +-- check_suite.requested
         |
-        +-- Accepted by the webhook but not implemented today
+        +-- Enqueue a grace-deferred recovery pass that synthesizes the
+            auto-plan delivery for open PR heads whose pull_request
+            delivery was lost
 ```
 
 ## GitHub App Authentication
