@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"time"
 )
 
 // rollbackTx rolls back tx, logging a warning if the rollback fails for a
@@ -37,6 +38,14 @@ func nullInt64Ptr(v *int64) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: *v, Valid: true}
+}
+
+// nullTimePtr returns a sql.NullTime for a *time.Time value.
+func nullTimePtr(v *time.Time) sql.NullTime {
+	if v == nil {
+		return sql.NullTime{}
+	}
+	return sql.NullTime{Time: *v, Valid: true}
 }
 
 // nullJSON returns valid JSON from []byte, defaulting to "{}" if nil/empty.

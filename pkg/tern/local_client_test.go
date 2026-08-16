@@ -3953,18 +3953,31 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 		State:          state.Task.Completed,
 		DDLAction:      "alter",
 	}
+	// An earlier table's failure ends the sequential apply, so a table still
+	// pending is cancelled rather than run.
+	blockedTask := &storage.Task{
+		ID:             10,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-payments",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "payments",
+		State:          state.Task.Cancelled,
+		DDLAction:      "alter",
+	}
 	client := &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
 		storage: &exactProgressStorage{
 			applies: &exactProgressApplyStore{apply: apply},
-			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask}},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask, blockedTask}},
 		},
 		logger: slog.Default(),
 	}
 
 	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
 	require.NoError(t, err)
-	require.Len(t, progress.Tables, 2)
+	require.Len(t, progress.Tables, 3)
 
 	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
 	for _, tp := range progress.Tables {
@@ -3972,6 +3985,9 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 	}
 	require.Contains(t, byTable, "users")
 	require.Contains(t, byTable, "orders")
+	require.Contains(t, byTable, "payments")
 	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
 	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
+	assert.Empty(t, byTable["payments"].ErrorMessage,
+		"a table cancelled because an earlier table's failure ended the apply has no error of its own, so the root-cause table stays identifiable")
 }
