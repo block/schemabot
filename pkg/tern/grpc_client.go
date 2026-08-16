@@ -873,6 +873,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
 			ApplyId:     remoteID,
 			Environment: apply.Environment,
+			Caller:      controlReq.RequestedBy,
 		})
 		if err != nil {
 			if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
@@ -989,7 +990,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	// cancels and the apply log with duplicate accept events while the remote
 	// works (or fails) to consume the first one.
 	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
-		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment})
+		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: controlReq.RequestedBy})
 		if err != nil {
 			if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
 				return true, nil
@@ -2156,6 +2157,25 @@ func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *sto
 	return c.pollForCompletion(ctx, apply, false, scope, false)
 }
 
+// operationCutoverCaller names the operator whose cutover this ordered drive is
+// carrying out. The deployment-ordered claim, not the durable request, is what
+// routes the swap here, so the requester has to be read back from the
+// apply-level cutover request the operator queued. Attribution must never cost
+// the swap: an unreadable or already-settled request yields an empty caller,
+// which the data plane records as the forwarding path.
+func (c *GRPCClient) operationCutoverCaller(ctx context.Context, apply *storage.Apply) string {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
+	if err != nil {
+		c.applyLogger(apply).WarnContext(ctx, "could not read the cutover request's operator; the data plane will record the forwarding path instead",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return ""
+	}
+	if controlReq == nil {
+		return ""
+	}
+	return controlReq.RequestedBy
+}
+
 // triggerRemoteOperationCutover preflights the exact remote state for an ordered
 // cutover drive and, only when the operation is still parked at the barrier,
 // issues the remote Cutover RPC. The claim moves the operation row to
@@ -2220,6 +2240,7 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     remoteID,
 		Environment: apply.Environment,
+		Caller:      c.operationCutoverCaller(ctx, apply),
 	})
 	if err != nil {
 		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)

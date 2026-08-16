@@ -557,9 +557,12 @@ type capturingTernServer struct {
 	remoteApplyID     string
 	remoteOperationID string
 	cancelApplyID     string
+	cancelCaller      string
 	stopApplyID       string
+	stopCaller        string
 	startApplyID      string
 	cutoverApplyID    string
+	cutoverCaller     string
 	skipRevertApplyID string
 	revertApplyID     string
 	progressApplyID   string
@@ -616,6 +619,7 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (*ternv1.StopResponse, error) {
 	s.mu.Lock()
 	s.stopApplyID = req.ApplyId
+	s.stopCaller = req.Caller
 	s.stopCalls++
 	s.mu.Unlock()
 	return &ternv1.StopResponse{Accepted: true}, nil
@@ -624,6 +628,7 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 func (s *capturingTernServer) Cancel(_ context.Context, req *ternv1.CancelRequest) (*ternv1.CancelResponse, error) {
 	s.mu.Lock()
 	s.cancelApplyID = req.ApplyId
+	s.cancelCaller = req.Caller
 	s.cancelCalls++
 	err := s.cancelErr
 	s.mu.Unlock()
@@ -636,6 +641,7 @@ func (s *capturingTernServer) Cancel(_ context.Context, req *ternv1.CancelReques
 func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	s.mu.Lock()
 	s.cutoverApplyID = req.ApplyId
+	s.cutoverCaller = req.Caller
 	err := s.cutoverErr
 	accepted := s.cutoverAccepted
 	message := s.cutoverMessage
@@ -720,6 +726,18 @@ func (s *capturingTernServer) getCancelApplyID() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cancelApplyID
+}
+
+func (s *capturingTernServer) getStopCaller() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopCaller
+}
+
+func (s *capturingTernServer) getCancelCaller() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cancelCaller
 }
 
 func (s *capturingTernServer) getStopCalls() int {
@@ -2189,6 +2207,94 @@ func TestGRPCClient_ResumeApplyOperationStopReachingTerminalLeavesApplyStopPendi
 	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.NotNil(t, stopReq, "the apply-level stop request must remain pending for sibling operations after one operation terminalizes")
+}
+
+// The control plane's immediate stop or cancel attempt carries the operator's
+// name, but when that attempt fails the durable request is what reaches the data
+// plane — forwarded later by the driver holding the apply. The data plane records
+// the requester from the RPC, so the driver has to carry the same name the
+// operator's command was queued under, or the row it stores names the forwarding
+// path and the PR notice credits an internal caller for a person's command.
+func TestGRPCClient_DriverForwardsTheOperatorOnStopAndCancel(t *testing.T) {
+	newApply := func(identifier, remoteID string) *storage.Apply {
+		return &storage.Apply{
+			ID:              7,
+			ApplyIdentifier: identifier,
+			ExternalID:      remoteID,
+			PlanID:          99,
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			State:           state.Apply.Running,
+		}
+	}
+	newStorage := func(apply *storage.Apply, operation storage.ControlOperation) storage.Storage {
+		storedApply := *apply
+		return &mockStorage{
+			applies: &mockApplyStore{apply: &storedApply},
+			tasks: &mockTaskStore{tasks: []*storage.Task{{
+				ID:             11,
+				TaskIdentifier: "task-users",
+				ApplyID:        apply.ID,
+				Namespace:      "default",
+				TableName:      "users",
+				State:          state.Task.Running,
+			}}},
+			logs: &mockApplyLogStore{},
+			controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   operation,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+				CreatedAt:   time.Now(),
+			}}},
+		}
+	}
+
+	t.Run("stop", func(t *testing.T) {
+		server := &capturingTernServer{
+			progressState:    ternv1.State_STATE_RUNNING,
+			progressStateSet: true,
+			progressTables: []*ternv1.TableProgress{{
+				Namespace: "default",
+				TableName: "users",
+				Status:    state.Task.Running,
+			}},
+		}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		defer cleanup()
+
+		apply := newApply("apply-grpc-stop-caller", "remote-grpc-stop-caller")
+		client.storage = newStorage(apply, storage.ControlOperationStop)
+
+		_, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+		require.NoError(t, err)
+		assert.Equal(t, "cli:alice", server.getStopCaller(),
+			"the data plane must record the operator who issued the stop, not the forwarding path")
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		server := &capturingTernServer{
+			progressState:    ternv1.State_STATE_CANCELLED,
+			progressStateSet: true,
+			progressTables: []*ternv1.TableProgress{{
+				Namespace: "default",
+				TableName: "users",
+				Status:    state.Task.Cancelled,
+			}},
+		}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		defer cleanup()
+
+		apply := newApply("apply-grpc-cancel-caller", "remote-grpc-cancel-caller")
+		client.storage = newStorage(apply, storage.ControlOperationCancel)
+
+		handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+		require.NoError(t, err)
+		require.True(t, handled)
+		assert.Equal(t, "cli:alice", server.getCancelCaller(),
+			"the data plane must record the operator who issued the cancel, not the forwarding path")
+	})
 }
 
 func TestGRPCClient_ProcessPendingCancelControlRequestCompletesWholeApply(t *testing.T) {
