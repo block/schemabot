@@ -25,7 +25,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | environment, event_type, action, repository, status | GitHub webhook events |
+| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status | GitHub webhook events (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
@@ -106,7 +106,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
-**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`
+**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`
 
 **state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `unknown`
 
@@ -123,6 +123,28 @@ available, such as `repository`, `github_app`, and `installation_id`.
 **reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_lease_release_error`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
+
+### Webhook Ownership Rejections
+
+A webhook whose signing App does not own the target repository is rejected with
+401 and counted on `schemabot.webhook.events_total` under one of two statuses.
+They separate routine traffic from an actionable trust-boundary signal, so alert
+on the second and never on the first:
+
+| Status | Meaning | Operator action |
+|---|---|---|
+| `repo_not_configured` | The repository has no entry in `repos:` at all. A shared App forwards deliveries for every repository it is installed on, so this is expected background traffic. | None. Onboard the repository if the deliveries were meant to be handled. |
+| `app_repo_mismatch` | The repository *is* declared, but the App that signed the delivery is not the App configured to own it. This is config drift or a hostile install. | Investigate: compare the delivery's `app_name` against the repository's `github_app:` mapping. |
+
+`repo_not_configured` deliberately carries **no `repository` attribute** —
+unmanaged repository names are unbounded and would blow up the metric's
+cardinality. Do not build a query that facets `repo_not_configured` by
+repository; the rejection's debug log line carries the repository name for
+one-off triage. `app_repo_mismatch` does carry `repository`, because a declared
+repository is a bounded set.
+
+Both statuses are rejections: the request fails closed with 401 either way, and
+the severity split exists only so a warn-level triage scan stays actionable.
 
 ### Check Ownership Misses
 

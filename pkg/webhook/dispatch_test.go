@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -188,18 +189,35 @@ func TestDispatch_RejectsUnknownRepoInMultiAppMode(t *testing.T) {
 // deliveries for every repo it is installed on) and logs at debug so it never
 // floods the warn stream; a delivery signed by the wrong App for a declared
 // repo is config drift or a hostile install and logs at warn. Both fail
-// closed with the same rejection either way.
+// closed with the same rejection either way, and both are counted on
+// schemabot.webhook.events_total under their own status — the unmanaged one
+// without a repository attribute, since unmanaged repo names are unbounded and
+// a nonzero app_repo_mismatch must stay an actionable drift signal.
 func TestDispatch_OwnershipRejectionSeverity(t *testing.T) {
 	scenarios := []struct {
-		name      string
-		repo      string
-		wantLevel slog.Level
+		name           string
+		repo           string
+		wantLevel      slog.Level
+		wantStatus     string
+		wantMetricRepo string
 	}{
-		{name: "unmanaged repo logs at debug", repo: "unknown-org/unknown-repo", wantLevel: slog.LevelDebug},
-		{name: "declared repo signed by wrong App logs at warn", repo: "org-b/repo-y", wantLevel: slog.LevelWarn},
+		{
+			name:       "unmanaged repo logs at debug and drops the repository attribute",
+			repo:       "unknown-org/unknown-repo",
+			wantLevel:  slog.LevelDebug,
+			wantStatus: "repo_not_configured",
+		},
+		{
+			name:           "declared repo signed by wrong App logs at warn and keeps the repository attribute",
+			repo:           "org-b/repo-y",
+			wantLevel:      slog.LevelWarn,
+			wantStatus:     "app_repo_mismatch",
+			wantMetricRepo: "org-b/repo-y",
+		},
 	}
 	for _, tc := range scenarios {
 		t.Run(tc.name, func(t *testing.T) {
+			reader := newDispatchMetricsReader(t)
 			var logs bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 			h, secrets := newMultiAppTestHandlerWithLogger(t, logger)
@@ -213,6 +231,21 @@ func TestDispatch_OwnershipRejectionSeverity(t *testing.T) {
 			assert.Equal(t, tc.wantLevel.String(), record["level"])
 			assert.Equal(t, tc.repo, record["repo"], "the log record must carry the rejected repo for triage")
 			assert.Equal(t, "app-a", record["app_name"])
+
+			points := collectCounterPoints(t, reader, "schemabot.webhook.events_total")
+			require.Len(t, points, 1, "the rejection must record exactly one webhook event")
+			assert.Equal(t, int64(1), points[0].Value)
+			assertStringAttr(t, points[0].Attributes, "status", tc.wantStatus)
+			assertStringAttr(t, points[0].Attributes, "app_name", "app-a")
+			assertStringAttr(t, points[0].Attributes, "event_type", "ping")
+			repository, hasRepository := points[0].Attributes.Value(attribute.Key("repository"))
+			if tc.wantMetricRepo == "" {
+				assert.False(t, hasRepository,
+					"unmanaged repo names are unbounded, so the repository attribute must be omitted")
+				return
+			}
+			require.True(t, hasRepository, "a declared repo must be attributed so drift is actionable")
+			assert.Equal(t, tc.wantMetricRepo, repository.AsString())
 		})
 	}
 }
