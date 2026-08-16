@@ -3,6 +3,8 @@ package templates
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // ControlRejectionData is one operator control command that SchemaBot accepted
@@ -14,7 +16,10 @@ type ControlRejectionData struct {
 	// Message is the engine or driver explanation for the rejection. It is
 	// sanitized before rendering.
 	Message string
-	// RequestedBy identifies who issued the command, when known.
+	// RequestedBy identifies who issued the command, when known. Requests that
+	// only ever carry SchemaBot's internal forwarding caller — volume is one —
+	// name no operator, and the notice omits the attribution rather than
+	// crediting the command to an internal path.
 	RequestedBy string
 }
 
@@ -32,7 +37,7 @@ func RenderControlRejections(rejections []ControlRejectionData) string {
 	sb.WriteString("> **Command not applied**\n>\n")
 	for _, r := range rejections {
 		fmt.Fprintf(&sb, "> - `%s` was accepted but did not take effect", sanitizeCommentError(r.Operation))
-		if r.RequestedBy != "" {
+		if storage.ControlRequestNamesAnOperator(r.RequestedBy) {
 			fmt.Fprintf(&sb, " (requested by `%s`)", sanitizeCommentError(r.RequestedBy))
 		}
 		if msg := sanitizeCommentError(r.Message); msg != "" {

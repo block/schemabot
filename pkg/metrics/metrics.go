@@ -740,11 +740,12 @@ var knownControlOperations = map[string]bool{
 	"volume":        true,
 	"revert":        true,
 	"skip_revert":   true,
+	"release":       true,
 	"rollback_plan": true,
 }
 
 // RecordControlOperation increments the control operations counter.
-// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, rollback_plan.
+// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, release, rollback_plan.
 // Status should be "success" or "error".
 func RecordControlOperation(ctx context.Context, operation, database, deployment, environment, status string) {
 	if !knownControlOperations[operation] {

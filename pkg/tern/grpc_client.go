@@ -896,10 +896,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		}
 	}
 
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
@@ -1014,7 +1011,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logRemoteControlResend(ctx, logger, apply, controlReq, now)
 		}
 	}
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
@@ -1050,6 +1047,23 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	return false, nil
 }
 
+// controlPathProgress polls remote progress on behalf of a control-request path
+// and mirrors any control rejections the response carries. A cancel or stop that
+// reconciles a terminal remote ends the drive, so the regular poll loop never
+// runs again: a rejection the data plane settled after the last regular poll
+// reaches the operator only if it is mirrored from here.
+func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.Apply, remoteID string) (*ternv1.ProgressResponse, error) {
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.mirrorRemoteControlRejections(ctx, apply, remoteID, progress.SettledControlRequests)
+	return progress, nil
+}
+
 func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	if handled, err := c.processPendingCancelControlRequest(ctx, apply, scope); handled || err != nil {
 		return handled, err
@@ -1063,10 +1077,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		logger.WarnContext(ctx, "remote gRPC stop error could not be reconciled from progress",
 			append(apply.MutableLogAttrs(),
@@ -1134,10 +1145,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		logger.WarnContext(ctx, "remote gRPC cancel error could not be reconciled from progress",
 			append(apply.MutableLogAttrs(),
@@ -1669,7 +1677,12 @@ func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume 
 // operator retries the operation, so a mirror that fails is retried on the next
 // tick rather than aborting the drive, and a mirror that succeeds is surfaced
 // exactly once (RecordRemoteFailure reports whether the stored row changed).
-func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *storage.Apply, settled []*ternv1.SettledControlRequest) {
+//
+// remoteID is the remote identifier this drive addressed. The data plane's
+// message names its own apply, which is meaningless to the operator reading the
+// PR — and on an operation-scoped drive the parent apply's ExternalID is empty,
+// so the remote identifier is only redactable when it is passed in here.
+func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *storage.Apply, remoteID string, settled []*ternv1.SettledControlRequest) {
 	if c.storage == nil || apply == nil || len(settled) == 0 {
 		return
 	}
@@ -1695,13 +1708,21 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 			continue
 		}
 		if entry.Status != string(storage.ControlRequestFailed) {
+			// Only a failure needs mirroring, and completion is handled above. A
+			// newer data plane reporting some other terminal status would drop the
+			// request here, so name it rather than skipping silently.
+			logger.Warn("data plane reported a settled control request in an unrecognized status; it will not reach the operator",
+				append(apply.MutableLogAttrs(),
+					"operation", entry.Operation,
+					"status", entry.Status,
+					"settled_at", entry.SettledAt)...)
 			continue
 		}
 		message := remoteControlRejectionMessage(entry)
 		changed, err := controlStore.RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
 			ApplyID:      apply.ID,
 			Operation:    operation,
-			ErrorMessage: apply.OperatorFacingMessage(message),
+			ErrorMessage: apply.OperatorFacingMessage(message, remoteID),
 			RequestedBy:  entry.RequestedBy,
 		})
 		if err != nil {
@@ -3895,7 +3916,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				logger.Info("mirrored remote volume level onto control-plane apply options",
 					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
 			}
-			c.mirrorRemoteControlRejections(ctx, apply, resp.SettledControlRequests)
+			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
 			terminal := isTerminalProtoState(resp.State)
 			if terminal {

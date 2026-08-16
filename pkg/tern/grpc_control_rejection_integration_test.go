@@ -115,7 +115,7 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 		Status:    string(storage.ControlRequestCompleted),
 	}}
 
-	client.mirrorRemoteControlRejections(ctx, apply, rejection)
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection)
 
 	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
 	require.NoError(t, err)
@@ -136,7 +136,7 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 	// The data plane reports the same rejection on every poll until the
 	// operator retries the operation; mirroring it again must not append a
 	// second entry.
-	client.mirrorRemoteControlRejections(ctx, apply, rejection)
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection)
 	logs, err = stor.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 1, countLogMessages(logs, "Volume was accepted but not applied"),
@@ -182,7 +182,7 @@ func TestGRPCClient_MirrorLeavesAReissuedCommandPending(t *testing.T) {
 
 	// The data plane has not seen the new request yet, so it keeps reporting the
 	// old one it settled.
-	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
 		Operation:    string(storage.ControlOperationCutover),
 		Status:       string(storage.ControlRequestFailed),
 		ErrorMessage: "cutover was not applied because apply is recovering",
@@ -235,8 +235,8 @@ func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *te
 		}}
 	}
 
-	client.mirrorRemoteControlRejections(ctx, apply, rejection("cli:alice"))
-	client.mirrorRemoteControlRejections(ctx, apply, rejection("cli:bob"))
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection("cli:alice"))
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection("cli:bob"))
 
 	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
 	require.NoError(t, err)
@@ -272,7 +272,7 @@ func TestGRPCClient_MirrorRetiresARejectionTheDataPlaneLaterCompleted(t *testing
 	defer cleanup()
 	client.storage = stor
 
-	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
 		Operation:    string(storage.ControlOperationVolume),
 		Status:       string(storage.ControlRequestFailed),
 		ErrorMessage: "throttle endpoint returned 404",
@@ -281,7 +281,7 @@ func TestGRPCClient_MirrorRetiresARejectionTheDataPlaneLaterCompleted(t *testing
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestFailed)
 
 	// The operator re-issues volume; this time the data plane applies it.
-	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
 		Operation:   string(storage.ControlOperationVolume),
 		Status:      string(storage.ControlRequestCompleted),
 		RequestedBy: "cli:alice",
@@ -359,7 +359,7 @@ func TestGRPCClient_MirrorKeepsTheOperatorNameOnALocallyQueuedRequest(t *testing
 	failLocallyQueuedControlRequest(t, dsn, stor, apply.ID, storage.ControlOperationCutover,
 		"octocat", "cutover request was not applied because apply is failed")
 
-	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
 		Operation:    string(storage.ControlOperationCutover),
 		Status:       string(storage.ControlRequestFailed),
 		ErrorMessage: "deploy request is not in a cutover-ready state",
@@ -403,7 +403,7 @@ func TestGRPCClient_MirrorReattributesToANamedOperator(t *testing.T) {
 	failLocallyQueuedControlRequest(t, dsn, stor, apply.ID, storage.ControlOperationCutover,
 		"octocat", "cutover request was not applied because apply is failed")
 
-	client.mirrorRemoteControlRejections(ctx, apply, []*ternv1.SettledControlRequest{{
+	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
 		Operation:    string(storage.ControlOperationCutover),
 		Status:       string(storage.ControlRequestFailed),
 		ErrorMessage: "deploy request is not in a cutover-ready state",
