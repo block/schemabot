@@ -29,6 +29,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewCuttingOverOutput()
 	case PreviewCompleted:
 		previewCompletedOutput()
+	case PreviewRetrying:
+		previewRetryingOutput()
 	case PreviewFailed:
 		previewFailedOutput()
 	case PreviewStopped:

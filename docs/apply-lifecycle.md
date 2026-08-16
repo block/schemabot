@@ -172,10 +172,24 @@ currently **10 attempts**, on top of the original run. The attempt counter is
 visible in the PR progress comment, so you can watch how much budget an apply
 has burned.
 
+Attempts are also **paced**. A failure that reproduces instantly — a refused
+lock, a connection error — would otherwise spend the whole budget in under a
+minute, on exactly the kind of failure a little time was most likely to clear.
+So each attempt arms a wait for the next one: the first couple of retries are
+immediate, and the wait then steps up and holds flat, spreading a fully spent
+budget over roughly ten minutes. The wait is measured from the *start* of an
+attempt, so an attempt that ran longer than its own wait has already spaced
+itself out and retries as soon as it fails. The PR comment and the CLI's
+progress view name the clock time the next attempt is due.
+
+The pacing applies to automatic retries only. An operator `start` runs now, and
+a driver that dies mid-attempt is picked up by a peer as soon as its lease goes
+stale — neither waits out a retry nobody asked for.
+
 ```
  running --(recoverable failure)--> failed_retryable
     ^                                     |
-    |     recovery driver reclaims,       |
+    |     recovery driver reclaims,       |  wait out the backoff
     +---- attempt counter +1, resume <----+
           from checkpoints                |
                                           |  budget spent (10 attempts),

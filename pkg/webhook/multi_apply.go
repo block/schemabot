@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -167,6 +168,15 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
+	}
+	// The armed wait belongs to the apply, not to one deployment of it: an
+	// operation is re-leased for redispatch only while the parent apply is
+	// itself failed_retryable. Carrying the deadline onto a deployment row of a
+	// still-active parent would name a time nothing is going to act on, so a
+	// failed deployment of an otherwise-running rollout reports its state
+	// without promising a retry at a particular moment.
+	if apply.RetryAfter != nil && state.IsState(apply.State, state.Apply.FailedRetryable) {
+		data.RetryAfter = apply.RetryAfter.Format(time.RFC3339)
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

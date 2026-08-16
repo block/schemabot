@@ -6385,3 +6385,27 @@ func TestSetRevertSkippedMetadata(t *testing.T) {
 	setRevertSkippedMetadata(resp, &storage.Apply{RevertSkippedAt: &now})
 	assert.Equal(t, "true", resp.Metadata["revert_skipped"], "flag set once revert_skipped_at is present")
 }
+
+// overlayRetryBudget reports the spent retry budget in every state, so a
+// permanently failed apply still shows how many recoveries were tried, but names
+// the next attempt only while the apply is waiting for one. A claim leaves the
+// armed deadline behind on the row it resumes, so a resumed apply must not
+// advertise a retry that is not coming.
+func TestOverlayRetryBudget(t *testing.T) {
+	due := time.Now().Add(90 * time.Second)
+
+	retrying := &apitypes.ProgressResponse{}
+	overlayRetryBudget(retrying, &storage.Apply{State: state.Apply.FailedRetryable, Attempt: 3, RetryAfter: &due})
+	assert.Equal(t, int32(3), retrying.Attempt)
+	assert.Equal(t, due.Format(time.RFC3339), retrying.RetryAfter)
+
+	resumed := &apitypes.ProgressResponse{}
+	overlayRetryBudget(resumed, &storage.Apply{State: state.Apply.Running, Attempt: 3, RetryAfter: &due})
+	assert.Equal(t, int32(3), resumed.Attempt, "the spent budget stays visible after redispatch")
+	assert.Empty(t, resumed.RetryAfter, "a running apply is not waiting on a retry")
+
+	failed := &apitypes.ProgressResponse{}
+	overlayRetryBudget(failed, &storage.Apply{State: state.Apply.Failed, Attempt: storage.MaxRecoveryAttempts, RetryAfter: &due})
+	assert.Equal(t, int32(storage.MaxRecoveryAttempts), failed.Attempt, "an exhausted budget is the record of what was tried")
+	assert.Empty(t, failed.RetryAfter)
+}

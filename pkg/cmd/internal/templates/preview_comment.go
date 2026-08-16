@@ -364,6 +364,7 @@ func previewCLIApplyAllOutput() {
 		// MySQL: single table
 		{"MYSQL: SINGLE TABLE RUNNING", previewProgressOutput},
 		{"MYSQL: SINGLE TABLE COMPLETED", previewCompletedOutput},
+		{"MYSQL: SINGLE TABLE RETRYING", previewRetryingOutput},
 		{"MYSQL: SINGLE TABLE FAILED", previewFailedOutput},
 		{"MYSQL: SINGLE TABLE STOPPED", previewStoppedOutput},
 		{"MYSQL: SINGLE TABLE WAITING FOR CUTOVER", previewWaitingForCutoverOutput},

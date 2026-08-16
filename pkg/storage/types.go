@@ -18,6 +18,52 @@ import (
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
 
+// retryBackoffStep and retryBackoffCap shape the wait between the automatic
+// redispatches of a failed_retryable apply. Without a wait the budget is spent
+// on whatever failure is fastest to reproduce — a refused lock or a connection
+// error can burn all of MaxRecoveryAttempts inside a minute, which is the case
+// where a retry was most likely to have worked given a little time. Stepping
+// the wait up and then holding it flat keeps the first attempts immediate for a
+// transient blip while spreading the rest of the budget over a window long
+// enough to outlast a rolling restart or a brief target outage.
+const (
+	retryBackoffStep = 30 * time.Second
+	retryBackoffCap  = 90 * time.Second
+)
+
+// RetryBackoff returns how long an apply admitted on this attempt waits before
+// it may be claimed again, where attempt is the value that claim consumed. The
+// first admitted attempt arms no wait, so together with a first interruption
+// that has no attempt to pace from, a transient blip gets two immediate retries.
+// Spending the rest of the budget on waits takes roughly ten minutes of wall
+// clock before MaxRecoveryAttempts terminalizes the apply as failed.
+func RetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		return 0
+	}
+	delay := time.Duration(attempt-1) * retryBackoffStep
+	if delay > retryBackoffCap {
+		return retryBackoffCap
+	}
+	return delay
+}
+
+// AnnouncedRetryAttempt reports the attempt number an interrupted apply's
+// operator-facing surfaces should name, and whether the budget still allows
+// that attempt to happen, where attempt is the apply's stored count of
+// attempts already admitted. The claim path stops admitting at
+// MaxRecoveryAttempts, so past that point the budget is spent and the surfaces
+// name the last attempt made rather than counting past the ceiling: an apply
+// sitting in failed_retryable with a spent budget is waiting to be terminalized,
+// not waiting to retry, and a comment promising one more attempt outlives the
+// apply that could have made it.
+func AnnouncedRetryAttempt(attempt int) (announced int, retryComing bool) {
+	if attempt >= MaxRecoveryAttempts {
+		return MaxRecoveryAttempts, false
+	}
+	return attempt + 1, true
+}
+
 // MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
 // times FindNext will hand out a given delivery (each claim increments
 // attempts) before the row stops being claimable. It bounds the blast radius
@@ -663,6 +709,14 @@ type Apply struct {
 	// Attempt tracks operator retry attempts for failed_retryable applies.
 	// Once the retry budget is exhausted, the apply becomes failed.
 	Attempt int
+
+	// RetryAfter is the earliest time a failed_retryable apply may be claimed
+	// again. It is armed when an attempt is admitted, so the wait is measured
+	// from the start of that attempt: a failure that took longer than its own
+	// backoff has already spaced itself out and retries immediately, while a
+	// failure that returns instantly waits. Nil means no wait — the first
+	// interruption of an apply retries as soon as a driver notices it.
+	RetryAfter *time.Time
 
 	// LeaseOwner identifies the driver that last claimed this apply. It is
 	// operator-facing context; LeaseToken is the ownership capability used for

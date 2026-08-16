@@ -1675,6 +1675,80 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
+// A multi-deployment apply paces its automatic retries off the same armed wait
+// as a single-deployment one: the budget is the parent apply's, so a
+// failed_retryable operation stays unclaimable until the parent's wait elapses.
+// Without this a fan-out whose failure reproduces instantly burns the whole
+// shared budget as fast as the claim loop can spin.
+func TestApplyOperationStore_FindNextApplyOperation_HonorsParentRetryBackoff(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_backoff_gate", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+	require.NoError(t, armRetryBackoff(t, apply.ID))
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, blocked, "a redispatch armed with a wait must not be admitted before the wait elapses")
+
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET retry_after = NOW() - INTERVAL 1 SECOND WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the redispatch is admitted once its wait has elapsed")
+	assert.Equal(t, id, claimed.ID)
+}
+
+// The operation redispatch arms the next wait on the parent apply, the row the
+// claim clause reads it back from. Arming on admission rather than on failure
+// measures the wait from the start of the attempt, so an operation that ran
+// longer than its own backoff retries as soon as it fails.
+func TestApplyOperationStore_FindNextApplyOperation_RedispatchArmsParentRetryBackoff(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_backoff_arm", 1, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ?, updated_at = NOW() WHERE id = ?
+	`, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	// A sibling operation makes this a genuine multi-deployment redispatch,
+	// which is what consumes the parent budget and arms the shared wait.
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.Pending,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	parent, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, parent.RetryAfter, "an admitted redispatch arms the parent's wait for the next one")
+	assert.True(t, parent.RetryAfter.After(time.Now()), "the armed wait is in the future")
+	assert.Equal(t, maxRecoveryAttempts, parent.Attempt, "the redispatch consumes one unit of the parent budget")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesParentBudget
 // verifies OC-5 Part B2: an operation-only redispatch of a failed_retryable
 // operation in a multi-deployment apply consumes one unit of the parent apply's

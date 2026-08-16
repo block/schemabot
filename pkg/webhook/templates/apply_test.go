@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1162,7 +1163,7 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.Contains(t, result, "**Status**: Retrying")
 	// The retry detail lives on the affected table, not in the headline, and
 	// counts the upcoming retry against the operator redispatch budget.
-	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 1/10)")
+	assert.Contains(t, result, "🔄 Retrying · attempt 1/10")
 	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
 	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
 	// Progress summary counts the retrying table.
@@ -1199,7 +1200,58 @@ func TestRenderApplyStatusComment_FailedRetryableCountsAttempts(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 5/10)")
+	assert.Contains(t, result, "🔄 Retrying · attempt 5/10")
+}
+
+// An interrupted apply backs off between attempts, and the comment is not
+// re-rendered while it waits. The retry line names the clock time the next
+// attempt becomes eligible so a watcher can tell a waiting apply from a stalled
+// one, and drops that segment once the wait has elapsed and the retry is due.
+func TestRenderApplyStatusComment_FailedRetryableNextRetry(t *testing.T) {
+	now := time.Date(2026, 8, 15, 14, 30, 0, 0, time.UTC)
+	original := NowFunc
+	t.Cleanup(func() { NowFunc = original })
+	NowFunc = func() time.Time { return now }
+
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.FailedRetryable,
+		ApplyID:     "apply-abc123",
+		Attempt:     2,
+		Tables: []TableProgressData{
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Status: state.Task.FailedRetryable},
+		},
+	}
+
+	data.RetryAfter = now.Add(2 * time.Minute).Format(time.RFC3339)
+	assert.Contains(t, RenderApplyStatusComment(data), "🔄 Retrying · attempt 3/10 · next 14:32 UTC")
+
+	data.RetryAfter = now.Add(-time.Minute).Format(time.RFC3339)
+	due := RenderApplyStatusComment(data)
+	assert.Contains(t, due, "🔄 Retrying · attempt 3/10\n")
+	assert.NotContains(t, due, "next ")
+
+	data.RetryAfter = ""
+	assert.Contains(t, RenderApplyStatusComment(data), "🔄 Retrying · attempt 3/10\n")
+
+	// A claim leaves the armed deadline behind on the row it resumes, so once
+	// the apply is moving again the stored time must not be named.
+	data.RetryAfter = now.Add(2 * time.Minute).Format(time.RFC3339)
+	data.State = state.Apply.Running
+	resumed := RenderApplyStatusComment(data)
+	assert.Contains(t, resumed, "🔄 Retrying · attempt 3/10\n")
+	assert.NotContains(t, resumed, "next ")
+
+	// The claim path stops admitting attempts at the budget ceiling, so the
+	// last attempt names itself rather than a further one, and the deadline it
+	// leaves behind promises nothing.
+	data.State = state.Apply.FailedRetryable
+	data.Attempt = storage.MaxRecoveryAttempts
+	spent := RenderApplyStatusComment(data)
+	assert.Contains(t, spent, "🔄 Retrying · attempt 10/10\n")
+	assert.NotContains(t, spent, "attempt 11/10")
+	assert.NotContains(t, spent, "next ")
 }
 
 // Every apply state must render a human-readable headline. Raw snake_case
@@ -1233,7 +1285,7 @@ func TestRenderApplyStatusComment_FailedRetryableUppercaseStatus(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "🔄 Interrupted — retrying automatically")
+	assert.Contains(t, result, "🔄 Retrying · attempt")
 	assert.NotContains(t, result, "Running...")
 }
 

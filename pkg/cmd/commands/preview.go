@@ -35,8 +35,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	switch previewType {
 	// Basic types
 	case templates.PreviewPlan, templates.PreviewProgress, templates.PreviewWaitingForDeploy, templates.PreviewWaitingForCutover,
-		templates.PreviewCuttingOver, templates.PreviewCompleted, templates.PreviewFailed,
-		templates.PreviewStopped, templates.PreviewStates:
+		templates.PreviewCuttingOver, templates.PreviewCompleted, templates.PreviewRetrying,
+		templates.PreviewFailed, templates.PreviewStopped, templates.PreviewStates:
 		templates.PreviewCLIOutput(previewType)
 	// Lock types
 	case templates.PreviewLockAcquired, templates.PreviewLockConflict,
@@ -173,6 +173,7 @@ Basic Types:
   waiting_for_cutover   Show sample waiting for cutover output
   cutting_over          Show sample cutting over output
   completed             Show sample completed output
+  retrying              Show sample interrupted output (waiting on an automatic retry)
   failed                Show sample failed output
   stopped               Show sample stopped output (mid-apply stop)
   states                Show state display formatting
@@ -276,7 +277,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
   comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
-  comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
+  comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter + next attempt time)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
   comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)

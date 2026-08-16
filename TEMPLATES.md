@@ -3307,7 +3307,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically (attempt 2/10)
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Retrying · attempt 4/10 · next 14:31 UTC
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -4788,6 +4788,31 @@ Single table progress (default):
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ✓ Apply complete!
+
+```
+</details>
+
+<details>
+<summary><a name="mysql-single-table-retrying"></a><strong>MySQL: Single Table Retrying</strong></summary>
+
+```
+
+┌────────────────────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6                 │
+│  State:     Retrying                           │
+│  Retry:     attempt 4/10 · next 14:31:00 UTC   │
+│  Started:   Jan 15 14:26:00 UTC                │
+│  Duration:  4m                                 │
+└────────────────────────────────────────────────┘
+
+  connection reset by peer
+
+
+  ── testapp ──
+
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ Retrying
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
 
 ```
 </details>

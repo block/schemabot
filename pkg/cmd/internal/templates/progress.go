@@ -56,6 +56,11 @@ func FormatKeyspaceHeader(ns string) string {
 // nowFunc returns the current time. Overridden in previews for deterministic output.
 var nowFunc = time.Now
 
+// localZone is the zone absolute clock times render in — an operator reads them
+// against the wall clock in front of them. Overridden in previews so a rendered
+// snapshot does not depend on the zone of the machine that produced it.
+var localZone = time.Local
+
 // volumeBoxRow returns the detail-box row for an operator-set volume level.
 // The level only matters while the engine is actively working (copying,
 // draining, or verifying — volume stays adjustable through the post-copy
@@ -67,6 +72,36 @@ func volumeBoxRow(volume int, applyState string) (BoxRow, bool) {
 		return BoxRow{}, false
 	}
 	return BoxRow{"Volume", fmt.Sprintf("%d/%d", volume, storage.MaxVolume)}, true
+}
+
+// showsFailureCause reports whether the progress view prints the apply's error
+// beneath the detail box. A permanently failed apply and an interrupted one ask
+// the operator the same question — what went wrong, and is it worth waiting on —
+// and only the raw message answers it. Other states have no cause to explain.
+func showsFailureCause(applyState string) bool {
+	return state.IsState(applyState, state.Apply.Failed) ||
+		state.IsState(applyState, state.Apply.FailedRetryable)
+}
+
+// retryBoxRow renders the automatic-retry state of an interrupted apply: how
+// much of the retry budget the next attempt consumes, and the clock time that
+// attempt becomes eligible. The wait is shown as a time rather than a countdown
+// because a watch redraws far more often than the backoff advances. It is
+// omitted once the wait has elapsed — the retry is then due and naming a time in
+// the past would read as a missed deadline — and outside the retrying state,
+// where a spent attempt counter carries no signal.
+func retryBoxRow(data ProgressData) (BoxRow, bool) {
+	if !state.IsState(data.State, state.Apply.FailedRetryable) {
+		return BoxRow{}, false
+	}
+	announced, retryComing := storage.AnnouncedRetryAttempt(data.Attempt)
+	retry := fmt.Sprintf("attempt %d/%d", announced, storage.MaxRecoveryAttempts)
+	if retryComing {
+		if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(nowFunc()) {
+			retry += " · next " + due.In(localZone).Format("15:04:05 MST")
+		}
+	}
+	return BoxRow{"Retry", retry}, true
 }
 
 // WriteProgress writes the schema change progress to stdout.
@@ -106,6 +141,9 @@ func WriteProgress(data ProgressData) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", displayState})
+	if row, ok := retryBoxRow(data); ok {
+		rows = append(rows, row)
+	}
 	if row, ok := volumeBoxRow(data.Volume, data.State); ok {
 		rows = append(rows, row)
 	}
@@ -160,7 +198,7 @@ func WriteProgress(data ProgressData) {
 	WriteBox(rows, "State", colorFn)
 
 	// Error below the box
-	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
+	if showsFailureCause(data.State) && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
 
@@ -410,7 +448,7 @@ func FormatProgressState(s string) string {
 	case state.Apply.Completed:
 		return ANSIGreen + "✓ Completed" + ANSIReset
 	case state.Apply.FailedRetryable:
-		return ANSIYellow + "↻ Retrying" + ANSIReset
+		return ANSIOrange + "↻ Retrying" + ANSIReset
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
@@ -593,7 +631,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	case state.Apply.FailedRetryable:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			retryPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
-			bar := ui.ProgressBar(retryPercent, ui.ColorYellow)
+			bar := ui.ProgressBar(retryPercent, ui.ColorOrange)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Retrying\n", t.TableName, bar)
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Retrying\n", t.TableName)
@@ -1387,7 +1425,7 @@ func stateColorFunc(s string) func(string) string {
 	case state.Apply.Failed:
 		return colorWrap(ANSIRed)
 	case state.Apply.FailedRetryable:
-		return colorWrap(ANSIYellow)
+		return colorWrap(ANSIOrange)
 	case state.Apply.Running, state.Apply.RunningDegraded,
 		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		return colorWrap(ANSICyan)

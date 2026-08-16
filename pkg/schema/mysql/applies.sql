@@ -18,6 +18,7 @@ CREATE TABLE `applies` (
   `error_message` text,
   `options` json NOT NULL,
   `attempt` int NOT NULL DEFAULT '0',
+  `retry_after` datetime(6) DEFAULT NULL,
   `lease_owner` varchar(255) NOT NULL DEFAULT '',
   `lease_token` varchar(64) NOT NULL DEFAULT '',
   `lease_acquired_at` datetime DEFAULT NULL,
