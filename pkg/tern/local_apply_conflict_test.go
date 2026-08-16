@@ -577,14 +577,17 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			want: []string{"table xfers", "task-holding", "apply-holding", "stopped", "started or cancelled"},
 		},
 		{
-			name: "a running apply releases its database on its own",
+			name: "a running apply releases its database on its own, unless it parks for cutover",
 			blocking: blockingTask{
 				taskIdentifier:  "task-holding",
 				table:           "xfers",
 				applyIdentifier: "apply-holding",
 				applyState:      state.Apply.Running,
 			},
-			want: []string{"table xfers", "task-holding", "apply-holding", "running", "releases the database when it finishes"},
+			want: []string{
+				"table xfers", "task-holding", "apply-holding", "running",
+				"releases the database when it finishes", "unless it parks for cutover",
+			},
 		},
 		{
 			name: "a post-copy phase is still the running family",
@@ -617,6 +620,36 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			want: []string{"task task-holding is held by apply apply-holding"},
 		},
 		{
+			name: "a sharded multi-table change still names the shard it holds",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				shard:           "-40",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.Running,
+			},
+			want: []string{"shard -40 (task task-holding)", "apply-holding"},
+		},
+		{
+			name: "a retryable failure rests holding its database, so a decision is owed",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.FailedRetryable,
+			},
+			want: []string{"table xfers", "task-holding", "apply-holding", "failed_retryable", "retried or cancelled"},
+		},
+		{
+			name: "an apply parked at the cutover barrier holds its database until cut over",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.WaitingForCutover,
+			},
+			want: []string{"table xfers", "task-holding", "apply-holding", "waiting_for_cutover", "cut over or cancelled"},
+		},
+		{
 			name: "an apply that could not be loaded still reports what it blocks on",
 			blocking: blockingTask{
 				taskIdentifier: "task-holding",
@@ -632,6 +665,34 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The refusal is a composed sentence an operator reads out of a CLI error, so
+// its shape is part of what is being delivered: the table leads, the task
+// identifier stays attached as the CLI handle, the apply and its state follow,
+// and the resolution hangs off a semicolon. Pinning both branches exactly
+// catches an edit that reorders the parts, drops the parenthesised handle, or
+// loses the separator — all of which every substring assertion still passes.
+func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
+	held := blockingTask{
+		taskIdentifier:  "task-holding",
+		table:           "xfers",
+		shard:           "-40",
+		applyIdentifier: "apply-holding",
+		applyState:      state.Apply.Stopped,
+	}
+	assert.Equal(t,
+		"table xfers shard -40 (task task-holding) is held by apply apply-holding (stopped); "+
+			"a stopped apply keeps its database until it is started or cancelled",
+		held.describe())
+
+	unloadable := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+	}
+	assert.Equal(t,
+		"table xfers (task task-holding) is held by an apply that could not be loaded",
+		unloadable.describe())
 }
 
 // A state whose next move is not certain gets no resolution line rather than a

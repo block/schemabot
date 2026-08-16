@@ -155,29 +155,44 @@ func (b blockingTask) describe() string {
 
 // subject names the work being done, leading with the table an operator
 // recognizes and keeping the task identifier as the handle for the CLI. A
-// multi-table atomic change records no table, so it is named by task alone.
+// multi-table atomic change records no table, so it is named by task alone —
+// but it still names its shard when it has one, because only that shard is
+// held and an operator reading the refusal needs to know which.
 func (b blockingTask) subject() string {
-	if b.table == "" {
+	switch {
+	case b.table == "" && b.shard == "":
 		return fmt.Sprintf("task %s", b.taskIdentifier)
-	}
-	if b.shard == "" {
+	case b.table == "":
+		return fmt.Sprintf("shard %s (task %s)", b.shard, b.taskIdentifier)
+	case b.shard == "":
 		return fmt.Sprintf("table %s (task %s)", b.table, b.taskIdentifier)
+	default:
+		return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
 	}
-	return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
 }
 
 // resolution states what clears the database, which differs by what the holding
-// apply is doing: a stopped apply keeps its database until an operator decides
-// its fate, while a running one releases it on its own. Other active states
-// (pending, cutting over, recovering) get no resolution line rather than a
-// guess — the state is still named, and inventing an action for a state whose
-// next move is not certain would send an operator the wrong way.
+// apply is doing. The resting states each keep their database until an operator
+// decides their fate, and differ only in which decision is owed: a stopped apply
+// waits to be started, a retryable failure waits to be retried, and an apply
+// parked at the cutover barrier waits to be cut over. A running apply is the one
+// case an operator can simply wait out — with the caveat that it may still park:
+// a deferred or ordered cutover moves it to waiting_for_cutover rather than to a
+// terminal state, so the running line promises progress, not release.
+//
+// Other active states (pending, cutting over, recovering) get no resolution line
+// rather than a guess — the state is still named, and inventing an action for a
+// state whose next move is not certain would send an operator the wrong way.
 func (b blockingTask) resolution() string {
 	switch {
 	case state.IsState(b.applyState, state.Apply.Stopped):
 		return "a stopped apply keeps its database until it is started or cancelled"
+	case state.IsState(b.applyState, state.Apply.FailedRetryable):
+		return "a retryable failure keeps its database until the apply is retried or cancelled"
+	case state.IsState(b.applyState, state.Apply.WaitingForCutover):
+		return "an apply parked at the cutover barrier keeps its database until it is cut over or cancelled"
 	case state.IsRunningApplyState(b.applyState):
-		return "it releases the database when it finishes"
+		return "it releases the database when it finishes, unless it parks for cutover first"
 	default:
 		return ""
 	}
