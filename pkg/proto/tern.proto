@@ -633,6 +633,13 @@ message TableProgress {
   // rejection), distinct from the apply-level error_message on
   // ProgressResponse. Empty when the table has not failed.
   string error_message = 16;
+  // The engine's throttler is pausing this table's active phase (row copy or
+  // checksum verify), so stalled row counts read as a deliberate pause rather
+  // than a hang. Cleared when the pause lifts.
+  bool throttled = 17;
+  // Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
+  // 2s"). Empty when throttled is false.
+  string throttle_reason = 18;
 }
 
 // SettledControlRequest reports the fate of a durable control request the

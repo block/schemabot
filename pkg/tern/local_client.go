@@ -2457,6 +2457,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsTotal = t.RowsTotal
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
+		tp.Throttled = t.Throttled
+		tp.ThrottleReason = t.ThrottleReason
 		// For Spirit the stored figure is the runner-wide remaining-copy
 		// estimate stamped on every still-copying table (see
 		// buildSpiritTableProgress), so in a multi-table apply each table

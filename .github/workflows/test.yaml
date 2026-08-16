@@ -91,7 +91,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build"
         run: go build -v ./...
@@ -100,13 +100,19 @@ jobs:
           go vet ./...
           go vet -tags=integration ./...
           go vet -tags=e2e ./e2e/...
+      # Compile (without running) the consumer module's test binary so the
+      # saved cache covers its dependency delta — the module resolves newer
+      # versions than the root go.sum, which the cache key also hashes.
+      - name: "Warm consumer-module cache"
+        working-directory: e2e/consumermodule
+        run: go test -race -run '^$' ./...
       - name: "Save Go cache"
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
 
   unit:
     name: "Unit Tests"
@@ -127,17 +133,38 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-unit
+      - name: "Consumer-module startup test"
+        run: make test-consumer-module
 
   integration:
-    name: "Integration Tests"
+    name: "Integration Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard names are the answer to "which shard ran my test?", so they
+          # name the packages they select rather than describing the split.
+          #
+          # The cross-package suite under ./integration is the longest single
+          # shard and cannot be shortened by package parallelism, so it gets its
+          # own runner rather than setting the wall time for everything else.
+          - shard: ./integration
+            match: "-E"
+          # Every other integration-tagged package: tests that live beside the
+          # code they cover, spread across ./pkg, ./cmd and ./e2e. Selected as
+          # the exact inverse of the grep above, so every package lands in
+          # exactly one shard and a newly added package is picked up here
+          # without touching this file.
+          - shard: per-package
+            match: "-vE"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -151,7 +178,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so transient registry outages
       # surface here as a named, retryable, fail-fast step instead of as many
@@ -168,8 +195,49 @@ jobs:
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
         # MySQL, starving operator claim loops and causing spurious pending-apply
-        # timeouts. Two lanes keeps wall time within the job budget.
-        run: go test -tags=integration -timeout=10m -count=1 -p=2 $(go list -tags=integration ./... | grep -v /localscale)
+        # timeouts. Two packages at a time keeps wall time within the job budget.
+        #
+        # Go's own timeout sits below the job's so a hung test panics with a
+        # goroutine dump naming the culprit, instead of the runner cancelling the
+        # job and leaving a bare "cancelled" that reads like a plain failure. It
+        # is per test binary and starts when that binary does, so the dump is
+        # guaranteed only where a binary's own deadline lands inside the job's:
+        # one starting late in a long shard can still be cancelled without one.
+        env:
+          MATCH: ${{ matrix.match }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          # Anchored at the module root so only the top-level cross-package
+          # suite takes that shard. A future nested package named `integration`
+          # belongs beside the code it covers, in the per-package shard.
+          selector='^github\.com/block/schemabot/integration(/|$)'
+          all=$(go list -tags=integration ./...)
+          set +e
+          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$MATCH" "$selector")
+          selector_status=$?
+          set -e
+          # grep exits 1 when a shard matches nothing and 2 when the selector
+          # itself is unusable. Under `set -e` either would abort here with a
+          # bare exit status, so both are absorbed and reported apart: a broken
+          # selector says so rather than being described as an empty shard.
+          if [ "$selector_status" -gt 1 ]; then
+            echo "::error::shard '$SHARD' selector $selector is unusable (grep exited $selector_status)"
+            exit 1
+          fi
+          # An empty shard would hand `go test` no packages and silently test the
+          # working directory instead, reporting success for work never run.
+          if [ -z "$pkgs" ]; then
+            echo "::error::shard '$SHARD' selected no packages"
+            exit 1
+          fi
+          # Print the selection so a reader can confirm which shard owns a given
+          # test from the log itself, rather than inferring it from the shard
+          # name and this file's grep expressions.
+          echo "::group::shard '$SHARD' runs $(echo "$pkgs" | wc -l | tr -d ' ') packages"
+          echo "$pkgs" | sed 's|^github.com/block/schemabot|.|'
+          echo "::endgroup::"
+          go test -tags=integration -timeout=8m -count=1 -p=2 $pkgs
 
   localscale-matrix:
     name: "LocalScale Matrix"
@@ -240,7 +308,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the image
@@ -278,7 +346,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -331,7 +399,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -398,7 +466,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -507,7 +575,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -556,7 +624,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
@@ -606,7 +674,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
@@ -656,7 +724,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # The runner ships a preinstalled MySQL whose AppArmor profile confines
       # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's
@@ -816,6 +884,34 @@ jobs:
           fi
           if [ "$LOCALSCALE_RESULT" != "success" ]; then
             echo "::error::localscale result=$LOCALSCALE_RESULT"
+            exit 1
+          fi
+
+  integration-rollup:
+    name: "Integration Tests"
+    needs: [changes, integration]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; integration intentionally skipped."
+            exit 0
+          fi
+          # A matrix result is success only when every shard succeeded, so this
+          # cannot pass on a partial run.
+          if [ "$INTEGRATION_RESULT" != "success" ]; then
+            echo "::error::integration result=$INTEGRATION_RESULT"
             exit 1
           fi
 

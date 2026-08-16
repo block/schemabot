@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1308,6 +1309,141 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 		require.NotNil(t, check)
 		assert.Equal(t, githubConfigDiscoveryUnavailableBlock.blockingReason, check.BlockingReason)
 		assert.Contains(t, check.ErrorMessage, githubConfigDiscoveryUnavailableBlock.message)
+	}
+}
+
+// TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap verifies what a PR
+// author sees when their PR changes more files than GitHub will report for a
+// single pull request. SchemaBot never plans from a truncated changed-file
+// list — the part GitHub withheld could contain a schema change — so the
+// aggregate fails closed in every configured environment whether or not the
+// reported files include a schema change. The block is distinct from a GitHub
+// outage and from a configuration error, and the check text names the cap and
+// the remedy instead of telling the author to retry a check that will keep
+// returning the same incomplete list, or leaving the author staring at a
+// required check that never reports.
+func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
+	scenarios := []struct {
+		name          string
+		schemaFile    string
+		schemaVisible bool
+	}{
+		{name: "schema change visible in reported files", schemaFile: "apps/orders/schema/users.sql", schemaVisible: true},
+		{name: "no schema change visible (refactor shape)", schemaFile: "", schemaVisible: false},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			metricsReader := newDispatchMetricsReader(t)
+			svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			// PR metadata is available, so SchemaBot knows the current commit SHA and
+			// can publish the failing aggregates against that SHA.
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.PullRequest{
+					Head: &gh.PullRequestBranch{
+						Ref: new("feature-branch"),
+						SHA: new("abc123"),
+					},
+					Base: &gh.PullRequestBranch{
+						Ref: new("main"),
+						SHA: new("def456"),
+					},
+					User: &gh.User{Login: new("testuser")},
+				})
+			})
+
+			var filePages atomic.Int64
+			servePRFileListPastCap(t, mux, 1, &filePages, tc.schemaFile)
+
+			checkRuns := make(chan checkRunCapture, 10)
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				var body checkRunCapture
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				checkRuns <- body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			})
+
+			h := newE2EHandler(t, svc, client)
+
+			req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+				action:  "opened",
+				headSHA: "abc123",
+				headRef: "feature-branch",
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+
+			seen := map[string]bool{}
+			for i := range 2 {
+				select {
+				case cr := <-checkRuns:
+					seen[cr.Name] = true
+					assert.Equal(t, checkStatusCompleted, cr.Status)
+					assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+					assert.Equal(t, "abc123", cr.HeadSHA)
+					assert.Contains(t, cr.Output.Summary, "more files than GitHub will report for a single pull request",
+						"the check must name the cap that stopped the plan")
+					assert.Contains(t, cr.Output.Summary, "smaller PR",
+						"the check must tell the author how to get a plan")
+				case <-time.After(webhookIntegrationCheckRunDeadline):
+					t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
+				}
+			}
+			assert.True(t, seen["SchemaBot (staging)"])
+			assert.True(t, seen["SchemaBot (production)"])
+			assert.Positive(t, filePages.Load(), "auto-plan must have listed PR files before failing closed")
+
+			// Each aggregate stores the file-cap blocking reason, so an operator can
+			// tell this apart from a GitHub outage or a broken SchemaBot configuration.
+			for _, env := range []string{"staging", "production"} {
+				var check *storage.Check
+				var checkErr error
+				require.Eventually(t, func() bool {
+					check, checkErr = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+					return checkErr == nil && check != nil
+				}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "stored aggregate check should be visible for %s", env)
+				require.NoError(t, checkErr)
+				require.NotNil(t, check)
+				assert.Equal(t, prFileCapExceededBlock.blockingReason, check.BlockingReason)
+				assert.Equal(t, prFileCapExceededBlock.message, check.ErrorMessage)
+			}
+
+			// Both shapes get the same check, so the counter's schema_visible
+			// label is the only place an operator can see how many cap hits look
+			// schema-related versus pure refactors.
+			capPoints := collectCounterPoints(t, metricsReader, "schemabot.github.pr_file_cap_exceeded_total")
+			require.Len(t, capPoints, 1, "the cap must be counted exactly once per auto-plan run")
+			assertStringAttr(t, capPoints[0].Attributes, "repository", "octocat/hello-world")
+			schemaVisible, ok := capPoints[0].Attributes.Value("schema_visible")
+			require.True(t, ok, "the cap counter must carry the schema_visible label")
+			assert.Equal(t, tc.schemaVisible, schemaVisible.AsBool(),
+				"schema_visible must reflect whether the reported prefix showed a schema or config path")
+
+			// Discovery reports the cap as blocked rather than error, keeping a
+			// deterministic property of the PR out of the discovery-error signal
+			// operators watch for outages and broken configuration.
+			var discoveryStatuses []string
+			for _, point := range collectCounterPoints(t, metricsReader, "schemabot.status_check_operations_total") {
+				if operation, found := point.Attributes.Value("operation"); found && operation.AsString() == "schema_config_discovery" {
+					status, hasStatus := point.Attributes.Value("status")
+					require.True(t, hasStatus, "a status-check operation must carry a status")
+					discoveryStatuses = append(discoveryStatuses, status.AsString())
+				}
+			}
+			assert.Equal(t, []string{"blocked"}, discoveryStatuses,
+				"the cap must be reported as blocked, never as a discovery error")
+		})
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,6 +185,8 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
 			ProgressDetail:      t.ProgressDetail,
 			TaskID:              t.TaskId,
@@ -654,7 +657,7 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 // server. It intentionally exposes topology metadata only; connection
 // strings, opaque execution targets, and endpoint addresses stay server-side.
 func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
-	databaseType, err := parseDatabaseListTypeFilter(r)
+	databaseType, err := parseDatabaseListTypeFilter(r, s.config)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -669,14 +672,41 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
+// parseDatabaseListTypeFilter validates the optional ?type= filter against the
+// types actually present in server config — the one source of truth for the
+// type vocabulary — so typos are still caught while embedder-supplied engine
+// types filter the same way as the built-ins.
+func parseDatabaseListTypeFilter(r *http.Request, config *ServerConfig) (string, error) {
 	databaseType := r.URL.Query().Get("type")
-	switch databaseType {
-	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
-		return databaseType, nil
-	default:
-		return "", fmt.Errorf("type must be %q, %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
+	if databaseType == "" {
+		return "", nil
 	}
+	configured := configuredDatabaseTypes(config)
+	if slices.Contains(configured, databaseType) {
+		return databaseType, nil
+	}
+	if len(configured) == 0 {
+		return "", fmt.Errorf("type %q matches no configured database type: no databases are configured on this server", databaseType)
+	}
+	return "", fmt.Errorf("type %q matches no configured database type (configured: %s)", databaseType, strings.Join(configured, ", "))
+}
+
+// configuredDatabaseTypes returns the distinct database types present in
+// server config, sorted for deterministic error messages.
+func configuredDatabaseTypes(config *ServerConfig) []string {
+	if config == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(config.Databases))
+	types := make([]string, 0, len(config.Databases))
+	for _, dbConfig := range config.Databases {
+		if !seen[dbConfig.Type] {
+			seen[dbConfig.Type] = true
+			types = append(types, dbConfig.Type)
+		}
+	}
+	sort.Strings(types)
+	return types
 }
 
 // databaseListResponse builds the sanitized database list, keeping only
@@ -1120,6 +1150,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
+			Throttled:           task.Throttled,
+			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
 			TaskID:              task.TaskIdentifier,
 		}
@@ -1187,6 +1219,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		task.ProgressPercent = int(tp.PercentComplete)
 		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+		task.Throttled = tp.Throttled
+		task.ThrottleReason = tp.ThrottleReason
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
 			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)

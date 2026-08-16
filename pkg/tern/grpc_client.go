@@ -3211,13 +3211,16 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 
 // stampRemoteApplyErrorOnFailedTasks copies a failed remote apply's error
 // message onto its failed stored task rows that carry no error of their own.
-// A remote TableProgress snapshot carries no per-table error text, so a task
-// mirrored to failed from remote progress persists with an empty ErrorMessage
-// even when the remote apply carries the actionable failure reason (for
-// example an engine preflight rejection). The stored task row is what the
-// operator derives the operation row from, so an empty task error would
-// otherwise become an empty operation — and PR-comment — failure reason. A
-// task that already carries its own, more specific error keeps it.
+// The per-table reason normally arrives on the remote TableProgress snapshot
+// and is adopted by syncStoredTasksFromRemoteTasks, but it can be absent — a
+// data plane on an older proto omits the field, and a failure that never
+// reached a specific table (for example an engine preflight rejection) has no
+// per-table text to report. Such a task persists as failed with an empty
+// ErrorMessage even though the remote apply carries the actionable reason. The
+// stored task row is what the operator derives the operation row from, so an
+// empty task error would otherwise become an empty operation — and PR-comment
+// — failure reason. A task that already carries its own, more specific error
+// keeps it.
 func (c *GRPCClient) stampRemoteApplyErrorOnFailedTasks(ctx context.Context, storedApply, remoteApply *storage.Apply, storedTasks []*storage.Task, now time.Time) error {
 	if !state.IsState(remoteApply.State, state.Apply.Failed) || remoteApply.ErrorMessage == "" {
 		return nil
@@ -3409,6 +3412,17 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ETASeconds = int(remoteTask.EtaSeconds)
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
+		}
+		// Throttle state is a point-in-time signal, not cumulative progress:
+		// it is mirrored on every tick — including ticks whose row totals are
+		// kept — so a lifted throttle clears promptly instead of lingering on
+		// the PR comment. The reason travels only with an active throttle and
+		// is bounded here because the remote data plane's reason is untrusted
+		// input for the operator surfaces that render it.
+		storedTask.Throttled = remoteTask.Throttled
+		storedTask.ThrottleReason = ""
+		if remoteTask.Throttled {
+			storedTask.ThrottleReason = engine.SanitizeThrottleReason(remoteTask.ThrottleReason)
 		}
 		// Adopt the remote task's own failure reason (for example an engine
 		// preflight rejection) so the operation row derived from the stored task

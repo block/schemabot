@@ -4550,6 +4550,8 @@ func TestGRPCClient_SyncRemoteProgressMirrorsRowCopySnapshot(t *testing.T) {
 			EtaSeconds:          340,
 			ChecksumRowsChecked: 200,
 			ChecksumRowsTotal:   1000,
+			Throttled:           true,
+			ThrottleReason:      "replica-lag 12s > 10s",
 		},
 	}, time.Now())
 	require.NoError(t, err)
@@ -4561,6 +4563,90 @@ func TestGRPCClient_SyncRemoteProgressMirrorsRowCopySnapshot(t *testing.T) {
 	assert.Equal(t, 340, task.ETASeconds)
 	assert.Equal(t, int64(200), task.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), task.ChecksumRowsTotal)
+	assert.True(t, task.Throttled, "throttle state mirrors from the remote table progress")
+	assert.Equal(t, "replica-lag 12s > 10s", task.ThrottleReason)
+}
+
+func TestGRPCClient_SyncRemoteProgressThrottleContract(t *testing.T) {
+	// Throttle state is a point-in-time signal the PR comment and CLI render
+	// verbatim, so the mirror must enforce its contract on every tick: a
+	// lifted throttle clears even on a snapshot whose row totals are kept, a
+	// reason never survives without the flag, and a remote reason is bounded
+	// before it can reach an operator surface.
+	apply := &storage.Apply{
+		ID:              22,
+		ApplyIdentifier: "apply-throttle-contract",
+		Database:        "testdb",
+		Environment:     "staging",
+		ExternalID:      "remote-throttle-contract",
+		State:           state.Apply.Running,
+	}
+	newThrottledTask := func() *storage.Task {
+		return &storage.Task{
+			ID:             35,
+			TaskIdentifier: "task-throttle-contract",
+			ApplyID:        apply.ID,
+			Namespace:      "default",
+			TableName:      "orders",
+			State:          state.Task.Running,
+			RowsCopied:     450,
+			RowsTotal:      1000,
+			Throttled:      true,
+			ThrottleReason: "replica-lag 12s > 10s",
+		}
+	}
+	sync := func(t *testing.T, task *storage.Task, remote *ternv1.TableProgress) {
+		t.Helper()
+		client := &GRPCClient{
+			storage: &mockStorage{
+				tasks: &mockTaskStore{tasks: []*storage.Task{task}},
+				logs:  &mockApplyLogStore{},
+			},
+		}
+		remote.Namespace = "default"
+		remote.TableName = "orders"
+		remote.Status = state.Task.Running
+		err := client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{task}, []*ternv1.TableProgress{remote}, time.Now())
+		require.NoError(t, err)
+	}
+
+	t.Run("a lifted throttle clears on a snapshot with omitted row totals", func(t *testing.T) {
+		task := newThrottledTask()
+		sync(t, task, &ternv1.TableProgress{})
+
+		assert.Equal(t, int64(450), task.RowsCopied, "the stored row-copy progress survives the omitted totals")
+		assert.Equal(t, int64(1000), task.RowsTotal)
+		assert.False(t, task.Throttled, "the throttle flag mirrors the snapshot even when row totals are kept")
+		assert.Empty(t, task.ThrottleReason)
+	})
+
+	t.Run("a reason without the flag is dropped", func(t *testing.T) {
+		task := newThrottledTask()
+		sync(t, task, &ternv1.TableProgress{
+			RowsCopied:     500,
+			RowsTotal:      1000,
+			ThrottleReason: "replica-lag 12s > 10s",
+		})
+
+		assert.False(t, task.Throttled)
+		assert.Empty(t, task.ThrottleReason, "an unthrottled task never carries a reason")
+	})
+
+	t.Run("a remote reason is sanitized before it is stored", func(t *testing.T) {
+		task := newThrottledTask()
+		sync(t, task, &ternv1.TableProgress{
+			RowsCopied:     500,
+			RowsTotal:      1000,
+			Throttled:      true,
+			ThrottleReason: "replica-lag\n12s | " + strings.Repeat("threads-running 130 > 128; ", 20),
+		})
+
+		assert.True(t, task.Throttled)
+		assert.NotContains(t, task.ThrottleReason, "\n", "newlines collapse before storage")
+		assert.NotContains(t, task.ThrottleReason, "|", "table separators are neutralized before storage")
+		assert.LessOrEqual(t, len(task.ThrottleReason), 200, "an overlong remote reason is clamped")
+		assert.True(t, strings.HasSuffix(task.ThrottleReason, "…"))
+	})
 }
 
 func TestGRPCClient_PollSetsTerminalTaskMetadataFromRemoteTaskProgress(t *testing.T) {

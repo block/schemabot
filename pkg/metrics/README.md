@@ -25,7 +25,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | environment, event_type, action, repository, status | GitHub webhook events |
+| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status | GitHub webhook events (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
@@ -34,6 +34,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
+| `schemabot.github.pr_file_cap_exceeded_total` | Counter | environment, repository, schema_visible | Auto-plan runs failed closed because the PR changes more files than GitHub will report for a single PR. Deterministic per PR, not an outage. Every over-cap PR gets the same cap-specific blocking check; `schema_visible` records whether the reported files include a schema or config path (`true`: the PR plausibly carries a schema change that needs a smaller PR; `false`: the visible files look like a pure refactor) |
 | `schemabot.github.rate_limit.limit` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit for the observed API resource |
 | `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
@@ -106,11 +107,11 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 
-**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`
+**status** (webhooks): `processed`, `invalid_signature`, `ignored`, `repo_not_configured`, `app_repo_mismatch`, `installation_resolution_failed`, `durable_enqueue_failed`, `durable_command_not_ready`, `durable_command_routing_blocked`, `durable_command_unrouted`, `durable_dispatch_started`, `durable_dispatch_retrying`, `durable_dispatch_failed`, `durable_dispatch_failed_permanent`, `durable_dispatch_completed`, `durable_dispatch_superseded`
 
-**state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `unknown`
+**state** (webhook inbox): `pending`, `processing`, `failed_retryable`, `completed`, `failed`, `failed_permanent`, `superseded`, `unknown`
 
-**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `released`, `lease_lost`, `finish_error`, `unknown`
+**outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
 **operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
@@ -123,6 +124,28 @@ available, such as `repository`, `github_app`, and `installation_id`.
 **reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_lease_release_error`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
+
+### Webhook Ownership Rejections
+
+A webhook whose signing App does not own the target repository is rejected with
+401 and counted on `schemabot.webhook.events_total` under one of two statuses.
+They separate routine traffic from an actionable trust-boundary signal, so alert
+on the second and never on the first:
+
+| Status | Meaning | Operator action |
+|---|---|---|
+| `repo_not_configured` | The repository has no entry in `repos:` at all. A shared App forwards deliveries for every repository it is installed on, so this is expected background traffic. | None. Onboard the repository if the deliveries were meant to be handled. |
+| `app_repo_mismatch` | The repository *is* declared, but the App that signed the delivery is not the App configured to own it. This is config drift or a hostile install. | Investigate: compare the delivery's `app_name` against the repository's `github_app:` mapping. |
+
+`repo_not_configured` deliberately carries **no `repository` attribute** —
+unmanaged repository names are unbounded and would blow up the metric's
+cardinality. Do not build a query that facets `repo_not_configured` by
+repository; the rejection's debug log line carries the repository name for
+one-off triage. `app_repo_mismatch` does carry `repository`, because a declared
+repository is a bounded set.
+
+Both statuses are rejections: the request fails closed with 401 either way, and
+the severity split exists only so a warn-level triage scan stays actionable.
 
 ### Check Ownership Misses
 
@@ -195,7 +218,7 @@ Operation values:
 | `aggregate_check_sync` | SchemaBot tried to make the visible aggregate GitHub Check Run match stored per-database check state. The status label says whether it created/updated, skipped, blocked, or failed. |
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |
 | `stale_check_reconciliation` | SchemaBot repaired stale `in_progress` stored check state by comparing it with authoritative apply state after a driver restart, crash, or race. |
-| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. |
+| `schema_config_discovery` | SchemaBot discovered managed schema configs for the PR before deciding what to plan or which aggregate checks to publish. `status="blocked"` means discovery could not run against a complete changed-file list — today that is a PR over GitHub's per-PR file cap — so the aggregate fails closed instead of planning from a partial diff. |
 | `schema_config_source_policy` | SchemaBot evaluated whether a discovered `schemabot.yaml` path is inside this repository's server-owned `allowed_dirs` boundary. `status="skipped"` means the config is outside the managed paths and was ignored; `status="error"` means the config is in a managed path but cannot be routed safely. |
 | `schema_config_environment_validation` | SchemaBot found schema changes but none of the database's server-configured environments are allowed for this deployment, so it failed the aggregate check closed. |
 
@@ -206,6 +229,16 @@ still matters. For example, commit A can add a schema change and start an apply,
 then commit B can remove that schema change before the apply finishes. SchemaBot
 blocks the aggregate Check Run for commit B until an operator decides whether
 the target environment needs another apply, a rollback, or manual reconciliation.
+
+`status="blocked"` for `operation="schema_config_discovery"` is a different
+signal: it counts PRs so large that GitHub will not report their full
+changed-file list, so it tracks PR size rather than stored-state trouble. It is
+deterministic per PR — the same PR blocks on every delivery until it is split —
+and the author is told to split the PR, so no operator action is needed unless
+the rate is high enough to suggest a repository routinely opening PRs SchemaBot
+cannot plan. Pair it with `schemabot.github.pr_file_cap_exceeded_total`, whose
+`schema_visible` label says how many of those PRs looked schema-related.
+
 A spike in `status="error"` usually points to storage or GitHub API failures and
 should be investigated before relying on branch-protection state.
 

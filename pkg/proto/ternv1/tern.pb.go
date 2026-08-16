@@ -2288,9 +2288,16 @@ type TableProgress struct {
 	// The table's own failure reason (for example an engine preflight
 	// rejection), distinct from the apply-level error_message on
 	// ProgressResponse. Empty when the table has not failed.
-	ErrorMessage  string `protobuf:"bytes,16,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ErrorMessage string `protobuf:"bytes,16,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// The engine's throttler is pausing this table's active phase (row copy or
+	// checksum verify), so stalled row counts read as a deliberate pause rather
+	// than a hang. Cleared when the pause lifts.
+	Throttled bool `protobuf:"varint,17,opt,name=throttled,proto3" json:"throttled,omitempty"`
+	// Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
+	// 2s"). Empty when throttled is false.
+	ThrottleReason string `protobuf:"bytes,18,opt,name=throttle_reason,json=throttleReason,proto3" json:"throttle_reason,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TableProgress) Reset() {
@@ -2431,6 +2438,20 @@ func (x *TableProgress) GetChecksumRowsTotal() int64 {
 func (x *TableProgress) GetErrorMessage() string {
 	if x != nil {
 		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *TableProgress) GetThrottled() bool {
+	if x != nil {
+		return x.Throttled
+	}
+	return false
+}
+
+func (x *TableProgress) GetThrottleReason() string {
+	if x != nil {
+		return x.ThrottleReason
 	}
 	return ""
 }
@@ -3783,7 +3804,7 @@ const file_tern_proto_rawDesc = "" +
 	"\veta_seconds\x18\x05 \x01(\x03R\n" +
 	"etaSeconds\x12)\n" +
 	"\x10cutover_attempts\x18\x06 \x01(\x05R\x0fcutoverAttempts\x120\n" +
-	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\xd2\x04\n" +
+	"\x14last_cutover_attempt\x18\a \x01(\tR\x12lastCutoverAttemptJ\x04\b\b\x10\tR\x11ready_to_complete\"\x99\x05\n" +
 	"\rTableProgress\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x1d\n" +
@@ -3807,7 +3828,9 @@ const file_tern_proto_rawDesc = "" +
 	"changeType\x122\n" +
 	"\x15checksum_rows_checked\x18\x0e \x01(\x03R\x13checksumRowsChecked\x12.\n" +
 	"\x13checksum_rows_total\x18\x0f \x01(\x03R\x11checksumRowsTotal\x12#\n" +
-	"\rerror_message\x18\x10 \x01(\tR\ferrorMessage\"\xb4\x01\n" +
+	"\rerror_message\x18\x10 \x01(\tR\ferrorMessage\x12\x1c\n" +
+	"\tthrottled\x18\x11 \x01(\bR\tthrottled\x12'\n" +
+	"\x0fthrottle_reason\x18\x12 \x01(\tR\x0ethrottleReason\"\xb4\x01\n" +
 	"\x15SettledControlRequest\x12\x1c\n" +
 	"\toperation\x18\x01 \x01(\tR\toperation\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\x12#\n" +

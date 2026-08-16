@@ -12,6 +12,7 @@ SchemaBot is a declarative schema GitOps orchestrator for MySQL via Spirit and V
 make build                # Build binary → bin/schemabot
 make test                 # Run ALL tests (unit + integration + e2e)
 make test-unit            # Unit tests only (fast, no containers)
+make test-consumer-module # Consumer-module startup tests (fast, no containers)
 make test-integration     # Integration tests (testcontainers)
 make test-e2e             # E2E tests (docker-compose: local + gRPC)
 make test-e2e-local       # E2E local tests only
@@ -31,15 +32,16 @@ make lint                 # golangci-lint via Docker
 
 ## Test Architecture
 
-Three test layers, each with its own make target and CI job:
+Four test layers, each with its own make target:
 
 - **Unit** (`make test-unit`, `./...`) — No containers, no network. Fast. Tests individual functions and packages with `-race`.
+- **Consumer module** (`make test-consumer-module`, `e2e/consumermodule/`) — No containers, no network, no build tags. A nested Go module that embeds schemabot the way a host binary does, pinning newer dependency versions than this repo to prove the public startup surface tolerates version skew. Runs in the Unit Tests CI job. Module-boundary tests belong here.
 - **Integration** (`make test-integration`, `-tags=integration ./...`) — A mix of Docker containers (MySQL via testcontainers) and in-process server/gRPC components. Tests cross-package interactions without requiring a full deployment. Lives in `pkg/` and `integration/`.
 - **E2E** (`make test-e2e`, `-tags=e2e ./e2e/...`) — Full docker-compose stack. All components (SchemaBot server, MySQL instances) are real containers — nothing is in-process or mocked. Tests the CLI against a running system. Lives in `e2e/local/` and `e2e/grpc/`.
 
-Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2E tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all three layers are the only safe way to evolve SchemaBot.
+Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2E tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all layers are the only safe way to evolve SchemaBot.
 
-CI mirrors local dev exactly — each job runs the corresponding make target.
+CI mirrors local dev — every CI test job runs make targets, not bespoke commands. The Unit Tests job runs `make test-unit` followed by `make test-consumer-module`; the other jobs each run their single corresponding target. The Integration job is the exception: it splits the packages across two runners, leaves out the LocalScale packages that have their own job, and gives Go a timeout below the job's so a hung test panics with a goroutine dump naming the culprit. `make test-integration` runs everything in one pass on the make target's own timeout, so a CI-only timeout will not necessarily reproduce locally.
 
 ## Git
 

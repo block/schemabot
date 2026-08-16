@@ -1970,6 +1970,19 @@ func (e *DatabaseNotConfiguredError) Error() string {
 	return fmt.Sprintf("database %q is not configured on this server", e.Database)
 }
 
+// EnvironmentNotConfiguredError reports that a configured database has no
+// entry for the requested environment. Callers use it to distinguish a
+// caller-supplied environment miss from server-side configuration failures
+// such as an invalid deployments map.
+type EnvironmentNotConfiguredError struct {
+	Database    string
+	Environment string
+}
+
+func (e *EnvironmentNotConfiguredError) Error() string {
+	return fmt.Sprintf("database %q environment %q is not configured on this server", e.Database, e.Environment)
+}
+
 // DatabaseEnvironments returns the environments configured server-side for a
 // database, ordered by the database's effective promotion order. Returns
 // *DatabaseNotConfiguredError when the database has no registry entry.
@@ -2101,11 +2114,11 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 	}
 	dbConfig := c.Database(database)
 	if dbConfig == nil {
-		return nil, fmt.Errorf("database %q is not configured on this server", database)
+		return nil, &DatabaseNotConfiguredError{Database: database}
 	}
 	envConfig, ok := dbConfig.Environments[environment]
 	if !ok {
-		return nil, fmt.Errorf("database %q environment %q is not configured on this server", database, environment)
+		return nil, &EnvironmentNotConfiguredError{Database: database, Environment: environment}
 	}
 
 	if envConfig.HasLocalDSN() {
@@ -2203,13 +2216,20 @@ func (c *ServerConfig) TrustedCheckAppSlugsForRepo(repo string) []string {
 	return app.Config.TrustedCheckAppSlugs
 }
 
+// ErrRepoNotConfigured reports that a repository has no entry in the repos
+// config at all — as opposed to a declared repo whose App mapping is broken.
+// Callers use it to tell routine traffic from unmanaged repositories apart
+// from a misconfigured managed repository.
+var ErrRepoNotConfigured = errors.New("repository is not declared in the repos config")
+
 // ResolveGitHubAppForRepo returns the GitHub App that owns webhooks and
 // outbound GitHub API calls for the given repository.
 //
 // Resolution rules:
 //   - If ServerConfig.Apps is configured, the repo MUST be declared in
 //     ServerConfig.Repos with a non-empty GitHubApp that names an entry in
-//     ServerConfig.Apps. Unknown repos or unknown app names return an error.
+//     ServerConfig.Apps. Unknown repos return an error wrapping
+//     ErrRepoNotConfigured; unknown app names return an error.
 //   - Otherwise the legacy single-App ServerConfig.GitHub is returned under
 //     the synthetic name "default" so callers can treat both shapes uniformly.
 //   - If neither Apps nor a configured GitHub is present, an error is returned.
@@ -2220,7 +2240,7 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 	if len(c.Apps) > 0 {
 		repoConfig, ok := c.Repos[repo]
 		if !ok {
-			return ResolvedGitHubApp{}, fmt.Errorf("repository %q is not declared in the repos config", repo)
+			return ResolvedGitHubApp{}, fmt.Errorf("repository %q: %w", repo, ErrRepoNotConfigured)
 		}
 		if repoConfig.GitHubApp == "" {
 			return ResolvedGitHubApp{}, fmt.Errorf("repository %q is missing github_app", repo)

@@ -1174,6 +1174,23 @@ func PreviewCommentApplyProgress() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
+// PreviewCommentApplyThrottled renders an apply comment where the active row
+// copy is paused by the engine's throttler, so the stalled bar reads as a
+// deliberate slowdown with its trigger named rather than a hang.
+func PreviewCommentApplyThrottled() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Running
+	tables[1].RowsCopied = 914707
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 62
+	tables[1].ETASeconds = 195
+	tables[1].Throttled = true
+	tables[1].ThrottleReason = "commit-latency 112.4ms >= 100ms"
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyCatchingUp renders an apply comment where a table has
 // finished copying and is draining the changes that accumulated during the copy.
 func PreviewCommentApplyCatchingUp() string {

@@ -1780,6 +1780,195 @@ func TestPullSchemaHandlerRoutesPrimaryDeployment(t *testing.T) {
 	assert.Nil(t, usClient.pullSchemaReq, "non-primary deployment must not be pulled")
 }
 
+// newTypeVocabularyService configures one database on a single production
+// deployment, backed by the given storage and tern client. Server config is
+// the one source of truth for the type vocabulary, so the database type can be
+// a built-in constant or an embedder-supplied custom type.
+func newTypeVocabularyService(t *testing.T, st storage.Storage, client *mockTernClient, database, databaseType, deployment string) *Service {
+	t.Helper()
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			database: {
+				Type: databaseType,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: database + "-production", Deployment: deployment},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			deployment: {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(st, cfg, map[string]tern.Client{deployment + "/production": client}, logger)
+}
+
+// The declared type is validated against server config — the one source of
+// truth for the type vocabulary — so a request for a database configured with
+// a custom engine type reaches the data plane, whose verdict then decides the
+// outcome.
+func TestPullSchemaHandlerAcceptsConfiguredCustomType(t *testing.T) {
+	client := &mockTernClient{pullSchemaErr: fmt.Errorf("engine does not support schema pull: %w", tern.ErrPullSchemaUnsupportedType)}
+	svc := newTypeVocabularyService(t, &mockStorage{}, client, "orders", "cockroach", "primary")
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","environment":"production","type":"cockroach"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotImplemented, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "pull schema is not supported for cockroach databases on this deployment")
+	require.NotNil(t, client.pullSchemaReq, "the pull must be dispatched to the data plane")
+}
+
+// A declared type that disagrees with the server's configured type for the
+// database is a caller defect, rejected as a 400 with both types named.
+func TestPullSchemaHandlerRejectsMismatchedTypeAsBadRequest(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newTypeVocabularyService(t, &mockStorage{}, client, "orders", "cockroach", "primary")
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","environment":"production","type":"mysql"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Contains(t, resp.Error, `type "mysql" does not match server config type "cockroach"`)
+	assert.Nil(t, client.pullSchemaReq, "a mismatched request must not reach the data plane")
+}
+
+// A pull request naming a database or environment absent from server config is
+// a caller defect: it is rejected as a 400 naming the missing route, never a
+// server failure, and never reaches the data plane.
+func TestPullSchemaHandlerRejectsUnknownRouteAsBadRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantBody string
+	}{
+		{
+			name:     "unknown database",
+			body:     `{"database":"nonexistent","environment":"production","type":"cockroach"}`,
+			wantBody: `database "nonexistent" is not configured on this server`,
+		},
+		{
+			name:     "unknown environment",
+			body:     `{"database":"orders","environment":"sandbox","type":"cockroach"}`,
+			wantBody: `database "orders" environment "sandbox" is not configured on this server`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mockTernClient{}
+			svc := newTypeVocabularyService(t, &mockStorage{}, client, "orders", "cockroach", "primary")
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			var resp apitypes.ErrorResponse
+			require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+			assert.Contains(t, resp.Error, tt.wantBody)
+			assert.Nil(t, client.pullSchemaReq, "an unroutable request must not reach the data plane")
+		})
+	}
+}
+
+// A plan request for a database configured with a custom engine type is
+// dispatched to the data plane carrying the config-resolved type: server
+// config is the one source of truth for the type vocabulary, and the data
+// plane decides whether it can plan the change.
+func TestPlanHandlerAcceptsConfiguredCustomType(t *testing.T) {
+	client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-custom-type"}}
+	st := &mockStorageWithPlanLookup{plans: &capturingPlanStore{}}
+	svc := newTypeVocabularyService(t, st, client, "orders", "cockroach", "primary")
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	body := `{"database":"orders","environment":"production","type":"cockroach","schema_files":{"orders":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	mux.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, client.planReq, "the plan must be dispatched to the data plane")
+	assert.Equal(t, "cockroach", client.planReq.Type)
+	assert.Equal(t, "orders-production", client.planReq.Target)
+	var resp apitypes.PlanResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, "plan-custom-type", resp.PlanID)
+}
+
+// A plan request must declare the database type; a declared type that
+// disagrees with server config, or a database/environment absent from server
+// config, is a caller defect rejected as a 400.
+func TestPlanHandlerValidatesTypeAgainstServerConfig(t *testing.T) {
+	svc := newTypeVocabularyService(t, &mockStorage{}, &mockTernClient{}, "payments", storage.DatabaseTypeMySQL, DefaultDeployment)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	tests := []struct {
+		name     string
+		body     string
+		wantCode int
+		wantBody string
+	}{
+		{
+			name:     "missing type",
+			body:     `{"database":"payments","environment":"production","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`,
+			wantCode: http.StatusBadRequest,
+			wantBody: "type is required",
+		},
+		{
+			name:     "mismatched type",
+			body:     `{"database":"payments","environment":"production","type":"vitess","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`,
+			wantCode: http.StatusBadRequest,
+			wantBody: `type "vitess" does not match server config type "mysql"`,
+		},
+		{
+			name:     "unknown database",
+			body:     `{"database":"nonexistent","environment":"production","type":"garbage","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`,
+			wantCode: http.StatusBadRequest,
+			wantBody: `database "nonexistent" is not configured on this server`,
+		},
+		{
+			name:     "unknown environment",
+			body:     `{"database":"payments","environment":"sandbox","type":"mysql","schema_files":{"payments":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`,
+			wantCode: http.StatusBadRequest,
+			wantBody: `database "payments" environment "sandbox" is not configured on this server`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, tt.wantCode, w.Code, w.Body.String())
+			var resp apitypes.ErrorResponse
+			require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+			assert.Contains(t, resp.Error, tt.wantBody)
+		})
+	}
+}
+
 func TestExecuteApplySourcePolicyAllowsDirectPlan(t *testing.T) {
 	plan := &storage.Plan{
 		ID:             42,
@@ -2687,19 +2876,16 @@ func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
 	assert.Equal(t, "accounts", resp.Databases[0].Database)
 	assert.Equal(t, storage.DatabaseTypeVitess, resp.Databases[0].Type)
 
+	// The type filter validates against the types present in server config, so
+	// a type with no configured databases — built-in or not — is rejected with
+	// the configured vocabulary named, instead of silently returning an empty
+	// list for a filter that can never match.
 	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=strata", nil)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Empty(t, resp.Databases)
-
-	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=postgres", nil)
-	w = httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.Empty(t, resp.Databases)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `type \"strata\" matches no configured database type`)
+	assert.Contains(t, w.Body.String(), "mysql, vitess")
 
 	// A name filter is a case-insensitive substring match, so a family
 	// prefix selects every shard-style database that contains it.
@@ -2745,7 +2931,27 @@ func TestDatabaseListSanitizesConfigAndReportsTopology(t *testing.T) {
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
-	assert.Contains(t, w.Body.String(), "type must be")
+	assert.Contains(t, w.Body.String(), `type \"cockroach\" matches no configured database type`)
+	assert.Contains(t, w.Body.String(), "mysql, vitess")
+}
+
+// A server configured with a custom engine type accepts that type as a list
+// filter: the filter vocabulary comes from server config, not a fixed list.
+func TestDatabaseListFiltersByConfiguredCustomType(t *testing.T) {
+	svc := newTypeVocabularyService(t, &mockStorage{}, &mockTernClient{}, "orders", "cockroach", "primary")
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?type=cockroach", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+	assert.Equal(t, "cockroach", resp.Databases[0].Type)
 }
 
 func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {

@@ -10,12 +10,11 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/storage"
 )
 
 // DatabasesCmd lists databases configured on the SchemaBot server.
 type DatabasesCmd struct {
-	Type string `help:"Database type filter (mysql, vitess, strata, or postgres)"`
+	Type string `help:"Only show databases of this type; the server validates the value against its configured database types"`
 	Name string `help:"Only show databases whose name contains this string, case-insensitively; a family prefix like omnibus matches every shard"`
 	JSON bool   `help:"Output as JSON"`
 }
@@ -24,9 +23,6 @@ type DatabasesCmd struct {
 func (cmd *DatabasesCmd) Run(g *Globals) error {
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
 	if err != nil {
-		return err
-	}
-	if err := validateDatabaseListType(cmd.Type); err != nil {
 		return err
 	}
 	// The server treats a whitespace-only name filter as absent; trim here so
@@ -47,15 +43,6 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 		return writeJSON(resp)
 	}
 	return writeDatabaseList(os.Stdout, resp, name)
-}
-
-func validateDatabaseListType(databaseType string) error {
-	switch databaseType {
-	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
-		return nil
-	default:
-		return fmt.Errorf("--type must be %q, %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
-	}
 }
 
 func writeDatabaseList(w io.Writer, resp *apitypes.DatabaseListResponse, nameFilter string) error {

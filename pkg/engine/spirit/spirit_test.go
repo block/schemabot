@@ -245,6 +245,59 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Equal(t, int64(1000), got[0].ChecksumRowsTotal)
 	})
 
+	// Spirit's throttle status is runner-wide but only meaningful to tables
+	// participating in the paced phase: a table still copying, or every table
+	// during the checksum verify. A table whose copy finished while others
+	// still copy must not render as paused by their throttling.
+	t.Run("throttle reaches copying tables, not completed ones", func(t *testing.T) {
+		prog := status.Progress{
+			Throttle: status.ThrottleStatus{Throttled: true, Reason: "replica-lag 12s > 10s"},
+			Tables: []status.TableProgress{
+				{TableName: "users", RowsCopied: 45000, RowsTotal: 100000},
+				{TableName: "orders", RowsCopied: 1000, RowsTotal: 1000, IsComplete: true},
+			},
+		}
+		got := buildSpiritTableProgress(prog, status.CopyRows, ddlByTable, tableNamespace)
+		require.Len(t, got, 2)
+
+		copying := got[0]
+		assert.True(t, copying.Throttled)
+		assert.Equal(t, "replica-lag 12s > 10s", copying.ThrottleReason)
+
+		completed := got[1]
+		assert.False(t, completed.Throttled, "a finished copy is not paused by another table's throttle")
+		assert.Empty(t, completed.ThrottleReason)
+	})
+
+	// The reason travels only with the flag: an unthrottled table carries no
+	// reason, even if the runner reports leftover reason text.
+	t.Run("a reason without the throttled flag is not stamped", func(t *testing.T) {
+		prog := status.Progress{
+			Throttle: status.ThrottleStatus{Throttled: false, Reason: "replica-lag 2s > 10s"},
+			Tables:   []status.TableProgress{{TableName: "users", RowsCopied: 45000, RowsTotal: 100000}},
+		}
+		got := buildSpiritTableProgress(prog, status.CopyRows, ddlByTable, tableNamespace)
+		require.Len(t, got, 1)
+		assert.False(t, got[0].Throttled)
+		assert.Empty(t, got[0].ThrottleReason)
+	})
+
+	// The checksum verify runs only after every copy completes, so a throttled
+	// verify is stamped on the completed tables — otherwise it would never
+	// surface at all.
+	t.Run("throttle reaches completed tables during checksum", func(t *testing.T) {
+		prog := status.Progress{
+			Throttle: status.ThrottleStatus{Throttled: true, Reason: "threads-running 130 > 128"},
+			Tables: []status.TableProgress{
+				{TableName: "users", RowsCopied: 1000, RowsTotal: 1000, IsComplete: true},
+			},
+		}
+		got := buildSpiritTableProgress(prog, status.Checksum, ddlByTable, tableNamespace)
+		require.Len(t, got, 1)
+		assert.True(t, got[0].Throttled)
+		assert.Equal(t, "threads-running 130 > 128", got[0].ThrottleReason)
+	})
+
 	notReady := []struct {
 		name string
 		eta  status.ETA
