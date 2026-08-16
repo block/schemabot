@@ -876,8 +876,8 @@ func previewFailedOutput() {
 // previewRetryingOutput shows an apply between automatic recovery attempts: the
 // drive was interrupted mid-copy, part of the retry budget is spent, and the
 // next attempt is armed for a fixed time. The Retry row is what tells an
-// operator this apply is waiting rather than wedged. The next-attempt time is
-// derived from the real backoff policy so the preview cannot drift from it.
+// operator this apply is waiting rather than wedged. The wait is the one the
+// real policy arms for this attempt, so the preview cannot drift from it.
 func previewRetryingOutput() {
 	data := ProgressData{
 		State:        state.Apply.FailedRetryable,
@@ -886,7 +886,7 @@ func previewRetryingOutput() {
 		StartedAt:    previewTime.Add(-4 * time.Minute).Format(time.RFC3339),
 		ErrorMessage: "connection reset by peer",
 		Attempt:      3,
-		RetryAfter:   previewTime.Add(storage.RetryBackoff(4)).Format(time.RFC3339),
+		RetryAfter:   previewTime.Add(storage.RetryBackoff(3)).Format(time.RFC3339),
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "testapp",

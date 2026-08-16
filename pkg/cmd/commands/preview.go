@@ -277,7 +277,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_completed       Multi-table: completed (all tables done)
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
   comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
-  comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
+  comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter + next attempt time)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
   comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)

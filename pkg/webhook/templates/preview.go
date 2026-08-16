@@ -1428,7 +1428,7 @@ func PreviewCommentApplyRetrying() string {
 	tables[2].Status = state.Task.Pending
 	data := sampleApplyData(state.Apply.FailedRetryable, tables)
 	data.Attempt = 3
-	data.RetryAfter = NowFunc().Add(storage.RetryBackoff(data.Attempt + 1)).UTC().Format(time.RFC3339)
+	data.RetryAfter = NowFunc().Add(storage.RetryBackoff(data.Attempt)).UTC().Format(time.RFC3339)
 	return RenderApplyStatusComment(data)
 }
 
