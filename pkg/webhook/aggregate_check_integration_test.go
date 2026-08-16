@@ -1317,6 +1317,45 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	}
 }
 
+// A failing aggregate's Check Run output is a public PR surface: when the
+// plan error carries internal connection detail (DSN fragments, host:port
+// endpoints, IP addresses), the published summary must render with those
+// redacted while keeping the actionable part of the error intact.
+func TestE2EFailingAggregateSummaryRedactsEndpoints(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+	ctx := t.Context()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "abc123")
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+
+	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
+		"staging": "plan schema change: dial tcp db-primary.internal.example.com:3306: connect: connection refused (dsn user:secret@tcp(10.2.3.4:3306)/appdb)",
+	})
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+		require.NotNil(t, cr.Output)
+		summary := cr.Output.Summary
+		assert.Contains(t, summary, "plan schema change")
+		assert.Contains(t, summary, "connection refused")
+		assert.Contains(t, summary, "[endpoint redacted]")
+		assert.NotContains(t, summary, "db-primary.internal.example.com")
+		assert.NotContains(t, summary, "10.2.3.4")
+		assert.NotContains(t, summary, "user:secret")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
+
 // setupFakeGitHubHeadAndCheckRuns registers a fake PR endpoint that always
 // reports headSHA as the PR HEAD, plus check-run create/update capture.
 func setupFakeGitHubHeadAndCheckRuns(t *testing.T, mux *http.ServeMux, headSHA string) chan checkRunCapture {

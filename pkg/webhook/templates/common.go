@@ -172,14 +172,15 @@ var (
 	ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 )
 
-// sanitizeCommentError makes an untrusted engine or task error safe to render
-// in a public PR comment: it normalizes line endings, strips control and
+// SanitizeCommentError makes an untrusted engine or task error safe to render
+// on a public PR surface — a comment body or a Check Run output summary: it
+// normalizes line endings, strips control and
 // format characters (including bidi overrides usable for visual spoofing),
 // redacts connection endpoints (DSN fragments, host:port pairs,
 // IP addresses) that leak internal infrastructure, trims surrounding
 // whitespace, and clamps the length by rune count. The raw error remains
 // available server-side in the apply logs, so nothing is lost for triage.
-func sanitizeCommentError(msg string) string {
+func SanitizeCommentError(msg string) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
 	msg = stripControlText(msg)
@@ -214,7 +215,7 @@ func stripControlText(msg string) string {
 // plus collapsing whitespace runs (including line breaks) so the message
 // cannot escape the enclosing Markdown line.
 func sanitizeInlineError(msg string) string {
-	return strings.Join(strings.Fields(sanitizeCommentError(msg)), " ")
+	return strings.Join(strings.Fields(SanitizeCommentError(msg)), " ")
 }
 
 // maxCellErrorLen clamps an error rendered inside a Markdown table cell so a
@@ -246,7 +247,7 @@ func quoteBlockLines(msg string) string {
 // The message is sanitized before rendering; a message that sanitizes to
 // empty writes nothing.
 func writeErrorBlock(sb *strings.Builder, msg string) {
-	sanitized := sanitizeCommentError(msg)
+	sanitized := SanitizeCommentError(msg)
 	if sanitized == "" {
 		return
 	}
@@ -257,7 +258,7 @@ func writeErrorBlock(sb *strings.Builder, msg string) {
 // progress line. The message is sanitized before rendering; a message that
 // sanitizes to empty writes nothing.
 func writeTableErrorLine(sb *strings.Builder, msg string) {
-	sanitized := sanitizeCommentError(msg)
+	sanitized := SanitizeCommentError(msg)
 	if sanitized == "" {
 		return
 	}
@@ -272,8 +273,8 @@ func writeTableErrorLine(sb *strings.Builder, msg string) {
 // compared in their sanitized form — the representation actually rendered —
 // so differences that sanitization erases cannot defeat the suppression.
 func taskErrorAddsDetail(taskError, applyError string) bool {
-	sanitized := sanitizeCommentError(taskError)
-	return sanitized != "" && sanitized != sanitizeCommentError(applyError)
+	sanitized := SanitizeCommentError(taskError)
+	return sanitized != "" && sanitized != SanitizeCommentError(applyError)
 }
 
 // writeSuccessBlock writes a success message as a blockquote.

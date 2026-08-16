@@ -10,61 +10,61 @@ import (
 func TestSanitizeCommentError(t *testing.T) {
 	t.Run("plain single-line error is unchanged", func(t *testing.T) {
 		msg := "preflight enumReorder check failed: retained value 'NO_VERSION' moved from position 7 to 11"
-		assert.Equal(t, msg, sanitizeCommentError(msg))
+		assert.Equal(t, msg, SanitizeCommentError(msg))
 	})
 
 	t.Run("surrounding whitespace is trimmed", func(t *testing.T) {
-		assert.Equal(t, "boom", sanitizeCommentError("  boom \n"))
+		assert.Equal(t, "boom", SanitizeCommentError("  boom \n"))
 	})
 
 	t.Run("whitespace-only becomes empty", func(t *testing.T) {
-		assert.Empty(t, sanitizeCommentError("   \n\t  "))
+		assert.Empty(t, SanitizeCommentError("   \n\t  "))
 	})
 
 	t.Run("CRLF and bare CR normalize to LF", func(t *testing.T) {
 		assert.Equal(t, "line one\nline two\nline three",
-			sanitizeCommentError("line one\r\nline two\rline three"))
+			SanitizeCommentError("line one\r\nline two\rline three"))
 	})
 
 	t.Run("control characters are stripped", func(t *testing.T) {
 		assert.Equal(t, "redalert",
-			sanitizeCommentError("red\x1b[31malert\x00\x07"))
+			SanitizeCommentError("red\x1b[31malert\x00\x07"))
 	})
 
 	t.Run("interior newlines and tabs survive", func(t *testing.T) {
-		assert.Equal(t, "a\n\tb", sanitizeCommentError("a\n\tb"))
+		assert.Equal(t, "a\n\tb", SanitizeCommentError("a\n\tb"))
 	})
 
 	t.Run("Unicode format characters are stripped", func(t *testing.T) {
 		assert.Equal(t, "renamed.txt",
-			sanitizeCommentError("re\u202enamed.txt\u202c\u200b\u2066\u2069"))
+			SanitizeCommentError("re\u202enamed.txt\u202c\u200b\u2066\u2069"))
 	})
 
 	t.Run("DSN fragment is redacted", func(t *testing.T) {
-		got := sanitizeCommentError("dial failed: user:secret@tcp(db-primary.internal:3306)/orders?tls=true refused")
+		got := SanitizeCommentError("dial failed: user:secret@tcp(db-primary.internal:3306)/orders?tls=true refused")
 		assert.Equal(t, "dial failed: [endpoint redacted] refused", got)
 		assert.NotContains(t, got, "secret")
 		assert.NotContains(t, got, "db-primary")
 	})
 
 	t.Run("hostname with port is redacted", func(t *testing.T) {
-		got := sanitizeCommentError("connect to db.internal.example.com:3306 timed out")
+		got := SanitizeCommentError("connect to db.internal.example.com:3306 timed out")
 		assert.Equal(t, "connect to [endpoint redacted] timed out", got)
 	})
 
 	t.Run("single-label service endpoint is redacted", func(t *testing.T) {
-		got := sanitizeCommentError("dial tcp mysql-primary:3306: connect: connection refused")
+		got := SanitizeCommentError("dial tcp mysql-primary:3306: connect: connection refused")
 		assert.Equal(t, "dial tcp [endpoint redacted]: connect: connection refused", got)
 		assert.NotContains(t, got, "mysql-primary")
 	})
 
 	t.Run("line:column references are not redacted", func(t *testing.T) {
 		msg := "parse error at line 3:14 near 'ENUM'"
-		assert.Equal(t, msg, sanitizeCommentError(msg))
+		assert.Equal(t, msg, SanitizeCommentError(msg))
 	})
 
 	t.Run("IP endpoints are redacted", func(t *testing.T) {
-		got := sanitizeCommentError("dial tcp 10.1.2.3:3306: connect: connection refused from 192.168.0.1")
+		got := SanitizeCommentError("dial tcp 10.1.2.3:3306: connect: connection refused from 192.168.0.1")
 		assert.NotContains(t, got, "10.1.2.3")
 		assert.NotContains(t, got, "192.168.0.1")
 		assert.Contains(t, got, "[endpoint redacted]")
@@ -72,11 +72,11 @@ func TestSanitizeCommentError(t *testing.T) {
 
 	t.Run("schema-qualified identifiers are not redacted", func(t *testing.T) {
 		msg := "table orders.line_items has no primary key"
-		assert.Equal(t, msg, sanitizeCommentError(msg))
+		assert.Equal(t, msg, SanitizeCommentError(msg))
 	})
 
 	t.Run("long errors clamp by rune with truncation marker", func(t *testing.T) {
-		got := sanitizeCommentError(strings.Repeat("é", maxCommentErrorLen+100))
+		got := SanitizeCommentError(strings.Repeat("é", maxCommentErrorLen+100))
 		runes := []rune(got)
 		assert.Len(t, runes, maxCommentErrorLen)
 		assert.Equal(t, '…', runes[len(runes)-1])
@@ -84,7 +84,7 @@ func TestSanitizeCommentError(t *testing.T) {
 
 	t.Run("errors at the limit are not clamped", func(t *testing.T) {
 		msg := strings.Repeat("x", maxCommentErrorLen)
-		assert.Equal(t, msg, sanitizeCommentError(msg))
+		assert.Equal(t, msg, SanitizeCommentError(msg))
 	})
 }
 

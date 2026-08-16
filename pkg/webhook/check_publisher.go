@@ -9,6 +9,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func (h *Handler) shouldPublishChecks(ctx context.Context, repo string, operation string) bool {
@@ -773,16 +774,22 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 	}
 
 	for _, ec := range checks {
-		// Build summary from the error for this environment
+		// Build summary from the error for this environment. The Check Run
+		// output is a public PR surface, so the plan error is sanitized before
+		// rendering; the raw error stays in the server logs from the plan
+		// failure that produced it.
 		summary := "Plan failed"
 		if errMsg, ok := errors[ec.environment]; ok {
-			summary = errMsg
+			summary = templates.SanitizeCommentError(errMsg)
 		} else if len(errors) > 0 {
 			// Single-instance mode: use first error
 			for _, msg := range errors {
-				summary = msg
+				summary = templates.SanitizeCommentError(msg)
 				break
 			}
+		}
+		if summary == "" {
+			summary = "Plan failed"
 		}
 
 		blockingReason := block.blockingReason
