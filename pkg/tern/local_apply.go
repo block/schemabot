@@ -171,26 +171,39 @@ func (b blockingTask) subject() string {
 	}
 }
 
-// resolution states what clears the database, which differs by what the holding
-// apply is doing. The resting states each keep their database until an operator
-// decides their fate, and differ only in which decision is owed: a stopped apply
-// waits to be started, a retryable failure waits to be retried, and an apply
-// parked at the cutover barrier waits to be cut over. A running apply is the one
-// case an operator can simply wait out — with the caveat that it may still park:
-// a deferred or ordered cutover moves it to waiting_for_cutover rather than to a
-// terminal state, so the running line promises progress, not release.
+// resolution continues the sentence describe() opens, so it speaks of the apply
+// already named there rather than restating the state alongside it. The split is
+// between an apply that holds the database until someone decides its fate and one
+// that releases it on its own, which is the distinction that tells an operator
+// whether to act or to wait.
 //
-// Other active states (pending, cutting over, recovering) get no resolution line
-// rather than a guess — the state is still named, and inventing an action for a
-// state whose next move is not certain would send an operator the wrong way.
+// The resting states differ only in which decision is owed: a stopped apply waits
+// to be started, a retryable failure to be retried, an apply at the cutover
+// barrier to be cut over, and one in its revert window to be reverted or
+// skip-reverted. The revert window is the one that offers no cancel: the change
+// has already cut over, so stop and cancel are permanently rejected, and only the
+// revert decision or the window's own expiry moves it on. A revert already under
+// way, like a running apply, finishes on its own — with the caveat that a running
+// apply may still park, since a deferred or ordered cutover moves it to
+// waiting_for_cutover rather than to a terminal state, so the running line
+// promises progress, not release.
+//
+// Other active states (pending, cutting over, recovering, waiting for a deploy
+// that tern may be about to trigger itself) get no resolution line rather than a
+// guess — the state is still named, and inventing an action for a state whose
+// next move is not certain would send an operator the wrong way.
 func (b blockingTask) resolution() string {
 	switch {
 	case state.IsState(b.applyState, state.Apply.Stopped):
-		return "a stopped apply keeps its database until it is started or cancelled"
+		return "it holds the database until it is started or cancelled"
 	case state.IsState(b.applyState, state.Apply.FailedRetryable):
-		return "a retryable failure keeps its database until the apply is retried or cancelled"
+		return "it holds the database until it is retried or cancelled"
 	case state.IsState(b.applyState, state.Apply.WaitingForCutover):
-		return "an apply parked at the cutover barrier keeps its database until it is cut over or cancelled"
+		return "it holds the database until it is cut over or cancelled"
+	case state.IsState(b.applyState, state.Apply.RevertWindow):
+		return "it holds the database until it is reverted, skip-reverted, or the window expires"
+	case state.IsState(b.applyState, state.Apply.Reverting, state.Apply.SkippingRevert):
+		return "it releases the database when the revert finishes, which it does on its own"
 	case state.IsRunningApplyState(b.applyState):
 		return "it releases the database when it finishes, unless it parks for cutover first"
 	default:

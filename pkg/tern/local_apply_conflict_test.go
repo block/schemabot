@@ -557,7 +557,7 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 // The refusal an apply gets when another holds the database is the whole of what
 // an operator sees when their apply dies on arrival, so it has to name what is
 // being changed, the apply to act on, and what frees the database. A stopped
-// apply keeps its database by design, so a refusal naming only the task leaves
+// apply holds the database by design, so a refusal naming only the task leaves
 // an operator with an identifier they cannot act on and no indication that a
 // decision is owed.
 func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
@@ -650,6 +650,39 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			want: []string{"table xfers", "task-holding", "apply-holding", "waiting_for_cutover", "cut over or cancelled"},
 		},
 		{
+			name: "an apply in its revert window rests holding its database, so a decision is owed",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.RevertWindow,
+			},
+			want: []string{
+				"table xfers", "task-holding", "apply-holding", "revert_window",
+				"reverted, skip-reverted, or the window expires",
+			},
+		},
+		{
+			name: "a revert already under way finishes on its own",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.Reverting,
+			},
+			want: []string{"apply-holding", "reverting", "releases the database when the revert finishes"},
+		},
+		{
+			name: "finalizing skip-revert finishes on its own too",
+			blocking: blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				applyIdentifier: "apply-holding",
+				applyState:      state.Apply.SkippingRevert,
+			},
+			want: []string{"apply-holding", "skipping_revert", "releases the database when the revert finishes"},
+		},
+		{
 			name: "an apply that could not be loaded still reports what it blocks on",
 			blocking: blockingTask{
 				taskIdentifier: "task-holding",
@@ -683,7 +716,7 @@ func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
 	}
 	assert.Equal(t,
 		"table xfers shard -40 (task task-holding) is held by apply apply-holding (stopped); "+
-			"a stopped apply keeps its database until it is started or cancelled",
+			"it holds the database until it is started or cancelled",
 		held.describe())
 
 	unloadable := blockingTask{
@@ -706,6 +739,29 @@ func TestBlockingTaskOffersNoResolutionForAnUncertainState(t *testing.T) {
 
 	assert.Empty(t, blocking.resolution(), "cutting over has no operator action to offer")
 	assert.Contains(t, blocking.describe(), state.Apply.CuttingOver, "the state is still named")
+}
+
+// Every other resting state clears by starting, retrying, or cutting over — or
+// by cancelling. The revert window is the exception: the change has already cut
+// over, so stop and cancel are permanently rejected there, and offering cancel
+// would point an operator at a command the control path refuses.
+func TestBlockingTaskOffersNoCancelInsideTheRevertWindow(t *testing.T) {
+	for _, applyState := range []string{
+		state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert,
+	} {
+		t.Run(applyState, func(t *testing.T) {
+			blocking := blockingTask{
+				taskIdentifier:  "task-holding",
+				table:           "xfers",
+				applyIdentifier: "apply-holding",
+				applyState:      applyState,
+			}
+
+			assert.NotEmpty(t, blocking.resolution(), "the revert phase names what clears the database")
+			assert.NotContains(t, blocking.describe(), "cancel",
+				"cancel is rejected once a change has cut over, so the refusal must not offer it")
+		})
+	}
 }
 
 // A stopped apply keeps its task and its database so it stays resumable. A new
