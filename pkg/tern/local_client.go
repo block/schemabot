@@ -1720,8 +1720,7 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 // namespaces of a VSchema-only dispatch — one where every ddl_change carries
 // CHANGE_TYPE_VSCHEMA — or nil when the dispatch carries any table DDL or no
 // changes at all. This is the shape the control plane's task-less VSchema
-// dispatch sends (a group_finalizer, or a VSchema-only plan's whole-deployment
-// work operation); a mixed set is a work dispatch and returns nil so the caller
+// dispatch sends; a mixed set is a work dispatch and returns nil so the caller
 // treats it as one.
 func vschemaOnlyDispatchNamespaces(changes []*ternv1.TableChange) []string {
 	if len(changes) == 0 {
@@ -1746,22 +1745,41 @@ func vschemaOnlyDispatchNamespaces(changes []*ternv1.TableChange) []string {
 	return namespaces
 }
 
-// finalizerDispatchNamespace validates a group_finalizer dispatch's namespace
-// set against the stored plan and returns the single namespace the finalizer
-// applies. The control plane dispatches one finalizer per namespace, so a
-// VSchema-only dispatch that arrives alongside a plan carrying table DDL must
-// name exactly one namespace, and the plan must hold that namespace's VSchema
-// artifact — otherwise the drive would have nothing to apply and the operation
-// would fail only after it was created.
-func finalizerDispatchNamespace(plan *storage.Plan, namespaces []string) (string, error) {
-	if len(namespaces) != 1 {
-		return "", fmt.Errorf("group_finalizer dispatch names %d namespaces (%v), expected exactly 1", len(namespaces), namespaces)
+// finalizerDispatchScope validates a group_finalizer dispatch's namespace set
+// against the stored plan and resolves the operation scope the finalizer is
+// created with. A single-namespace dispatch (a sharded plan's per-namespace
+// finalizer) is namespace-scoped; a multi-namespace dispatch (a VSchema-only
+// plan) is deployment-scoped (empty namespace) and applies every dispatched
+// namespace's VSchema in one engine apply — the engine treats the deployment
+// as the unit of change, so splitting the namespaces across operations would
+// have each drive validating keyspaces whose VSchema it never applied. Every
+// dispatched namespace must hold a VSchema artifact in the stored plan —
+// otherwise the drive would have nothing to apply and the operation would fail
+// only after it was created.
+func finalizerDispatchScope(plan *storage.Plan, namespaces []string) (string, error) {
+	if len(namespaces) == 0 {
+		return "", fmt.Errorf("group_finalizer dispatch names no namespaces")
 	}
-	namespace := namespaces[0]
-	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
-		return "", fmt.Errorf("group_finalizer dispatch for namespace %q: %w", namespace, err)
+	for _, namespace := range namespaces {
+		if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
+			return "", fmt.Errorf("group_finalizer dispatch for namespace %q: %w", namespace, err)
+		}
 	}
-	return namespace, nil
+	if len(namespaces) == 1 {
+		return namespaces[0], nil
+	}
+	// A deployment-scoped finalizer's drive applies every VSchema-changed
+	// namespace in the stored plan, so a multi-namespace dispatch must cover
+	// exactly that set — a partial dispatch would silently apply namespaces the
+	// dispatcher never named.
+	planNamespaces := plan.VSchemaNamespaces()
+	dispatched := append([]string(nil), namespaces...)
+	sort.Strings(dispatched)
+	if !slices.Equal(dispatched, planNamespaces) {
+		return "", fmt.Errorf("group_finalizer dispatch names namespaces %v but plan %s changes VSchema in %v; a deployment-scoped dispatch must cover the plan's full VSchema set",
+			namespaces, plan.PlanIdentifier, planNamespaces)
+	}
+	return "", nil
 }
 
 // shardScopedDispatchOperationKey builds the operation key for a shard-scoped
@@ -2061,20 +2079,24 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// closed.
 	//
 	// A dispatch with no target shards whose changes are all VSchema-typed is a
-	// group_finalizer: it applies one namespace's VSchema and deliberately
-	// carries no shard (the VSchema is namespace-level). When the stored plan
-	// also carries table DDL, that DDL belongs to the finalizer's sibling shard
-	// work operations — falling back to the plan here would resurrect it as
-	// shard-less work tasks, which a sharded engine rejects and which would run
-	// unscoped work on a non-sharded one. Create the task-less finalizer
-	// operation instead so the drive applies the namespace VSchema from the
-	// plan.
+	// VSchema apply: it targets VSchema documents and deliberately carries no
+	// shard (the VSchema is namespace-level). Whether the stored plan also
+	// carries table DDL (a group_finalizer alongside sibling shard work) or is
+	// VSchema-only (the plan's entire change), falling back to the plan's flat
+	// DDL here would be wrong: sibling table DDL would resurrect as shard-less
+	// work tasks a sharded engine rejects, and a VSchema-only plan would yield
+	// a work operation with no tasks — a shape with nothing to drive. Create
+	// the task-less group_finalizer operation instead — scoped to the
+	// dispatch's one namespace, or to the whole deployment when the dispatch
+	// names every VSchema-changed namespace of a VSchema-only plan — so the
+	// drive applies the VSchema change(s) from the plan.
 	//
 	// Every other no-target-shard dispatch (a whole-deployment or non-sharded
-	// apply, including a VSchema-only plan's task-less work operation) uses the
-	// stored plan unchanged — keeping that path byte-for-byte as before.
+	// apply) uses the stored plan unchanged — keeping that path byte-for-byte
+	// as before.
 	ddlChanges := plan.FlatDDLChanges()
 	dispatchShard := ""
+	finalizerDispatch := false
 	finalizerNamespace := ""
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
@@ -2087,11 +2109,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		}
 		dispatchShard = shard
 		ddlChanges = scoped
-	} else if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 && len(ddlChanges) > 0 {
-		namespace, err := finalizerDispatchNamespace(plan, namespaces)
+	} else if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		namespace, err := finalizerDispatchScope(plan, namespaces)
 		if err != nil {
 			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 		}
+		finalizerDispatch = true
 		finalizerNamespace = namespace
 		ddlChanges = nil
 	}
@@ -2236,11 +2259,15 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		}
 	}
 	// A group_finalizer dispatch creates a task-less finalizer operation: the
-	// finalizer key names the namespace the drive reconstructs the VSchema
-	// change from, and the kind routes the claim to the finalizer drive instead
-	// of failing closed on the empty task set.
-	if finalizerNamespace != "" {
-		operationKey = finalizerNamespace + finalizerOperationKeySuffix
+	// finalizer key names the scope the drive reconstructs the VSchema
+	// change(s) from — one namespace, or the whole deployment for a
+	// VSchema-only plan — and the kind routes the claim to the finalizer drive
+	// instead of failing closed on the empty task set.
+	if finalizerDispatch {
+		operationKey = finalizerDeploymentScopedKey
+		if finalizerNamespace != "" {
+			operationKey = finalizerNamespace + finalizerOperationKeySuffix
+		}
 		operationKind = storage.ApplyOperationKindGroupFinalizer
 	}
 

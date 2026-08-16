@@ -1782,13 +1782,15 @@ const (
 
 // dispatchRemoteGroupFinalizer drives a task-less group_finalizer apply_operation
 // over gRPC. It is the remote counterpart to LocalClient.driveGroupFinalizer:
-// the control plane cannot run the engine, so it dispatches the namespace's
-// VSchema to the data plane, which applies it via its task-less VSchema-only
-// path.
+// the control plane cannot run the engine, so it dispatches the operation's
+// VSchema scope to the data plane, which applies it via its task-less
+// VSchema-only path. A namespace-scoped finalizer (from a sharded fan-out)
+// dispatches its one namespace; a deployment-scoped finalizer (a VSchema-only
+// apply) dispatches every VSchema-changed namespace in the plan as one apply.
 func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	op := scope.operation
 	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" {
+	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
 	}
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
@@ -1798,12 +1800,16 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 	if plan == nil {
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	// Fail closed if the namespace carries no VSchema artifact, mirroring the
-	// local finalizer drive.
+	// Fail closed if the operation's scope carries no VSchema artifact,
+	// mirroring the local finalizer drive.
 	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
-	return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, []string{namespace}, groupFinalizerDispatchKind)
+	namespaces := []string{namespace}
+	if namespace == "" {
+		namespaces = plan.VSchemaNamespaces()
+	}
+	return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, namespaces, groupFinalizerDispatchKind)
 }
 
 // dispatchRemoteVSchemaOnly dispatches the given namespaces' VSchema to the data

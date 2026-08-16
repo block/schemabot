@@ -100,6 +100,151 @@ func TestLocalClient_VSchemaOnlyDispatchCreatesGroupFinalizer(t *testing.T) {
 	assert.Equal(t, state.ApplyOperation.Pending, ops[0].State)
 }
 
+// A VSchema-only dispatch against a plan that is itself VSchema-only (no table
+// DDL anywhere — the plan's entire change is one namespace's VSchema document)
+// must create the same task-less group_finalizer operation as a mixed plan's
+// finalizer dispatch. A work operation with no tasks has nothing to drive, so
+// only the finalizer shape lets the drive apply the VSchema from the plan.
+func TestLocalClient_VSchemaOnlyPlanDispatchCreatesGroupFinalizer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-vschema-only-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"ks_sharded": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Environment: localClientTestEnvironment,
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "ks_sharded",
+			TableName:  "VSchema: ks_sharded",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+		}},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "VSchema-only dispatch was not accepted: %s", resp.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Empty(t, tasks, "a VSchema-only plan produces no task rows")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, ops[0].OperationKind)
+	assert.Equal(t, "ks_sharded/group_finalizer", ops[0].OperationKey)
+	assert.Equal(t, state.ApplyOperation.Pending, ops[0].State)
+}
+
+// A VSchema-only dispatch naming every VSchema-changed namespace of a
+// VSchema-only plan creates one deployment-scoped group_finalizer operation
+// whose drive applies all the namespaces' VSchemas in a single engine apply. A
+// branch-based engine stands up one branch covering the whole deployment and
+// validates every keyspace in it, so per-namespace operations would each
+// validate keyspaces whose VSchema they never applied.
+func TestLocalClient_VSchemaOnlyMultiNamespaceDispatchCreatesDeploymentScopedFinalizer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-vschema-multi-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"ks_sharded":   {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
+			"ks_unsharded": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Environment: localClientTestEnvironment,
+		DdlChanges: []*ternv1.TableChange{
+			{Namespace: "ks_sharded", TableName: "VSchema: ks_sharded", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA},
+			{Namespace: "ks_unsharded", TableName: "VSchema: ks_unsharded", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "multi-namespace VSchema-only dispatch was not accepted: %s", resp.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Empty(t, tasks, "a VSchema-only plan produces no task rows")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1, "both namespaces' VSchemas are applied by one deployment-scoped finalizer")
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, ops[0].OperationKind)
+	assert.Equal(t, "group_finalizer", ops[0].OperationKey)
+	assert.Equal(t, state.ApplyOperation.Pending, ops[0].State)
+}
+
 // A VSchema-only dispatch naming a namespace whose stored plan carries no
 // VSchema artifact has nothing to apply; the dispatch is rejected before any
 // apply or operation row is created rather than failing at drive time.

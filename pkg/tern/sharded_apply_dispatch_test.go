@@ -146,29 +146,61 @@ func TestVSchemaOnlyDispatchNamespaces(t *testing.T) {
 	})
 }
 
-// A group_finalizer dispatch applies exactly one namespace's VSchema, and the
-// stored plan must carry that namespace's artifact — otherwise the operation
-// would be created only to fail at drive time with nothing to apply.
-func TestFinalizerDispatchNamespace(t *testing.T) {
+// A group_finalizer dispatch resolves to a namespace scope (one namespace) or
+// a deployment scope (every VSchema-changed namespace of a VSchema-only plan,
+// applied as one engine apply). The stored plan must carry each dispatched
+// namespace's artifact, and a multi-namespace dispatch must cover the plan's
+// full VSchema set — otherwise the operation would be created only to apply
+// something other than what was dispatched, or to fail at drive time with
+// nothing to apply.
+func TestFinalizerDispatchScope(t *testing.T) {
 	plan := &storage.Plan{
-		ID: 7,
+		ID:             7,
+		PlanIdentifier: "plan-scope-test",
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"ks_a": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
 			"ks_b": {},
 		},
 	}
-	t.Run("valid namespace", func(t *testing.T) {
-		ns, err := finalizerDispatchNamespace(plan, []string{"ks_a"})
+	t.Run("single namespace is namespace-scoped", func(t *testing.T) {
+		ns, err := finalizerDispatchScope(plan, []string{"ks_a"})
 		require.NoError(t, err)
 		assert.Equal(t, "ks_a", ns)
 	})
-	t.Run("multiple namespaces fail closed", func(t *testing.T) {
-		_, err := finalizerDispatchNamespace(plan, []string{"ks_a", "ks_b"})
+	t.Run("full VSchema set is deployment-scoped", func(t *testing.T) {
+		multiPlan := &storage.Plan{
+			ID:             8,
+			PlanIdentifier: "plan-scope-multi",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks_a": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
+				"ks_b": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+			},
+		}
+		ns, err := finalizerDispatchScope(multiPlan, []string{"ks_b", "ks_a"})
+		require.NoError(t, err)
+		assert.Empty(t, ns)
+	})
+	t.Run("partial multi-namespace dispatch fails closed", func(t *testing.T) {
+		multiPlan := &storage.Plan{
+			ID:             9,
+			PlanIdentifier: "plan-scope-partial",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks_a": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
+				"ks_b": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+				"ks_c": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+			},
+		}
+		_, err := finalizerDispatchScope(multiPlan, []string{"ks_a", "ks_b"})
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "expected exactly 1")
+		assert.Contains(t, err.Error(), "must cover the plan's full VSchema set")
+	})
+	t.Run("no namespaces fails closed", func(t *testing.T) {
+		_, err := finalizerDispatchScope(plan, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "names no namespaces")
 	})
 	t.Run("namespace without a VSchema artifact fails closed", func(t *testing.T) {
-		_, err := finalizerDispatchNamespace(plan, []string{"ks_b"})
+		_, err := finalizerDispatchScope(plan, []string{"ks_b"})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no VSchema artifact")
 	})

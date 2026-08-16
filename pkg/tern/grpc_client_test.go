@@ -1410,6 +1410,121 @@ func TestGRPCClient_ResumeApplyOperationDispatchesGroupFinalizerAsVSchemaOnly(t 
 	assert.Contains(t, req.SchemaFiles, "commerce", "the vschema.json must be carried for a materializing remote")
 }
 
+func TestGRPCClient_ResumeApplyOperationDispatchesDeploymentScopedGroupFinalizer(t *testing.T) {
+	// A VSchema-only apply is shaped as one deployment-scoped group_finalizer
+	// (operation key "group_finalizer", no namespace prefix). Its remote drive
+	// dispatches every VSchema-changed namespace in the plan as one VSchema-only
+	// apply, because a branch-based engine stands up one branch covering the whole
+	// deployment and validates every keyspace in it.
+	server := &capturingTernServer{remoteApplyID: "remote-finalizer-deployment-1"} // default Progress = COMPLETED
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              8,
+		ApplyIdentifier: "apply-finalizer-deployment",
+		PlanID:          99,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(51)
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{getByApplyIDErr: errors.New("finalizer drive must not load tasks")},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-finalizer-deployment",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce":         {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+				"commerce_unshard": {Files: map[string]string{storage.VSchemaArtifactName: `{"tables":{}}`}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce":         {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+				"commerce_unshard": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{}}`}},
+			},
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKey:  "group_finalizer",
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.NoError(t, err, "a deployment-scoped group_finalizer must dispatch every VSchema-changed namespace")
+
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "expected the finalizer to dispatch a VSchema apply to remote Tern")
+	require.Len(t, req.DdlChanges, 2, "one VSchema change per VSchema-changed namespace, in one dispatch")
+	gotNamespaces := []string{req.DdlChanges[0].Namespace, req.DdlChanges[1].Namespace}
+	assert.ElementsMatch(t, []string{"commerce", "commerce_unshard"}, gotNamespaces)
+	for _, change := range req.DdlChanges {
+		assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, change.ChangeType)
+	}
+	assert.Empty(t, req.TargetShards, "a VSchema apply targets no shard")
+	assert.Contains(t, req.SchemaFiles, "commerce", "the vschema.json must be carried for a materializing remote")
+	assert.Contains(t, req.SchemaFiles, "commerce_unshard")
+}
+
+func TestGRPCClient_ResumeApplyOperationFailsClosedOnMalformedFinalizerKey(t *testing.T) {
+	// A group_finalizer key is either namespace-scoped ("<ns>/group_finalizer") or
+	// the deployment-scoped "group_finalizer". Anything else is a malformed row;
+	// the drive must fail closed before dispatching a scope it cannot name.
+	server := &capturingTernServer{remoteApplyID: "remote-finalizer-malformed-1"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              8,
+		ApplyIdentifier: "apply-finalizer-malformed",
+		PlanID:          99,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeStrata,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(51)
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{getByApplyIDErr: errors.New("finalizer drive must not load tasks")},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-finalizer-malformed",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+			},
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {
+				ID:            operationID,
+				ApplyID:       apply.ID,
+				Deployment:    "commerce-deployment",
+				OperationKey:  "banana",
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
+				State:         state.ApplyOperation.Pending,
+			},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "malformed operation key")
+	assert.Nil(t, server.getApplyRequest(), "a malformed finalizer key must not reach the data plane")
+}
+
 func TestGRPCClient_ResumeApplyOperationDispatchesTasklessVSchemaOnlyWork(t *testing.T) {
 	// A VSchema-only change carries no DDL, so its apply gets one whole-deployment
 	// work operation and no task rows. The remote drive must dispatch that
