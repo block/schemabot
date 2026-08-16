@@ -153,6 +153,11 @@ func NewCommandParser() *CommandParser {
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
 	Action string
+	// SuppressRetryComments is set by the durable driver so retryable failures
+	// do not post an answer the driver is about to supersede. The driver posts
+	// the single terminal answer after exhaustion; synchronous handling leaves
+	// it false.
+	SuppressRetryComments bool
 	// CommentID is the PR comment that carried this command. Handlers
 	// acknowledge it with a reaction once they commit to acting, so on a
 	// fan-out only the deployments actually doing work acknowledge.

@@ -287,6 +287,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		var markErr error
 		var outcome string
+		var notifyTerminalCommand bool
 		switch {
 		case !retry:
 			// The processor proved this delivery can never succeed for its head
@@ -317,6 +318,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 				"attempts", event.Attempts, "error", processErr)
 			markErr = store.MarkFailed(finishCtx, event.ID, event.LeaseToken, processErr.Error(), nil)
 			outcome = "failed"
+			notifyTerminalCommand = true
 		}
 		if markErr != nil {
 			if errors.Is(markErr, storage.ErrWebhookEventLeaseLost) || errors.Is(markErr, storage.ErrWebhookEventNotFound) {
@@ -334,6 +336,9 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		recordOutcome(outcome)
 		metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
+		if notifyTerminalCommand {
+			h.postDurableCommandTerminalComment(event, processErr)
+		}
 		h.logger.Warn("durable webhook driver recorded delivery failure",
 			"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 			"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
@@ -481,6 +486,25 @@ func (h *Handler) claimedAutoPlanHeadConfirmedStale(ctx context.Context, driverI
 		return false
 	}
 	return true
+}
+
+// postDurableCommandTerminalComment gives an acknowledged command one final
+// user-visible answer after its retry budget is exhausted. Notification is
+// best-effort: failure is logged by the parsing or comment-posting path and
+// never changes the inbox row's terminal disposition.
+func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent, processErr error) {
+	if event.Event != "issue_comment" {
+		return
+	}
+	result, repo, pr, installationID, requestedBy, err := durableIssueCommentCommand(event)
+	if err != nil {
+		h.logger.Warn("durable webhook driver could not prepare terminal command comment",
+			"delivery_id", event.DeliveryID, "event", event.Event, "repo", event.Repository,
+			"pr", event.PullRequest, "error", err)
+		return
+	}
+	h.postCommandError(repo, pr, installationID, result.Action, result.Environment, requestedBy,
+		"SchemaBot could not complete this command after retrying: "+processErr.Error())
 }
 
 // safeProcessDurableWebhookEvent runs process with panic recovery. The legacy
