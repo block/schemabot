@@ -454,9 +454,14 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 // requested_timestamp shows it was created by this apply's deploy. Vitess
 // stamps requested_timestamp when a change is submitted and preserves it
 // across retries, so a resurrected pre-deploy change always fails this check
-// regardless of baseline membership. A nil timestamp proves nothing and is
-// never accepted.
+// regardless of baseline membership. A nil requested timestamp proves
+// nothing, and a zero deploy creation time gives the comparison no anchor —
+// both fail closed so discovery keeps the stored identifier rather than
+// attaching on evidence it does not have.
 func requestedAtOrAfterDeploy(requested *time.Time, deployCreatedAt time.Time) bool {
+	if deployCreatedAt.IsZero() {
+		return false
+	}
 	return requested != nil && !requested.Before(deployCreatedAt)
 }
 

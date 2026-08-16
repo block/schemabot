@@ -352,6 +352,17 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 		assert.Equal(t, []string{"singularity:untimed-change"}, candidates)
 	})
 
+	t.Run("a zero deploy creation time anchors nothing and stays ambiguous", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:some-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
+
+		assert.Empty(t, got, "without the deploy's creation time no candidate can be proven to be this apply's change")
+		assert.Equal(t, []string{"singularity:some-change"}, candidates)
+	})
+
 	t.Run("multiple in-flight candidates are ambiguous", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{MigrationContext: "singularity:change-a", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
