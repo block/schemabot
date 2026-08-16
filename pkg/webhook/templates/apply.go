@@ -988,7 +988,7 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	if !table.Throttled || table.ThrottleReason == "" {
 		return
 	}
-	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", table.ThrottleReason)
+	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {

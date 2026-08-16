@@ -19,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
@@ -868,7 +867,7 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		// an unthrottled table carries no reason.
 		if tableInPacedPhase(st.IsComplete, spiritState) && prog.Throttle.Throttled {
 			tp.Throttled = true
-			tp.ThrottleReason = sanitizeThrottleReason(prog.Throttle.Reason)
+			tp.ThrottleReason = engine.SanitizeThrottleReason(prog.Throttle.Reason)
 		}
 		tableProgress = append(tableProgress, tp)
 	}
@@ -880,24 +879,6 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 // checksum verify (which runs only after every copy finished).
 func tableInPacedPhase(copyComplete bool, spiritState status.State) bool {
 	return !copyComplete || spiritState == status.Checksum
-}
-
-// sanitizeThrottleReason bounds an engine-produced throttle reason for the
-// operator surfaces that render it (PR comment tables, CLI rows): newlines and
-// table separators are neutralized and the text is clamped, so a reason can
-// never break markdown layout no matter what a throttler reports.
-func sanitizeThrottleReason(reason string) string {
-	reason = strings.Join(strings.Fields(reason), " ")
-	reason = strings.ReplaceAll(reason, "|", "/")
-	const maxLen = 200
-	if len(reason) > maxLen {
-		cut := maxLen - len("…")
-		for cut > 0 && !utf8.RuneStart(reason[cut]) {
-			cut--
-		}
-		reason = reason[:cut] + "…"
-	}
-	return reason
 }
 
 // spiritPostCopyPhase reports whether the runner is in one of the active

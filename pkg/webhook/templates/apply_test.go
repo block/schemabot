@@ -297,6 +297,12 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	notThrottled := RenderApplyStatusComment(data)
 	assert.NotContains(t, notThrottled, "(throttled)")
 	assert.NotContains(t, notThrottled, "Throttled")
+
+	data.Tables[0].Throttled = true
+	data.Tables[0].ThrottleReason = "signal_a 1_000ms >= `500ms` [gradual]"
+	escaped := RenderApplyStatusComment(data)
+	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal\\_a 1\\_000ms >= \\`500ms\\` \\[gradual\\]_",
+		"markdown delimiters in an engine reason are escaped so they cannot cut the italic span short")
 }
 
 // A throttled checksum verify carries the same header annotation and tooltip
