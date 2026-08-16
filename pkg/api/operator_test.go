@@ -545,6 +545,25 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 
 		assert.Empty(t, applyLogs.logs, "a stale projection must not write a misleading transition entry")
 	})
+
+	t.Run("swap that only stamps started_at appends nothing", func(t *testing.T) {
+		applyLogs := &capturingApplyLogStore{}
+		applyStore := &recordingApplyStore{swapped: true}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithApplyStoresAndOperations{
+			applyOps: &listingApplyOperationStore{ops: []*storage.ApplyOperation{
+				{ID: 7, State: state.ApplyOperation.Running},
+			}},
+			applies:   applyStore,
+			applyLogs: applyLogs,
+		}, testServerConfig(), nil, logger)
+
+		result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply(), rejectFailedApplyReopen)
+		require.NoError(t, err)
+		require.True(t, result.Swapped, "the started_at stamp must win the compare-and-swap in this scenario")
+
+		assert.Empty(t, applyLogs.logs, "a swap that leaves the state unchanged is not a state transition")
+	})
 }
 
 // releaseLatchControlStore returns a fixed release latch from GetByOperation so
