@@ -812,7 +812,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			logOperationDriveLeavesParentStop(logger, apply, scope)
 			return true, nil
 		}
-	} else if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
+	} else if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return true, err
 	} else if completed {
 		logger.InfoContext(ctx, "completing pending gRPC stop request for resolved apply",

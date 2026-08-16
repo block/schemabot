@@ -939,7 +939,14 @@ func (s *Service) queueCancelForApplyOwner(ctx context.Context, apply *storage.A
 	}
 	cancelledCount, skippedCount := stopRequestCounts(tasks)
 	if cancelledCount == 0 && skippedCount == 0 {
-		return nil, "", controlConflictf("no active schema change for apply %s", apply.ApplyIdentifier)
+		// The apply owns no task rows: it was queued before its first drive
+		// created them, or it is a VSchema-only apply that never has any. The
+		// apply row itself is still active work (the caller already rejected
+		// terminal applies), so the durable request is recorded and the drive's
+		// task-less settle path resolves it — refusing here would leave the
+		// apply with no command that can end it.
+		s.logger.Info("cancel requested for a task-less apply; recording the durable request for the task-less settle path",
+			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
 	controlReq, alreadyPending, err := s.createCancelControlRequest(ctx, apply, caller, cancelledCount, skippedCount)
 	if err != nil {
@@ -1067,7 +1074,14 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 	}
 	stoppedCount, skippedCount := stopRequestCounts(tasks)
 	if stoppedCount == 0 && skippedCount == 0 {
-		return nil, "", controlConflictf("no active schema change for apply %s", apply.ApplyIdentifier)
+		// The apply owns no task rows: it was queued before its first drive
+		// created them, or it is a VSchema-only apply that never has any. The
+		// apply row itself is still active work (a terminal apply was rejected
+		// above), so the durable request is recorded and the drive's task-less
+		// settle path resolves it — refusing here would leave the apply with no
+		// stop command that can park it.
+		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
+			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
 	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount)
 	if err != nil {
