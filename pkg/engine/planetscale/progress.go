@@ -217,8 +217,8 @@ const baselineContextRetention = 24 * time.Hour
 // captureExistingContexts returns the set of migration_context values currently
 // in SHOW VITESS_MIGRATIONS. Used as a baseline before deploying so that new
 // contexts can be identified after deploy. The baseline is bounded: contexts
-// with a non-terminal row are always kept (they are live work discovery must
-// not attach to), while purely terminal history is kept only when active
+// with a non-terminal row are always kept (they are live work that discovery
+// must not attach to), while purely terminal history is kept only when active
 // within baselineContextRetention. A terminal context that ages out and is
 // later resurrected by a Vitess retry keeps its original requested_timestamp,
 // so the requested-at-or-after-deploy check in selectSchemaChangeContext still
