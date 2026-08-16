@@ -661,6 +661,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return false
 	}
 	ps.consecutiveErrors = 0
+	c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &ps.resumeEventLogged)
 
 	// Update resumeState if the engine returned a newer one (e.g., with
 	// updated metadata like deploy request URL or migration context).
@@ -1265,6 +1266,8 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			task.ETASeconds = int(tp.ETASeconds)
 			task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 			task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+			task.Throttled = tp.Throttled
+			task.ThrottleReason = tp.ThrottleReason
 			task.IsInstant = tp.IsInstant
 			if tp.StartedAt != nil && task.StartedAt == nil {
 				task.StartedAt = tp.StartedAt

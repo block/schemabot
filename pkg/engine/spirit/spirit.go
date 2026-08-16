@@ -793,12 +793,13 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	}
 
 	return &engine.ProgressResult{
-		State:        state,
-		Message:      message,
-		ErrorMessage: rm.errorMessage,
-		Retryable:    state == engine.StateFailed,
-		Tables:       tableProgress,
-		ResumeState:  req.ResumeState,
+		State:                 state,
+		Message:               message,
+		ErrorMessage:          rm.errorMessage,
+		Retryable:             state == engine.StateFailed,
+		Tables:                tableProgress,
+		ResumeState:           req.ResumeState,
+		ResumedFromCheckpoint: spiritProgress.Resume,
 	}, nil
 }
 
@@ -857,9 +858,27 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		// runs, so the estimate is stamped on all tables unconditionally.
 		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
 		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
+		// Spirit's throttle status is likewise runner-wide and already scoped to
+		// the paced phases (the row copy and the checksum verify; zero-valued
+		// everywhere else). Stamp it on the tables participating in that paced
+		// work — a table still copying, or every table during the verify — so a
+		// completed table is never rendered as paused by another table's copy.
+		// The reason is stamped only with the flag, keeping the contract that
+		// an unthrottled table carries no reason.
+		if tableInPacedPhase(st.IsComplete, spiritState) && prog.Throttle.Throttled {
+			tp.Throttled = true
+			tp.ThrottleReason = engine.SanitizeThrottleReason(prog.Throttle.Reason)
+		}
 		tableProgress = append(tableProgress, tp)
 	}
 	return tableProgress
+}
+
+// tableInPacedPhase reports whether a table is doing work the runner's
+// throttler paces: its own row copy while incomplete, or the runner-wide
+// checksum verify (which runs only after every copy finished).
+func tableInPacedPhase(copyComplete bool, spiritState status.State) bool {
+	return !copyComplete || spiritState == status.Checksum
 }
 
 // spiritPostCopyPhase reports whether the runner is in one of the active

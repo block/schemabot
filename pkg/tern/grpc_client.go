@@ -3298,6 +3298,17 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
 		}
+		// Throttle state is a point-in-time signal, not cumulative progress:
+		// it is mirrored on every tick — including ticks whose row totals are
+		// kept — so a lifted throttle clears promptly instead of lingering on
+		// the PR comment. The reason travels only with an active throttle and
+		// is bounded here because the remote data plane's reason is untrusted
+		// input for the operator surfaces that render it.
+		storedTask.Throttled = remoteTask.Throttled
+		storedTask.ThrottleReason = ""
+		if remoteTask.Throttled {
+			storedTask.ThrottleReason = engine.SanitizeThrottleReason(remoteTask.ThrottleReason)
+		}
 		// Adopt the remote task's own failure reason (for example an engine
 		// preflight rejection) so the operation row derived from the stored task
 		// carries a per-table error. An empty remote error never clears a stored

@@ -8,7 +8,7 @@
 // version imported by pkg/api/telemetry.go; the test guards this precondition.
 module github.com/block/schemabot/e2e/consumermodule
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/block/schemabot v0.0.0
@@ -37,7 +37,7 @@ require (
 	github.com/aws/smithy-go v1.27.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/block/pg-sprite v0.0.0-20260814025010-d6cf677e4feb // indirect
-	github.com/block/spirit v0.16.1-0.20260808013537-864cf2ee6b6b // indirect
+	github.com/block/spirit v0.16.1-0.20260815035524-fc3efbddfa34 // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

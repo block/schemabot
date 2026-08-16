@@ -1994,6 +1994,38 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
 }
 
+// A drive claim that reattaches to the engine's durable checkpoint records one
+// timeline event, so an operator can tell a resumed copy from a fresh start.
+// The engine reports the resume flag on every subsequent poll; the per-drive
+// latch keeps the timeline to one event per claim.
+func TestLocalClient_LogEngineResumeOnce(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-resume",
+		Database:        "testdb",
+		Environment:     "staging",
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		storage: &exactProgressStorage{logs: logs},
+		logger:  slog.Default(),
+	}
+
+	var latch bool
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, false, &latch)
+	assert.Empty(t, logs.logs, "a fresh start records no resume event")
+	assert.False(t, latch)
+
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, true, &latch)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, storage.LogEventInfo, logs.logs[0].EventType)
+	assert.Equal(t, storage.LogLevelInfo, logs.logs[0].Level)
+	assert.Contains(t, logs.logs[0].Message, "resumed from checkpoint")
+
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, true, &latch)
+	assert.Len(t, logs.logs, 1, "the flag on every later poll produces one event per drive claim")
+}
+
 // The drive's auto-cutover records one trigger in the timeline per drive and
 // retries quietly while the engine backend stages the cutover. A rejection
 // that outlives the staging window records a one-time timeline error and
@@ -3892,6 +3924,8 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 		ETASeconds:          90,
 		ChecksumRowsChecked: 10,
 		ChecksumRowsTotal:   1000,
+		Throttled:           true,
+		ThrottleReason:      "replica-lag 12s > 10s",
 	}
 	client := &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
@@ -3914,6 +3948,8 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(90), tp.EtaSeconds, "ETA comes from the stored task row")
 	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
+	assert.True(t, tp.Throttled, "throttle state comes from the stored task row")
+	assert.Equal(t, "replica-lag 12s > 10s", tp.ThrottleReason)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
 }
 

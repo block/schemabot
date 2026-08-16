@@ -435,6 +435,12 @@ type ProgressResult struct {
 	Tables       []TableProgress
 	ResumeState  *ResumeState // Updated resume state (engines may update MigrationContext/Metadata during polling)
 
+	// ResumedFromCheckpoint reports that this run reattached to a durable
+	// checkpoint left by an earlier run rather than starting the copy from
+	// scratch, so preserved progress can be told apart from a fresh restart.
+	// False for engines without checkpoint resume.
+	ResumedFromCheckpoint bool
+
 	// Metadata carries engine-specific display fields for the progress response
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the
 	// engine surface structured status to the renderer without core decoding the
@@ -480,12 +486,21 @@ type TableProgress struct {
 	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	Shards              []ShardProgress // Per-shard breakdown (for Vitess)
-	IsInstant           bool            // True if using instant DDL
-	ProgressDetail      string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
-	DDL                 string          // The DDL statement being applied
-	StartedAt           *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
-	CompletedAt         *time.Time      // When execution completed (from engine)
+	// Throttled reports that the engine's throttler is currently pausing the
+	// phase this table's work is in (the row copy or the checksum verify), so
+	// stalled row counts read as a deliberate pause rather than a hang. False
+	// in phases nothing paces, and cleared when the pause lifts.
+	Throttled bool
+	// ThrottleReason names the signal pausing the work, for display only
+	// (e.g. "replica-lag 5s >= 2s"). Empty when Throttled is false or the
+	// engine cannot explain the pause.
+	ThrottleReason string
+	Shards         []ShardProgress // Per-shard breakdown (for Vitess)
+	IsInstant      bool            // True if using instant DDL
+	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
+	DDL            string          // The DDL statement being applied
+	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
+	CompletedAt    *time.Time      // When execution completed (from engine)
 }
 
 // ShardProgress tracks progress for a single shard.

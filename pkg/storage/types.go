@@ -1199,7 +1199,14 @@ type Task struct {
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	CutoverAttempts     int // Number of cutover attempts for this shard
+	// Throttled reports that the engine's throttler is pausing this table's
+	// active phase (row copy or checksum verify), so stalled row counts read
+	// as a deliberate pause rather than a hang. Cleared when the pause lifts.
+	Throttled bool
+	// ThrottleReason names the signal pausing the work, for display (e.g.
+	// "replica-lag 5s >= 2s"). Empty when Throttled is false.
+	ThrottleReason  string
+	CutoverAttempts int // Number of cutover attempts for this shard
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
