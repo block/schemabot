@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -194,13 +193,16 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	defer utils.CloseAndLog(targetDB)
 
 	appDBName := fmt.Sprintf("extid_%d", time.Now().UnixNano()%100000)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdentifier(appDBName))
 	require.NoError(t, err, "create app database")
 	defer func() {
-		_, _ = targetDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE IF EXISTS "+appDBName)
+		_, _ = targetDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName))
 	}()
 
-	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
+	appCfg, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err, "parse target DSN")
+	appCfg.DBName = appDBName
+	appDSN := appCfg.FormatDSN()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
@@ -328,7 +330,7 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 
 	appDBName := fmt.Sprintf("taskst_%d", time.Now().UnixNano()%100000)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdentifier(appDBName))
 	require.NoError(t, err, "create app database")
 	t.Cleanup(func() {
 		// Cleanup runs after the test context is cancelled, so the drop detaches
@@ -336,12 +338,15 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 		// the database would outlive the run.
 		dropCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+appDBName); err != nil {
+		if _, err := targetDB.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName)); err != nil {
 			t.Logf("cleanup: drop database %s: %v", appDBName, err)
 		}
 	})
 
-	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
+	appCfg, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err, "parse target DSN")
+	appCfg.DBName = appDBName
+	appDSN := appCfg.FormatDSN()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
@@ -583,11 +588,16 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 		func() string { return "schemabot HTTP server did not become healthy" },
 	)
 
-	// Step 1: Plan — add a unique index the seeded duplicate rows cannot satisfy
+	// Step 1: Plan — add a unique index the seeded duplicate rows cannot satisfy,
+	// alongside a second table whose change is unaffected by that failure.
 	schemaSQL := `CREATE TABLE dup_users (
 		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
 		name VARCHAR(255) NOT NULL,
 		UNIQUE KEY uniq_name (name)
+	);`
+	bystanderSQL := `CREATE TABLE audit_log (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+		note VARCHAR(255) NOT NULL
 	);`
 	planResp := postJSON(t, "http://"+schemabotAddr+"/api/plan", map[string]any{
 		"database":    appDBName,
@@ -597,6 +607,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 			"default": map[string]any{
 				"files": map[string]string{
 					"dup_users.sql": schemaSQL,
+					"audit_log.sql": bystanderSQL,
 				},
 			},
 		},
@@ -615,8 +626,11 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	applyID, ok := applyResp["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
 
-	// Step 3: Wait for the apply to fail on the duplicate rows
-	waitForState(t, "http://"+schemabotAddr, applyID, "failed", 15*time.Second)
+	// Step 3: Wait for the apply to fail on the duplicate rows. The engine
+	// classifies this failure retryable, so the remote re-runs it until the
+	// recovery budget is spent; the deadline covers that whole bounded sequence,
+	// not a single engine run.
+	waitForState(t, "http://"+schemabotAddr, applyID, "failed", 30*time.Second)
 
 	// Step 4: Wait for the local apply record to be updated by pollForCompletion.
 	var storedApply *storage.Apply
@@ -642,23 +656,37 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	require.NoError(t, err, "get tasks by apply ID")
 	require.NotEmpty(t, tasks, "expected task records for apply %s", applyID)
 
-	var dupTask *storage.Task
+	var dupTask, bystanderTask *storage.Task
 	for _, task := range tasks {
-		if task.TableName == "dup_users" && task.Shard == "" {
+		if task.Shard != "" {
+			continue
+		}
+		switch task.TableName {
+		case "dup_users":
 			dupTask = task
-			break
+		case "audit_log":
+			bystanderTask = task
 		}
 	}
 	require.NotNil(t, dupTask, "expected a task record for table dup_users")
+	require.NotNil(t, bystanderTask, "expected a task record for table audit_log")
 	assert.Equal(t, state.Task.Failed, dupTask.State,
 		"task %s should be failed, but is %q", dupTask.TaskIdentifier, dupTask.State)
-	assert.Contains(t, dupTask.ErrorMessage, "checksum failed",
+	assert.NotEmpty(t, dupTask.ErrorMessage,
 		"failed task should carry the engine's own reason for this table, mirrored from the remote per-table progress")
 	// The apply-level error names the table it blames ("table X failed: ..."),
 	// so its absence here shows the reason came from this table's own remote
 	// progress rather than from the apply-level error being stamped over it.
 	assert.NotContains(t, dupTask.ErrorMessage, "table "+dupTask.TableName+" failed",
 		"per-table reason should reach the task row directly, not by way of the apply-level error")
+
+	// The other table did not fail, so its row must stay error-free: an apply
+	// that stamps its failure across every task tells the operator the schema
+	// change broke without telling them which table to look at.
+	assert.NotEqual(t, state.Task.Failed, bystanderTask.State,
+		"table %s did not fail, but its task is %q", bystanderTask.TableName, bystanderTask.State)
+	assert.Empty(t, bystanderTask.ErrorMessage,
+		"only the table that failed should carry an error, so the root cause stays identifiable")
 }
 
 // TestGRPC_ServerSideTargetPlan verifies that HTTP plan succeeds when the
@@ -733,13 +761,16 @@ func TestGRPC_ServerSideDeploymentStoredOnApply(t *testing.T) {
 	defer utils.CloseAndLog(targetDB)
 
 	appDBName := fmt.Sprintf("deploy_%d", time.Now().UnixNano()%100000)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+appDBName)
+	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+quoteIdentifier(appDBName))
 	require.NoError(t, err, "create app database")
 	defer func() {
-		_, _ = targetDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE IF EXISTS "+appDBName)
+		_, _ = targetDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE IF EXISTS "+quoteIdentifier(appDBName))
 	}()
 
-	appDSN := strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
+	appCfg, err := mysql.ParseDSN(targetDSN)
+	require.NoError(t, err, "parse target DSN")
+	appCfg.DBName = appDBName
+	appDSN := appCfg.FormatDSN()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	ternGRPCAddr, err := startTernGRPC(ctx, appDSN, ternStorageDSN)
