@@ -28,11 +28,17 @@ const durableWebhookTestDeadline = 5 * time.Second
 type durableWebhookTestStorage struct {
 	emptyStorage
 	webhookEvents storage.WebhookEventStore
+	locks         storage.LockStore
+	applies       storage.ApplyStore
 }
 
 func (s *durableWebhookTestStorage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
 }
+
+func (s *durableWebhookTestStorage) Locks() storage.LockStore { return s.locks }
+
+func (s *durableWebhookTestStorage) Applies() storage.ApplyStore { return s.applies }
 
 type recordingWebhookEventStore struct {
 	mu     sync.Mutex
@@ -331,6 +337,33 @@ func newDurableDriverHandler(t *testing.T, store storage.WebhookEventStore, conf
 		factory = &fakeClientFactory{}
 	}
 	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+}
+
+func newDurableDriverHarness(
+	t *testing.T,
+	st *durableWebhookTestStorage,
+	config *api.ServerConfig,
+	configureGitHub func(*http.ServeMux, chan string),
+) (*Handler, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	if configureGitHub == nil {
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	} else {
+		configureGitHub(mux, comments)
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if config == nil {
+		config = &api.ServerConfig{}
+	}
+	service := api.New(st, config, nil, logger)
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch()), comments
 }
 
 func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
