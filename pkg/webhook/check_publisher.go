@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"html"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -878,8 +878,21 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 	}
 }
 
+// checkRunSummaryEscaper neutralizes HTML markup in a Check Run summary
+// without rewriting quotes, so operator-facing prose (apostrophes, quoted
+// identifiers) renders verbatim while injected tags cannot.
+var checkRunSummaryEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+
+// sanitizeCheckRunErrorSummary makes error text safe for a Check Run summary:
+// single-line sanitization (endpoint redaction, control stripping, clamping)
+// plus markup escaping. Text that sanitizes to nothing falls back to a fixed
+// summary so the Check Run never publishes with an empty summary.
 func sanitizeCheckRunErrorSummary(summary string) string {
-	return html.EscapeString(templates.SanitizeInlineError(summary))
+	sanitized := templates.SanitizeInlineError(summary)
+	if sanitized == "" {
+		return "Plan failed"
+	}
+	return checkRunSummaryEscaper.Replace(sanitized)
 }
 
 // clearAggregateBlocksForVerifiedPR releases stored aggregate blocking reasons
