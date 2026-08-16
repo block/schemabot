@@ -115,7 +115,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 		case dr.Submitting:
 			// Crash recovery: if the background goroutine panicked or exited without
 			// advancing the state, detect stale "submitting" rows and transition to error.
-			if createdAt, err := time.Parse("2006-01-02 15:04:05", r.createdAtStr); err == nil {
+			if createdAt, err := time.Parse(storedTimestampLayout, r.createdAtStr); err == nil {
 				if time.Since(createdAt) > 2*time.Minute {
 					s.logger.Error("deploy request stuck in submitting (possible crash)", "number", r.number)
 					if err := s.updateDeployState(ctx, ref, dr.Error); err != nil {
@@ -284,7 +284,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 		case dr.CompletePendingRevert:
 			// Auto-expire the revert window after the configured duration
 			if r.revertExpiresAtStr.Valid {
-				if expiresAt, err := time.Parse("2006-01-02 15:04:05", r.revertExpiresAtStr.String); err == nil && time.Now().After(expiresAt) {
+				if expiresAt, err := time.Parse(storedTimestampLayout, r.revertExpiresAtStr.String); err == nil && time.Now().After(expiresAt) {
 					s.logger.Info("revert window expired", "number", r.number)
 					if err := s.updateDeployState(ctx, ref, dr.Complete); err != nil {
 						s.logger.Error("processor: failed to complete expired revert", "number", r.number, "error", err)

@@ -71,12 +71,17 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusInternalServerError, "get deploy request id: %v", err)
 	}
 
-	// Read back the assigned number.
+	// Read back the assigned number and creation time.
 	var number uint64
+	var createdAtRaw string
 	if err := s.metadataDB.QueryRowContext(r.Context(),
-		"SELECT number FROM localscale_deploy_requests WHERE id = ?", id,
-	).Scan(&number); err != nil {
+		"SELECT number, created_at FROM localscale_deploy_requests WHERE id = ?", id,
+	).Scan(&number, &createdAtRaw); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "read deploy request number: %v", err)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 	}
 
 	// Return immediately with "pending" — background goroutine will compute diff
@@ -86,6 +91,7 @@ func (s *Server) handleCreateDeployRequest(w http.ResponseWriter, r *http.Reques
 		"branch":           body.Branch,
 		"into_branch":      body.IntoBranch,
 		"deployment_state": dr.Pending,
+		"created_at":       createdAt,
 		"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 		"approved":         false,
 		"deployment": map[string]any{
@@ -138,17 +144,21 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Read deploy request
-	var branch, ddlJSON, deployState string
+	var branch, ddlJSON, deployState, createdAtRaw string
 	var vschemaDataSQL sql.NullString
 	var autoCutover, deployed bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state
+		`SELECT branch, ddl_statements, vschema_data, auto_cutover, deployed, deployment_state, created_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState)
+	).Scan(&branch, &ddlJSON, &vschemaDataSQL, &autoCutover, &deployed, &deployState, &createdAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 	}
 
 	if deployState == dr.Pending {
@@ -210,7 +220,7 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 		); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 		}
-		s.writeJSON(w, deployResponse(number, branch, dr.NoChanges))
+		s.writeJSON(w, deployResponse(number, branch, dr.NoChanges, createdAt))
 		return nil
 	}
 
@@ -232,7 +242,7 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusConflict, "deploy request already deployed")
 	}
 
-	resp := deployResponse(number, branch, dr.Submitting)
+	resp := deployResponse(number, branch, dr.Submitting, createdAt)
 	resp["approved"] = true
 	resp["html_url"] = fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number)
 
@@ -276,7 +286,7 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 	database := r.PathValue("db")
 
 	rows, err := s.metadataDB.QueryContext(r.Context(),
-		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover
+		`SELECT number, branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ?
 		 ORDER BY number DESC`,
@@ -289,16 +299,21 @@ func (s *Server) handleListDeployRequests(w http.ResponseWriter, r *http.Request
 	var results []map[string]any
 	for rows.Next() {
 		var number int64
-		var branch, intoBranch, state string
+		var branch, intoBranch, state, createdAtRaw string
 		var instantEligible, instantDDL, autoCutover bool
-		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover); err != nil {
+		if err := rows.Scan(&number, &branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw); err != nil {
 			return newHTTPError(http.StatusInternalServerError, "scan deploy request: %v", err)
+		}
+		createdAt, err := deployRequestCreatedAt(createdAtRaw)
+		if err != nil {
+			return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 		}
 		results = append(results, map[string]any{
 			"number":           number,
 			"branch":           branch,
 			"into_branch":      intoBranch,
 			"deployment_state": state,
+			"created_at":       createdAt,
 			"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 			"deployment": map[string]any{
 				"instant_ddl_eligible": instantEligible,
@@ -323,16 +338,20 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 
-	var branch, intoBranch, state string
+	var branch, intoBranch, state, createdAtRaw string
 	var instantEligible, instantDDL, autoCutover bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover
+		`SELECT branch, into_branch, deployment_state, instant_ddl_eligible, instant_ddl, auto_cutover, created_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		org, database, number,
-	).Scan(&branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover)
+	).Scan(&branch, &intoBranch, &state, &instantEligible, &instantDDL, &autoCutover, &createdAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 	}
 
 	resp := map[string]any{
@@ -340,6 +359,7 @@ func (s *Server) handleGetDeployRequest(w http.ResponseWriter, r *http.Request) 
 		"branch":           branch,
 		"into_branch":      intoBranch,
 		"deployment_state": state,
+		"created_at":       createdAt,
 		"html_url":         fmt.Sprintf("%s/%s/%s/deploy-requests/%d", s.baseURL, org, database, number),
 		"deployment": map[string]any{
 			"instant_ddl_eligible": instantEligible,

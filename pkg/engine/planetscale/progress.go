@@ -207,9 +207,22 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	return result, nil
 }
 
+// baselineContextRetention bounds how much terminal history
+// captureExistingContexts keeps in the pre-deploy context baseline. SHOW
+// VITESS_MIGRATIONS retains every schema change ever run against the target,
+// and the baseline is persisted into durable engine resume state on every
+// apply, so an unbounded capture grows linearly with the target's lifetime.
+const baselineContextRetention = 24 * time.Hour
+
 // captureExistingContexts returns the set of migration_context values currently
 // in SHOW VITESS_MIGRATIONS. Used as a baseline before deploying so that new
-// contexts can be identified after deploy.
+// contexts can be identified after deploy. The baseline is bounded: contexts
+// with a non-terminal row are always kept (they are live work that discovery
+// must not attach to), while purely terminal history is kept only when active
+// within baselineContextRetention. A terminal context that ages out and is
+// later resurrected by a Vitess retry keeps its original requested_timestamp,
+// so the requested-at-or-after-deploy check in selectSchemaChangeContext still
+// excludes it.
 func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials) map[string]MigrationContextTimestamps {
 	existing := make(map[string]MigrationContextTimestamps)
 	if creds.DSN == "" {
@@ -227,6 +240,8 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 		return existing
 	}
 
+	cutoff := time.Now().Add(-baselineContextRetention)
+	var skippedRows int
 	for _, ks := range keyspaces {
 		rows, err := e.showVitessMigrationsForKeyspace(ctx, creds.DSN, ks.Name, "")
 		if err != nil {
@@ -234,14 +249,47 @@ func (e *Engine) captureExistingContexts(ctx context.Context, client psclient.PS
 			continue
 		}
 		for _, r := range rows {
-			if r.MigrationContext != "" {
-				existing[r.MigrationContext] = migrationRowTimestamps(r)
+			if r.MigrationContext == "" {
+				continue
 			}
+			if !baselineContextRow(r, cutoff) {
+				skippedRows++
+				continue
+			}
+			existing[r.MigrationContext] = migrationRowTimestamps(r)
 		}
 	}
 
-	e.logger.Info("captured schema change context baseline", "count", len(existing))
+	e.logger.Info("captured schema change context baseline",
+		"count", len(existing), "skipped_old_terminal_rows", skippedRows)
 	return existing
+}
+
+// baselineContextRow reports whether a SHOW VITESS_MIGRATIONS row belongs in
+// the pre-deploy context baseline. Non-terminal rows always do. Terminal rows
+// qualify only when active at or after cutoff; a terminal row with no
+// timestamps at all is kept because its age cannot be proven.
+func baselineContextRow(r vitessMigrationRow, cutoff time.Time) bool {
+	if !state.IsTerminalVitessState(r.Status) {
+		return true
+	}
+	latest := latestMigrationRowTime(r)
+	if latest == nil {
+		return true
+	}
+	return !latest.Before(cutoff)
+}
+
+// latestMigrationRowTime returns the most recent of a row's requested, started,
+// and completed timestamps, or nil when none is set.
+func latestMigrationRowTime(r vitessMigrationRow) *time.Time {
+	var latest *time.Time
+	for _, ts := range []*time.Time{r.RequestedAt, r.StartedAt, r.CompletedAt} {
+		if ts != nil && (latest == nil || ts.After(*latest)) {
+			latest = ts
+		}
+	}
+	return latest
 }
 
 // migrationRowTimestamps snapshots a baseline row's Vitess timestamp fields for
@@ -310,6 +358,13 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 		e.logger.Warn("multiple in-flight schema change contexts; keeping stored identifier to avoid attaching to the wrong change",
 			"database", database, "candidate_count", len(candidates), "candidates", candidates)
 		return ""
+	case len(candidates) == 1:
+		// The sole in-flight context was requested before this deploy was
+		// created, so it is another change's work — typically an old change
+		// resurrected by a Vitess retry. Keep the stored identifier.
+		e.logger.Warn("sole in-flight schema change context predates this deploy; keeping stored identifier to avoid attaching to a resurrected change",
+			"database", database, "candidate", candidates[0], "deploy_created_at", deployCreatedAt)
+		return ""
 	default:
 		e.logger.Warn("schema change context not discovered yet", "database", database)
 		return ""
@@ -323,8 +378,9 @@ func (e *Engine) discoverMigrationContext(ctx context.Context, client psclient.P
 // completed history that SHOW VITESS_MIGRATIONS retains is terminal and must be
 // ignored so an empty-baseline rediscovery never attaches to an old, unrelated
 // change. It returns the single context when exactly one candidate remains and
-// the full candidate list so the caller can distinguish the zero and multiple
-// cases (both ambiguous, both must keep the stored identifier).
+// its requested_timestamp is at or after the deploy, plus the full candidate
+// list so the caller can distinguish the zero and multiple cases (both
+// ambiguous, both must keep the stored identifier).
 func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[string]MigrationContextTimestamps, deployCreatedAt time.Time) (string, []string) {
 	// A context is a candidate if it is absent from the pre-deploy baseline and
 	// any of its shards is still non-terminal: the change is in flight even when
@@ -353,8 +409,18 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 	}
 	sort.Strings(candidates)
 
-	if len(candidates) <= 1 {
-		if len(candidates) == 1 {
+	if len(candidates) == 0 {
+		return "", candidates
+	}
+	if len(candidates) == 1 {
+		// Even a sole candidate must prove it is this deploy's work: a
+		// pre-deploy change resurrected by a Vitess retry re-enters SHOW
+		// VITESS_MIGRATIONS as non-terminal, and the bounded baseline no longer
+		// remembers old terminal history. Retries preserve the original
+		// requested_timestamp, so the requested-at-or-after-deploy check
+		// excludes such a change; when the check fails, stay ambiguous so the
+		// caller keeps the stored identifier.
+		if requestedAtOrAfterDeploy(earliestRequested[candidates[0]], deployCreatedAt) {
 			return candidates[0], candidates
 		}
 		return "", candidates
@@ -370,7 +436,7 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 	var bestRequested *time.Time
 	for _, c := range candidates {
 		requested := earliestRequested[c]
-		if requested == nil || requested.Before(deployCreatedAt) {
+		if !requestedAtOrAfterDeploy(requested, deployCreatedAt) {
 			continue
 		}
 		if best == "" || requested.Before(*bestRequested) || (requested.Equal(*bestRequested) && c < best) {
@@ -382,6 +448,21 @@ func selectSchemaChangeContext(rows []vitessMigrationRow, existingContexts map[s
 		return best, candidates
 	}
 	return "", candidates
+}
+
+// requestedAtOrAfterDeploy reports whether a candidate context's earliest
+// requested_timestamp shows it was created by this apply's deploy. Vitess
+// stamps requested_timestamp when a change is submitted and preserves it
+// across retries, so a resurrected pre-deploy change always fails this check
+// regardless of baseline membership. A nil requested timestamp proves
+// nothing, and a zero deploy creation time gives the comparison no anchor —
+// both fail closed so discovery keeps the stored identifier rather than
+// attaching on evidence it does not have.
+func requestedAtOrAfterDeploy(requested *time.Time, deployCreatedAt time.Time) bool {
+	if deployCreatedAt.IsZero() {
+		return false
+	}
+	return requested != nil && !requested.Before(deployCreatedAt)
 }
 
 // earlierTime reports whether candidate is strictly earlier than current,

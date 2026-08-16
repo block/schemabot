@@ -493,6 +493,11 @@ type psMetadata struct {
 	// only one that knows it. Map membership drives the baseline diff; the stored
 	// timestamp values are diagnostic only — the earliest-requested tie-break in
 	// discovery reads requested_timestamp from the current rows, not from these.
+	// The set is bounded at capture time: non-terminal contexts are always
+	// included, terminal history only within baselineContextRetention. Old
+	// terminal contexts absent from the baseline are still excluded from
+	// discovery by the requested-at-or-after-deploy check, because Vitess
+	// retries preserve the original requested_timestamp.
 	ExistingMigrationCtxs map[string]MigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
 }
 
