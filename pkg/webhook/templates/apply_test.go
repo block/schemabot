@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1173,6 +1174,16 @@ func TestRenderApplyStatusComment_FailedRetryableNextRetry(t *testing.T) {
 	resumed := RenderApplyStatusComment(data)
 	assert.Contains(t, resumed, "🔄 Retrying · attempt 3/10\n")
 	assert.NotContains(t, resumed, "next ")
+
+	// The claim path stops admitting attempts at the budget ceiling, so the
+	// last attempt names itself rather than a further one, and the deadline it
+	// leaves behind promises nothing.
+	data.State = state.Apply.FailedRetryable
+	data.Attempt = storage.MaxRecoveryAttempts
+	spent := RenderApplyStatusComment(data)
+	assert.Contains(t, spent, "🔄 Retrying · attempt 10/10\n")
+	assert.NotContains(t, spent, "attempt 11/10")
+	assert.NotContains(t, spent, "next ")
 }
 
 // Every apply state must render a human-readable headline. Raw snake_case

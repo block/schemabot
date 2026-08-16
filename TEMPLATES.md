@@ -4752,7 +4752,7 @@ Single table progress (default):
 ┌────────────────────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6                 │
 │  State:     Retrying                           │
-│  Retry:     attempt 4/10 · next 14:31:30 UTC   │
+│  Retry:     attempt 4/10 · next 14:31:00 UTC   │
 │  Started:   Jan 15 14:26:00 UTC                │
 │  Duration:  4m                                 │
 └────────────────────────────────────────────────┘

@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T) {
@@ -127,6 +128,15 @@ func TestRetryBoxRow(t *testing.T) {
 
 	_, ok = retryBoxRow(ProgressData{State: state.Apply.Running, Attempt: 3})
 	assert.False(t, ok, "a spent attempt counter carries no signal outside the retrying state")
+
+	spent, ok := retryBoxRow(ProgressData{
+		State:      state.Apply.FailedRetryable,
+		Attempt:    storage.MaxRecoveryAttempts,
+		RetryAfter: now.Add(90 * time.Second).Format(time.RFC3339),
+	})
+	require.True(t, ok)
+	assert.Equal(t, "attempt 10/10", spent.Value,
+		"a spent budget names the last attempt made, not one the claim path will never admit")
 }
 
 func TestParseProgressResponseWithoutOperationsKeepsDeploymentEmpty(t *testing.T) {

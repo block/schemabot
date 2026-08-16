@@ -48,6 +48,22 @@ func RetryBackoff(attempt int) time.Duration {
 	return delay
 }
 
+// AnnouncedRetryAttempt reports the attempt number an interrupted apply's
+// operator-facing surfaces should name, and whether the budget still allows
+// that attempt to happen, where attempt is the apply's stored count of
+// attempts already admitted. The claim path stops admitting at
+// MaxRecoveryAttempts, so past that point the budget is spent and the surfaces
+// name the last attempt made rather than counting past the ceiling: an apply
+// sitting in failed_retryable with a spent budget is waiting to be terminalized,
+// not waiting to retry, and a comment promising one more attempt outlives the
+// apply that could have made it.
+func AnnouncedRetryAttempt(attempt int) (announced int, retryComing bool) {
+	if attempt >= MaxRecoveryAttempts {
+		return MaxRecoveryAttempts, false
+	}
+	return attempt + 1, true
+}
+
 // MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
 // times FindNext will hand out a given delivery (each claim increments
 // attempts) before the row stops being claimable. It bounds the blast radius

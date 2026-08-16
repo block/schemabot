@@ -82,8 +82,9 @@ type ApplyStatusCommentData struct {
 	// from the derived model to agree with its <summary> line.
 	DerivedStatus string
 
-	// Attempt is the apply's operator redispatch count so far; the retry the
-	// comment announces is Attempt+1 of storage.MaxRecoveryAttempts.
+	// Attempt is the apply's operator redispatch count so far; the attempt the
+	// comment announces follows from it via storage.AnnouncedRetryAttempt,
+	// which stops counting once the budget is spent.
 	Attempt int
 
 	// RetryAfter is the RFC3339 time the next automatic retry becomes eligible.
@@ -829,8 +830,13 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, retry app
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBar(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied), ui.ColorOrange)
+		announced, retryComing := storage.AnnouncedRetryAttempt(retry.attempt)
+		next := ""
+		if retryComing {
+			next = nextRetrySegment(retry.retryAfter)
+		}
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Retrying · attempt %d/%d%s\n",
-			table.TableName, bar, retry.attempt+1, storage.MaxRecoveryAttempts, nextRetrySegment(retry.retryAfter))
+			table.TableName, bar, announced, storage.MaxRecoveryAttempts, next)
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
 			writeTableErrorLine(sb, table.ErrorMessage)

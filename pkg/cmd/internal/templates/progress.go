@@ -94,9 +94,12 @@ func retryBoxRow(data ProgressData) (BoxRow, bool) {
 	if !state.IsState(data.State, state.Apply.FailedRetryable) {
 		return BoxRow{}, false
 	}
-	retry := fmt.Sprintf("attempt %d/%d", data.Attempt+1, storage.MaxRecoveryAttempts)
-	if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(nowFunc()) {
-		retry += " · next " + due.In(localZone).Format("15:04:05 MST")
+	announced, retryComing := storage.AnnouncedRetryAttempt(data.Attempt)
+	retry := fmt.Sprintf("attempt %d/%d", announced, storage.MaxRecoveryAttempts)
+	if retryComing {
+		if due, err := time.Parse(time.RFC3339, data.RetryAfter); err == nil && due.After(nowFunc()) {
+			retry += " · next " + due.In(localZone).Format("15:04:05 MST")
+		}
 	}
 	return BoxRow{"Retry", retry}, true
 }

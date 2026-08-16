@@ -618,10 +618,10 @@ func TestStateColorsReserveRedForFailure(t *testing.T) {
 		}
 	}
 
-	for _, s := range []string{state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted} {
+	for _, s := range []string{state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.FailedRetryable} {
 		fn := stateColorFunc(s)
 		require.NotNil(t, fn, "expected color function for state %q", s)
-		assert.Contains(t, fn(state.Label(s)), ANSIOrange, "operator-halted state %q must render orange", s)
+		assert.Contains(t, fn(state.Label(s)), ANSIOrange, "halted state %q must render orange", s)
 	}
 }
 
