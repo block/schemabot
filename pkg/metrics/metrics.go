@@ -779,6 +779,27 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	)
 }
 
+// RecordTasklessSettleDeferred counts task-less stop/cancel settles that lost
+// the parent apply lease mid-drive and settled only the drive's own leased
+// operation row, deferring the apply row to the operator's state projection.
+// The deferral itself converges (the projection derives the apply state from
+// the settled rows and completes the pending request), so an occasional count
+// is benign lease churn. A sustained rate means drives are routinely outliving
+// their parent apply lease — check apply-lease heartbeating and claim
+// contention on the affected database before the churn hits tasked drives too.
+func RecordTasklessSettleDeferred(ctx context.Context, operation, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.control.taskless_settle_deferrals_total",
+		"Total task-less stop/cancel settles that lost the apply lease and deferred the apply row to the state projection", "{settle}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordEngineTerminalTruthReconcile counts drive claims that read the
 // engine's authoritative state before consuming a pending stop/cancel control
 // request. Outcomes:

@@ -1629,7 +1629,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+			return fmt.Errorf("mark resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
