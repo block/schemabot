@@ -777,7 +777,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 
 	for _, ec := range checks {
 		// Build summary from the error for this environment
-		summary := "Plan failed"
+		summary := planFailedCheckText
 		if errMsg, ok := errors[ec.environment]; ok {
 			summary = errMsg
 		} else if len(errors) > 0 {
@@ -825,7 +825,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 			Status:     checkStatusCompleted,
 			Conclusion: checkConclusionFailure,
 			Output: &ghclient.CheckRunOutput{
-				Title:   "Plan failed",
+				Title:   planFailedCheckText,
 				Summary: summary,
 			},
 		}
@@ -878,6 +878,10 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 	}
 }
 
+// planFailedCheckText is the fixed title and fallback summary a failing plan
+// aggregate Check Run shows when no more specific error text is available.
+const planFailedCheckText = "Plan failed"
+
 // checkRunSummaryEscaper neutralizes HTML markup in a Check Run summary
 // without rewriting quotes, so operator-facing prose (apostrophes, quoted
 // identifiers) renders verbatim while injected tags cannot.
@@ -890,7 +894,7 @@ var checkRunSummaryEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">",
 func sanitizeCheckRunErrorSummary(summary string) string {
 	sanitized := templates.SanitizeInlineError(summary)
 	if sanitized == "" {
-		return "Plan failed"
+		return planFailedCheckText
 	}
 	return checkRunSummaryEscaper.Replace(sanitized)
 }

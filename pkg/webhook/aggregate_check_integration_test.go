@@ -1317,6 +1317,39 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	}
 }
 
+// A failing aggregate's summary carries error text that can contain internal
+// endpoints, control sequences, and markup. The publish path must sanitize
+// that text before it reaches the GitHub Check Run, so the visible summary
+// never leaks infrastructure detail or renders injected markup.
+func TestE2EFailingAggregateSanitizesErrorSummary(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+	ctx := t.Context()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "abc123")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
+		"staging": "plan failed:\n\x1b[31mdial tcp db-primary.internal:3306: connect & retry <5s>",
+	})
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, "Plan failed", cr.Output.Title)
+		assert.Equal(t, "plan failed: dial tcp [endpoint redacted]: connect &amp; retry &lt;5s&gt;", cr.Output.Summary)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
+
 // setupFakeGitHubHeadAndCheckRuns registers a fake PR endpoint that always
 // reports headSHA as the PR HEAD, plus check-run create/update capture.
 func setupFakeGitHubHeadAndCheckRuns(t *testing.T, mux *http.ServeMux, headSHA string) chan checkRunCapture {

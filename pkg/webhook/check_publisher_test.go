@@ -21,6 +21,10 @@ func TestSanitizeCheckRunErrorSummary(t *testing.T) {
 		assert.NotContains(t, got, "db-primary.internal")
 	})
 
+	t.Run("ampersands escape exactly once, including around escaped angle brackets", func(t *testing.T) {
+		assert.Equal(t, "retry &amp; wait &lt;5s&gt;", sanitizeCheckRunErrorSummary("retry & wait <5s>"))
+	})
+
 	t.Run("quotes and apostrophes in operator-facing prose pass through verbatim", func(t *testing.T) {
 		input := "Check SchemaBot's access to this \"repository\", then retry the check."
 
