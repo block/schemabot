@@ -181,12 +181,13 @@ func (b blockingTask) subject() string {
 // to be started, a retryable failure to be retried, an apply at the cutover
 // barrier to be cut over, and one in its revert window to be reverted or
 // skip-reverted. The revert window is the one that offers no cancel: the change
-// has already cut over, so stop and cancel are permanently rejected, and only the
-// revert decision or the window's own expiry moves it on. A revert already under
-// way, like a running apply, finishes on its own — with the caveat that a running
-// apply may still park, since a deferred or ordered cutover moves it to
-// waiting_for_cutover rather than to a terminal state, so the running line
-// promises progress, not release.
+// has already cut over, so stop and cancel are permanently rejected there. It is
+// also the one whose wait is bounded without an operator, since the window's
+// expiry triggers the skip-revert itself rather than being a third way out.
+// A revert already under way, like a running apply, finishes on its own — with
+// the caveat that a running apply may still park, since a deferred or ordered
+// cutover moves it to waiting_for_cutover rather than to a terminal state, so
+// the running line promises progress, not release.
 //
 // Other active states (pending, cutting over, recovering, waiting for a deploy
 // that tern may be about to trigger itself) get no resolution line rather than a
@@ -201,7 +202,7 @@ func (b blockingTask) resolution() string {
 	case state.IsState(b.applyState, state.Apply.WaitingForCutover):
 		return "it holds the database until it is cut over or cancelled"
 	case state.IsState(b.applyState, state.Apply.RevertWindow):
-		return "it holds the database until it is reverted, skip-reverted, or the window expires"
+		return "it holds the database until it is reverted or skip-reverted"
 	case state.IsState(b.applyState, state.Apply.Reverting, state.Apply.SkippingRevert):
 		return "it releases the database when the revert finishes, which it does on its own"
 	case state.IsRunningApplyState(b.applyState):

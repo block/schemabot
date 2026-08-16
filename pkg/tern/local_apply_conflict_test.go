@@ -659,7 +659,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 			},
 			want: []string{
 				"table xfers", "task-holding", "apply-holding", "revert_window",
-				"reverted, skip-reverted, or the window expires",
+				"reverted or skip-reverted",
 			},
 		},
 		{
