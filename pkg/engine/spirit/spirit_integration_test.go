@@ -1604,7 +1604,8 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, result.State)
 	assert.Contains(t, result.ErrorMessage, "schema change failed")
 	assert.Contains(t, result.ErrorMessage, "nonexistent_column")
-	assert.True(t, result.Retryable)
+	assert.False(t, result.Retryable,
+		"a column the table does not have is missing on every attempt, so the failure is permanent")
 }
 
 // TestEngine_ExecuteMigration_MultipleStatements tests running multiple

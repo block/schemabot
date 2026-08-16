@@ -471,7 +471,11 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		logger.Error("schema change failed",
 			"error", err,
 		)
-		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", err))
+		failure := fmt.Errorf("schema change failed: %w", err)
+		if checksumRejectedUniqueIndex(runner, parsed) {
+			failure = &engine.PermanentError{Err: failure}
+		}
+		e.setSchemaChangeFailed(failure)
 		utils.CloseAndLog(runner)
 		return err
 	}
@@ -489,14 +493,28 @@ func (e *Engine) setSchemaChangeCompleted() {
 	}
 }
 
-// setSchemaChangeFailed sets the state to failed with an error message.
+// setSchemaChangeFailed sets the state to failed with an error message, and
+// records whether the failure is one a later attempt could clear. A rejection
+// the target reproduces every time is reported as a permanent failure so the
+// apply goes terminal on the spot instead of spending its recovery budget — and
+// the target's active-apply slot — reproducing the same rejection.
 func (e *Engine) setSchemaChangeFailed(err error) {
+	err = classifyExecutionFailure(err)
+	if err != nil && !engine.IsRetryable(err) {
+		attrs := []any{"error", err}
+		if number, rejected := permanentDDLRejection(err); rejected {
+			attrs = append(attrs, "mysql_error_number", number)
+		}
+		e.changeLogger().Error("the target reproduces this failure on every attempt; the apply will not be retried", attrs...)
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.runningSchemaChange != nil {
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
 			e.runningSchemaChange.errorMessage = err.Error()
+			e.runningSchemaChange.permanentFailure = !engine.IsRetryable(err)
 		}
 	}
 }

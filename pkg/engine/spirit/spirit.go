@@ -95,6 +95,7 @@ type runningSchemaChange struct {
 	progressCallback        func() string // returns Summary from Spirit's Progress API
 	state                   engine.State
 	errorMessage            string // Error details when state is StateFailed
+	permanentFailure        bool   // Set when the recorded failure reproduces on every later attempt
 	started                 time.Time
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
@@ -796,7 +797,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		State:        state,
 		Message:      message,
 		ErrorMessage: rm.errorMessage,
-		Retryable:    state == engine.StateFailed,
+		Retryable:    state == engine.StateFailed && !rm.permanentFailure,
 		Tables:       tableProgress,
 		ResumeState:  req.ResumeState,
 	}, nil

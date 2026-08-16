@@ -159,9 +159,18 @@ data plane, a network blip, an unclean kill mid-drive. Nothing about the work
 needs to change; it just needs to be picked up again. Those failures move the
 apply to `failed_retryable` instead of `failed`, and recovery is automatic: a
 recovery driver reclaims the apply and continues it from where it left off,
-using engine checkpoints so completed work is not redone. Failures where
-retrying cannot help — the engine rejected a statement, the target refused the
-change — skip this state and go straight to permanent `failed`.
+using engine checkpoints so completed work is not redone.
+
+Failures where retrying cannot help skip this state and go straight to permanent
+`failed`. Those are the ones the target rejects for a reason that belongs to the
+statement or to the data already in the table: a duplicate value under a new
+unique index, existing rows that do not fit a narrowed column, a column the
+table does not have, DDL the target will not perform at all. Nothing about the
+target changes between attempts, so the apply is failed on the spot with the
+target's own reason rather than spending its whole budget reproducing it — and
+the database's active-apply slot is released for the corrected apply that
+follows. Anything that might read differently once a lock, a lagging replica, or
+a busy target has moved on keeps its retries.
 
 A clean shutdown is not one of these failures. A process that stops on purpose
 hands its claims back and leaves the apply active, so a peer driver resumes it
