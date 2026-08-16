@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -522,6 +523,64 @@ func TestDurableCheckSuiteNoOpenPRMatchNoOps(t *testing.T) {
 
 	require.NoError(t, err)
 	require.False(t, retry)
+}
+
+// A fork-head walk that exhausts its page budget before the listing does has
+// incomplete PR coverage, not a genuine no-match: a PR matched on a visited
+// page is still recovered and the delivery completes without retrying — a
+// match beyond the budget is the reconciler's missing-head scan to backstop.
+func TestDurableCheckSuiteTruncatedOpenPRWalkStillRecoversVisitedMatches(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	h.webhookReconcileMaxPages = 1
+	mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", fmt.Sprintf(`<%s?page=2>; rel="next"`, r.URL.Path))
+		writeOpenPRs(t, w, openPR(7, "suite-sha", time.Now().Add(-time.Hour)))
+	})
+
+	retry, err := h.processDurableCheckSuite(t.Context(), durableCheckSuiteForkEvent(t, "suite-sha"))
+
+	require.NoError(t, err)
+	require.False(t, retry)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	require.NoError(t, err)
+	require.NotNil(t, row, "a PR matched on a visited page must still be recovered")
+}
+
+// Exhausting the page budget while the listing still has pages is truncation,
+// not a no-match: the resolver reports the two outcomes distinctly so an
+// incomplete walk is never counted as a benign no-open-PR result.
+func TestResolveCheckSuitePRsDistinguishesTruncationFromNoMatch(t *testing.T) {
+	tests := []struct {
+		name          string
+		morePages     bool
+		wantTruncated bool
+	}{
+		{name: "budget exhausted with pages remaining", morePages: true, wantTruncated: true},
+		{name: "listing exhausted within budget", morePages: false, wantTruncated: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newCheckSuiteProcessHandler(t, newRecordingWebhookEventStore(), map[string]api.RepoConfig{"octocat/hello-world": {}})
+			h.webhookReconcileMaxPages = 1
+			ghc, clientMux := setupGitHubServer(t)
+			client := ghclient.NewInstallationClient(ghc, testLogger())
+			clientMux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, r *http.Request) {
+				if tt.morePages {
+					w.Header().Set("Link", fmt.Sprintf(`<%s?page=2>; rel="next"`, r.URL.Path))
+				}
+				writeOpenPRs(t, w, openPR(8, "other-sha", time.Now().Add(-time.Hour)))
+			})
+
+			var payload checkSuitePayload // a fork head: empty head_branch, no payload PRs
+			prs, truncated, retry, err := h.resolveCheckSuitePRs(t.Context(), client, "octocat/hello-world", "suite-sha", payload)
+
+			require.NoError(t, err)
+			require.False(t, retry)
+			require.Empty(t, prs, "no open PR sits at the suite head on the visited page")
+			require.Equal(t, tt.wantTruncated, truncated)
+		})
+	}
 }
 
 // A same-repository suite (non-empty head_branch) whose payload names no PRs

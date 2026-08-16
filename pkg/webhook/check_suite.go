@@ -120,15 +120,19 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 	// open PR existed at delivery time and there is nothing to recover.
 	// Skipping it here keeps the dominant non-PR traffic — pushes to branches
 	// (including the default branch) without an open PR — from occupying
-	// inbox rows and grace-delayed processing passes. A PR opened after the
-	// push produces its own pull_request.opened delivery, and the
-	// reconciler's missing-head scan backstops the exotic residue. Fork heads
-	// arrive with an empty head_branch and an empty list, so they pass
-	// through to processing's API-resolution fallback.
+	// inbox rows and grace-delayed processing passes. The cost of the skip:
+	// for a same-repository PR, the only check_suite.requested at its initial
+	// head fires at push time, before the PR exists, so it is dropped here —
+	// a lost pull_request.opened on a same-repository PR is not recovered by
+	// this mechanism at all; the reconciler's missing-head scan owns that
+	// gap. Fork heads are the mirror image: their suite is created when the
+	// PR opens, so they arrive with an empty head_branch and an empty list
+	// and pass through to processing's API-resolution fallback.
 	if payload.CheckSuite.HeadBranch != "" && len(payload.CheckSuite.PullRequests) == 0 {
 		h.logger.Debug("check_suite delivery skipped because no open PR existed at the suite head",
 			"repo", repo, "head_sha", headSHA, "branch", payload.CheckSuite.HeadBranch,
 			"delivery_id", deliveryID)
+		metrics.RecordWebhookCheckSuiteRecovery(ctx, repo, "no_pr_at_ingress")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "check_suite without an open PR skipped"})
 		return
 	}
@@ -233,14 +237,24 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 		return true, fmt.Errorf("webhook event storage is unavailable for durable check_suite delivery %s", event.DeliveryID)
 	}
 
-	candidates, retryable, err := h.resolveCheckSuitePRs(ctx, client, repo, headSHA, payload)
+	candidates, truncated, retryable, err := h.resolveCheckSuitePRs(ctx, client, repo, headSHA, payload)
 	if err != nil {
 		return retryable, err
 	}
+	if truncated {
+		// PR coverage for this head is incomplete, not absent — a matching
+		// PR beyond the page budget goes unresolved this delivery, and the
+		// reconciler's missing-head scan backstops it. Recorded distinctly
+		// from no_open_pr so a dashboard shows truncation instead of a
+		// benign no-match.
+		metrics.RecordWebhookCheckSuiteRecovery(ctx, repo, "truncated")
+	}
 	if len(candidates) == 0 {
-		h.logger.Info("durable check_suite delivery matched no open PR at the suite head",
-			"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
-		metrics.RecordWebhookCheckSuiteRecovery(ctx, repo, "no_open_pr")
+		if !truncated {
+			h.logger.Info("durable check_suite delivery matched no open PR at the suite head",
+				"delivery_id", event.DeliveryID, "repo", repo, "head_sha", headSHA)
+			metrics.RecordWebhookCheckSuiteRecovery(ctx, repo, "no_open_pr")
+		}
 		return false, nil
 	}
 
@@ -295,8 +309,10 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 // skipped because a fresher signal owns its new state. Only a fork head — an
 // empty head_branch, whose payload cannot name PRs — falls back to a bounded
 // walk of the repository's open PRs matched by head SHA, whose listing is
-// current at call time.
-func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, payload checkSuitePayload) (prs []int, retry bool, err error) {
+// current at call time. truncated reports that the walk exhausted its page
+// budget before the listing did, so the returned PRs are incomplete rather
+// than a genuine no-match.
+func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, payload checkSuitePayload) (prs []int, truncated bool, retry bool, err error) {
 	if len(payload.CheckSuite.PullRequests) > 0 {
 		for _, candidate := range payload.CheckSuite.PullRequests {
 			if candidate.Number <= 0 {
@@ -306,7 +322,7 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 			}
 			info, err := client.FetchPullRequestNoCache(ctx, repo, candidate.Number)
 			if err != nil {
-				return nil, true, fmt.Errorf("fetch pull request %s#%d for check_suite head %s: %w",
+				return nil, false, true, fmt.Errorf("fetch pull request %s#%d for check_suite head %s: %w",
 					repo, candidate.Number, headSHA, err)
 			}
 			if info.IsClosed() {
@@ -322,23 +338,25 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 			}
 			prs = append(prs, candidate.Number)
 		}
-		return prs, false, nil
+		return prs, false, false, nil
 	}
 	// GitHub names the open PRs for a same-repository head in the payload, so
 	// an empty list on a non-fork suite (a non-empty head_branch) means no
-	// open PR existed when the delivery was sent — a PR opened later produces
-	// its own pull_request.opened delivery. The API walk below exists only
-	// for fork heads, whose payload cannot name PRs.
+	// open PR existed when the delivery was sent. A same-repository PR opened
+	// after the push never produces another check_suite.requested at this
+	// head, so its recovery belongs to the reconciler's missing-head scan,
+	// not this path. The API walk below exists only for fork heads, whose
+	// payload cannot name PRs.
 	if payload.CheckSuite.HeadBranch != "" {
 		h.logger.Debug("check_suite recovery resolved no PRs because the same-repository suite head had no open PR at delivery time",
 			"repo", repo, "head_sha", headSHA, "head_branch", payload.CheckSuite.HeadBranch)
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	page := 1
 	for range h.webhookReconcileMaxPages {
 		open, nextPage, _, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookReconcilePageSize)
 		if err != nil {
-			return nil, true, fmt.Errorf("list open pull requests for %s while resolving check_suite head %s: %w",
+			return nil, false, true, fmt.Errorf("list open pull requests for %s while resolving check_suite head %s: %w",
 				repo, headSHA, err)
 		}
 		for _, pr := range open {
@@ -347,7 +365,7 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 			}
 		}
 		if nextPage == 0 {
-			return prs, false, nil
+			return prs, false, false, nil
 		}
 		page = nextPage
 	}
@@ -357,5 +375,5 @@ func (h *Handler) resolveCheckSuitePRs(ctx context.Context, client *ghclient.Ins
 	h.logger.Warn("check_suite recovery exhausted its page budget while resolving the suite head; open PR coverage for this head is truncated",
 		"repo", repo, "head_sha", headSHA, "max_pages", h.webhookReconcileMaxPages,
 		"page_size", webhookReconcilePageSize)
-	return prs, false, nil
+	return prs, true, false, nil
 }
