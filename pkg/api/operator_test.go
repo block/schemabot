@@ -417,14 +417,18 @@ func newOperatorStateTestService(opStore storage.ApplyOperationStore, applyStore
 
 type mockStorageWithApplyStoresAndOperations struct {
 	mockStorage
-	applyOps storage.ApplyOperationStore
-	applies  storage.ApplyStore
+	applyOps  storage.ApplyOperationStore
+	applies   storage.ApplyStore
+	applyLogs storage.ApplyLogStore
 }
 
 func (m *mockStorageWithApplyStoresAndOperations) ApplyOperations() storage.ApplyOperationStore {
 	return m.applyOps
 }
 func (m *mockStorageWithApplyStoresAndOperations) Applies() storage.ApplyStore { return m.applies }
+func (m *mockStorageWithApplyStoresAndOperations) ApplyLogs() storage.ApplyLogStore {
+	return m.applyLogs
+}
 
 // TestUpdateApplyStateFromOperations_ContinuePolicy verifies that the operator's
 // apply-state writer projects the rollout policy over the sibling set: under
@@ -481,6 +485,66 @@ func TestUpdateApplyStateFromOperations_ContinuePolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The projection is often the last writer standing on an apply — the drives
+// that produced the operation states may be gone by the time it runs (a crashed
+// driver, a lease-lost settle, stop reconciliation). When it swaps the parent
+// state it must record the transition in the apply's own durable log so the
+// timeline states how the derived state was reached; a projection that loses
+// the compare-and-swap must not append a stale entry.
+func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T) {
+	newService := func(swapped bool, applyLogs storage.ApplyLogStore) (*Service, *recordingApplyStore) {
+		applyStore := &recordingApplyStore{swapped: swapped}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithApplyStoresAndOperations{
+			applyOps: &listingApplyOperationStore{ops: []*storage.ApplyOperation{
+				{ID: 7, State: state.ApplyOperation.Cancelled},
+			}},
+			applies:   applyStore,
+			applyLogs: applyLogs,
+		}, testServerConfig(), nil, logger)
+		return svc, applyStore
+	}
+	apply := func() *storage.Apply {
+		return &storage.Apply{
+			ID:              3,
+			ApplyIdentifier: "apply-projection",
+			State:           state.Apply.Running,
+			Environment:     "staging",
+		}
+	}
+
+	t.Run("swapped projection appends the transition", func(t *testing.T) {
+		applyLogs := &capturingApplyLogStore{}
+		svc, _ := newService(true, applyLogs)
+
+		result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply(), rejectFailedApplyReopen)
+		require.NoError(t, err)
+		require.True(t, result.Swapped, "the projection must win the compare-and-swap in this scenario")
+
+		require.Len(t, applyLogs.logs, 1, "a swapped projection must append exactly one durable log entry")
+		entry := applyLogs.logs[0]
+		assert.Equal(t, int64(3), entry.ApplyID)
+		assert.Equal(t, storage.LogLevelInfo, entry.Level)
+		assert.Equal(t, storage.LogEventStateTransition, entry.EventType)
+		assert.Equal(t, storage.LogSourceSchemaBot, entry.Source)
+		assert.Equal(t, state.Apply.Running, entry.OldState)
+		assert.Equal(t, state.Apply.Cancelled, entry.NewState)
+		assert.Contains(t, entry.Message, "derived")
+		assert.Contains(t, entry.Message, state.Apply.Cancelled)
+	})
+
+	t.Run("lost compare-and-swap appends nothing", func(t *testing.T) {
+		applyLogs := &capturingApplyLogStore{}
+		svc, _ := newService(false, applyLogs)
+
+		result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply(), rejectFailedApplyReopen)
+		require.NoError(t, err)
+		require.False(t, result.Swapped)
+
+		assert.Empty(t, applyLogs.logs, "a stale projection must not write a misleading transition entry")
+	})
 }
 
 // releaseLatchControlStore returns a fixed release latch from GetByOperation so
