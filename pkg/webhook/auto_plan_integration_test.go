@@ -26,8 +26,6 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -1447,26 +1445,6 @@ func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
 				"the cap must be reported as blocked, never as a discovery error")
 		})
 	}
-}
-
-// collectCounterPoints returns the named int64 counter's data points from the
-// reader, failing the test when the counter was never recorded.
-func collectCounterPoints(t *testing.T, reader *sdkmetric.ManualReader, name string) []metricdata.DataPoint[int64] {
-	t.Helper()
-	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(t.Context(), &rm))
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != name {
-				continue
-			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			require.True(t, ok, "metric %s must be an int64 sum", name)
-			return sum.DataPoints
-		}
-	}
-	t.Fatalf("metric %s was never recorded", name)
-	return nil
 }
 
 // TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun verifies that

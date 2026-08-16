@@ -925,7 +925,7 @@ func getEnv(key, defaultValue string) string {
 // reconciler's missing-head synthesis, unless the operator disabled it with
 // WEBHOOK_RECONCILE_SYNTHESIS=false. The kill switch drops the reconciler
 // back to a report-only missing-delivery scan with a restart instead of a
-// code revert; the missing-delivery warning and metric keep flowing either
+// code revert; the missing-delivery log and metric keep flowing either
 // way, so detection is unaffected. An unparseable value also disables
 // synthesis: the only reason to set the variable is to turn synthesis off,
 // so a malformed value ("off", "disabled") is treated as intent to disable —

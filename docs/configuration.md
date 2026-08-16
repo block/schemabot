@@ -1183,7 +1183,14 @@ The map key under `apps:` is the App's stable logical name and the value that fl
 
 ### How dispatch works
 
-GitHub sends `X-GitHub-Hook-Installation-Target-ID` (the App's numeric ID) and `X-GitHub-Hook-Installation-Target-Type: integration` on every App-originated webhook. SchemaBot uses that header to look up which configured App signed the request and verifies the HMAC against that App's secret only. Then it cross-checks that the App signing the delivery is the same App configured to own the repository in `repos:` — a mismatch is rejected with 401 and a `app_repo_mismatch` log line so config drift fails closed rather than crossing tenant boundaries.
+GitHub sends `X-GitHub-Hook-Installation-Target-ID` (the App's numeric ID) and `X-GitHub-Hook-Installation-Target-Type: integration` on every App-originated webhook. SchemaBot uses that header to look up which configured App signed the request and verifies the HMAC against that App's secret only. Then it cross-checks that the App signing the delivery is the same App configured to own the repository in `repos:` so config drift fails closed rather than crossing tenant boundaries. Both outcomes are rejected with 401, but they are logged and counted differently because only one is actionable:
+
+| Cause | Log level | `schemabot.webhook.events_total` status |
+|---|---|---|
+| The repository has no entry in `repos:` at all — routine traffic from a repository this instance does not manage, since a shared App forwards deliveries for every repository it is installed on. | `debug` (invisible at the default `LOG_LEVEL=info`) | `repo_not_configured`, recorded without a `repository` attribute to keep the metric's cardinality bounded |
+| The repository is declared but the signing App is not the App configured to own it — config drift or a hostile install. | `warn` | `app_repo_mismatch`, with the `repository` attribute |
+
+Both emit the same `webhook rejected: signing App does not own repo` message and carry the repository in the log record, so debugging constant 401s for an unmanaged repository means searching at debug level, not warn.
 
 The legacy single-`github:` shape does not require the header and continues to verify against the single configured secret.
 

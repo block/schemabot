@@ -33,6 +33,26 @@ func newDispatchMetricsReader(t *testing.T) *sdkmetric.ManualReader {
 	return reader
 }
 
+// collectCounterPoints returns the named int64 counter's data points from the
+// reader, failing the test when the counter was never recorded.
+func collectCounterPoints(t *testing.T, reader *sdkmetric.ManualReader, name string) []metricdata.DataPoint[int64] {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "metric %s must be an int64 sum", name)
+			return sum.DataPoints
+		}
+	}
+	t.Fatalf("metric %s was never recorded", name)
+	return nil
+}
+
 // collectDispatchHistogramPoints collects the named float64 histogram's data
 // points from the reader.
 func collectDispatchHistogramPoints(t *testing.T, reader *sdkmetric.ManualReader, name string) []metricdata.HistogramDataPoint[float64] {
