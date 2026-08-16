@@ -102,6 +102,48 @@ func TestWriteProgressMultiDeploymentReleasedPauseRendersDegradedNotPaused(t *te
 	assert.Contains(t, released, "running (degraded)")
 }
 
+// An engine can fan one deployment out into several operations — per-shard
+// work applies plus group finalizers — all sharing the deployment name. The
+// status view must render that as one deployment section whose operation lines
+// each carry their own kind and external identifiers (so an operator can find
+// the exact remote apply), with the deployment's tables rendered once, and the
+// header histogram labeled as operations rather than deployments.
+func TestWriteProgressGroupsOperationsSharingADeployment(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-sharded",
+			Environment: "staging",
+			State:       state.Apply.Completed,
+			StartedAt:   "2026-06-16T10:00:00Z",
+			CompletedAt: "2026-06-16T10:00:23Z",
+			Operations: []ProgressOperation{
+				{Deployment: "cake", ExternalID: "remote-apply-w1", ExternalOperationID: "304", OperationKind: "work", Target: "orders-primary", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "cake", ExternalID: "remote-apply-w2", ExternalOperationID: "305", OperationKind: "work", Target: "orders-primary", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "cake", ExternalID: "remote-apply-f1", ExternalOperationID: "306", OperationKind: "group_finalizer", Target: "orders-primary", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "cake", TableName: "mutes", Namespace: "orders_sharded", ChangeType: "alter", DDL: "ALTER TABLE `mutes` ADD COLUMN `flag` varchar(32)", Status: state.Task.Completed},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "Operations:")
+	assert.NotContains(t, output, "Deployments:")
+	assert.Contains(t, output, "3 completed")
+	assert.Equal(t, 1, strings.Count(output, "✅ cake — "), "one section per deployment, not per operation")
+	assert.Contains(t, output, "(orders-primary)")
+	assert.Contains(t, output, "external operation ID 304")
+	assert.Contains(t, output, "external apply ID remote-apply-w1")
+	assert.Contains(t, output, "external operation ID 305")
+	assert.Contains(t, output, "external apply ID remote-apply-w2")
+	assert.Contains(t, output, "external operation ID 306")
+	assert.Contains(t, output, "external apply ID remote-apply-f1")
+	assert.Equal(t, 2, strings.Count(output, "work — completed"))
+	assert.Equal(t, 1, strings.Count(output, "group_finalizer — completed"))
+	assert.Equal(t, 1, strings.Count(output, "mutes:"), "deployment tables render once, not per operation")
+	assert.Equal(t, 1, strings.Count(output, "orders_sharded"), "keyspace header renders once, not per operation")
+}
+
 func TestWriteProgressSingleDeploymentDoesNotRenderMultiDeploymentAggregate(t *testing.T) {
 	data := ProgressData{
 		ApplyID:     "apply-single",

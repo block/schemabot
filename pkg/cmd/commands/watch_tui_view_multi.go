@@ -18,8 +18,12 @@ func (m WatchModel) multiDeploymentProgressView() string {
 	var b strings.Builder
 	m.writeMultiDeploymentHeader(&b, model)
 
-	for _, deployment := range model.Deployments {
-		m.writeDeploymentSection(&b, deployment)
+	for _, group := range templates.GroupOperationIndicesByDeployment(m.operations) {
+		if len(group) == 1 {
+			m.writeDeploymentSection(&b, model.Deployments[group[0]], m.operations[group[0]])
+			continue
+		}
+		m.writeGroupedDeploymentSection(&b, group, model)
 	}
 
 	m.writeMultiDeploymentFooter(&b, model)
@@ -81,17 +85,17 @@ func formatTUIDeploymentCounts(counts []presentation.StateCount) string {
 	return strings.Join(parts, " · ")
 }
 
-func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment) {
+func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment, op templates.ProgressOperation) {
 	fmt.Fprintf(b, "%s %s — %s", deployment.Emoji, deployment.Deployment, deployment.Label)
-	if target := targetForTUIDeployment(m.operations, deployment.Deployment); target != "" {
-		fmt.Fprintf(b, " (%s)", target)
+	if op.Target != "" {
+		fmt.Fprintf(b, " (%s)", op.Target)
 	}
 	b.WriteString("\n")
-	if externalOperationID := externalOperationIDForTUIDeployment(m.operations, deployment.Deployment); externalOperationID != "" {
-		fmt.Fprintf(b, "  External operation ID: %s\n", externalOperationID)
+	if op.ExternalOperationID != "" {
+		fmt.Fprintf(b, "  External operation ID: %s\n", op.ExternalOperationID)
 	}
-	if externalID := externalIDForTUIDeployment(m.operations, deployment.Deployment); externalID != "" {
-		fmt.Fprintf(b, "  External apply ID: %s\n", externalID)
+	if op.ExternalID != "" {
+		fmt.Fprintf(b, "  External apply ID: %s\n", op.ExternalID)
 	}
 
 	if deployment.Error != "" {
@@ -99,39 +103,51 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		fmt.Fprintf(b, "  %s\n", errStyle.Render(deployment.Error))
 	}
 
-	tables := tablesForDeployment(m.tables, deployment.Deployment)
+	m.writeDeploymentSectionTables(b, deployment.Deployment)
+	b.WriteString("\n")
+}
+
+// writeGroupedDeploymentSection renders one section for a deployment that owns
+// several operations. The header aggregates the group; each operation gets one
+// line with its own kind, status, and external identifiers, and the
+// deployment's tables render once — task rows are deployment-scoped, not
+// operation-scoped.
+func (m WatchModel) writeGroupedDeploymentSection(b *strings.Builder, group []int, model presentation.Apply) {
+	ops := make([]templates.ProgressOperation, 0, len(group))
+	for _, i := range group {
+		ops = append(ops, m.operations[i])
+	}
+	sub := presentation.Derive(tuiOperationsForPresentation(ops, m.released))
+
+	fmt.Fprintf(b, "%s %s — %s", templates.AggregateStateEmoji(sub.State), ops[0].Deployment, formatTUIDeploymentCounts(sub.Counts))
+	if ops[0].Target != "" {
+		fmt.Fprintf(b, " (%s)", ops[0].Target)
+	}
+	b.WriteString("\n")
+
+	for n, i := range group {
+		deployment := model.Deployments[i]
+		op := m.operations[i]
+		fmt.Fprintf(b, "  %s %s — %s%s\n",
+			deployment.Emoji, templates.OperationKindLabel(op, n), deployment.Label, templates.OperationIdentifierSuffix(op))
+		if deployment.Error != "" {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+			fmt.Fprintf(b, "      %s\n", errStyle.Render(deployment.Error))
+		}
+	}
+
+	m.writeDeploymentSectionTables(b, ops[0].Deployment)
+	b.WriteString("\n")
+}
+
+// writeDeploymentSectionTables renders the deployment's table progress once
+// per deployment section, outside the setup phase.
+func (m WatchModel) writeDeploymentSectionTables(b *strings.Builder, deployment string) {
+	tables := tablesForDeployment(m.tables, deployment)
 	if len(tables) > 0 && !state.IsSetupPhase(m.state) {
 		sortTablesByProgress(tables)
 		m.renderTables(b, tables)
 	}
-	b.WriteString("\n")
-}
-
-func targetForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment {
-			return op.Target
-		}
-	}
-	return ""
-}
-
-func externalOperationIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalOperationID != "" {
-			return op.ExternalOperationID
-		}
-	}
-	return ""
-}
-
-func externalIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalID != "" {
-			return op.ExternalID
-		}
-	}
-	return ""
 }
 
 func tablesForDeployment(tables []tableProgress, deployment string) []tableProgress {

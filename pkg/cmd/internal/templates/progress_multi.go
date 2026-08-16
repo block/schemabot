@@ -20,9 +20,34 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	writeMultiDeploymentNextAction(model.NextAction)
 	fmt.Println()
 
-	for _, deployment := range model.Deployments {
-		writeDeploymentProgressSection(deployment, data)
+	for _, group := range GroupOperationIndicesByDeployment(data.Operations) {
+		if len(group) == 1 {
+			writeDeploymentProgressSection(model.Deployments[group[0]], data.Operations[group[0]], data)
+			continue
+		}
+		writeGroupedDeploymentProgressSection(group, model, data)
 	}
+}
+
+// GroupOperationIndicesByDeployment groups operation indices by deployment
+// name, preserving first-appearance order. Multi-deployment rollouts have one
+// operation per deployment, so every group is a singleton; engines that fan
+// one deployment out into several operations (per-shard work plus finalizers)
+// produce larger groups that render as one deployment section.
+func GroupOperationIndicesByDeployment(ops []ProgressOperation) [][]int {
+	byName := make(map[string][]int, len(ops))
+	var order []string
+	for i, op := range ops {
+		if _, seen := byName[op.Deployment]; !seen {
+			order = append(order, op.Deployment)
+		}
+		byName[op.Deployment] = append(byName[op.Deployment], i)
+	}
+	groups := make([][]int, 0, len(order))
+	for _, name := range order {
+		groups = append(groups, byName[name])
+	}
+	return groups
 }
 
 // progressOperationsForPresentation maps the parsed progress operations to the
@@ -73,9 +98,25 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 		rows = append(rows, BoxRow{"Duration", dur})
 	}
 	if counts := formatDeploymentCounts(model.Counts); counts != "" {
-		rows = append(rows, BoxRow{"Deployments", counts})
+		rows = append(rows, BoxRow{operationCountsLabel(data.Operations), counts})
 	}
 	WriteBox(rows, "State", stateColorFunc(model.State))
+}
+
+// operationCountsLabel names the header histogram row. The per-status counts
+// tally operations; for a classic rollout that equals deployments, so the
+// deployment-facing label stays. When a deployment fans out into several
+// operations the counts exceed the deployment count, and labeling them
+// "Deployments" would misstate the topology.
+func operationCountsLabel(ops []ProgressOperation) string {
+	seen := make(map[string]struct{}, len(ops))
+	for _, op := range ops {
+		if _, dup := seen[op.Deployment]; dup {
+			return "Operations"
+		}
+		seen[op.Deployment] = struct{}{}
+	}
+	return "Deployments"
 }
 
 func formatDeploymentCounts(counts []presentation.StateCount) string {
@@ -113,63 +154,124 @@ func writeMultiDeploymentNextAction(next presentation.NextAction) {
 	}
 }
 
-func writeDeploymentProgressSection(deployment presentation.Deployment, data ProgressData) {
+func writeDeploymentProgressSection(deployment presentation.Deployment, op ProgressOperation, data ProgressData) {
 	fmt.Printf("%s %s — %s", deployment.Emoji, deployment.Deployment, deployment.Label)
-	if target := targetForDeployment(data.Operations, deployment.Deployment); target != "" {
-		fmt.Printf(" (%s)", target)
+	if op.Target != "" {
+		fmt.Printf(" (%s)", op.Target)
 	}
 	fmt.Println()
-	if externalOperationID := externalOperationIDForDeployment(data.Operations, deployment.Deployment); externalOperationID != "" {
-		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, externalOperationID, ANSIReset)
+	if op.ExternalOperationID != "" {
+		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, op.ExternalOperationID, ANSIReset)
 	}
-	if externalID := externalIDForDeployment(data.Operations, deployment.Deployment); externalID != "" {
-		fmt.Printf("  %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
+	if op.ExternalID != "" {
+		fmt.Printf("  %sExternal apply ID: %s%s\n", ANSIDim, op.ExternalID, ANSIReset)
 	}
 
 	if deployment.Error != "" {
 		fmt.Printf("  %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
 	}
 
-	tables := activeTablesForDeployment(data.Tables, deployment.Deployment)
-	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
-		sortActiveTables(tables)
-		if hasTableNamespaces(tables) {
-			fmt.Print(FormatNamespacedTables(tables))
-		} else {
-			fmt.Println()
-			for _, table := range tables {
-				fmt.Print(FormatTableProgress(table))
-			}
-		}
-	}
+	writeDeploymentTables(deployment.Deployment, data)
 	fmt.Println()
 }
 
-func targetForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment {
-			return op.Target
+// writeGroupedDeploymentProgressSection renders one section for a deployment
+// that owns several operations. The header aggregates the group with the same
+// policy-aware projection the apply header uses; each operation then gets one
+// line carrying its own kind, status, and external identifiers, so an operator
+// can drill into the exact remote apply. The deployment's tables render once —
+// task rows are deployment-scoped, not operation-scoped.
+func writeGroupedDeploymentProgressSection(group []int, model presentation.Apply, data ProgressData) {
+	ops := make([]ProgressOperation, 0, len(group))
+	for _, i := range group {
+		ops = append(ops, data.Operations[i])
+	}
+	sub := presentation.Derive(progressOperationsForPresentation(ops, data.Released))
+
+	fmt.Printf("%s %s — %s", AggregateStateEmoji(sub.State), ops[0].Deployment, formatDeploymentCounts(sub.Counts))
+	if ops[0].Target != "" {
+		fmt.Printf(" (%s)", ops[0].Target)
+	}
+	fmt.Println()
+
+	for n, i := range group {
+		deployment := model.Deployments[i]
+		op := data.Operations[i]
+		fmt.Printf("  %s %s — %s%s%s%s\n",
+			deployment.Emoji, OperationKindLabel(op, n), deployment.Label, ANSIDim, OperationIdentifierSuffix(op), ANSIReset)
+		if deployment.Error != "" {
+			fmt.Printf("      %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
 		}
 	}
-	return ""
+
+	writeDeploymentTables(ops[0].Deployment, data)
+	fmt.Println()
 }
 
-func externalOperationIDForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalOperationID != "" {
-			return op.ExternalOperationID
-		}
+// OperationKindLabel names one operation of a grouped deployment section. The
+// stored kind (work, group_finalizer, ...) is the operator-facing name; when a
+// server predates the kind field the 1-based position keeps the line unique.
+func OperationKindLabel(op ProgressOperation, n int) string {
+	if op.OperationKind != "" {
+		return op.OperationKind
 	}
-	return ""
+	return fmt.Sprintf("operation %d", n+1)
 }
 
-func externalIDForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalID != "" {
-			return op.ExternalID
-		}
+// OperationIdentifierSuffix renders the external identifiers an operator needs
+// to find this operation in the remote data plane, as a dimmed suffix.
+func OperationIdentifierSuffix(op ProgressOperation) string {
+	var sb strings.Builder
+	if op.ExternalOperationID != "" {
+		fmt.Fprintf(&sb, " · external operation ID %s", op.ExternalOperationID)
 	}
-	return ""
+	if op.ExternalID != "" {
+		fmt.Fprintf(&sb, " · external apply ID %s", op.ExternalID)
+	}
+	return sb.String()
+}
+
+// AggregateStateEmoji is the status glyph for a grouped deployment's derived
+// aggregate state, mirroring the per-operation glyph vocabulary.
+func AggregateStateEmoji(s string) string {
+	switch {
+	case state.IsState(s, state.Apply.Completed):
+		return "✅"
+	case state.IsState(s, state.Apply.Failed):
+		return "❌"
+	case state.IsState(s, state.Apply.FailedRetryable), state.IsState(s, state.Apply.CuttingOver):
+		return "🔁"
+	case state.IsState(s, state.Apply.WaitingForCutover):
+		return "🟡"
+	case state.IsState(s, state.Apply.Stopped), state.IsState(s, state.Apply.Paused):
+		return "⏸"
+	case state.IsState(s, state.Apply.Cancelled):
+		return "⛔"
+	case state.IsState(s, state.Apply.Reverted):
+		return "↩️"
+	case state.IsState(s, state.Apply.Pending), state.IsState(s, state.Apply.RevertWindow):
+		return "⏳"
+	default:
+		return "🔄"
+	}
+}
+
+// writeDeploymentTables renders the deployment's active table progress once
+// per deployment section, outside the setup phase.
+func writeDeploymentTables(deployment string, data ProgressData) {
+	tables := activeTablesForDeployment(data.Tables, deployment)
+	if len(tables) == 0 || state.IsSetupPhase(data.State) {
+		return
+	}
+	sortActiveTables(tables)
+	if hasTableNamespaces(tables) {
+		fmt.Print(FormatNamespacedTables(tables))
+		return
+	}
+	fmt.Println()
+	for _, table := range tables {
+		fmt.Print(FormatTableProgress(table))
+	}
 }
 
 func activeTablesForDeployment(tables []TableProgress, deployment string) []TableProgress {

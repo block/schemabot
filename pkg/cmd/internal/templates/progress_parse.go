@@ -44,6 +44,7 @@ type ProgressOperation struct {
 	Deployment          string
 	ExternalID          string
 	ExternalOperationID string
+	OperationKind       string
 	Target              string
 	State               string
 	CutoverPolicy       string
@@ -165,6 +166,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Deployment:          op.Deployment,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
+			OperationKind:       op.OperationKind,
 			Target:              op.Target,
 			State:               state.NormalizeState(op.State),
 			CutoverPolicy:       op.CutoverPolicy,
