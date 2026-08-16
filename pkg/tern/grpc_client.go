@@ -1519,13 +1519,16 @@ func operationLeaseOnly(ctx context.Context) bool {
 // remoteApplyIdempotencyKey derives the deduplication key the control plane
 // stamps on every remote Apply dispatch. The key is stable across a re-dispatch
 // of the same generation — so an ambiguous dispatch whose response was lost is
-// reused rather than duplicated — but rotates when the work is deliberately
-// retried. Multi-operation drives key on the claimed operation's identity and
-// its own attempt, so a sibling operation's retry (which advances the shared
-// parent apply.Attempt but not this operation's) never rotates this operation's
-// key; whole-apply and single-operation drives key on the parent apply.Attempt,
-// which advances only on that apply's own failed_retryable claim. The tuple is
-// hashed so the stored key stays within the column width and is free of
+// reused rather than duplicated — and rotates on apply.Attempt when the work is
+// deliberately retried.
+//
+// Operation-scoped drives key on the deployment, not the individual operation:
+// every sibling operation a deployment dispatches in one generation carries the
+// same key, so the data plane lands them on one remote apply — the first
+// dispatch creates it, each sibling attaches its own operation, and the data
+// plane tells the dispatches apart by the operation key it derives from each
+// request's shape. Whole-apply drives key on the parent apply alone. The tuple
+// is hashed so the stored key stays within the column width and is free of
 // delimiter collisions between variable-length identifiers.
 func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) string {
 	parts := []string{
@@ -1533,13 +1536,38 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 		apply.ApplyIdentifier,
 	}
 	if scope.usesOperationRemoteResume() {
-		parts = append(parts, "operation", scope.operation.Deployment, scope.operation.OperationKey,
-			strconv.Itoa(scope.operation.Attempt))
+		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(apply.Attempt))
 	} else {
 		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return "schemabot:v1:" + hex.EncodeToString(sum[:])
+}
+
+// verifyDispatchOperationKeyEcho checks an accepted ApplyResponse against the
+// operation key the dispatched request's shape derives to. Deployment-keyed
+// dispatches share one remote apply across sibling operations, so the apply id
+// alone no longer proves the response addresses this dispatch's operation — the
+// data plane echoes the operation key it resolved, and the control plane
+// re-derives the same key from the request it sent (both planes share the
+// derivation helpers). A mismatch means the response's ids belong to some other
+// operation of the shared apply — most often a data plane too old to attach
+// sibling operations, which aliases every sibling dispatch to the apply's
+// first operation and echoes no key at all — so the dispatch must fail closed
+// instead of persisting another operation's remote ids.
+func verifyDispatchOperationKeyEcho(plan *storage.Plan, req *ternv1.ApplyRequest, resp *ternv1.ApplyResponse) error {
+	scope, err := deriveDispatchScope(plan, req)
+	if err != nil {
+		return fmt.Errorf("derive dispatch scope for operation key echo check: %w", err)
+	}
+	expectedKey, _, err := operationIdentityForDispatch(scope)
+	if err != nil {
+		return fmt.Errorf("derive expected operation key for echo check: %w", err)
+	}
+	if resp.OperationKey != expectedKey {
+		return fmt.Errorf("remote apply %q echoed operation key %q, expected %q: the response does not address this dispatch's operation (data plane may predate sibling-operation attach)", resp.ApplyId, resp.OperationKey, expectedKey)
+	}
+	return nil
 }
 
 // persistRemoteApplyID stores the remote Tern apply id returned by dispatch.
@@ -1984,7 +2012,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		for _, namespace := range namespaces {
 			changes = append(changes, &ternv1.TableChange{Namespace: namespace, TableName: "VSchema: " + namespace, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA})
 		}
-		resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
+		req := &ternv1.ApplyRequest{
 			PlanId:      plan.PlanIdentifier,
 			Options:     options,
 			Database:    apply.Database,
@@ -1996,7 +2024,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			Caller:      apply.Caller,
 			// No TargetShards: the VSchema is namespace-level, not per shard.
 			IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
-		})
+		}
+		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
 			if isAmbiguousRemoteApplyDispatchError(err) {
 				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
@@ -2015,6 +2044,21 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 				return fmt.Errorf("mark %s apply_operation %d failed: %w", kind, op.ID, markErr)
 			}
 			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %s", kind, op.ID, apply.ApplyIdentifier, errMsg)
+		}
+		if echoErr := verifyDispatchOperationKeyEcho(plan, req, resp); echoErr != nil {
+			c.applyLogger(apply).ErrorContext(ctx, "remote dispatch response does not address this operation; refusing its remote ids and failing the operation closed",
+				append(apply.MutableLogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_key", op.OperationKey,
+					"kind", kind,
+					"remote_apply_id", resp.ApplyId,
+					"error", echoErr)...)
+			metrics.RecordRemoteApplyKeyEchoMismatch(ctx, apply.Database, apply.Environment)
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, echoErr.Error(), false, scope); markErr != nil {
+				return fmt.Errorf("mark %s apply_operation %d failed after operation key echo mismatch: %w", kind, op.ID, markErr)
+			}
+			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, echoErr)
 		}
 		if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId, resp.ApplyOperationId); err != nil {
 			return fmt.Errorf("store remote apply id for %s apply_operation %d: %w", kind, op.ID, err)
@@ -2718,7 +2762,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return err
 	}
 
-	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
+	req := &ternv1.ApplyRequest{
 		PlanId:         plan.PlanIdentifier,
 		Options:        options,
 		Database:       apply.Database,
@@ -2730,7 +2774,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		Caller:         apply.Caller,
 		TargetShards:   targetShards,
 		IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
-	})
+	}
+	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteApplyDispatchError(err) {
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
@@ -2763,6 +2808,17 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing remote apply id: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+	if echoErr := verifyDispatchOperationKeyEcho(plan, req, resp); echoErr != nil {
+		c.applyLogger(apply).ErrorContext(ctx, "remote dispatch response does not address this operation; refusing its remote ids and failing the apply closed",
+			append(apply.MutableLogAttrs(),
+				"remote_apply_id", resp.ApplyId,
+				"error", echoErr)...)
+		metrics.RecordRemoteApplyKeyEchoMismatch(ctx, apply.Database, apply.Environment)
+		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, echoErr.Error(), false, scope); markErr != nil {
+			return fmt.Errorf("mark queued gRPC apply %s failed after operation key echo mismatch: %w", apply.ApplyIdentifier, markErr)
+		}
+		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, echoErr)
 	}
 
 	oldApplyState := apply.State

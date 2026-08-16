@@ -583,6 +583,31 @@ type capturingTernServer struct {
 	startCalled       bool // tracks whether Start was actually invoked
 	stopCalls         int
 	cancelCalls       int
+	omitOperationKey  bool // emulate a data plane that does not echo the operation key
+}
+
+// dispatchOperationKeyEcho mirrors the data plane's operation key derivation
+// for the dispatch shapes these tests exercise, minus the stored-plan
+// validation a real data plane performs before answering.
+func dispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
+	if len(req.TargetShards) == 1 {
+		changes, err := scopedDispatchDDLChanges(req.DdlChanges)
+		if err != nil {
+			return ""
+		}
+		key, err := shardScopedDispatchOperationKey(changes, req.TargetShards[0])
+		if err != nil {
+			return ""
+		}
+		return key
+	}
+	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		if len(namespaces) == 1 {
+			return namespaces[0] + finalizerOperationKeySuffix
+		}
+		return finalizerDeploymentScopedKey
+	}
+	return ""
 }
 
 func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -593,12 +618,17 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 		applyID = "remote-apply-123"
 	}
 	operationID := s.remoteOperationID
+	omitOperationKey := s.omitOperationKey
 	err := s.applyErr
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID}, nil
+	operationKey := ""
+	if !omitOperationKey {
+		operationKey = dispatchOperationKeyEcho(req)
+	}
+	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID, OperationKey: operationKey}, nil
 }
 
 func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
@@ -6933,7 +6963,9 @@ func TestRemoteApplyIdempotencyKey(t *testing.T) {
 	assert.Equal(t, whole, remoteApplyIdempotencyKey(apply, singleOp),
 		"single-operation drives share the whole-apply key")
 
-	// Multi-operation sibling operations dispatch independently, so their keys differ.
+	// Sibling operations of one deployment share the key: the data plane lands
+	// them on one remote apply and tells the dispatches apart by the operation
+	// key derived from each request's shape, not by distinct idempotency keys.
 	opA := applyTaskScope{
 		applyOperationID: 1,
 		operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/-80/users"},
@@ -6946,20 +6978,27 @@ func TestRemoteApplyIdempotencyKey(t *testing.T) {
 	}
 	keyA := remoteApplyIdempotencyKey(apply, opA)
 	keyB := remoteApplyIdempotencyKey(apply, opB)
-	assert.NotEqual(t, keyA, keyB, "distinct operations must produce distinct keys")
-	assert.NotEqual(t, whole, keyA, "an operation-scoped key differs from the whole-apply key")
-	assert.Equal(t, keyA, remoteApplyIdempotencyKey(apply, opA), "operation key is stable across re-dispatch")
+	assert.Equal(t, keyA, keyB, "sibling operations of one deployment share the deployment key")
+	assert.NotEqual(t, whole, keyA, "a deployment-scoped key differs from the whole-apply key")
+	assert.Equal(t, keyA, remoteApplyIdempotencyKey(apply, opA), "the deployment key is stable across re-dispatch")
+
+	// Different deployments of one apply dispatch to different data planes, so
+	// their keys must differ.
+	opOtherDeployment := applyTaskScope{
+		applyOperationID: 3,
+		operation:        &storage.ApplyOperation{Deployment: "region-b", OperationKey: "commerce/-80/users"},
+		multiOperation:   true,
+	}
+	assert.NotEqual(t, keyA, remoteApplyIdempotencyKey(apply, opOtherDeployment),
+		"distinct deployments must produce distinct keys")
 }
 
-// TestRemoteApplyIdempotencyKey_OperationAttemptRotation verifies that an
-// operation-scoped key rotates on the operation's OWN attempt, not the shared
-// parent apply.Attempt. A sibling operation's retry advances the parent attempt
-// but not this operation's; if the key embedded the parent attempt, that sibling
-// retry would rotate this operation's key and re-dispatch it (re-running DDL)
-// while it sits in its dispatch-then-crash window. The operation-local attempt
-// keeps the key stable across a sibling's retry and rotates it only on this
-// operation's own redispatch.
-func TestRemoteApplyIdempotencyKey_OperationAttemptRotation(t *testing.T) {
+// TestRemoteApplyIdempotencyKey_GenerationRotation verifies that a
+// deployment-scoped key rotates on the shared apply.Attempt — a retried
+// generation dispatches fresh — and is insensitive to the individual
+// operation's attempt, so every sibling of one generation keeps sharing one
+// key regardless of per-operation retry counters.
+func TestRemoteApplyIdempotencyKey_GenerationRotation(t *testing.T) {
 	opScope := func(parentAttempt, opAttempt int) (*storage.Apply, applyTaskScope) {
 		return &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: parentAttempt},
 			applyTaskScope{
@@ -6972,17 +7011,123 @@ func TestRemoteApplyIdempotencyKey_OperationAttemptRotation(t *testing.T) {
 	apply0, scope0 := opScope(0, 0)
 	base := remoteApplyIdempotencyKey(apply0, scope0)
 
-	// A sibling's retry advances the parent attempt but not this operation's:
-	// the key must NOT rotate, so a lost-response self-redispatch is reused.
-	applySib, scopeSib := opScope(1, 0)
-	assert.Equal(t, base, remoteApplyIdempotencyKey(applySib, scopeSib),
-		"a sibling's retry (parent attempt bump) must not rotate this operation's key")
+	// The operation's own attempt is not part of the key: siblings share one
+	// key per generation whatever their individual retry counters read.
+	applySame, scopeSame := opScope(0, 3)
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applySame, scopeSame),
+		"the operation's own attempt must not rotate the deployment key")
 
-	// This operation's own retry advances its attempt: the key must rotate so the
-	// redispatch starts a fresh generation.
-	applyOwn, scopeOwn := opScope(1, 1)
-	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyOwn, scopeOwn),
-		"this operation's own attempt advancing must rotate its key")
+	// The generation retrying (parent attempt advancing) rotates the key so the
+	// retried work dispatches a fresh remote apply.
+	applyRetried, scopeRetried := opScope(1, 0)
+	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+		"an advanced apply attempt must rotate the deployment key")
+}
+
+// A deployment-keyed dispatch shares one remote apply across sibling
+// operations, so an accepted response only addresses this dispatch if it
+// echoes the operation key the request's shape derives to. The verifier must
+// accept a correct echo, reject a missing one (a data plane that answers
+// without attaching sibling operations), and keep accepting the empty echo for
+// a whole-deployment dispatch whose derived key is itself empty.
+func TestVerifyDispatchOperationKeyEcho(t *testing.T) {
+	plan := &storage.Plan{PlanIdentifier: "plan-echo"}
+	shardReq := &ternv1.ApplyRequest{
+		PlanId:       "plan-echo",
+		TargetShards: []string{"-80"},
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "commerce",
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}
+
+	matching := &ternv1.ApplyResponse{Accepted: true, ApplyId: "remote-1", OperationKey: "commerce/-80/users"}
+	require.NoError(t, verifyDispatchOperationKeyEcho(plan, shardReq, matching))
+
+	missing := &ternv1.ApplyResponse{Accepted: true, ApplyId: "remote-1"}
+	err := verifyDispatchOperationKeyEcho(plan, shardReq, missing)
+	require.Error(t, err, "a shard dispatch answered without its operation key must be refused")
+	assert.Contains(t, err.Error(), `expected "commerce/-80/users"`)
+
+	other := &ternv1.ApplyResponse{Accepted: true, ApplyId: "remote-1", OperationKey: "commerce/80-/users"}
+	err = verifyDispatchOperationKeyEcho(plan, shardReq, other)
+	require.Error(t, err, "another operation's key must be refused")
+
+	// A whole-deployment dispatch derives an empty key, so the empty echo is the
+	// correct answer for it.
+	wholeReq := &ternv1.ApplyRequest{
+		PlanId: "plan-echo",
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "commerce",
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}
+	require.NoError(t, verifyDispatchOperationKeyEcho(plan, wholeReq, missing))
+}
+
+// A shard-scoped dispatch answered by a data plane that does not echo the
+// derived operation key — one that aliases every sibling dispatch to the
+// apply's first operation instead of attaching them — must fail closed: the
+// response's remote ids are refused (never persisted) and the dispatch is
+// marked failed for the operator to act on, instead of the control plane
+// polling another operation's remote apply as if it were this one's.
+func TestGRPCClient_ResumeApplyOperationFailsClosedOnMissingOperationKeyEcho(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-no-echo",
+		omitOperationKey: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-no-echo",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		Shard:            "-80",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Pending,
+	}
+	operation := &storage.ApplyOperation{
+		ID: operationID, ApplyID: apply.ID, Deployment: "testdb-deployment",
+		OperationKey: "default/-80/users", State: state.ApplyOperation.Pending,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		plans:   &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-no-echo"}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: operation,
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "echoed operation key")
+
+	require.NotNil(t, server.getApplyRequest(), "the dispatch itself must have been sent")
+	assert.Empty(t, apply.ExternalID, "the unverified response's remote apply id must not be persisted on the parent")
+	assert.Empty(t, operation.ExternalID, "the unverified response's remote apply id must not be persisted on the operation")
 }
 
 // A task-less operation has no task rows, so the operator's task-derived

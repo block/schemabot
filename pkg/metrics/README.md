@@ -44,6 +44,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.remote_control_requests.stale_resends_total` | Counter | operation, database, deployment, environment | Retransmissions of a stop/cancel request the data plane accepted but has not consumed past the stale threshold — see [Control Operations](#control-operations) |
 | `schemabot.remote_apply_dedup_total` | Counter | database, environment, outcome | Idempotency-keyed dispatches replayed against their existing operation on the keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_attach_total` | Counter | database, environment, outcome | Sibling dispatches resolved into an existing deployment-keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
+| `schemabot.remote_apply_key_echo_mismatch_total` | Counter | database, environment | Remote dispatches refused fail-closed because the data plane's accepted response echoed a different operation key than the dispatch derives — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
@@ -332,6 +333,17 @@ operation, counted on `schemabot.remote_apply_attach_total`:
 | `attached` | A sibling dispatch added its operation and tasks to the deployment's shared keyed apply. | None — this is the normal fan-out event; its rate tracks sharded dispatch volume. |
 | `attach_race` | A concurrent same-operation attach lost the unique-index insert and was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
 | `terminal_refused` | The shared apply was already terminal, so the attach was refused fail-closed. | Investigate: the deployment's remaining operations cannot join a finished apply. The caller must re-dispatch under a fresh generation; the paired warn log names the apply, its state, and the refused operation key. |
+
+On the control plane, `schemabot.remote_apply_key_echo_mismatch_total` counts
+dispatches whose accepted response echoed a different operation key than the
+request's shape derives to, so the control plane refused the response's remote
+ids and failed the dispatch closed. A non-zero rate means a data plane is
+answering deployment-keyed dispatches without resolving them by operation key —
+most often a data plane running a version that predates sibling-operation
+attach. The operator action is to upgrade (or roll back) the named database's
+data plane so both planes derive the same key, then retry the blocked applies;
+the paired error log carries the apply, the dispatched operation key, and the
+echoed key.
 
 `schemabot.lock_operations_total` tracks database-level lock acquisition and
 release attempts.
