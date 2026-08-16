@@ -8,10 +8,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/pingcap/tidb/pkg/parser/ast"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -343,27 +341,39 @@ func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Lo
 }
 
 // refusedStorageChange is a planned storage-schema statement EnsureSchema
-// refused to execute, with the reason it was classified as destructive.
+// refused to execute, with the reason it was classified as unsafe.
 type refusedStorageChange struct {
 	change engine.TableChange
 	reason string
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
-// statements safe to execute and the destructive statements to refuse. A
-// statement is refused whole: an ALTER TABLE that mixes additive clauses with
-// a DROP COLUMN is not rewritten, because executing a partial statement would
-// diverge from the plan Spirit produced.
+// statements safe to execute and the unsafe statements to refuse, using
+// Spirit's unsafe vocabulary (ddl.UnsafeStatement). The vocabulary is
+// Spirit's, not a local list: every statement its UnsafeLinter flags as
+// destroying data — dropping a table, column, partition, or primary key,
+// truncating or coalescing partitions, discarding a tablespace — is refused,
+// while structural statements that lose nothing (DROP INDEX, renames) are
+// allowed. A statement Spirit's parser cannot classify fails startup rather
+// than executing unclassified — classification uncertainty must never widen
+// what the bootstrap will execute. The Spirit diff emits an
+// unsafe statement when the live storage database holds a table or column the
+// starting binary's embedded schema does not declare — during a rolling
+// deploy or rollback that surplus state usually belongs to a newer binary,
+// not to a removal the operator intended. A statement is refused whole: an
+// ALTER TABLE that mixes additive clauses with a DROP COLUMN is not
+// rewritten, because executing a partial statement would diverge from the
+// plan Spirit produced.
 func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
 	for _, sc := range changes {
 		kept := sc
 		kept.TableChanges = nil
 		for _, tc := range sc.TableChanges {
-			destructive, reason, err := isDestructiveStorageStatement(tc.DDL)
+			unsafe, reason, err := ddl.UnsafeStatement(tc.DDL)
 			if err != nil {
 				return nil, nil, fmt.Errorf("classify storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
 			}
-			if destructive {
+			if unsafe {
 				// The caller logs each refusal with the exact DDL and reason.
 				refused = append(refused, refusedStorageChange{change: tc, reason: reason})
 				continue
@@ -375,49 +385,6 @@ func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engin
 		}
 	}
 	return allowed, refused, nil
-}
-
-// isDestructiveStorageStatement reports whether a storage-schema DDL statement
-// destroys existing data: DROP TABLE, or an ALTER TABLE containing a DROP
-// COLUMN clause. The Spirit diff emits these when the live storage database
-// holds a table or column the starting binary's embedded schema does not
-// declare — during a rolling deploy or rollback that surplus state usually
-// belongs to a newer binary, not to a removal the operator intended.
-func isDestructiveStorageStatement(stmt string) (bool, string, error) {
-	stmtType, _, err := ddl.ClassifyStatement(stmt)
-	if err != nil {
-		return false, "", fmt.Errorf("classify statement: %w", err)
-	}
-	switch stmtType {
-	case ddl.StatementDropTable:
-		return true, "DROP TABLE removes the table and its data", nil
-	case ddl.StatementAlterTable:
-		return alterDropsColumn(stmt)
-	default:
-		return false, "", nil
-	}
-}
-
-// alterDropsColumn reports whether an ALTER TABLE statement contains a DROP
-// COLUMN clause, and names the first dropped column when it does.
-func alterDropsColumn(stmt string) (bool, string, error) {
-	parsed, err := statement.New(stmt)
-	if err != nil {
-		return false, "", fmt.Errorf("parse ALTER TABLE statement: %w", err)
-	}
-	if len(parsed) != 1 {
-		return false, "", fmt.Errorf("expected exactly 1 parsed ALTER TABLE statement, got %d", len(parsed))
-	}
-	alterStmt, ok := (*parsed[0].StmtNode).(*ast.AlterTableStmt)
-	if !ok {
-		return false, "", fmt.Errorf("statement is not ALTER TABLE: %s", stmt)
-	}
-	for _, spec := range alterStmt.Specs {
-		if spec.Tp == ast.AlterTableDropColumn {
-			return true, fmt.Sprintf("DROP COLUMN `%s` removes the column and its data", spec.OldColumnName.Name.String()), nil
-		}
-	}
-	return false, "", nil
 }
 
 // flatTableChanges returns all table changes across the given schema changes.

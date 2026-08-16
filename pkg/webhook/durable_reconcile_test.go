@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,8 +25,15 @@ import (
 // mux. Extra options are appended so tests can enable synthesis.
 func newReconcileTestHandler(t *testing.T, store storage.WebhookEventStore, repos map[string]api.RepoConfig, opts ...HandlerOption) (*Handler, *http.ServeMux) {
 	t.Helper()
-	ghc, mux := setupGitHubServer(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return newReconcileTestHandlerWithLogger(t, logger, store, repos, opts...)
+}
+
+// newReconcileTestHandlerWithLogger is newReconcileTestHandler with a
+// caller-supplied logger, for tests that assert on emitted log records.
+func newReconcileTestHandlerWithLogger(t *testing.T, logger *slog.Logger, store storage.WebhookEventStore, repos map[string]api.RepoConfig, opts ...HandlerOption) (*Handler, *http.ServeMux) {
+	t.Helper()
+	ghc, mux := setupGitHubServer(t)
 	service := api.New(&durableWebhookTestStorage{webhookEvents: store}, &api.ServerConfig{Repos: repos}, nil, logger)
 	factory := &fakeClientFactory{client: ghclient.NewInstallationClient(ghc, logger)}
 	h := NewHandler(service, factory, nil, logger, append([]HandlerOption{WithDurableWebhookDispatch(), WithWebhookReconciler()}, opts...)...)
@@ -169,6 +177,54 @@ func TestWebhookReconcilerSynthesisDedupesOnLaterPasses(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 0, missing)
 	require.Equal(t, 0, synthesized)
+}
+
+// TestWebhookReconcilerMissingHeadSeverityByMode pins the severity of the
+// per-head line for a missing inbox delivery to what an operator can act on.
+// In report-only mode the reconciler cannot recover the head, so the same line
+// repeats every pass until synthesis is enabled or an organic delivery arrives:
+// it stays at info and the missing-event metric plus the per-pass summary carry
+// the signal. Once synthesis is enabled the line is emitted at most once per
+// head and names a recovery that is actually happening, so it warns.
+func TestWebhookReconcilerMissingHeadSeverityByMode(t *testing.T) {
+	scenarios := []struct {
+		name      string
+		opts      []HandlerOption
+		wantLevel slog.Level
+		wantMsg   string
+	}{
+		{
+			name:      "report-only mode logs the repeating per-head line at info",
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "webhook reconciler found open PR head with no inbox delivery (report-only; synthesis disabled)",
+		},
+		{
+			name:      "synthesis mode warns because a recovery delivery is being enqueued",
+			opts:      []HandlerOption{WithWebhookReconcileSynthesis()},
+			wantLevel: slog.LevelWarn,
+			wantMsg:   "webhook reconciler found open PR head with no inbox delivery; synthesizing recovery delivery",
+		},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			store := newRecordingWebhookEventStore()
+			h, mux := newReconcileTestHandlerWithLogger(t, logger, store, map[string]api.RepoConfig{"octocat/hello-world": {}}, tc.opts...)
+			mux.HandleFunc("/repos/octocat/hello-world/pulls", func(w http.ResponseWriter, _ *http.Request) {
+				writeOpenPRs(t, w, openPR(7, "head-sha", time.Now().Add(-time.Hour)))
+			})
+
+			_, missing, _ := h.reconcileRepoWebhookInbox(t.Context(), store, "octocat/hello-world")
+			require.Equal(t, 1, missing)
+
+			record := findLogRecord(t, logs.Bytes(), tc.wantMsg)
+			require.Equal(t, tc.wantLevel.String(), record["level"])
+			require.Equal(t, "octocat/hello-world", record["repo"])
+			require.Equal(t, float64(7), record["pr"])
+			require.Equal(t, "head-sha", record["head_sha"])
+		})
+	}
 }
 
 func TestWebhookReconcilerSkipsAllowAllRegistry(t *testing.T) {

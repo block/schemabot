@@ -490,7 +490,10 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	return &mockApplyLogStore{}
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
-	return s.controlRequests
+	if s.controlRequests != nil {
+		return s.controlRequests
+	}
+	return &testControlRequestStore{}
 }
 func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
@@ -618,6 +621,17 @@ func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int6
 	return nil, nil
 }
 
+func (s *testControlRequestStore) ListSettled(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	var settled []*storage.ApplyControlRequest
+	for _, req := range s.requests {
+		if req.ApplyID != applyID || req.Status == storage.ControlRequestPending {
+			continue
+		}
+		settled = append(settled, cloneTestControlRequest(req))
+	}
+	return settled, nil
+}
+
 func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
 	for _, req := range s.requests {
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
@@ -635,6 +649,36 @@ func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, 
 		}
 	}
 	return nil
+}
+
+// RecordRemoteFailure mirrors the store's contract: a pending row is a live
+// request this plane has not forwarded yet, so a settled report describes a
+// superseded attempt and is ignored; anything else takes the remote reason.
+func (s *testControlRequestStore) RecordRemoteFailure(_ context.Context, req *storage.ApplyControlRequest) (bool, error) {
+	for _, existing := range s.requests {
+		if existing.ApplyID != req.ApplyID || existing.Operation != req.Operation {
+			continue
+		}
+		if existing.Status == storage.ControlRequestPending {
+			return false, nil
+		}
+		if existing.Status == storage.ControlRequestFailed &&
+			existing.ErrorMessage == req.ErrorMessage &&
+			existing.RequestedBy == req.RequestedBy {
+			return false, nil
+		}
+		existing.Status = storage.ControlRequestFailed
+		existing.ErrorMessage = req.ErrorMessage
+		if req.RequestedBy != "" {
+			existing.RequestedBy = req.RequestedBy
+		}
+		return true, nil
+	}
+	stored := cloneTestControlRequest(req)
+	stored.ID = int64(len(s.requests) + 1)
+	stored.Status = storage.ControlRequestFailed
+	s.requests = append(s.requests, stored)
+	return true, nil
 }
 
 func cloneTestControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
@@ -1992,6 +2036,38 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	require.NoError(t, err)
 	assert.Nil(t, pending, "the accepted cutover must complete the pending request")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
+}
+
+// A drive claim that reattaches to the engine's durable checkpoint records one
+// timeline event, so an operator can tell a resumed copy from a fresh start.
+// The engine reports the resume flag on every subsequent poll; the per-drive
+// latch keeps the timeline to one event per claim.
+func TestLocalClient_LogEngineResumeOnce(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-resume",
+		Database:        "testdb",
+		Environment:     "staging",
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		storage: &exactProgressStorage{logs: logs},
+		logger:  slog.Default(),
+	}
+
+	var latch bool
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, false, &latch)
+	assert.Empty(t, logs.logs, "a fresh start records no resume event")
+	assert.False(t, latch)
+
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, true, &latch)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, storage.LogEventInfo, logs.logs[0].EventType)
+	assert.Equal(t, storage.LogLevelInfo, logs.logs[0].Level)
+	assert.Contains(t, logs.logs[0].Message, "resumed from checkpoint")
+
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, true, &latch)
+	assert.Len(t, logs.logs, 1, "the flag on every later poll produces one event per drive claim")
 }
 
 // The drive's auto-cutover records one trigger in the timeline per drive and
@@ -3892,6 +3968,8 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 		ETASeconds:          90,
 		ChecksumRowsChecked: 10,
 		ChecksumRowsTotal:   1000,
+		Throttled:           true,
+		ThrottleReason:      "replica-lag 12s > 10s",
 	}
 	client := &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
@@ -3914,6 +3992,8 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(90), tp.EtaSeconds, "ETA comes from the stored task row")
 	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
+	assert.True(t, tp.Throttled, "throttle state comes from the stored task row")
+	assert.Equal(t, "replica-lag 12s > 10s", tp.ThrottleReason)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
 }
 
@@ -3953,18 +4033,31 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 		State:          state.Task.Completed,
 		DDLAction:      "alter",
 	}
+	// An earlier table's failure ends the sequential apply, so a table still
+	// pending is cancelled rather than run.
+	blockedTask := &storage.Task{
+		ID:             10,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-payments",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "payments",
+		State:          state.Task.Cancelled,
+		DDLAction:      "alter",
+	}
 	client := &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
 		storage: &exactProgressStorage{
 			applies: &exactProgressApplyStore{apply: apply},
-			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask}},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask, blockedTask}},
 		},
 		logger: slog.Default(),
 	}
 
 	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
 	require.NoError(t, err)
-	require.Len(t, progress.Tables, 2)
+	require.Len(t, progress.Tables, 3)
 
 	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
 	for _, tp := range progress.Tables {
@@ -3972,6 +4065,9 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 	}
 	require.Contains(t, byTable, "users")
 	require.Contains(t, byTable, "orders")
+	require.Contains(t, byTable, "payments")
 	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
 	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
+	assert.Empty(t, byTable["payments"].ErrorMessage,
+		"a table cancelled because an earlier table's failure ended the apply has no error of its own, so the root-cause table stays identifiable")
 }

@@ -517,34 +517,60 @@ func (s *Server) resolveDeployAction(r *http.Request) (*databaseBackend, deployR
 	return backend, deployRequest{org: org, database: database, number: number}, nil
 }
 
-// deployResponse returns the standard deploy request response map with number, branch, and state.
-func deployResponse(number uint64, branch, state string) map[string]any {
+// deployResponse returns the standard deploy request response map with number,
+// branch, state, and creation time.
+func deployResponse(number uint64, branch, state, createdAt string) map[string]any {
 	return map[string]any{
 		"number":           number,
 		"branch":           branch,
 		"deployment_state": state,
+		"created_at":       createdAt,
 	}
 }
 
+// storedTimestampLayout is the format the metadata database renders TIMESTAMP
+// columns in when scanned as strings.
+const storedTimestampLayout = "2006-01-02 15:04:05"
+
+// deployRequestCreatedAt converts a stored deploy request created_at value to
+// the RFC3339 form the PlanetScale API uses for the field. Clients anchor
+// schema change context discovery on this value, so it must round-trip into
+// the SDK's time field rather than being omitted.
+func deployRequestCreatedAt(raw string) (string, error) {
+	ts, err := time.Parse(storedTimestampLayout, raw)
+	if err != nil {
+		return "", fmt.Errorf("parse deploy request created_at %q: %w", raw, err)
+	}
+	return ts.UTC().Format(time.RFC3339), nil
+}
+
 // deployRequestInfo holds commonly needed fields from a deploy request row.
+// createdAt carries the row's creation time already converted to the RFC3339
+// form deploy request responses use.
 type deployRequestInfo struct {
 	branch           string
 	migrationContext string
 	deploymentState  string
+	createdAt        string
 }
 
 // getDeployRequestInfo fetches common deploy request fields.
 func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*deployRequestInfo, error) {
 	var info deployRequestInfo
 	err := s.metadataDB.QueryRowContext(ctx,
-		`SELECT branch, migration_context, deployment_state
+		`SELECT branch, migration_context, deployment_state, created_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		ref.org, ref.database, ref.number,
-	).Scan(&info.branch, &info.migrationContext, &info.deploymentState)
+	).Scan(&info.branch, &info.migrationContext, &info.deploymentState, &info.createdAt)
 	if err != nil {
 		return nil, newHTTPError(http.StatusNotFound, "deploy request not found: %d", ref.number)
 	}
+	createdAt, err := deployRequestCreatedAt(info.createdAt)
+	if err != nil {
+		return nil, newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", ref.number, err)
+	}
+	info.createdAt = createdAt
 	return &info, nil
 }
 

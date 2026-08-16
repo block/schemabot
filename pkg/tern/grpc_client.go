@@ -896,10 +896,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		}
 	}
 
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
@@ -1014,7 +1011,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logRemoteControlResend(ctx, logger, apply, controlReq, now)
 		}
 	}
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
@@ -1050,6 +1047,23 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	return false, nil
 }
 
+// controlPathProgress polls remote progress on behalf of a control-request path
+// and mirrors any control rejections the response carries. A cancel or stop that
+// reconciles a terminal remote ends the drive, so the regular poll loop never
+// runs again: a rejection the data plane settled after the last regular poll
+// reaches the operator only if it is mirrored from here.
+func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.Apply, remoteID string) (*ternv1.ProgressResponse, error) {
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.mirrorRemoteControlRejections(ctx, apply, remoteID, progress.SettledControlRequests)
+	return progress, nil
+}
+
 func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	if handled, err := c.processPendingCancelControlRequest(ctx, apply, scope); handled || err != nil {
 		return handled, err
@@ -1063,10 +1077,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		logger.WarnContext(ctx, "remote gRPC stop error could not be reconciled from progress",
 			append(apply.MutableLogAttrs(),
@@ -1134,10 +1145,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		logger.WarnContext(ctx, "remote gRPC cancel error could not be reconciled from progress",
 			append(apply.MutableLogAttrs(),
@@ -1656,6 +1664,134 @@ func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume 
 	opts.Volume = int(remoteVolume)
 	apply.SetOptions(opts)
 	return true
+}
+
+// mirrorRemoteControlRejections records, on the control plane, the control
+// requests the data plane accepted and then failed. Accepting a control RPC
+// only means the request was queued: the engine call happens later on the data
+// plane's own driver tick, and until it is mirrored here a rejection lives
+// solely in the data plane's storage and logs — the operator who issued the
+// command is told it succeeded and never learns the effect did not land.
+//
+// The data plane reports the same settled request on every poll until the
+// operator retries the operation, so a mirror that fails is retried on the next
+// tick rather than aborting the drive, and a mirror that succeeds is surfaced
+// exactly once (RecordRemoteFailure reports whether the stored row changed).
+//
+// remoteID is the remote identifier this drive addressed. The data plane's
+// message names its own apply, which is meaningless to the operator reading the
+// PR — and on an operation-scoped drive the parent apply's ExternalID is empty,
+// so the remote identifier is only redactable when it is passed in here.
+func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *storage.Apply, remoteID string, settled []*ternv1.SettledControlRequest) {
+	if c.storage == nil || apply == nil || len(settled) == 0 {
+		return
+	}
+	logger := c.applyLogger(apply)
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		logger.Warn("control request store is not available; remote control rejections will not reach the operator",
+			apply.MutableLogAttrs()...)
+		return
+	}
+	for _, entry := range settled {
+		if entry == nil {
+			continue
+		}
+		operation := storage.ControlOperation(entry.Operation)
+		if !operation.Valid() {
+			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
+		if entry.Status == string(storage.ControlRequestCompleted) {
+			c.retireMirroredControlRejection(ctx, apply, controlStore, operation)
+			continue
+		}
+		if entry.Status != string(storage.ControlRequestFailed) {
+			// Only a failure needs mirroring, and completion is handled above. A
+			// newer data plane reporting some other terminal status would drop the
+			// request here, so name it rather than skipping silently.
+			logger.Warn("data plane reported a settled control request in an unrecognized status; it will not reach the operator",
+				append(apply.MutableLogAttrs(),
+					"operation", entry.Operation,
+					"status", entry.Status,
+					"settled_at", entry.SettledAt)...)
+			continue
+		}
+		message := remoteControlRejectionMessage(entry)
+		changed, err := controlStore.RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
+			ApplyID:      apply.ID,
+			Operation:    operation,
+			ErrorMessage: apply.OperatorFacingMessage(message, remoteID),
+			RequestedBy:  entry.RequestedBy,
+		})
+		if err != nil {
+			logger.Warn("failed to record remote control rejection; the operator will not see it until a later poll mirrors it",
+				append(apply.MutableLogAttrs(),
+					"operation", entry.Operation,
+					"settled_at", entry.SettledAt,
+					"error", err)...)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		logger.Warn("data plane rejected an accepted control command",
+			append(apply.MutableLogAttrs(),
+				"operation", entry.Operation,
+				"requested_by", entry.RequestedBy,
+				"settled_at", entry.SettledAt,
+				"error_message", message)...)
+		metrics.RecordRemoteControlRequestRejected(ctx, entry.Operation, apply.Engine, apply.Database, apply.Deployment, apply.Environment)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
+			fmt.Sprintf("%s was accepted but not applied: %s%s", remoteControlOperationLabel(operation), message,
+				callerApplyLogSuffix(entry.RequestedBy)), "", "")
+	}
+}
+
+// retireMirroredControlRejection clears a rejection this plane mirrored once the
+// data plane reports the same operation succeeded. It matters for an operation
+// this plane only proxies — volume, whose request lives entirely in the data
+// plane — because the mirrored row is the sole record here and no local request
+// lifecycle will ever reset it: without this the operator re-issues the command,
+// it works, and the PR keeps warning that it did not.
+func (c *GRPCClient) retireMirroredControlRejection(
+	ctx context.Context,
+	apply *storage.Apply,
+	controlStore storage.ControlRequestStore,
+	operation storage.ControlOperation,
+) {
+	changed, err := controlStore.ClearRemoteFailure(ctx, apply.ID, operation)
+	if err != nil {
+		c.applyLogger(apply).Warn("failed to clear a mirrored control rejection the data plane has since completed; the notice stays until a later poll clears it",
+			append(apply.MutableLogAttrs(), "operation", string(operation), "error", err)...)
+		return
+	}
+	if !changed {
+		return
+	}
+	c.applyLogger(apply).Info("data plane completed a control command it had previously rejected; clearing the mirrored rejection",
+		append(apply.MutableLogAttrs(), "operation", string(operation))...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition,
+		fmt.Sprintf("%s succeeded on a later attempt; the earlier rejection no longer applies", remoteControlOperationLabel(operation)), "", "")
+}
+
+// remoteControlRejectionMessage renders the reason the data plane gave, falling
+// back to a fixed line so a rejection is never recorded without one.
+func remoteControlRejectionMessage(entry *ternv1.SettledControlRequest) string {
+	if entry.ErrorMessage != "" {
+		return entry.ErrorMessage
+	}
+	return "the data plane reported no reason; see the data plane logs"
+}
+
+// remoteControlOperationLabel renders a control operation for an operator-facing
+// apply log line.
+func remoteControlOperationLabel(operation storage.ControlOperation) string {
+	if operation == "" {
+		return "Control command"
+	}
+	return strings.ToUpper(string(operation)[:1]) + strings.ReplaceAll(string(operation)[1:], "_", "-")
 }
 
 // operationForDisplayMirror loads the apply_operation whose
@@ -3102,13 +3238,16 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 
 // stampRemoteApplyErrorOnFailedTasks copies a failed remote apply's error
 // message onto its failed stored task rows that carry no error of their own.
-// A remote TableProgress snapshot carries no per-table error text, so a task
-// mirrored to failed from remote progress persists with an empty ErrorMessage
-// even when the remote apply carries the actionable failure reason (for
-// example an engine preflight rejection). The stored task row is what the
-// operator derives the operation row from, so an empty task error would
-// otherwise become an empty operation — and PR-comment — failure reason. A
-// task that already carries its own, more specific error keeps it.
+// The per-table reason normally arrives on the remote TableProgress snapshot
+// and is adopted by syncStoredTasksFromRemoteTasks, but it can be absent — a
+// data plane on an older proto omits the field, and a failure that never
+// reached a specific table (for example an engine preflight rejection) has no
+// per-table text to report. Such a task persists as failed with an empty
+// ErrorMessage even though the remote apply carries the actionable reason. The
+// stored task row is what the operator derives the operation row from, so an
+// empty task error would otherwise become an empty operation — and PR-comment
+// — failure reason. A task that already carries its own, more specific error
+// keeps it.
 func (c *GRPCClient) stampRemoteApplyErrorOnFailedTasks(ctx context.Context, storedApply, remoteApply *storage.Apply, storedTasks []*storage.Task, now time.Time) error {
 	if !state.IsState(remoteApply.State, state.Apply.Failed) || remoteApply.ErrorMessage == "" {
 		return nil
@@ -3300,6 +3439,17 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ETASeconds = int(remoteTask.EtaSeconds)
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
+		}
+		// Throttle state is a point-in-time signal, not cumulative progress:
+		// it is mirrored on every tick — including ticks whose row totals are
+		// kept — so a lifted throttle clears promptly instead of lingering on
+		// the PR comment. The reason travels only with an active throttle and
+		// is bounded here because the remote data plane's reason is untrusted
+		// input for the operator surfaces that render it.
+		storedTask.Throttled = remoteTask.Throttled
+		storedTask.ThrottleReason = ""
+		if remoteTask.Throttled {
+			storedTask.ThrottleReason = engine.SanitizeThrottleReason(remoteTask.ThrottleReason)
 		}
 		// Adopt the remote task's own failure reason (for example an engine
 		// preflight rejection) so the operation row derived from the stored task
@@ -3772,6 +3922,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				logger.Info("mirrored remote volume level onto control-plane apply options",
 					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
 			}
+			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
 			terminal := isTerminalProtoState(resp.State)
 			if terminal {

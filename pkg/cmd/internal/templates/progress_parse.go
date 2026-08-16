@@ -70,9 +70,14 @@ type TableProgress struct {
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	IsInstant           bool
-	ProgressDetail      string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
-	Shards              []ShardProgress
+	// The engine's throttler is pausing this table's active phase (row copy
+	// or checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool
+	ThrottleReason string
+	IsInstant      bool
+	ProgressDetail string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
+	Shards         []ShardProgress
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -185,6 +190,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
 			ChecksumRowsTotal:   tbl.ChecksumRowsTotal,
+			Throttled:           tbl.Throttled,
+			ThrottleReason:      tbl.ThrottleReason,
 			IsInstant:           tbl.IsInstant,
 			ProgressDetail:      tbl.ProgressDetail,
 		}

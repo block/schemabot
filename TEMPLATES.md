@@ -2525,7 +2525,7 @@ Verify the database name, or run the command against the SchemaBot instance that
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
-Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+- Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
 
 ---
@@ -2556,7 +2556,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
-Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+- Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
 
 ---
@@ -2639,7 +2639,7 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
-Rows: 156,342 / 397,453
+- Rows: 156,342 / 397,453
 
 
 ---
@@ -2718,7 +2718,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-Rows: 321,450 / 1,466,232 · ETA: 5m 40s
+- Rows: 321,450 / 1,466,232 · ETA: 5m 40s
 
 **`users`**: ⏳ Queued
 
@@ -2765,7 +2765,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 
@@ -2840,6 +2840,54 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="second-table-throttled"></a><strong>Second Table Throttled</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+📊 1/3 complete · 1 running (62%) · 1 queued
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (throttled)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- ℹ️ _Throttled: commit-latency 112.4ms >= 100ms_
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="second-table-catching-up"></a><strong>Second Table Catching Up</strong></summary>
 
 
@@ -2860,7 +2908,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows copied: 1,466,232
+- Rows copied: 1,466,232
 
 **`products`**: ⏳ Queued
 
@@ -2907,7 +2955,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows verified: 321,450 / 1,466,232
+- Rows verified: 321,450 / 1,466,232
 
 **`products`**: ⏳ Queued
 
@@ -2954,7 +3002,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows copied: 1,466,232
+- Rows copied: 1,466,232
 
 **`products`**: ⏳ Queued
 
@@ -3001,7 +3049,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
-Rows: 87,231 / 523,140 · ETA: 7m 0s
+- Rows: 87,231 / 523,140 · ETA: 7m 0s
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -3046,7 +3094,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
   └ shards: ✓ -40 · ◐ 40-80 62% · ◐ 80-c0 31% · ⏳ c0-
 
 
@@ -3080,7 +3128,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
 ```
-Rows: 4,200,000,000 / 6,000,000,000 · ETA: 1h 30m
+- Rows: 4,200,000,000 / 6,000,000,000 · ETA: 1h 30m
   └ 256 shards: 200 ✓ · 52 ◐ copying · 4 ⏳ · slowest f7- 12%
 
 
@@ -3453,7 +3501,7 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows: 1,055,687 / 1,466,232
+- Rows: 1,055,687 / 1,466,232
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -3928,7 +3976,7 @@ Use `schemabot status -e <environment>` to find the apply ID.
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
-Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
+- Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
 
 
 ---
@@ -3967,7 +4015,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
-Rows: 2,300,000 / 7,200,000
+- Rows: 2,300,000 / 7,200,000
 
 
 ---
@@ -4127,7 +4175,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
-Rows: 2,300,000 / 7,200,000
+- Rows: 2,300,000 / 7,200,000
 
 
 ---
@@ -4653,7 +4701,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 ```sql
 ALTER TABLE `users` DROP INDEX `idx_email`;
 ```
-Rows: 45,000 / 100,000
+- Rows: 45,000 / 100,000
 
 
 ---
@@ -4962,6 +5010,36 @@ Sequential mode: First complete, second catching up on accumulated changes
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Catching up on accumulated changes...
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows copied: 5,000,000
+
+     ~ products: ⏳ Queued
+       ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
+
+     ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+
+```
+</details>
+
+<details>
+<summary><a name="mysql-multitable-second-table-throttled"></a><strong>MySQL: Multi-table Second Table Throttled</strong></summary>
+
+```
+
+Sequential mode: First complete, second paused by the engine's throttler
+
+┌──────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6   │
+│  State:     Running              │
+│  Started:   Jan 15 14:10:00 UTC  │
+│  Duration:  20m                  │
+└──────────────────────────────────┘
+
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (throttled)
+       ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
+       • Rows: 3,100,000 / 5,000,000
+       • ℹ️ Throttled: commit-latency 112.4ms >= 100ms
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
@@ -6360,7 +6438,7 @@ SchemaBot triggers cutover automatically — no action needed.
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 

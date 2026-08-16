@@ -104,7 +104,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 	switch {
 	case isAutoPlannablePullRequest(payload):
 		// proceed to auto-plan below
-	case payload.Action == "closed":
+	case payload.Action == storage.PullRequestClosedAction:
 		if h.durableWebhookDispatch {
 			// Enqueue and ACK fast; a leased driver runs cleanup with retries so
 			// a process restart mid-cleanup cannot drop the delivery and leave a

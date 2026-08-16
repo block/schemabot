@@ -533,6 +533,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
+		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}
@@ -663,7 +664,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (enforced per handler) is the authorization boundary in that mode.
 	if !h.repoWebhookTargeted(r) {
 		if err := h.verifySignedAppOwnsRepo(repo, appName); err != nil {
-			h.logger.Warn("webhook rejected: signing App does not own repo",
+			// A repo with no config entry at all is routine traffic from an
+			// unmanaged repository (a shared App forwards deliveries for every
+			// repo it is installed on): it logs at debug and counts under its
+			// own repo_not_configured status without the repository attribute,
+			// since unmanaged repo names are unbounded and would blow up the
+			// metric's cardinality — the debug log carries the repo. A declared
+			// repo that fails ownership resolution is config drift or a hostile
+			// install: it stays a warning and counts under app_repo_mismatch
+			// with the repository attribute, so a nonzero app_repo_mismatch is
+			// always an actionable drift signal.
+			rejectionLog := h.logger.Warn
+			rejectionStatus := "app_repo_mismatch"
+			metricRepo := repo
+			if errors.Is(err, api.ErrRepoNotConfigured) {
+				rejectionLog = h.logger.Debug
+				rejectionStatus = "repo_not_configured"
+				metricRepo = ""
+			}
+			rejectionLog("webhook rejected: signing App does not own repo",
 				"app_name", appName,
 				"app_id", appID,
 				"delivery_id", r.Header.Get(headerDeliveryID),
@@ -671,7 +690,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"action", action,
 				"repo", repo,
 				"error", err)
-			metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, repo, "app_repo_mismatch")
+			metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, metricRepo, rejectionStatus)
 			h.writeError(w, http.StatusUnauthorized, "invalid webhook dispatch")
 			return
 		}

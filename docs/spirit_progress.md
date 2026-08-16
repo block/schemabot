@@ -50,6 +50,8 @@ key to debugging stale-progress issues.
 | `CurrentState`  | `status.State`    | Atomic int32 enum: `Initial`, `CopyRows`, `WaitingOnSentinelTable`, `Checksum`, `CutOver`, `Close`, ... |
 | `Summary`       | `string`          | `"71436/221193 32.30% copyRows ETA 5m 30s"` |
 | `Tables[]`      | `[]TableProgress` | Per-table: `TableName`, `RowsCopied` (uint64), `RowsTotal` (uint64), `IsComplete` (bool) |
+| `Resume`        | `bool`            | True only after the runner successfully resumed from its durable checkpoint; a fresh start (or an abandoned resume attempt) reports false. |
+| `Throttle`      | `status.ThrottleStatus` | `Throttled` (bool), `Reason` (display-only string, `"<signal> <observed> <op> <threshold>"`), `Utilization` (float64, 0 means unknown — never render it as idle). |
 
 Key details:
 - **ETA is embedded in `Summary`**, not a separate field. Downstream layers parse it out with a regex.
@@ -59,6 +61,12 @@ Key details:
   `CurrentState == Checksum`** — it reads zero before the verify starts and again after it
   finishes (including during `PostChecksum`). A renderer that shows checksum counters for any
   other phase shows zeros.
+- **`Throttle` is populated only for the paced phases** — the row copy and the checksum
+  verify report the throttler's live status; every other phase reports the zero
+  `ThrottleStatus{}`, so a finished schema change can never look paused on an aged-out
+  signal. A composite throttler joins the reasons of every currently-throttling child with
+  `"; "`, and `Throttled` can be true with an empty `Reason` (a throttler that implements
+  no reason extension).
 
 ## Spirit runner lifecycle
 
@@ -114,6 +122,14 @@ Two properties matter for display:
    - Stamps the runner-wide checksum estimate (`ChecksumRowsChecked`/`Total`) on
      every table unconditionally — Spirit populates it only during the verify
      phase, and every copy is complete by then.
+   - Stamps the runner-wide throttle status (`Throttled`/`ThrottleReason`) on the
+     tables participating in paced work — a table still copying, or every table
+     during the verify (`tableInPacedPhase`) — so a completed table is never
+     rendered as paused by another table's copy. The reason passes through
+     `engine.SanitizeThrottleReason` so it can never break an operator surface.
+4. Sets `ProgressResult.ResumedFromCheckpoint` from `Progress.Resume`, which the
+   drive turns into a one-per-claim "resumed from checkpoint" timeline event
+   (`logEngineResumeOnce`).
 
 Key types: `engine.ProgressResult`, `engine.TableProgress` (`pkg/engine/engine.go`).
 
@@ -188,7 +204,7 @@ no live result for a reader on another pod, and the drive keeps stored current.
 2. Picks the most relevant task (priority: active > stopped > pending > terminal).
 3. Builds the per-table response from the stored task rows: `Status`,
    `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`,
-   `ChecksumRowsChecked/Total`. When per-shard rows are persisted, the table
+   `ChecksumRowsChecked/Total`, `Throttled`, `ThrottleReason`. When per-shard rows are persisted, the table
    headline is the aggregate of those rows, computed at read time.
 
 Reading stored state matters for:
@@ -212,6 +228,8 @@ Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
 | `ETASeconds`      | int    | From `engine.TableProgress.ETASeconds` |
 | `ChecksumRowsChecked` | int64 | From `engine.TableProgress.ChecksumRowsChecked` |
 | `ChecksumRowsTotal`   | int64 | From `engine.TableProgress.ChecksumRowsTotal` |
+| `Throttled`       | bool   | From `engine.TableProgress.Throttled`; cleared when the task comes to rest (`transitionTaskState`) |
+| `ThrottleReason`  | string | From `engine.TableProgress.ThrottleReason`, sanitized at every ingest boundary; empty whenever `Throttled` is false |
 | `IsInstant`       | bool   | From `engine.TableProgress.IsInstant` |
 | `State`           | string | Mapped from `engine.State` |
 | `StartedAt`       | time   | Set when task transitions to RUNNING |
@@ -222,7 +240,7 @@ Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
 
 | Trigger | What writes | Frequency | Fields updated |
 |---------|-------------|-----------|----------------|
-| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `UpdatedAt`, `CompletedAt` (on terminal) |
+| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
 | `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms | Same as above, plus `IsInstant` |
 | `LocalClient.Stop()` | Stop handler | Once, after `eng.Stop()` blocks | `State` → STOPPED (or COMPLETED if table finished), `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `CompletedAt` |
 | `LocalClient.Progress()` | Progress handler | On each API call (if engine state changed and task is non-terminal) | `State`, `UpdatedAt`, `CompletedAt` |

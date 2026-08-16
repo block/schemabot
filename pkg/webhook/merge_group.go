@@ -304,11 +304,13 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 				"repo", repo, "head_sha", headSHA, "check_name", target.name,
 				"operation", content.operation, "error", findErr)
 		}
+		action := "created"
 		switch {
 		case findErr == nil && existing != nil:
 			if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
 				return fmt.Errorf("update %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
 			}
+			action = "updated"
 		default:
 			if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
 				return fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
@@ -320,9 +322,10 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			Environment: target.environment,
 			Status:      "success",
 		})
-		h.logger.Info("passing aggregate check posted",
+		h.logger.Info("posted passing aggregate",
 			"repo", repo, "head_sha", headSHA, "check_name", target.name,
-			"environment", target.environment, "operation", content.operation)
+			"environment", target.environment, "action", action,
+			"operation", content.operation)
 	}
 	return nil
 }

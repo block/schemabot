@@ -260,6 +260,74 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 	assert.Contains(t, result, "1 checksumming")
 }
 
+// A table slowed by the engine's throttler carries a "(throttled)" annotation
+// on its header line — right where the eye checks progress — with the trigger
+// explained in a tooltip bullet, so a slow bar reads as deliberate backpressure
+// (e.g. replica lag) rather than a hang. The reason is sanitized at the engine
+// boundary, and the annotation renders only on active tables — a throttled flag
+// on a terminal table would be stale.
+func TestRenderApplyStatusComment_Throttled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "running",
+				RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+				Throttled: true, ThrottleReason: "replica-lag 12s > 10s"},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "45% (throttled)",
+		"the annotation lands on the header line next to the percent")
+	assert.Contains(t, result, "- ℹ️ _Throttled: replica-lag 12s > 10s_",
+		"the reason renders as a tooltip bullet under the detail list")
+
+	data.Tables[0].ThrottleReason = ""
+	noReason := RenderApplyStatusComment(data)
+	assert.Contains(t, noReason, "45% (throttled)")
+	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
+
+	data.Tables[0].Throttled = false
+	notThrottled := RenderApplyStatusComment(data)
+	assert.NotContains(t, notThrottled, "(throttled)")
+	assert.NotContains(t, notThrottled, "Throttled")
+
+	data.Tables[0].Throttled = true
+	data.Tables[0].ThrottleReason = "signal_a 1_000ms >= `500ms` [gradual]"
+	escaped := RenderApplyStatusComment(data)
+	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal\\_a 1\\_000ms >= \\`500ms\\` \\[gradual\\]_",
+		"markdown delimiters in an engine reason are escaped so they cannot cut the italic span short")
+}
+
+// A throttled checksum verify carries the same header annotation and tooltip
+// alongside the verify progress, since the checksum is the other phase the
+// engine's throttler paces.
+func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming",
+				ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
+				Throttled: true, ThrottleReason: "threads-running 130 > 128"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21%) (throttled)")
+	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 130 > 128_")
+}
+
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 	tests := []struct {
 		name                string

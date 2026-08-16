@@ -185,6 +185,8 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
 			ProgressDetail:      t.ProgressDetail,
 			TaskID:              t.TaskId,
@@ -1148,6 +1150,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
+			Throttled:           task.Throttled,
+			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
 			TaskID:              task.TaskIdentifier,
 		}
@@ -1215,6 +1219,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		task.ProgressPercent = int(tp.PercentComplete)
 		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+		task.Throttled = tp.Throttled
+		task.ThrottleReason = tp.ThrottleReason
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
 			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)

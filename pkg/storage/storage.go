@@ -221,15 +221,21 @@ type WebhookEventStore interface {
 	// Create records a webhook delivery in the pending state. Returns
 	// inserted=false when provider + delivery GUID already exists, so callers
 	// can deduplicate redeliveries. One exception: when the existing row is
-	// terminal — failed, permanently failed, or completed — Create re-opens it
-	// (pending, attempts reset, fresh payload) and returns inserted=true, so
-	// GitHub's "Redeliver" button — which reuses the original delivery GUID —
-	// is a real remediation for a terminal delivery instead of a permanent
-	// no-op. Redeliver is also the only lever that revives a permanently
-	// failed row — the reconciler never re-Creates its GUID because
-	// HasEventForHead reports the dead-lettered head as covered — and it
-	// exists only for organic GUIDs; a synthesized dead-lettered row stays
-	// terminal, its head advancing only through a fresh delivery.
+	// terminal — failed, permanently failed, completed, or superseded —
+	// Create re-opens it (pending, attempts reset, fresh payload) and returns
+	// inserted=true, so GitHub's "Redeliver" button — which reuses the
+	// original delivery GUID — is a real remediation for a terminal delivery
+	// instead of a permanent no-op. Redeliver is also the only lever that
+	// revives a permanently failed row — the reconciler never re-Creates its
+	// GUID because HasEventForHead reports the dead-lettered head as covered —
+	// and it exists only for organic GUIDs; a synthesized dead-lettered row
+	// stays terminal, its head advancing only through a fresh delivery.
+	//
+	// A non-nil RetryAfter on the event is persisted as a not-before time: the
+	// delivery is durable immediately but FindNext will not claim it until the
+	// time passes. Producers of deferred work — a redundant convergence signal
+	// that should lose the race to the primary delivery — set it to schedule
+	// dispatch; nil means immediately claimable. A redelivery reopen clears it.
 	Create(ctx context.Context, event *WebhookEvent) (inserted bool, err error)
 
 	// GetByDeliveryID returns a webhook event by provider + delivery GUID, or nil if not found.
@@ -249,18 +255,86 @@ type WebhookEventStore interface {
 	// fresh recovery delivery that reopens it through Create's
 	// duplicate-GUID branch. A permanently failed (dead-lettered) row covers
 	// its head in either GUID form: the driver proved no retry can plan that
-	// head, so no reconciler synthesis may resurrect it.
+	// head, so no reconciler synthesis may resurrect it. A superseded row
+	// never covers: it was discarded on the promise that a covering successor
+	// performs its work, so it cannot itself attest that the head was
+	// planned — if the successor's coverage lapses, the reconciler must be
+	// able to synthesize afresh.
 	HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error)
+
+	// HasCoveringSuccessor reports whether a covering successor — as defined
+	// by SupersedeIfCovered — currently exists for the claimed event's
+	// (provider, repository, pull request). It is a read-only, advisory
+	// probe with no lease semantics: the answer can change the moment it
+	// returns, so a true result is a reason to verify the claimed head
+	// against the live PR before discarding, never permission to discard by
+	// itself — SupersedeIfCovered re-evaluates the predicate atomically with
+	// its lease-guarded write.
+	HasCoveringSuccessor(ctx context.Context, event *WebhookEvent) (bool, error)
+
+	// SupersedeIfCovered marks a claimed auto-plannable pull_request event
+	// superseded when a covering successor exists for the same
+	// (provider, repository, pull request), and reports whether it did. The
+	// caller must hold the claim: the write is guarded by the event's lease
+	// token and its processing state, and returns ErrWebhookEventLeaseLost /
+	// ErrWebhookEventNotFound like the other lease-guarded writes.
+	//
+	// A successor is a strictly newer pull_request delivery for the same PR —
+	// strictly greater received_at, so a Redeliver-reopened row (which
+	// refreshes received_at) is never superseded by rows that predate the
+	// operator's redelivery, and deliveries whose received_at ties at the
+	// column's timestamp precision never cover each other (they both
+	// process, the safe direction for an optimization) — that either plans
+	// the PR (AutoPlanPullRequestActions) or closes it
+	// (PullRequestClosedAction). received_at is webhook arrival order, not
+	// Git push order: GitHub does not guarantee delivery order and a
+	// Redeliver refreshes received_at on an old-head row, so a newer
+	// received_at proves only that newer-arriving work exists, never that
+	// the claimed head is stale. Callers must independently confirm against
+	// the live PR that the claimed head is no longer current before
+	// invoking this — the durable dispatcher fetches the PR from GitHub and
+	// skips coalescing when the claimed delivery carries the current head.
+	//
+	// A successor covers only when its own work will run, is running, or
+	// has run: pending, processing (live lease, or reclaimable under the
+	// attempt cap), retryable under the attempt cap, or completed.
+	// Terminally failed and superseded successors never cover — discarding
+	// old work on the strength of a successor that will not run would lose
+	// the PR's plan. Coverage is a promise evaluated once, at supersede
+	// time: a covering successor that later terminally fails does not
+	// resurrect the superseded row. Recovery for that loss is the operator
+	// Redeliver lever, plus reconciler synthesis when the lost work
+	// targeted the PR's current head. Coalescing is keyed per PR, not per
+	// head SHA: distinct PRs sharing a head remain independent.
+	//
+	// The asymmetry for closed deliveries: a newer closed delivery covers
+	// older auto-plan work (planning a closed PR is pointless, and a reopen
+	// arrives as its own auto-plannable delivery), but a closed delivery is
+	// never itself superseded — its cleanup must always run, which the
+	// auto-plan-only guard on the updated row enforces.
+	SupersedeIfCovered(ctx context.Context, event *WebhookEvent) (bool, error)
 
 	// FindNext atomically claims one pending, retryable, or lease-expired event.
 	// The claim rotates lease_owner/lease_token, increments attempts, and sets a
-	// lease expiry in the same transaction. Retryable and lease-expired rows are
-	// only reclaimed while attempts < MaxWebhookEventAttempts, so a poison event
-	// cannot be reclaimed forever. Returns nil when no event is claimable.
+	// lease expiry in the same transaction. A pending row with a future
+	// retry_after (not-before time) is not claimable until it passes. Retryable
+	// and lease-expired rows are only reclaimed while attempts <
+	// MaxWebhookEventAttempts, so a poison event cannot be reclaimed forever.
+	// Returns nil when no event is claimable.
 	//
-	// Ordering is currently global FIFO (created_at, id). A contemplated
-	// evolution is per-(repository, pull_request) claiming with coalescing of
-	// superseded deliveries; callers should not depend on cross-key ordering.
+	// The claim consumes retry_after (the persisted row's is cleared); the
+	// returned event carries ClaimableSince — the later of receipt and the
+	// consumed not-before time — so the dispatcher can measure dispatch lag
+	// from when the row became eligible rather than from receipt.
+	//
+	// Ordering is global FIFO (created_at, id); callers should not depend on
+	// cross-key ordering. A row that spent time deferred re-enters dispatch
+	// at its original insertion position once due — ahead of rows created
+	// during its deferral — not at its due time. Stale auto-plan claims are
+	// coalesced after the claim, not here: for each claimed auto-plannable
+	// pull_request event the driver probes HasCoveringSuccessor, confirms
+	// against the live PR that the claimed head is no longer current, and
+	// only then calls SupersedeIfCovered.
 	FindNext(ctx context.Context, owner string, leaseDuration time.Duration) (*WebhookEvent, error)
 
 	// Heartbeat extends the current lease. Returns ErrWebhookEventNotFound when
@@ -1014,4 +1088,28 @@ type ControlRequestStore interface {
 	// FailPending marks the pending request for an apply operation failed with an
 	// operator-visible reason.
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
+
+	// ListSettled returns every control request for an apply that has reached a
+	// terminal status, so the plane that accepted a control RPC can learn
+	// whether the operation took effect: accepting a request only queues it.
+	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
+
+	// RecordRemoteFailure records the terminal failure another plane reported
+	// for a control request, and creates the row when the local plane never held
+	// one. A locally completed row means the request was queued there, which a
+	// later rejection overtakes; a locally pending row is a live request this
+	// plane has not forwarded yet, so a settled report necessarily describes a
+	// superseded attempt and is ignored rather than dropping the command. It
+	// reports whether the stored row changed, so a caller polling the same
+	// rejection every tick surfaces it exactly once.
+	RecordRemoteFailure(ctx context.Context, req *ApplyControlRequest) (bool, error)
+
+	// ClearRemoteFailure retires a rejection this plane mirrored from another,
+	// for use when that plane later reports the same operation succeeded. It
+	// only touches a failed row the mirror itself created: rows this plane
+	// queued are cleared by their own request lifecycle, and a row with no
+	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// keep warning about a command the operator has since re-issued
+	// successfully. It reports whether the stored row changed.
+	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)
 }

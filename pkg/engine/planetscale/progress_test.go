@@ -274,11 +274,16 @@ func TestShardLess(t *testing.T) {
 
 // SHOW VITESS_MIGRATIONS retains completed historical rows, so an empty-baseline
 // rediscovery on resume sees both this apply's in-flight change and unrelated
-// finished changes. Selection must attach only to a non-terminal context: a
-// freshly deployed change is queued or running, while old completed history is
-// terminal and must be ignored so progress never renders the wrong change's
-// finished state while the real deploy is mid-flight.
+// finished changes. Selection must attach only to a non-terminal context whose
+// requested_timestamp is at or after the deploy: a freshly deployed change is
+// queued or running and requested after the deploy was created, while old
+// history — terminal, or resurrected as non-terminal by a Vitess retry that
+// preserves its original requested_timestamp — must be ignored so progress
+// never renders the wrong change's state while the real deploy is mid-flight.
 func TestSelectSchemaChangeContext(t *testing.T) {
+	deployCreatedAt := time.Date(2026, 6, 23, 10, 0, 5, 0, time.UTC)
+	afterDeploy := time.Date(2026, 6, 23, 10, 0, 7, 0, time.UTC)
+
 	t.Run("attaches to the in-flight context, ignoring completed history", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			// Completed history from prior, unrelated schema changes.
@@ -286,11 +291,11 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:old-add-email", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Complete},
 			{MigrationContext: "singularity:old-drop-index", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Cancelled},
 			// This apply's in-flight change.
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Queued},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Queued, RequestedAt: &afterDeploy},
 		}
 
-		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
@@ -311,14 +316,51 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 
 	t.Run("a context with one running shard is in flight even if others completed", func(t *testing.T) {
 		rows := []vitessMigrationRow{
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete},
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete, RequestedAt: &afterDeploy},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Equal(t, "singularity:new-change", got)
+		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+	})
+
+	t.Run("a sole in-flight candidate requested before the deploy stays ambiguous", func(t *testing.T) {
+		// A pre-deploy change resurrected by a Vitess retry re-enters SHOW
+		// VITESS_MIGRATIONS as non-terminal with its original requested
+		// timestamp preserved. It must not be claimed as this deploy's work.
+		beforeDeploy := time.Date(2026, 6, 22, 15, 0, 0, 0, time.UTC)
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:resurrected-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued, RequestedAt: &beforeDeploy},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Empty(t, got, "a candidate requested before the deploy cannot be this apply's change")
+		assert.Equal(t, []string{"singularity:resurrected-change"}, candidates)
+	})
+
+	t.Run("a sole in-flight candidate without a requested timestamp stays ambiguous", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:untimed-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Empty(t, got, "a candidate with no requested timestamp cannot prove it is this apply's change")
+		assert.Equal(t, []string{"singularity:untimed-change"}, candidates)
+	})
+
+	t.Run("a zero deploy creation time anchors nothing and stays ambiguous", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:some-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
 		}
 
 		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
 
-		assert.Equal(t, "singularity:new-change", got)
-		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+		assert.Empty(t, got, "without the deploy's creation time no candidate can be proven to be this apply's change")
+		assert.Equal(t, []string{"singularity:some-change"}, candidates)
 	})
 
 	t.Run("multiple in-flight candidates are ambiguous", func(t *testing.T) {
@@ -336,11 +378,11 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 	t.Run("baseline contexts are never candidates", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{MigrationContext: "singularity:pre-existing", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
 		}
 		baseline := map[string]MigrationContextTimestamps{"singularity:pre-existing": {}}
 
-		got, candidates := selectSchemaChangeContext(rows, baseline, time.Time{})
+		got, candidates := selectSchemaChangeContext(rows, baseline, deployCreatedAt)
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
@@ -379,6 +421,39 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 
 		assert.Empty(t, got, "no candidate requested at/after the deploy means none can be claimed as this apply's")
 		assert.Len(t, candidates, 2)
+	})
+}
+
+// The pre-deploy context baseline is persisted into durable engine resume
+// state on every apply, while SHOW VITESS_MIGRATIONS retains every schema
+// change ever run against the target. Baseline membership must therefore stay
+// bounded: live (non-terminal) work is always remembered, but terminal history
+// is kept only while recent — an aged-out terminal context that a Vitess retry
+// later resurrects is excluded from discovery by its preserved
+// requested_timestamp instead.
+func TestBaselineContextRow(t *testing.T) {
+	cutoff := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
+	oldTime := time.Date(2024, 3, 1, 8, 0, 0, 0, time.UTC)
+	recentTime := time.Date(2026, 6, 23, 9, 0, 0, 0, time.UTC)
+
+	t.Run("non-terminal rows always qualify regardless of age", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:stalled", Status: state.Vitess.Running, RequestedAt: &oldTime}
+		assert.True(t, baselineContextRow(row, cutoff))
+	})
+
+	t.Run("recently completed terminal rows qualify", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:just-finished", Status: state.Vitess.Complete, RequestedAt: &oldTime, CompletedAt: &recentTime}
+		assert.True(t, baselineContextRow(row, cutoff), "the most recent timestamp decides recency, not the oldest")
+	})
+
+	t.Run("old terminal rows are dropped", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:ancient", Status: state.Vitess.Complete, RequestedAt: &oldTime, StartedAt: &oldTime, CompletedAt: &oldTime}
+		assert.False(t, baselineContextRow(row, cutoff))
+	})
+
+	t.Run("terminal rows without timestamps are kept because their age cannot be proven", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:untimed", Status: state.Vitess.Cancelled}
+		assert.True(t, baselineContextRow(row, cutoff))
 	})
 }
 
