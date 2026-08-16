@@ -1102,6 +1102,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// different failed_retryable operations of the same apply concurrently, and
 		// the row lock this UPDATE takes serializes them, so the second sees the
 		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
+		// That concurrency holds only for claims racing before the first of them
+		// commits. Afterwards the parent's freshly armed retry_after gates the
+		// claim clause, so a sibling operation that failed later waits out the
+		// same backoff — the pacing is per apply, not per operation, and a
+		// multi-deployment fan-out spends one shared budget rather than one per
+		// deployment.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			// Advance the operation's own attempt only on a genuine deliberate
 			// redispatch — the parent apply is still failed_retryable. A
