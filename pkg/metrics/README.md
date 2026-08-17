@@ -42,6 +42,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
 | `schemabot.remote_control_requests.rejected_total` | Counter | operation, engine, database, deployment, environment | Control requests a remote data plane accepted and its own driver then failed, mirrored back so the operator learns the command never took effect — see [Control Operations](#control-operations) |
 | `schemabot.remote_control_requests.stale_resends_total` | Counter | operation, database, deployment, environment | Retransmissions of a stop/cancel request the data plane accepted but has not consumed past the stale threshold — see [Control Operations](#control-operations) |
+| `schemabot.remote_apply_dedup_total` | Counter | database, environment, outcome | Idempotency-keyed dispatches replayed against their existing operation on the keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
+| `schemabot.remote_apply_attach_total` | Counter | database, environment, outcome | Sibling dispatches resolved into an existing deployment-keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
@@ -315,7 +317,21 @@ operator command is not taking effect and the apply will not converge until the
 data plane's own driver can consume it — its logs carry the failing consume
 error.
 
-### Lock Operations
+### Remote Apply Attaches
+
+When a dispatch's idempotency key already maps to an apply, the data plane
+resolves the dispatch by its derived operation key: a matching operation row is
+an idempotent replay (counted on `schemabot.remote_apply_dedup_total`, with
+`outcome` naming the path that resolved the key — `hit`, `conflict_race`,
+`create_race`, or `key_collision_refused`), and a missing row attaches the
+dispatch as a new sibling
+operation, counted on `schemabot.remote_apply_attach_total`:
+
+| Outcome | Meaning | Operator action |
+|---|---|---|
+| `attached` | A sibling dispatch added its operation and tasks to the deployment's shared keyed apply. | None — this is the normal fan-out event; its rate tracks sharded dispatch volume. |
+| `attach_race` | A concurrent same-operation attach lost the unique-index insert and was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
+| `terminal_refused` | The shared apply was already terminal, so the attach was refused fail-closed. | Investigate: the deployment's remaining operations cannot join a finished apply. The caller must re-dispatch under a fresh generation; the paired warn log names the apply, its state, and the refused operation key. |
 
 `schemabot.lock_operations_total` tracks database-level lock acquisition and
 release attempts.

@@ -926,6 +926,36 @@ func RecordRemoteApplyDedup(ctx context.Context, database, environment, outcome 
 	)
 }
 
+var knownRemoteApplyAttachOutcomes = map[string]bool{
+	"attached":         true,
+	"attach_race":      true,
+	"terminal_refused": true,
+}
+
+// RecordRemoteApplyAttach increments the counter for dispatches that resolved
+// into an existing deployment-keyed apply with a new operation. Outcome should
+// be one of:
+//   - "attached": a sibling dispatch added its operation to the deployment's
+//     shared apply (the normal fan-out event; its rate tracks sharded
+//     dispatch volume).
+//   - "attach_race": a concurrent same-operation attach lost the insert and
+//     was resolved to the winner's row instead of a spurious error.
+//   - "terminal_refused": the shared apply was already terminal, so the
+//     attach was refused fail-closed — the deployment's remaining operations
+//     cannot dispatch until an operator reconciles the apply, so investigate
+//     what terminalized it mid-fan-out.
+func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome string) {
+	if !knownRemoteApplyAttachOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_apply_attach_total",
+		"Total dispatches attaching an operation to an existing deployment-keyed remote apply", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.

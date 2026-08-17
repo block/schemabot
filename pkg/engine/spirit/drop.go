@@ -8,9 +8,9 @@ import (
 	"fmt"
 
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/pingcap/tidb/pkg/parser/ast"
 
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
