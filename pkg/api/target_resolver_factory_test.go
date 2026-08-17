@@ -259,14 +259,15 @@ func TestBuildEtreResolverRejectsUnsupportedEngine(t *testing.T) {
 	assert.Contains(t, err.Error(), "not supported")
 }
 
-// The Vitess organization attribute is surfaced to the resolver so the assembler
-// can read it, even when not listed in attribute_fields.
-func TestResolverAttributeFieldsIncludesOrganization(t *testing.T) {
-	defaultOrg := EtreConfig{DatabaseType: storage.DatabaseTypeVitess}
-	assert.Equal(t, []string{"organization"}, resolverAttributeFields(defaultOrg))
+// The Vitess organization and database-name attributes are surfaced to the
+// resolver so the assembler can read them, even when not listed in
+// attribute_fields.
+func TestResolverAttributeFieldsIncludesOrganizationAndDatabase(t *testing.T) {
+	defaults := EtreConfig{DatabaseType: storage.DatabaseTypeVitess}
+	assert.Equal(t, []string{"organization", "name"}, resolverAttributeFields(defaults))
 
-	customOrg := EtreConfig{DatabaseType: storage.DatabaseTypeVitess, Vitess: EtreVitessConfig{OrganizationAttribute: "ps_org"}}
-	assert.Equal(t, []string{"ps_org"}, resolverAttributeFields(customOrg))
+	custom := EtreConfig{DatabaseType: storage.DatabaseTypeVitess, Vitess: EtreVitessConfig{OrganizationAttribute: "ps_org", DatabaseAttribute: "ps_database"}}
+	assert.Equal(t, []string{"ps_org", "ps_database"}, resolverAttributeFields(custom))
 }
 
 // The Etre resolver's lazily-validated fields are checked at startup so a

@@ -188,6 +188,50 @@ func TestLocalClient_PullSchemaDiscoversVitessKeyspaces(t *testing.T) {
 	assert.Equal(t, "commerce_sharded", psClient.schemaReqs[1].Keyspace)
 }
 
+// The database a target is registered under is an arbitrary routing key; when
+// the target metadata carries the PlanetScale database name, every PlanetScale
+// API call in the pull addresses that name, while the response stays keyed to
+// the registered identifier.
+func TestLocalClient_PullSchemaAddressesPlanetScaleDatabaseFromMetadata(t *testing.T) {
+	psClient := &pullSchemaPSClient{
+		keyspaces: []*ps.Keyspace{{Name: "commerce_sharded"}},
+		schemas: map[string][]*ps.Diff{
+			"commerce_sharded": {{Name: "users", Raw: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		vschemas: map[string]*ps.VSchema{
+			"commerce_sharded": {Raw: "{\"sharded\":true}"},
+		},
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				"organization": "test-org",
+				"database":     "commerce_main",
+			},
+		},
+		psClientFunc: func(_, _ string) (psclient.PSClient, error) { return psClient, nil },
+		logger:       slog.Default(),
+	}
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "commerce",
+		Type:        storage.DatabaseTypeVitess,
+		Environment: "production",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, psClient.listReq)
+	assert.Equal(t, "commerce_main", psClient.listReq.Database)
+	require.Len(t, psClient.schemaReqs, 1)
+	assert.Equal(t, "commerce_main", psClient.schemaReqs[0].Database)
+	require.Len(t, psClient.vschemaReqs, 1)
+	assert.Equal(t, "commerce_main", psClient.vschemaReqs[0].Database)
+	assert.Contains(t, resp.Namespaces, "commerce_sharded")
+}
+
 func TestLocalClient_PullSchemaRejectsInvalidVitessDDL(t *testing.T) {
 	psClient := &pullSchemaPSClient{
 		schemas: map[string][]*ps.Diff{

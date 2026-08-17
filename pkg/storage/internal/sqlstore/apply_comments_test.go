@@ -19,7 +19,7 @@ func TestApplyCommentStore_Upsert(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_upsert", 1)
 
 	postedVolume := 3
@@ -100,7 +100,7 @@ func TestApplyCommentStore_ListByApply(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_getbyapply", 1)
 
 	// ListByApply with no comments should return empty slice
@@ -143,7 +143,7 @@ func TestApplyCommentStore_ListByApply_Isolation(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply1 := createTestApply(t, store, lock, "apply_iso_1", 1)
 	apply2 := createTestApplyWithStateAndEnv(t, store, lock, "apply_iso_2", 2, state.Apply.Completed, "staging")
 
@@ -171,7 +171,7 @@ func TestApplyCommentStore_DeleteByApply(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply1 := createTestApply(t, store, lock, "apply_comment_del1", 1)
 	apply2 := createTestApplyWithStateAndEnv(t, store, lock, "apply_comment_del2", 2, state.Apply.Completed, "staging")
 
@@ -208,7 +208,7 @@ func TestApplyCommentStore_Supersede(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_supersede", 1)
 
 	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
@@ -254,7 +254,7 @@ func TestApplyCommentStore_PendingFreeze(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_pending_freeze", 1)
 
 	// A volume-change rotation records the freeze owed to the superseded
@@ -306,7 +306,7 @@ func TestApplyCommentStore_UniqueConstraint(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_unique", 1)
 
 	// Insert two different states for same apply — should succeed
@@ -343,7 +343,7 @@ func TestApplyCommentStore_LeaseGuardsWrites(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_lease", 1)
 	_, err := testDB.ExecContext(ctx, `
 		UPDATE applies
@@ -456,9 +456,9 @@ func TestApplyCommentStore_ClaimSummaryComment(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_claim", 1)
-	otherLock := createTestLock(t, store, "testdb_other", "mysql", "staging")
+	otherLock := createTestLock(t, store, "testdb_other", "mysql")
 	other := createTestApply(t, store, otherLock, "apply_comment_claim_other", 2)
 
 	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
@@ -525,7 +525,7 @@ func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_reclaim", 1)
 
 	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
@@ -571,7 +571,7 @@ func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_release", 1)
 
 	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID), "releasing a missing claim is not an error")
@@ -617,7 +617,7 @@ func TestApplyCommentStore_MutationsStampUpdatedAt(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_updated_at_stamp", 1)
 
 	frozen := int64(900)
@@ -690,7 +690,7 @@ func TestApplyCommentStore_ClaimConversionRestartsStaleWindow(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_claim_fresh", 1)
 
 	// A stop's summary was posted and later consumed by a resume rotation,

@@ -1803,8 +1803,14 @@ type ApplyResponse struct {
 	ApplyId string `protobuf:"bytes,3,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// The apply_operation identifier for operation-scoped callers.
 	ApplyOperationId string `protobuf:"bytes,4,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// The operation key the data plane derived from this dispatch's shape,
+	// echoed so a caller can verify the response addresses its own operation —
+	// an apply shared by a deployment's operations answers many keys, and a
+	// response without the caller's key must not be treated as that
+	// operation's dispatch.
+	OperationKey  string `protobuf:"bytes,5,opt,name=operation_key,json=operationKey,proto3" json:"operation_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ApplyResponse) Reset() {
@@ -1861,6 +1867,13 @@ func (x *ApplyResponse) GetApplyId() string {
 func (x *ApplyResponse) GetApplyOperationId() string {
 	if x != nil {
 		return x.ApplyOperationId
+	}
+	return ""
+}
+
+func (x *ApplyResponse) GetOperationKey() string {
+	if x != nil {
+		return x.OperationKey
 	}
 	return ""
 }
@@ -2674,7 +2687,12 @@ type CutoverRequest struct {
 	// Apply ID for the schema change to cut over.
 	ApplyId string `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Environment: "staging" or "production".
-	Environment   string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	Environment string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Caller identifies the operator who issued the command, as resolved by the
+	// plane that accepted it. The plane that records the durable control request
+	// may not be the one the operator talked to, and the request is what names
+	// the requester in the PR notice and the apply log.
+	Caller        string `protobuf:"bytes,3,opt,name=caller,proto3" json:"caller,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2719,6 +2737,13 @@ func (x *CutoverRequest) GetApplyId() string {
 func (x *CutoverRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
+	}
+	return ""
+}
+
+func (x *CutoverRequest) GetCaller() string {
+	if x != nil {
+		return x.Caller
 	}
 	return ""
 }
@@ -3080,7 +3105,12 @@ type StopRequest struct {
 	// Apply ID for the schema change to stop.
 	ApplyId string `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Environment: "staging" or "production".
-	Environment   string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	Environment string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Caller identifies the operator who issued the command, as resolved by the
+	// plane that accepted it. The plane that records the durable control request
+	// may not be the one the operator talked to, and the request is what names
+	// the requester in the PR notice and the apply log.
+	Caller        string `protobuf:"bytes,3,opt,name=caller,proto3" json:"caller,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3125,6 +3155,13 @@ func (x *StopRequest) GetApplyId() string {
 func (x *StopRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
+	}
+	return ""
+}
+
+func (x *StopRequest) GetCaller() string {
+	if x != nil {
+		return x.Caller
 	}
 	return ""
 }
@@ -3215,7 +3252,12 @@ type CancelRequest struct {
 	// Apply ID for the schema change to cancel.
 	ApplyId string `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Environment: "staging" or "production".
-	Environment   string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	Environment string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Caller identifies the operator who issued the command, as resolved by the
+	// plane that accepted it. The plane that records the durable control request
+	// may not be the one the operator talked to, and the request is what names
+	// the requester in the PR notice and the apply log.
+	Caller        string `protobuf:"bytes,3,opt,name=caller,proto3" json:"caller,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3260,6 +3302,13 @@ func (x *CancelRequest) GetApplyId() string {
 func (x *CancelRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
+	}
+	return ""
+}
+
+func (x *CancelRequest) GetCaller() string {
+	if x != nil {
+		return x.Caller
 	}
 	return ""
 }
@@ -3341,7 +3390,12 @@ type StartRequest struct {
 	// Apply ID for the schema change to start.
 	ApplyId string `protobuf:"bytes,1,opt,name=apply_id,json=applyId,proto3" json:"apply_id,omitempty"`
 	// Environment: "staging" or "production".
-	Environment   string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	Environment string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
+	// Caller identifies the operator who issued the command, as resolved by the
+	// plane that accepted it. The plane that records the durable control request
+	// may not be the one the operator talked to, and the request is what names
+	// the requester in the PR notice and the apply log.
+	Caller        string `protobuf:"bytes,3,opt,name=caller,proto3" json:"caller,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3386,6 +3440,13 @@ func (x *StartRequest) GetApplyId() string {
 func (x *StartRequest) GetEnvironment() string {
 	if x != nil {
 		return x.Environment
+	}
+	return ""
+}
+
+func (x *StartRequest) GetCaller() string {
+	if x != nil {
+		return x.Caller
 	}
 	return ""
 }
@@ -3469,7 +3530,12 @@ type VolumeRequest struct {
 	// Environment: "staging" or "production".
 	Environment string `protobuf:"bytes,2,opt,name=environment,proto3" json:"environment,omitempty"`
 	// Volume level 1-11 (1=conservative, 11=aggressive).
-	Volume        int32 `protobuf:"varint,3,opt,name=volume,proto3" json:"volume,omitempty"`
+	Volume int32 `protobuf:"varint,3,opt,name=volume,proto3" json:"volume,omitempty"`
+	// Caller identifies the operator who issued the command, as resolved by the
+	// plane that accepted it. The plane that records the durable control request
+	// may not be the one the operator talked to, and the request is what names
+	// the requester in the PR notice and the apply log.
+	Caller        string `protobuf:"bytes,4,opt,name=caller,proto3" json:"caller,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3523,6 +3589,13 @@ func (x *VolumeRequest) GetVolume() int32 {
 		return x.Volume
 	}
 	return 0
+}
+
+func (x *VolumeRequest) GetCaller() string {
+	if x != nil {
+		return x.Caller
+	}
+	return ""
 }
 
 // VolumeResponse indicates whether the volume change was accepted.
@@ -3759,12 +3832,13 @@ const file_tern_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01\"\x99\x01\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01\"\xbe\x01\n" +
 	"\rApplyResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12\x19\n" +
 	"\bapply_id\x18\x03 \x01(\tR\aapplyId\x12,\n" +
-	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\"N\n" +
+	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\x12#\n" +
+	"\roperation_key\x18\x05 \x01(\tR\foperationKey\"N\n" +
 	"\x0fProgressRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\"\xa8\x01\n" +
@@ -3854,10 +3928,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x18settled_control_requests\x18\v \x03(\v2\x1e.tern.v1.SettledControlRequestR\x16settledControlRequests\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"M\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"e\n" +
 	"\x0eCutoverRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
-	"\venvironment\x18\x02 \x01(\tR\venvironment\"R\n" +
+	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
+	"\x06caller\x18\x03 \x01(\tR\x06caller\"R\n" +
 	"\x0fCutoverResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"L\n" +
@@ -3875,36 +3950,40 @@ const file_tern_proto_rawDesc = "" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x0f\n" +
 	"\rHealthRequest\"(\n" +
 	"\x0eHealthResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06status\"J\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\"b\n" +
 	"\vStopRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
-	"\venvironment\x18\x02 \x01(\tR\venvironment\"\xc2\x01\n" +
+	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
+	"\x06caller\x18\x03 \x01(\tR\x06caller\"\xc2\x01\n" +
 	"\fStopResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12'\n" +
 	"\x0fresume_deadline\x18\x03 \x01(\tR\x0eresumeDeadline\x12#\n" +
 	"\rstopped_count\x18\x04 \x01(\x03R\fstoppedCount\x12#\n" +
-	"\rskipped_count\x18\x05 \x01(\x03R\fskippedCount\"L\n" +
+	"\rskipped_count\x18\x05 \x01(\x03R\fskippedCount\"d\n" +
 	"\rCancelRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
-	"\venvironment\x18\x02 \x01(\tR\venvironment\"\x9f\x01\n" +
+	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
+	"\x06caller\x18\x03 \x01(\tR\x06caller\"\x9f\x01\n" +
 	"\x0eCancelResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12'\n" +
 	"\x0fcancelled_count\x18\x03 \x01(\x03R\x0ecancelledCount\x12#\n" +
-	"\rskipped_count\x18\x04 \x01(\x03R\fskippedCount\"K\n" +
+	"\rskipped_count\x18\x04 \x01(\x03R\fskippedCount\"c\n" +
 	"\fStartRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
-	"\venvironment\x18\x02 \x01(\tR\venvironment\"\x9a\x01\n" +
+	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
+	"\x06caller\x18\x03 \x01(\tR\x06caller\"\x9a\x01\n" +
 	"\rStartResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12#\n" +
 	"\rstarted_count\x18\x03 \x01(\x03R\fstartedCount\x12#\n" +
-	"\rskipped_count\x18\x04 \x01(\x03R\fskippedCount\"d\n" +
+	"\rskipped_count\x18\x04 \x01(\x03R\fskippedCount\"|\n" +
 	"\rVolumeRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
-	"\x06volume\x18\x03 \x01(\x05R\x06volume\"\x99\x01\n" +
+	"\x06volume\x18\x03 \x01(\x05R\x06volume\x12\x16\n" +
+	"\x06caller\x18\x04 \x01(\tR\x06caller\"\x99\x01\n" +
 	"\x0eVolumeResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\x12'\n" +

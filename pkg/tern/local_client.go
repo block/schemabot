@@ -123,7 +123,10 @@ import (
 
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
-	// Database is the name of this database.
+	// Database is the identifier this database is registered under — a routing
+	// and display key. For PlanetScale targets the API addresses the "database"
+	// metadata key when set; without it this identifier doubles as the
+	// PlanetScale database name.
 	Database string
 
 	// Type is the database type. "mysql", "vitess", and "postgres" have built-in
@@ -136,8 +139,9 @@ type LocalConfig struct {
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
-	// Keys used by PlanetScale: organization, token_name, token_value,
-	// tls_name, revert_window_duration, main_branch.
+	// Keys used by PlanetScale: organization, database (the PlanetScale
+	// database name when it differs from the registered identifier),
+	// token_name, token_value, tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
@@ -300,10 +304,8 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		config:  cfg,
 		storage: stor,
 		spiritEngine: spirit.New(spirit.Config{
-			Logger: logger,
-			// Pending drops quarantine is on by default; deployments opt out
-			// via the pending_drops metadata key.
-			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
+			Logger:              logger,
+			DisablePendingDrops: pendingDropsDisabled(cfg.Metadata),
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
@@ -834,83 +836,83 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 }
 
 func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string, error) {
-	client, org, branch, err := c.planetScalePullClient()
+	pt, err := c.planetScalePullClient()
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "branch", branch)
-	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch)
+	keyspaces, err := pt.client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", c.config.Database, branch, err)
+		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", pt.database, pt.branch, err)
 	}
 	dialect := schema.DialectForDatabaseType(c.config.Type)
 	namespaces := make([]string, 0, len(keyspaces))
 	for _, keyspace := range keyspaces {
 		if keyspace == nil {
-			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "branch", branch)
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch)
 			continue
 		}
 		if keyspace.Name == "" {
-			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", c.config.Database, branch)
+			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", pt.database, pt.branch)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, keyspace.Name) {
-			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", branch, "namespace", keyspace.Name)
+			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", keyspace.Name)
 			continue
 		}
 		namespaces = append(namespaces, keyspace.Name)
 	}
 	sort.Strings(namespaces)
-	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "branch", branch, "namespace_count", len(namespaces))
+	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace_count", len(namespaces))
 	return namespaces, nil
 }
 
 func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1.PullSchemaRequest, namespace string) (*ternv1.PullSchemaResponse, error) {
-	client, org, branch, err := c.planetScalePullClient()
+	pt, err := c.planetScalePullClient()
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
-	schemaResult, err := client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", namespace)
+	schemaResult, err := pt.client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 		Keyspace:     namespace,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 	}
 
 	pulledTables := make(map[string]string, len(schemaResult))
 	for _, tbl := range schemaResult {
 		if tbl == nil {
-			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", namespace)
 			continue
 		}
 		if tbl.Name == "" {
-			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", c.config.Database, branch, namespace)
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", pt.database, pt.branch, namespace)
 		}
 		content, err := pulledSchemaFileContent(c.config.Database, tbl.Name, tbl.Raw)
 		if err != nil {
-			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 		}
 		pulledTables[tbl.Name] = content
 	}
 
 	artifacts := map[string]string{}
-	vschema, err := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	vschema, err := pt.client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 		Keyspace:     namespace,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 	}
 	if vschema != nil && strings.TrimSpace(vschema.Raw) != "" {
 		artifacts[storage.VSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
@@ -918,7 +920,8 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 
 	c.logger.Info("LocalClient.PullSchema: loaded live Vitess schema",
 		"database", c.config.Database,
-		"branch", branch,
+		"planetscale_database", pt.database,
+		"branch", pt.branch,
 		"namespace", namespace,
 		"table_count", len(pulledTables),
 		"artifact_count", len(artifacts),
@@ -953,16 +956,33 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 	}, nil
 }
 
-func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string, error) {
+// planetScalePullTarget carries the PlanetScale client and the identifiers a
+// pull resolves once per call: the organization, the PlanetScale database
+// name, and the branch to read from.
+type planetScalePullTarget struct {
+	client   psclient.PSClient
+	org      string
+	database string
+	branch   string
+}
+
+func (c *LocalClient) planetScalePullClient() (*planetScalePullTarget, error) {
 	if c.psClientFunc == nil {
 		// A vitess database supports pull; a missing PlanetScale client is a
 		// configuration defect, surfaced as an internal error rather than the
 		// unsupported-type sentinel so it cannot read as "pull not supported".
-		return nil, "", "", fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
+		return nil, fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
 	}
 	org := c.config.Metadata["organization"]
 	if org == "" {
-		return nil, "", "", fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+		return nil, fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+	}
+	// The SchemaBot database identifier is a routing and display key; the
+	// PlanetScale database name in target metadata is what the API addresses.
+	// Without the metadata the identifier doubles as the PlanetScale name.
+	database := c.config.Metadata["database"]
+	if database == "" {
+		database = c.config.Database
 	}
 	branch := c.config.Metadata["main_branch"]
 	if branch == "" {
@@ -970,9 +990,9 @@ func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string
 	}
 	client, err := c.psClientFunc(c.config.Metadata["token_name"], c.config.Metadata["token_value"])
 	if err != nil {
-		return nil, "", "", fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
+		return nil, fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
 	}
-	return client, org, branch, nil
+	return &planetScalePullTarget{client: client, org: org, database: database, branch: branch}, nil
 }
 
 type pulledCatalog struct {
@@ -2022,6 +2042,279 @@ func newTaskIdentifier() string {
 	return "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 }
 
+// dispatchScope is the execution shape derived from a dispatch request: the
+// DDL changes this dispatch drives, the single target shard of a shard-scoped
+// dispatch, and whether the dispatch is a task-less VSchema finalizer.
+type dispatchScope struct {
+	ddlChanges         []storage.TableChange
+	shard              string
+	finalizer          bool
+	finalizerNamespace string
+}
+
+// deriveDispatchScope determines a dispatch request's scope. A sharded
+// engine's work is dispatched one apply_operation per shard, so a request that
+// carries target shards is scoped to that single shard: it drives the
+// operation's own DDL changes (req.DdlChanges) and tags its tasks with the
+// shard, so the engine receives exactly one target shard. More than one target
+// shard is a malformed dispatch (the per-shard fan-out emits one shard per
+// operation) and fails closed.
+//
+// A dispatch with no target shards whose changes are all VSchema-typed is a
+// VSchema apply: it targets VSchema documents and deliberately carries no
+// shard (the VSchema is namespace-level). Whether the stored plan also
+// carries table DDL (a group_finalizer alongside sibling shard work) or is
+// VSchema-only (the plan's entire change), falling back to the plan's flat
+// DDL here would be wrong: sibling table DDL would resurrect as shard-less
+// work tasks a sharded engine rejects, and a VSchema-only plan would yield
+// a work operation with no tasks — a shape with nothing to drive. The scope
+// is the task-less group_finalizer instead — the dispatch's one namespace, or
+// the whole deployment when the dispatch names every VSchema-changed
+// namespace of a VSchema-only plan — so the drive applies the VSchema
+// change(s) from the plan.
+//
+// Every other no-target-shard dispatch (a whole-deployment or non-sharded
+// apply) uses the stored plan unchanged.
+func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatchScope, error) {
+	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges()}
+	if len(req.TargetShards) > 0 {
+		shard, err := dispatchTargetShard(req.TargetShards)
+		if err != nil {
+			return dispatchScope{}, err
+		}
+		scoped, err := scopedDispatchDDLChanges(req.DdlChanges)
+		if err != nil {
+			return dispatchScope{}, err
+		}
+		scope.shard = shard
+		scope.ddlChanges = scoped
+		return scope, nil
+	}
+	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		namespace, err := finalizerDispatchScope(plan, namespaces)
+		if err != nil {
+			return dispatchScope{}, err
+		}
+		scope.finalizer = true
+		scope.finalizerNamespace = namespace
+		scope.ddlChanges = nil
+	}
+	return scope, nil
+}
+
+// operationIdentityForDispatch returns the operation key and kind the dispatch
+// scope stores on its apply_operations row.
+//
+// A shard-scoped dispatch tags its tasks with the target shard, so its
+// operation row must carry the matching shard operation key: the task loaders
+// treat a shard-tagged row as a drive task only when its operation's key
+// matches (the convention the control plane's sharded fan-out stamps).
+// Without the key, the operator's claim would load no drive tasks for the
+// apply and the dispatched work would never run.
+//
+// A group_finalizer dispatch creates a task-less finalizer operation: the
+// finalizer key names the scope the drive reconstructs the VSchema change(s)
+// from — one namespace, or the whole deployment for a VSchema-only plan — and
+// the kind routes the claim to the finalizer drive instead of failing closed
+// on the empty task set.
+func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationKind string, err error) {
+	if scope.shard != "" {
+		operationKey, err = shardScopedDispatchOperationKey(scope.ddlChanges, scope.shard)
+		if err != nil {
+			return "", "", err
+		}
+		return operationKey, "", nil
+	}
+	if scope.finalizer {
+		operationKey = finalizerDeploymentScopedKey
+		if scope.finalizerNamespace != "" {
+			operationKey = scope.finalizerNamespace + finalizerOperationKeySuffix
+		}
+		return operationKey, storage.ApplyOperationKindGroupFinalizer, nil
+	}
+	return "", "", nil
+}
+
+// buildDispatchTasks constructs the task rows for a dispatch scope's DDL
+// changes, each tagged with the dispatch's shard.
+func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, engineName string, optionsJSON []byte, now time.Time) []*storage.Task {
+	tasks := make([]*storage.Task, len(scope.ddlChanges))
+	for i, ddlChange := range scope.ddlChanges {
+		tasks[i] = &storage.Task{
+			TaskIdentifier: newTaskIdentifier(),
+			PlanID:         plan.ID,
+			Database:       plan.Database,
+			DatabaseType:   plan.DatabaseType,
+			Engine:         engineName,
+			Repository:     plan.Repository,
+			PullRequest:    plan.PullRequest,
+			Environment:    environment,
+			State:          state.Task.Pending,
+			Options:        optionsJSON,
+			TableName:      ddlChange.Table,
+			Namespace:      ddlChange.Namespace,
+			Shard:          scope.shard,
+			DDL:            ddlChange.DDL,
+			DDLAction:      ddlChange.Operation,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+	}
+	return tasks
+}
+
+// dispatchApplyResponse is the accepted-dispatch response shape: the apply's
+// identifier, the operation row the dispatch resolved to, and the derived
+// operation key echoed so the caller can verify the response addresses its
+// own operation.
+func dispatchApplyResponse(apply *storage.Apply, operationID int64, operationKey string) *ternv1.ApplyResponse {
+	return &ternv1.ApplyResponse{
+		Accepted:         true,
+		ApplyId:          apply.ApplyIdentifier,
+		ApplyOperationId: strconv.FormatInt(operationID, 10),
+		OperationKey:     operationKey,
+	}
+}
+
+// findApplyOperationByKey returns the apply's operation row for this
+// deployment and operation key, or nil when the apply has no such operation.
+func (c *LocalClient) findApplyOperationByKey(ctx context.Context, apply *storage.Apply, operationKey string) (*storage.ApplyOperation, error) {
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return nil, fmt.Errorf("apply operation store is not configured")
+	}
+	op, err := store.GetByApplyDeploymentAndOperationKey(ctx, apply.ID, c.config.Database, operationKey)
+	if err != nil {
+		return nil, fmt.Errorf("get apply_operation (deployment=%s, operation_key=%s) for apply %s: %w", c.config.Database, operationKey, apply.ApplyIdentifier, err)
+	}
+	return op, nil
+}
+
+// dispatchIntoExistingApply resolves a dispatch whose idempotency key already
+// maps to an apply. The dispatch is identified within the apply by the
+// operation key derived from its shape: a matching operation row means this
+// exact dispatch was seen before and is replayed, and a missing row means the
+// dispatch is a sibling operation of the same keyed generation, which is
+// attached to the apply. dedupOutcome labels the replay metric with the path
+// that resolved the key (first lookup, conflict race, or create race).
+func (c *LocalClient) dispatchIntoExistingApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, dedupOutcome string) (*ternv1.ApplyResponse, error) {
+	operationKey, operationKind, err := operationIdentityForDispatch(scope)
+	if err != nil {
+		return nil, fmt.Errorf("derive operation identity for dispatch into apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	existing, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		c.logger.Info("Apply: returning existing apply for idempotency key",
+			append(apply.LogAttrs(),
+				"idempotency_key", req.IdempotencyKey,
+				"operation_key", operationKey,
+				"dedup_outcome", dedupOutcome)...)
+		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, dedupOutcome)
+		return dispatchApplyResponse(apply, existing.ID, operationKey), nil
+	}
+	return c.attachDispatchOperation(ctx, req, apply, plan, scope, operationKey, operationKind)
+}
+
+// refuseAttachToTerminalApply is the fail-closed rejection for an attach
+// against an apply that is (or just became) terminal: its target reservation
+// is released and no drive will pick new work up, so accepting the operation
+// would strand it. The deployment's remaining operations cannot dispatch until
+// an operator reconciles the apply.
+func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
+	c.logger.Warn("Apply: refusing to attach operation to terminal keyed apply; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey)...)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "terminal_refused")
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("apply %s for this idempotency key is terminal (%s); operation %s cannot attach", apply.ApplyIdentifier, apply.State, operationKey),
+	}
+}
+
+// attachDispatchOperation adds a sibling dispatch's operation and its tasks to
+// the deployment's existing keyed apply. The attach runs the same conflict and
+// unsafe-DDL gates a fresh apply runs, so attaching never admits work a create
+// would have refused, and it fails closed on a terminal apply.
+func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey, operationKind string) (*ternv1.ApplyResponse, error) {
+	if state.IsTerminalApplyState(apply.State) {
+		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+	}
+
+	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+
+	eng := c.getEngine()
+	if eng == nil {
+		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+
+	applyOpts := storage.ApplyOptionsFromMap(req.Options)
+	applyOpts.Target = plan.Target
+	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+	optionsJSON := storage.MarshalApplyOptions(applyOpts)
+
+	now := time.Now()
+	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
+	operation := &storage.ApplyOperation{
+		Deployment:    c.config.Database,
+		OperationKey:  operationKey,
+		OperationKind: operationKind,
+		Target:        plan.Target,
+		State:         state.ApplyOperation.Pending,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	switch {
+	case errors.Is(err, storage.ErrApplyOperationExists):
+		// A concurrent same-operation attach won the insert; the winner's row
+		// is this dispatch's replay target.
+		winner, lookupErr := c.findApplyOperationByKey(ctx, apply, operationKey)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("resolve attach race for operation %s of apply %s: %w", operationKey, apply.ApplyIdentifier, lookupErr)
+		}
+		if winner == nil {
+			return nil, fmt.Errorf("operation %s of apply %s exists per the unique index but was not found on re-read", operationKey, apply.ApplyIdentifier)
+		}
+		c.logger.Info("Apply: concurrent attach won the operation insert; replaying the winner's row",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey)...)
+		metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
+		return dispatchApplyResponse(apply, winner.ID, operationKey), nil
+	case errors.Is(err, storage.ErrApplyNotActive):
+		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+	case err != nil:
+		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
+	}
+
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attached")
+	c.logger.Info("Apply: attached operation to keyed apply",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"task_count", len(tasks),
+			"plan_id", plan.PlanIdentifier)...)
+	c.wakeOperatorForQueuedApply(apply)
+
+	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
 // Apply executes a previously generated plan.
 // In local mode, Apply has additional conflict checking and polls for completion.
 //
@@ -2036,25 +2329,30 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		return nil, fmt.Errorf("environment is required")
 	}
 
-	// Idempotent re-dispatch: if this request's generation already created an
-	// apply, return that apply's id instead of starting a duplicate. This runs
-	// before plan resolution and the active-task conflict check so a re-dispatch
-	// of our own in-flight apply is recovered rather than rejected as "already
-	// in progress".
+	// Idempotent re-dispatch: if this request's idempotency key already maps to
+	// an apply, resolve the dispatch against that apply instead of starting a
+	// duplicate — replaying the dispatch's own operation, or attaching it as a
+	// sibling operation of the same keyed generation. This runs before the
+	// active-task conflict check so a re-dispatch of our own in-flight apply is
+	// recovered rather than rejected as "already in progress".
 	if existing, err := c.existingIdempotentApply(ctx, req); err != nil {
 		return nil, err
 	} else if existing != nil {
-		c.logger.Info("Apply: returning existing apply for idempotency key",
-			"apply_id", existing.ApplyIdentifier,
-			"idempotency_key", req.IdempotencyKey,
-			"state", existing.State,
-		)
-		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "hit")
-		applyOperationID, err := c.applyResponseOperationID(ctx, existing)
+		plan, err := c.planForApplyRequest(ctx, req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("resolve plan %s for idempotent re-dispatch: %w", req.PlanId, err)
 		}
-		return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
+		if plan == nil {
+			return &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: "plan not found",
+			}, nil
+		}
+		scope, err := deriveDispatchScope(plan, req)
+		if err != nil {
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
+		return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "hit")
 	}
 
 	// Look up the plan, materializing it from the dispatch request when this
@@ -2070,64 +2368,20 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	// Determine the dispatch's scope. A sharded engine's work is dispatched
-	// one apply_operation per shard, so a request that carries target shards is
-	// scoped to that single shard: it drives the operation's own DDL changes
-	// (req.DdlChanges) and tags its tasks with the shard, so the engine receives
-	// exactly one target shard. More than one target shard is a malformed
-	// dispatch (the per-shard fan-out emits one shard per operation) and fails
-	// closed.
-	//
-	// A dispatch with no target shards whose changes are all VSchema-typed is a
-	// VSchema apply: it targets VSchema documents and deliberately carries no
-	// shard (the VSchema is namespace-level). Whether the stored plan also
-	// carries table DDL (a group_finalizer alongside sibling shard work) or is
-	// VSchema-only (the plan's entire change), falling back to the plan's flat
-	// DDL here would be wrong: sibling table DDL would resurrect as shard-less
-	// work tasks a sharded engine rejects, and a VSchema-only plan would yield
-	// a work operation with no tasks — a shape with nothing to drive. Create
-	// the task-less group_finalizer operation instead — scoped to the
-	// dispatch's one namespace, or to the whole deployment when the dispatch
-	// names every VSchema-changed namespace of a VSchema-only plan — so the
-	// drive applies the VSchema change(s) from the plan.
-	//
-	// Every other no-target-shard dispatch (a whole-deployment or non-sharded
-	// apply) uses the stored plan unchanged — keeping that path byte-for-byte
-	// as before.
-	ddlChanges := plan.FlatDDLChanges()
-	dispatchShard := ""
-	finalizerDispatch := false
-	finalizerNamespace := ""
-	if len(req.TargetShards) > 0 {
-		shard, err := dispatchTargetShard(req.TargetShards)
-		if err != nil {
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
-		}
-		scoped, err := scopedDispatchDDLChanges(req.DdlChanges)
-		if err != nil {
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
-		}
-		dispatchShard = shard
-		ddlChanges = scoped
-	} else if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
-		namespace, err := finalizerDispatchScope(plan, namespaces)
-		if err != nil {
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
-		}
-		finalizerDispatch = true
-		finalizerNamespace = namespace
-		ddlChanges = nil
+	scope, err := deriveDispatchScope(plan, req)
+	if err != nil {
+		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
 		"plan_identifier", plan.PlanIdentifier,
-		"ddl_change_count", len(ddlChanges),
+		"ddl_change_count", len(scope.ddlChanges),
 		"target_shards", req.TargetShards,
 		"database", plan.Database,
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if err := c.checkActiveTaskConflict(ctx, plan, dispatchShard); err != nil {
+	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
@@ -2135,16 +2389,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			return nil, errors.Join(err, lookupErr)
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
-				"apply_id", existing.ApplyIdentifier,
-				"idempotency_key", req.IdempotencyKey,
-				"state", existing.State,
-			)
-			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "conflict_race")
-			applyOperationID, err := c.applyResponseOperationID(ctx, existing)
-			if err != nil {
-				return nil, err
-			}
-			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
+				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
+			return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "conflict_race")
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -2176,7 +2422,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// target string the request carried.
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	applyOpts.Target = plan.Target
-	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, ddlChanges, applyOpts); err != nil {
+	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -2210,9 +2456,9 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 
 	c.logger.Info("Apply: creating tasks",
 		"plan_id", plan.PlanIdentifier,
-		"ddl_change_count", len(ddlChanges),
+		"ddl_change_count", len(scope.ddlChanges),
 	)
-	for i, ddlChange := range ddlChanges {
+	for i, ddlChange := range scope.ddlChanges {
 		c.logger.Debug("Apply: DDLChange",
 			"index", i,
 			"table", ddlChange.Table,
@@ -2220,55 +2466,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	tasks := make([]*storage.Task, len(ddlChanges))
-	for i, ddlChange := range ddlChanges {
-		taskIdentifier := newTaskIdentifier()
-		tasks[i] = &storage.Task{
-			TaskIdentifier: taskIdentifier,
-			PlanID:         plan.ID,
-			Database:       plan.Database,
-			DatabaseType:   plan.DatabaseType,
-			Engine:         eng.Name(),
-			Repository:     plan.Repository,
-			PullRequest:    plan.PullRequest,
-			Environment:    req.Environment,
-			State:          state.Task.Pending,
-			Options:        optionsJSON,
-			TableName:      ddlChange.Table,
-			Namespace:      ddlChange.Namespace,
-			Shard:          dispatchShard,
-			DDL:            ddlChange.DDL,
-			DDLAction:      ddlChange.Operation,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
-	}
+	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
 
-	// A shard-scoped dispatch tags its tasks with the target shard, so its
-	// operation row must carry the matching shard operation key: the task
-	// loaders treat a shard-tagged row as a drive task only when its operation's
-	// key matches (the convention the control plane's sharded fan-out stamps).
-	// Without the key, the operator's claim would load no drive tasks for the
-	// apply and the dispatched work would never run.
-	operationKey := ""
-	operationKind := ""
-	if dispatchShard != "" {
-		operationKey, err = shardScopedDispatchOperationKey(ddlChanges, dispatchShard)
-		if err != nil {
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
-		}
-	}
-	// A group_finalizer dispatch creates a task-less finalizer operation: the
-	// finalizer key names the scope the drive reconstructs the VSchema
-	// change(s) from — one namespace, or the whole deployment for a
-	// VSchema-only plan — and the kind routes the claim to the finalizer drive
-	// instead of failing closed on the empty task set.
-	if finalizerDispatch {
-		operationKey = finalizerDeploymentScopedKey
-		if finalizerNamespace != "" {
-			operationKey = finalizerNamespace + finalizerOperationKeySuffix
-		}
-		operationKind = storage.ApplyOperationKindGroupFinalizer
+	operationKey, operationKind, err := operationIdentityForDispatch(scope)
+	if err != nil {
+		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 	}
 
 	// Dual-write one apply_operations row alongside the applies row in the
@@ -2300,16 +2502,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			return nil, fmt.Errorf("create apply %s with tasks and operations (idempotency re-lookup also failed): %w", applyIdentifier, errors.Join(err, lookupErr))
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved a create race",
-				"apply_id", existing.ApplyIdentifier,
-				"idempotency_key", req.IdempotencyKey,
-				"state", existing.State,
-			)
-			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "create_race")
-			applyOperationID, err := c.applyResponseOperationID(ctx, existing)
-			if err != nil {
-				return nil, err
-			}
-			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
+				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
+			return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "create_race")
 		}
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
 	}
@@ -2352,32 +2546,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier)...)
 	c.wakeOperatorForQueuedApply(apply)
 
-	return &ternv1.ApplyResponse{
-		Accepted:         true,
-		ApplyId:          apply.ApplyIdentifier,
-		ApplyOperationId: strconv.FormatInt(operations[0].ID, 10),
-	}, nil
-}
-
-func (c *LocalClient) applyResponseOperationID(ctx context.Context, apply *storage.Apply) (string, error) {
-	if apply == nil {
-		return "", fmt.Errorf("apply is required")
-	}
-	store := c.storage.ApplyOperations()
-	if store == nil {
-		return "", fmt.Errorf("apply operation store is not configured")
-	}
-	ops, err := store.ListByApply(ctx, apply.ID)
-	if err != nil {
-		return "", fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	if len(ops) != 1 {
-		c.logger.Debug("ApplyResponse omits apply_operation_id because apply has no single child operation",
-			"apply_id", apply.ApplyIdentifier,
-			"operation_count", len(ops))
-		return "", nil
-	}
-	return strconv.FormatInt(ops[0].ID, 10), nil
+	return dispatchApplyResponse(apply, operations[0].ID, operationKey), nil
 }
 
 // getEngine returns the appropriate engine based on database type.
@@ -3020,4 +3189,16 @@ func dsnLogAttrs(dsn string) []any {
 		"target_addr", cfg.Addr,
 		"target_db", cfg.DBName,
 	}
+}
+
+// pendingDropsDisabled reports whether this client drops tables outright rather
+// than quarantining them in the pending drops database.
+//
+// The quarantine is opt-in: a deployment turns it on with the pending_drops
+// metadata key, and anything else, including an absent key, drops the table
+// outright. Quarantining is only safe for a deployment that also reaps its own
+// targets, because a quarantine no cleaner reaches grows on the target server
+// forever, so an embedder that never states the intent must not inherit it.
+func pendingDropsDisabled(metadata map[string]string) bool {
+	return metadata["pending_drops"] != "true"
 }

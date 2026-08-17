@@ -926,6 +926,52 @@ func RecordRemoteApplyDedup(ctx context.Context, database, environment, outcome 
 	)
 }
 
+var knownRemoteApplyAttachOutcomes = map[string]bool{
+	"attached":         true,
+	"attach_race":      true,
+	"terminal_refused": true,
+}
+
+// RecordRemoteApplyAttach increments the counter for dispatches that resolved
+// into an existing deployment-keyed apply with a new operation. Outcome should
+// be one of:
+//   - "attached": a sibling dispatch added its operation to the deployment's
+//     shared apply (the normal fan-out event; its rate tracks sharded
+//     dispatch volume).
+//   - "attach_race": a concurrent same-operation attach lost the insert and
+//     was resolved to the winner's row instead of a spurious error.
+//   - "terminal_refused": the shared apply was already terminal, so the
+//     attach was refused fail-closed — the deployment's remaining operations
+//     cannot dispatch until an operator reconciles the apply, so investigate
+//     what terminalized it mid-fan-out.
+func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome string) {
+	if !knownRemoteApplyAttachOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_apply_attach_total",
+		"Total dispatches attaching an operation to an existing deployment-keyed remote apply", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordRemoteApplyKeyEchoMismatch increments the counter for remote dispatches
+// whose accepted response echoed a different operation key than the request's
+// shape derives to, so the control plane refused the response's remote ids and
+// failed the dispatch closed. A spike means a data plane is answering
+// deployment-keyed dispatches without attaching sibling operations — most often
+// a data plane running a version that predates sibling-operation attach —
+// so the operator action is to upgrade (or roll back) the named database's data
+// plane before retrying the blocked applies.
+func RecordRemoteApplyKeyEchoMismatch(ctx context.Context, database, environment string) {
+	addCounter(ctx, "schemabot.remote_apply_key_echo_mismatch_total",
+		"Total remote apply dispatches refused because the response's operation key did not match the dispatched operation", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.
@@ -1990,6 +2036,20 @@ func RecordStatusCheckOperation(ctx context.Context, op StatusCheckOperation) {
 func RecordPendingDropMoved(ctx context.Context, database string) {
 	addCounter(ctx, "schemabot.pending_drops.tables_moved_total",
 		"Total number of dropped tables quarantined into the pending drops database", "{table}",
+		attribute.String("database", database),
+		EnvironmentAttribute(""),
+	)
+}
+
+// RecordDropTableAlreadyAbsent increments the counter for a DROP TABLE target
+// that was already gone when the apply reached it. The DROP phase replays from
+// its first statement on resume, so a stopped and resumed apply produces these
+// for the tables its earlier attempt dropped. Outside that, it means something
+// other than the apply removed the table, and the schema files and the target
+// have diverged.
+func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
+	addCounter(ctx, "schemabot.drop_table.already_absent_total",
+		"Total number of DROP TABLE targets that were already absent when the apply reached them", "{table}",
 		attribute.String("database", database),
 		EnvironmentAttribute(""),
 	)

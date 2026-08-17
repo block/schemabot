@@ -107,14 +107,15 @@ func TestMySQLConnectionAssemblerDatabaseType(t *testing.T) {
 }
 
 // Vitess connects through the PlanetScale API, so the assembler emits a
-// metadata-only target: organization from the endpoint attributes, the service
-// token from credentials, and the API URL from configuration. No DSN.
+// metadata-only target: organization and database name from the endpoint
+// attributes, the service token from credentials, and the API URL from
+// configuration. No DSN.
 func TestVitessConnectionAssemblerBuildsMetadataTarget(t *testing.T) {
 	a := VitessConnectionAssembler{APIURL: "https://localscale.test"}
 
 	dsn, meta, err := a.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{
 			MetadataTokenName:  "tok-id",
 			MetadataTokenValue: "tok-secret",
@@ -124,6 +125,7 @@ func TestVitessConnectionAssemblerBuildsMetadataTarget(t *testing.T) {
 	assert.Empty(t, dsn, "Vitess targets carry connection details in metadata, not a DSN")
 	assert.Equal(t, map[string]string{
 		MetadataOrganization: "acme",
+		MetadataDatabase:     "acme_main",
 		MetadataTokenName:    "tok-id",
 		MetadataTokenValue:   "tok-secret",
 		MetadataAPIURL:       "https://localscale.test",
@@ -139,7 +141,7 @@ func TestVitessConnectionAssemblerNoVtgateDSNWithoutMySQLUsername(t *testing.T) 
 
 	dsn, meta, err := a.Assemble(
 		"vtgate.example:3306",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
@@ -156,7 +158,7 @@ func TestVitessConnectionAssemblerBuildsVtgateDSN(t *testing.T) {
 
 	dsn, meta, err := a.Assemble(
 		"vtgate.example",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{
 			Username: "ddl-user",
 			Password: "ddl-pass",
@@ -184,11 +186,38 @@ func TestVitessConnectionAssemblerCustomOrganizationAttribute(t *testing.T) {
 
 	_, meta, err := a.Assemble(
 		"",
-		map[string]string{"ps_org": "acme"},
+		map[string]string{"ps_org": "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "acme", meta[MetadataOrganization])
+}
+
+// A custom database attribute lets the resolver surface the PlanetScale
+// database name under a label other than the default.
+func TestVitessConnectionAssemblerCustomDatabaseAttribute(t *testing.T) {
+	a := VitessConnectionAssembler{DatabaseAttribute: "ps_database"}
+
+	_, meta, err := a.Assemble(
+		"",
+		map[string]string{MetadataOrganization: "acme", "ps_database": "acme_main"},
+		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "acme_main", meta[MetadataDatabase])
+}
+
+// The PlanetScale database name attribute is required: without it every API
+// call would fall back to addressing the database by its registered
+// identifier, which is an arbitrary routing key rather than a PlanetScale name.
+func TestVitessConnectionAssemblerRequiresDatabase(t *testing.T) {
+	_, _, err := VitessConnectionAssembler{}.Assemble(
+		"",
+		map[string]string{MetadataOrganization: "acme"},
+		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), DefaultDatabaseAttribute)
 }
 
 // Configured Metadata is merged after the resolved fields so deployments can
@@ -198,7 +227,7 @@ func TestVitessConnectionAssemblerMergesConfiguredMetadata(t *testing.T) {
 
 	_, meta, err := a.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
@@ -224,7 +253,7 @@ func TestVitessConnectionAssemblerRequiresOrganization(t *testing.T) {
 func TestVitessConnectionAssemblerRequiresToken(t *testing.T) {
 	_, _, err := VitessConnectionAssembler{}.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id"}},
 	)
 	require.Error(t, err)
@@ -242,7 +271,7 @@ func TestVitessConnectionAssemblerSecretAPIURLOverridesConfig(t *testing.T) {
 
 	_, meta, err := a.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{
 			MetadataTokenName:  "id",
 			MetadataTokenValue: "secret",

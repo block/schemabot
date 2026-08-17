@@ -608,6 +608,70 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 	})
 }
 
+// AttachOperationWithTasks inserts one apply_operations row and its tasks
+// under an existing apply. The parent applies row is locked and re-read inside
+// the transaction so the attach cannot race a concurrent terminalization; the
+// apply's target reservation and idempotency key are untouched — the attach
+// adds work to the reservation the apply already holds.
+func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storage.Apply, operation *storage.ApplyOperation, tasks []*storage.Task) error {
+	if apply == nil {
+		return fmt.Errorf("attach operation: apply is nil")
+	}
+	if operation == nil {
+		return fmt.Errorf("attach operation to apply %s: operation is nil", apply.ApplyIdentifier)
+	}
+	// A group_finalizer carries no tasks — it applies namespace-level work
+	// reconstructed from the plan at drive time. Every work operation must
+	// have at least one task so operation-scoped drives fail closed on bad
+	// scoping.
+	if len(tasks) == 0 && operation.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+		return fmt.Errorf("attach operation %s to apply %s: work operation has no tasks", operation.OperationKey, apply.ApplyIdentifier)
+	}
+	for _, task := range tasks {
+		if task == nil {
+			return fmt.Errorf("attach operation %s to apply %s: operation has a nil task", operation.OperationKey, apply.ApplyIdentifier)
+		}
+	}
+
+	const opName = "attach operation to apply"
+	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
+	if err != nil {
+		return err
+	}
+	defer writeTx.close(ctx, opName)
+
+	var currentState string
+	err = writeTx.tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("lock apply %s to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
+	}
+	if !isActiveApplyState(currentState) {
+		return fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
+	}
+
+	operation.ApplyID = apply.ID
+	if _, err := insertApplyOperation(ctx, writeTx.tx, s.identity, s.classifier, operation); err != nil {
+		return fmt.Errorf("attach apply_operation (deployment=%s, operation_key=%s) to apply %s: %w", operation.Deployment, operation.OperationKey, apply.ApplyIdentifier, err)
+	}
+	for _, task := range tasks {
+		task.ApplyID = apply.ID
+		task.ApplyOperationID = &operation.ID
+		taskID, err := insertTask(ctx, writeTx.tx, s.identity, task)
+		if err != nil {
+			return fmt.Errorf("insert task %s for attached operation %s of apply %s: %w", task.TaskIdentifier, operation.OperationKey, apply.ApplyIdentifier, err)
+		}
+		task.ID = taskID
+	}
+
+	if err := writeTx.commit(); err != nil {
+		return fmt.Errorf("commit %s: %w", opName, err)
+	}
+	return nil
+}
+
 func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options

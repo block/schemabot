@@ -22,7 +22,13 @@ import (
 // distinct physical primaries that run concurrently by design, so a task on
 // another shard is not a conflict. dispatchShard is "" for a non-sharded apply,
 // which conflicts with any active task on the database (today's behaviour).
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string) error {
+//
+// attachApplyID names the keyed apply a sibling dispatch is attaching into (0
+// when the dispatch creates a new apply). That apply's own tasks are the
+// dispatch's siblings, not conflicts: the apply already holds the database's
+// reservation and the driver orders sibling work, so only other applies'
+// active work blocks the attach.
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string, attachApplyID int64) error {
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
 		if err != nil {
@@ -31,7 +37,7 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
+		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard, attachApplyID)
 		if !blocking.blocks() {
 			return nil
 		}
@@ -64,10 +70,17 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 // when both the candidate apply and an existing task target a non-empty shard,
 // a different shard does not conflict, so a sharded fan-out runs its shards
 // concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) blockingTask {
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string, attachApplyID int64) blockingTask {
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
+			continue
+		}
+
+		// A task of the apply this dispatch is attaching into is sibling work
+		// under the same reservation, not a conflict (see checkActiveTaskConflict).
+		if attachApplyID != 0 && t.ApplyID == attachApplyID {
+			c.logger.Debug("conflict check: skipping sibling task of the attach-target apply", "task_id", t.TaskIdentifier, "shard", t.Shard)
 			continue
 		}
 
