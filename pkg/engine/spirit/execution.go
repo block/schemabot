@@ -320,24 +320,25 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 	return e.executeSpiritMigration(ctx, host, username, password, database, combinedStatement, deferCutover) == nil
 }
 
-// executeDropStatements runs the DROP TABLE phase. By default each table is
-// quarantined in the pending drops database so its data stays recoverable until
-// the retention period expires; when pending drops is disabled the DROP runs
-// directly through Spirit. Both the initial-apply DROP phase and the resume DROP
-// phase call this helper, so a resumed DROP quarantines exactly like an initial
-// one. It returns false when execution should stop: a cancelled context leaves
-// the state Stopped, a genuine failure transitions to StateFailed.
+// executeDropStatements runs the DROP TABLE phase. Each table is dropped
+// directly through Spirit unless the deployment enabled the pending drops
+// quarantine, in which case it is renamed into the pending drops database so
+// its data stays recoverable until the retention period expires. Both the
+// initial-apply DROP phase and the resume DROP phase call this helper, so a
+// resumed DROP behaves exactly like an initial one. It returns false when
+// execution should stop: a cancelled context leaves the state Stopped, a
+// genuine failure transitions to StateFailed.
 func (e *Engine) executeDropStatements(ctx context.Context, host, username, password, database string, drops []string) bool {
 	return e.runStatementPhase(ctx, database, "DROP TABLE", "DROP TABLE phase", drops, func(ctx context.Context, stmt string) error {
 		return e.executeDropStatement(ctx, host, username, password, database, stmt)
 	})
 }
 
-// executeDropStatement runs a single DROP TABLE statement, quarantining the
-// table by default and dropping it directly only when pending drops is disabled.
+// executeDropStatement runs a single DROP TABLE statement, dropping the table
+// outright unless the pending drops quarantine is enabled for this deployment.
 func (e *Engine) executeDropStatement(ctx context.Context, host, username, password, database, stmt string) error {
 	if e.disablePendingDrops {
-		if err := e.executeSingleStatement(ctx, host, username, password, database, stmt); err != nil {
+		if err := e.executeDropDirectly(ctx, host, username, password, database, stmt); err != nil {
 			return fmt.Errorf("drop table directly: %w", err)
 		}
 		return nil

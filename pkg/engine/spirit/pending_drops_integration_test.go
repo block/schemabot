@@ -255,3 +255,67 @@ func TestEngine_ExecuteSchemaChange_DropTemporaryTableExecutesDirectly(t *testin
 	quarantined := listQuarantinedTables(t, db)
 	assert.Empty(t, quarantined, "temporary tables must not create quarantine entries")
 }
+
+// The DROP phase re-runs from its first statement whenever an apply resumes,
+// so on a deployment that drops tables outright the phase must tolerate the
+// tables an earlier attempt already dropped and still drop the ones that
+// remain, rather than failing the apply on the first absent table.
+func TestEngine_ExecuteSchemaChange_DirectDropSkipsAlreadyAbsentTables(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, name := range []string{"resumed_first", "resumed_second"} {
+		_, err := db.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY AUTO_INCREMENT)", name))
+		require.NoError(t, err, "create table %s", name)
+	}
+
+	// Stand in for the earlier attempt: the first table is already dropped
+	// when the phase restarts from the top.
+	_, err := db.ExecContext(t.Context(), "DROP TABLE `resumed_first`")
+	require.NoError(t, err, "pre-drop resumed_first")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	state := runDDLApply(t, eng, dsn, []string{
+		"DROP TABLE `resumed_first`",
+		"DROP TABLE `resumed_second`",
+	})
+	assert.Equal(t, engine.StateCompleted, state)
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = 'resumed_second'").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "the statement after the absent table must still run")
+
+	quarantined := listQuarantinedTables(t, db)
+	assert.Empty(t, quarantined, "the direct path must not quarantine anything")
+}
+
+// A multi-table DROP on the direct path drops the tables that are still there
+// and leaves the already-absent ones alone, so a stop partway through a
+// multi-table statement still converges on the planned end state.
+func TestEngine_ExecuteSchemaChange_DirectDropMultiTablePartiallyAbsent(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(),
+		"CREATE TABLE `partial_present` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `partial_absent`, `partial_present`"})
+	assert.Equal(t, engine.StateCompleted, state)
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = 'partial_present'").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "the table that was still present must be dropped")
+}
