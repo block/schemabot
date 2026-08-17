@@ -339,9 +339,10 @@ behalf of a user. It has its own section:
 ## Calling SchemaBot as a service
 
 Not every caller is a person. A schema inventory that pulls live schemas, a
-dashboard that polls apply status, another platform that watches lock state:
-these are services calling SchemaBot as themselves, with their own identity
-rather than a forwarded user's. Both authenticators support this, and on both
+dashboard that polls apply status, an agentic tool that queries schema
+information across your fleet of databases: these are services calling
+SchemaBot as themselves, with their own identity rather than a forwarded
+user's. Both authenticators support this, and on both
 the shape is the same: the service gets the read tier, and every log line and
 metric attributes the request to the service's own identity.
 
