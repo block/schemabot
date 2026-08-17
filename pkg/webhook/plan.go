@@ -9,9 +9,11 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -752,6 +754,34 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 	return out
 }
 
+// splitExistingCopies sorts the target's unfinished copies by what the apply
+// will do to them. The two sections are opposite promises to the operator —
+// one says the work survives, the other says it is destroyed — so a
+// disposition this build does not recognize is shown as a discard: warning
+// about work that in fact survives costs a second look, while promising
+// survival to work that is destroyed costs the copy.
+func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, adopted []templates.ExistingCopyData) {
+	for _, c := range copies {
+		if c == nil {
+			continue
+		}
+		entry := templates.ExistingCopyData{
+			Namespace: c.Namespace,
+			Tables:    c.Tables,
+			Reason:    c.Reason,
+		}
+		if c.AgeSeconds > 0 {
+			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
+		}
+		if engine.CopyDisposition(c.Disposition) == engine.CopyAdopt {
+			adopted = append(adopted, entry)
+			continue
+		}
+		discarded = append(discarded, entry)
+	}
+	return discarded, adopted
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -899,6 +929,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 		}
 	}
+
+	data.DiscardedCopies, data.AdoptedCopies = splitExistingCopies(planResp.ExistingCopies)
 
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {

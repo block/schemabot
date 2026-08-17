@@ -112,6 +112,13 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
+	// Unfinished copies already on the target that the apply will throw away
+	// and copy again from the start.
+	DiscardedCopies []ExistingCopyData
+
+	// Unfinished copies already on the target that the apply will resume.
+	AdoptedCopies []ExistingCopyData
+
 	// Tables carrying a destructive change that another pull request owns, or
 	// whose ownership could not be established.
 	AttributedChanges []AttributedChangeData
@@ -259,6 +266,18 @@ func RenderPlanComment(data PlanCommentData) string {
 	// disclosure must sit on the comment the confirmation acts on.
 	if len(data.DirectChanges) > 0 {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
+	}
+
+	// Copies already on the target. Shown on the locked apply comment too:
+	// discarding an unfinished copy destroys hours of work already done, so the
+	// disclosure must sit on the comment the confirmation acts on. The copy is
+	// read from the target at plan time, so it can appear on the apply comment
+	// without having been on the plan comment that preceded it.
+	if len(data.DiscardedCopies) > 0 {
+		writeDiscardedCopies(&sb, data.DiscardedCopies)
+	}
+	if len(data.AdoptedCopies) > 0 {
+		writeAdoptedCopies(&sb, data.AdoptedCopies)
 	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
@@ -1356,6 +1375,15 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	// since the policy is configured per environment.
 	if len(plan.DirectChanges) > 0 {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
+	}
+
+	// Copies already on the target — read per environment, since each
+	// environment has its own target.
+	if len(plan.DiscardedCopies) > 0 {
+		writeDiscardedCopies(sb, plan.DiscardedCopies)
+	}
+	if len(plan.AdoptedCopies) > 0 {
+		writeAdoptedCopies(sb, plan.AdoptedCopies)
 	}
 
 	// Unsafe changes warning

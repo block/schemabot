@@ -463,6 +463,21 @@ type PlanResponse struct {
 	// keyspace to one entry, so a keyspace whose shards diverge is represented
 	// faithfully only here. Empty for non-sharded plans.
 	Shards []*ShardPlanResponse `json:"shards,omitempty"`
+	// ExistingCopies carries the unfinished copies already on the target that
+	// applying this plan will adopt or discard, one entry per namespace holding
+	// any. Empty when the target is clean, which is the ordinary case.
+	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
+}
+
+// ExistingCopyResponse is an unfinished copy sitting on the target and what
+// applying the plan will do to it: adopt it and resume, or discard it and copy
+// again from the start.
+type ExistingCopyResponse struct {
+	Namespace   string   `json:"namespace,omitempty"`
+	Disposition string   `json:"disposition"`
+	Reason      string   `json:"reason,omitempty"`
+	Tables      []string `json:"tables,omitempty"`
+	AgeSeconds  int64    `json:"age_seconds,omitempty"`
 }
 
 // ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and
