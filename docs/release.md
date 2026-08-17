@@ -120,10 +120,11 @@ release cannot be rolled back in parts, so trouble in one change forces a decisi
 about all of them, and a change that needs its own rollout ordering drags the rest
 of the batch along with it.
 
-**Pick the release commit deliberately.** It is not automatically the tip of
-`main`. A later commit may hold something staged separately that must not ride
-along, so decide which commit is being released, tag that one, and confirm the
-tag resolves to it.
+**Release the tip of `main` by default.** That is the normal choice and usually the
+right one. Read the commits since the previous tag first, though, because a later
+commit may hold something staged separately that must not ride along yet. When one
+does, tag the last commit that should go out instead, and confirm the tag resolves
+to it.
 
 **Then ask whether it should be one release or two.** Read the commits in the
 range and split the release if it contains a change that cannot safely coexist
@@ -216,9 +217,10 @@ several releases apart.
 ## Pre-tag checks
 
 Run these against the commit range since the previous tag
-(`git diff <previous-tag>..<release-commit>`, where the release commit is the one
-chosen under [Cadence](#cadence-and-release-boundaries), not necessarily the tip of
-`main`). Each one is here because it has caught a real problem.
+(`git diff <previous-tag>..<release-commit>`, where the release commit is normally
+the tip of `main`, or whichever earlier commit was chosen under
+[Cadence](#cadence-and-release-boundaries)). Each one is here because it has caught
+a real problem.
 
 ### 1. Removed or renamed config keys
 
