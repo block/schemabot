@@ -503,7 +503,12 @@ func TestDurableIssueCommentDriverFinalAttemptPostsOneRetryFailure(t *testing.T)
 	event := durableIssueCommentEvent("schemabot unlock")
 	event.Attempts = maxDurableWebhookAttempts - 1
 	store := newScriptedWebhookEventStore(event)
-	h, comments := newDurableUnlockDriverHarness(t, store, &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")})
+	st := &durableWebhookTestStorage{
+		webhookEvents: store,
+		locks:         &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")},
+		applies:       &noActiveAppliesStore{},
+	}
+	h, comments := newDurableDriverHarness(t, st, nil, nil)
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
