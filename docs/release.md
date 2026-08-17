@@ -29,9 +29,9 @@ to you. Everything else here does.
 
 SchemaBot is developed by Block and runs Block's own schema changes, so every tag
 in this repository is a tag Block deploys. Releases are not cut on a calendar. A
-tag goes out when merged work is ready to roll, reaches a pre-production (e.g. staging)
-control plane and its data planes first, then production, and anything found along the way is
-fixed forward in the next tag.
+tag goes out when merged work is ready to roll, reaches a pre-production (e.g.
+staging) control plane and its data planes first, then production, and anything
+found along the way is fixed forward in the next tag.
 
 Note the order, because it is easy to read too much into it: **the tag comes
 first and the rollout follows it.** Publishing a tag says nothing about how the
@@ -112,13 +112,13 @@ notes as the contract.
 ## Cadence and release boundaries
 
 A release usually carries several merged commits. Every tag has to be rolled out
-through pre-production and then production, so batching amortizes that time rather than
-paying it per change.
+through pre-production and then production, so batching amortizes that time rather
+than paying it per change.
 
-There is no minimum amount of commits however, and a single commit is still a perfectly
-good release candidate. If the next rollout step needs code that is only on `main`, cut the next
-patch release instead of deploying an unreleased commit or sitting on the fix until
-more work piles up.
+There is no minimum number of commits however, and a single commit is still a
+perfectly good release. If the next rollout step needs code that is only on `main`,
+cut the next patch release instead of deploying an unreleased commit or sitting on
+the fix until more work piles up.
 
 What a batch should not do is put changes together that constrain each other. A
 release cannot be rolled back in parts, so trouble in one change forces a decision
