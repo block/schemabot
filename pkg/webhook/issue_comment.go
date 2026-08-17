@@ -944,9 +944,13 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 }
 
 // durableIssueCommentCommand identifies the command and PR destination in a
-// stored issue_comment payload. Terminal notification uses the payload rather
-// than denormalized inbox columns so replayed rows receive the same validation
-// as normal command dispatch.
+// stored issue_comment payload. Terminal notification re-parses the payload
+// rather than trusting denormalized inbox columns, applying the same shape
+// and command-ready gates as normal dispatch. The routing gates (repo
+// allow-list, tenant and environment ownership) are intentionally not
+// re-run: a routing-blocked delivery completes as a no-op on its first
+// attempt and never exhausts its retry budget, so no routing-blocked row can
+// reach terminal notification.
 func durableIssueCommentCommand(event *storage.WebhookEvent) (CommandResult, string, int, int64, string, error) {
 	var payload webhookPayload
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
