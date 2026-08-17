@@ -340,17 +340,34 @@ behalf of a user. It has its own section:
 
 Not every caller is a person. A schema inventory that pulls live schemas, a
 dashboard that polls apply status, an agentic tool that queries schema
-information across your fleet of databases: these are services calling
-SchemaBot as themselves, with their own identity rather than a forwarded
-user's. Both authenticators support this, and on both
-the shape is the same: the service gets the read tier, and every log line and
-metric attributes the request to the service's own identity.
+information across your fleet of databases, a replication control plane that
+needs to know which tables exist and when they changed: these are services
+calling SchemaBot as themselves, with their own identity rather than a
+forwarded user's. Both authenticators support this, and on both the shape is
+the same: the service gets the read tier, and every log line and metric
+attributes the request to the service's own identity.
+
+The read tier is a complete consumer surface. SchemaBot is the system that
+knows what is in your databases, and a service consumer typically builds on
+four endpoints:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/databases` | Every registered database, with type and environments |
+| `POST /api/pull` | A live schema snapshot of one database |
+| `GET /api/history/{database}` | Every apply for a database, with states and timestamps |
+| `GET /api/progress/apply/{apply_id}` | Per-table detail for one apply: the DDL, change type, and timestamps |
+
+The expected call pattern is periodic sync: recurring `pull` calls across the
+databases the service cares about, with `history` and `progress` answering
+what changed and when.
 
 **Service callers are read-only by design.** The read tier already gives a
-service everything it needs to observe the deployment: status, history, locks,
-and `pull`. The write tier stays with identities that carry accountability, a
-GitHub user on the PR workflow or a person behind the CLI, so there is no
-configuration that grants a service the write tier.
+service everything it needs to observe the deployment. The write tier stays
+with identities that carry accountability, a GitHub user on the PR workflow or
+a person behind the CLI, so no configuration grants a service the write tier.
+If a service ever needs to mutate something, that is a design conversation,
+not a config change.
 
 Under `oidc`, a service is just another token holder. It presents a JWT minted
 for SchemaBot's audience, typically through the client-credentials grant, and
@@ -388,14 +405,35 @@ X-Forwarded-Client-Cert: …;URI=spiffe://example.org/ns/service-ingress/sa/gate
 X-Forwarded-Caller-Spiffe-Id: spiffe://example.org/ns/reporting/sa/reporting
 ```
 
+There are no API keys, tokens, or auth headers anywhere in this lane. Identity
+is the service's mesh certificate, end to end:
+
+```
+ service pod                       gateway                       SchemaBot
++---------------------+      +---------------------+      +----------------------+
+| app sends plain     | mTLS | verifies the pod's  | mTLS | trusts the caller    |
+| HTTP to its sidecar |----->| certificate, strips |----->| header only from a   |
+|                     |      | inbound copies of   |      | listed gateway,      |
+| sidecar presents    |      | the caller header,  |      | checks the caller    |
+| the pod's identity  |      | then sets it from   |      | against the          |
+|                     |      | the verified cert   |      | allowlist, grants    |
++---------------------+      +---------------------+      | the read tier        |
+                                                          +----------------------+
+```
+
+Deny is the default at every step, which also makes onboarding concrete: you
+do not have to guess a service's SPIFFE ID. Have the service make one call
+before it is allowlisted; the denial log records the caller identity that
+actually arrived, and that exact string is what you add to
+`read_service_spiffe`.
+
 The lane fails closed like everything else. A gateway list without callers,
 callers without a gateway, or the lane without SPIFFE-anchored proxy trust
 each refuse to start; the pairing rules are in
 [the configuration reference](configuration.md#forward-auth-authenticating-proxy).
 The allowlist is exact, and every denial is logged and counted with its own
 reason (an unlisted caller, a missing forwarded identity, a write attempt), so
-onboarding a new service caller is a config change you can verify from the
-auth-decision metric.
+a new service caller's rollout is verifiable from the auth-decision metric.
 
 ## Per-database operator scoping
 
