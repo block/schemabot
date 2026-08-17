@@ -3616,9 +3616,16 @@ repos:
 func TestPendingDropsConfig(t *testing.T) {
 	boolPtr := func(b bool) *bool { return &b }
 
-	t.Run("enabled by default", func(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
 		cfg := ServerConfig{}
+		assert.False(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
+	})
+
+	t.Run("explicit enable turns on the quarantine and its cleaner together", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(true)}}
 		assert.True(t, cfg.PendingDropsEnabled())
+		assert.True(t, cfg.PendingDropsCleanupEnabled())
 	})
 
 	t.Run("explicit disable", func(t *testing.T) {
@@ -3627,14 +3634,18 @@ func TestPendingDropsConfig(t *testing.T) {
 		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
-	t.Run("cleanup enabled by default", func(t *testing.T) {
-		cfg := ServerConfig{}
-		assert.True(t, cfg.PendingDropsCleanupEnabled())
+	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(true), CleanupEnabled: boolPtr(false)}}
+		assert.True(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
-	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
-		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(false)}}
-		assert.True(t, cfg.PendingDropsEnabled())
+	t.Run("cleanup stays off when only the cleaner is enabled", func(t *testing.T) {
+		// Enabling the cleaner without the quarantine would start a reaper for a
+		// deployment that writes no quarantined tables of its own, which is how
+		// one deployment ends up sweeping another's targets.
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(true)}}
+		assert.False(t, cfg.PendingDropsEnabled())
 		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
@@ -3674,7 +3685,7 @@ func TestPendingDropsConfig(t *testing.T) {
 					},
 				},
 			},
-			PendingDrops: PendingDropsConfig{Retention: "not-a-duration"},
+			PendingDrops: PendingDropsConfig{Enabled: boolPtr(true), Retention: "not-a-duration"},
 		}
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "pending_drops.retention")

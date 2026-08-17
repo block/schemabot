@@ -164,10 +164,12 @@ type ServerConfig struct {
 	RespondToUnscoped *bool `yaml:"respond_to_unscoped"`
 
 	// PendingDrops configures the pending drops quarantine for MySQL/Spirit
-	// databases. When enabled (the default), DROP TABLE statements rename the
-	// table into the _pending_drops database instead of dropping it. The
-	// background cleaner can be run by this process or disabled so another
-	// deployment owns permanent cleanup after the retention period.
+	// databases. When enabled, DROP TABLE statements rename the table into the
+	// _pending_drops database instead of dropping it, and the background cleaner
+	// removes it once the retention period expires. The quarantine is off by
+	// default: enable it only on a deployment whose cleaner can reach its own
+	// targets, because a quarantine no cleaner reaps grows on the target server
+	// forever.
 	PendingDrops PendingDropsConfig `yaml:"pending_drops,omitempty"`
 
 	// Spirit overrides the Spirit engine's default run settings for every
@@ -183,7 +185,8 @@ type ServerConfig struct {
 // databases.
 type PendingDropsConfig struct {
 	// Enabled controls the quarantine.
-	// Defaults to true when not configured (nil = enabled).
+	// Defaults to false when not configured (nil = disabled), so a DROP TABLE
+	// executes as written.
 	Enabled *bool `yaml:"enabled"`
 
 	// CleanupEnabled controls whether this server process starts the background
@@ -214,9 +217,18 @@ func (c SupportChannelConfig) Enabled() bool {
 }
 
 // PendingDropsEnabled reports whether the pending drops quarantine is enabled.
-// Defaults to true when not configured.
+// Defaults to false when not configured.
+//
+// Quarantine and reaping are one feature, and a deployment gets both or
+// neither. Defaulting the quarantine on made every deployment rename dropped
+// tables into a schema on the target server, while reaping them required a
+// cleaner reaching that same server, so a deployment that quarantined but could
+// not reap accumulated tables on its targets with nothing scheduled to remove
+// them. Off by default keeps the two halves from being enabled independently:
+// turning the quarantine on is a deliberate statement that this deployment
+// reaps its own targets.
 func (c *ServerConfig) PendingDropsEnabled() bool {
-	return c.PendingDrops.Enabled == nil || *c.PendingDrops.Enabled
+	return c.PendingDrops.Enabled != nil && *c.PendingDrops.Enabled
 }
 
 // PendingDropsCleanupEnabled reports whether this process should run the
