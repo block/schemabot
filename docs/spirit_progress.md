@@ -9,7 +9,7 @@
 - [Spirit runner lifecycle](#spirit-runner-lifecycle)
 - [Engine layer](#engine-layer)
 - [How Spirit phases surface as task states](#how-spirit-phases-surface-as-task-states)
-- [Tern layer — drive writes, readers read stored](#tern-layer-drive-writes-readers-read-stored)
+- [Tern layer — drive writes, readers read stored](#tern-layer--drive-writes-readers-read-stored)
 - [What gets persisted in storage](#what-gets-persisted-in-storage)
 - [Polling modes (atomic vs sequential)](#polling-modes-atomic-vs-sequential)
   - [Atomic mode (`--defer-cutover`)](#atomic-mode---defer-cutover)

@@ -6,7 +6,7 @@
 
 - [Declarative Schema](#declarative-schema)
 - [Layers](#layers)
-- [User Layer (CLI / PR Comments / API)](#user-layer-cli-pr-comments-api)
+- [User Layer (CLI / PR Comments / API)](#user-layer-cli--pr-comments--api)
   - [Status Checks and Branch Protection](#status-checks-and-branch-protection)
   - [Apply Options](#apply-options)
   - [Unsafe Changes](#unsafe-changes)
