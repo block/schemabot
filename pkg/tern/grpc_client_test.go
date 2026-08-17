@@ -7076,10 +7076,13 @@ func TestRemoteApplyIdempotencyKey(t *testing.T) {
 }
 
 // TestRemoteApplyIdempotencyKey_GenerationRotation verifies that a
-// deployment-scoped key rotates on the shared apply.Attempt — a retried
-// generation dispatches fresh — and is insensitive to the individual
-// operation's attempt, so every sibling of one generation keeps sharing one
-// key regardless of per-operation retry counters.
+// deployment-scoped key rotates only on the operation's own dispatch
+// generation. The shared apply.Attempt advances when any sibling operation of
+// any deployment is redispatched, so a key derived from it would rotate under
+// an unrelated deployment's orphaned dispatch and duplicate its remote apply;
+// the deployment key must ignore it. The operation's own attempt advances only
+// on that operation's deliberate retry, which is exactly when the retried work
+// must dispatch fresh.
 func TestRemoteApplyIdempotencyKey_GenerationRotation(t *testing.T) {
 	opScope := func(parentAttempt, opAttempt int) (*storage.Apply, applyTaskScope) {
 		return &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: parentAttempt},
@@ -7093,17 +7096,26 @@ func TestRemoteApplyIdempotencyKey_GenerationRotation(t *testing.T) {
 	apply0, scope0 := opScope(0, 0)
 	base := remoteApplyIdempotencyKey(apply0, scope0)
 
-	// The operation's own attempt is not part of the key: siblings share one
-	// key per generation whatever their individual retry counters read.
-	applySame, scopeSame := opScope(0, 3)
-	assert.Equal(t, base, remoteApplyIdempotencyKey(applySame, scopeSame),
-		"the operation's own attempt must not rotate the deployment key")
+	// A sibling deployment's retry advances the shared parent attempt while
+	// this deployment's dispatch is still orphaned mid-flight. Its key must not
+	// move, so the re-drive reuses the original dispatch instead of starting a
+	// duplicate remote apply.
+	applySiblingRetried, scopeOrphaned := opScope(3, 0)
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applySiblingRetried, scopeOrphaned),
+		"the shared apply attempt must not rotate an orphaned deployment's key")
 
-	// The generation retrying (parent attempt advancing) rotates the key so the
-	// retried work dispatches a fresh remote apply.
-	applyRetried, scopeRetried := opScope(1, 0)
+	// The operation's own deliberate retry rotates the key so the retried work
+	// dispatches a fresh remote apply.
+	applyRetried, scopeRetried := opScope(1, 1)
 	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		"an advanced apply attempt must rotate the deployment key")
+		"an operation's own advanced attempt must rotate the deployment key")
+
+	// Siblings redispatched to the same generation regroup on one fresh key.
+	_, scopeSiblingRetried := opScope(1, 1)
+	scopeSiblingRetried.operation.OperationKey = "commerce/80-/users"
+	assert.Equal(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+		remoteApplyIdempotencyKey(applyRetried, scopeSiblingRetried),
+		"siblings retried to the same generation must share the rotated key")
 }
 
 // A deployment-keyed dispatch shares one remote apply across sibling
@@ -7210,6 +7222,77 @@ func TestGRPCClient_ResumeApplyOperationFailsClosedOnMissingOperationKeyEcho(t *
 	require.NotNil(t, server.getApplyRequest(), "the dispatch itself must have been sent")
 	assert.Empty(t, apply.ExternalID, "the unverified response's remote apply id must not be persisted on the parent")
 	assert.Empty(t, operation.ExternalID, "the unverified response's remote apply id must not be persisted on the operation")
+
+	// The mismatch is non-retryable: a data plane that cannot address the
+	// operation would answer every redispatch the same way, so the failure must
+	// land terminally for an operator instead of retrying forever.
+	assert.Equal(t, state.Apply.Failed, apply.State, "the echo mismatch must terminalize the apply, not leave it retryable")
+	assert.Equal(t, state.Task.Failed, task.State, "the echo mismatch must terminalize the task, not leave it retryable")
+	require.NotNil(t, task.CompletedAt, "a terminally failed task records its completion time")
+	assert.Contains(t, task.ErrorMessage, "echoed operation key")
+}
+
+// A VSchema-only dispatch derives a finalizer operation key from its namespace,
+// so it carries the same fail-closed echo contract as shard work: a data plane
+// that answers without echoing that key has not addressed this operation, and
+// the dispatch must refuse the response's remote ids and land terminally failed
+// for an operator instead of polling another operation's remote apply.
+func TestGRPCClient_VSchemaOnlyDispatchFailsClosedOnMissingOperationKeyEcho(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID:    "remote-finalizer-no-echo",
+		omitOperationKey: true,
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              8,
+		ApplyIdentifier: "apply-finalizer-no-echo",
+		PlanID:          99,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeStrata,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	operationID := int64(51)
+	operation := &storage.ApplyOperation{
+		ID:            operationID,
+		ApplyID:       apply.ID,
+		Deployment:    "commerce-deployment",
+		OperationKey:  "commerce/group_finalizer",
+		OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		State:         state.ApplyOperation.Pending,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{getByApplyIDErr: errors.New("finalizer drive must not load tasks")},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-finalizer-no-echo",
+			SchemaFiles: schema.SchemaFiles{
+				"commerce": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+			},
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+			},
+		}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: operation,
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	err := client.ResumeApplyOperation(ctx, apply, operationID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "echoed operation key")
+
+	require.NotNil(t, server.getApplyRequest(), "the VSchema dispatch itself must have been sent")
+	assert.Empty(t, apply.ExternalID, "the unverified response's remote apply id must not be persisted on the parent")
+	assert.Empty(t, operation.ExternalID, "the unverified response's remote apply id must not be persisted on the operation")
+	assert.Equal(t, state.Apply.Failed, apply.State, "the echo mismatch must terminalize the apply, not leave it retryable")
+	assert.Contains(t, apply.ErrorMessage, "echoed operation key")
 }
 
 // A task-less operation has no task rows, so the operator's task-derived

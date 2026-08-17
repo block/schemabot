@@ -42,6 +42,68 @@ type webhookPayload struct {
 	} `json:"installation"`
 }
 
+type issueCommentGateBlockReason string
+
+const (
+	issueCommentGatePass                issueCommentGateBlockReason = ""
+	issueCommentGateInvalidTenant       issueCommentGateBlockReason = "invalid tenant flag"
+	issueCommentGateTenantNotOwned      issueCommentGateBlockReason = "tenant handled by another deployment"
+	issueCommentGateTenantRequired      issueCommentGateBlockReason = "tenant target required"
+	issueCommentGateInvalidEnvironment  issueCommentGateBlockReason = "invalid environment value"
+	issueCommentGateMissingEnvironment  issueCommentGateBlockReason = "missing environment flag"
+	issueCommentGateEnvironmentNotOwned issueCommentGateBlockReason = "environment handled by another instance"
+	issueCommentGateMissingApplyID      issueCommentGateBlockReason = "missing apply ID"
+	issueCommentGateCommandNotFound     issueCommentGateBlockReason = "command not found"
+	issueCommentGateAutoConfirm         issueCommentGateBlockReason = "auto-confirm flag unsupported for command"
+	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
+	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
+)
+
+// issueCommentGateBlock evaluates the routing and usage gates shared by the
+// request path and durable driver in request-path order.
+func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parser *CommandParser, commentBody string) issueCommentGateBlockReason {
+	if result.TenantError {
+		return issueCommentGateInvalidTenant
+	}
+	if h.service != nil {
+		cfg := h.service.Config()
+		if result.Tenant != "" && !cfg.ShouldRespondToTenant(result.Tenant) {
+			return issueCommentGateTenantNotOwned
+		}
+		if result.Tenant == "" && cfg.Tenant != "" && commandRequiresTenantTarget(result) {
+			fansOut := h.fansOutUnscopedCommand(repo) && unscopedCommandFansOut(result)
+			if !fansOut {
+				return issueCommentGateTenantRequired
+			}
+		}
+	}
+	if result.EnvironmentError {
+		return issueCommentGateInvalidEnvironment
+	}
+	if result.MissingEnv {
+		return issueCommentGateMissingEnvironment
+	}
+	if result.Found && result.Environment != "" && h.service != nil && !h.service.Config().IsEnvironmentAllowed(result.Environment) {
+		return issueCommentGateEnvironmentNotOwned
+	}
+	if result.Found && result.Action == action.Rollback && result.ApplyID == "" {
+		return issueCommentGateMissingApplyID
+	}
+	if !result.Found {
+		return issueCommentGateCommandNotFound
+	}
+	if result.Action != action.Apply && parser.HasAutoConfirmFlag(commentBody) {
+		return issueCommentGateAutoConfirm
+	}
+	if result.Action == action.Rollback && parser.HasDeferCutoverFlag(commentBody) {
+		return issueCommentGateDeferCutover
+	}
+	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(commentBody) {
+		return issueCommentGateDatabase
+	}
+	return issueCommentGatePass
+}
+
 // handleIssueComment processes GitHub issue comment webhooks.
 func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w http.ResponseWriter, body []byte, deliveryID string) {
 	var payload webhookPayload
@@ -132,7 +194,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	if result.TenantError {
+	// The ladder evaluates in request-path order, so the first-tripped reason
+	// cached here is the one each branch below would have observed.
+	gateReason := h.issueCommentGateBlock(repo, result, parser, payload.Comment.Body)
+
+	if gateReason == issueCommentGateInvalidTenant {
 		h.logger.Info("ignoring command with invalid tenant flag",
 			"repo", repo, "pr", pr, "action", result.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -143,7 +209,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	// When a command names a tenant, only the matching isolated deployment should
 	// react or post comments. This mirrors allowed_environments routing for -e.
-	if result.Tenant != "" && h.service != nil && !h.service.Config().ShouldRespondToTenant(result.Tenant) {
+	if gateReason == issueCommentGateTenantNotOwned {
 		h.logger.Info("ignoring command for non-owned tenant",
 			"repo", repo, "pr", pr, "tenant", result.Tenant, "action", result.Action)
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -151,23 +217,22 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		return
 	}
+	if gateReason == issueCommentGateTenantRequired {
+		h.logger.Info("ignoring work command without tenant target",
+			"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
+		h.writeJSON(w, http.StatusOK, map[string]string{
+			"message": "tenant target required",
+		})
+		return
+	}
 	if result.Tenant == "" && commandRequiresTenantTarget(result) && h.service != nil && h.service.Config().Tenant != "" {
-		if h.fansOutUnscopedCommand(repo) && unscopedCommandFansOut(result) {
-			h.logger.Info("aggregate participant fanning out unscoped work command; acting on work it owns",
-				"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
-			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
-				Operation:  "aggregate_participant_fanout",
-				Repository: repo,
-				Status:     "success",
-			})
-		} else {
-			h.logger.Info("ignoring work command without tenant target",
-				"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
-			h.writeJSON(w, http.StatusOK, map[string]string{
-				"message": "tenant target required",
-			})
-			return
-		}
+		h.logger.Info("aggregate participant fanning out unscoped work command; acting on work it owns",
+			"repo", repo, "pr", pr, "tenant", h.service.Config().Tenant, "action", result.Action)
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:  "aggregate_participant_fanout",
+			Repository: repo,
+			Status:     "success",
+		})
 	}
 
 	// Handle help command
@@ -187,7 +252,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// allowed_environments, so no instance would act on it. On an aggregate
 	// repo participants defer the reply to the leader, which posts it exactly
 	// once; otherwise the respond_to_unscoped policy picks one responder.
-	if result.EnvironmentError {
+	if gateReason == issueCommentGateInvalidEnvironment {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping malformed environment reply for unscoped fan-out; the leader posts it once",
 				"repo", repo, "pr", pr, "action", result.Action)
@@ -213,7 +278,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// for every other command a missing -e is a usage error, answered by
 	// exactly one deployment: participants defer to the leader on an aggregate
 	// repo, and the respond_to_unscoped policy picks one responder otherwise.
-	if result.MissingEnv {
+	if gateReason == issueCommentGateMissingEnvironment {
 		if result.Action == action.Plan {
 			// Plan without -e: run for all configured environments. The same
 			// acknowledgment split as scoped commands applies: repos without an
@@ -270,7 +335,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// except on an aggregate repo, where a participant's configuration covers
 	// only its own slice of the fleet's environments and a sibling deployment
 	// may serve the value, so participants defer silently instead.
-	if result.Found && result.Environment != "" && h.service != nil && !h.service.Config().IsEnvironmentAllowed(result.Environment) {
+	if gateReason == issueCommentGateEnvironmentNotOwned {
 		if !h.service.Config().IsEnvironmentKnown(result.Environment) {
 			if h.silentUnknownEnvOnAggregateFanOut(repo) {
 				h.logger.Info("deferring unknown environment on aggregate participant; a sibling deployment may serve it",
@@ -300,7 +365,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	if result.Found && result.Action == action.Rollback && result.ApplyID == "" {
+	if gateReason == issueCommentGateMissingApplyID {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping rollback missing-apply-id reply for unscoped fan-out; the leader posts it once",
 				"repo", repo, "pr", pr)
@@ -313,7 +378,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 
 	// Handle invalid command (schemabot mentioned but command not recognized)
-	if !result.Found {
+	if gateReason == issueCommentGateCommandNotFound {
 		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
 			h.logger.Debug("skipping invalid command response (respond_to_unscoped is false)", "repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
@@ -325,7 +390,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	}
 
 	// Reject -y/--yes on commands that don't support it
-	if result.Action != action.Apply && parser.HasAutoConfirmFlag(payload.Comment.Body) {
+	if gateReason == issueCommentGateAutoConfirm {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping unsupported auto-confirm flag reply for unscoped fan-out; the leader posts it once",
 				"repo", repo, "pr", pr, "action", result.Action)
@@ -336,7 +401,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
 	}
-	if result.Action == action.Rollback && parser.HasDeferCutoverFlag(payload.Comment.Body) {
+	if gateReason == issueCommentGateDeferCutover {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping misplaced defer-cutover flag reply for unscoped fan-out; the leader posts it once",
 				"repo", repo, "pr", pr)
@@ -349,7 +414,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(payload.Comment.Body) {
+	if gateReason == issueCommentGateDatabase {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping unsupported database flag reply for unscoped fan-out; the leader posts it once",
 				"repo", repo, "pr", pr, "action", result.Action)
@@ -358,6 +423,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedDatabaseFlag(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
+	// The branches above match the shared ladder's reasons one-for-one. A
+	// reason none of them recognized means a gate was added to the ladder
+	// without a request-path branch — the ladder said to block, so block:
+	// dispatching here would run a command the ladder rejected.
+	if gateReason != issueCommentGatePass {
+		h.logger.Error("blocking command because its gate reason has no request-path branch",
+			"repo", repo, "pr", pr, "action", result.Action, "reason", gateReason)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "command blocked"})
 		return
 	}
 
@@ -904,7 +980,14 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 		metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_not_ready")
 		return false, nil
 	}
-	if reason := h.durableIssueCommentRoutingBlock(repo, result, parser, payload.Comment.Body); reason != "" {
+	if reason := h.issueCommentGateBlock(repo, result, parser, payload.Comment.Body); reason != issueCommentGatePass {
+		if reason == issueCommentGateInvalidTenant ||
+			reason == issueCommentGateInvalidEnvironment || reason == issueCommentGateMissingEnvironment {
+			h.logger.Warn("durable issue_comment delivery completed without dispatch because its command is malformed",
+				"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action, "reason", reason)
+			metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_not_ready")
+			return false, nil
+		}
 		h.logger.Warn("durable issue_comment delivery completed without dispatch because the request path would not have dispatched it",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action, "reason", reason)
 		metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_routing_blocked")
@@ -980,52 +1063,15 @@ func durableIssueCommentCommand(event *storage.WebhookEvent) (CommandResult, str
 	return result, payload.Repository.FullName, payload.Issue.Number, installationID, requestedBy, nil
 }
 
-// durableIssueCommentCommandReady reports whether a re-parsed comment carries
-// a well-formed command the driver dispatches durably. The request path
-// answers usage errors (missing or malformed flags) synchronously and never
-// enqueues them, so a claimed row failing these checks is a replayed or
-// hand-crafted delivery, not a user waiting on an answer.
+// durableIssueCommentCommandReady reports whether the driver implements the
+// re-parsed command. Routing and usage validity are evaluated by the shared
+// gate predicate after this command-set check, so a command outside the
+// durable set classifies as not-ready even when it also trips a gate.
 func durableIssueCommentCommandReady(result CommandResult) bool {
-	if !result.Found || result.TenantError || result.EnvironmentError || result.MissingEnv {
-		return false
-	}
 	switch result.Action {
 	case action.Apply, action.ApplyConfirm, action.Unlock:
 		return true
 	default:
 		return false
 	}
-}
-
-// durableIssueCommentRoutingBlock re-runs the request-path routing and usage
-// gates that precede the durable enqueue, returning a non-empty reason when
-// any of them would have kept the delivery out of the inbox. The request path
-// answers usage errors synchronously and routes tenant- or environment-owned
-// commands to the deployment that owns them, so a claimed row tripping one of
-// these gates is a replayed or hand-crafted delivery — or one enqueued before
-// a configuration change moved the ownership — and must complete as a no-op
-// rather than run work this deployment does not route.
-func (h *Handler) durableIssueCommentRoutingBlock(repo string, result CommandResult, parser *CommandParser, commentBody string) string {
-	if h.service != nil {
-		cfg := h.service.Config()
-		if result.Tenant != "" && !cfg.ShouldRespondToTenant(result.Tenant) {
-			return "tenant handled by another deployment"
-		}
-		if result.Tenant == "" && cfg.Tenant != "" && commandRequiresTenantTarget(result) {
-			fansOut := h.fansOutUnscopedCommand(repo) && unscopedCommandFansOut(result)
-			if !fansOut {
-				return "tenant target required"
-			}
-		}
-		if result.Environment != "" && !cfg.IsEnvironmentAllowed(result.Environment) {
-			return "environment handled by another instance"
-		}
-	}
-	if result.Action != action.Apply && parser.HasAutoConfirmFlag(commentBody) {
-		return "auto-confirm flag unsupported for command"
-	}
-	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(commentBody) {
-		return "database flag unsupported for command"
-	}
-	return ""
 }
