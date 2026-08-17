@@ -611,9 +611,13 @@ func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
 	tests := []struct {
 		name       string
 		instantDDL bool
+		column     string
 	}{
-		{name: "deployed instantly", instantDDL: true},
-		{name: "eligible but deployed with a row copy", instantDDL: false},
+		// Each subtest deploys to the shared main branch, so each adds its
+		// own column — an earlier subtest's completed deploy is visible to
+		// the branches later subtests create.
+		{name: "deployed instantly", instantDDL: true, column: "instant_report_col_instant"},
+		{name: "eligible but deployed with a row copy", instantDDL: false, column: "instant_report_col_copy"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -622,13 +626,19 @@ func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
 
 			branchName := createBranch(t, ctx, "instant-report")
 			applyBranchSchemaHTTP(t, ctx, branchName, map[string][]string{
-				"testapp_sharded": {"ALTER TABLE users ADD COLUMN instant_report_col VARCHAR(50) NULL"},
+				"testapp_sharded": {fmt.Sprintf("ALTER TABLE users ADD COLUMN %s VARCHAR(50) NULL", tt.column)},
 			})
 
 			dr := createDeploy(t, ctx, branchName, true)
 			require.Equal(t, drState.Ready, dr.DeploymentState)
 			require.NotNil(t, dr.Deployment)
 			require.True(t, dr.Deployment.InstantDDLEligible, "ADD COLUMN NULL should be instant-eligible")
+			// Leak safety for the failure path only: a subtest that fails before
+			// it settles would otherwise leave this deploy active, and only one
+			// deploy can be active per database, so the next subtest could not
+			// create its own and would fail for a reason that hides the first
+			// failure. On the passing path the deploy is already complete and
+			// this cancel is refused — hence the discarded result.
 			t.Cleanup(func() {
 				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
 				defer cancel()
@@ -658,6 +668,10 @@ func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
 				"deploy request should report whether it was deployed instantly")
 			assert.True(t, read.Deployment.InstantDDLEligible,
 				"eligibility should stay reported independently of how the deploy ran")
+
+			// Only one deploy can be active per database — settle this deploy
+			// request so it cannot block the next subtest's deploy.
+			settleDeploy(t, ctx, dr.Number)
 		})
 	}
 }
@@ -946,14 +960,7 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	require.Equal(t, drState.Ready, dr.DeploymentState)
 
 	deploy(t, ctx, dr.Number, false)
-	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert, drState.Complete)
-	if dr.DeploymentState == drState.CompletePendingRevert {
-		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: dr.Number,
-		})
-		require.NoError(t, err, "SkipRevert")
-		waitForDeployState(t, ctx, dr.Number, drState.Complete)
-	}
+	settleDeploy(t, ctx, dr.Number)
 
 	// Refresh schema for reuse
 	err := testClient.RefreshSchema(ctx, testOrg, testDB, branchName)
@@ -968,14 +975,7 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	require.Equal(t, drState.Ready, dr2.DeploymentState)
 
 	deploy(t, ctx, dr2.Number, false)
-	dr2 = waitForDeployState(t, ctx, dr2.Number, drState.CompletePendingRevert, drState.Complete)
-	if dr2.DeploymentState == drState.CompletePendingRevert {
-		_, err = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: dr2.Number,
-		})
-		require.NoError(t, err, "SkipRevert")
-		waitForDeployState(t, ctx, dr2.Number, drState.Complete)
-	}
+	settleDeploy(t, ctx, dr2.Number)
 
 	// Verify both columns exist on main
 	verifyColumnExists(t, "users", "reuse_col_1")

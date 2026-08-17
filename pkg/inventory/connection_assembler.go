@@ -107,6 +107,11 @@ func hostWithDefaultPort(host, defaultPort string) string {
 const (
 	// MetadataOrganization is the PlanetScale organization that owns the database.
 	MetadataOrganization = "organization"
+	// MetadataDatabase is the PlanetScale database name. It can differ from the
+	// SchemaBot database identifier the target was requested under: the
+	// identifier is a routing and display key, while this name is what every
+	// PlanetScale API call must address.
+	MetadataDatabase = "database"
 	// MetadataTokenName is the PlanetScale service token id.
 	MetadataTokenName = "token_name"
 	// MetadataTokenValue is the PlanetScale service token secret.
@@ -120,11 +125,16 @@ const (
 // tests).
 const DefaultPlanetScaleAPIURL = "https://api.planetscale.com"
 
+// DefaultDatabaseAttribute is the endpoint attribute the Vitess assembler reads
+// the PlanetScale database name from when none is configured.
+const DefaultDatabaseAttribute = "name"
+
 // VitessConnectionAssembler assembles a Target for Vitess via PlanetScale.
-// Vitess applies DDL through the PlanetScale API (organization + service token,
-// carried in Metadata), so those fields are always populated: the organization
-// comes from the resolved endpoint's attributes, the service token from
-// credentials, and the API URL from deployment configuration.
+// Vitess applies DDL through the PlanetScale API (organization + database name
+// + service token, carried in Metadata), so those fields are always populated:
+// the organization and database name come from the resolved endpoint's
+// attributes, the service token from credentials, and the API URL from
+// deployment configuration.
 //
 // When the resolved endpoint also exposes a vtgate host and the credentials carry
 // a MySQL username, the assembler additionally returns a namespace-free vtgate
@@ -135,6 +145,11 @@ type VitessConnectionAssembler struct {
 	// OrganizationAttribute is the endpoint attribute holding the PlanetScale
 	// organization. Defaults to "organization" when empty.
 	OrganizationAttribute string
+	// DatabaseAttribute is the endpoint attribute holding the PlanetScale
+	// database name. Defaults to "name" when empty. The resolved name rides in
+	// Metadata so the SchemaBot database identifier stays an arbitrary routing
+	// key while PlanetScale API calls address the database by its own name.
+	DatabaseAttribute string
 	// APIURL is the PlanetScale-compatible API base URL. A per-target override in
 	// the credential secret (api_url) takes precedence; this is the deployment
 	// default, itself falling back to DefaultPlanetScaleAPIURL when empty.
@@ -156,7 +171,7 @@ var _ ConnectionAssembler = VitessConnectionAssembler{}
 func (VitessConnectionAssembler) DatabaseType() string { return "vitess" }
 
 // Assemble builds a Vitess Target. The PlanetScale API fields (organization,
-// service token, API URL) always populate Metadata. When a vtgate host and a
+// database name, service token, API URL) always populate Metadata. When a vtgate host and a
 // MySQL username are available, a namespace-free vtgate DSN is also returned for
 // SHOW VITESS_MIGRATIONS progress; otherwise the DSN is empty (progress falls
 // back to the deploy-request state).
@@ -171,6 +186,14 @@ func (a VitessConnectionAssembler) Assemble(host string, attrs map[string]string
 	organization := attrs[orgAttr]
 	if organization == "" {
 		return "", nil, fmt.Errorf("vitess connection requires the %q endpoint attribute", orgAttr)
+	}
+	dbAttr := a.DatabaseAttribute
+	if dbAttr == "" {
+		dbAttr = DefaultDatabaseAttribute
+	}
+	database := attrs[dbAttr]
+	if database == "" {
+		return "", nil, fmt.Errorf("vitess connection requires the %q endpoint attribute", dbAttr)
 	}
 	tokenName := creds.Metadata[MetadataTokenName]
 	tokenValue := creds.Metadata[MetadataTokenValue]
@@ -194,6 +217,7 @@ func (a VitessConnectionAssembler) Assemble(host string, attrs map[string]string
 		metadata = make(map[string]string, 4)
 	}
 	metadata[MetadataOrganization] = organization
+	metadata[MetadataDatabase] = database
 	metadata[MetadataTokenName] = tokenName
 	metadata[MetadataTokenValue] = tokenValue
 	metadata[MetadataAPIURL] = apiURL

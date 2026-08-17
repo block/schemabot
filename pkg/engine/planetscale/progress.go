@@ -25,6 +25,10 @@ import (
 // Progress polls deploy request status from PlanetScale's API and optionally queries
 // SHOW VITESS_MIGRATIONS for per-table, per-shard row counts and ETA.
 func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
 		return &engine.ProgressResult{
 			State:   engine.StatePending,
