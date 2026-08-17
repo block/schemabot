@@ -1606,6 +1606,17 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	}
 	currentRemoteID := current.RemoteApplyID()
 	if currentRemoteID != "" && currentRemoteID != remoteID {
+		// The same fail-closed class the deployment guard below counts: storing
+		// this id would correlate the operation — and so its deployment — to a
+		// second remote apply.
+		c.applyLogger(apply).ErrorContext(ctx, "dispatch returned a remote apply id that disagrees with the one this operation already recorded; refusing to overwrite it",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", current.Deployment,
+				"operation_key", current.OperationKey,
+				"recorded_remote_apply_id", currentRemoteID,
+				"refused_remote_apply_id", remoteID)...)
+		metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
 		return fmt.Errorf("apply_operation %d already has remote apply id %q; refusing to overwrite with %q", op.ID, currentRemoteID, remoteID)
 	}
 	if err := c.guardDeploymentRemoteApplyID(ctx, apply, current, remoteID); err != nil {
