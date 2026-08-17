@@ -106,9 +106,10 @@ func permanentDDLRejection(err error) (uint16, bool) {
 // every attempt is the transient failure the retries exist for, and both
 // arrive with the differences discarded. The coarse read costs a transiently
 // errored checksum its retries and the operator a re-apply; the alternative
-// costs a rejected unique index its whole budget, one full table copy per
-// attempt. Narrow this to the differences case once the run failure carries
-// which one it was.
+// costs a rejected unique index its whole budget, and each attempt re-verifies
+// the table in full, because a checksum that found differences is not allowed
+// to persist a watermark to resume from. Narrow this to the differences case
+// once the run failure carries which one it was.
 func checksumRejectedUniqueIndex(runner *spiritmigration.Runner, parsed []*statement.AbstractStatement) bool {
 	if runner.Progress().CurrentState != status.Checksum {
 		return false
