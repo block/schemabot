@@ -1683,3 +1683,69 @@ type WebhookEvent struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
+
+// PendingDropState is the lifecycle state of a pending-drops ledger row.
+type PendingDropState string
+
+const (
+	// PendingDropQuarantined means the table is expected to be sitting in the
+	// engine's quarantine schema, recoverable until retention expires.
+	PendingDropQuarantined PendingDropState = "quarantined"
+	// PendingDropReaped means a sweep permanently removed the quarantined table.
+	PendingDropReaped PendingDropState = "reaped"
+	// PendingDropVanished means a sweep reached the target and found no such
+	// table. The usual cause is a crash between recording the row and performing
+	// the move, so the row describes a table that was never created; an operator
+	// recovering the table by hand produces the same result.
+	PendingDropVanished PendingDropState = "vanished"
+)
+
+// PendingDrop is one row of the pending-drops quarantine ledger: a table this
+// deployment moved into an engine's quarantine schema, or one it adopted after
+// finding it there unrecorded.
+//
+// Target and Environment together are the sweep key, the pair the deployment
+// re-resolves to an endpoint on every cleanup pass. DatabaseName and
+// OriginalTable are provenance, and both are recorded because neither survives
+// the move: the quarantined name discards the origin schema entirely and
+// truncates the source table name to fit the server's identifier limit, so
+// origin exists only at quarantine time.
+type PendingDrop struct {
+	ID          int64
+	Target      string
+	Environment string
+
+	// DatabaseName is the origin database. It is empty on adopted rows, where
+	// the quarantined name carries no origin and attributing one would be a
+	// guess.
+	DatabaseName string
+	// OriginalTable is the full source table name before truncation. It is empty
+	// on adopted rows for the same reason as DatabaseName.
+	OriginalTable string
+
+	// QuarantinedName is the table's name inside the engine's quarantine schema.
+	QuarantinedName string
+	QuarantinedAt   time.Time
+
+	// RunID is the durable run identifier of the apply that performed the
+	// quarantine, and is what makes the row usable as proof that an interrupted
+	// DROP phase already executed. It is empty on adopted rows.
+	RunID string
+
+	// Engine is the engine that wrote the row. Quarantine is a per-engine
+	// behavior, so the reaper dispatches its sweep on this value.
+	Engine string
+
+	State PendingDropState
+
+	// ArrivalTarget records which target a sweep was visiting when it adopted an
+	// unrecorded table, so unattributed rows still say where they were found.
+	ArrivalTarget string
+
+	// Metadata holds engine-specific data as JSON, keeping engine semantics out
+	// of the shared row.
+	Metadata []byte
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}

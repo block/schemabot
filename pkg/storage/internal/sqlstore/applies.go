@@ -175,6 +175,14 @@ func placeholders(count int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
 
+func int64Args(values []int64) []any {
+	args := make([]any, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
+}
+
 func stringArgs(values []string) []any {
 	args := make([]any, len(values))
 	for i, value := range values {
