@@ -44,9 +44,9 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 // the core classifies retryable: the gate still fails closed for this
 // delivery, but the outcome is not the command's answer.
 //
-// A posted PR comment does not imply a terminal disposition: retryable sites
-// post best-effort error comments too, so a durable driver re-driving one may
-// post the same comment again.
+// Retryable failures post their best-effort error comment synchronously.
+// Durable attempts stay silent because the driver will retry and post the
+// single terminal answer if the retry budget is exhausted.
 //
 // The parent context scopes the command beyond its own timeout: the
 // synchronous wrapper passes context.Background(), while the durable driver
@@ -64,7 +64,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+		}
 		return true, fmt.Errorf("apply command managed-schema check %s#%d: %w", repo, pr, err)
 	} else if handled {
 		return false, nil
@@ -80,13 +82,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			return false, nil
 		}
-		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err) {
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
 			return false, nil
 		}
 		return true, fmt.Errorf("apply command schema request %s#%d: %w", repo, pr, err)
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
-		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err) {
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
 			return false, nil
 		}
 		return true, fmt.Errorf("apply command attach server environments %s#%d: %w", repo, pr, err)
@@ -95,13 +97,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	}
 
-	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy); gateErr != nil {
+	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command open-PR gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
 	}
 
-	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply); gateErr != nil {
+	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.Apply, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command actor authorization gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
@@ -111,12 +113,14 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// is authorized to run apply for this database.
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		}
 		return true, fmt.Errorf("apply command reconcile stale checks %s#%d: %w", repo, pr, err)
 	}
 
 	// Tier 1: review gate (server-owned review policy for this database)
-	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply); gateErr != nil {
+	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command review gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
@@ -127,10 +131,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for checks gate", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
+		}
 		return true, fmt.Errorf("apply command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
-	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); gateErr != nil {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
@@ -141,7 +147,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
-	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID); gateErr != nil {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command prior environment gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -152,7 +158,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
 		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to check lock status: "+err.Error())
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to check lock status: "+err.Error())
+		}
 		return true, fmt.Errorf("apply command check lock %s#%d: %w", repo, pr, err)
 	}
 
@@ -217,8 +225,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if prErr != nil {
 		h.logger.Error("failed to fetch PR for stale-schema check",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", prErr)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-			"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				"SchemaBot could not verify the current PR state. The apply was rejected; retry the command.")
+		}
 		return true, fmt.Errorf("apply command fetch PR for stale-schema check %s#%d: %w", repo, pr, prErr)
 	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
@@ -247,10 +257,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
 		if isTransientRemotePlanError(err) {
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
+			}
 			return true, fmt.Errorf("apply command plan %s#%d: %w", repo, pr, err)
 		}
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, err.Error())
 		// Failures other than remote-deployment unavailability are treated
 		// as deterministic: the posted error is the command's answer. Some
 		// of them are not truly deterministic (planning runs against a live
@@ -320,7 +333,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Failed to acquire lock: "+err.Error())
+		}
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
 
@@ -349,7 +364,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// failure releases the same way — the retryable re-drive (or a user retry)
 	// re-plans from the top and reacquires the lock, so leaving it pinned
 	// would only force the stale-lock release path on the next attempt.
-	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment); gateErr != nil {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate read failure")
 		return true, fmt.Errorf("apply command fresh-HEAD checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
@@ -441,9 +456,9 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 // lock pinned, so a re-drive (or user retry) can still confirm the reviewed
 // plan.
 //
-// A posted PR comment does not imply a terminal disposition: retryable sites
-// post best-effort error comments too, so a durable driver re-driving one may
-// post the same comment again.
+// Retryable failures post their best-effort error comment synchronously.
+// Durable attempts stay silent because the driver will retry and post the
+// single terminal answer if the retry budget is exhausted.
 //
 // The parent context scopes the command beyond its own timeout: the
 // synchronous wrapper passes context.Background(), while the durable driver
@@ -461,7 +476,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, err.Error())
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, err.Error())
+		}
 		return true, fmt.Errorf("apply-confirm command managed-schema check %s#%d: %w", repo, pr, err)
 	} else if handled {
 		return false, nil
@@ -475,32 +492,32 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 				"repo", repo, "pr", pr, "environment", environment, "error", err)
 			return false, nil
 		}
-		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err) {
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {
 			return false, nil
 		}
 		return true, fmt.Errorf("apply-confirm command schema request %s#%d: %w", repo, pr, err)
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
-		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err) {
+		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {
 			return false, nil
 		}
 		return true, fmt.Errorf("apply-confirm command attach server environments %s#%d: %w", repo, pr, err)
 	}
 
-	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy); gateErr != nil {
+	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command open-PR gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
 	}
 
-	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm); gateErr != nil {
+	if blocked, gateErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, schemaResult.Database, schemaResult.Type, environment, action.ApplyConfirm, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command actor authorization gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
 	}
 
 	// Tier 1: review gate (re-check on confirm to prevent bypass)
-	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm); gateErr != nil {
+	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command review gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply-confirm blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
@@ -517,11 +534,13 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	confirmPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR for checks gate", "repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to fetch PR info. Retry, and see server logs if it persists.")
+		}
 		return true, fmt.Errorf("apply-confirm command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
 
-	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment); gateErr != nil {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
@@ -535,7 +554,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
 		h.logger.Error("failed to check lock", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to check lock status: "+err.Error())
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to check lock status: "+err.Error())
+		}
 		return true, fmt.Errorf("apply-confirm command check lock %s#%d: %w", repo, pr, err)
 	}
 	if existingLock == nil {
@@ -626,7 +647,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		h.logger.Error("failed to load confirmation plan for cross-delivery freshness check",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"pending_plan_id", existingLock.PendingPlanID, "error", planLoadErr)
-		h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to load confirmation plan: "+planLoadErr.Error())
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, "Failed to load confirmation plan: "+planLoadErr.Error())
+		}
 		return true, fmt.Errorf("apply-confirm command load confirmation plan %s#%d: %w", repo, pr, planLoadErr)
 	}
 	if rejected := h.assertPlanStillCurrent(ctx, repo, pr, installationID, storedPlan, confirmPRInfo.HeadSHA, environment, requestedBy); rejected {
@@ -704,9 +727,9 @@ func isUnlockRejection(err error) bool {
 // the core classifies retryable: the gate still fails closed for this
 // delivery, but the outcome is not the command's answer.
 //
-// A posted PR comment does not imply a terminal disposition: retryable sites
-// post best-effort error comments too, so a durable driver re-driving one may
-// post the same comment again.
+// Retryable failures post their best-effort error comment synchronously.
+// Durable attempts stay silent because the driver will retry and post the
+// single terminal answer if the retry budget is exhausted.
 //
 // The parent context scopes the command beyond its own timeout: the
 // synchronous wrapper passes context.Background(), while the durable driver
@@ -722,9 +745,12 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		database, err := h.inferUnlockDatabase(ctx, repo, pr, installationID)
 		if err != nil {
 			h.logger.Error("failed to infer database for force unlock", "repo", repo, "pr", pr, "error", err)
-			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
 			if isUnlockRejection(err) {
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
 				return false, nil
+			}
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
 			}
 			return true, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 		}
@@ -734,9 +760,12 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	locks, err := h.locksForUnlock(ctx, repo, pr, result)
 	if err != nil {
 		h.logger.Error("failed to look up unlock targets", "repo", repo, "pr", pr, "database", result.Database, "force", result.Force, "error", err)
-		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
 		if isUnlockRejection(err) {
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
 			return false, nil
+		}
+		if !result.SuppressRetryComments {
+			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to look up locks: "+err.Error())
 		}
 		return true, fmt.Errorf("unlock command lock lookup %s#%d: %w", repo, pr, err)
 	}
@@ -796,7 +825,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		return true, fmt.Errorf("unlock command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
 	}
 	for _, lock := range locks {
-		blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock)
+		blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock, result.SuppressRetryComments)
 		if authErr != nil {
 			return true, fmt.Errorf("unlock command actor authorization gate %s#%d database %s: %w", repo, pr, lock.DatabaseName, authErr)
 		}
@@ -815,8 +844,10 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		if err != nil {
 			h.logger.Error("unlock refused: cannot verify active applies, no locks will be released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
-			h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
-				"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
+					"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
+			}
 			return true, fmt.Errorf("unlock command verify active applies %s#%d database %s: %w", repo, pr, lock.DatabaseName, err)
 		}
 		for _, a := range applies {

@@ -396,42 +396,36 @@ func durableIssueCommentCoreConfig() *api.ServerConfig {
 // when non-nil, runs before each comment post is recorded.
 func newDurableIssueCommentCoreHarness(t *testing.T, store storage.WebhookEventStore, cfg *api.ServerConfig, onComment func()) (*Handler, chan string) {
 	t.Helper()
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 10)
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
-			"user": map[string]any{"login": "testuser"},
-		}))
+	st := &durableWebhookTestStorage{webhookEvents: store}
+	return newDurableDriverHarness(t, st, cfg, func(mux *http.ServeMux, comments chan string) {
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+				"base": map[string]any{"sha": "def456", "ref": "main"},
+				"user": map[string]any{"login": "testuser"},
+			}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+				"filename": "schemabot.yaml",
+				"status":   "modified",
+			}}))
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte("database: orders\ntype: mysql\n")),
+			}))
+		})
+		recorder := commentRecorder(t, comments)
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
+			if onComment != nil {
+				onComment()
+			}
+			recorder(w, r)
+		})
 	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/7/files", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
-			"filename": "schemabot.yaml",
-			"status":   "modified",
-		}}))
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
-			"type":     "file",
-			"encoding": "base64",
-			"content":  base64.StdEncoding.EncodeToString([]byte("database: orders\ntype: mysql\n")),
-		}))
-	})
-	recorder := commentRecorder(t, comments)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", func(w http.ResponseWriter, r *http.Request) {
-		if onComment != nil {
-			onComment()
-		}
-		recorder(w, r)
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	})
-	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := newDurableDriverHandler(t, store, cfg, &fakeClientFactory{client: installClient})
-	return h, comments
 }
 
 // A routed apply command must reach the command core with the payload's
@@ -455,49 +449,13 @@ func TestDurableIssueCommentDriverAnswersApplyThroughCore(t *testing.T) {
 	require.Contains(t, body, `database &#34;orders&#34; environment &#34;staging&#34; is not configured on this server`)
 }
 
-// durableUnlockDriverStorage augments the durable-driver storage with the
-// lock and apply stores the unlock command core reads.
-type durableUnlockDriverStorage struct {
-	emptyStorage
-	webhookEvents storage.WebhookEventStore
-	locks         storage.LockStore
-	applies       storage.ApplyStore
-}
-
-func (s *durableUnlockDriverStorage) WebhookEvents() storage.WebhookEventStore {
-	return s.webhookEvents
-}
-
-func (s *durableUnlockDriverStorage) Locks() storage.LockStore { return s.locks }
-
-func (s *durableUnlockDriverStorage) Applies() storage.ApplyStore { return s.applies }
-
-// newDurableUnlockDriverHarness builds a durable-driver handler whose storage
-// serves the given lock store and whose stub GitHub server records posted PR
-// comments, so a driven unlock command can walk the core to its user-facing
-// answer.
-func newDurableUnlockDriverHarness(t *testing.T, store storage.WebhookEventStore, locks storage.LockStore) (*Handler, chan string) {
-	t.Helper()
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 10)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	})
-	installClient := ghclient.NewInstallationClient(client, testLogger())
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	st := &durableUnlockDriverStorage{webhookEvents: store, locks: locks, applies: &noActiveAppliesStore{}}
-	service := api.New(st, &api.ServerConfig{}, nil, logger)
-	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch()), comments
-}
-
 // A routed unlock command must reach the command core through the driver: with
 // no locks held by the PR, the core posts the no-locks answer — the command's
 // terminal answer — and the delivery completes.
 func TestDurableIssueCommentDriverAnswersUnlockThroughCore(t *testing.T) {
 	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot unlock"))
-	h, comments := newDurableUnlockDriverHarness(t, store, &unlockTestLockStore{})
+	st := &durableWebhookTestStorage{webhookEvents: store, locks: &unlockTestLockStore{}, applies: &noActiveAppliesStore{}}
+	h, comments := newDurableDriverHarness(t, st, nil, nil)
 
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
@@ -517,7 +475,12 @@ func TestDurableIssueCommentDriverAnswersUnlockThroughCore(t *testing.T) {
 // transient storage blip.
 func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
 	store := newScriptedWebhookEventStore(durableIssueCommentEvent("schemabot unlock"))
-	h, _ := newDurableUnlockDriverHarness(t, store, &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")})
+	st := &durableWebhookTestStorage{
+		webhookEvents: store,
+		locks:         &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")},
+		applies:       &noActiveAppliesStore{},
+	}
+	h, comments := newDurableDriverHarness(t, st, nil, nil)
 
 	before := time.Now()
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
@@ -531,6 +494,30 @@ func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
 		t.Fatal("expected unlock lock-lookup failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
+	require.Empty(t, comments, "an intermediate durable attempt must not post a retry comment")
+}
+
+// The final durable attempt still gives the user exactly one answer: the core
+// stays silent and the driver posts after recording the terminal disposition.
+func TestDurableIssueCommentDriverFinalAttemptPostsOneRetryFailure(t *testing.T) {
+	event := durableIssueCommentEvent("schemabot unlock")
+	event.Attempts = maxDurableWebhookAttempts - 1
+	store := newScriptedWebhookEventStore(event)
+	st := &durableWebhookTestStorage{
+		webhookEvents: store,
+		locks:         &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")},
+		applies:       &noActiveAppliesStore{},
+	}
+	h, comments := newDurableDriverHarness(t, st, nil, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	failure := <-store.failed
+	require.Nil(t, failure.retryAfter)
+	body := requireComment(t, comments, "terminal unlock failure")
+	require.Contains(t, body, "Unlock Failed")
+	require.Contains(t, body, "could not complete this command after retrying")
+	require.Empty(t, comments, "the final attempt must post only one answer")
 }
 
 // cancelOnLookupLockStore cancels the drive context during the lock lookup and,
@@ -569,7 +556,8 @@ func TestDurableIssueCommentDriverCancelledUnlockStopsLockReleases(t *testing.T)
 	lock := prOwnedOrdersLock()
 	lock.CreatedAt = time.Now().Add(-time.Hour)
 	locks := &cancelOnLookupLockStore{cancel: cancelDrive, locks: []*storage.Lock{lock}}
-	h, _ := newDurableUnlockDriverHarness(t, store, locks)
+	st := &durableWebhookTestStorage{webhookEvents: store, locks: locks, applies: &noActiveAppliesStore{}}
+	h, _ := newDurableDriverHarness(t, st, nil, nil)
 
 	h.driveNextDurableWebhook(driveCtx, 0, "test-host/1/webhook-driver-0")
 

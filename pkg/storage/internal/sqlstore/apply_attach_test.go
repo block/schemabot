@@ -18,7 +18,7 @@ import (
 // dispatch persists, so attach tests exercise the sibling-dispatch case.
 func createAttachFixtureApply(t *testing.T, store *Storage) *storage.Apply {
 	t.Helper()
-	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL, "production")
+	lock := createTestLock(t, store, "payments", storage.DatabaseTypeMySQL)
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply_attach_fixture",

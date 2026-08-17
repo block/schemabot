@@ -241,7 +241,7 @@ func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
 			continue
 		}
 		shard := html.EscapeString(s.Shard)
-		if msg := sanitizeInlineError(s.Error); msg == "" {
+		if msg := SanitizeInlineError(s.Error); msg == "" {
 			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code>\n", shard)
 		} else {
 			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))

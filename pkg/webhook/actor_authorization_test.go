@@ -343,7 +343,7 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, false)
 	require.NoError(t, err)
 	assert.True(t, blocked)
 
@@ -367,7 +367,7 @@ func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testin
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock, false)
 	require.NoError(t, err)
 	assert.True(t, blocked)
 
@@ -387,7 +387,7 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, false)
 	require.Error(t, err)
 	assert.False(t, blocked)
 
@@ -397,6 +397,23 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	assert.Contains(t, body, "No schema change was started")
 	assert.Contains(t, body, "GitHub App can read organization members")
 	assert.NotContains(t, body, "is not authorized")
+}
+
+func TestEnforcePRCommandActorAuthorizationDurableAttemptSuppressesErrorComment(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, true)
+	require.Error(t, err)
+	assert.False(t, blocked)
+	assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
 }
 
 // TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning exercises the

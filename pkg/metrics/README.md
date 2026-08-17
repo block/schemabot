@@ -31,6 +31,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
 | `schemabot.webhook.inbox_stuck_processing` | Gauge | environment | Durable webhook inbox rows stuck in processing past the attempt cap |
 | `schemabot.webhook.inbox_stats_collection_failures` | Counter | environment | Failed durable webhook inbox metric snapshots (liveness signal for the inbox gauges) |
+| `schemabot.webhook.check_suite_recovery_total` | Counter | environment, repository, outcome | Durable check_suite recovery outcomes (`covered`, `synthesized`, `resynthesized`, `already_queued` per candidate PR; `no_pr_at_ingress`, `no_open_pr`, `truncated` per delivery) |
 | `schemabot.webhook.inbox_dispatch_lag_seconds` | Histogram | environment, event_type, repository | Time from webhook receipt to the delivery's first dispatch claim |
 | `schemabot.webhook.dispatch_duration_seconds` | Histogram | environment, event_type, outcome | Duration of one durable webhook dispatch claim by outcome (deliberately no repository label — see the ledger note below) |
 | `schemabot.github.requests_total` | Counter | environment, operation, category, resource, status, repository, github_app, installation_id | GitHub API request attempts observed by SchemaBot, including attempts that never produced a response |
@@ -109,7 +110,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
 
-**event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `ping`, `push`
+**event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 
 **action** (webhooks): common GitHub actions for the subscribed webhook events, such as `created`, `opened`, `synchronize`, `submitted`, `edited`, `closed`, `requested`, `completed` (omitted for events without actions like `ping` and `push`)
 

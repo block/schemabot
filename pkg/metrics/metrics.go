@@ -1877,6 +1877,41 @@ func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string, re
 		attribute.String("outcome", outcome))
 }
 
+// RecordWebhookCheckSuiteRecovery counts outcomes of durable
+// check_suite.requested recovery processing. "covered", "synthesized",
+// "resynthesized", and "already_queued" increment once per candidate PR (a
+// delivery can carry several), while "no_pr_at_ingress", "no_open_pr", and
+// "truncated" increment once per delivery; a delivery retried under its
+// attempt budget re-counts PRs it already observed on an earlier attempt, so
+// outcomes are per observation, not per unique PR. "no_pr_at_ingress" is the
+// dominant branch by volume — a same-repository suite whose payload named no
+// open PR, dropped at ingress before occupying an inbox row; it exists so
+// the drop rate is comparable against "synthesized" and the reconciler's
+// synthesize rate. "covered" is the healthy steady state — the organic
+// pull_request delivery arrived during the recovery grace and planned the
+// head, so the redundant signal no-oped. "synthesized" means the auto-plan
+// delivery for an open PR head was genuinely lost and the check_suite signal
+// recovered it — investigate the upstream loss (edge auth, GitHub send
+// failures), not the recovery. "resynthesized" means the recovery reopened a
+// terminally failed synthesized row, so a sustained rate is the same head
+// failing repeatedly after recovery — investigate that head's processing
+// failure. "already_queued" means another recovery producer (the reconciler
+// or an earlier check_suite delivery) got there first. "no_open_pr" means no
+// PR named by the delivery was still open at the suite head — its PRs closed
+// or moved on during the grace, or a fork head matched no open PR.
+// "truncated" means the fork-head open-PR walk exhausted its page budget, so
+// coverage for the head is incomplete rather than absent — a matching PR
+// beyond the budget went unresolved and the reconciler's missing-head scan
+// is the backstop; a sustained rate means the repository's open-PR count has
+// outgrown the page budget.
+func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome string) {
+	addCounter(ctx, "schemabot.webhook.check_suite_recovery_total",
+		"Total number of outcomes from durable check_suite recovery processing", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.String("outcome", outcome))
+}
+
 // RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
 // reconciler terminated because they were parked in processing with an expired
 // lease at the attempt cap — a driver hard-killed on its final attempt. A

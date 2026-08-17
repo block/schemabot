@@ -857,7 +857,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 func writeErrors(sb *strings.Builder, errors []string) {
 	var msgs []string
 	for _, errMsg := range errors {
-		if msg := sanitizeInlineError(errMsg); msg != "" {
+		if msg := SanitizeInlineError(errMsg); msg != "" {
 			msgs = append(msgs, msg)
 		}
 	}

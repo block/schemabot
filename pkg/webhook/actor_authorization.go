@@ -56,6 +56,7 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 	databaseType string,
 	environment string,
 	commandName string,
+	suppressRetryComments bool,
 ) (blocked bool, err error) {
 	result, err := h.authorizePRCommandActor(ctx, client, requestedBy, repo, database)
 	status := actorAuthorizationMetricStatus(result, err)
@@ -65,18 +66,24 @@ func (h *Handler) enforcePRCommandActorAuthorization(
 	// read) stops the command (fail closed) and is returned as an error, not a
 	// block: the actor's authorization could not be determined, so the outcome
 	// is not the command's answer and a durable driver may re-drive it.
+	// suppressRetryComments silences the evaluation-failure comment on durable
+	// attempts, where the driver retries and posts the single terminal answer
+	// instead; merit denials always comment because they are the command's
+	// answer.
 	if err != nil {
 		h.logger.Warn("PR command stopped by actor authorization error",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", databaseType, "environment", environment,
 			"command", commandName, "requested_by", requestedBy,
 			"reason", result.Reason, "error", err)
-		h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
-			RequestedBy: requestedBy,
-			CommandName: commandName,
-			Database:    database,
-			Environment: environment,
-		}))
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
+				RequestedBy: requestedBy,
+				CommandName: commandName,
+				Database:    database,
+				Environment: environment,
+			}))
+		}
 		return false, fmt.Errorf("actor authorization for %s command %s#%d: %w", commandName, repo, pr, err)
 	}
 	if !result.Allowed {

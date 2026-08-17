@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func (h *Handler) shouldPublishChecks(ctx context.Context, repo string, operation string) bool {
@@ -775,7 +777,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 
 	for _, ec := range checks {
 		// Build summary from the error for this environment
-		summary := "Plan failed"
+		summary := planFailedCheckText
 		if errMsg, ok := errors[ec.environment]; ok {
 			summary = errMsg
 		} else if len(errors) > 0 {
@@ -816,13 +818,14 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 					"blocking_reason", blockingReason)
 			}
 		}
+		summary = sanitizeCheckRunErrorSummary(summary)
 
 		opts := ghclient.CheckRunOptions{
 			Name:       ec.name,
 			Status:     checkStatusCompleted,
 			Conclusion: checkConclusionFailure,
 			Output: &ghclient.CheckRunOutput{
-				Title:   "Plan failed",
+				Title:   planFailedCheckText,
 				Summary: summary,
 			},
 		}
@@ -873,6 +876,37 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		h.logger.Info("posted failing aggregate",
 			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
 	}
+}
+
+// planFailedCheckText is the fixed title and fallback summary a failing plan
+// aggregate Check Run shows when no more specific error text is available.
+const planFailedCheckText = "Plan failed"
+
+// checkRunSummaryEscaper neutralizes the markup that renders in a Check Run
+// summary: HTML tags, plus the Markdown constructs that can carry a payload —
+// links and images (brackets), which would let error text phish or fire an
+// outbound request from every viewer, and code spans (backticks). Entity
+// references decode on render but cannot form Markdown structure, so the
+// displayed text is unchanged. Quotes are left alone — unlike
+// html.EscapeString — as a source-readability choice: they need no
+// neutralization here and operator-facing prose stays byte-verbatim.
+// Emphasis characters are also left alone; they can restyle text but cannot
+// inject content or reach out.
+var checkRunSummaryEscaper = strings.NewReplacer(
+	"&", "&amp;", "<", "&lt;", ">", "&gt;",
+	"[", "&#91;", "]", "&#93;", "`", "&#96;",
+)
+
+// sanitizeCheckRunErrorSummary makes error text safe for a Check Run summary:
+// single-line sanitization (endpoint redaction, control stripping, clamping)
+// plus markup escaping. Text that sanitizes to nothing falls back to a fixed
+// summary so the Check Run never publishes with an empty summary.
+func sanitizeCheckRunErrorSummary(summary string) string {
+	sanitized := templates.SanitizeInlineError(summary)
+	if sanitized == "" {
+		return planFailedCheckText
+	}
+	return checkRunSummaryEscaper.Replace(sanitized)
 }
 
 // clearAggregateBlocksForVerifiedPR releases stored aggregate blocking reasons

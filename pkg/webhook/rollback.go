@@ -153,7 +153,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		// delivery, but a fresh client may succeed on a later attempt.
 		return true, fmt.Errorf("rollback command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
 	}
-	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback)
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback, result.SuppressRetryComments)
 	if authErr != nil {
 		return true, fmt.Errorf("rollback command actor authorization gate %s#%d database %s: %w", repo, pr, database, authErr)
 	}
@@ -528,7 +528,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	// must be an authorized admin/operator before any lock is released or acted
 	// on. The database comes from the lock-pinned rollback plan instead of
 	// current PR files so confirmation follows the reviewed rollback artifact.
-	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm)
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm, result.SuppressRetryComments)
 	if authErr != nil {
 		return true, fmt.Errorf("rollback-confirm command actor authorization gate %s#%d database %s: %w", repo, pr, database, authErr)
 	}

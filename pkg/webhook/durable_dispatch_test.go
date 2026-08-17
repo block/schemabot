@@ -31,14 +31,45 @@ const durableWebhookTestDeadline = 5 * time.Second
 type durableWebhookTestStorage struct {
 	emptyStorage
 	webhookEvents storage.WebhookEventStore
+	locks         storage.LockStore
+	applies       storage.ApplyStore
 }
 
 func (s *durableWebhookTestStorage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
 }
 
+// Locks and Applies fall back to the embedded emptyStorage stores when a test
+// leaves the optional fields unset, so harnesses that only exercise the inbox
+// keep working non-nil stores instead of panicking on a nil interface.
+func (s *durableWebhookTestStorage) Locks() storage.LockStore {
+	if s.locks != nil {
+		return s.locks
+	}
+	return s.emptyStorage.Locks()
+}
+
+func (s *durableWebhookTestStorage) Applies() storage.ApplyStore {
+	if s.applies != nil {
+		return s.applies
+	}
+	return s.emptyStorage.Applies()
+}
+
+// TestDurableWebhookTestStorageDefaults pins the shared-fixture contract: a
+// zero-value durableWebhookTestStorage must hand back working no-op stores for
+// every accessor, so harnesses that leave optional fields unset never see a
+// nil interface inside a driver goroutine.
+func TestDurableWebhookTestStorageDefaults(t *testing.T) {
+	s := &durableWebhookTestStorage{}
+	require.NotNil(t, s.Locks())
+	require.NotNil(t, s.Applies())
+	require.NotNil(t, s.Checks())
+}
+
 type recordingWebhookEventStore struct {
 	mu     sync.Mutex
+	nextID int64
 	events map[string]*storage.WebhookEvent
 }
 
@@ -69,6 +100,11 @@ func (s *recordingWebhookEventStore) Create(_ context.Context, event *storage.We
 		}
 		return false, nil
 	}
+	// Mirror the real store's insert contract: a fresh insert populates the
+	// caller's event.ID, while the reopen branch above leaves it zero — the
+	// discriminator callers use to tell the two apart.
+	s.nextID++
+	event.ID = s.nextID
 	copy := *event
 	copy.Payload = append([]byte(nil), event.Payload...)
 	if copy.State == "" {
@@ -398,6 +434,41 @@ func newDurableDriverHandler(t *testing.T, store storage.WebhookEventStore, conf
 		factory = &fakeClientFactory{}
 	}
 	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+}
+
+// newDurableDriverHarness builds a durable-dispatch Handler backed by a stub
+// GitHub server and returns it with the channel that receives every PR comment
+// the driver posts. It is the shared harness for durable command-driver tests:
+// st supplies the scripted webhook-event storage the driver claims from, a nil
+// config defaults to an empty ServerConfig, and a nil configureGitHub installs
+// only the default PR-comment capture route; pass configureGitHub to add or
+// replace stub routes (it receives the mux and the comment channel and must
+// register its own comment capture if it wants one).
+func newDurableDriverHarness(
+	t *testing.T,
+	st *durableWebhookTestStorage,
+	config *api.ServerConfig,
+	configureGitHub func(*http.ServeMux, chan string),
+) (*Handler, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	if configureGitHub == nil {
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	} else {
+		configureGitHub(mux, comments)
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if config == nil {
+		config = &api.ServerConfig{}
+	}
+	service := api.New(st, config, nil, logger)
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch()), comments
 }
 
 func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
@@ -981,6 +1052,82 @@ func TestDurableWebhookDriverStopsRetryingAtAttemptCap(t *testing.T) {
 	default:
 		t.Fatal("expected exhausted delivery to be marked failed")
 	}
+	require.Empty(t, store.completed)
+}
+
+// An acknowledged command receives one sanitized terminal answer when its
+// final drive fails, using the repository and PR carried by the stored payload.
+func TestDurableWebhookDriverPostsTerminalCommandCommentAtAttemptCap(t *testing.T) {
+	event := durableIssueCommentEvent("schemabot apply -e production")
+	event.Repository = "wrong/denormalized-repo"
+	event.PullRequest = 99
+	event.Attempts = maxDurableWebhookAttempts - 1
+	store := newScriptedWebhookEventStore(event)
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := newDurableDriverHandler(t, store, nil, &fakeClientFactory{client: installClient})
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("dial tcp db.internal.example.com:3306: unavailable")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	failure := <-store.failed
+	require.Nil(t, failure.retryAfter)
+	body := requireComment(t, comments, "terminal command answer")
+	require.Contains(t, body, "Apply Failed")
+	require.Contains(t, body, "could not complete this command after retrying")
+	require.Contains(t, body, "[endpoint redacted]")
+	require.NotContains(t, body, "db.internal.example.com")
+}
+
+// Retry exhaustion for non-command deliveries remains operator-facing only
+// and must not create unrelated PR timeline noise.
+func TestDurableWebhookDriverDoesNotPostTerminalCommentForNonCommand(t *testing.T) {
+	event := durablePullRequestEvent(t)
+	event.Attempts = maxDurableWebhookAttempts - 1
+	store := newScriptedWebhookEventStore(event)
+	client, mux := setupGitHubServer(t)
+	commentRequests := make(chan struct{}, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", func(w http.ResponseWriter, _ *http.Request) {
+		commentRequests <- struct{}{}
+		w.WriteHeader(http.StatusCreated)
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := newDurableDriverHandler(t, store, nil, &fakeClientFactory{client: installClient})
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("temporary failure")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	failure := <-store.failed
+	require.Nil(t, failure.retryAfter)
+	require.Empty(t, commentRequests)
+}
+
+// A failed best-effort terminal comment never reopens or otherwise changes
+// the exhausted inbox row's terminal disposition.
+func TestDurableWebhookDriverTerminalCommentFailureKeepsTerminalDisposition(t *testing.T) {
+	event := durableIssueCommentEvent("schemabot unlock")
+	event.Attempts = maxDurableWebhookAttempts - 1
+	store := newScriptedWebhookEventStore(event)
+	client, mux := setupGitHubServer(t)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := newDurableDriverHandler(t, store, nil, &fakeClientFactory{client: installClient})
+	h.durableWebhookProcessOverride = func(context.Context, *storage.WebhookEvent) (bool, error) {
+		return true, errors.New("temporary failure")
+	}
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	failure := <-store.failed
+	require.Nil(t, failure.retryAfter)
 	require.Empty(t, store.completed)
 }
 
