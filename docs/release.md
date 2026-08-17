@@ -120,22 +120,25 @@ release cannot be rolled back in parts, so trouble in one change forces a decisi
 about all of them, and a change that needs its own rollout ordering drags the rest
 of the batch along with it.
 
-**Release the tip of `main` by default.** That is the normal choice and usually the
-right one. Read the commits since the previous tag first, though, because a later
-commit may hold something staged separately that must not ride along yet. When one
-does, tag the last commit that should go out instead, and confirm the tag resolves
-to it.
+**Prefer the tip of `main`.** It is the default and usually the right release
+commit. Everything merged since the last tag goes out together.
 
-**Then ask whether it should be one release or two.** Read the commits in the
-range and split the release if it contains a change that cannot safely coexist
-with what is currently deployed. The hazards that keep coming up:
+**When not to choose `main`:** when the range since the last tag holds a commit
+that needs its rollout done a particular way. Bundling one of those makes every
+other change in the tag inherit its constraint. So read the commits in the range
+before tagging, and look for:
 
-- Storage schema column renames or removals
-- Protobuf or API changes that need the data planes updated before the control
-  plane image rolls
-- Config shape changes an already-running binary cannot parse
+- Storage schema column renames or removals, which need the expand/contract
+  sequence below
+- Protobuf or API changes that require the data planes to roll before the control
+  plane image
+- Config shape changes, where the new binary rejects the deployed config or the
+  running binary rejects the new one
 - Data-plane changes that are not backward compatible with the deployed control
   plane
+
+Found one? Tag the commit before it and let that release roll out, then give the
+constrained change a tag of its own.
 
 Column renames deserve special care: do them as expand/contract across several
 releases rather than one. Add the new column and teach the code to tolerate both
