@@ -175,17 +175,26 @@ func TestUniqueTableList(t *testing.T) {
 // the callback that was installed or is dropped, never dereferences a
 // half-written slot.
 func TestSpiritLogFilter_UnwiringTheCallbackWhileLoggingIsSafe(t *testing.T) {
+	const racingInfoLines = 2000
+
 	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	spiritLogger := eng.spiritLogger.With("table", "orders")
 
 	var routed atomic.Int64
 	cb := func(slog.Level, string, string) { routed.Add(1) }
 
+	// One line routes before the race starts, so the count the race then adds to
+	// is known to be reachable at all: a filter that never called through its
+	// callback slot would satisfy the upper bound below with nothing routed.
+	eng.SetLogCallback(cb)
+	spiritLogger.Info("copy rows complete")
+	require.Equal(t, int64(1), routed.Load(), "an installed callback records the line")
+
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		defer close(done)
-		for range 2000 {
+		for range racingInfoLines {
 			spiritLogger.Info("copy rows complete")
 			spiritLogger.Debug("replication event")
 		}
@@ -205,8 +214,35 @@ func TestSpiritLogFilter_UnwiringTheCallbackWhileLoggingIsSafe(t *testing.T) {
 	})
 	wg.Wait()
 
-	assert.LessOrEqual(t, routed.Load(), int64(2000),
+	assert.LessOrEqual(t, routed.Load(), int64(racingInfoLines+1),
 		"only the info lines route, and each of them at most once")
+}
+
+// The debug toggle is what an operator turns on to see Spirit's replication
+// chatter for a schema change, and off again once they have seen it. It governs
+// the process logs alone: debug lines are not part of the apply log stream, so
+// the toggle never widens what a deployment already emits below its own level.
+func TestEngineDebugLogsToggleGovernsSpiritDebugLines(t *testing.T) {
+	var processLogs bytes.Buffer
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(&processLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	spiritLogger := eng.spiritLogger.With("table", "orders")
+
+	var routed atomic.Int64
+	eng.SetLogCallback(func(slog.Level, string, string) { routed.Add(1) })
+
+	spiritLogger.Debug("replication event")
+	assert.Empty(t, processLogs.String(), "debug lines stay out of the process logs until the toggle is on")
+
+	eng.SetDebugLogs(true)
+	spiritLogger.Debug("replication event")
+	assert.Contains(t, processLogs.String(), "replication event", "the toggle admits debug lines the process logs accept")
+
+	processLogs.Reset()
+	eng.SetDebugLogs(false)
+	spiritLogger.Debug("replication event")
+	assert.Empty(t, processLogs.String(), "clearing the toggle stops them again")
+
+	assert.Zero(t, routed.Load(), "debug lines are not part of the apply log stream")
 }
 
 // A drive hands the engine over by clearing its apply-log callback rather than
