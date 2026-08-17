@@ -175,8 +175,10 @@ func runControlCommand[R any](
 	}
 	// Control commands are not durable cores, so an authorization evaluation
 	// failure and a merit denial both stop the command here; the gate has
-	// already logged and posted the distinction.
-	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName, result.SuppressRetryComments)
+	// already logged and posted the distinction. Pass a literal false: no
+	// driver retries or posts a terminal answer for a control command, so the
+	// gate's comment is the user's only answer and must never be suppressed.
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, apply.Database, apply.DatabaseType, result.Environment, actionName, false)
 	if authErr != nil || blocked {
 		return nil
 	}

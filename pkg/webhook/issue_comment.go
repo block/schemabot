@@ -944,9 +944,11 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 }
 
 // durableIssueCommentCommand identifies the command and PR destination in a
-// stored issue_comment payload. Terminal notification re-parses the payload
-// rather than trusting denormalized inbox columns, applying the same shape
-// and command-ready gates as normal dispatch. The routing gates (repo
+// stored issue_comment payload. Terminal notification re-derives the repo,
+// PR, command, and requester from the payload rather than the denormalized
+// inbox columns, applying the same shape and command-ready gates as normal
+// dispatch; the installation ID comes from the tenant column, the same
+// source normal dispatch uses. The routing gates (repo
 // allow-list, tenant and environment ownership) are intentionally not
 // re-run: a routing-blocked delivery completes as a no-op on its first
 // attempt and never exhausts its retry budget, so no routing-blocked row can

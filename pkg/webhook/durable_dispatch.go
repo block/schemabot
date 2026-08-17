@@ -506,6 +506,12 @@ func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent,
 			"pr", event.PullRequest, "error", err)
 		return
 	}
+	// The answer carries the wrapped error chain rather than the gates'
+	// curated per-attempt messages. Those messages advise retrying — the
+	// wrong advice once the retry budget is exhausted — while the chain names
+	// what kept failing. postCommandError sanitizes before rendering
+	// (endpoint redaction, control stripping, escaping, clamping), so the
+	// chain is safe for PR markdown even when it carries transport detail.
 	h.postCommandError(repo, pr, installationID, result.Action, result.Environment, requestedBy,
 		"SchemaBot could not complete this command after retrying: "+processErr.Error())
 }
