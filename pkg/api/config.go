@@ -1088,6 +1088,15 @@ type RepoConfig struct {
 	// AdminUsers are GitHub users with the same repository-scoped authority
 	// as AdminTeams.
 	AdminUsers []string `yaml:"admin_users,omitempty"`
+
+	// RespondToUnscoped overrides the instance-level respond_to_unscoped
+	// policy for this repository. The instance-level policy assumes another
+	// instance with a complete environment roster answers unscoped commands
+	// (help, invalid/unknown values); a repository registered on only this
+	// instance has no such other responder, so silence there drops the reply
+	// everywhere. Set true on such repositories to answer locally. Nil falls
+	// back to the instance-level policy.
+	RespondToUnscoped *bool `yaml:"respond_to_unscoped,omitempty"`
 }
 
 // RepoAdmins returns the repository-scoped admin principals configured for
@@ -2468,6 +2477,22 @@ func (c *ServerConfig) ShouldRespondToUnscoped() bool {
 		return true
 	}
 	return *c.RespondToUnscoped
+}
+
+// ShouldRespondToUnscopedForRepo returns whether this instance should respond
+// to unscoped commands on repo, honoring the repository-level
+// respond_to_unscoped override before falling back to the instance-level
+// policy. The override exists for repositories registered on only one
+// instance, where deferring to another responder would leave the command
+// unanswered everywhere.
+func (c *ServerConfig) ShouldRespondToUnscopedForRepo(repo string) bool {
+	if c == nil {
+		return true
+	}
+	if repoConfig, ok := c.Repos[repo]; ok && repoConfig.RespondToUnscoped != nil {
+		return *repoConfig.RespondToUnscoped
+	}
+	return c.ShouldRespondToUnscoped()
 }
 
 // ShouldRequirePassingChecks returns whether apply should be blocked when

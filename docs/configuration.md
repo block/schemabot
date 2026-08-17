@@ -1089,6 +1089,18 @@ leaving `respond_to_unscoped` enabled there and setting it to `false` on the
 others. Operators can still direct help to a specific deployment with
 `schemabot help --tenant <name>` or `schemabot help -t <name>`.
 
+A repository registered on only one instance has no other responder to defer
+to: with the instance-level policy set to `false`, unscoped commands on that
+repository would be answered by no one. Override the policy per repository so
+the sole instance answers there while staying silent on shared repositories:
+
+```yaml
+respond_to_unscoped: false  # shared repos: another instance answers
+repos:
+  octocat/staging-only-repo:
+    respond_to_unscoped: true  # no other instance serves this repo
+```
+
 ### How it works
 
 - **Environment scoping:** When `allowed_environments` is set, the instance only processes commands targeting those environments. Commands for other environments (e.g., `schemabot apply -e production` sent to the staging instance) are accepted without a PR response by this deployment. A deployment that allows the requested environment must process its own webhook delivery.

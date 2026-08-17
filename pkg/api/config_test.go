@@ -4087,3 +4087,37 @@ spirit:
 		require.ErrorContains(t, err, "must be positive")
 	})
 }
+
+func TestShouldRespondToUnscopedForRepo(t *testing.T) {
+	silent := false
+	answers := true
+
+	t.Run("repo override wins over the instance policy", func(t *testing.T) {
+		cfg := &ServerConfig{
+			RespondToUnscoped: &silent,
+			Repos: map[string]RepoConfig{
+				"octocat/hello-world": {RespondToUnscoped: &answers},
+			},
+		}
+		assert.True(t, cfg.ShouldRespondToUnscopedForRepo("octocat/hello-world"))
+		assert.False(t, cfg.ShouldRespondToUnscopedForRepo("octocat/other"), "repos without an override follow the instance policy")
+	})
+
+	t.Run("repo override can silence a responding instance", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Repos: map[string]RepoConfig{
+				"octocat/hello-world": {RespondToUnscoped: &silent},
+			},
+		}
+		assert.False(t, cfg.ShouldRespondToUnscopedForRepo("octocat/hello-world"))
+		assert.True(t, cfg.ShouldRespondToUnscopedForRepo("octocat/other"))
+	})
+
+	t.Run("defaults to responding when nothing is configured", func(t *testing.T) {
+		cfg := &ServerConfig{Repos: map[string]RepoConfig{"octocat/hello-world": {}}}
+		assert.True(t, cfg.ShouldRespondToUnscopedForRepo("octocat/hello-world"))
+
+		var nilCfg *ServerConfig
+		assert.True(t, nilCfg.ShouldRespondToUnscopedForRepo("octocat/hello-world"))
+	})
+}
