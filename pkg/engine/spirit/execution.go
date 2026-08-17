@@ -252,6 +252,11 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 
 	combinedStatement := strings.Join(routing.spiritAlters, "; ")
 
+	// The batch is only final here, after routing has re-evaluated each
+	// statement against the target's live schema, so this is the first point
+	// where what Spirit will compare against the checkpoint is known.
+	e.reportExistingCopy(ctx, target, database, combinedStatement, routing.spiritTables)
+
 	logger.Info("executing ALTER via Spirit",
 		"database", database,
 		"tables", routing.spiritTables,
