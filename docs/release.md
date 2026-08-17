@@ -94,9 +94,14 @@ Nothing else is required. There is no manual artifact step.
 
 ## What the version number means
 
-SchemaBot is pre-1.0, so the version number is an ordering label rather than a
-compatibility promise. A patch bump tells you a release is newer, not that it is a
-drop-in replacement, and it can carry a behavior change.
+Every version is a deployment. There are no tags cut and shelved, no numbers
+skipped over, no builds that existed only to be published: each version in the
+history is one Block rolls out to production, so the sequence reads as a record of
+deployments in order.
+
+What the number is not is a semver compatibility promise. SchemaBot is pre-1.0, so
+a patch bump tells you a release is newer, not that it is a drop-in replacement,
+and it can carry a behavior change.
 
 The compatibility signal lives in two places instead. The
 [pre-tag checks](#pre-tag-checks) below are what every release has to clear, and
