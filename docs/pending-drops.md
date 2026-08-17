@@ -142,6 +142,19 @@ The apply log for a schema change that drops a table records the quarantine
 database and table name, so operators can locate the table for recovery without
 querying `information_schema`.
 
+### Why a process is not reaping
+
+A process that quarantines without reaping is what leaves tables on a target
+forever, so each way the cleaner can decline to start logs its own line at
+startup, naming the consequence:
+
+| Startup log says | Meaning |
+| --- | --- |
+| the quarantine is disabled | Expected. `DROP TABLE` executes as written, so there is nothing to reap. |
+| no local MySQL database targets are configured | Expected for a control plane. Every target is routed to the deployment that executes against it and reaps it. The line carries `routed_mysql_targets`, which separates this from a process with no MySQL topology at all. |
+| cleanup is disabled for this process | Safe only while another deployment reaps the same targets. |
+| retention is invalid | Config bug. Logged at error, and blocks reaping until it is fixed. |
+
 ## Limitations
 
 - **Triggers**: MySQL cannot rename a table with triggers into another
