@@ -29,8 +29,8 @@ to you. Everything else here does.
 
 SchemaBot is developed by Block and runs Block's own schema changes, so every tag
 in this repository is a tag Block deploys. Releases are not cut on a calendar. A
-tag goes out when merged work is ready to roll, reaches a staging control plane
-and its data planes first, then production, and anything found along the way is
+tag goes out when merged work is ready to roll, reaches a pre-production (e.g. staging)
+control plane and its data planes first, then production, and anything found along the way is
 fixed forward in the next tag.
 
 Note the order, because it is easy to read too much into it: **the tag comes
