@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,9 +47,21 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	rowsCopied := waitForCopyProgress(t, eng, 2000)
 	t.Logf("halting after %d rows copied", rowsCopied)
 
+	// Rows copied proves chunks are landing, not that a checkpoint can be
+	// written: the copier feeds chunks back as their writes finish, out of
+	// order, and a checkpoint needs the contiguous low watermark that only
+	// exists once every chunk behind it has fed back. Wait for that watermark
+	// so the halt's dump asserts checkpointing behavior, not watermark timing.
+	waitForCheckpointReadiness(t, eng)
+
+	// The readiness wait proved the watermark by dumping a checkpoint of its
+	// own. Clear it: every dump appends a row, so the probe's row would
+	// satisfy the count below even if the halt never dumped. The watermark
+	// only advances while the copy runs, so clearing the row does not undo
+	// readiness.
 	checkpointTable := utils.CheckpointTableName(tableName)
-	require.Zero(t, checkpointRowCount(t, db, checkpointTable),
-		"the copy has not run long enough for Spirit's periodic checkpoint, so any checkpoint after the halt is the halt's own")
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("DELETE FROM `%s`", checkpointTable))
+	require.NoError(t, err, "clear the readiness probe's checkpoint from %s", checkpointTable)
 
 	// Bound the halt: it waits for the copy goroutine to exit, so one that will
 	// not come down fails here rather than hanging until the package timeout.
@@ -56,8 +69,8 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	defer cancelHalt()
 	require.NoError(t, eng.HaltForShutdown(haltCtx), "HaltForShutdown()")
 
-	// Spirit keeps one checkpoint row per run, so the halt's own dump is the
-	// only write that can account for it.
+	// The probe's row was cleared, so the halt's own dump is the only write
+	// that can account for the row that exists now.
 	require.Equal(t, 1, checkpointRowCount(t, db, checkpointTable),
 		"halting checkpoints the copy before cancelling it, so the reclaiming driver resumes from where the copy stopped rather than recopying from the last periodic checkpoint")
 
@@ -147,6 +160,32 @@ func startCopyForcingAlter(t *testing.T, tableName string) (*Engine, *sql.DB) {
 	require.True(t, applyResult.Accepted, "apply not accepted: %s", applyResult.Message)
 
 	return eng, db
+}
+
+// waitForCheckpointReadiness blocks until the schema change can write a
+// checkpoint, proven by dumping one. Copy progress alone does not imply this:
+// the checkpoint records the copy's contiguous low watermark, which lags the
+// rows-copied count until every chunk behind it has fed back.
+func waitForCheckpointReadiness(t *testing.T, eng *Engine) {
+	t.Helper()
+
+	eng.mu.Lock()
+	rm := eng.runningSchemaChange
+	eng.mu.Unlock()
+	require.NotNil(t, rm, "no schema change is running")
+	require.NotEmpty(t, rm.runners, "the schema change has no runners")
+
+	deadline := time.Now().Add(copyProgressPollDeadline)
+	for time.Now().Before(deadline) {
+		err := rm.runners[0].DumpCheckpoint(t.Context())
+		if err == nil {
+			return
+		}
+		require.ErrorIs(t, err, status.ErrWatermarkNotReady,
+			"the checkpoint dump failed for a reason other than the watermark not being ready yet")
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("the copy's low watermark was not checkpoint-ready within %s", copyProgressPollDeadline)
 }
 
 // requireCopyGoroutineExited waits for the copy goroutine to exit, bounded so a
