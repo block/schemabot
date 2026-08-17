@@ -68,7 +68,7 @@ func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 			}
 		}
 		return false
-	}, postgresConfigFixtureDeadline, 20*time.Millisecond)
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
 
 	var exists bool
 	err = db.QueryRowContext(t.Context(), `SELECT EXISTS (

@@ -81,6 +81,7 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -210,7 +211,10 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 			}
 		})
 
-		appDSN = strings.Replace(e2eTargetDSN, "/target_test", "/"+appDBName, 1)
+		cfg, err := mysql.ParseDSN(e2eTargetDSN)
+		require.NoError(t, err)
+		cfg.DBName = appDBName
+		appDSN = cfg.FormatDSN()
 	}
 	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
