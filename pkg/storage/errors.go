@@ -33,6 +33,11 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
+	// ErrApplyNotActive is returned when a write requires the apply to still be
+	// active (non-terminal) and it is not — e.g. attaching a new operation to
+	// an apply no drive will pick up again.
+	ErrApplyNotActive = errors.New("apply is not active")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")

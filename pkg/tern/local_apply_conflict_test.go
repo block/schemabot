@@ -78,7 +78,7 @@ func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	assert.Nil(t, stopped.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "a new apply must be refused while a stopped task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Stopped, stopped.State)
@@ -107,7 +107,7 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	assert.Nil(t, retryable.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "a new apply must be refused while a retryable task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State)
@@ -218,12 +218,12 @@ func TestConflictCheckIsPerShard(t *testing.T) {
 	// which this test does not need to exercise.
 
 	// A different shard is not a conflict — it runs concurrently.
-	assert.False(t, client.findBlockingTask(t.Context(), tasks, plan, "40-80").blocks(),
+	assert.False(t, client.findBlockingTask(t.Context(), tasks, plan, "40-80", 0).blocks(),
 		"an active task on shard -40 must not block an apply on shard 40-80")
 	assert.Equal(t, state.Task.Running, activeShard.State, "the other shard's task is left running")
 
 	// The same shard still conflicts.
-	assert.Equal(t, "task-shard-neg40", client.findBlockingTask(t.Context(), tasks, plan, "-40").taskIdentifier,
+	assert.Equal(t, "task-shard-neg40", client.findBlockingTask(t.Context(), tasks, plan, "-40", 0).taskIdentifier,
 		"an active task on shard -40 must block another apply on shard -40")
 }
 
@@ -255,7 +255,7 @@ func TestConflictCheckCancelsOrphanedPendingTask(t *testing.T) {
 			}}
 
 			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-			err := client.checkActiveTaskConflict(t.Context(), plan, "")
+			err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 			require.NoError(t, err, "an orphaned pending task must not refuse a new apply")
 			assert.Equal(t, state.Task.Cancelled, orphan.State, "the orphaned task must be cancelled")
 			assert.Contains(t, orphan.ErrorMessage, "orphaned")
@@ -284,7 +284,7 @@ func TestConflictCheckPreservesPendingTaskOfActiveApply(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "a pending task of an active apply must refuse a new apply")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Pending, pending.State, "the pending task must be left untouched")
@@ -310,7 +310,7 @@ func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
 		client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: nil}
 
 		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-		err := client.checkActiveTaskConflict(t.Context(), plan, "")
+		err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 		require.Error(t, err, "a pending task with a missing apply row must keep blocking")
 		assert.Equal(t, state.Task.Pending, pending.State)
 		assert.Nil(t, pending.CompletedAt)
@@ -330,7 +330,7 @@ func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
 		client.storage.(*exactProgressStorage).applies = &erroringApplyStore{err: errors.New("storage down")}
 
 		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-		err := client.checkActiveTaskConflict(t.Context(), plan, "")
+		err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 		require.Error(t, err, "a pending task must keep blocking when its apply cannot be loaded")
 		assert.Equal(t, state.Task.Pending, pending.State)
 		assert.Nil(t, pending.CompletedAt)
@@ -375,7 +375,7 @@ func TestConflictCheckKeepsOrphanWhenCancellationWriteFails(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "the orphan must keep blocking when its cancellation cannot be written")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Pending, orphan.State, "the task must be restored to pending for a clean retry")
@@ -427,7 +427,7 @@ func TestConflictCheckLeavesActivelyDrivenTask(t *testing.T) {
 			client.spiritEngine = &fakeControlEngine{progressResult: memory}
 
 			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-			err := client.checkActiveTaskConflict(t.Context(), plan, "")
+			err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 			require.Error(t, err, "a task with an actively driven apply must refuse a new apply")
 			assert.Contains(t, err.Error(), "schema change already in progress")
 			assert.Equal(t, state.Task.Running, running.State, "the driven task must be left untouched")
@@ -464,7 +464,7 @@ func TestConflictCheckRefusesForeignTerminalReport(t *testing.T) {
 	}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "another process's task must not be stamped from this process's engine memory")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Running, running.State, "the task must be left for driver recovery")
@@ -498,7 +498,7 @@ func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
 	}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.NoError(t, err, "this process's own terminal report must settle the task and admit the new apply")
 	assert.Equal(t, state.Task.Completed, running.State, "the task must carry the engine's terminal state")
 	assert.NotNil(t, running.CompletedAt)
@@ -528,7 +528,7 @@ func TestConflictCheckFailsAbandonedTaskWithStaleForeignLease(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.NoError(t, err, "an abandoned task under a crashed process's stale lease must be failed and unblock")
 	assert.Equal(t, state.Task.Failed, running.State)
 	assert.Contains(t, running.ErrorMessage, "server may have crashed")
@@ -549,7 +549,7 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.NoError(t, err, "new apply should proceed once the abandoned task is failed")
 	assert.Equal(t, state.Task.Failed, running.State)
 }
@@ -798,7 +798,7 @@ func TestConflictCheckReportsTheStoppedApplyHoldingTheDatabase(t *testing.T) {
 	}
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
 
-	blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "")
+	blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", 0)
 
 	require.True(t, blocking.blocks(), "a stopped task holds the database and refuses a new apply")
 	assert.Equal(t, "task-stopped", blocking.taskIdentifier)

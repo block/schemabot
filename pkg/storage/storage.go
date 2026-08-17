@@ -445,6 +445,17 @@ type ApplyStore interface {
 	// that operation after its auto-increment ID is known.
 	CreateWithGroupedOperations(ctx context.Context, apply *Apply, groups []*ApplyOperationWithTasks) (int64, error)
 
+	// AttachOperationWithTasks stores one additional apply_operations row and
+	// its tasks under an existing apply in a single transaction. The apply's
+	// state is re-read under a row lock inside the transaction and the attach
+	// fails with ErrApplyNotActive when it is terminal — new work must never
+	// land on an apply no drive will pick up again. The (apply_id, deployment,
+	// operation_key) unique index is the idempotency guard: a concurrent attach
+	// of the same operation loses with ErrApplyOperationExists, which the
+	// caller resolves by re-reading the winner's row. On success the operation's
+	// ID and every task's ID and ApplyOperationID are populated.
+	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
+
 	// Get returns an apply by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*Apply, error)
 
