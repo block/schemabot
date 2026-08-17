@@ -110,6 +110,46 @@ schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
 
 Users can also run `schemabot plan` manually in a PR comment to re-plan without waiting for auto-plan.
 
+The same flow as a timeline:
+
+```
+ Developer                GitHub PR               SchemaBot               Database
+     │                        │                       │                       │
+     │ push schema change     │                       │                       │
+     │───────────────────────▶│  webhook              │                       │
+     │                        │──────────────────────▶│ auto-plan             │
+     │                        │                       │──────────────────────▶│
+     │                        │  plan comment (DDL)   │      live schema      │
+     │  review the diff       │◀──────────────────────│◀──────────────────────│
+     │                        │                       │                       │
+     │ "schemabot apply       │                       │                       │
+     │  -e staging"           │  webhook              │                       │
+     │───────────────────────▶│──────────────────────▶│ re-plan, lock,        │
+     │                        │  confirmation footer  │ stage the apply       │
+     │                        │◀──────────────────────│                       │
+     │ "schemabot             │                       │                       │
+     │  apply-confirm         │                       │                       │
+     │  -e staging"           │  webhook              │                       │
+     │───────────────────────▶│──────────────────────▶│ review gate,          │
+     │                        │                       │ start execution       │
+     │                        │                       │──────────────────────▶│
+     │                        │  progress comment     │      execute DDL      │
+     │                        │◀───── updates ────────│◀───── progress ───────│
+     │                        │                       │ (row copy → cutover)  │
+     │                        │  check run → green    │                       │
+     │                        │◀──────────────────────│                       │
+     │ merge the PR           │                       │                       │
+     │───────────────────────▶│  webhook              │                       │
+     │                        │──────────────────────▶│ clean up PR state,    │
+     │                        │                       │ release locks         │
+     │                        │                       │                       │
+```
+
+The staging apply above repeats for each environment in the database's
+[environment order](configuration.md#environment-order); production applies are
+additionally gated on the staging check and the
+[review gate](configuration.md#review-gate).
+
 **Check Runs** — SchemaBot publishes aggregate GitHub checks that block merge until managed schema changes are applied. See [Status Checks and Branch Protection](#status-checks-and-branch-protection) below.
 
 **API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/v1/plan`, `/v1/apply`, `/v1/progress`, `/v1/cutover`, etc.

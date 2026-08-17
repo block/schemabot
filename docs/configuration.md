@@ -776,6 +776,8 @@ Approval is checked at the time of `schemabot apply` and `schemabot apply-confir
 
 ## Authentication
 
+This section is the YAML reference. For the model behind it (the trust surfaces, why the tiers are drawn where they are, the fail-closed principles, and what to monitor), read [auth.md](auth.md).
+
 By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated — every request is allowed, which suits local development and deployments where the network is the only boundary. Setting `auth.type` turns on per-request authentication and a two-tier authorization model:
 
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
