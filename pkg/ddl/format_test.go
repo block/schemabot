@@ -211,6 +211,31 @@ func TestCanonicalize(t *testing.T) {
 			expected: "DROP TABLE `users`",
 		},
 		{
+			name:     "generated column keeps its expression",
+			input:    "CREATE TABLE t (a INT, b INT AS (a * 2) STORED)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS(`a`*2) STORED)",
+		},
+		{
+			name:     "generated column keeps redundant parentheses",
+			input:    "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS ((a * 2)) VIRTUAL)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS((`a`*2)) VIRTUAL)",
+		},
+		{
+			name:     "parenthesized DEFAULT expression stays an expression",
+			input:    "CREATE TABLE t (a INT DEFAULT (1 + 2))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT (1+2))",
+		},
+		{
+			name:     "nested parentheses in a DEFAULT expression are preserved",
+			input:    "CREATE TABLE t (a INT DEFAULT ((1 + 2)))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT ((1+2)))",
+		},
+		{
+			name:     "function call in a DEFAULT expression keeps its call syntax",
+			input:    "CREATE TABLE t (a CHAR(36) DEFAULT (uuid()))",
+			expected: "CREATE TABLE `t` (`a` CHAR(36) DEFAULT (UUID()))",
+		},
+		{
 			name:     "invalid SQL returns original",
 			input:    "not valid sql",
 			expected: "not valid sql",
