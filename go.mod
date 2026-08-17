@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/block/pg-sprite v0.0.0-20260814025010-d6cf677e4feb
-	github.com/block/spirit v0.16.1-0.20260815035524-fc3efbddfa34
+	github.com/block/spirit v0.16.1-0.20260817021341-7eec0bf5d21f
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -28,7 +28,6 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/moby/moby/api v1.54.2
 	github.com/pganalyze/pg_query_go/v6 v6.2.2
-	github.com/pingcap/tidb/pkg/parser v0.0.0-20260504140133-511dba1dbe17
 	github.com/planetscale/planetscale-go v0.155.0
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/prometheus/client_golang v1.23.2
@@ -212,8 +211,8 @@ require (
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pierrec/lz4 v2.6.1+incompatible // indirect
 	github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2 // indirect
-	github.com/pingcap/failpoint v0.0.0-20260406204437-bbc9d102c19e // indirect
 	github.com/pingcap/log v1.1.1-0.20260227082333-572e590d08f1 // indirect
+	github.com/pingcap/tidb/pkg/parser v0.0.0-20260504140133-511dba1dbe17 // indirect
 	github.com/pires/go-proxyproto v0.11.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/planetscale/pargzip v0.0.0-20201116224723-90c7fc03ea8a // indirect
