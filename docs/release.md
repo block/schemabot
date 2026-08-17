@@ -94,14 +94,15 @@ Nothing else is required. There is no manual artifact step.
 
 ## What the version number means
 
-Very little, on its own. SchemaBot is pre-1.0, and patch releases carry behavior
-changes.
+SchemaBot is pre-1.0, so the version number is an ordering label rather than a
+compatibility promise. A patch bump tells you a release is newer, not that it is a
+drop-in replacement, and it can carry a behavior change.
 
-Compatibility is carried by the [pre-tag checks](#pre-tag-checks) and by the
-release notes, which call out every change that needs an operator to do
-something: a config edit, a changed default, a deploy ordering constraint, a
-storage schema change. Treat the notes as the contract and the version number as
-a label.
+The compatibility signal lives in two places instead. The
+[pre-tag checks](#pre-tag-checks) below are what every release has to clear, and
+the release notes spell out anything a release asks of an operator: a config edit,
+a changed default, a deploy ordering constraint, a storage schema change. Read the
+notes as the contract.
 
 ## Cadence and release boundaries
 
