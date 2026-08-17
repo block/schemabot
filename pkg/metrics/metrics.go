@@ -956,6 +956,22 @@ func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome
 	)
 }
 
+// RecordRemoteApplyKeyEchoMismatch increments the counter for remote dispatches
+// whose accepted response echoed a different operation key than the request's
+// shape derives to, so the control plane refused the response's remote ids and
+// failed the dispatch closed. A spike means a data plane is answering
+// deployment-keyed dispatches without attaching sibling operations — most often
+// a data plane running a version that predates sibling-operation attach —
+// so the operator action is to upgrade (or roll back) the named database's data
+// plane before retrying the blocked applies.
+func RecordRemoteApplyKeyEchoMismatch(ctx context.Context, database, environment string) {
+	addCounter(ctx, "schemabot.remote_apply_key_echo_mismatch_total",
+		"Total remote apply dispatches refused because the response's operation key did not match the dispatched operation", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.
