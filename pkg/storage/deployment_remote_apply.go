@@ -33,12 +33,32 @@ func (op *ApplyOperation) RemoteApplyID() string {
 // Operations of other deployments are ignored: sibling deployments of the
 // same apply legitimately carry their own distinct remote apply ids.
 func DeploymentRemoteApplyID(ops []*ApplyOperation, deployment string) (string, error) {
+	return deploymentSharedID(ops, deployment, (*ApplyOperation).RemoteApplyID)
+}
+
+// DeploymentExternalID resolves the deployment's shared data-plane apply id
+// from the external_id column alone, without the legacy engine resume context
+// fallback. Read paths that span both local and remote drives must use this
+// variant: on locally driven operations engine_resume_context holds
+// engine-owned resume state, which must never surface as an apply id.
+// Locally driven operations never record an external_id, so this returns ""
+// for them; the divergence error semantics match DeploymentRemoteApplyID.
+func DeploymentExternalID(ops []*ApplyOperation, deployment string) (string, error) {
+	return deploymentSharedID(ops, deployment, func(op *ApplyOperation) string { return op.ExternalID })
+}
+
+// deploymentSharedID resolves the single id shared by one deployment's
+// operations, reading each row's candidate id with idOf. It returns "" when
+// no operation of the deployment has recorded an id yet, and an error when
+// the deployment's operations disagree. Operations of other deployments are
+// ignored.
+func deploymentSharedID(ops []*ApplyOperation, deployment string, idOf func(*ApplyOperation) string) (string, error) {
 	shared := ""
 	for _, op := range ops {
 		if op == nil || op.Deployment != deployment {
 			continue
 		}
-		id := op.RemoteApplyID()
+		id := idOf(op)
 		if id == "" {
 			continue
 		}

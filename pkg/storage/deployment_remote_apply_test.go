@@ -87,3 +87,48 @@ func TestDeploymentRemoteApplyID(t *testing.T) {
 		assert.Contains(t, err.Error(), `deployment "west"`)
 	})
 }
+
+func TestDeploymentExternalID(t *testing.T) {
+	t.Run("all siblings agree", func(t *testing.T) {
+		ops := []*ApplyOperation{
+			{ID: 1, Deployment: "west", ExternalID: "apply-remote-1"},
+			{ID: 2, Deployment: "west", ExternalID: "apply-remote-1"},
+			{ID: 3, Deployment: "west"},
+		}
+		id, err := DeploymentExternalID(ops, "west")
+		require.NoError(t, err)
+		assert.Equal(t, "apply-remote-1", id)
+	})
+
+	t.Run("legacy resume context carrier is not an external id", func(t *testing.T) {
+		ops := []*ApplyOperation{
+			{ID: 1, Deployment: "west", EngineResumeContext: "engine-owned-resume-state"},
+			{ID: 2, Deployment: "west", EngineResumeContext: "other-engine-state"},
+		}
+		id, err := DeploymentExternalID(ops, "west")
+		require.NoError(t, err)
+		assert.Empty(t, id, "engine resume state must never surface as an apply id")
+	})
+
+	t.Run("disagreeing siblings fail closed", func(t *testing.T) {
+		ops := []*ApplyOperation{
+			{ID: 1, Deployment: "west", ExternalID: "apply-remote-1"},
+			{ID: 2, Deployment: "west", ExternalID: "apply-remote-2"},
+		}
+		id, err := DeploymentExternalID(ops, "west")
+		require.Error(t, err)
+		assert.Empty(t, id)
+		assert.Contains(t, err.Error(), "apply-remote-1")
+		assert.Contains(t, err.Error(), "apply-remote-2")
+	})
+
+	t.Run("sibling deployments keep their own ids", func(t *testing.T) {
+		ops := []*ApplyOperation{
+			{ID: 1, Deployment: "west", ExternalID: "apply-remote-west"},
+			{ID: 2, Deployment: "east", ExternalID: "apply-remote-east"},
+		}
+		id, err := DeploymentExternalID(ops, "east")
+		require.NoError(t, err)
+		assert.Equal(t, "apply-remote-east", id)
+	})
+}
