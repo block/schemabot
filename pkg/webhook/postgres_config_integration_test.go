@@ -21,6 +21,10 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
+// postgresConfigFixtureDeadline bounds a real containerized PostgreSQL apply
+// (plan, queue, operator drive, target verification), which needs more
+// headroom than the in-process waits webhookIntegrationCheckRunDeadline is
+// sized for.
 const postgresConfigFixtureDeadline = 30 * time.Second
 
 // A repository config selecting PostgreSQL routes the declarative schema
@@ -75,7 +79,8 @@ func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 }
 
 // A repository config selecting PostgreSQL surfaces a statement outside the
-// optimistic native-safe slice as a typed blocked plan and never queues apply.
+// optimistic native-safe slice as a typed blocked plan, and the apply gate
+// refuses to queue it when an apply is attempted anyway.
 func TestPostgresConfigFixtureSurfacesBlockedPlan(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres-blocked")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
@@ -93,6 +98,16 @@ func TestPostgresConfigFixtureSurfacesBlockedPlan(t *testing.T) {
 	require.Len(t, plan.Changes[0].TableChanges, 1)
 	assert.True(t, plan.Changes[0].TableChanges[0].EngineBlocked())
 	assert.Equal(t, engine.ExecutionModeBlocked, plan.Changes[0].TableChanges[0].ExecutionMode)
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "blocked change")
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
 
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
