@@ -106,7 +106,11 @@ func (e *Engine) executeDropDirectly(ctx context.Context, host, username, passwo
 			e.emitTableLog(target.table, "table was already absent; nothing to drop")
 			continue
 		}
-		drop := fmt.Sprintf("DROP TABLE %s.%s",
+		// IF EXISTS carries the convergence through the window between the
+		// check above and the drop itself: a table another actor removes in
+		// that window has already reached the state the plan asked for, and
+		// the check is what decides whether to report the table as absent.
+		drop := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",
 			sqlescape.EscapeIdentifier(target.schema), sqlescape.EscapeIdentifier(target.table))
 		if err := e.executeSingleStatement(ctx, host, username, password, database, drop); err != nil {
 			return fmt.Errorf("drop table `%s`.`%s`: %w", target.schema, target.table, err)
