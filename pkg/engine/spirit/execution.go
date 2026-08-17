@@ -11,11 +11,9 @@ import (
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
 // maxCommitLatency is the commit-latency throttle threshold: the copy backs
@@ -34,7 +32,7 @@ const maxCommitLatency = 100 * time.Millisecond
 // the instance vCPU count) and, when autoscaling is enabled, scale
 // dynamically from there on throttler feedback, so apply throughput tracks
 // the target instance rather than a fixed constant.
-func (e *Engine) newSpiritMigration(ctx context.Context, host, username, password, database, stmt string) *spiritmigration.Migration {
+func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
 	threads, chunkTime, lockTimeout := e.copySettings()
 	return &spiritmigration.Migration{
 		Host:                          host,
@@ -51,63 +49,7 @@ func (e *Engine) newSpiritMigration(ctx context.Context, host, username, passwor
 		ChecksumYieldTimeout:          e.checksumYieldTimeout,
 		MaxCommitLatency:              maxCommitLatency,
 		EnableExperimentalAutoscaling: e.autoscaling,
-		EnableExperimentalGTID:        e.gtidChangeSourceSupported(ctx, host, username, password, database),
 	}
-}
-
-// gtidChangeSourceSupported reports whether the target can serve Spirit's
-// GTID-based change source. The change source is Spirit's bookmark into the
-// target's replication stream while a schema change copies a table: binlog
-// file+position works on every target but is tied to one server's binlog
-// files, while a GTID set stays valid across binlog rotation and failover,
-// letting an interrupted schema change resume where file+position would have
-// to restart the copy. Spirit refuses to start the GTID source on a target
-// without gtid_mode=ON, so the source is chosen per target: GTID-capable
-// targets get the stronger source, every other target keeps binlog
-// file+position, and a target that enables GTIDs later picks up the GTID
-// source automatically on its next schema change. A checkpoint written under
-// one source cannot be resumed under the other — the copy restarts from the
-// beginning, which is safe but loses progress. Whichever source is chosen,
-// Spirit's pre-cutover checksum turns a missed change into a failed apply,
-// never silent divergence.
-func (e *Engine) gtidChangeSourceSupported(ctx context.Context, host, username, password, database string) bool {
-	logger := e.changeLogger()
-	cfg := mysql.NewConfig()
-	cfg.User = username
-	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = host
-	cfg.DBName = database
-	db, err := mysqlconn.Open(cfg.FormatDSN())
-	if err != nil {
-		logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
-			"target_host", host, "database", database, "error", err)
-		return false
-	}
-	defer utils.CloseAndLog(db)
-
-	if err := db.PingContext(ctx); err != nil {
-		logger.Warn("failed to connect to target for GTID support probe, using the binlog file+position change source",
-			"target_host", host, "database", database, "error", err)
-		return false
-	}
-
-	var gtidMode, enforceConsistency string
-	if err := db.QueryRowContext(ctx,
-		`SELECT @@global.gtid_mode, @@global.enforce_gtid_consistency`).Scan(&gtidMode, &enforceConsistency); err != nil {
-		logger.Warn("failed to probe target GTID support, using the binlog file+position change source",
-			"target_host", host, "database", database, "error", err)
-		return false
-	}
-	if gtidMode != "ON" || enforceConsistency != "ON" {
-		logger.Info("target does not support GTID, using the binlog file+position change source",
-			"target_host", host, "database", database,
-			"gtid_mode", gtidMode, "enforce_gtid_consistency", enforceConsistency)
-		return false
-	}
-	logger.Info("target supports GTID, using the GTID change source",
-		"target_host", host, "database", database)
-	return true
 }
 
 // executeSchemaChange runs the Spirit schema change synchronously.
@@ -374,7 +316,7 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 		"type", stmtType,
 	)
 
-	migration := e.newSpiritMigration(ctx, host, username, password, database, stmt)
+	migration := e.newSpiritMigration(host, username, password, database, stmt)
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
@@ -414,7 +356,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		ddls = append(ddls, p.Statement)
 	}
 
-	migration := e.newSpiritMigration(ctx, host, username, password, database, combinedStatement)
+	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover
 	migration.RespectSentinel = deferCutover // Only wait for sentinel when deferring cutover
 
