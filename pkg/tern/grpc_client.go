@@ -2171,6 +2171,11 @@ func (c *GRPCClient) operationCutoverCaller(ctx context.Context, apply *storage.
 		return ""
 	}
 	if controlReq == nil {
+		// Expected whenever the request settled before this operation's claim
+		// reached the swap — a sibling operation's drive resolving it, or a
+		// recovery claim re-driving a cutover already sent.
+		c.applyLogger(apply).DebugContext(ctx, "no pending cutover request names an operator; the data plane will record the forwarding path",
+			apply.MutableLogAttrs()...)
 		return ""
 	}
 	return controlReq.RequestedBy

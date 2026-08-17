@@ -728,6 +728,12 @@ func (s *capturingTernServer) getCancelApplyID() string {
 	return s.cancelApplyID
 }
 
+func (s *capturingTernServer) getCutoverCaller() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cutoverCaller
+}
+
 func (s *capturingTernServer) getStopCaller() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3266,6 +3272,57 @@ func TestGRPCClient_ResumeApplyOperationCutoverDrivesParkedOperation(t *testing.
 	assert.True(t, state.IsState(task.State, state.Task.Completed),
 		"the operation's task should reach completed; got %q", task.State)
 	assert.Equal(t, "remote-east", operationStore.ops[siblingID].EngineResumeContext, "the sibling must be untouched")
+}
+
+// The deployment-ordered cutover is routed by the claim rather than by the
+// durable request, so nothing hands the drive an operator's name. It reads the
+// requester back from the apply-level cutover request the operator queued, and
+// the swap is only attributed correctly if that name reaches the RPC. When no
+// request is pending — a sibling's drive resolved it, or this is a recovery
+// re-drive — the swap still proceeds, unattributed.
+func TestGRPCClient_OperationCutoverForwardsTheOperator(t *testing.T) {
+	driveCutover := func(t *testing.T, pending []*storage.ApplyControlRequest) *capturingTernServer {
+		t.Helper()
+		server := &capturingTernServer{
+			cutoverAccepted:  true,
+			progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+			progressStateSet: true,
+		}
+		client, cleanup := testCapturingGRPCClient(t, server)
+		t.Cleanup(cleanup)
+
+		apply := newCutoverDriveApply()
+		operationID, siblingID := int64(42), int64(43)
+		st, _, operationStore, _ := buildCutoverDriveStorage(apply, operationID, siblingID, state.ApplyOperation.WaitingForCutover, "remote-op-west")
+		st.controlRequests = &testControlRequestStore{requests: pending}
+		client.storage = st
+
+		scope := applyTaskScope{applyOperationID: operationID, operation: operationStore.ops[operationID], multiOperation: true}
+		poll, err := client.triggerRemoteOperationCutover(t.Context(), apply, scope, "remote-op-west")
+		require.NoError(t, err)
+		assert.True(t, poll, "a swap forced at the barrier must be polled to terminal")
+		return server
+	}
+
+	t.Run("names the operator who queued the cutover", func(t *testing.T) {
+		server := driveCutover(t, []*storage.ApplyControlRequest{{
+			ApplyID:     7,
+			Operation:   storage.ControlOperationCutover,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "octocat",
+			CreatedAt:   time.Now(),
+		}})
+		assert.Equal(t, "remote-op-west", server.getCutoverApplyID())
+		assert.Equal(t, "octocat", server.getCutoverCaller(),
+			"the data plane must record the operator whose cutover this drive is carrying out")
+	})
+
+	t.Run("proceeds unattributed when no request is pending", func(t *testing.T) {
+		server := driveCutover(t, nil)
+		assert.Equal(t, "remote-op-west", server.getCutoverApplyID(),
+			"a settled request must not stop the swap")
+		assert.Empty(t, server.getCutoverCaller())
+	})
 }
 
 // A stale-lease recovery whose remote already left the barrier must not re-issue
