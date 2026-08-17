@@ -25,7 +25,9 @@ import (
 // Deployment-shape errors in that class (for example an own-App slug the
 // Check Run trust check cannot verify) may not clear on a re-drive alone, but
 // they are bounded by the driver's retry budget, so the gate does not
-// maintain a separate taxonomy for them.
+// maintain a separate taxonomy for them. suppressRetryComments silences the
+// read-failure comments on durable attempts, where the driver retries and
+// posts the single terminal answer instead; merit blocks always comment.
 //
 // For environments: [sandbox, staging, production]
 //   - applying to sandbox: no prior envs, always allowed
@@ -45,6 +47,7 @@ func (h *Handler) checkPriorEnvironments(
 	database, dbType, environment string,
 	environments []string,
 	installationID int64,
+	suppressRetryComments bool,
 ) (blocked bool, err error) {
 	config := h.service.Config()
 
@@ -89,7 +92,7 @@ func (h *Handler) checkPriorEnvironments(
 
 		if config.IsEnvironmentAllowed(priorEnv) {
 			// This instance owns the prior environment — check local database
-			blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID)
+			blocked, err := h.checkPriorEnvViaLocal(ctx, repo, pr, database, dbType, environment, priorEnv, installationID, suppressRetryComments)
 			if err != nil {
 				return false, err
 			}
@@ -98,7 +101,7 @@ func (h *Handler) checkPriorEnvironments(
 			}
 		} else {
 			// Another instance owns this environment — check GitHub Checks API
-			blocked, err := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID)
+			blocked, err := h.checkPriorEnvViaGitHub(ctx, repo, pr, database, environment, priorEnv, installationID, suppressRetryComments)
 			if err != nil {
 				return false, err
 			}
@@ -155,6 +158,7 @@ func (h *Handler) checkPriorEnvViaLocal(
 	ctx context.Context, repo string, pr int,
 	database, dbType, environment, priorEnv string,
 	installationID int64,
+	suppressRetryComments bool,
 ) (blocked bool, err error) {
 	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, database, dbType, environment, priorEnv)
 	if err != nil {
@@ -163,8 +167,10 @@ func (h *Handler) checkPriorEnvViaLocal(
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
 			"error", err)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage"))
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage"))
+		}
 		return false, fmt.Errorf("prior environment gate read stored check for %s: %w", priorEnv, err)
 	}
 
@@ -277,13 +283,16 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	ctx context.Context, repo string, pr int,
 	database, environment, priorEnv string,
 	installationID int64,
+	suppressRetryComments bool,
 ) (blocked bool, err error) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		h.logger.Error("failed to create GitHub client for prior env check, stopping apply",
 			"prior_env", priorEnv, "error", err)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client"))
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client"))
+		}
 		return false, fmt.Errorf("prior environment gate create GitHub client for %s: %w", priorEnv, err)
 	}
 
@@ -291,8 +300,10 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	if err != nil {
 		h.logger.Error("failed to fetch PR for prior env check, stopping apply",
 			"prior_env", priorEnv, "error", err)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details"))
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details"))
+		}
 		return false, fmt.Errorf("prior environment gate fetch PR %s#%d for %s: %w", repo, pr, priorEnv, err)
 	}
 
@@ -305,8 +316,10 @@ func (h *Handler) checkPriorEnvViaGitHub(
 			"environment", environment, "prior_environment", priorEnv,
 			"head_sha", prInfo.HeadSHA,
 			"check_name", checkName, "error", err)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs"))
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs"))
+		}
 		return false, fmt.Errorf("prior environment gate query check run %q for %s: %w", checkName, priorEnv, err)
 	}
 

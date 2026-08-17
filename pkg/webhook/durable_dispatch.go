@@ -494,6 +494,9 @@ func (h *Handler) claimedAutoPlanHeadConfirmedStale(ctx context.Context, driverI
 // never changes the inbox row's terminal disposition.
 func (h *Handler) postDurableCommandTerminalComment(event *storage.WebhookEvent, processErr error) {
 	if event.Event != "issue_comment" {
+		h.logger.Debug("durable webhook driver skipped the terminal command comment because the exhausted delivery is not a command",
+			"delivery_id", event.DeliveryID, "event", event.Event, "action", event.Action,
+			"repo", event.Repository, "pr", event.PullRequest)
 		return
 	}
 	result, repo, pr, installationID, requestedBy, err := durableIssueCommentCommand(event)

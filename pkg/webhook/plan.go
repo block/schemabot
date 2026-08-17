@@ -55,12 +55,12 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
 		}
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err, false)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
 	}
 	if err := h.attachServerEnvironments(schemaResult, environment); err != nil {
-		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err)
+		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err, false)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
 		return
 	}
@@ -206,7 +206,7 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 	// The plan handler is not a durable core, so an authorization evaluation
 	// failure blocks the plan the same as a merit denial (fail closed); the
 	// gate has already logged and posted the distinction.
-	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan)
+	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, authzClient, repo, pr, installationID, requestedBy, databaseName, dbConfig.Type, environment, action.Plan, false)
 	return authErr != nil || blocked
 }
 
@@ -248,7 +248,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
@@ -258,7 +258,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
 			}
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr, false)
 			return
 		}
 		schemaDatabase = config.Database
@@ -270,7 +270,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 					"repo", repo, "pr", pr, "error", findErr)
 				return
 			}
-			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr)
+			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
 		schemaDatabase = config.Database
@@ -287,7 +287,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		if isAutoPlan {
 			h.postFailingAggregateForMultiEnvSetupError(ctx, client, repo, pr, schemaDatabase, envErr)
 		}
-		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
+		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr, false)
 		return
 	}
 	environments, envErr := h.allowedDatabaseEnvironments(schemaDatabase)
@@ -295,7 +295,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		if isAutoPlan {
 			h.postFailingAggregateForMultiEnvSetupError(ctx, client, repo, pr, schemaDatabase, envErr)
 		}
-		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr)
+		h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, envErr, false)
 		return
 	}
 	// Ownership is only fully decided once the discovered database resolves in
@@ -533,8 +533,11 @@ func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context,
 // reports whether the error is a recognized user-facing rejection — the
 // command's answer, which the same input will always reproduce — as opposed to
 // an unexpected failure (for example a transient GitHub read error) that a
-// durable driver may re-drive.
-func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID int64, environment, databaseName, requestedBy, commandName string, err error) bool {
+// durable driver may re-drive. suppressRetryComments silences only the
+// unexpected-failure fallback comment on durable attempts, where the driver
+// retries and posts the single terminal answer instead; recognized rejections
+// always comment because they are the command's answer.
+func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID int64, environment, databaseName, requestedBy, commandName string, err error, suppressRetryComments bool) bool {
 	data := templates.SchemaErrorData{
 		RequestedBy:  requestedBy,
 		Timestamp:    time.Now().UTC().Format("2006-01-02 15:04:05"),
@@ -614,8 +617,10 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	h.logger.Error("schema request failed", logFields...)
 	metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "unexpected")
-	data.ErrorDetail = err.Error()
-	h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+	if !suppressRetryComments {
+		data.ErrorDetail = err.Error()
+		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+	}
 	return false
 }
 
