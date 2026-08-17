@@ -270,8 +270,10 @@ the Spirit dependency. The other engines do not have this exposure: a Vitess
 change is a PlanetScale deploy request that the Vitess side owns and tracks, so
 there is no checkpoint on SchemaBot's side that has to stay compatible.
 
-How much an app restart costs depends on the change. Adding a column is instant DDL
-and completes in milliseconds, so there is nothing to pick up. A change that needs
+How much an app restart costs depends on the change. Adding a column is usually
+instant DDL and completes in milliseconds, so there is nothing to pick up. (Spirit
+asserts `ALGORITHM=INSTANT` and lets MySQL decide, so when a table cannot take the
+change instantly it falls back to the copy path below.) A change that needs
 a table copy, such as adding an index, can run for hours to weeks on a large table.
 To prevent an app restart from losing progress, Spirit keeps a small checkpoint
 table alongside the table being changed and rewrites a single row in it as the copy
@@ -279,13 +281,13 @@ progresses: how far the copy has reached, how far verification has reached, the
 binlog position, and the statement being applied. On restart it reads that row and
 picks up from there instead of copying the table again.
 
-This is typically safe, but when the Spirit dependency upgrades, it's important to
-verify the checkpoint format between the new and old version are the same, since a
-checkpoint format change will require rebuilding the checkpoint table from scratch,
-and hence losing all table copy progress and needing to start over from the
-beginning. The best mitigation for this is to ensure all long running schema
-changes finish before doing the upgrade (e.g. via the `schemabot status` CLI
-command).
+This is typically safe, but when the Spirit dependency upgrades, it is important
+to verify the checkpoint format is the same between the old and new versions:
+diff Spirit's `pkg/checkpoint` between the two pins. A checkpoint format change
+means the checkpoint table gets rebuilt from scratch, losing all table copy
+progress and starting the copy over from the beginning. The best mitigation is to
+ensure all long-running schema changes finish before doing the upgrade (e.g. via
+the `schemabot status` CLI command).
 
 ### 5. Wire protocol
 
