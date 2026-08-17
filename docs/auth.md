@@ -12,6 +12,7 @@
   - [`none`: allow-all, but observable](#none-allow-all-but-observable)
   - [`oidc`: Bearer tokens](#oidc-bearer-tokens)
   - [`forward_auth`: authenticating proxy](#forward_auth-authenticating-proxy)
+- [Calling SchemaBot as a service](#calling-schemabot-as-a-service)
 - [Per-database operator scoping](#per-database-operator-scoping)
 - [GitHub-side authorization](#github-side-authorization)
 - [Group and team matching](#group-and-team-matching)
@@ -49,6 +50,16 @@ mesh. At this step every authenticated user can read, and writes are limited
 to the admin groups you name. For many deployments this is the destination:
 humans read, admins operate, and changes flow through the PR workflow.
 
+```yaml
+auth:
+  type: oidc
+  issuer: "https://issuer.example.com"
+  audience: "schemabot"
+```
+
+(Each authenticator's full configuration, including the `forward_auth`
+equivalent, is shown in [its section below](#api-authenticators).)
+
 **Step 2: narrow reads, if you need to.** Reads are deployment-wide
 visibility, not access to data, so most deployments leave them open to any
 authenticated caller. Set `read_groups` only when even visibility needs a
@@ -84,6 +95,15 @@ trusted on one surface holds no standing on another.
 | `/livez`, `/health`, `/tern-health/*` | Kubernetes probes, load balancers | Unauthenticated by design: probes carry no credentials | — |
 | Metrics | Prometheus scrapers | Served on a dedicated listener, never on the API port | — |
 
+What the credential looks like on the wire, per surface:
+
+```
+POST /webhook        X-Hub-Signature-256: sha256=…        HMAC of the body
+GET  /api/status     Authorization: Bearer eyJ…           oidc
+GET  /api/status     X-Forwarded-User: jane               forward_auth, set by the proxy
+GET  /livez          (no credentials)
+```
+
 One channel is deliberately absent from the table: the gRPC connection between
 a control plane and its data planes. SchemaBot dials the endpoints listed in
 `tern_deployments` and trusts what answers, so securing that channel (mTLS,
@@ -101,6 +121,11 @@ history, database discovery, and `pull`, which exports a live schema. The
 **write tier** is anything that stages or makes a change: `plan`, `apply`, the
 control operations (`stop`, `start`, `cutover`, `volume`, `revert`,
 `skip-revert`, `rollback`), lock acquire and release, and settings mutation.
+
+```
+read:   GET  /api/status      GET  /api/locks      POST /api/pull
+write:  POST /api/plan        POST /api/apply      POST /api/locks/acquire
+```
 
 Two classification choices are deliberate, and both err toward write.
 
@@ -183,6 +208,14 @@ authenticators. Under `oidc` a valid token clears the read tier, only the admin
 groups clear the write tier, and there is no operator branch. Under `none`
 everything is allowed, counted, and logged.
 
+A worked example: a caller whose forwarded groups include
+`myorg/payments-team` sends `POST /api/apply` for the `payments` database in
+`staging`. The middleware admits the request, because `myorg/payments-team` is
+listed in some database's `operator_groups`. The handler then resolves the
+target from the stored plan, sees that the caller's group grants `payments`
+and that `staging` is in `operator_environments`, and allows. The same caller
+targeting `production`, or any other database, gets a `403` at the handler.
+
 A few operations take the admin exit only. Settings mutation, checks
 maintenance, and webhook redrive have no single target database to scope to, so
 the operator branch never applies to them: `write_groups` or nothing.
@@ -198,17 +231,42 @@ The default. Every request is allowed and attributed to a synthetic anonymous
 user. This suits local development, and deployments where the network is
 genuinely the only boundary.
 
+```yaml
+auth:
+  type: none    # or leave auth unset entirely
+```
+
 Allow-all does not mean invisible. Every request is still recorded in the
 auth-decision metric with reason `auth_disabled`, and every write operation is
 logged with its method, path, and remote address. If someone port-forwards to
 the pod and starts mutating things, a deployment running without authentication
-has an alertable signal for it instead of silence.
+has an alertable signal for it instead of silence:
+
+```
+schemabot.auth_decisions.total{tier="write", decision="allow", reason="auth_disabled"}
+```
 
 ### `oidc`: Bearer tokens
 
 The server validates a JWT on each request against the issuer's public keys
 (JWKS), fetched and cached via OIDC discovery. It never calls the provider at
 request time, so any spec-compliant OIDC provider works.
+
+```yaml
+auth:
+  type: oidc
+  issuer: "https://issuer.example.com"   # required
+  audience: "schemabot"                  # required: the expected aud claim
+  groups_claim: "groups"                 # optional (default "groups")
+```
+
+Callers pass the token as a Bearer header; the CLI takes it via `--token` or
+`SCHEMABOT_TOKEN`:
+
+```
+GET /api/status
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs…
+```
 
 The `aud` claim is required and always checked. Skipping it would accept a
 token minted for any other application that happens to share the issuer.
@@ -223,6 +281,30 @@ are not consulted on this authenticator. They belong to `forward_auth`.
 Use this when a reverse proxy has already authenticated the caller and forwards
 the identity as HTTP headers. This is the pattern used by the Kubernetes API
 server's authenticating proxy, Grafana's auth proxy, and oauth2-proxy.
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    user_header: X-Forwarded-User        # optional (default)
+    groups_header: X-Forwarded-Groups    # optional (default)
+    # Trust anchor: configure at least one.
+    trusted_proxy_spiffe:
+      - spiffe://example.org/ns/ingress/sa/proxy
+    trusted_proxy_cidrs:
+      - 10.0.0.0/8
+    read_groups: []                      # empty = any authenticated caller reads
+    write_groups: [myorg/schema-admins]
+```
+
+A request as the server sees it, after the proxy has authenticated the caller:
+
+```
+POST /api/plan
+X-Forwarded-User: jane
+X-Forwarded-Groups: myorg/schema-admins,myorg/payments-team
+X-Forwarded-Client-Cert: …;URI=spiffe://example.org/ns/ingress/sa/proxy
+```
 
 Forwarded headers are only as trustworthy as the path they arrived by, so the
 server's job splits in two: first prove the request actually came from the
@@ -251,12 +333,68 @@ satisfies the read tier, so a write grant never needs a parallel read grant to
 be usable.
 
 An optional second lane serves services calling as themselves rather than on
-behalf of a user. A caller-forwarding gateway terminates the service's mTLS,
-verifies its client certificate, and forwards the caller's SPIFFE ID in a
-dedicated header. The lane is honored only when the XFCC-verified peer is a
-listed gateway, only for callers on an explicit read allowlist, and never for
-writes. Its fail-closed pairing rules are in
+behalf of a user. It has its own section:
+[calling SchemaBot as a service](#calling-schemabot-as-a-service).
+
+## Calling SchemaBot as a service
+
+Not every caller is a person. A schema inventory that pulls live schemas, a
+dashboard that polls apply status, another platform that watches lock state:
+these are services calling SchemaBot as themselves, with their own identity
+rather than a forwarded user's. Both authenticators support this, and on both
+the shape is the same: the service gets the read tier, and every log line and
+metric attributes the request to the service's own identity.
+
+**Service callers are read-only by design.** The read tier already gives a
+service everything it needs to observe the deployment: status, history, locks,
+and `pull`. The write tier stays with identities that carry accountability, a
+GitHub user on the PR workflow or a person behind the CLI, so there is no
+configuration that grants a service the write tier.
+
+Under `oidc`, a service is just another token holder. It presents a JWT minted
+for SchemaBot's audience, typically through the client-credentials grant, and
+a valid token clears the read tier. Writes additionally require an admin group
+in the token's groups claim, which service tokens usually do not carry.
+
+Under `forward_auth`, forwarding a user identity does not fit a service, so a
+dedicated lane exists. A caller-forwarding gateway terminates the service's
+mTLS, verifies its client certificate, and forwards the verified SPIFFE ID in
+a dedicated header (`caller_spiffe_header`). The server honors that header
+only when everything lines up: the request provably arrived through a gateway
+listed in `trusted_gateway_spiffe`, the forwarded caller is in the
+`read_service_spiffe` allowlist, and the request is read-tier. The user and
+groups headers are never read on this lane, so a gateway can vouch for a
+service but can never inject a user identity.
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    trusted_proxy_spiffe:                # the lane requires SPIFFE-anchored trust
+      - spiffe://example.org/ns/ingress/sa/proxy
+    trusted_gateway_spiffe:              # gateways allowed to vouch for a caller
+      - spiffe://example.org/ns/service-ingress/sa/gateway
+    read_service_spiffe:                 # services granted read-tier access
+      - spiffe://example.org/ns/reporting/sa/reporting
+    caller_spiffe_header: X-Forwarded-Caller-Spiffe-Id   # optional (default)
+```
+
+A service request as the server sees it, arriving through the gateway:
+
+```
+GET /api/status
+X-Forwarded-Client-Cert: …;URI=spiffe://example.org/ns/service-ingress/sa/gateway
+X-Forwarded-Caller-Spiffe-Id: spiffe://example.org/ns/reporting/sa/reporting
+```
+
+The lane fails closed like everything else. A gateway list without callers,
+callers without a gateway, or the lane without SPIFFE-anchored proxy trust
+each refuse to start; the pairing rules are in
 [the configuration reference](configuration.md#forward-auth-authenticating-proxy).
+The allowlist is exact, and every denial is logged and counted with its own
+reason (an unlisted caller, a missing forwarded identity, a write attempt), so
+onboarding a new service caller is a config change you can verify from the
+auth-decision metric.
 
 ## Per-database operator scoping
 
@@ -266,6 +404,26 @@ step: letting a database's owning team mutate their own database directly,
 without handing them the rest of the deployment. The database carries
 `operator_groups`, and the server carries `operator_environments`, the
 instance-wide list of environments where scoped writes are allowed at all.
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    operator_environments: [staging]     # scoped writes allowed here, instance-wide
+databases:
+  payments:
+    type: mysql
+    operator_groups: [myorg/payments-team]
+    environments:
+      staging:
+        dsn: "env:STAGING_PAYMENTS_DSN"
+      production:
+        dsn: "env:PROD_PAYMENTS_DSN"
+```
+
+With this config, `myorg/payments-team` can plan and apply against
+`payments` in `staging` directly, and nothing else: not `production`, and not
+any other database.
 
 The decision happens in two phases because of an ordering problem: the
 middleware runs before the request body is parsed, so at admission time the
@@ -297,7 +455,18 @@ production environment, add a trusted-source or stored-plan gate.
 
 PR comment commands (`schemabot apply`, `stop`, `cutover`, and the rest) carry
 a GitHub identity, the comment author, and are authorized entirely within the
-GitHub domain. API auth plays no part in them. Two independent checks apply:
+GitHub domain. API auth plays no part in them.
+
+```yaml
+pr_command_authorization:
+  enabled: true
+  admin_teams: [myorg/db-admins]         # may command any database
+databases:
+  payments:
+    operator_teams: [myorg/payments-operators]   # may command this database
+```
+
+Two independent checks apply:
 
 - **Actor authorization** (`pr_command_authorization`) checks the commenting
   user against the admin teams and users, and against the target database's
@@ -326,6 +495,12 @@ segment when at least one side is a bare slug with no `/` in it. The bare-slug
 condition is what bounds the bridge: it lets an identity provider that emits
 `schema-admins` match a configured `org/schema-admins`, without letting
 `org-a/admins` match `org-b/admins` across organization boundaries.
+
+```
+caller "myorg/admins"     config "myorg/admins"        match (exact)
+caller "schema-admins"    config "myorg/schema-admins" match (bare-slug bridge)
+caller "org-a/admins"     config "org-b/admins"        no match (both qualified)
+```
 
 If your proxy forwards groups from more than one organization, org-qualify the
 entries of any list that decides a boundary, `operator_groups` especially. A
@@ -358,7 +533,11 @@ config with no trust anchor, an `operator_groups` grant without
 environments are allowed, a service-caller lane missing its counterpart list:
 each one refuses to start, because each one is a grant or a gate that could
 never do what its author intended. A server that starts anyway would just
-defer the surprise to the first request.
+defer the surprise to the first request. The errors name the exact pairing:
+
+```
+forward_auth read_service_spiffe requires at least one trusted_gateway_spiffe gateway
+```
 
 **Unauthenticated mode is loud.** `auth.type: none` logs every write and counts
 every request, so "we forgot to turn auth on" shows up on a dashboard rather
@@ -376,6 +555,12 @@ attribute vocabularies are in [pkg/metrics/README.md](../pkg/metrics/README.md).
 | `schemabot.pr_command_actor_authorization.total` | Webhook | PR comment command actor decisions: which principal granted access, or why the command was blocked |
 
 A spike in denials on any of them means one of two things: someone is probing,
-or a grant that should exist does not. Every deny is also logged with the
-subject, target, operation, and reason, so a single denied request is
-triageable from logs alone.
+or a grant that should exist does not. Watch for deny counts by reason, for
+example:
+
+```
+schemabot.auth_decisions.total{tier="write", decision="deny", reason="not_admin"}
+```
+
+Every deny is also logged with the subject, target, operation, and reason, so
+a single denied request is triageable from logs alone.

@@ -125,12 +125,7 @@ The same flow as a timeline:
      │ "schemabot apply       │                       │                       │
      │  -e staging"           │  webhook              │                       │
      │───────────────────────▶│──────────────────────▶│ re-plan, lock,        │
-     │                        │  confirmation footer  │ stage the apply       │
-     │                        │◀──────────────────────│                       │
-     │ "schemabot             │                       │                       │
-     │  apply-confirm         │                       │                       │
-     │  -e staging"           │  webhook              │                       │
-     │───────────────────────▶│──────────────────────▶│ review gate,          │
+     │                        │                       │ review gate,          │
      │                        │                       │ start execution       │
      │                        │                       │──────────────────────▶│
      │                        │  progress comment     │      execute DDL      │
@@ -152,7 +147,7 @@ additionally gated on the staging check and the
 
 **Check Runs** — SchemaBot publishes aggregate GitHub checks that block merge until managed schema changes are applied. See [Status Checks and Branch Protection](#status-checks-and-branch-protection) below.
 
-**API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/v1/plan`, `/v1/apply`, `/v1/progress`, `/v1/cutover`, etc.
+**API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/api/plan`, `/api/apply`, `/api/progress`, `/api/cutover`, etc.
 
 ### Status Checks and Branch Protection
 
