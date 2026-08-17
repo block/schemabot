@@ -18,6 +18,12 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
+// TelemetrySchemaURL is the semconv schema URL that schemabot's telemetry
+// attributes are written against. Host binaries embedding schemabot can
+// compare it against their own SDK's default resource schema URL to detect
+// version skew between the two modules.
+const TelemetrySchemaURL = semconv.SchemaURL
+
 // Telemetry holds the OTel providers and the Prometheus HTTP handler.
 // Call Shutdown to flush and release resources on server exit.
 type Telemetry struct {

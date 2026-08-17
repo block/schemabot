@@ -2406,6 +2406,30 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		append(apply.LogAttrs(),
 			"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
 
+	// The projection is often the last writer standing on an apply — the drives
+	// that produced the operation states may be gone (a crashed driver, a
+	// lease-lost settle, stop reconciliation). Record the transition in the
+	// apply's own durable log so its timeline states how it reached the derived
+	// state instead of ending at the last claim entry. A swap that only stamps
+	// started_at while the state holds is not a transition, so it writes no
+	// timeline entry.
+	if state.IsState(apply.State, derived) {
+		s.logger.Debug("operator: derived apply state swap stamped started_at only; no state transition to record",
+			append(apply.LogAttrs(),
+				"driver", driverID, "derived_state", derived)...)
+	} else {
+		s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
+			ApplyID:   apply.ID,
+			Level:     storage.LogLevelInfo,
+			EventType: storage.LogEventStateTransition,
+			Source:    storage.LogSourceSchemaBot,
+			Message:   fmt.Sprintf("Apply state derived from its %d operation row(s): %s", len(ops), derived),
+			OldState:  apply.State,
+			NewState:  derived,
+			CreatedAt: s.clock.Now(),
+		}, "how the derived apply state was reached", append(apply.LogAttrs(), "driver", driverID)...)
+	}
+
 	// Own the active-apply gauge for multi-operation applies. The enqueue-time
 	// increment is keyed to the parent's primary deployment, and operation-scoped
 	// drives suppress the parent-level metric, so the projection that wins the

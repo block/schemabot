@@ -147,6 +147,25 @@ func escapeMarkdownLinkText(text string) string {
 	return strings.ReplaceAll(text, "]", "\\]")
 }
 
+// escapeInlineMarkdown backslash-escapes the characters that can change how
+// engine-influenced text renders inside an inline markdown span: emphasis and
+// code delimiters, link brackets, and HTML tag openers. Use it when untrusted
+// text is interpolated into styled inline markdown (for example inside an
+// italic span), where a stray delimiter would otherwise cut the styling short
+// or start a new construct.
+func escapeInlineMarkdown(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for _, r := range text {
+		switch r {
+		case '\\', '`', '*', '_', '[', ']', '<':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // maxCommentErrorLen bounds an error message rendered into a PR comment so a
 // pathological engine error cannot flood the comment. Genuine engine errors,
 // such as a Spirit preflight check reason, are a few hundred characters and

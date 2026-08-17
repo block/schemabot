@@ -25,6 +25,8 @@ CREATE TABLE `tasks` (
   `eta_seconds` int DEFAULT NULL,
   `checksum_rows_checked` bigint DEFAULT '0',
   `checksum_rows_total` bigint DEFAULT '0',
+  `throttled` tinyint(1) NOT NULL DEFAULT '0',
+  `throttle_reason` varchar(255) NOT NULL DEFAULT '',
   `cutover_attempts` int NOT NULL DEFAULT '0',
   `is_instant` tinyint(1) DEFAULT '0',
   `engine_migration_id` varchar(255) DEFAULT NULL,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -520,6 +521,62 @@ func TestResumeExistingDeployRequest_DeferredCutoverDeclinesRecoveredInstantDDL(
 	}
 }
 
+// Instant DDL has no revert window, so a recovered deploy request carrying an
+// instant decision must not take it when the change is unsafe — the change
+// would land with no way to revert it. The row-copy path keeps the revert
+// window, so the recorded decision is narrowed and the deploy still starts.
+func TestResumeExistingDeployRequest_UnsafeChangesDeclineRecoveredInstantDDL(t *testing.T) {
+	tests := []struct {
+		name        string
+		changes     []engine.SchemaChange
+		wantInstant bool
+	}{
+		{
+			name: "a DROP COLUMN declines the recorded instant decision",
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "ALTER TABLE `users` DROP COLUMN `email`"}},
+			}},
+			wantInstant: false,
+		},
+		{
+			name: "a DROP TABLE declines the recorded instant decision",
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "DROP TABLE `users`"}},
+			}},
+			wantInstant: false,
+		},
+		{
+			name: "a safe additive change keeps it",
+			changes: []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)"}},
+			}},
+			wantInstant: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/61"},
+			}
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-drop", DeployRequestID: 61, IsInstant: true}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Changes = tt.changes
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			require.NoError(t, err)
+			require.Equal(t, 1, client.deployCalls)
+			require.NotNil(t, client.lastDeploy)
+			assert.Equal(t, tt.wantInstant, client.lastDeploy.InstantDDL)
+		})
+	}
+}
+
 // A deferred deploy request recovered on resume must wait for the
 // operator-triggered deploy rather than being started automatically.
 func TestResumeExistingDeployRequest_DeferredIsNotDeployed(t *testing.T) {
@@ -759,4 +816,140 @@ func TestResumeExistingDeployRequest_ReattachRediscoversWhenApplyIdentifier(t *t
 	// Discovery found no real context (no DSN), so the apply identifier is kept
 	// rather than persisted.
 	assert.Empty(t, *persisted)
+}
+
+// declineEventMessages filters the operator-facing events down to the row-copy
+// decline announcements, so tests can assert the decline reached the apply's
+// timeline and not only the engine log.
+func declineEventMessages(events []engine.ApplyEvent) []string {
+	var msgs []string
+	for _, event := range events {
+		if strings.Contains(event.Message, "Deploying with a row copy rather than instant DDL") {
+			msgs = append(msgs, event.Message)
+		}
+	}
+	return msgs
+}
+
+// branchResumeClient serves the branch-resume path — a driver that crashed
+// after creating the branch but before the deploy request existed — without a
+// live PlanetScale API. The branch is ready, its schema already matches the
+// desired files (no remaining DDL to run), and the deploy request this resume
+// creates is instant-DDL eligible so the instant decision is actually reached.
+type branchResumeClient struct {
+	psclient.PSClient
+	deployCalls int
+	lastDeploy  *ps.PerformDeployRequest
+}
+
+func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
+	return &ps.DatabaseBranch{Name: req.Branch, Ready: true}, nil
+}
+
+func (c *branchResumeClient) CreateDeployRequest(_ context.Context, _ *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	return &ps.DeployRequest{
+		Number:          77,
+		HtmlURL:         "https://app/dr/77",
+		DeploymentState: deployState.Ready,
+		Deployment:      &ps.Deployment{InstantDDLEligible: true},
+	}, nil
+}
+
+func (c *branchResumeClient) DeployDeployRequest(_ context.Context, req *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
+	c.deployCalls++
+	c.lastDeploy = req
+	return &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.InProgress}, nil
+}
+
+// A resume that recovers a branch whose deploy request was never created takes
+// the instant DDL decision fresh, exactly as a fresh apply does: an unsafe
+// change deploys with a row copy so a revert window stays open, and the decline
+// is announced on the apply's timeline, not only in the engine log. A safe
+// change keeps instant DDL and announces nothing.
+func TestResumeApply_BranchResumeDecidesInstantDDLAndAnnouncesDecline(t *testing.T) {
+	tests := []struct {
+		name        string
+		ddl         string
+		wantInstant bool
+	}{
+		{name: "an unsafe change declines instant DDL and announces the row copy", ddl: "ALTER TABLE `users` DROP COLUMN `email`", wantInstant: false},
+		{name: "a safe change keeps instant DDL", ddl: "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)", wantInstant: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &branchResumeClient{}
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-crash"}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Changes = []engine.SchemaChange{{
+				Namespace:    "orders",
+				TableChanges: []engine.TableChange{{DDL: tt.ddl}},
+			}}
+			var events []engine.ApplyEvent
+			req.OnEvent = func(event engine.ApplyEvent) { events = append(events, event) }
+
+			result, err := e.resumeApply(t.Context(), client, "org", req)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, result.Accepted)
+			require.Equal(t, 1, client.deployCalls)
+			require.NotNil(t, client.lastDeploy)
+			assert.Equal(t, tt.wantInstant, client.lastDeploy.InstantDDL)
+
+			// The decision that deployed is the decision that was persisted.
+			require.NotNil(t, result.ResumeState)
+			stored, decodeErr := decodePSMetadata(result.ResumeState.Metadata)
+			require.NoError(t, decodeErr)
+			assert.Equal(t, tt.wantInstant, stored.IsInstant)
+
+			declines := declineEventMessages(events)
+			if tt.wantInstant {
+				assert.Empty(t, declines)
+			} else {
+				require.Len(t, declines, 1)
+				assert.Contains(t, declines[0], "DROP COLUMN")
+				assert.Contains(t, declines[0], "revert window")
+			}
+		})
+	}
+}
+
+// A recovered instant decision that resume narrows must be narrowed everywhere
+// it can be read later: the deploy runs with a row copy, the apply's timeline
+// carries the announcement, and the returned metadata stores IsInstant=false.
+// Metadata that kept the stale instant decision would let a later consumer of
+// the stored value — a deferred start, a subsequent resume — widen it back to
+// instant after this drive declined it.
+func TestResumeExistingDeployRequest_NarrowedDecisionIsPersistedAndAnnounced(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &resumeDeployClient{
+		recovered: &ps.DeployRequest{DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/63"},
+	}
+
+	meta := &psMetadata{BranchName: "schemabot-testdb-narrow", DeployRequestID: 63, IsInstant: true}
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+	req.Changes = []engine.SchemaChange{{
+		Namespace:    "orders",
+		TableChanges: []engine.TableChange{{DDL: "ALTER TABLE `users` DROP COLUMN `email`"}},
+	}}
+	var events []engine.ApplyEvent
+	req.OnEvent = func(event engine.ApplyEvent) { events = append(events, event) }
+
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.NoError(t, err)
+	require.NotNil(t, client.lastDeploy)
+	assert.False(t, client.lastDeploy.InstantDDL)
+
+	declines := declineEventMessages(events)
+	require.Len(t, declines, 1)
+	assert.Contains(t, declines[0], "DROP COLUMN")
+	assert.Contains(t, declines[0], "revert window")
+
+	require.NotNil(t, result.ResumeState)
+	stored, err := decodePSMetadata(result.ResumeState.Metadata)
+	require.NoError(t, err)
+	assert.False(t, stored.IsInstant)
 }

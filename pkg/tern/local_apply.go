@@ -31,33 +31,40 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blockingTaskID := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
-		if blockingTaskID == "" {
+		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard)
+		if !blocking.blocks() {
 			return nil
 		}
 
 		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
 		// Handles the race where storage is updated but Spirit hasn't fully finished.
 		if attempt < 9 {
-			c.logger.Debug("found potentially stale active task, retrying", "task_id", blockingTaskID, "attempt", attempt)
+			c.logger.Debug("found potentially stale active task, retrying",
+				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
+				"apply_id", blocking.applyIdentifier, "apply_state", blocking.applyState,
+				"attempt", attempt)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		return fmt.Errorf("schema change already in progress for database %q (plan %s): blocking task %s", plan.Database, plan.PlanIdentifier, blockingTaskID)
+		// The refusal is what the operator sees when an apply dies on arrival, so
+		// it names the apply holding the database rather than only the task, which
+		// on its own gives them nothing to act on.
+		return fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
+			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
 	return nil
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.
-// Returns the blocking task's identifier, or "" if no conflict exists.
+// Returns the conflict, or a zero blockingTask when no conflict exists.
 // As a side effect, resolves stale tasks by checking engine state.
 //
 // dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
 // when both the candidate apply and an existing task target a non-empty shard,
 // a different shard does not conflict, so a sharded fan-out runs its shards
 // concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) string {
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string) blockingTask {
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
@@ -77,7 +84,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		// keeps blocking (fail closed).
 		apply, ok := c.applyForConflictCheck(ctx, t)
 		if !ok {
-			return t.TaskIdentifier
+			return newBlockingTask(t, nil)
 		}
 
 		// A pending task of a terminal apply can never start; cancel it so it
@@ -91,10 +98,118 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue // Task was stale; engine confirmed it's done.
 		}
 
-		c.logger.Debug("conflict check: task is active", "task_id", t.TaskIdentifier)
-		return t.TaskIdentifier
+		c.logger.Debug("conflict check: task is active", append(t.LogAttrs(),
+			"apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return newBlockingTask(t, apply)
 	}
-	return ""
+	return blockingTask{}
+}
+
+// blockingTask names the active work that refuses a new apply on a database,
+// in the terms an operator needs to clear it: what is being changed, which task
+// tracks it, which apply owns that task, and what that apply is doing.
+//
+// applyIdentifier and applyState are empty when the apply could not be loaded.
+// That task still blocks — the conflict check fails closed — so the conflict is
+// reported by task alone rather than being suppressed.
+type blockingTask struct {
+	taskIdentifier  string
+	table           string
+	shard           string
+	applyIdentifier string
+	applyState      string
+}
+
+// newBlockingTask records the conflicting task, and the apply that owns it when
+// that apply could be loaded.
+func newBlockingTask(t *storage.Task, apply *storage.Apply) blockingTask {
+	b := blockingTask{
+		taskIdentifier: t.TaskIdentifier,
+		table:          t.TableName,
+		shard:          t.Shard,
+	}
+	if apply != nil {
+		b.applyIdentifier = apply.ApplyIdentifier
+		b.applyState = apply.State
+	}
+	return b
+}
+
+// blocks reports whether a conflicting task was found.
+func (b blockingTask) blocks() bool { return b.taskIdentifier != "" }
+
+// describe renders the conflict for an operator: what holds the database, and
+// where to go to clear it.
+func (b blockingTask) describe() string {
+	if b.applyIdentifier == "" {
+		return b.subject() + " is held by an apply that could not be loaded"
+	}
+
+	described := fmt.Sprintf("%s is held by apply %s (%s)",
+		b.subject(), b.applyIdentifier, b.applyState)
+	if resolution := b.resolution(); resolution != "" {
+		return described + "; " + resolution
+	}
+	return described
+}
+
+// subject names the work being done, leading with the table an operator
+// recognizes and keeping the task identifier as the handle for the CLI. A
+// multi-table atomic change records no table, so it is named by task alone —
+// but it still names its shard when it has one, because only that shard is
+// held and an operator reading the refusal needs to know which.
+func (b blockingTask) subject() string {
+	switch {
+	case b.table == "" && b.shard == "":
+		return fmt.Sprintf("task %s", b.taskIdentifier)
+	case b.table == "":
+		return fmt.Sprintf("shard %s (task %s)", b.shard, b.taskIdentifier)
+	case b.shard == "":
+		return fmt.Sprintf("table %s (task %s)", b.table, b.taskIdentifier)
+	default:
+		return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
+	}
+}
+
+// resolution continues the sentence describe() opens, so it speaks of the apply
+// already named there rather than restating the state alongside it. The split is
+// between an apply that holds the database until someone decides its fate and one
+// that releases it on its own, which is the distinction that tells an operator
+// whether to act or to wait.
+//
+// The resting states differ only in which decision is owed: a stopped apply waits
+// to be started, a retryable failure to be retried, an apply at the cutover
+// barrier to be cut over, and one in its revert window to be reverted or
+// skip-reverted. The revert window is the one that offers no cancel: the change
+// has already cut over, so stop and cancel are permanently rejected there. It is
+// also the one whose wait is bounded without an operator, since the window's
+// expiry triggers the skip-revert itself rather than being a third way out.
+// A revert already under way, like a running apply, finishes on its own — with
+// the caveat that a running apply may still park, since a deferred or ordered
+// cutover moves it to waiting_for_cutover rather than to a terminal state, so
+// the running line promises progress, not release.
+//
+// Other active states (pending, cutting over, recovering, waiting for a deploy
+// that tern may be about to trigger itself) get no resolution line rather than a
+// guess — the state is still named, and inventing an action for a state whose
+// next move is not certain would send an operator the wrong way.
+func (b blockingTask) resolution() string {
+	switch {
+	case state.IsState(b.applyState, state.Apply.Stopped):
+		return "it holds the database until it is started or cancelled"
+	case state.IsState(b.applyState, state.Apply.FailedRetryable):
+		return "it holds the database until it is retried or cancelled"
+	case state.IsState(b.applyState, state.Apply.WaitingForCutover):
+		return "it holds the database until it is cut over or cancelled"
+	case state.IsState(b.applyState, state.Apply.RevertWindow):
+		return "it holds the database until it is reverted or skip-reverted"
+	case state.IsState(b.applyState, state.Apply.Reverting, state.Apply.SkippingRevert):
+		return "it releases the database when the revert finishes, which it does on its own"
+	case state.IsRunningApplyState(b.applyState):
+		return "it releases the database when it finishes, unless it parks for cutover first"
+	default:
+		return ""
+	}
 }
 
 // applyForConflictCheck loads the parent apply the conflict-check resolvers
@@ -281,6 +396,23 @@ func (c *LocalClient) logApplyEvent(ctx context.Context, applyID int64, taskID *
 	}
 }
 
+// logEngineResumeOnce records a timeline event the first time a drive claim
+// observes the engine reattached to a durable checkpoint instead of starting
+// the copy fresh. One event per drive claim is intentional: every claim that
+// resumes (pod restart, lease handover, operator start after a stop) is a
+// real engine resume the operator should see on the timeline. eventLogged is
+// the per-drive latch; the durable checkpoint itself lives in the engine.
+func (c *LocalClient) logEngineResumeOnce(ctx context.Context, logger *slog.Logger, apply *storage.Apply, resumed bool, eventLogged *bool) {
+	if !resumed || *eventLogged {
+		return
+	}
+	*eventLogged = true
+	const msg = "Engine resumed from checkpoint; row copy continues from durable progress"
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		msg, "", "")
+	logger.Info("engine resumed from checkpoint")
+}
+
 // setupSpiritLogging wires up Spirit's log callback to route engine logs to the apply_logs table.
 // Returns a cleanup function that must be deferred.
 func (c *LocalClient) setupSpiritLogging(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) func() {
@@ -334,13 +466,16 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
-	// An ETA is only meaningful while an engine is actively driving the task
-	// and refreshing the estimate. Clear it when the task comes to rest
-	// (terminal, stopped, retryable, pending) so the stored row never carries
-	// a frozen estimate; a resumed or retried task gets a fresh figure from
-	// the first engine poll.
+	// An ETA and throttle state are only meaningful while an engine is
+	// actively driving the task and refreshing them. Clear them when the task
+	// comes to rest (terminal, stopped, retryable, pending) so the stored row
+	// never carries a frozen estimate or renders as paused with no copy in
+	// flight; a resumed or retried task gets fresh figures from the first
+	// engine poll.
 	if !state.IsInFlightTaskState(newState) {
 		task.ETASeconds = 0
+		task.Throttled = false
+		task.ThrottleReason = ""
 	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
 		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)

@@ -618,18 +618,56 @@ func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient
 //
 // Instant DDL rewrites metadata only: the deploy executes and the schema is
 // swapped in a single step, with nothing in between. That makes it the right
-// way to run an eligible change — except when the operator asked to hold the
-// cutover. A held cutover is a decision the operator kept for themselves, and
-// instant DDL takes it: there is no pending_cutover to park at, so the schema
-// swaps the moment the deploy runs and the operator is told afterwards. The
-// row-copy path parks at the gate, so a deferred cutover is deployed that way
-// instead, trading the speed of an eligible change for the gate that was asked
-// for.
-func useInstantDDL(dr *ps.DeployRequest, deferCutover bool) bool {
+// way to run an eligible change — except in two cases where the in-between is
+// the point:
+//
+//   - A deferred cutover is a decision the operator kept for themselves, and
+//     instant DDL takes it: there is no pending_cutover to park at, so the
+//     schema swaps the moment the deploy runs and the operator is told
+//     afterwards. The row-copy path parks at the gate.
+//   - An unsafe change — one that destroys existing data, in Spirit's unsafe
+//     vocabulary (DROP TABLE, DROP COLUMN, DROP PARTITION, ...) — must keep a
+//     revert window: the row-copy path retains the old data and can revert
+//     after cutover, while instant DDL destroys the data the moment the
+//     deploy runs with no way back.
+//
+// Both cases trade the speed of an eligible change for the safety net that
+// the change requires.
+func useInstantDDL(dr *ps.DeployRequest, deferCutover, unsafe bool) bool {
 	if dr.Deployment == nil || !dr.Deployment.InstantDDLEligible {
 		return false
 	}
-	return !deferCutover
+	return !deferCutover && !unsafe
+}
+
+// changesContainUnsafe reports whether any DDL statement in the requested
+// changes is unsafe (destroys existing data, per ddl.UnsafeStatement), and
+// names the operation. The verdict is unconditional — it does not honor
+// allow-unsafe: the plan gate proves the operator intended the change, while
+// the revert window is what recovers an intended change that turns out to be
+// wrong, so passing the first must never remove the second. Classification
+// failures fail closed: a statement that cannot be classified is treated as
+// unsafe, so the deploy takes the row-copy path and keeps its revert window —
+// the cost is time, never data.
+func (e *Engine) changesContainUnsafe(changes []engine.SchemaChange, database string) (bool, string) {
+	for _, sc := range changes {
+		for _, tc := range sc.TableChanges {
+			unsafe, reason, err := ddl.UnsafeStatement(tc.DDL)
+			if err != nil {
+				e.logger.Warn("could not classify statement for the instant DDL decision, taking the row-copy path to keep a revert window",
+					"database", database,
+					"namespace", sc.Namespace,
+					"ddl", tc.DDL,
+					"error", err,
+				)
+				return true, "a statement could not be classified"
+			}
+			if unsafe {
+				return true, reason
+			}
+		}
+	}
+	return false, ""
 }
 
 func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (*ps.DeployRequest, error) {

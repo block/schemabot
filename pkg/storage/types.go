@@ -951,6 +951,19 @@ const (
 	ControlOperationVolume ControlOperation = "volume"
 )
 
+// Valid reports whether the operation is one SchemaBot recognizes. Control
+// operations cross the control-plane / data-plane boundary as strings, so a
+// value read off the wire is checked here before it reaches storage.
+func (o ControlOperation) Valid() bool {
+	switch o {
+	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+		ControlOperationRelease, ControlOperationVolume:
+		return true
+	}
+	return false
+}
+
 // MinVolume and MaxVolume bound the volume scale shared by every engine:
 // 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
 const (
@@ -978,6 +991,49 @@ func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
 		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
 	}
 	return data, nil
+}
+
+// mirroredControlRequestMetadataKey marks a control request row this plane never
+// queued: the row exists only because another plane reported the operation
+// rejected, as happens for a pure proxy like volume where the request lives
+// entirely in the serving plane. Such a row has no local lifecycle to reset it,
+// so it is the mirror's to clear when the operation later succeeds. Rows this
+// plane queued itself carry no marker and are only ever cleared by their own
+// request lifecycle.
+const mirroredControlRequestMetadataKey = "mirrored_remote_rejection"
+
+// MirroredControlRequestMetadata returns the metadata stamped on a control
+// request row created solely to carry another plane's rejection.
+func MirroredControlRequestMetadata() []byte {
+	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
+}
+
+// ForwardingControlRequestCaller is the requester recorded for a control
+// request that reached this plane over the data-plane RPC boundary. The control
+// RPCs carry no operator identity, so this names the path the request arrived
+// on rather than the person who issued it.
+const ForwardingControlRequestCaller = "tern-grpc"
+
+// ControlRequestNamesAnOperator reports whether a requester identifies the
+// operator who issued the command. Only such a value is worth showing in the
+// PR notice, whose whole purpose is telling an operator which of their commands
+// did not take effect.
+func ControlRequestNamesAnOperator(requestedBy string) bool {
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+}
+
+// IsMirroredRemoteRejection reports whether this row exists only to carry
+// another plane's rejection, so no local request lifecycle will ever clear it.
+func (r *ApplyControlRequest) IsMirroredRemoteRejection() bool {
+	if r == nil || len(r.Metadata) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return false
+	}
+	marked, _ := payload[mirroredControlRequestMetadataKey].(bool)
+	return marked
 }
 
 // DecodeVolumeControlRequestMetadata parses the desired volume level from a
@@ -1199,7 +1255,14 @@ type Task struct {
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	CutoverAttempts     int // Number of cutover attempts for this shard
+	// Throttled reports that the engine's throttler is pausing this table's
+	// active phase (row copy or checksum verify), so stalled row counts read
+	// as a deliberate pause rather than a hang. Cleared when the pause lifts.
+	Throttled bool
+	// ThrottleReason names the signal pausing the work, for display (e.g.
+	// "replica-lag 5s >= 2s"). Empty when Throttled is false.
+	ThrottleReason  string
+	CutoverAttempts int // Number of cutover attempts for this shard
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
@@ -1437,6 +1500,12 @@ const (
 	WebhookEventFailedRetryable = "failed_retryable"
 	WebhookEventFailed          = "failed"
 	WebhookEventFailedPermanent = "failed_permanent"
+
+	// WebhookEventSuperseded is the terminal state for an auto-plan delivery
+	// discarded at claim time because a newer covering delivery exists for the
+	// same pull request (see WebhookEventStore.SupersedeIfCovered). The row's
+	// work was never performed; the covering successor performs it instead.
+	WebhookEventSuperseded = "superseded"
 )
 
 // SynthesizedWebhookDeliveryIDPrefix marks delivery GUIDs minted by the
@@ -1457,6 +1526,14 @@ const SynthesizedWebhookDeliveryIDPrefix = "recon:"
 // enqueue rows the dispatcher completes without planning.
 var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
 
+// PullRequestClosedAction is the pull_request action GitHub delivers when a PR
+// is closed (merged or not). A closed delivery participates asymmetrically in
+// claim-time coalescing (SupersedeIfCovered): a later closed delivery covers
+// older unprocessed auto-plan deliveries — planning a closed PR is pointless —
+// but a closed delivery itself is never superseded, because its cleanup must
+// always run.
+const PullRequestClosedAction = "closed"
+
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a
 // series is always present even when a state is momentarily empty.
@@ -1467,6 +1544,7 @@ var WebhookEventStatesAll = []string{
 	WebhookEventCompleted,
 	WebhookEventFailed,
 	WebhookEventFailedPermanent,
+	WebhookEventSuperseded,
 }
 
 // WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox
@@ -1478,8 +1556,12 @@ type WebhookInboxStats struct {
 	CountsByState map[string]int64
 
 	// OldestClaimableAge is how long the oldest ready-to-claim-but-unclaimed row
-	// (pending, or retryable with an elapsed retry window) has been waiting. It
-	// is the inbox's backlog latency; zero when nothing is waiting.
+	// (pending with no future not-before time, or retryable with an elapsed
+	// retry window) has been claimable. Age is measured from when the row
+	// became claimable — the later of receipt and its retry_after — not from
+	// receipt, so a row that spent time deliberately deferred does not report
+	// its grace period as backlog. It is the inbox's backlog latency; zero
+	// when nothing is waiting.
 	OldestClaimableAge time.Duration
 
 	// StuckProcessing is the number of rows wedged in processing with an expired
@@ -1505,6 +1587,12 @@ type WebhookEvent struct {
 	LeaseToken     string
 	LeaseExpiresAt *time.Time
 	RetryAfter     *time.Time
+	// ClaimableSince is when the row became eligible for dispatch: the later
+	// of receipt and its not-before time (retry_after). It is not a column —
+	// FindNext derives it on the returned event because the claim consumes
+	// retry_after, and the dispatcher needs the original eligibility time to
+	// measure dispatch lag without counting a deliberate deferral as backlog.
+	ClaimableSince time.Time
 	LastError      string
 	ReceivedAt     time.Time
 	StartedAt      *time.Time

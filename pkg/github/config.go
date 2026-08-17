@@ -588,10 +588,10 @@ func isDiscoveryInputFile(filename string) bool {
 	return IsSchemaFile(filename) || isConfigFile(filename)
 }
 
-// hasDiscoveryInputFiles reports whether any changed file could resolve a
+// HasDiscoveryInputFiles reports whether any changed file could resolve a
 // database. Callers use it to skip work entirely on the pull requests — most of
 // them, in a repository of any size — that touch no schema at all.
-func hasDiscoveryInputFiles(files []PRFile) bool {
+func HasDiscoveryInputFiles(files []PRFile) bool {
 	for _, file := range files {
 		if isDiscoveryInputFile(file.Filename) {
 			return true

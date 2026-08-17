@@ -619,12 +619,15 @@ func (o *CommentObserver) shardsByTable(ctx context.Context, apply *storage.Appl
 // the load failed. Callers that already hold the operation set (e.g. OnTerminal)
 // use this to avoid re-reading apply_operations.
 func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
+	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		return formatProgressComment(apply, tasks, shardsByTable, o.tenant)
+		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
+	} else {
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
-	return formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
+	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
 
 // resolveDisplay projects the apply's per-operation engine display state (VSchema
@@ -678,6 +681,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 	} else {
 		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
 	}
+	body += controlRejectionSection(ctx, o.stor, o.logger, apply, body)
 	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
 }
 
