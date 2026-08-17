@@ -581,6 +581,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
 		Changes:        schemaChanges,
 		LintViolations: lintViolations,
+		// Applying this plan can meet a copy an earlier schema change left on
+		// the target and continue it or destroy it. Disclose which, so that is
+		// known before anyone confirms rather than after the copy is gone.
+		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes),
 	}, nil
 }
 

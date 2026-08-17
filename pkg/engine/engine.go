@@ -192,6 +192,12 @@ type PlanResult struct {
 	// Lint results from schema analysis. Violations with Severity "error" block
 	// apply unless overridden with --allow-unsafe.
 	LintViolations []LintViolation
+
+	// ExistingCopies is unfinished work earlier schema changes left on the
+	// target that applying this plan will continue or destroy, one entry per
+	// namespace that holds any. Empty when the target holds none, which is the
+	// ordinary case.
+	ExistingCopies []*ExistingCopy
 }
 
 // HasErrors returns true if any lint warning has error severity.
@@ -361,6 +367,26 @@ const (
 	// ones that never started.
 	DiscardCopyIncomplete = "copy_incomplete"
 )
+
+// ExistingCopy is unfinished work an earlier schema change left on the target
+// that applying this plan will either continue or destroy. It never carries
+// CopyNone: a plan that destroys nothing reports no ExistingCopy at all.
+type ExistingCopy struct {
+	// Namespace is where the work sits. A plan spanning several namespaces
+	// reports one ExistingCopy per namespace that holds any, so an operator can
+	// tell which target a disclosure is about.
+	Namespace string
+	// Disposition is what applying will do with the existing work.
+	Disposition CopyDisposition
+	// Reason names why a discard cannot be avoided by applying as planned.
+	// Empty for an adopt.
+	Reason string
+	// Tables are the tables in this plan that already hold unfinished work.
+	Tables []string
+	// Age is how long ago the engine last recorded progress on it. Zero when
+	// the engine has no record to resume from, which is itself a discard.
+	Age time.Duration
+}
 
 // Engine metadata keys carrying the direct execution policy from config
 // surfaces (server config, embedder assemblers) to an engine via request
