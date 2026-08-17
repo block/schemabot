@@ -147,7 +147,7 @@ additionally gated on the staging check and the
 
 **Check Runs** — SchemaBot publishes aggregate GitHub checks that block merge until managed schema changes are applied. See [Status Checks and Branch Protection](#status-checks-and-branch-protection) below.
 
-**API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/api/plan`, `/api/apply`, `/api/progress`, `/api/cutover`, etc.
+**API** — HTTP endpoints that both CLI and webhook use internally. The SchemaBot server exposes `/api/plan`, `/api/apply`, `/api/progress`, `/api/cutover`, etc. The read-tier endpoints also serve external service consumers (schema inventories, dashboards, agentic tools); see [Consuming the HTTP API](api.md).
 
 ### Status Checks and Branch Protection
 

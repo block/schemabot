@@ -360,7 +360,8 @@ four endpoints:
 
 The expected call pattern is periodic sync: recurring `pull` calls across the
 databases the service cares about, with `history` and `progress` answering
-what changed and when.
+what changed and when. Request and response shapes for all four, with worked
+payload examples, are in [Consuming the HTTP API](api.md).
 
 **Service callers are read-only by design.** The read tier already gives a
 service everything it needs to observe the deployment. The write tier stays
