@@ -45,6 +45,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.remote_apply_dedup_total` | Counter | database, environment, outcome | Idempotency-keyed dispatches replayed against their existing operation on the keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_attach_total` | Counter | database, environment, outcome | Sibling dispatches resolved into an existing deployment-keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_key_echo_mismatch_total` | Counter | database, environment | Remote dispatches refused fail-closed because the data plane's accepted response echoed a different operation key than the dispatch derives — see [Remote Apply Attaches](#remote-apply-attaches) |
+| `schemabot.remote_apply_deployment_id_conflict_total` | Counter | database, environment, deployment | Remote dispatch results refused fail-closed because the deployment already correlates to a different remote apply id — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
@@ -344,6 +345,17 @@ attach. The operator action is to upgrade (or roll back) the named database's
 data plane so both planes derive the same key, then retry the blocked applies;
 the paired error log carries the apply, the dispatched operation key, and the
 echoed key.
+
+`schemabot.remote_apply_deployment_id_conflict_total` counts dispatch results
+the control plane refused because storing them would correlate one deployment
+to two remote applies. All operations of a deployment attach into the
+deployment's single data-plane apply and record the same remote apply id, so a
+second id means the planes diverged — an in-flight apply spanning a
+dispatch-key rollout, or a data plane that lost its keyed apply and minted a
+fresh one. The operator action is to inspect the named database's apply
+operations (the paired error log carries the recorded and refused ids), decide
+which remote apply is authoritative, and re-dispatch under a fresh generation
+once the planes agree.
 
 `schemabot.lock_operations_total` tracks database-level lock acquisition and
 release attempts.
