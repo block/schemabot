@@ -633,6 +633,12 @@ func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
 			require.Equal(t, drState.Ready, dr.DeploymentState)
 			require.NotNil(t, dr.Deployment)
 			require.True(t, dr.Deployment.InstantDDLEligible, "ADD COLUMN NULL should be instant-eligible")
+			// Leak safety for the failure path only: a subtest that fails before
+			// it settles would otherwise leave this deploy active, and only one
+			// deploy can be active per database, so the next subtest could not
+			// create its own and would fail for a reason that hides the first
+			// failure. On the passing path the deploy is already complete and
+			// this cancel is refused — hence the discarded result.
 			t.Cleanup(func() {
 				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
 				defer cancel()
