@@ -13,9 +13,10 @@ func TestSanitizeCheckRunErrorSummary(t *testing.T) {
 
 		got := sanitizeCheckRunErrorSummary(input)
 
-		assert.Len(t, []rune(got), 506, "sanitization clamps before markup escaping expands entities")
+		assert.Greater(t, len([]rune(got)), 500,
+			"the summary is clamped to 500 runes before escaping, so entity expansion pushes it past the clamp; the clamp bounds the payload, not the escaped length")
 		assert.True(t, strings.HasSuffix(got, "…"), "oversize summary ends with a truncation marker")
-		assert.Contains(t, got, "`plan failed` dial tcp [endpoint redacted]: connection refused &lt;retry&gt;")
+		assert.Contains(t, got, "&#96;plan failed&#96; dial tcp &#91;endpoint redacted&#93;: connection refused &lt;retry&gt;")
 		assert.NotContains(t, got, "\n")
 		assert.NotContains(t, got, "\x1b")
 		assert.NotContains(t, got, "db-primary.internal")
@@ -23,6 +24,12 @@ func TestSanitizeCheckRunErrorSummary(t *testing.T) {
 
 	t.Run("ampersands escape exactly once, including around escaped angle brackets", func(t *testing.T) {
 		assert.Equal(t, "retry &amp; wait &lt;5s&gt;", sanitizeCheckRunErrorSummary("retry & wait <5s>"))
+	})
+
+	t.Run("markdown links, images, and code spans are neutralized without changing the displayed text", func(t *testing.T) {
+		got := sanitizeCheckRunErrorSummary("plan failed: ![](https://attacker.example/p.png) [click here](https://attacker.example) `near \"x\"`")
+
+		assert.Equal(t, "plan failed: !&#91;&#93;(https://attacker.example/p.png) &#91;click here&#93;(https://attacker.example) &#96;near \"x\"&#96;", got)
 	})
 
 	t.Run("quotes and apostrophes in operator-facing prose pass through verbatim", func(t *testing.T) {

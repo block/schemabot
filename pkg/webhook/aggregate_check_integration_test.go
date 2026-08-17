@@ -1320,7 +1320,9 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 // A failing aggregate's summary carries error text that can contain internal
 // endpoints, control sequences, and markup. The publish path must sanitize
 // that text before it reaches the GitHub Check Run, so the visible summary
-// never leaks infrastructure detail or renders injected markup.
+// never leaks infrastructure detail, renders injected HTML, or forms Markdown
+// links, images, or code spans that could carry a payload. Emphasis-style
+// formatting is left intact: it can restyle text but not inject content.
 func TestE2EFailingAggregateSanitizesErrorSummary(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 	ctx := t.Context()
@@ -1344,7 +1346,7 @@ func TestE2EFailingAggregateSanitizesErrorSummary(t *testing.T) {
 		assert.Equal(t, "SchemaBot (staging)", cr.Name)
 		require.NotNil(t, cr.Output)
 		assert.Equal(t, "Plan failed", cr.Output.Title)
-		assert.Equal(t, "plan failed: dial tcp [endpoint redacted]: connect &amp; retry &lt;5s&gt;", cr.Output.Summary)
+		assert.Equal(t, "plan failed: dial tcp &#91;endpoint redacted&#93;: connect &amp; retry &lt;5s&gt;", cr.Output.Summary)
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for failing aggregate check run")
 	}

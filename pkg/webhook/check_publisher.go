@@ -882,10 +882,20 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 // aggregate Check Run shows when no more specific error text is available.
 const planFailedCheckText = "Plan failed"
 
-// checkRunSummaryEscaper neutralizes HTML markup in a Check Run summary
-// without rewriting quotes, so operator-facing prose (apostrophes, quoted
-// identifiers) renders verbatim while injected tags cannot.
-var checkRunSummaryEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+// checkRunSummaryEscaper neutralizes the markup that renders in a Check Run
+// summary: HTML tags, plus the Markdown constructs that can carry a payload —
+// links and images (brackets), which would let error text phish or fire an
+// outbound request from every viewer, and code spans (backticks). Entity
+// references decode on render but cannot form Markdown structure, so the
+// displayed text is unchanged. Quotes are left alone — unlike
+// html.EscapeString — as a source-readability choice: they need no
+// neutralization here and operator-facing prose stays byte-verbatim.
+// Emphasis characters are also left alone; they can restyle text but cannot
+// inject content or reach out.
+var checkRunSummaryEscaper = strings.NewReplacer(
+	"&", "&amp;", "<", "&lt;", ">", "&gt;",
+	"[", "&#91;", "]", "&#93;", "`", "&#96;",
+)
 
 // sanitizeCheckRunErrorSummary makes error text safe for a Check Run summary:
 // single-line sanitization (endpoint redaction, control stripping, clamping)
