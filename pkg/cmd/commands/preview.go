@@ -76,6 +76,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
 		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
+		templates.PreviewCommentPlanCopyDiscardedPaused,
 		templates.PreviewCommentPlanCopyAdopted,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,

@@ -194,8 +194,45 @@ func PreviewCommentPlanCopyDiscarded() string {
 	})
 }
 
+// PreviewCommentPlanCopyDiscardedPaused renders the discard on the locked
+// comment of an automatic apply that stopped for confirmation because of it.
+// The copy is still on the target and confirming is what destroys it, so the
+// section warns and names the remedy.
+func PreviewCommentPlanCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+			},
+		},
+		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+	})
+}
+
 // PreviewCommentPlanCopyDiscardedApplying renders the same discard on the
-// comment of an apply that is already running. Nothing is being asked of the
+// comment of an apply that is already running — the path an operator reaches
+// with `-y`, having already accepted the cost. Nothing is being asked of the
 // reader and the copy is already gone, so the section is a record of what the
 // apply threw away rather than a warning with a remedy.
 func PreviewCommentPlanCopyDiscardedApplying() string {
