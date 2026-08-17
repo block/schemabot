@@ -863,13 +863,13 @@ func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string
 			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", pt.database, pt.branch)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, keyspace.Name) {
-			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", pt.branch, "namespace", keyspace.Name)
+			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", keyspace.Name)
 			continue
 		}
 		namespaces = append(namespaces, keyspace.Name)
 	}
 	sort.Strings(namespaces)
-	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "branch", pt.branch, "namespace_count", len(namespaces))
+	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace_count", len(namespaces))
 	return namespaces, nil
 }
 
