@@ -12,7 +12,7 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 
 **Config** — Engine configuration:
 - `TargetChunkTime` (default 2s): Target time per checksum chunk. Row copies are sized by an in-memory byte budget instead
-- `Threads` (default 4): Number of concurrent copier threads
+- `Threads` (default 2): Number of concurrent copier threads
 - `LockWaitTimeout` (default 30s): How long to wait for table locks during cutover
 - `DebugLogs`: Enable verbose Spirit debug output
 
