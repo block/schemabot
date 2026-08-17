@@ -445,10 +445,7 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 // emitTableLog routes an operator-facing message for a table to the apply log
 // store when a log callback is registered.
 func (e *Engine) emitTableLog(table, msg string) {
-	e.mu.Lock()
-	onLog := e.onLog
-	e.mu.Unlock()
-	if onLog != nil {
+	if onLog := loadLogCallback(&e.onLog); onLog != nil {
 		onLog(slog.LevelInfo, table, msg)
 	}
 }
