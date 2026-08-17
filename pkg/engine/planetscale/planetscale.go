@@ -698,6 +698,31 @@ func credOrg(creds *engine.Credentials) string {
 	return ""
 }
 
+func credDatabase(creds *engine.Credentials) string {
+	if creds != nil {
+		return creds.Metadata["database"]
+	}
+	return ""
+}
+
+// resolveDatabase returns the PlanetScale database name for a request: the
+// "database" credential metadata when set, otherwise the request's database
+// identifier itself. The two differ when a database is registered under an
+// arbitrary identifier while the PlanetScale database keeps its own name.
+// Each exported engine method rewrites its request's Database with the
+// resolved name, so every PlanetScale API call, error, and log line in the
+// engine names the database as PlanetScale knows it; the debug log ties the
+// resolved name back to the registered identifier when they differ.
+func (e *Engine) resolveDatabase(creds *engine.Credentials, database string) string {
+	resolved := credDatabase(creds)
+	if resolved == "" || resolved == database {
+		return database
+	}
+	e.logger.Debug("using PlanetScale database name from credential metadata",
+		"database", database, "planetscale_database", resolved)
+	return resolved
+}
+
 func credTokenName(creds *engine.Credentials) string {
 	if creds != nil {
 		return creds.Metadata["token_name"]

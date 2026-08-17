@@ -339,25 +339,31 @@ The listener binds `:9102` by default; set `metrics_port` to move it. The API po
 
 ## Pending Drops
 
-For MySQL databases executed by the Spirit engine, `DROP TABLE` statements are
-quarantined by default: the table is renamed into a `_pending_drops` database
-on the target server with a timestamp prefix instead of being dropped. The data
-stays recoverable until a background cleaner permanently drops the table after
+For MySQL databases executed by the Spirit engine, `DROP TABLE` statements can
+be quarantined instead of executed: the table is renamed into a
+`_pending_drops` database on the target server with a timestamp prefix, and the
+data stays recoverable until a background cleaner permanently drops it after
 the retention period. See [Pending Drops](pending-drops.md) for the full
 lifecycle and recovery steps.
 
+The quarantine is **off by default**. With no `pending_drops` block, `DROP
+TABLE` executes as written.
+
 ```yaml
 pending_drops:
-  enabled: true          # default: true
+  enabled: true          # default: false (the quarantine is opt-in)
   cleanup_enabled: true  # default: true when enabled is true
   retention: 168h        # default: 168h (7 days)
   dry_run: false         # default: false — set true to log instead of dropping
 ```
 
-Set `enabled: false` to execute `DROP TABLE` directly with no quarantine and no
-cleaner. Set `cleanup_enabled: false` to keep quarantining drops while this
-server process does not run the background cleaner; use that for frequently
-redeployed executors when a stable operator deployment owns cleanup.
+Set `enabled: true` only on a deployment whose cleaner can reach its own
+targets: the quarantine leaves tables on the target server that only the
+cleaner removes, so enabling one without the other grows the target's disk with
+nothing scheduled to reclaim it. Set `cleanup_enabled: false` to keep
+quarantining drops while this server process does not run the background
+cleaner; use that for frequently redeployed executors when a stable operator
+deployment owns cleanup for the same targets.
 `dry_run: true` keeps the quarantine active but makes the cleaner log the tables
 it would drop without dropping them, which is useful when previewing a retention
 change.

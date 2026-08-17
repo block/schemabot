@@ -1519,7 +1519,7 @@ func operationLeaseOnly(ctx context.Context) bool {
 // remoteApplyIdempotencyKey derives the deduplication key the control plane
 // stamps on every remote Apply dispatch. The key is stable across a re-dispatch
 // of the same generation — so an ambiguous dispatch whose response was lost is
-// reused rather than duplicated — and rotates on apply.Attempt when the work is
+// reused rather than duplicated — and rotates when the dispatched work is
 // deliberately retried.
 //
 // Operation-scoped drives key on the deployment, not the individual operation:
@@ -1527,16 +1527,24 @@ func operationLeaseOnly(ctx context.Context) bool {
 // same key, so the data plane lands them on one remote apply — the first
 // dispatch creates it, each sibling attaches its own operation, and the data
 // plane tells the dispatches apart by the operation key it derives from each
-// request's shape. Whole-apply drives key on the parent apply alone. The tuple
-// is hashed so the stored key stays within the column width and is free of
-// delimiter collisions between variable-length identifiers.
+// request's shape. The generation is the operation's own attempt, never the
+// shared apply.Attempt: the parent counter advances when any sibling operation
+// of any deployment is redispatched (it feeds the apply's retry budget), so
+// keying on it would let one deployment's genuine retry rotate the key under
+// another deployment's orphaned dispatch and duplicate its remote apply.
+// Siblings of one deployment share a key because their attempts advance in
+// lockstep within a generation — they all start at zero and only a deliberate
+// per-operation redispatch advances one. Whole-apply drives key on the parent
+// apply alone and rotate on its attempt. The tuple is hashed so the stored key
+// stays within the column width and is free of delimiter collisions between
+// variable-length identifiers.
 func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) string {
 	parts := []string{
 		"schemabot-remote-apply-v1",
 		apply.ApplyIdentifier,
 	}
 	if scope.usesOperationRemoteResume() {
-		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(apply.Attempt))
+		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(scope.operation.Attempt))
 	} else {
 		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
 	}

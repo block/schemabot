@@ -93,7 +93,7 @@ func TestEtreResolverResolvesMySQLTarget(t *testing.T) {
 // the assembler produces a namespace-free vtgate DSN for SHOW VITESS_MIGRATIONS
 // progress alongside the PlanetScale API metadata.
 func TestEtreResolverResolvesVitessTarget(t *testing.T) {
-	entity := etre.Entity{"endpoint": "vtgate.example", "organization": "acme"}
+	entity := etre.Entity{"endpoint": "vtgate.example", "organization": "acme", "name": "boardgames_main"}
 	creds := &capturingCredResolver{creds: &inventory.Credentials{
 		Username: "vt-user",
 		Password: "vt-pass",
@@ -105,7 +105,7 @@ func TestEtreResolverResolvesVitessTarget(t *testing.T) {
 	r := newEtreResolverForTest(t, nil, []etre.Entity{entity}, EtreResolverConfig{
 		TargetLabel:     "dsid",
 		HostField:       "endpoint",
-		AttributeFields: []string{"organization"},
+		AttributeFields: []string{"organization", "name"},
 		Credentials:     creds,
 		Assembler:       inventory.VitessConnectionAssembler{DefaultPort: "3306"},
 	})
@@ -115,6 +115,7 @@ func TestEtreResolverResolvesVitessTarget(t *testing.T) {
 
 	assert.Equal(t, "vitess", target.DatabaseType)
 	assert.Equal(t, "acme", target.Metadata[inventory.MetadataOrganization])
+	assert.Equal(t, "boardgames_main", target.Metadata[inventory.MetadataDatabase])
 	assert.Equal(t, "tok-secret", target.Metadata[inventory.MetadataTokenValue])
 
 	cfg, err := mysql.ParseDSN(target.DSN)

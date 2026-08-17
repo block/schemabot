@@ -22,6 +22,10 @@ import (
 // For each keyspace in the schema files, it fetches the current schema and uses
 // Spirit's PlanChanges to diff and lint in a single pass.
 func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	e.logger.Info("computing plan",
 		"database", req.Database,
 		"schema_files", len(req.SchemaFiles),
