@@ -103,17 +103,22 @@ something: a config edit, a changed default, a deploy ordering constraint, a
 storage schema change. Treat the notes as the contract and the version number as
 a label.
 
-## Cadence: small and frequent
+## Cadence and release boundaries
 
-Releases are deliberately small. One commit is a perfectly good release, and two
-tags minutes apart for two unrelated changes beat one tag carrying both. The rule
-of thumb: the release boundary should match the smallest coherent deployable
-unit. If the next rollout step needs code that is only on `main`, cut the next
-patch release instead of deploying an unreleased commit or sitting on the fix
-until more work piles up.
+A release usually carries several merged commits. Every tag has to be rolled out
+through staging and then production, so batching amortizes that time rather than
+paying it per change.
 
-This is not tidiness. A release that bundles unrelated changes cannot be rolled
-back in parts, so trouble in one change forces a decision about all of them.
+There is no minimum, though. A single commit is a perfectly good release, and
+reaching for one is the right call whenever waiting would cost more than the extra
+rollout. If the next rollout step needs code that is only on `main`, cut the next
+patch release instead of deploying an unreleased commit or sitting on the fix until
+more work piles up.
+
+What a batch should not do is put changes together that constrain each other. A
+release cannot be rolled back in parts, so trouble in one change forces a decision
+about all of them, and a change that needs its own rollout ordering drags the rest
+of the batch along with it.
 
 **Pick the release commit deliberately.** It is not automatically the tip of
 `main`. A later commit may hold something staged separately that must not ride
@@ -212,7 +217,7 @@ several releases apart.
 
 Run these against the commit range since the previous tag
 (`git diff <previous-tag>..<release-commit>`, where the release commit is the one
-chosen under [Cadence](#cadence-small-and-frequent), not necessarily the tip of
+chosen under [Cadence](#cadence-and-release-boundaries), not necessarily the tip of
 `main`). Each one is here because it has caught a real problem.
 
 ### 1. Removed or renamed config keys
@@ -306,7 +311,7 @@ inside it.
 ## Cutting the tag
 
 1. Confirm the exact commit, per
-   [Cadence](#cadence-small-and-frequent). Re-read the SHA immediately before
+   [Cadence](#cadence-and-release-boundaries). Re-read the SHA immediately before
    tagging, since `main` may have moved while you were running the checks.
 2. Tag and push:
    ```bash
