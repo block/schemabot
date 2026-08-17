@@ -426,6 +426,17 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	// The branches above match the shared ladder's reasons one-for-one. A
+	// reason none of them recognized means a gate was added to the ladder
+	// without a request-path branch — the ladder said to block, so block:
+	// dispatching here would run a command the ladder rejected.
+	if gateReason != issueCommentGatePass {
+		h.logger.Error("blocking command because its gate reason has no request-path branch",
+			"repo", repo, "pr", pr, "action", result.Action, "reason", gateReason)
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "command blocked"})
+		return
+	}
+
 	// Two cases are decidable at dispatch and acknowledge immediately: a repo
 	// with no aggregate role has exactly one SchemaBot (no ownership question),
 	// and a -t-scoped command names its actor (every non-addressed deployment
@@ -972,8 +983,8 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	if reason := h.issueCommentGateBlock(repo, result, parser, payload.Comment.Body); reason != issueCommentGatePass {
 		if reason == issueCommentGateInvalidTenant ||
 			reason == issueCommentGateInvalidEnvironment || reason == issueCommentGateMissingEnvironment {
-			h.logger.Warn("durable issue_comment delivery completed without dispatch because its comment is not a durably dispatched command",
-				"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action)
+			h.logger.Warn("durable issue_comment delivery completed without dispatch because its command is malformed",
+				"delivery_id", event.DeliveryID, "repo", repo, "pr", pr, "command", result.Action, "reason", reason)
 			metrics.RecordWebhookEvent(ctx, h.metricAppForRepo(repo), "issue_comment", payload.Action, repo, "durable_command_not_ready")
 			return false, nil
 		}

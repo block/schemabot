@@ -50,29 +50,62 @@ func newDurableIssueCommentEnqueueHandler(t *testing.T, events storage.WebhookEv
 	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch())
 }
 
+// TestIssueCommentGateBlockParity pins the shared gate ladder reason by
+// reason: every block reason has a row whose comment trips exactly that gate,
+// so a reordering or a dropped gate fails a named row. The handler carries a
+// tenanted, environment-restricted config so the routing and ownership gates
+// — tenant addressing, tenant-target requirement, environment ownership — are
+// reachable, not skipped behind a nil service. The test drives the ladder
+// directly; the entry points' handling of each reason is exercised by the
+// request-path and durable-driver tests.
 func TestIssueCommentGateBlockParity(t *testing.T) {
 	parser := NewCommandParser()
-	h := &Handler{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// A deployment that owns tenant "alpha" and environment "production" only,
+	// with no aggregate role: unscoped work commands require a tenant target.
+	h := &Handler{service: api.New(nil, &api.ServerConfig{
+		Tenant:              "alpha",
+		AllowedEnvironments: []string{"production"},
+	}, nil, logger)}
+	// An aggregate participant for the repo: unscoped work commands fan out
+	// instead of requiring a tenant target.
+	participant := &Handler{service: api.New(nil, &api.ServerConfig{
+		Tenant:              "alpha",
+		AllowedEnvironments: []string{"production"},
+		Repos: map[string]api.RepoConfig{
+			"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
+		},
+	}, nil, logger)}
 	tests := []struct {
 		name    string
 		comment string
+		handler *Handler
 		want    issueCommentGateBlockReason
 	}{
-		{name: "apply passes", comment: "schemabot apply -e production", want: issueCommentGatePass},
-		{name: "apply-confirm passes", comment: "schemabot apply-confirm -e production", want: issueCommentGatePass},
-		{name: "unlock passes without environment", comment: "schemabot unlock", want: issueCommentGatePass},
+		{name: "apply passes", comment: "schemabot apply -e production -t alpha", want: issueCommentGatePass},
+		{name: "apply-confirm passes", comment: "schemabot apply-confirm -e production -t alpha", want: issueCommentGatePass},
+		{name: "unlock passes without environment", comment: "schemabot unlock -t alpha", want: issueCommentGatePass},
+		{name: "unscoped apply fans out on a participant repo", comment: "schemabot apply -e production", handler: participant, want: issueCommentGatePass},
 		{name: "invalid tenant", comment: "schemabot apply -e production -t", want: issueCommentGateInvalidTenant},
-		{name: "invalid environment", comment: "schemabot apply -e production--yes", want: issueCommentGateInvalidEnvironment},
-		{name: "missing environment", comment: "schemabot apply", want: issueCommentGateMissingEnvironment},
-		{name: "rollback missing apply ID", comment: "schemabot rollback -e production", want: issueCommentGateMissingApplyID},
-		{name: "unsupported auto-confirm", comment: "schemabot apply-confirm -e production -y", want: issueCommentGateAutoConfirm},
-		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover", want: issueCommentGateDeferCutover},
-		{name: "unsupported database", comment: "schemabot stop -e production -d accounts", want: issueCommentGateDatabase},
+		{name: "tenant handled by another deployment", comment: "schemabot apply -e production -t other", want: issueCommentGateTenantNotOwned},
+		{name: "tenant target required", comment: "schemabot apply -e production", want: issueCommentGateTenantRequired},
+		{name: "invalid environment", comment: "schemabot apply -e production--yes -t alpha", want: issueCommentGateInvalidEnvironment},
+		{name: "missing environment", comment: "schemabot apply -t alpha", want: issueCommentGateMissingEnvironment},
+		{name: "environment handled by another instance", comment: "schemabot apply -e staging -t alpha", want: issueCommentGateEnvironmentNotOwned},
+		{name: "rollback missing apply ID", comment: "schemabot rollback -e production -t alpha", want: issueCommentGateMissingApplyID},
+		{name: "command not found", comment: "schemabot frobnicate", want: issueCommentGateCommandNotFound},
+		{name: "unsupported auto-confirm", comment: "schemabot apply-confirm -e production -y -t alpha", want: issueCommentGateAutoConfirm},
+		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover -t alpha", want: issueCommentGateDeferCutover},
+		{name: "unsupported database", comment: "schemabot stop -e production -d accounts -t alpha", want: issueCommentGateDatabase},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			handler := tt.handler
+			if handler == nil {
+				handler = h
+			}
 			result := parser.ParseCommand(tt.comment)
-			reason := h.issueCommentGateBlock("octocat/hello-world", result, parser, tt.comment)
+			reason := handler.issueCommentGateBlock("octocat/hello-world", result, parser, tt.comment)
 
 			require.Equal(t, tt.want, reason)
 		})
