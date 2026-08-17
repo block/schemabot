@@ -734,20 +734,20 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 // LocalClient the data plane builds, so the router and single-database paths
 // share identical execution semantics and can resolve custom database types.
 func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
-	pendingDropsDisabled := !config.PendingDropsEnabled()
+	pendingDrops := strconv.FormatBool(config.PendingDropsEnabled())
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
 		spiritMetadata, err := config.SpiritMetadata()
 		if err != nil {
 			return nil, fmt.Errorf("resolve spirit config for database %q: %w", cfg.Database, err)
 		}
-		if pendingDropsDisabled || len(spiritMetadata) > 0 {
-			if cfg.Metadata == nil {
-				cfg.Metadata = map[string]string{}
-			}
+		if cfg.Metadata == nil {
+			cfg.Metadata = map[string]string{}
 		}
-		if pendingDropsDisabled {
-			cfg.Metadata["pending_drops"] = "false"
-		}
+		// Stated either way rather than only when disabled: a data plane that
+		// predates the opt-in default reads an absent key as "quarantine", so
+		// leaving it out during a rolling deploy would quarantine on a
+		// deployment that has turned the quarantine off.
+		cfg.Metadata["pending_drops"] = pendingDrops
 		// Server-level spirit overrides are defaults; a database's own
 		// metadata entry for the same key wins.
 		for key, value := range spiritMetadata {

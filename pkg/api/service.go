@@ -11,6 +11,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -600,9 +601,11 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.APIURL != "" {
 		metadata["api_url"] = envConfig.APIURL
 	}
-	if !s.config.PendingDropsEnabled() {
-		metadata["pending_drops"] = "false"
-	}
+	// Stated either way rather than only when disabled: a data plane that
+	// predates the opt-in default reads an absent key as "quarantine", so
+	// leaving it out during a rolling deploy would quarantine on a deployment
+	// that has turned the quarantine off.
+	metadata["pending_drops"] = strconv.FormatBool(s.config.PendingDropsEnabled())
 	spiritMetadata, err := s.config.SpiritMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)

@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/block/spirit/pkg/parser/ast"
-	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -23,21 +21,14 @@ import (
 // database instead of being dropped. IF EXISTS semantics are preserved —
 // missing tables are skipped when the statement allows it.
 func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, password, database, stmt string) error {
-	parsed, err := statement.New(stmt)
+	dropStmt, err := parseDropTableStatement(stmt)
 	if err != nil {
-		return fmt.Errorf("parse DROP TABLE statement: %w", err)
-	}
-	if len(parsed) != 1 {
-		return fmt.Errorf("expected exactly 1 parsed DROP TABLE statement, got %d", len(parsed))
-	}
-	dropStmt, ok := (*parsed[0].StmtNode).(*ast.DropTableStmt)
-	if !ok {
-		return fmt.Errorf("statement is not DROP TABLE: %s", stmt)
+		return err
 	}
 	// DROP VIEW and DROP TEMPORARY TABLE also parse as DropTableStmt. Neither
 	// holds recoverable table data, and neither can be renamed into the pending
 	// drops database with table semantics, so execute them as written.
-	if dropStmt.IsView || dropStmt.TemporaryKeyword != ast.TemporaryNone {
+	if isNonTableDrop(dropStmt) {
 		e.logger.Info("executing non-table drop directly without pending drops quarantine",
 			"database", database,
 			"statement", stmt,
@@ -59,28 +50,23 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		return fmt.Errorf("ping database %s: %w", database, err)
 	}
 
-	tables := make([]pendingdrops.TableMove, 0, len(dropStmt.Tables))
-	for _, table := range dropStmt.Tables {
-		tableName := table.Name.String()
-		schemaName := table.Schema.String()
-		if schemaName == "" {
-			schemaName = database
-		}
-
+	targets := dropTableTargets(dropStmt, database)
+	tables := make([]pendingdrops.TableMove, 0, len(targets))
+	for _, target := range targets {
 		if dropStmt.IfExists {
-			exists, err := tableExistsInSchema(ctx, db, schemaName, tableName)
+			exists, err := tableExistsInSchema(ctx, db, target.schema, target.table)
 			if err != nil {
-				return fmt.Errorf("check table `%s`.`%s` exists: %w", schemaName, tableName, err)
+				return fmt.Errorf("check table `%s`.`%s` exists: %w", target.schema, target.table, err)
 			}
 			if !exists {
 				e.logger.Info("DROP TABLE IF EXISTS target does not exist, skipping quarantine",
-					"database", schemaName,
-					"table", tableName,
+					"database", target.schema,
+					"table", target.table,
 				)
 				continue
 			}
 		}
-		tables = append(tables, pendingdrops.TableMove{SchemaName: schemaName, TableName: tableName})
+		tables = append(tables, pendingdrops.TableMove{SchemaName: target.schema, TableName: target.table})
 	}
 
 	moved, err := pendingdrops.MoveTables(ctx, db, tables, time.Now())
