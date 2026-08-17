@@ -79,6 +79,74 @@ func (c *cancelDeployRequestClient) CancelDeployRequest(context.Context, *ps.Can
 	return nil, c.cancelErr
 }
 
+// capturingCancelClient records the cancel request so a test can assert which
+// PlanetScale database name the API call addressed.
+type capturingCancelClient struct {
+	psclient.PSClient
+	gotCancel *ps.CancelDeployRequestRequest
+}
+
+func (c *capturingCancelClient) CancelDeployRequest(_ context.Context, req *ps.CancelDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.gotCancel = req
+	return &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.Cancelled}, nil
+}
+
+// The database a target is registered under is an arbitrary routing key; when
+// the credential metadata carries the PlanetScale database name, every
+// PlanetScale API call addresses that name. Without the metadata the
+// registered identifier doubles as the PlanetScale name.
+func TestControl_AddressesPlanetScaleDatabaseFromCredentialMetadata(t *testing.T) {
+	meta, err := encodePSMetadata(&psMetadata{
+		BranchName:       "schemabot-mydb-abc",
+		DeployRequestID:  7,
+		DeployRequestURL: "https://example.test/deploys/7",
+	})
+	require.NoError(t, err)
+
+	controlReq := func(credMetadata map[string]string) *engine.ControlRequest {
+		return &engine.ControlRequest{
+			Database:    "mydb",
+			ResumeState: &engine.ResumeState{Metadata: meta},
+			Credentials: &engine.Credentials{Metadata: credMetadata},
+		}
+	}
+
+	t.Run("credential metadata database addresses the API", func(t *testing.T) {
+		client := &capturingCancelClient{}
+		e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+			func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+		result, err := e.Cancel(t.Context(), controlReq(map[string]string{
+			"organization": "org",
+			"token_name":   "tn",
+			"token_value":  "tv",
+			"database":     "mydb_main",
+		}))
+
+		require.NoError(t, err)
+		assert.True(t, result.Accepted)
+		require.NotNil(t, client.gotCancel)
+		assert.Equal(t, "mydb_main", client.gotCancel.Database)
+	})
+
+	t.Run("without the metadata the registered identifier is the name", func(t *testing.T) {
+		client := &capturingCancelClient{}
+		e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+			func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+		result, err := e.Cancel(t.Context(), controlReq(map[string]string{
+			"organization": "org",
+			"token_name":   "tn",
+			"token_value":  "tv",
+		}))
+
+		require.NoError(t, err)
+		assert.True(t, result.Accepted)
+		require.NotNil(t, client.gotCancel)
+		assert.Equal(t, "mydb", client.gotCancel.Database)
+	})
+}
+
 func (c *cancelDeployRequestClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
 	if c.getErr != nil {
 		return nil, c.getErr

@@ -170,6 +170,7 @@ func etreAssembler(cfg EtreConfig) (inventory.ConnectionAssembler, inventory.Sec
 	case storage.DatabaseTypeVitess:
 		return inventory.VitessConnectionAssembler{
 			OrganizationAttribute: cfg.Vitess.OrganizationAttribute,
+			DatabaseAttribute:     cfg.Vitess.DatabaseAttribute,
 			APIURL:                cfg.Vitess.APIURL,
 			DefaultPort:           cfg.Vitess.DefaultPort,
 		}, inventory.DecodePlanetScaleSecret, nil
@@ -260,6 +261,11 @@ func resolverAttributeFields(cfg EtreConfig) []string {
 			orgAttr = inventory.MetadataOrganization
 		}
 		fields = ensureField(fields, orgAttr)
+		dbAttr := cfg.Vitess.DatabaseAttribute
+		if dbAttr == "" {
+			dbAttr = inventory.DefaultDatabaseAttribute
+		}
+		fields = ensureField(fields, dbAttr)
 	}
 	if credentialType(cfg.Credentials) == credentialTypeAWSSM {
 		// Assume-role mode (role_arn set) resolves the target account from an

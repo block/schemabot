@@ -588,6 +588,9 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		"token_name":   tokenName,
 		"token_value":  tokenValue,
 	}
+	if envConfig.Database != "" {
+		metadata["database"] = envConfig.Database
+	}
 	if tlsName != "" {
 		metadata["tls_name"] = tlsName
 	}

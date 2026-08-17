@@ -743,6 +743,10 @@ type EtreVitessConfig struct {
 	// OrganizationAttribute is the entity field holding the PlanetScale
 	// organization. Defaults to "organization".
 	OrganizationAttribute string `yaml:"organization_attribute,omitempty"`
+	// DatabaseAttribute is the entity field holding the PlanetScale database
+	// name. Defaults to "name". The requested target identifier stays an
+	// arbitrary routing key; PlanetScale API calls address this name.
+	DatabaseAttribute string `yaml:"database_attribute,omitempty"`
 	// APIURL is the PlanetScale-compatible API base URL; a per-target override in
 	// the credential secret takes precedence.
 	APIURL string `yaml:"api_url,omitempty"`
@@ -958,6 +962,11 @@ type EnvironmentConfig struct {
 	// Organization is the PlanetScale organization name.
 	// sadscan:disable kingfisher.planetscale.2
 	Organization string `yaml:"organization,omitempty"`
+
+	// Database is the PlanetScale database name, for a database registered
+	// under an identifier that differs from its PlanetScale name. Empty means
+	// the registered identifier is also the PlanetScale database name.
+	Database string `yaml:"database,omitempty"`
 
 	// TokenSecretRef is the reference to the PlanetScale API token secret.
 	TokenSecretRef string `yaml:"token_secret_ref,omitempty"`
