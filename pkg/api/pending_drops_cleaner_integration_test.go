@@ -22,6 +22,10 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
+// pendingDropsEnabled opts these tests into the quarantine, which is off by
+// default so a deployment only quarantines when it also reaps its own targets.
+var pendingDropsEnabled = true
+
 // The service-level pending drops cleaner starts a scheduled background loop
 // and runs an immediate cleanup pass, so expired quarantined tables are dropped
 // without waiting for the next interval.
@@ -64,7 +68,7 @@ func TestStartPendingDropsCleanerDropsExpiredTable(t *testing.T) {
 				},
 			},
 		},
-		PendingDrops: PendingDropsConfig{Retention: "24h"},
+		PendingDrops: PendingDropsConfig{Enabled: &pendingDropsEnabled, Retention: "24h"},
 	}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	cleanerCtx, cancel := context.WithCancel(ctx)

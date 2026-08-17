@@ -2059,6 +2059,20 @@ func RecordPendingDropMoved(ctx context.Context, database string) {
 	)
 }
 
+// RecordDropTableAlreadyAbsent increments the counter for a DROP TABLE target
+// that was already gone when the apply reached it. The DROP phase replays from
+// its first statement on resume, so a stopped and resumed apply produces these
+// for the tables its earlier attempt dropped. Outside that, it means something
+// other than the apply removed the table, and the schema files and the target
+// have diverged.
+func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
+	addCounter(ctx, "schemabot.drop_table.already_absent_total",
+		"Total number of DROP TABLE targets that were already absent when the apply reached them", "{table}",
+		attribute.String("database", database),
+		EnvironmentAttribute(""),
+	)
+}
+
 // knownDirectExecutionOutcomes limits metric cardinality to the outcomes the
 // direct execution path can produce. Executed statements terminate as
 // completed, failed, or stopped; refused statements the policy does not route

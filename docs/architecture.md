@@ -209,10 +209,11 @@ Unsafe operations that produce error-severity violations:
 - `MODIFY COLUMN` (type change) — may truncate or lose data if the new type is narrower
 - `DROP INDEX` without first making it invisible — may cause query performance regression
 
-For MySQL/Spirit databases, an applied `DROP TABLE` is additionally quarantined
-instead of executed: the table is renamed into a `_pending_drops` database and
-stays recoverable until a background cleaner drops it after the retention
-period. See [Pending Drops](pending-drops.md).
+For MySQL/Spirit databases, an applied `DROP TABLE` can additionally be
+quarantined instead of executed: the table is renamed into a `_pending_drops`
+database and stays recoverable until a background cleaner drops it after the
+retention period. The quarantine is opt-in per deployment and off by default.
+See [Pending Drops](pending-drops.md).
 
 `HasErrors()` on the plan result checks if any lint warning has error severity. The CLI, webhook check runs, and PR comments all use this to gate applies and surface warnings to reviewers.
 

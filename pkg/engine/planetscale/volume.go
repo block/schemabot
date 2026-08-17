@@ -13,6 +13,10 @@ import (
 // NOTE: Volume/Throttle requires the PlanetScale client to be initialized with a
 // base URL (via Credentials.DSN). This is wired in the tern layer.
 func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
 		return nil, fmt.Errorf("no active schema change")
 	}
