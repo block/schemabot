@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -55,10 +56,11 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	waitForCheckpointReadiness(t, eng)
 
 	// The readiness wait proved the watermark by dumping a checkpoint of its
-	// own. Clear it: every dump appends a row, so the probe's row would
-	// satisfy the count below even if the halt never dumped. The watermark
-	// only advances while the copy runs, so clearing the row does not undo
-	// readiness.
+	// own. Clear it: Spirit keeps a single checkpoint row that every dump
+	// replaces, so the probe's row is indistinguishable from the halt's and
+	// would satisfy the count below even if the halt never dumped. The
+	// watermark only advances while the copy runs, so clearing the row does
+	// not undo readiness.
 	checkpointTable := utils.CheckpointTableName(tableName)
 	_, err := db.ExecContext(t.Context(), fmt.Sprintf("DELETE FROM `%s`", checkpointTable))
 	require.NoError(t, err, "clear the readiness probe's checkpoint from %s", checkpointTable)
@@ -169,15 +171,22 @@ func startCopyForcingAlter(t *testing.T, tableName string) (*Engine, *sql.DB) {
 func waitForCheckpointReadiness(t *testing.T, eng *Engine) {
 	t.Helper()
 
+	// Snapshot the runner in the same lock acquisition that reads the schema
+	// change, mirroring how the engine's own halt path takes it, so the dump
+	// calls below run on the snapshot without touching shared fields.
 	eng.mu.Lock()
 	rm := eng.runningSchemaChange
+	var runner *spiritmigration.Runner
+	if rm != nil && len(rm.runners) > 0 {
+		runner = rm.runners[0]
+	}
 	eng.mu.Unlock()
 	require.NotNil(t, rm, "no schema change is running")
-	require.NotEmpty(t, rm.runners, "the schema change has no runners")
+	require.NotNil(t, runner, "the schema change has no runners")
 
 	deadline := time.Now().Add(copyProgressPollDeadline)
 	for time.Now().Before(deadline) {
-		err := rm.runners[0].DumpCheckpoint(t.Context())
+		err := runner.DumpCheckpoint(t.Context())
 		if err == nil {
 			return
 		}
@@ -222,7 +231,11 @@ func columnType(t *testing.T, db *sql.DB, tableName, columnName string) string {
 }
 
 // haltForCleanup brings a still-running schema change down so a test that fails
-// before halting unwinds promptly instead of waiting out the whole copy.
+// before halting unwinds promptly instead of waiting out the whole copy. On a
+// passing run it halts an already-halted engine, whose dump legitimately finds
+// no watermark — the "could not checkpoint before halting for shutdown ...
+// watermark not ready" warning it logs is expected, not the failure the halt
+// tests guard against.
 func haltForCleanup(t *testing.T, eng *Engine) {
 	t.Helper()
 
