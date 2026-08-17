@@ -2224,7 +2224,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	}
 
-	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard); err != nil {
+	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -2270,6 +2270,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		if winner == nil {
 			return nil, fmt.Errorf("operation %s of apply %s exists per the unique index but was not found on re-read", operationKey, apply.ApplyIdentifier)
 		}
+		c.logger.Info("Apply: concurrent attach won the operation insert; replaying the winner's row",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey)...)
 		metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
 		return dispatchApplyResponse(apply, winner.ID, operationKey), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
@@ -2357,7 +2361,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard); err != nil {
+	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.

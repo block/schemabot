@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -189,4 +191,124 @@ func TestLocalClient_Apply_AttachToTerminalApplyFailsClosed(t *testing.T) {
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Len(t, ops, 1, "the refused dispatch must not attach an operation")
+}
+
+// attachFixture dispatches the first shard of a keyed generation and returns
+// the pieces a direct attachDispatchOperation call needs: the created apply,
+// the stored plan, and the sibling dispatch's derived scope.
+func attachFixture(t *testing.T, stor storage.Storage, client *LocalClient, planID, key string) (*storage.Apply, *storage.Plan, dispatchScope, *ternv1.ApplyRequest) {
+	t.Helper()
+	ctx := t.Context()
+
+	first, err := client.Apply(ctx, shardDispatchRequest(planID, key, "-80"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "first shard dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	siblingReq := shardDispatchRequest(planID, key, "80-")
+	plan, err := client.planForApplyRequest(ctx, siblingReq)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	scope, err := deriveDispatchScope(plan, siblingReq)
+	require.NoError(t, err)
+
+	return apply, plan, scope, siblingReq
+}
+
+// A dispatch that loses the unique-index race to a concurrent same-operation
+// attach is replayed against the winner's row instead of surfacing an error:
+// both racers receive the same apply and operation identifiers.
+func TestLocalClient_Apply_AttachRaceReplaysWinner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	apply, plan, scope, siblingReq := attachFixture(t, stor, client, planID, "schemabot:v1:attach-race-test")
+
+	// The concurrent winner inserts the sibling operation between this
+	// dispatch's operation lookup (a miss) and its attach.
+	now := time.Now()
+	winner := &storage.ApplyOperation{
+		Deployment:   "testdb",
+		OperationKey: "testdb/80-/users",
+		Target:       plan.Target,
+		State:        state.ApplyOperation.Pending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	require.NoError(t, stor.Applies().AttachOperationWithTasks(ctx, apply, winner, buildDispatchTasks(plan, scope, siblingReq.Environment, "spirit", []byte("{}"), now)))
+
+	resp, err := client.attachDispatchOperation(ctx, siblingReq, apply, plan, scope, "testdb/80-/users", storage.ApplyOperationKindWork)
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "the losing racer must be replayed, not refused: %s", resp.ErrorMessage)
+	assert.Equal(t, apply.ApplyIdentifier, resp.ApplyId)
+	assert.Equal(t, strconv.FormatInt(winner.ID, 10), resp.ApplyOperationId, "the loser must resolve to the winner's operation row")
+	assert.Equal(t, "testdb/80-/users", resp.OperationKey)
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the lost race must not insert a duplicate operation")
+}
+
+// An apply that terminalizes between the attach's in-memory state check and
+// its storage write is still refused: the row-locked re-read inside the attach
+// transaction catches the transition and the dispatch fails closed.
+func TestLocalClient_Apply_AttachRefusesApplyTerminalizedUnderneath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	apply, plan, scope, siblingReq := attachFixture(t, stor, client, planID, "schemabot:v1:attach-toctou-test")
+
+	// Terminalize the stored row while the caller still holds a stale
+	// non-terminal snapshot, as a concurrent driver would.
+	current, err := stor.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	current.State = state.Apply.Completed
+	require.NoError(t, stor.Applies().Update(ctx, current))
+	require.False(t, state.IsTerminalApplyState(apply.State), "the caller's snapshot must still look active for the race to be exercised")
+
+	resp, err := client.attachDispatchOperation(ctx, siblingReq, apply, plan, scope, "testdb/80-/users", storage.ApplyOperationKindWork)
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted, "the attach must fail closed when the apply terminalized underneath it")
+	assert.Contains(t, resp.ErrorMessage, "terminal", "the refusal must name the terminal state as the cause")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused attach must not insert its operation")
+}
+
+// The keyed apply's own in-flight tasks are sibling work, not conflicts: a
+// dispatch attaching more work for a shard that apply is already copying on
+// must attach, while another apply's active task on the database still blocks.
+func TestLocalClient_Apply_AttachNotBlockedByOwnSiblingTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	apply, plan, scope, siblingReq := attachFixture(t, stor, client, planID, "schemabot:v1:attach-self-conflict-test")
+
+	// The first dispatch's shard task is still pending. Attach a second
+	// operation for the same shard: without the sibling skip the conflict
+	// gate would treat the apply's own task as active work and refuse.
+	sameShardScope := scope
+	sameShardScope.shard = "-80"
+	resp, err := client.attachDispatchOperation(ctx, siblingReq, apply, plan, sameShardScope, "testdb/-80/orders", storage.ApplyOperationKindWork)
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "the apply's own in-flight sibling task must not block the attach: %s", resp.ErrorMessage)
+	assert.Equal(t, "testdb/-80/orders", resp.OperationKey)
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the same-shard sibling must attach as its own operation")
 }
