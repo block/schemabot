@@ -31,10 +31,40 @@ const durableWebhookTestDeadline = 5 * time.Second
 type durableWebhookTestStorage struct {
 	emptyStorage
 	webhookEvents storage.WebhookEventStore
+	locks         storage.LockStore
+	applies       storage.ApplyStore
 }
 
 func (s *durableWebhookTestStorage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
+}
+
+// Locks and Applies fall back to the embedded emptyStorage stores when a test
+// leaves the optional fields unset, so harnesses that only exercise the inbox
+// keep working non-nil stores instead of panicking on a nil interface.
+func (s *durableWebhookTestStorage) Locks() storage.LockStore {
+	if s.locks != nil {
+		return s.locks
+	}
+	return s.emptyStorage.Locks()
+}
+
+func (s *durableWebhookTestStorage) Applies() storage.ApplyStore {
+	if s.applies != nil {
+		return s.applies
+	}
+	return s.emptyStorage.Applies()
+}
+
+// TestDurableWebhookTestStorageDefaults pins the shared-fixture contract: a
+// zero-value durableWebhookTestStorage must hand back working no-op stores for
+// every accessor, so harnesses that leave optional fields unset never see a
+// nil interface inside a driver goroutine.
+func TestDurableWebhookTestStorageDefaults(t *testing.T) {
+	s := &durableWebhookTestStorage{}
+	require.NotNil(t, s.Locks())
+	require.NotNil(t, s.Applies())
+	require.NotNil(t, s.Checks())
 }
 
 type recordingWebhookEventStore struct {
@@ -404,6 +434,41 @@ func newDurableDriverHandler(t *testing.T, store storage.WebhookEventStore, conf
 		factory = &fakeClientFactory{}
 	}
 	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
+}
+
+// newDurableDriverHarness builds a durable-dispatch Handler backed by a stub
+// GitHub server and returns it with the channel that receives every PR comment
+// the driver posts. It is the shared harness for durable command-driver tests:
+// st supplies the scripted webhook-event storage the driver claims from, a nil
+// config defaults to an empty ServerConfig, and a nil configureGitHub installs
+// only the default PR-comment capture route; pass configureGitHub to add or
+// replace stub routes (it receives the mux and the comment channel and must
+// register its own comment capture if it wants one).
+func newDurableDriverHarness(
+	t *testing.T,
+	st *durableWebhookTestStorage,
+	config *api.ServerConfig,
+	configureGitHub func(*http.ServeMux, chan string),
+) (*Handler, chan string) {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	if configureGitHub == nil {
+		mux.HandleFunc("POST /repos/octocat/hello-world/issues/7/comments", commentRecorder(t, comments))
+	} else {
+		configureGitHub(mux, comments)
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if config == nil {
+		config = &api.ServerConfig{}
+	}
+	service := api.New(st, config, nil, logger)
+	return NewHandler(service, &fakeClientFactory{client: installClient}, nil, logger, WithDurableWebhookDispatch()), comments
 }
 
 func durablePullRequestEvent(t *testing.T) *storage.WebhookEvent {
