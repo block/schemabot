@@ -1053,7 +1053,7 @@ func WriteStatusList(data StatusListData) {
 	maxState := 5       // "STATE"
 	maxStarted := 7     // "STARTED"
 	for _, a := range data.Applies {
-		maxID = maxLen(maxID, len(a.ApplyID))
+		maxID = maxLen(maxID, len(statusApplyID(data, a)))
 		if data.ShowExternalID {
 			maxExternal = maxLen(maxExternal, len(statusExternalID(data, a)))
 		}
@@ -1127,7 +1127,7 @@ func WriteStatusList(data StatusListData) {
 		switch {
 		case data.ShowExternalID && showDeployment:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
+				maxID, statusApplyID(data, a),
 				maxExternal, statusExternalID(data, a),
 				maxDB, a.Database,
 				maxEnv, a.Environment,
@@ -1137,7 +1137,7 @@ func WriteStatusList(data StatusListData) {
 				caller.Short(a.Caller))
 		case data.ShowExternalID:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
+				maxID, statusApplyID(data, a),
 				maxExternal, statusExternalID(data, a),
 				maxDB, a.Database,
 				maxEnv, a.Environment,
@@ -1146,7 +1146,7 @@ func WriteStatusList(data StatusListData) {
 				caller.Short(a.Caller))
 		case showDeployment:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
+				maxID, statusApplyID(data, a),
 				maxDB, a.Database,
 				maxEnv, a.Environment,
 				maxDeployment, a.Deployment,
@@ -1155,7 +1155,7 @@ func WriteStatusList(data StatusListData) {
 				caller.Short(a.Caller))
 		default:
 			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
+				maxID, statusApplyID(data, a),
 				maxDB, a.Database,
 				maxEnv, a.Environment,
 				coloredState,
@@ -1213,6 +1213,20 @@ func writeFailedStatusList(data StatusListData) {
 		fmt.Println()
 		writeStatusListTruncation(data, "failed schema changes")
 	}
+}
+
+// statusApplyID returns the identifier rendered in the APPLY ID column. A
+// deployment-filtered list is the deployment's view of each apply, and the
+// deployment's data-plane apply id is the handle its operator correlates
+// with the data plane's own storage and logs, so it takes the column when
+// one is recorded. Rows without one — not yet dispatched, locally driven, or
+// omitted because the deployment's operations disagree — keep the
+// control-plane apply id so every row carries a usable handle.
+func statusApplyID(data StatusListData, a ActiveApplyData) string {
+	if data.Deployment != "" && a.ExternalID != "" {
+		return a.ExternalID
+	}
+	return a.ApplyID
 }
 
 func statusExternalID(data StatusListData, a ActiveApplyData) string {

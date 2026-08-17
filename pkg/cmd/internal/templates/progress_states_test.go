@@ -198,7 +198,11 @@ func TestWriteStatusListExternalID(t *testing.T) {
 	assert.Contains(t, output, "apply-complete")
 }
 
-func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
+// A deployment-filtered list is the deployment's view of each apply: the
+// APPLY ID column carries the deployment's data-plane apply id — the handle
+// its operator greps in the data plane's own storage and logs — and the
+// EXTERNAL OP ID column carries the per-operation remote row id.
+func TestWriteStatusListDeploymentRendersDataPlaneApplyID(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{
 			ActiveCount:    1,
@@ -209,7 +213,7 @@ func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
 			Applies: []ActiveApplyData{
 				{
 					ApplyID:             "apply-running",
-					ExternalID:          "parent-external",
+					ExternalID:          "apply-remote-a",
 					ExternalOperationID: "remote-operation-a",
 					Database:            "orders",
 					Environment:         "staging",
@@ -225,8 +229,36 @@ func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
 	assert.Contains(t, output, "EXTERNAL OP ID")
 	assert.Contains(t, output, "DEPLOYMENT")
 	assert.Contains(t, output, "remote-operation-a")
-	assert.NotContains(t, output, "parent-external")
+	assert.Contains(t, output, "apply-remote-a")
+	assert.NotContains(t, output, "apply-running",
+		"the deployment view renders the data-plane apply id in place of the control-plane one")
 	assert.Contains(t, output, "deploy-a")
+}
+
+// A deployment row without a recorded data-plane apply id — not yet
+// dispatched, locally driven, or omitted after divergence — keeps the
+// control-plane apply id, so every row carries a usable handle.
+func TestWriteStatusListDeploymentFallsBackToControlPlaneApplyID(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 1,
+			Limit:       20,
+			MaxLimit:    1000,
+			Deployment:  "deploy-a",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-pending",
+					Database:    "orders",
+					Environment: "staging",
+					Deployment:  "deploy-a",
+					State:       state.Apply.Pending,
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "apply-pending")
 }
 
 func TestWriteStatusListFailedOnly(t *testing.T) {
