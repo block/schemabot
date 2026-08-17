@@ -123,7 +123,10 @@ import (
 
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
-	// Database is the name of this database.
+	// Database is the identifier this database is registered under — a routing
+	// and display key. For PlanetScale targets the API addresses the "database"
+	// metadata key when set; without it this identifier doubles as the
+	// PlanetScale database name.
 	Database string
 
 	// Type is the database type. "mysql", "vitess", and "postgres" have built-in
@@ -136,8 +139,9 @@ type LocalConfig struct {
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
-	// Keys used by PlanetScale: organization, token_name, token_value,
-	// tls_name, revert_window_duration, main_branch.
+	// Keys used by PlanetScale: organization, database (the PlanetScale
+	// database name when it differs from the registered identifier),
+	// token_name, token_value, tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
@@ -834,83 +838,83 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 }
 
 func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string, error) {
-	client, org, branch, err := c.planetScalePullClient()
+	pt, err := c.planetScalePullClient()
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "branch", branch)
-	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch)
+	keyspaces, err := pt.client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", c.config.Database, branch, err)
+		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", pt.database, pt.branch, err)
 	}
 	dialect := schema.DialectForDatabaseType(c.config.Type)
 	namespaces := make([]string, 0, len(keyspaces))
 	for _, keyspace := range keyspaces {
 		if keyspace == nil {
-			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "branch", branch)
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch)
 			continue
 		}
 		if keyspace.Name == "" {
-			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", c.config.Database, branch)
+			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", pt.database, pt.branch)
 		}
 		if schema.IsReservedPullNamespaceForDialect(dialect, keyspace.Name) {
-			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", branch, "namespace", keyspace.Name)
+			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", keyspace.Name)
 			continue
 		}
 		namespaces = append(namespaces, keyspace.Name)
 	}
 	sort.Strings(namespaces)
-	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "branch", branch, "namespace_count", len(namespaces))
+	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace_count", len(namespaces))
 	return namespaces, nil
 }
 
 func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1.PullSchemaRequest, namespace string) (*ternv1.PullSchemaResponse, error) {
-	client, org, branch, err := c.planetScalePullClient()
+	pt, err := c.planetScalePullClient()
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
-	schemaResult, err := client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", namespace)
+	schemaResult, err := pt.client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 		Keyspace:     namespace,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 	}
 
 	pulledTables := make(map[string]string, len(schemaResult))
 	for _, tbl := range schemaResult {
 		if tbl == nil {
-			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", namespace)
 			continue
 		}
 		if tbl.Name == "" {
-			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", c.config.Database, branch, namespace)
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", pt.database, pt.branch, namespace)
 		}
 		content, err := pulledSchemaFileContent(c.config.Database, tbl.Name, tbl.Raw)
 		if err != nil {
-			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 		}
 		pulledTables[tbl.Name] = content
 	}
 
 	artifacts := map[string]string{}
-	vschema, err := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	vschema, err := pt.client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 		Keyspace:     namespace,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 	}
 	if vschema != nil && strings.TrimSpace(vschema.Raw) != "" {
 		artifacts[storage.VSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
@@ -918,7 +922,8 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 
 	c.logger.Info("LocalClient.PullSchema: loaded live Vitess schema",
 		"database", c.config.Database,
-		"branch", branch,
+		"planetscale_database", pt.database,
+		"branch", pt.branch,
 		"namespace", namespace,
 		"table_count", len(pulledTables),
 		"artifact_count", len(artifacts),
@@ -953,16 +958,33 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 	}, nil
 }
 
-func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string, error) {
+// planetScalePullTarget carries the PlanetScale client and the identifiers a
+// pull resolves once per call: the organization, the PlanetScale database
+// name, and the branch to read from.
+type planetScalePullTarget struct {
+	client   psclient.PSClient
+	org      string
+	database string
+	branch   string
+}
+
+func (c *LocalClient) planetScalePullClient() (*planetScalePullTarget, error) {
 	if c.psClientFunc == nil {
 		// A vitess database supports pull; a missing PlanetScale client is a
 		// configuration defect, surfaced as an internal error rather than the
 		// unsupported-type sentinel so it cannot read as "pull not supported".
-		return nil, "", "", fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
+		return nil, fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
 	}
 	org := c.config.Metadata["organization"]
 	if org == "" {
-		return nil, "", "", fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+		return nil, fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+	}
+	// The SchemaBot database identifier is a routing and display key; the
+	// PlanetScale database name in target metadata is what the API addresses.
+	// Without the metadata the identifier doubles as the PlanetScale name.
+	database := c.config.Metadata["database"]
+	if database == "" {
+		database = c.config.Database
 	}
 	branch := c.config.Metadata["main_branch"]
 	if branch == "" {
@@ -970,9 +992,9 @@ func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string
 	}
 	client, err := c.psClientFunc(c.config.Metadata["token_name"], c.config.Metadata["token_value"])
 	if err != nil {
-		return nil, "", "", fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
+		return nil, fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
 	}
-	return client, org, branch, nil
+	return &planetScalePullTarget{client: client, org: org, database: database, branch: branch}, nil
 }
 
 type pulledCatalog struct {

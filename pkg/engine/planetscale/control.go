@@ -27,6 +27,10 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 }
 
 func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.ControlOperation, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	meta, client, err := e.controlClient(operation, req)
 	if err != nil {
 		return nil, err
@@ -158,6 +162,10 @@ func classifyCancelRejection(deploymentState string) (class cancelRejectionClass
 
 // Start starts a deferred deploy request. Cancelled deploy requests cannot be restarted.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	meta, err := controlMeta(engine.ControlStart, req)
 	if err != nil {
 		return nil, fmt.Errorf("decode control metadata: %w", err)
@@ -194,6 +202,10 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 
 // Cutover triggers the final schema swap via ApplyDeployRequest.
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	return e.controlDeployRequest(ctx, engine.ControlCutover, req, "cutover", "Cutover initiated for",
 		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
 			dr, err := client.ApplyDeployRequest(ctx, &ps.ApplyDeployRequestRequest{
@@ -218,6 +230,10 @@ func isDeployNotStagedError(err error) bool {
 
 // Revert rolls back a completed schema change during the revert window.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	return e.controlDeployRequest(ctx, engine.ControlRevert, req, "revert", "Revert initiated for",
 		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
 			return client.RevertDeployRequest(ctx, &ps.RevertDeployRequestRequest{
@@ -230,6 +246,10 @@ func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engin
 
 // SkipRevert closes the revert window, making the schema change permanent.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	return e.controlDeployRequest(ctx, engine.ControlSkipRevert, req, "skip revert for", "Revert window skipped for",
 		func(ctx context.Context, client psclient.PSClient, number uint64) (*ps.DeployRequest, error) {
 			return client.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{

@@ -88,6 +88,53 @@ default_reviewers:
 	assert.Equal(t, "localhost:9090", cfg.TernDeployments["default"]["staging"])
 }
 
+// A Vitess database can be registered under an arbitrary identifier: the
+// per-environment database field names the PlanetScale database the API must
+// address, and the etre resolver can read that name from a configurable entity
+// attribute.
+func TestLoadServerConfig_PlanetScaleDatabaseName(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+databases:
+  commerce:
+    type: vitess
+    environments:
+      staging:
+        target: commerce-staging
+        deployment: default
+        organization: acme
+        database: commerce_main
+        token_secret_ref: "name:value"
+tern_deployments:
+  default:
+    staging: "localhost:9090"
+target_resolver:
+  etre:
+    - addr: https://etre.example
+      database_type: vitess
+      entity_type: planetscale_database
+      target_label: dsid
+      vitess:
+        database_attribute: ps_database
+      credentials:
+        password_ref: env:PS_TOKEN
+repos:
+  org/repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+	t.Setenv("SCHEMABOT_CONFIG_FILE", configPath)
+
+	cfg, err := LoadServerConfig()
+	require.NoError(t, err, "LoadServerConfig")
+
+	envConfig := cfg.Databases["commerce"].Environments["staging"]
+	assert.Equal(t, "acme", envConfig.Organization)
+	assert.Equal(t, "commerce_main", envConfig.Database)
+	require.Len(t, cfg.TargetResolver.Etre, 1)
+	assert.Equal(t, "ps_database", cfg.TargetResolver.Etre[0].Vitess.DatabaseAttribute)
+}
+
 func TestLoadServerConfig_NoEnvVar(t *testing.T) {
 	t.Setenv("SCHEMABOT_CONFIG_FILE", "")
 
