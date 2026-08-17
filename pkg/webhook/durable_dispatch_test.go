@@ -36,9 +36,33 @@ func (s *durableWebhookTestStorage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
 }
 
-func (s *durableWebhookTestStorage) Locks() storage.LockStore { return s.locks }
+// Locks and Applies fall back to the embedded emptyStorage stores when a test
+// leaves the optional fields unset, so harnesses that only exercise the inbox
+// keep working non-nil stores instead of panicking on a nil interface.
+func (s *durableWebhookTestStorage) Locks() storage.LockStore {
+	if s.locks != nil {
+		return s.locks
+	}
+	return s.emptyStorage.Locks()
+}
 
-func (s *durableWebhookTestStorage) Applies() storage.ApplyStore { return s.applies }
+func (s *durableWebhookTestStorage) Applies() storage.ApplyStore {
+	if s.applies != nil {
+		return s.applies
+	}
+	return s.emptyStorage.Applies()
+}
+
+// TestDurableWebhookTestStorageDefaults pins the shared-fixture contract: a
+// zero-value durableWebhookTestStorage must hand back working no-op stores for
+// every accessor, so harnesses that leave optional fields unset never see a
+// nil interface inside a driver goroutine.
+func TestDurableWebhookTestStorageDefaults(t *testing.T) {
+	s := &durableWebhookTestStorage{}
+	require.NotNil(t, s.Locks())
+	require.NotNil(t, s.Applies())
+	require.NotNil(t, s.Checks())
+}
 
 type recordingWebhookEventStore struct {
 	mu     sync.Mutex
