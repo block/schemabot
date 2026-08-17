@@ -112,12 +112,11 @@ notes as the contract.
 ## Cadence and release boundaries
 
 A release usually carries several merged commits. Every tag has to be rolled out
-through staging and then production, so batching amortizes that time rather than
+through pre-production and then production, so batching amortizes that time rather than
 paying it per change.
 
-There is no minimum, though. A single commit is a perfectly good release, and
-reaching for one is the right call whenever waiting would cost more than the extra
-rollout. If the next rollout step needs code that is only on `main`, cut the next
+There is no minimum amount of commits however, and a single commit is still a perfectly
+good release candidate. If the next rollout step needs code that is only on `main`, cut the next
 patch release instead of deploying an unreleased commit or sitting on the fix until
 more work piles up.
 
