@@ -339,6 +339,14 @@ func newDurableDriverHandler(t *testing.T, store storage.WebhookEventStore, conf
 	return NewHandler(service, factory, nil, logger, WithDurableWebhookDispatch())
 }
 
+// newDurableDriverHarness builds a durable-dispatch Handler backed by a stub
+// GitHub server and returns it with the channel that receives every PR comment
+// the driver posts. It is the shared harness for durable command-driver tests:
+// st supplies the scripted webhook-event storage the driver claims from, a nil
+// config defaults to an empty ServerConfig, and a nil configureGitHub installs
+// only the default PR-comment capture route; pass configureGitHub to add or
+// replace stub routes (it receives the mux and the comment channel and must
+// register its own comment capture if it wants one).
 func newDurableDriverHarness(
 	t *testing.T,
 	st *durableWebhookTestStorage,
