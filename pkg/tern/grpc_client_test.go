@@ -908,7 +908,13 @@ func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationI
 	if m.getByOperationIDErr != nil {
 		return nil, m.getByOperationIDErr
 	}
-	return m.tasks, nil
+	var scoped []*storage.Task
+	for _, task := range m.tasks {
+		if task.ApplyOperationID != nil && *task.ApplyOperationID == applyOperationID {
+			scoped = append(scoped, task)
+		}
+	}
+	return scoped, nil
 }
 func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return m.updateErr }
 
@@ -1411,6 +1417,82 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 	require.Len(t, req.DdlChanges, 1)
 	assert.Equal(t, "users", req.DdlChanges[0].TableName)
 	assert.Equal(t, []string{"-80"}, req.TargetShards)
+}
+
+// A deployment applied per shard dispatches each shard's operation to the
+// remote data plane under one deployment-keyed idempotency key, so the data
+// plane lands every sibling in the deployment's single data-plane apply: the
+// first dispatch creates it, each later sibling attaches its own operation.
+// Both operation rows record that one remote apply id, and the parent apply's
+// external_id stays untouched — one deployment, one data-plane apply.
+func TestGRPCClient_SiblingShardOperationsRecordOneRemoteApply(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID: "remote-shared-1",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "commerce",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-sharded",
+		PlanID:          99,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeStrata,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	opA, opB := int64(41), int64(42)
+	taskA := &storage.Task{
+		ID: 11, TaskIdentifier: "task-users-a", ApplyID: apply.ID, ApplyOperationID: &opA,
+		TableName: "users", Shard: "-80", Namespace: "commerce",
+		DDL: "ALTER TABLE users ADD COLUMN email varchar(255)", DDLAction: "alter", State: state.Task.Pending,
+	}
+	taskB := &storage.Task{
+		ID: 12, TaskIdentifier: "task-users-b", ApplyID: apply.ID, ApplyOperationID: &opB,
+		TableName: "users", Shard: "80-", Namespace: "commerce",
+		DDL: "ALTER TABLE users ADD COLUMN email varchar(255)", DDLAction: "alter", State: state.Task.Pending,
+	}
+	operationStore := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		opA: {ID: opA, ApplyID: apply.ID, Deployment: "commerce-deployment", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
+		opB: {ID: opB, ApplyID: apply.ID, Deployment: "commerce-deployment", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
+	}}
+	client.storage = &mockStorage{
+		applies:    &mockApplyStore{apply: apply},
+		tasks:      &mockTaskStore{tasks: []*storage.Task{taskA, taskB}},
+		plans:      &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-sharded"}},
+		operations: operationStore,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, opA))
+	firstReq := server.getApplyRequest()
+	require.NotNil(t, firstReq, "the first shard operation must dispatch to the data plane")
+	assert.Equal(t, []string{"-80"}, firstReq.TargetShards)
+	assert.Equal(t, "remote-shared-1", operationStore.ops[opA].ExternalID)
+
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, opB))
+	secondReq := server.getApplyRequest()
+	require.NotNil(t, secondReq, "the sibling shard operation must dispatch to the data plane")
+	assert.Equal(t, []string{"80-"}, secondReq.TargetShards)
+
+	require.NotEmpty(t, firstReq.IdempotencyKey)
+	assert.Equal(t, firstReq.IdempotencyKey, secondReq.IdempotencyKey,
+		"sibling dispatches must carry the deployment-keyed idempotency key so the data plane attaches them into one apply")
+
+	assert.Equal(t, "remote-shared-1", operationStore.ops[opA].ExternalID)
+	assert.Equal(t, "remote-shared-1", operationStore.ops[opB].ExternalID,
+		"every operation of the deployment must record the deployment's one remote apply id")
+	assert.Empty(t, apply.ExternalID,
+		"a multi-operation dispatch must not write the parent apply external_id")
 }
 
 func TestGRPCClient_ResumeApplyOperationDispatchesGroupFinalizerAsVSchemaOnly(t *testing.T) {

@@ -4070,6 +4070,83 @@ func TestHandleStatusDeploymentFilterSummarizesMatchingOperations(t *testing.T) 
 	assert.Equal(t, state.Apply.Running, resp.Applies[0].State)
 }
 
+// A deployment applied per shard has exactly one data-plane apply: every
+// operation dispatched for it attaches into that apply and records its id.
+// The deployment-filtered status endpoint folds those operations into one row
+// that surfaces the shared data-plane apply id, so the operator gets the
+// deployment's correlation handle straight from the list — per-operation ids
+// stay in the detail views.
+func TestHandleStatusDeploymentFoldSurfacesSharedDataPlaneApplyID(t *testing.T) {
+	now := time.Now().UTC()
+	startedAt := now.Add(-2 * time.Minute)
+	completedAt := now.Add(-time.Minute)
+	applies := &recentApplyStore{
+		applies: []*storage.Apply{
+			{
+				ID:              101,
+				ApplyIdentifier: "apply-deployment",
+				Database:        "orders",
+				Environment:     "staging",
+				Deployment:      "deploy-a",
+				Engine:          storage.EngineSpirit,
+				State:           state.Apply.Running,
+				Caller:          "cli",
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			},
+		},
+	}
+	operations := &staticApplyOperationStore{
+		operations: []*storage.ApplyOperation{
+			{
+				ID:                  202,
+				ApplyID:             101,
+				Deployment:          "deploy-a",
+				ExternalID:          "remote-apply-shared",
+				ExternalOperationID: "remote-operation-202",
+				State:               state.Apply.Completed,
+				StartedAt:           &startedAt,
+				CompletedAt:         &completedAt,
+				CreatedAt:           now.Add(-2 * time.Minute),
+				UpdatedAt:           completedAt,
+			},
+			{
+				ID:                  203,
+				ApplyID:             101,
+				Deployment:          "deploy-a",
+				ExternalID:          "remote-apply-shared",
+				ExternalOperationID: "remote-operation-203",
+				State:               state.Apply.Running,
+				StartedAt:           &startedAt,
+				CreatedAt:           now.Add(-90 * time.Second),
+				UpdatedAt:           now,
+			},
+		},
+	}
+	stor := &mockStorageWithApplyStores{applies: applies, operations: operations}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(stor, testServerConfig(), nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?environment=staging&deployment=deploy-a", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp apitypes.StatusResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	require.Len(t, resp.Applies, 1)
+	assert.Equal(t, "apply-deployment", resp.Applies[0].ApplyID)
+	assert.Equal(t, "remote-apply-shared", resp.Applies[0].ExternalID,
+		"the folded row must carry the deployment's one data-plane apply id")
+	assert.Empty(t, resp.Applies[0].ExternalOperationID,
+		"per-operation remote ids belong to the detail views, not the fold")
+	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].State)
+}
+
 func TestHandleStatusFailedFilter(t *testing.T) {
 	now := time.Now().UTC()
 	applies := &recentApplyStore{
