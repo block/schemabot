@@ -12,6 +12,7 @@ import (
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
@@ -99,11 +100,12 @@ func (e *Engine) executeDropDirectly(ctx context.Context, host, username, passwo
 			return fmt.Errorf("check table `%s`.`%s` exists: %w", target.schema, target.table, err)
 		}
 		if !exists {
-			e.logger.Warn("DROP TABLE target is already absent, leaving it dropped",
+			e.logger.Warn("DROP TABLE target is already absent; nothing to drop",
 				"database", target.schema,
 				"table", target.table,
 			)
 			e.emitTableLog(target.table, "table was already absent; nothing to drop")
+			metrics.RecordDropTableAlreadyAbsent(ctx, target.schema)
 			continue
 		}
 		// IF EXISTS carries the convergence through the window between the

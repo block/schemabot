@@ -300,10 +300,8 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		config:  cfg,
 		storage: stor,
 		spiritEngine: spirit.New(spirit.Config{
-			Logger: logger,
-			// Pending drops quarantine is on by default; deployments opt out
-			// via the pending_drops metadata key.
-			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
+			Logger:              logger,
+			DisablePendingDrops: pendingDropsDisabled(cfg.Metadata),
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
@@ -3169,4 +3167,16 @@ func dsnLogAttrs(dsn string) []any {
 		"target_addr", cfg.Addr,
 		"target_db", cfg.DBName,
 	}
+}
+
+// pendingDropsDisabled reports whether this client drops tables outright rather
+// than quarantining them in the pending drops database.
+//
+// The quarantine is opt-in: a deployment turns it on with the pending_drops
+// metadata key, and anything else, including an absent key, drops the table
+// outright. Quarantining is only safe for a deployment that also reaps its own
+// targets, because a quarantine no cleaner reaches grows on the target server
+// forever, so an embedder that never states the intent must not inherit it.
+func pendingDropsDisabled(metadata map[string]string) bool {
+	return metadata["pending_drops"] != "true"
 }

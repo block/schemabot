@@ -319,3 +319,63 @@ func TestEngine_ExecuteSchemaChange_DirectDropMultiTablePartiallyAbsent(t *testi
 	require.NoError(t, err)
 	assert.Equal(t, 0, count, "the table that was still present must be dropped")
 }
+
+// The direct path forwards drops that carry no base-table data or that already
+// tolerate a missing target: views, temporary tables, and an explicit IF
+// EXISTS. Each must execute as written rather than going through the existence
+// check, which only understands base tables.
+func TestEngine_ExecuteSchemaChange_DirectDropForwardsBypassedStatements(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  string
+		ddl    string
+		absent string
+	}{
+		{
+			name:   "view",
+			setup:  "CREATE VIEW `direct_view` AS SELECT 1 AS one",
+			ddl:    "DROP VIEW `direct_view`",
+			absent: "direct_view",
+		},
+		{
+			name:   "if exists on a present table",
+			setup:  "CREATE TABLE `direct_if_exists` (id INT PRIMARY KEY AUTO_INCREMENT)",
+			ddl:    "DROP TABLE IF EXISTS `direct_if_exists`",
+			absent: "direct_if_exists",
+		},
+		{
+			name:   "if exists on a missing table",
+			ddl:    "DROP TABLE IF EXISTS `direct_never_existed`",
+			absent: "direct_never_existed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := setupTestMySQL(t)
+			cleanupTables(t, db)
+			cleanupPendingDropsDB(t, db)
+
+			if tt.setup != "" {
+				_, err := db.ExecContext(t.Context(), tt.setup)
+				require.NoError(t, err, "setup")
+			}
+
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+			state := runDDLApply(t, eng, dsn, []string{tt.ddl})
+			assert.Equal(t, engine.StateCompleted, state)
+
+			var count int
+			err := db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = ?",
+				tt.absent).Scan(&count)
+			require.NoError(t, err)
+			assert.Equal(t, 0, count, "%s should not exist in testdb", tt.absent)
+
+			quarantined := listQuarantinedTables(t, db)
+			assert.Empty(t, quarantined, "the direct path must not quarantine anything")
+		})
+	}
+}

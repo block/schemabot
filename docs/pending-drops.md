@@ -131,6 +131,7 @@ See [Configuration](configuration.md#pending-drops) for field semantics.
 
 | Signal | Meaning |
 | --- | --- |
+| `schemabot.drop_table.already_absent_total` | DROP TABLE targets that were already absent when the apply reached them, by database and environment. Expected after a stopped apply resumes, because the DROP phase replays from its first statement. Outside that, the schema files and the target have diverged. |
 | `schemabot.pending_drops.tables_moved_total` | Tables quarantined instead of dropped, by database and environment. |
 | `schemabot.pending_drops.cleanup_dropped_total` | Expired quarantined tables permanently dropped by the cleaner. |
 | `schemabot.pending_drops.cleanup_skipped_total` | Quarantined tables skipped because their names carry no valid timestamp prefix. A sustained nonzero rate means tables are accumulating that an operator must inspect and remove manually. |

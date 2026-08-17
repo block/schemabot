@@ -79,9 +79,10 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 		}
 	}
 
-	// Execute DROP TABLE statements last. By default each table is quarantined
-	// in the pending drops database instead of dropped; when pending drops is
-	// disabled the DROP runs directly through Spirit.
+	// Execute DROP TABLE statements last. Each table is dropped directly
+	// through Spirit unless the deployment enabled the pending drops
+	// quarantine, in which case it is renamed into the pending drops database
+	// instead.
 	if !e.executeDropStatements(ctx, host, username, password, database, phases.drops) {
 		return
 	}
