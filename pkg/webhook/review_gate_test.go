@@ -593,7 +593,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply")
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
 		require.Error(t, err)
 		assert.False(t, blocked, "evaluation failure must not report a merit block")
 
@@ -604,6 +604,29 @@ func TestEnforceReviewGate(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for evaluation-failure comment")
 		}
+	})
+
+	t.Run("durable attempt suppresses the evaluation-failure comment", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		comments := registerCommentsCapture(mux)
+		mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/reviews", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+		})
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", true)
+		require.Error(t, err)
+		assert.False(t, blocked, "evaluation failure must not report a merit block")
+		assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
 	})
 
 	t.Run("missing approval blocks on the merits without error", func(t *testing.T) {
@@ -619,7 +642,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply")
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
 		require.NoError(t, err)
 		assert.True(t, blocked)
 
@@ -651,7 +674,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply")
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
 		require.NoError(t, err)
 		assert.False(t, blocked)
 		assert.Empty(t, comments, "an approved review must not draw a gate comment")

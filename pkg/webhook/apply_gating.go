@@ -25,12 +25,15 @@ import (
 // A PR fetch failure stops the command (fail closed) and is returned as an
 // error, not a block: the PR state could not be verified, so the outcome is
 // not the command's answer and a durable driver may re-drive it. blocked is
-// true only for a verified closed PR.
+// true only for a verified closed PR. suppressRetryComments silences the
+// evaluation-failure comment on durable attempts, where the driver retries
+// and posts the single terminal answer instead; merit blocks always comment
+// because they are the command's answer.
 //
 // This is a safety re-check, so it bypasses the request-scoped PR-info cache:
 // discovery earlier in the same delivery may have cached the PR as open, and a
 // close landing between discovery and this gate must still block the apply.
-func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string) (blocked bool, err error) {
+func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, requestedBy string, suppressRetryComments bool) (blocked bool, err error) {
 	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("failed to fetch PR state for the closed-PR apply gate; stopping the command",
@@ -38,7 +41,9 @@ func (h *Handler) enforceOpenPR(ctx context.Context, client *ghclient.Installati
 		// The raw error can carry internal detail (hosts, headers, newlines)
 		// that must not render in PR markdown; operators triage from the log
 		// line above.
-		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Could not verify the pull request state, so the command was blocked. Retry, and see server logs if it persists.")
+		if !suppressRetryComments {
+			h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, "Could not verify the pull request state, so the command was blocked. Retry, and see server logs if it persists.")
+		}
 		return false, fmt.Errorf("closed-PR gate fetch PR %s#%d: %w", repo, pr, err)
 	}
 	if !prInfo.IsClosed() {
@@ -110,8 +115,10 @@ func isPassingCheckConclusion(conclusion string) bool {
 // checks with distinct messages. A check-status read failure stops the command
 // (fail closed) and is returned as an error, not a block: the gate could not
 // evaluate its inputs, so the outcome is not the command's answer and a
-// durable driver may re-drive it.
-func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string) (blocked bool, err error) {
+// durable driver may re-drive it. suppressRetryComments silences the
+// read-failure comment on durable attempts, where the driver retries and
+// posts the single terminal answer instead; merit blocks always comment.
+func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string, suppressRetryComments bool) (blocked bool, err error) {
 	config := h.service.Config()
 	if !config.ShouldRequirePassingChecks() {
 		h.logger.Debug("passing checks gate disabled", "repo", repo, "pr", pr)
@@ -146,8 +153,10 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"checks_error", diagnostic.ChecksError,
 			"commit_statuses_error", diagnostic.CommitStatusesError,
 			"error", err)
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID,
+				templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
+		}
 		return false, fmt.Errorf("checks gate read PR check statuses %s#%d: %w", repo, pr, err)
 	}
 

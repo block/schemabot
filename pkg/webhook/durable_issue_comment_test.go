@@ -480,7 +480,7 @@ func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
 		locks:         &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")},
 		applies:       &noActiveAppliesStore{},
 	}
-	h, _ := newDurableDriverHarness(t, st, nil, nil)
+	h, comments := newDurableDriverHarness(t, st, nil, nil)
 
 	before := time.Now()
 	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
@@ -494,6 +494,30 @@ func TestDurableIssueCommentDriverRetriesUnlockLockLookupFailure(t *testing.T) {
 		t.Fatal("expected unlock lock-lookup failure to be marked failed")
 	}
 	require.Empty(t, store.completed)
+	require.Empty(t, comments, "an intermediate durable attempt must not post a retry comment")
+}
+
+// The final durable attempt still gives the user exactly one answer: the core
+// stays silent and the driver posts after recording the terminal disposition.
+func TestDurableIssueCommentDriverFinalAttemptPostsOneRetryFailure(t *testing.T) {
+	event := durableIssueCommentEvent("schemabot unlock")
+	event.Attempts = maxDurableWebhookAttempts - 1
+	store := newScriptedWebhookEventStore(event)
+	st := &durableWebhookTestStorage{
+		webhookEvents: store,
+		locks:         &unlockTestLockStore{getByPRErr: errors.New("lock lookup failed")},
+		applies:       &noActiveAppliesStore{},
+	}
+	h, comments := newDurableDriverHarness(t, st, nil, nil)
+
+	h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
+
+	failure := <-store.failed
+	require.Nil(t, failure.retryAfter)
+	body := requireComment(t, comments, "terminal unlock failure")
+	require.Contains(t, body, "Unlock Failed")
+	require.Contains(t, body, "could not complete this command after retrying")
+	require.Empty(t, comments, "the final attempt must post only one answer")
 }
 
 // cancelOnLookupLockStore cancels the drive context during the lock lookup and,

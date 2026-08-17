@@ -892,6 +892,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.SuppressRetryComments = true
 	// The two drop paths below can swallow a command the user already saw
 	// acknowledged: a config or command-spec change between enqueue and drive
 	// reclassifies a legitimately enqueued row, and the user is left waiting on
@@ -940,6 +941,43 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 		return true, fmt.Errorf("durable issue_comment delivery %s run cancelled during %s command: %w", event.DeliveryID, result.Action, ctxErr)
 	}
 	return coreRetry, nil
+}
+
+// durableIssueCommentCommand identifies the command and PR destination in a
+// stored issue_comment payload. Terminal notification re-derives the repo,
+// PR, command, and requester from the payload rather than the denormalized
+// inbox columns, applying the same shape and command-ready gates as normal
+// dispatch; the installation ID comes from the tenant column, the same
+// source normal dispatch uses. The routing gates (repo
+// allow-list, tenant and environment ownership) are intentionally not
+// re-run: a routing-blocked delivery completes as a no-op on its first
+// attempt and never exhausts its retry budget, so no routing-blocked row can
+// reach terminal notification.
+func durableIssueCommentCommand(event *storage.WebhookEvent) (CommandResult, string, int, int64, string, error) {
+	var payload webhookPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return CommandResult{}, "", 0, 0, "", fmt.Errorf("decode durable issue_comment terminal notification %s: %w", event.DeliveryID, err)
+	}
+	if payload.Action != "created" || payload.Issue == nil || payload.Issue.PullRequest == nil ||
+		payload.Comment == nil || payload.Repository == nil {
+		return CommandResult{}, "", 0, 0, "", fmt.Errorf("durable issue_comment terminal notification %s is not a PR comment creation", event.DeliveryID)
+	}
+	result := NewCommandParser().ParseCommand(payload.Comment.Body)
+	if !durableIssueCommentCommandReady(result) {
+		return CommandResult{}, "", 0, 0, "", fmt.Errorf("durable issue_comment terminal notification %s is not a durable command", event.DeliveryID)
+	}
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return CommandResult{}, "", 0, 0, "", err
+	}
+	if payload.Repository.FullName == "" || payload.Issue.Number == 0 {
+		return CommandResult{}, "", 0, 0, "", fmt.Errorf("durable issue_comment terminal notification %s is missing repo or PR", event.DeliveryID)
+	}
+	requestedBy := ""
+	if payload.Comment.User != nil {
+		requestedBy = payload.Comment.User.Login
+	}
+	return result, payload.Repository.FullName, payload.Issue.Number, installationID, requestedBy, nil
 }
 
 // durableIssueCommentCommandReady reports whether a re-parsed comment carries
