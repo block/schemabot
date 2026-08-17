@@ -270,25 +270,22 @@ the Spirit dependency. The other engines do not have this exposure: a Vitess
 change is a PlanetScale deploy request that the Vitess side owns and tracks, so
 there is no checkpoint on SchemaBot's side that has to stay compatible.
 
-How much a restart costs depends on the change. Adding a column is instant DDL and
-completes in milliseconds, so there is nothing to pick up. A change that needs a
-row copy, such as adding an index, can run for hours to weeks on a large table. So
-that a restart does not throw that work away, Spirit keeps a small checkpoint table
-alongside the table being changed and rewrites a single row in it as the copy
+How much an app restart costs depends on the change. Adding a column is instant DDL
+and completes in milliseconds, so there is nothing to pick up. A change that needs
+a table copy, such as adding an index, can run for hours to weeks on a large table.
+To prevent an app restart from losing progress, Spirit keeps a small checkpoint
+table alongside the table being changed and rewrites a single row in it as the copy
 progresses: how far the copy has reached, how far verification has reached, the
-binlog position, and the statement being applied. On restart it
-reads that row and picks up from there instead of copying the table again.
+binlog position, and the statement being applied. On restart it reads that row and
+picks up from there instead of copying the table again.
 
-The exposure is a schema change that is **already in flight** when the process
-restarts on the new version. A fresh run is safe, because Spirit recreates the
-checkpoint table when a single-table change starts and therefore always writes
-the shape the running version expects. A row written by the old version and read
-back by the new one is the case that has to still mean the same thing.
-
-So when the Spirit dependency moves, diff its checkpoint package between the old
-and new pin. Identical means in-flight work survives the upgrade untouched. Any
-change means the release needs a drain step, and the notes have to say so, because
-the failure is quiet: the copy simply starts over.
+This is typically safe, but when the Spirit dependency upgrades, it's important to
+verify the checkpoint format between the new and old version are the same, since a
+checkpoint format change will require rebuilding the checkpoint table from scratch,
+and hence losing all table copy progress and needing to start over from the
+beginning. The best mitigation for this is to ensure all long running schema
+changes finish before doing the upgrade (e.g. via the `schemabot status` CLI
+command).
 
 ### 5. Wire protocol
 
