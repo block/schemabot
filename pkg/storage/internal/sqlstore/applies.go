@@ -794,11 +794,10 @@ func insertApplyGroupedOperations(ctx context.Context, tx *rebindTx, identity id
 			return fmt.Errorf("create apply %s deployment %s: grouped operation is missing its operation row", apply.ApplyIdentifier, deployment)
 		}
 		// A group_finalizer carries no tasks — it applies namespace-level work
-		// reconstructed from the plan at drive time. A caller may also explicitly
-		// allow a task-less work operation for a single grouped engine apply whose
-		// only work is plan-level metadata. Every other work operation must have at
-		// least one task so operation-scoped drives fail closed on bad scoping.
-		if len(group.Tasks) == 0 && group.Operation.OperationKind != storage.ApplyOperationKindGroupFinalizer && !group.AllowTaskless {
+		// reconstructed from the plan at drive time. Every work operation must
+		// have at least one task so operation-scoped drives fail closed on bad
+		// scoping.
+		if len(group.Tasks) == 0 && group.Operation.OperationKind != storage.ApplyOperationKindGroupFinalizer {
 			return fmt.Errorf("create apply %s deployment %s: grouped work operation has no tasks", apply.ApplyIdentifier, deployment)
 		}
 

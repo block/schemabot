@@ -867,14 +867,19 @@ type TableProgressResponse struct {
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
-	ChecksumRowsChecked int64                    `json:"checksum_rows_checked,omitempty"`
-	ChecksumRowsTotal   int64                    `json:"checksum_rows_total,omitempty"`
-	IsInstant           bool                     `json:"is_instant,omitempty"`
-	ProgressDetail      string                   `json:"progress_detail,omitempty"`
-	TaskID              string                   `json:"task_id,omitempty"`
-	StartedAt           string                   `json:"started_at,omitempty"`
-	CompletedAt         string                   `json:"completed_at,omitempty"`
-	Shards              []*ShardProgressResponse `json:"shards,omitempty"`
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
+	// The engine's throttler is pausing this table's active phase (row copy or
+	// checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool                     `json:"throttled,omitempty"`
+	ThrottleReason string                   `json:"throttle_reason,omitempty"`
+	IsInstant      bool                     `json:"is_instant,omitempty"`
+	ProgressDetail string                   `json:"progress_detail,omitempty"`
+	TaskID         string                   `json:"task_id,omitempty"`
+	StartedAt      string                   `json:"started_at,omitempty"`
+	CompletedAt    string                   `json:"completed_at,omitempty"`
+	Shards         []*ShardProgressResponse `json:"shards,omitempty"`
 }
 
 // ShardProgressResponse contains per-shard progress for Vitess schema changes.

@@ -145,9 +145,13 @@
 //
 // # Instant DDL
 //
-// PlanetScale auto-detects instant DDL eligibility. When eligible and neither
-// enableRevert nor deferCutover is set, instant DDL is used automatically.
-// Instant DDL completes immediately without a row copy phase.
+// PlanetScale auto-detects instant DDL eligibility. When eligible, instant DDL
+// is used automatically — unless the cutover was deferred (instant DDL swaps
+// the schema the moment the deploy runs, so there is no gate to hold) or the
+// change is unsafe in Spirit's vocabulary (DROP TABLE, DROP COLUMN, and other
+// data-destroying operations — instant DDL has no revert window, so an unsafe
+// change must take the row-copy path to stay revertible). Instant DDL
+// completes immediately without a row copy phase.
 //
 // # VSchema
 //
@@ -489,6 +493,11 @@ type psMetadata struct {
 	// only one that knows it. Map membership drives the baseline diff; the stored
 	// timestamp values are diagnostic only — the earliest-requested tie-break in
 	// discovery reads requested_timestamp from the current rows, not from these.
+	// The set is bounded at capture time: non-terminal contexts are always
+	// included, terminal history only within baselineContextRetention. Old
+	// terminal contexts absent from the baseline are still excluded from
+	// discovery by the requested-at-or-after-deploy check, because Vitess
+	// retries preserve the original requested_timestamp.
 	ExistingMigrationCtxs map[string]MigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
 }
 

@@ -784,7 +784,7 @@ Operations that support instant DDL include:
 - Modifying ENUM/SET column definitions
 - Adding or dropping a virtual generated column
 
-Note: some instant operations (e.g., dropping a column) are also flagged as unsafe since they cause data loss. Instant DDL is skipped when `--defer-cutover` or `--enable-revert` is set, since those require the full online DDL flow for cutover and revert control.
+Note: instant DDL completes immediately and leaves no revert window, so eligibility alone does not decide the path. An instant-eligible change deploys with a row copy instead when the change is unsafe in Spirit's vocabulary (e.g., dropping a column or partition — the row copy keeps a revert window open to undo the change) or when `--defer-cutover` is set (an instant deploy swaps the schema as soon as it runs, leaving the deferred cutover with nothing to hold).
 
 **Spirit (MySQL) — Sequential** (default):
 - Each task runs independently: instant DDL or copy rows → cutover → next task

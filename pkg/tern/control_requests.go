@@ -178,21 +178,27 @@ func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storag
 	return nil
 }
 
-func completePendingStopIfStoredApplyResolved(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
+// completePendingRequestIfStoredApplyResolved reloads the apply and, when its
+// stored state is terminal, completes the operation's pending control requests
+// and refreshes the caller's copy of the apply. It returns false without error
+// when the stored apply has not resolved yet — the caller decides whether that
+// means the request stays pending (a settle deferred to the apply-state
+// projection) or the consumption failed.
+func completePendingRequestIfStoredApplyResolved(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
 	if store == nil {
 		return false, fmt.Errorf("storage is not available")
 	}
 	storedApply, err := store.Applies().Get(ctx, apply.ID)
 	if err != nil {
-		return false, fmt.Errorf("load apply %s before completing pending stop: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("load apply %s before completing pending %s: %w", apply.ApplyIdentifier, operation, err)
 	}
 	if storedApply == nil {
-		return false, fmt.Errorf("load apply %s before completing pending stop: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+		return false, fmt.Errorf("load apply %s before completing pending %s: %w", apply.ApplyIdentifier, operation, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(storedApply.State) {
 		return false, nil
 	}
-	if err := completePendingControlRequests(ctx, store, storedApply, storage.ControlOperationStop); err != nil {
+	if err := completePendingControlRequests(ctx, store, storedApply, operation); err != nil {
 		return false, err
 	}
 	*apply = *storedApply

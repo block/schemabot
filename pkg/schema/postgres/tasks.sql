@@ -25,6 +25,8 @@ CREATE TABLE tasks (
   eta_seconds integer DEFAULT NULL,
   checksum_rows_checked bigint DEFAULT 0,
   checksum_rows_total bigint DEFAULT 0,
+  throttled boolean NOT NULL DEFAULT FALSE,
+  throttle_reason varchar(255) NOT NULL DEFAULT '',
   cutover_attempts integer NOT NULL DEFAULT 0,
   is_instant boolean DEFAULT FALSE,
   engine_migration_id varchar(255) DEFAULT NULL,

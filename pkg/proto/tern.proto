@@ -633,6 +633,31 @@ message TableProgress {
   // rejection), distinct from the apply-level error_message on
   // ProgressResponse. Empty when the table has not failed.
   string error_message = 16;
+  // The engine's throttler is pausing this table's active phase (row copy or
+  // checksum verify), so stalled row counts read as a deliberate pause rather
+  // than a hang. Cleared when the pause lifts.
+  bool throttled = 17;
+  // Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
+  // 2s"). Empty when throttled is false.
+  string throttle_reason = 18;
+}
+
+// SettledControlRequest reports the fate of a durable control request the
+// serving plane consumed. Accepting a control RPC only means the request was
+// queued, so the plane that accepted it learns here whether the operation
+// actually took effect.
+message SettledControlRequest {
+  // The control operation: "stop", "start", "cutover", "cancel", "volume",
+  // "revert", or "skip_revert".
+  string operation = 1;
+  // Terminal status of the request: "completed" or "failed".
+  string status = 2;
+  // Operator-facing reason the request failed. Empty when it completed.
+  string error_message = 3;
+  // RFC3339 timestamp of when the request reached its terminal status.
+  string settled_at = 4;
+  // Who issued the request, as recorded by the plane that queued it.
+  string requested_by = 5;
 }
 
 // ProgressResponse contains detailed progress information.
@@ -647,6 +672,8 @@ message ProgressResponse {
   string completed_at = 8;
   int32 volume = 9;
   map<string, string> metadata = 10;
+  // Control requests on this apply that have reached a terminal status.
+  repeated SettledControlRequest settled_control_requests = 11;
 }
 
 // CutoverRequest triggers the cutover phase.

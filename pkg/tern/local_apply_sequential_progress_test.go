@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -162,6 +163,59 @@ func TestPollTaskToCompletion_RefinesPostCopyPhases(t *testing.T) {
 		state.Task.PostChecksum, // postChecksum
 		state.Task.Completed,
 	}, taskStore.states)
+}
+
+// A drive claim that reattaches to an engine's durable checkpoint must surface
+// that in the apply timeline exactly once, even though the engine reports the
+// resume flag on every subsequent poll — so an operator reading the timeline
+// can tell a resumed copy from a fresh start without the event repeating on
+// every tick. Drive the sequential poll against an engine that reports a
+// resumed copy across several polls and assert a single timeline event.
+func TestPollTaskToCompletion_LogsResumeOnce(t *testing.T) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+	}
+	resumedResult := func(engineState engine.State) *engine.ProgressResult {
+		return &engine.ProgressResult{
+			State:                 engineState,
+			ResumedFromCheckpoint: true,
+			Tables:                []engine.TableProgress{{Table: "mutes", State: spiritstatus.CopyRows.String()}},
+		}
+	}
+	logs := &mockApplyLogStore{}
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		resumedResult(engine.StateRunning),
+		resumedResult(engine.StateRunning),
+		resumedResult(engine.StateCompleted),
+	}}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: &testControlRequestStore{},
+			logs:            logs,
+		},
+		logger: slog.Default(),
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	resumeEvents := 0
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, "resumed from checkpoint") {
+			resumeEvents++
+		}
+	}
+	assert.Equal(t, 1, resumeEvents, "the resume flag on every poll records one timeline event per drive claim")
 }
 
 // permanentProgressErrorEngine always fails Progress with a permanent error.

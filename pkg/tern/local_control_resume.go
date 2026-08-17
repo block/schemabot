@@ -38,7 +38,7 @@ func (c *LocalClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ter
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationStart,
 		Status:      storage.ControlRequestPending,
-		RequestedBy: "tern-grpc",
+		RequestedBy: storage.ForwardingControlRequestCaller,
 		Metadata:    metadata,
 	})
 	if err != nil {
@@ -1222,14 +1222,24 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	return c.resumeApplyWithTasks(ctx, apply, tasks, opts.Map(), false, true)
 }
 
-// finalizerOperationKeySuffix is the trailing segment of a group_finalizer
-// operation key (namespace + "/" + segment), assigned at apply creation. The
-// drive parses the namespace back out to reconstruct the VSchema change.
+// finalizerOperationKeySuffix is the trailing segment of a namespace-scoped
+// group_finalizer operation key (namespace + "/" + segment), assigned at apply
+// creation. The drive parses the namespace back out to reconstruct the VSchema
+// change.
 const finalizerOperationKeySuffix = "/group_finalizer"
 
+// finalizerDeploymentScopedKey is the operation key of a deployment-scoped
+// group_finalizer — the single operation a VSchema-only apply is shaped as. It
+// carries no namespace: the drive applies every VSchema-changed namespace in
+// the plan in one engine apply, because the engine treats the deployment (one
+// branch, one deploy) as the unit of change.
+const finalizerDeploymentScopedKey = "group_finalizer"
+
 // namespaceFromFinalizerKey recovers the namespace a group_finalizer operation
-// targets from its operation key. Returns empty when the key is not a finalizer
-// key, which the caller treats as a fail-closed condition.
+// targets from its operation key. Returns empty for any key without a
+// namespace prefix — callers must distinguish the deployment-scoped key
+// (finalizerDeploymentScopedKey, where empty means "all VSchema namespaces")
+// from a malformed key, which is a fail-closed condition.
 func namespaceFromFinalizerKey(operationKey string) string {
 	if !strings.HasSuffix(operationKey, finalizerOperationKeySuffix) {
 		return ""
@@ -1261,6 +1271,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
 	namespace := namespaceFromFinalizerKey(op.OperationKey)
+	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
+		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	}
 	changes, err := finalizerVSchemaChanges(plan, namespace)
 	if err != nil {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
@@ -1616,7 +1629,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
-			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+			return fmt.Errorf("mark resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {

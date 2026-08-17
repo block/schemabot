@@ -3,6 +3,7 @@ package planetscale
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -296,16 +298,81 @@ func TestVerifyCutoverHeld(t *testing.T) {
 	})
 }
 
-// Instant DDL swaps the schema in the same step that runs the deploy, so there
-// is no pending_cutover for a deferred cutover to park at. An operator who held
-// the cutover kept that decision for themselves, so an eligible change is
-// deployed with a row copy instead — slower, but it stops at the gate.
+// Instant DDL swaps the schema in the same step that runs the deploy: there is
+// no pending_cutover for a deferred cutover to park at, and no revert window to
+// undo an unsafe change. An operator who held the cutover kept that decision
+// for themselves, and an unsafe change must stay revertible — so in both cases
+// an eligible change is deployed with a row copy instead: slower, but it stops
+// at the gate and keeps the safety net.
 func TestUseInstantDDL(t *testing.T) {
 	eligible := &ps.DeployRequest{Deployment: &ps.Deployment{InstantDDLEligible: true}}
 	ineligible := &ps.DeployRequest{Deployment: &ps.Deployment{InstantDDLEligible: false}}
 
-	assert.True(t, useInstantDDL(eligible, false), "an eligible change with no held cutover deploys instantly")
-	assert.False(t, useInstantDDL(eligible, true), "a held cutover needs a gate, so instant DDL is declined")
-	assert.False(t, useInstantDDL(ineligible, false))
-	assert.False(t, useInstantDDL(&ps.DeployRequest{}, false), "a deploy request with no deployment is not eligible")
+	assert.True(t, useInstantDDL(eligible, false, false), "an eligible safe change with no held cutover deploys instantly")
+	assert.False(t, useInstantDDL(eligible, true, false), "a held cutover needs a gate, so instant DDL is declined")
+	assert.False(t, useInstantDDL(eligible, false, true), "an unsafe change needs a revert window, so instant DDL is declined")
+	assert.False(t, useInstantDDL(eligible, true, true), "a held cutover and an unsafe change each decline instant DDL on their own")
+	assert.False(t, useInstantDDL(ineligible, false, false))
+	assert.False(t, useInstantDDL(&ps.DeployRequest{}, false, false), "a deploy request with no deployment is not eligible")
+}
+
+// An unsafe change — one that destroys existing data, in Spirit's unsafe
+// vocabulary — must keep the revert window that only the row-copy path
+// provides. Safe additive changes carry no such risk and stay eligible for
+// instant DDL. A statement that cannot be classified fails closed to the
+// row-copy path: the cost of a misclassification must only ever be time,
+// never data.
+func TestChangesContainUnsafe(t *testing.T) {
+	e := &Engine{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	changes := func(ddls ...string) []engine.SchemaChange {
+		tcs := make([]engine.TableChange, 0, len(ddls))
+		for _, d := range ddls {
+			tcs = append(tcs, engine.TableChange{DDL: d})
+		}
+		return []engine.SchemaChange{{Namespace: "orders", TableChanges: tcs}}
+	}
+
+	t.Run("DROP TABLE is unsafe", func(t *testing.T) {
+		unsafe, reason := e.changesContainUnsafe(changes("DROP TABLE `users`"), "mydb")
+		assert.True(t, unsafe)
+		assert.Contains(t, reason, "DROP TABLE")
+	})
+
+	t.Run("ALTER TABLE DROP COLUMN is unsafe", func(t *testing.T) {
+		unsafe, reason := e.changesContainUnsafe(changes("ALTER TABLE `users` DROP COLUMN `email`"), "mydb")
+		assert.True(t, unsafe)
+		assert.Contains(t, reason, "DROP COLUMN")
+		assert.Contains(t, reason, "email")
+	})
+
+	t.Run("an unsafe statement among additive changes is unsafe", func(t *testing.T) {
+		unsafe, reason := e.changesContainUnsafe(changes(
+			"ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)",
+			"ALTER TABLE `users` DROP COLUMN `fax`",
+		), "mydb")
+		assert.True(t, unsafe)
+		assert.Contains(t, reason, "fax")
+	})
+
+	t.Run("additive changes are safe", func(t *testing.T) {
+		unsafe, reason := e.changesContainUnsafe(changes(
+			"CREATE TABLE `audit` (`id` BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (`id`))",
+			"ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)",
+		), "mydb")
+		assert.False(t, unsafe)
+		assert.Empty(t, reason)
+	})
+
+	t.Run("an unclassifiable statement fails closed", func(t *testing.T) {
+		unsafe, reason := e.changesContainUnsafe(changes("THIS IS NOT SQL"), "mydb")
+		assert.True(t, unsafe)
+		assert.NotEmpty(t, reason)
+	})
+
+	t.Run("no changes are safe", func(t *testing.T) {
+		unsafe, reason := e.changesContainUnsafe(nil, "mydb")
+		assert.False(t, unsafe)
+		assert.Empty(t, reason)
+	})
 }

@@ -1215,17 +1215,66 @@ func buildApplyOperationGroups(
 		return groups, true, nil
 	}
 
+	// A VSchema-only plan carries no per-table work: its only change is one or
+	// more namespaces' VSchema documents, which are never modeled as task rows.
+	// Shape it as one deployment-scoped task-less group_finalizer per target —
+	// the kind whose drive applies every VSchema-changed namespace from the plan
+	// in a single engine apply — so no work operation is ever created without
+	// tasks to drive. One operation, not one per namespace: a branch-based
+	// engine stands up one branch covering the whole deployment and validates
+	// every keyspace in it, so splitting the namespaces across operations would
+	// have each drive validating keyspaces whose VSchema it never applied.
+	if len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0 {
+		groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
+		for _, target := range targets {
+			operation := newPendingApplyOperation(target, finalizerOperationKeySegment, cutoverPolicy, onFailure, now)
+			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
+			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
+		}
+		return groups, false, nil
+	}
+
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(targets))
-	allowTasklessWork := len(targets) == 1 && len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0
 	for _, target := range targets {
 		tasks := buildApplyTasks(plan, taskChanges, environment, applyOpts, "", now)
 		groups = append(groups, &storage.ApplyOperationWithTasks{
-			Operation:     newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
-			Tasks:         tasks,
-			AllowTaskless: allowTasklessWork,
+			Operation: newPendingApplyOperation(target, "", cutoverPolicy, onFailure, now),
+			Tasks:     tasks,
 		})
 	}
 	return groups, false, nil
+}
+
+// buildNamespaceFinalizerOperations builds one task-less group_finalizer per
+// VSchema-changed namespace in the plan, for one target. The VSchema is applied
+// once the namespace's shard work (if any) completes; the finalizer drives it
+// from the plan (reconstructed by namespace at drive time), not from a
+// synthetic task. A namespace with no shard work still gets a finalizer so its
+// VSchema change is never dropped.
+func buildNamespaceFinalizerOperations(
+	plan *storage.Plan,
+	target routing.ExecutionTarget,
+	cutoverPolicy string,
+	onFailure string,
+	now time.Time,
+) ([]*storage.ApplyOperationWithTasks, error) {
+	namespaces := plan.VSchemaNamespaces()
+	groups := make([]*storage.ApplyOperationWithTasks, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		if err := validateOperationKeyPart("namespace", namespace); err != nil {
+			return nil, err
+		}
+		operationKey := finalizerOperationKey(namespace)
+		if len(operationKey) > applyOperationKeyMaxLen {
+			return nil, fmt.Errorf("operation key for namespace %q finalizer exceeds %d characters", namespace, applyOperationKeyMaxLen)
+		}
+		operation := newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now)
+		operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
+		groups = append(groups, &storage.ApplyOperationWithTasks{
+			Operation: operation,
+		})
+	}
+	return groups, nil
 }
 
 func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.TableChange) bool {
@@ -1301,26 +1350,11 @@ func buildShardedApplyOperationGroups(
 				}
 			}
 		}
-		// Every namespace that changes its VSchema gets a task-less
-		// group_finalizer. The VSchema is applied once the namespace's shard work
-		// (if any) completes; the finalizer drives it from the plan (reconstructed
-		// by namespace at drive time), not from a synthetic task. A VSchema-only
-		// namespace with no shard work still gets a finalizer so its VSchema change
-		// is never dropped.
-		for _, namespace := range plan.VSchemaNamespaces() {
-			if err := validateOperationKeyPart("namespace", namespace); err != nil {
-				return nil, err
-			}
-			operationKey := finalizerOperationKey(namespace)
-			if len(operationKey) > applyOperationKeyMaxLen {
-				return nil, fmt.Errorf("operation key for namespace %q finalizer exceeds %d characters", namespace, applyOperationKeyMaxLen)
-			}
-			operation := newPendingApplyOperation(target, operationKey, cutoverPolicy, onFailure, now)
-			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
-			groups = append(groups, &storage.ApplyOperationWithTasks{
-				Operation: operation,
-			})
+		finalizers, err := buildNamespaceFinalizerOperations(plan, target, cutoverPolicy, onFailure, now)
+		if err != nil {
+			return nil, err
 		}
+		groups = append(groups, finalizers...)
 	}
 	return groups, nil
 }

@@ -740,11 +740,12 @@ var knownControlOperations = map[string]bool{
 	"volume":        true,
 	"revert":        true,
 	"skip_revert":   true,
+	"release":       true,
 	"rollback_plan": true,
 }
 
 // RecordControlOperation increments the control operations counter.
-// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, rollback_plan.
+// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, release, rollback_plan.
 // Status should be "success" or "error".
 func RecordControlOperation(ctx context.Context, operation, database, deployment, environment, status string) {
 	if !knownControlOperations[operation] {
@@ -772,6 +773,47 @@ func RecordRemoteControlRequestStale(ctx context.Context, operation, database, d
 	}
 	addCounter(ctx, "schemabot.remote_control_requests.stale_resends_total",
 		"Total retransmissions of remote control requests still unconsumed by the data plane past the stale threshold", "{resend}",
+		attribute.String("operation", operation),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordRemoteControlRequestRejected counts control requests the data plane
+// accepted and its own driver then failed — the operator was told the command
+// was queued and the effect never landed. A non-zero rate names the operation
+// and engine that is refusing operator commands: chart it by operation to see
+// which control surface is unsupported or broken on that engine, and read the
+// apply log entry recorded alongside it for the engine's own reason.
+func RecordRemoteControlRequestRejected(ctx context.Context, operation, engine, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_control_requests.rejected_total",
+		"Total remote control requests the data plane accepted and then failed", "{rejection}",
+		attribute.String("operation", operation),
+		attribute.String("engine", engine),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
+// RecordTasklessSettleDeferred counts task-less stop/cancel settles that lost
+// the parent apply lease mid-drive and settled only the drive's own leased
+// operation row, deferring the apply row to the operator's state projection.
+// The deferral itself converges (the projection derives the apply state from
+// the settled rows and completes the pending request), so an occasional count
+// is benign lease churn. A sustained rate means drives are routinely outliving
+// their parent apply lease — check apply-lease heartbeating and claim
+// contention on the affected database before the churn hits tasked drives too.
+func RecordTasklessSettleDeferred(ctx context.Context, operation, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.control.taskless_settle_deferrals_total",
+		"Total task-less stop/cancel settles that lost the apply lease and deferred the apply row to the state projection", "{settle}",
 		attribute.String("operation", operation),
 		attribute.String("database", database),
 		DeploymentAttribute(deployment),
@@ -1482,7 +1524,10 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 
 // RecordWebhookEvent increments the webhook events counter.
 // Unknown event types and actions are normalized to "unknown" to prevent unbounded cardinality.
-// Repo is not allowlisted since it's bounded by the repos configured in SchemaBot.
+// Repo is not allowlisted since it's bounded by the repos configured in SchemaBot;
+// callers recording a status for a repo outside the configured set (e.g.
+// repo_not_configured) must pass repo as "" so unbounded repo names never
+// become attribute values.
 // appName is the resolved GitHub App name (bounded by config), or "unknown" if
 // the request could not be attributed to a configured App (e.g. unknown App ID
 // header). Pass "" in legacy single-App mode and the metric will record
@@ -1585,12 +1630,17 @@ var knownWebhookInboxStates = func() map[string]bool {
 // RecordWebhookInboxDepth records the number of durable webhook inbox rows in a
 // given state. A rising pending/processing depth means dispatch is falling
 // behind ingestion; a rising failed_retryable depth means deliveries are
-// retrying; a rising completed/failed depth means terminal rows are accumulating
-// and retention has not reclaimed them. A rising failed_permanent depth means
-// deliveries are being dead-lettered — each such row is a permanently dropped
-// delivery that will never retry and needs explicit operator action (GitHub
-// Redeliver for an organic delivery; a new head push or check re-run for a
-// synthesized one).
+// retrying; a rising completed/failed/superseded depth means terminal rows are
+// accumulating and retention has not reclaimed them. A rising failed_permanent
+// depth means deliveries are being dead-lettered — each such row is a
+// permanently dropped delivery that will never retry and needs explicit
+// operator action (GitHub Redeliver for an organic delivery; a new head push
+// or check re-run for a synthesized one).
+//
+// One caveat on pending: a row created with a not-before time sits in pending
+// by design until it becomes due, so steady nonzero pending depth alone does
+// not imply dispatch lag — cross-check the oldest-claimable-age gauge, which
+// counts only dispatchable rows.
 func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 	if !knownWebhookInboxStates[state] {
 		state = "unknown"
@@ -1603,9 +1653,11 @@ func RecordWebhookInboxDepth(ctx context.Context, state string, count int64) {
 }
 
 // RecordWebhookInboxOldestClaimableAge records how long the oldest
-// ready-to-claim-but-unclaimed inbox row has been waiting, in seconds. It is the
-// inbox's backlog latency: a value climbing past the dispatch cadence means work
-// is acked but not being picked up.
+// ready-to-claim-but-unclaimed inbox row has been claimable, in seconds. Age
+// counts from when the row became claimable — the later of receipt and its
+// not-before/retry time — so a deliberately deferred row does not report its
+// grace period as backlog. It is the inbox's backlog latency: a value climbing
+// past the dispatch cadence means work is acked but not being picked up.
 func RecordWebhookInboxOldestClaimableAge(ctx context.Context, age time.Duration) {
 	recordGauge(ctx, "schemabot.webhook.inbox_oldest_claimable_age_seconds", int64(age.Seconds()),
 		"Age in seconds of the oldest ready-to-claim durable webhook inbox row", "s",
@@ -1637,16 +1689,19 @@ func RecordWebhookInboxStatsCollectionFailure(ctx context.Context) {
 }
 
 // RecordWebhookInboxDispatchLag records how long an accepted delivery waited
-// in the durable inbox before a driver first claimed it. This is the
-// per-delivery counterpart of the oldest-claimable-age gauge: the gauge shows
-// the backlog's worst case right now, while this histogram shows the lag every
-// delivery actually experienced. A distribution drifting past the dispatch
-// poll cadence means accepted deliveries are waiting on driver capacity —
-// investigate driver-pool sizing and claim-query health. One caveat: a
-// shutdown-released claim refunds its attempt, so the delivery's reclaim
-// counts as the first attempt again and records another sample measured from
-// the original receipt — deploy churn therefore adds extra, longer samples
-// without any driver-capacity problem. Unknown event types fold to "unknown"
+// dispatchable in the durable inbox before a driver first claimed it — from
+// when the row became eligible (receipt, or its not-before time for a
+// deliberately deferred row), so a deferral's grace period never counts as
+// lag. This is the per-delivery counterpart of the oldest-claimable-age
+// gauge: the gauge shows the backlog's worst case right now, while this
+// histogram shows the lag every delivery actually experienced. A distribution
+// drifting past the dispatch poll cadence means accepted deliveries are
+// waiting on driver capacity — investigate driver-pool sizing and claim-query
+// health. One caveat: a shutdown-released claim refunds its attempt, so the
+// delivery's reclaim counts as the first attempt again and records another
+// sample measured from the original eligibility time — deploy churn therefore
+// adds extra, longer samples without any driver-capacity problem. Unknown
+// event types fold to "unknown"
 // and negative lags (cross-pod clock skew between the enqueueing and claiming
 // replica) clamp to zero so the histogram stays trustworthy. appName is the
 // resolved GitHub App name used only for fold-log attribution; it is not a
@@ -1660,7 +1715,7 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 		lag = 0
 	}
 	recordHistogram(ctx, "schemabot.webhook.inbox_dispatch_lag_seconds", lag.Seconds(),
-		"Time from webhook receipt to the delivery's first dispatch claim",
+		"Time a webhook delivery spent dispatchable before its first dispatch claim",
 		EnvironmentAttribute(""),
 		attribute.String("event_type", eventType),
 		attribute.String("repository", repo),
@@ -1683,6 +1738,9 @@ func RecordWebhookInboxDispatchLag(ctx context.Context, appName, eventType, repo
 //     find the delivery in the driver logs and inspect its last_error.
 //   - "retrying": processing failed retryably; the row waits for its retry
 //     window.
+//   - "superseded": the claimed auto-plan delivery was discarded without
+//     processing because a newer covering delivery exists for the same pull
+//     request; the successor performs the work.
 //   - "released": the pool shut down mid-flight and refunded the claim.
 //   - "lease_lost": the driver lost delivery ownership (heartbeat failure or
 //     a lease-token mismatch recording the finish); another driver owns the
@@ -1695,6 +1753,7 @@ var knownWebhookDispatchOutcomes = map[string]bool{
 	"failed":           true,
 	"failed_permanent": true,
 	"retrying":         true,
+	"superseded":       true,
 	"released":         true,
 	"lease_lost":       true,
 	"finish_error":     true,
@@ -1746,14 +1805,18 @@ func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState s
 }
 
 // RecordWebhookReconcileMissingEvent counts open PR heads the webhook
-// reconciler found without a live inbox delivery — no row at all, or only a
-// plain-failed synthesized one. A dead-lettered row or a plain-failed organic
-// row covers its head, so neither counts as missing (the dead-letter is
-// deliberately terminal; the organic failure has GitHub Redeliver as its
-// lever). A nonzero rate means deliveries are being lost
-// upstream of the inbox (edge auth, GitHub send failures); with synthesis
+// reconciler found without a live inbox delivery — no row at all, or only
+// rows that cannot attest coverage (plain-failed synthesized rows, or
+// superseded rows whose work was discarded by claim-time coalescing). A
+// dead-lettered row or a plain-failed organic row covers its head, so neither
+// counts as missing (the dead-letter is deliberately terminal; the organic
+// failure has GitHub Redeliver as its lever). A nonzero rate usually means
+// deliveries are being lost upstream of the inbox (edge auth, GitHub send
+// failures), but a head covered only by superseded rows is a
+// coalescing-created miss with no upstream loss — check the superseded
+// dispatch outcome for the repo before blaming delivery. With synthesis
 // enabled each miss also triggers a recovery delivery, counted by
-// RecordWebhookReconcileSynthesizedEvent, so investigate the upstream loss.
+// RecordWebhookReconcileSynthesizedEvent.
 func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 	addCounter(ctx, "schemabot.webhook.reconcile_missing_events_total",
 		"Total number of open PR heads found without a webhook inbox delivery", "{event}",
@@ -1768,9 +1831,10 @@ func RecordWebhookReconcileMissingEvent(ctx context.Context, repo string) {
 // thrash: "first" is the healthy case — a genuinely lost delivery recovered
 // once, so investigate the upstream loss (edge auth, GitHub send failures)
 // rather than the recovery — while "resynthesis" means a previously
-// synthesized row terminally failed and was reopened, so a sustained
-// resynthesis rate is the same head failing repeatedly after recovery —
-// investigate that head's processing failure, not delivery loss.
+// synthesized row terminally failed or was superseded and was reopened, so a
+// sustained resynthesis rate is the same head repeatedly failing or being
+// discarded after recovery — investigate that head's processing, not
+// delivery loss.
 func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string, resynthesis bool) {
 	outcome := "first"
 	if resynthesis {
@@ -1778,6 +1842,41 @@ func RecordWebhookReconcileSynthesizedEvent(ctx context.Context, repo string, re
 	}
 	addCounter(ctx, "schemabot.webhook.reconcile_synthesized_events_total",
 		"Total number of webhook inbox deliveries synthesized for open PR heads missing one", "{event}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.String("outcome", outcome))
+}
+
+// RecordWebhookCheckSuiteRecovery counts outcomes of durable
+// check_suite.requested recovery processing. "covered", "synthesized",
+// "resynthesized", and "already_queued" increment once per candidate PR (a
+// delivery can carry several), while "no_pr_at_ingress", "no_open_pr", and
+// "truncated" increment once per delivery; a delivery retried under its
+// attempt budget re-counts PRs it already observed on an earlier attempt, so
+// outcomes are per observation, not per unique PR. "no_pr_at_ingress" is the
+// dominant branch by volume — a same-repository suite whose payload named no
+// open PR, dropped at ingress before occupying an inbox row; it exists so
+// the drop rate is comparable against "synthesized" and the reconciler's
+// synthesize rate. "covered" is the healthy steady state — the organic
+// pull_request delivery arrived during the recovery grace and planned the
+// head, so the redundant signal no-oped. "synthesized" means the auto-plan
+// delivery for an open PR head was genuinely lost and the check_suite signal
+// recovered it — investigate the upstream loss (edge auth, GitHub send
+// failures), not the recovery. "resynthesized" means the recovery reopened a
+// terminally failed synthesized row, so a sustained rate is the same head
+// failing repeatedly after recovery — investigate that head's processing
+// failure. "already_queued" means another recovery producer (the reconciler
+// or an earlier check_suite delivery) got there first. "no_open_pr" means no
+// PR named by the delivery was still open at the suite head — its PRs closed
+// or moved on during the grace, or a fork head matched no open PR.
+// "truncated" means the fork-head open-PR walk exhausted its page budget, so
+// coverage for the head is incomplete rather than absent — a matching PR
+// beyond the budget went unresolved and the reconciler's missing-head scan
+// is the backstop; a sustained rate means the repository's open-PR count has
+// outgrown the page budget.
+func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome string) {
+	addCounter(ctx, "schemabot.webhook.check_suite_recovery_total",
+		"Total number of outcomes from durable check_suite recovery processing", "{event}",
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.String("outcome", outcome))
@@ -1792,6 +1891,27 @@ func RecordWebhookReconcileStuckTerminated(ctx context.Context, count int64) {
 	addCounterN(ctx, count, "schemabot.webhook.reconcile_stuck_terminated_total",
 		"Total number of stuck processing webhook inbox rows terminated by the reconciler", "{event}",
 		EnvironmentAttribute(""))
+}
+
+// RecordPRFileCapExceeded counts auto-plan runs that failed closed because the
+// pull request changes more files than GitHub will report for a single PR, so
+// SchemaBot never saw the whole diff. This is a deterministic property of the
+// PR, not an outage: the same PR fails the same way on every attempt, so the
+// signal is "how often do PRs in this repository grow past the cap", not "is
+// GitHub degraded".
+//
+// Every over-cap PR gets the same cap-specific blocking check. schemaVisible
+// records whether the visible prefix of the listing showed a schema or config
+// file: true means the PR plausibly carries a schema change that cannot be
+// planned until it moves to a PR small enough for GitHub to report in full,
+// false means the visible files look like a pure refactor (the withheld tail
+// is not inspectable either way).
+func RecordPRFileCapExceeded(ctx context.Context, repo string, schemaVisible bool) {
+	addCounter(ctx, "schemabot.github.pr_file_cap_exceeded_total",
+		"Total number of auto-plan runs that failed closed because the PR exceeds GitHub's per-PR changed-file cap", "{pull_request}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo),
+		attribute.Bool("schema_visible", schemaVisible))
 }
 
 var knownStatusCheckOperations = map[string]bool{

@@ -310,6 +310,55 @@ func TestTaskStore_PerShardTaskRoundTrip(t *testing.T) {
 	assert.Equal(t, "-80", reloaded.Shard, "shard is fixed at creation, not changed by Update")
 }
 
+// A table paused by the engine's throttler stores the pause flag and its
+// display reason on the task row, so readers (PR comment, CLI) render the
+// pause from storage without polling the engine. Both fields are written by
+// the drive's progress sync every tick: they set while the pause is active and
+// clear on the first unpaced tick.
+func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testapp", "mysql", "staging")
+	apply := createTestApply(t, store, lock, "apply_throttle", 1)
+
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_throttle",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Running,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:      "ALTER",
+		Throttled:      true,
+		ThrottleReason: "replica-lag 12s > 10s",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	got, err := store.Tasks().Get(ctx, "task_throttle")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.True(t, got.Throttled)
+	assert.Equal(t, "replica-lag 12s > 10s", got.ThrottleReason)
+
+	got.Throttled = false
+	got.ThrottleReason = ""
+	require.NoError(t, store.Tasks().Update(ctx, got))
+	cleared, err := store.Tasks().Get(ctx, "task_throttle")
+	require.NoError(t, err)
+	assert.False(t, cleared.Throttled, "the pause clears when the throttler releases")
+	assert.Empty(t, cleared.ThrottleReason)
+}
+
 // A sharded work operation's operation key identifies which shard task is real
 // drive input. Other shard rows remain progress detail and must not be replayed
 // as extra table changes if the operation is resumed.

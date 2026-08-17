@@ -946,6 +946,12 @@ const maxGitHubPRFiles = 3000
 const maxGitHubCompareFiles = 300
 
 // FetchPRFiles gets the list of files changed in a PR.
+//
+// When the PR changes more files than GitHub will report (ErrPRFilesIncomplete),
+// the returned slice still carries the visible prefix of the listing alongside
+// the error. That prefix must never be planned from — the withheld tail could
+// hold a schema change — but callers may inspect it to describe the cap, e.g.
+// whether the PR visibly touches schema at all.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
@@ -979,7 +985,7 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 			})
 		}
 		if len(allFiles) >= maxGitHubPRFiles {
-			return nil, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
+			return allFiles, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
 		}
 		if readResult.resp.NextPage == 0 {
 			break
@@ -1112,7 +1118,7 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 // Only the files discovery keys on are compared, so a pull request that touches
 // no schema costs no API calls.
 func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {
-	if !hasDiscoveryInputFiles(files) {
+	if !HasDiscoveryInputFiles(files) {
 		return files, "", nil
 	}
 

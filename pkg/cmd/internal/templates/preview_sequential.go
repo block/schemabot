@@ -107,6 +107,26 @@ func previewSeqThirdRunOutput() {
 	WriteProgress(data)
 }
 
+func previewSeqThrottledOutput() {
+	fmt.Println("Sequential mode: First complete, second paused by the engine's throttler")
+	fmt.Println()
+
+	data := ProgressData{
+		State:     state.Apply.Running,
+		Engine:    "Spirit",
+		ApplyID:   "apply-a1b2c3d4e5f6",
+		StartedAt: previewTime.Add(-20 * time.Minute).Format(time.RFC3339),
+		Tables: []TableProgress{
+			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Running,
+				RowsCopied: 3100000, RowsTotal: 5000000, PercentComplete: 62,
+				Throttled: true, ThrottleReason: "commit-latency 112.4ms >= 100ms"},
+			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+		},
+	}
+	WriteProgress(data)
+}
+
 func previewSeqCatchingUpOutput() {
 	fmt.Println("Sequential mode: First complete, second catching up on accumulated changes")
 	fmt.Println()

@@ -715,7 +715,8 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 			Status:      "success",
 		})
 		h.logger.Info("posted passing aggregate",
-			"repo", repo, "pr", pr, "check_name", checkName, "env", ec.environment, "action", action)
+			"repo", repo, "pr", pr, "head_sha", headSHA, "check_name", checkName,
+			"environment", ec.environment, "action", action)
 	}
 }
 

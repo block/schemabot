@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -212,7 +213,7 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 	}
 	requestedBy := caller
 	if requestedBy == "" {
-		requestedBy = "tern-grpc"
+		requestedBy = storage.ForwardingControlRequestCaller
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -387,7 +388,7 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 	}
 	requestedBy := caller
 	if requestedBy == "" {
-		requestedBy = "tern-grpc"
+		requestedBy = storage.ForwardingControlRequestCaller
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -447,7 +448,7 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 	}
 	requestedBy := caller
 	if requestedBy == "" {
-		requestedBy = "tern-grpc"
+		requestedBy = storage.ForwardingControlRequestCaller
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
@@ -769,7 +770,10 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	}
 	previousState := apply.State
 	if err := c.markApplyCancelled(ctx, apply.ID); err != nil {
-		return nil, err
+		if !errors.Is(err, storage.ErrApplyLeaseLost) {
+			return nil, err
+		}
+		return c.deferTasklessCancelToProjection(ctx, apply, caller, err)
 	}
 	eventMsg := "Cancel requested: task-less apply cancelled before any task work started"
 	if caller != "" {
@@ -793,6 +797,113 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	}
 	c.notifyTerminalObserver(apply, nil)
 	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
+// deferTasklessCancelToProjection settles a task-less cancel whose apply-row
+// write was refused because the apply lease was lost. Only the operation row is
+// heartbeated through a drive, so a drive can outlive its parent apply lease
+// while the operation lease stays live: the cancel is still honored by settling
+// the drive's own leased operation row to cancelled and leaving the apply row
+// to the operator's state projection, which derives cancelled from the terminal
+// rows, completes the pending cancel request, and publishes the terminal
+// summary. The terminal observer is not notified here — the apply is not yet
+// terminal, and the projection owns the once-only summary.
+func (c *LocalClient) deferTasklessCancelToProjection(ctx context.Context, apply *storage.Apply, caller string, applyWriteErr error) (*ternv1.CancelResponse, error) {
+	if err := c.settleLeasedOperationRowForTasklessApply(ctx, apply, state.ApplyOperation.Cancelled, applyWriteErr); err != nil {
+		return nil, err
+	}
+	eventMsg := "Cancel requested: task-less apply's operation row settled as cancelled; the apply record follows via the operator's state projection"
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
+		eventMsg, "", "")
+	c.logger.Warn("cancel settled the task-less apply's leased operation row but the apply lease was lost; the apply-state projection will settle the apply as cancelled and complete the pending cancel request",
+		append(apply.LogAttrs(), "requested_by", caller, "error", applyWriteErr)...)
+	metrics.RecordTasklessSettleDeferred(ctx, string(storage.ControlOperationCancel), apply.Database, apply.Deployment, apply.Environment)
+	return &ternv1.CancelResponse{Accepted: true}, nil
+}
+
+// deferTasklessStopToProjection is the stop counterpart of
+// deferTasklessCancelToProjection: the apply-row write was refused because the
+// apply lease was lost, so the stop is honored by settling the drive's own
+// leased operation row to stopped. A stopped row counts as settled for the
+// operator's state projection, which derives the apply's stopped state from it,
+// keeps completed_at nil (stopped is resumable), and completes the pending stop
+// request; any pending sibling rows are swept by stop reconciliation.
+func (c *LocalClient) deferTasklessStopToProjection(ctx context.Context, apply *storage.Apply, caller string, applyWriteErr error) (*ternv1.StopResponse, error) {
+	if err := c.settleLeasedOperationRowForTasklessApply(ctx, apply, state.ApplyOperation.Stopped, applyWriteErr); err != nil {
+		return nil, err
+	}
+	eventMsg := "Stop requested: task-less apply's operation row settled as stopped; the apply record follows via the operator's state projection"
+	if caller != "" {
+		eventMsg += callerApplyLogSuffix(caller)
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
+		eventMsg, "", "")
+	c.logger.Warn("stop settled the task-less apply's leased operation row but the apply lease was lost; the apply-state projection will settle the apply as stopped and complete the pending stop request",
+		append(apply.LogAttrs(), "requested_by", caller, "error", applyWriteErr)...)
+	metrics.RecordTasklessSettleDeferred(ctx, string(storage.ControlOperationStop), apply.Database, apply.Deployment, apply.Environment)
+	return &ternv1.StopResponse{Accepted: true}, nil
+}
+
+// settleLeasedOperationRowForTasklessApply moves the drive's own leased
+// operation row to the task-less settle's target state after the apply-row
+// write lost the apply lease. The operation lease is the drive's surviving
+// write capability, and it authorizes exactly one row — the leased one — so
+// sibling rows are intentionally left alone: pending siblings are settled by
+// their own drives (cancel) or by stop reconciliation (stop). Fails closed when
+// no operation lease is held, when the leased row cannot be loaded, or when it
+// belongs to a different apply, so a lost claim never settles someone else's
+// work. An already-terminal row is left unchanged under the same discipline as
+// settleOperationRowsForTasklessApply.
+func (c *LocalClient) settleLeasedOperationRowForTasklessApply(ctx context.Context, apply *storage.Apply, operationState string, applyWriteErr error) error {
+	opLease, ok := storage.OperationLeaseFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("task-less settle of apply %s to %s: apply lease was lost and no operation lease is held: %w",
+			apply.ApplyIdentifier, operationState, applyWriteErr)
+	}
+	op, err := c.storage.ApplyOperations().Get(ctx, opLease.OperationID)
+	if err != nil {
+		return fmt.Errorf("load leased apply_operation %d for task-less settle of apply %s to %s: %w",
+			opLease.OperationID, apply.ApplyIdentifier, operationState, err)
+	}
+	if op == nil {
+		return fmt.Errorf("load leased apply_operation %d for task-less settle of apply %s to %s: %w",
+			opLease.OperationID, apply.ApplyIdentifier, operationState, storage.ErrApplyOperationNotFound)
+	}
+	if op.ApplyID != apply.ID {
+		return fmt.Errorf("leased apply_operation %d belongs to a different apply than %s; refusing task-less settle to %s",
+			op.ID, apply.ApplyIdentifier, operationState)
+	}
+	if !operationRowSettlesWithTasklessApply(op.State, operationState) {
+		c.logger.Info("task-less settle leaving terminal leased operation row unchanged",
+			append(apply.LogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"operation_state", op.State,
+				"target_operation_state", operationState)...)
+		return nil
+	}
+	var writeErr error
+	if state.IsState(operationState, state.ApplyOperation.Stopped) {
+		// stopped is resumable: mirror the state but keep completed_at nil,
+		// matching the apply-level convention.
+		writeErr = c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState)
+	} else {
+		writeErr = c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState)
+	}
+	if writeErr != nil {
+		return fmt.Errorf("move leased apply_operation %d (%s) from %s to %s for task-less settle of apply %s: %w",
+			op.ID, op.Deployment, op.State, operationState, apply.ApplyIdentifier, writeErr)
+	}
+	c.logger.Info("task-less settle moved the leased operation row; the apply-state projection settles the apply row",
+		append(apply.LogAttrs(),
+			"apply_operation_id", op.ID,
+			"operation_deployment", op.Deployment,
+			"previous_operation_state", op.State,
+			"operation_state", operationState)...)
+	return nil
 }
 
 // settleOperationRowsForTasklessApply moves the settled apply's dual-written
@@ -886,7 +997,10 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 	}
 	previousState := apply.State
 	if err := c.markApplyStopped(ctx, apply.ID); err != nil {
-		return nil, err
+		if !errors.Is(err, storage.ErrApplyLeaseLost) {
+			return nil, err
+		}
+		return c.deferTasklessStopToProjection(ctx, apply, caller, err)
 	}
 	eventMsg := "Stop requested: task-less apply stopped before any task work started"
 	if caller != "" {
@@ -941,7 +1055,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// Bind the apply's identity once so every consumption log line is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
+	if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return true, err
 	} else if completed {
 		logger.Info("completing pending stop request for resolved apply",
@@ -998,12 +1112,21 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		}
 		return true, fmt.Errorf("process pending stop for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
-	completed, err := completePendingStopIfStoredApplyResolved(stopCtx, c.storage, apply)
+	completed, err := completePendingRequestIfStoredApplyResolved(stopCtx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return true, err
 	}
 	if !completed {
-		return true, fmt.Errorf("process pending stop for apply %s: storage did not reach a resolved stop state", apply.ApplyIdentifier)
+		// The stop was accepted but the apply row has not settled — the settle
+		// lost the apply lease and moved only the drive's own operation row, so
+		// the apply-state projection owns the rest. The request stays pending on
+		// purpose: it keeps unstarted sibling rows gated off, and the projection
+		// (or stop reconciliation, for pending siblings) completes it once the
+		// stored apply resolves.
+		logger.Warn("pending stop consumed but the stored apply has not settled; leaving the request pending for the apply-state projection to complete",
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return true, nil
 	}
 	return true, nil
 }
@@ -1058,8 +1181,20 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		}
 		return true, fmt.Errorf("process pending cancel for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
-	if err := completePendingControlRequests(cancelCtx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
+	if err != nil {
 		return true, err
+	}
+	if !completed {
+		// The cancel was accepted but the apply row has not settled — the settle
+		// lost the apply lease and moved only the drive's own operation row, so
+		// the apply-state projection owns the rest. The request stays pending on
+		// purpose: sibling rows' own drives consume it for their share of the
+		// apply, and the projection completes it once the stored apply resolves.
+		logger.Warn("pending cancel consumed but the stored apply has not settled; leaving the request pending for the apply-state projection to complete",
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
+		return true, nil
 	}
 	return true, nil
 }
@@ -1685,7 +1820,7 @@ func (c *LocalClient) queueVolumeRequest(ctx context.Context, apply *storage.App
 	if err != nil {
 		return nil, fmt.Errorf("encode volume request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	requestedBy := "tern-grpc"
+	requestedBy := storage.ForwardingControlRequestCaller
 	controlReq, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationVolume,
