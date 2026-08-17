@@ -34,14 +34,18 @@ type ReviewGateResult struct {
 // may re-drive it. Policy-shape errors in that class (for example a review
 // policy with no configured reviewers) cannot succeed on a re-drive, but they
 // are bounded by the driver's retry budget, so the gate does not maintain a
-// separate taxonomy for them.
-func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string) (blocked bool, err error) {
+// separate taxonomy for them. suppressRetryComments silences the
+// evaluation-failure comment on durable attempts, where the driver retries
+// and posts the single terminal answer instead; merit blocks always comment.
+func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
 	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
 	if err != nil {
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
 			"database", schemaResult.Database, "environment", environment,
 			"command", commandName, "error", err)
-		h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
+		if !suppressRetryComments {
+			h.postCommandError(repo, pr, installationID, commandName, environment, requestedBy, reviewGateErrorDetail(err))
+		}
 		return false, fmt.Errorf("review gate check %s#%d: %w", repo, pr, err)
 	}
 	if gateResult != nil && !gateResult.Approved {

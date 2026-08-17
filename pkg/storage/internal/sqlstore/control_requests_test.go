@@ -354,7 +354,7 @@ func getControlRequestByID(t *testing.T, store *Storage, id int64) *storage.Appl
 
 func createControlRequestTestApply(t *testing.T, store *Storage, applyIdentifier string) int64 {
 	t.Helper()
-	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+	lock := createTestLock(t, store, "testdb", "mysql")
 	applyID, err := store.Applies().Create(t.Context(), &storage.Apply{
 		ApplyIdentifier: applyIdentifier,
 		LockID:          lock.ID,

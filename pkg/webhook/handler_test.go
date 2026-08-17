@@ -333,7 +333,7 @@ func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
 		Database:     "orders",
 		DatabaseType: "mysql",
 		SchemaPath:   "services/orders/schema",
-	})
+	}, false)
 
 	body := requireComment(t, comments, "config-not-authorized comment")
 	assert.Contains(t, body, "SchemaBot Configuration Not Authorized")

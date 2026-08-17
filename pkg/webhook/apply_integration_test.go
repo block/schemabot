@@ -2810,7 +2810,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	seedCheck(t, svc, dbName, "sandbox", "action_required")
 
 	blocked, err := h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "production", envs, 1)
+		dbName, "mysql", "production", envs, 1, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "production should be blocked when sandbox is action_required")
 
@@ -2826,7 +2826,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	seedCheck(t, svc, dbName, "staging", "action_required")
 
 	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "production", envs, 1)
+		dbName, "mysql", "production", envs, 1, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "production should be blocked when staging is action_required")
 
@@ -2841,7 +2841,7 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	seedCheck(t, svc, dbName, "staging", "success")
 
 	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "production", envs, 1)
+		dbName, "mysql", "production", envs, 1, false)
 	require.NoError(t, err)
 	assert.False(t, blocked, "production should not be blocked when all prior envs are success")
 
@@ -2849,13 +2849,13 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	seedCheck(t, svc, dbName, "sandbox", "action_required")
 
 	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "staging", envs, 1)
+		dbName, "mysql", "staging", envs, 1, false)
 	require.NoError(t, err)
 	assert.True(t, blocked, "staging should be blocked when sandbox is action_required")
 
 	// Case 5: sandbox (first env) is never blocked
 	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "sandbox", envs, 1)
+		dbName, "mysql", "sandbox", envs, 1, false)
 	require.NoError(t, err)
 	assert.False(t, blocked, "sandbox (first env) should never be blocked")
 }

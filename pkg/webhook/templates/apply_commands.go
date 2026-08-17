@@ -236,7 +236,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
-		if reason := sanitizeInlineError(c.Reason); reason != "" {
+		if reason := SanitizeInlineError(c.Reason); reason != "" {
 			fmt.Fprintf(&sb, "- %s: %s\n", table, html.EscapeString(reason))
 		} else {
 			fmt.Fprintf(&sb, "- %s\n", table)
