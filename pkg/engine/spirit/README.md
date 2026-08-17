@@ -11,7 +11,7 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 **runningSchemaChange** — Tracks a running schema change: the Spirit runners, affected tables, DDL statements, state, and a cancel function for stopping. Created by `Apply()`, consumed by `Progress()` and control operations.
 
 **Config** — Engine configuration:
-- `TargetChunkTime` (default 500ms): How long each batch of row copies should take
+- `TargetChunkTime` (default 2s): Target time per checksum chunk. Row copies are sized by an in-memory byte budget instead
 - `Threads` (default 4): Number of concurrent copier threads
 - `LockWaitTimeout` (default 30s): How long to wait for table locks during cutover
 - `DebugLogs`: Enable verbose Spirit debug output

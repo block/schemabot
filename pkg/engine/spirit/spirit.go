@@ -33,8 +33,11 @@ import (
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
-// DefaultTargetChunkTime is the default time Spirit aims for per chunk.
-// Lower values = faster copies but more load on the database.
+// DefaultTargetChunkTime is the default time Spirit aims for per checksum
+// chunk. Lower values = faster verification but more load on the database.
+// The row copy is not sized by this: the copier sizes each chunk against an
+// in-memory byte budget instead, because its fed-back time measures queue
+// wait as well as work and collapses under backpressure.
 // Spirit requires this to be in range 100ms-5s. Matches volume 3 (default).
 const DefaultTargetChunkTime = 2 * time.Second
 
