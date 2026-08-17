@@ -682,6 +682,11 @@ message CutoverRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
@@ -732,6 +737,11 @@ message StopRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // StopResponse indicates whether the stop was accepted.
@@ -752,6 +762,11 @@ message CancelRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // CancelResponse indicates whether the cancel was accepted.
@@ -770,6 +785,11 @@ message StartRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 3;
 }
 
 // StartResponse indicates whether the start was accepted.
@@ -790,6 +810,11 @@ message VolumeRequest {
   string environment = 2;
   // Volume level 1-11 (1=conservative, 11=aggressive).
   int32 volume = 3;
+  // Caller identifies the operator who issued the command, as resolved by the
+  // plane that accepted it. The plane that records the durable control request
+  // may not be the one the operator talked to, and the request is what names
+  // the requester in the PR notice and the apply log.
+  string caller = 4;
 }
 
 // VolumeResponse indicates whether the volume change was accepted.
