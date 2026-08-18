@@ -81,6 +81,7 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -177,6 +178,10 @@ type e2eServiceOpts struct {
 	// observe the initial durable state of queued work (e.g. a pending
 	// apply_operations row) without racing an operator claim.
 	skipOperator bool
+	// databaseType and targetDSN let integration scenarios exercise another
+	// built-in engine while retaining the same API, storage, and operator path.
+	databaseType string
+	targetDSN    string
 }
 
 // setupE2EServiceOpts creates a real api.Service with a LocalClient for the
@@ -184,23 +189,34 @@ type e2eServiceOpts struct {
 func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *api.Service {
 	t.Helper()
 	ctx := t.Context()
+	databaseType := opts.databaseType
+	if databaseType == "" {
+		databaseType = storage.DatabaseTypeMySQL
+	}
+	appDSN := opts.targetDSN
 
-	// Create the app database on the target
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-	require.NoError(t, err)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
-	require.NoError(t, err)
-	_ = targetDB.Close()
+	if databaseType == storage.DatabaseTypeMySQL {
+		// Create the app database on the target.
+		targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		require.NoError(t, err)
+		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
+		require.NoError(t, err)
+		_ = targetDB.Close()
 
-	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-		if err == nil {
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
-			_ = db.Close()
-		}
-	})
+		t.Cleanup(func() {
+			db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+			if err == nil {
+				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
+				_ = db.Close()
+			}
+		})
 
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+appDBName, 1)
+		cfg, err := mysql.ParseDSN(e2eTargetDSN)
+		require.NoError(t, err)
+		cfg.DBName = appDBName
+		appDSN = cfg.FormatDSN()
+	}
+	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
@@ -225,7 +241,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
-		Type:      "mysql",
+		Type:      databaseType,
 		TargetDSN: appDSN,
 		Metadata:  opts.engineMetadata,
 	}, st, logger)
@@ -236,7 +252,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		Drivers: 1,
 		Databases: map[string]api.DatabaseConfig{
 			appDBName: {
-				Type: "mysql",
+				Type: databaseType,
 				Environments: map[string]api.EnvironmentConfig{
 					"staging": {DSN: appDSN},
 				},
