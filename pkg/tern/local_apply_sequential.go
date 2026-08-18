@@ -643,6 +643,23 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A multi-operation drive owns only its operation: the tasks it drove carry
+	// the outcome, the operator derives the operation row from them and projects
+	// the parent, so the parent terminal write, control-request completion,
+	// apply-level metric, and terminal observer are all the operator's to make.
+	// Pending tasks after a failed one are still this drive's to settle.
+	if suppressParentApplyWrites(ctx) {
+		if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
+			for _, task := range tasks {
+				if task.State == state.Task.Pending {
+					c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
+				}
+			}
+		}
+		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
+			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil)
+		return
+	}
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
 		logger.Error("failed to reload apply before sequential finalization",
 			append(apply.MutableLogAttrs(), "error", err)...)
