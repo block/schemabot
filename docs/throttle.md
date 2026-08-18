@@ -51,12 +51,13 @@ proceed without lag protection.
 redo-aware 4 > 3
 ```
 
-The database's CPUs are busy with application query work. This signal counts
+Read this as: active threads greater than the instance's threshold. The
+engine selects this algorithm when it detects an Aurora source. It counts
 threads actively executing queries (from `performance_schema`) and subtracts
-threads parked on Aurora's redo-log flush wait, which consume no CPU. When the
-active count exceeds the instance's budget (vCPUs plus headroom), the copy
-yields so application queries keep their CPU. In the example, 4 active threads
-exceed a budget of 3 on a 2-vCPU instance.
+threads parked on Aurora's redo-log flush wait, which consume no CPU. When
+the active count exceeds the instance's budget (vCPUs plus headroom), the
+copy yields so application queries keep their CPU. In the example, 4 active
+threads exceed a budget of 3 on a 2-vCPU instance.
 
 **When to act.** Usually nothing: the throttle is doing its job, trading copy
 speed for application latency. If the copy must finish sooner, either reduce
