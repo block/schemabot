@@ -20,6 +20,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -31,8 +32,6 @@ import (
 
 const applyOperationKeyMaxLen = 255
 const finalizerOperationKeySegment = "group_finalizer"
-
-const postgresVerdictUnavailableReason = "PostgreSQL classifier verdict unavailable; this change cannot be applied"
 
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
@@ -598,9 +597,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 		return nil, nil, err
 	}
-	if resolvedTarget.DatabaseType == storage.DatabaseTypePostgres {
-		blockPostgresPlanWithoutClassifierVerdicts(resp)
-	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
 	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
@@ -619,6 +615,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
+
 	route := storedPlanRoute{
 		DatabaseType: resolvedTarget.DatabaseType,
 		Deployment:   deployment,
@@ -636,36 +634,56 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	return resp, planResp, nil
 }
 
-// blockPostgresPlanWithoutClassifierVerdicts is the fail-closed seam for the
-// PostgreSQL classifier adapter. Until that adapter supplies authoritative
-// per-statement verdicts, no PostgreSQL statement is eligible to execute.
-func blockPostgresPlanWithoutClassifierVerdicts(resp *ternv1.PlanResponse) {
+// normalizeExecutionVerdicts validates every table change's execution-mode
+// verdict against its closed vocabulary — empty (executable), "blocked", or
+// "direct" — before the plan is stored or returned. The verdict crosses the
+// wire as a free-form string and everything except "blocked" executes as the
+// engine's default path downstream, so a value this build does not recognize
+// (a skewed remote planner, a newer plan contract) must fail closed rather
+// than run.
+func (s *Service) normalizeExecutionVerdicts(resp *ternv1.PlanResponse, database, deployment string) {
 	if resp == nil {
 		return
 	}
-	block := func(change *ternv1.TableChange) {
+	for _, change := range resp.Changes {
 		if change == nil {
-			return
-		}
-		change.ExecutionMode = "blocked"
-		change.ModeReason = postgresVerdictUnavailableReason
-	}
-	for _, schemaChange := range resp.Changes {
-		if schemaChange == nil {
 			continue
 		}
-		for _, tableChange := range schemaChange.TableChanges {
-			block(tableChange)
+		for _, tc := range change.TableChanges {
+			s.normalizeExecutionVerdict(tc, database, deployment)
 		}
 	}
 	for _, shard := range resp.Shards {
 		if shard == nil {
 			continue
 		}
-		for _, tableChange := range shard.Changes {
-			block(tableChange)
+		for _, tc := range shard.Changes {
+			s.normalizeExecutionVerdict(tc, database, deployment)
 		}
 	}
+}
+
+func (s *Service) normalizeExecutionVerdict(tc *ternv1.TableChange, database, deployment string) {
+	if tc == nil || recognizedExecutionMode(tc.ExecutionMode) {
+		return
+	}
+	s.logger.Warn("plan response carried an unrecognized execution-mode verdict; the change will be blocked",
+		"database", database,
+		"deployment", deployment,
+		"table", tc.TableName,
+		"execution_mode", tc.ExecutionMode,
+	)
+	tc.ModeReason = fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode)
+	tc.ExecutionMode = engine.ExecutionModeBlocked
+}
+
+// recognizedExecutionMode reports whether mode is in the closed execution-mode
+// vocabulary: empty (the engine executes the statement on its default path),
+// blocked, or direct.
+func recognizedExecutionMode(mode string) bool {
+	return mode == "" ||
+		strings.EqualFold(mode, engine.ExecutionModeBlocked) ||
+		strings.EqualFold(mode, engine.ExecutionModeDirect)
 }
 
 type storedPlanRoute struct {
@@ -1520,6 +1538,7 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if err != nil {
 		return nil, err
 	}
+	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
 		DatabaseType: apply.DatabaseType,
 		Deployment:   deployment,

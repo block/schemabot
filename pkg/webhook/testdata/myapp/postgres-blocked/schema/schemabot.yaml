@@ -1,0 +1,2 @@
+database: postgres_blocked_fixture
+type: postgres
