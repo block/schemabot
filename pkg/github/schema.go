@@ -85,14 +85,15 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	if len(config.IgnoreNamespaces) > 0 {
+	ignoredNamespaces := schema.ResolveIgnoreNamespaces(config.IgnoreNamespaces, environment)
+	if len(ignoredNamespaces) > 0 {
 		ic.logger.Info("excluding ignored namespaces from schema request",
-			"repo", repo, "pr", pr, "database", config.Database,
-			"schema_root", schemaRoot, "ignore_namespaces", config.IgnoreNamespaces)
+			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
+			"schema_root", schemaRoot, "ignore_namespaces", ignoredNamespaces)
 	}
 	if len(schemaFiles) == 0 {
-		if len(config.IgnoreNamespaces) > 0 {
-			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, config.IgnoreNamespaces)
+		if len(ignoredNamespaces) > 0 {
+			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)
 		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}

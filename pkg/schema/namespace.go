@@ -88,23 +88,43 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 		return nil, fmt.Errorf("schema directory has both flat files and namespace subdirectories — use one layout or the other")
 	}
 
-	for _, ignored := range ignoreNamespaces {
-		if environment != "" {
-			ignored = strings.ReplaceAll(ignored, "$ENV", environment)
-		}
+	for _, ignored := range ResolveIgnoreNamespaces(ignoreNamespaces, environment) {
 		delete(result, ignored)
 	}
 
 	return result, nil
 }
 
-// ValidateIgnoreNamespaces rejects ignore_namespaces entries that cannot name
-// a namespace subdirectory of the schema root: blank entries and entries with
-// path separators.
+// ResolveIgnoreNamespaces applies the same $ENV substitution to
+// ignore_namespaces entries that GroupFilesByNamespace applies to namespace
+// directory names, returning the namespace keys that are actually excluded
+// for the environment. Callers that log or report ignored namespaces should
+// use the resolved values so operators see the real excluded keys.
+func ResolveIgnoreNamespaces(namespaces []string, environment string) []string {
+	if len(namespaces) == 0 {
+		return nil
+	}
+	resolved := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		if environment != "" {
+			ns = strings.ReplaceAll(ns, "$ENV", environment)
+		}
+		resolved[i] = ns
+	}
+	return resolved
+}
+
+// ValidateIgnoreNamespaces rejects ignore_namespaces entries that cannot match
+// a namespace subdirectory of the schema root: blank entries, entries padded
+// with whitespace (namespace keys are never padded, so such an entry would
+// silently exclude nothing), and entries with path separators.
 func ValidateIgnoreNamespaces(namespaces []string) error {
 	for _, ns := range namespaces {
 		if strings.TrimSpace(ns) == "" {
 			return fmt.Errorf("ignore_namespaces entries must not be blank")
+		}
+		if ns != strings.TrimSpace(ns) {
+			return fmt.Errorf("ignore_namespaces entry %q must not have leading or trailing whitespace", ns)
 		}
 		if strings.ContainsAny(ns, `/\`) {
 			return fmt.Errorf("ignore_namespaces entry %q must be a namespace name, not a path", ns)

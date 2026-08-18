@@ -275,7 +275,23 @@ func TestValidateIgnoreNamespaces(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must not be blank")
 
+	err = ValidateIgnoreNamespaces([]string{"local_fixtures "})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "whitespace")
+
+	err = ValidateIgnoreNamespaces([]string{" local_fixtures"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "whitespace")
+
 	err = ValidateIgnoreNamespaces([]string{"schema/local_fixtures"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a path")
+}
+
+func TestResolveIgnoreNamespaces(t *testing.T) {
+	assert.Nil(t, ResolveIgnoreNamespaces(nil, "staging"))
+	assert.Equal(t, []string{"fixtures_staging", "local_fixtures"},
+		ResolveIgnoreNamespaces([]string{"fixtures_$ENV", "local_fixtures"}, "staging"))
+	assert.Equal(t, []string{"fixtures_$ENV"},
+		ResolveIgnoreNamespaces([]string{"fixtures_$ENV"}, ""))
 }
