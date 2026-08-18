@@ -33,14 +33,13 @@ const maxCommitLatency = 100 * time.Millisecond
 // dynamically from there on throttler feedback, so apply throughput tracks
 // the target instance rather than a fixed constant.
 func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
-	threads, chunkTime, lockTimeout := e.copySettings()
+	threads, lockTimeout := e.copySettings()
 	return &spiritmigration.Migration{
 		Host:                          host,
 		Username:                      username,
 		Password:                      &password,
 		Database:                      database,
 		Statement:                     stmt,
-		TargetChunkTime:               chunkTime,
 		Threads:                       threads,
 		WriteThreads:                  0, // auto-size for the target
 		LockWaitTimeout:               lockTimeout,
