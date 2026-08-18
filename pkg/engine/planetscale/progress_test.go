@@ -126,6 +126,20 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, state.Vitess.Failed, tables[0].State)
 	})
 
+	t.Run("uppercase status canonicalized before table state resolution", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "RUNNING"},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "FAILED"},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
+		require.Len(t, tables[0].Shards, 2)
+		assert.Equal(t, state.Vitess.Running, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.Failed, tables[0].Shards[1].State)
+	})
+
 	t.Run("ready_to_complete derived state", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running", ReadyToComplete: true},
