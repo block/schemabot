@@ -1720,10 +1720,15 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
 	// A multi-operation drive owns only its operation: its failed tasks carry
 	// the outcome, and the operator's projection settles the parent, resolves
-	// pending control requests, and posts the terminal summary.
+	// pending control requests, and posts the terminal summary. The drive
+	// itself returns nil — the failure is already durably settled in the
+	// tasks, and an error here would read as a transient drive failure that
+	// leaves the operation claimable, re-leasing already-settled work instead
+	// of letting the claim loop persist the operation row from its now-failed
+	// tasks immediately.
 	if suppressParentApplyWrites(ctx) {
 		logger.Info("operation drive failed during recovery; operator derives the operation row and projects the parent")
-		return err
+		return nil
 	}
 	if startRequested {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {

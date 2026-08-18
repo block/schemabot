@@ -272,3 +272,30 @@ func TestLocalClient_OperationResumeEngineFailureSettlesTasksNotParent(t *testin
 		"a queued sibling task behind a failed one must settle cancelled")
 	f.requireParentUntouched(t)
 }
+
+// A grouped-mode engine failure during an operation-scoped resume settles the
+// drive's own tasks as failed and leaves the parent to the operator's
+// projection — and the drive itself exits cleanly. The failure is already
+// durably recorded in the tasks; a returned error would read as a transient
+// drive failure that leaves the settled operation claimable on every operator
+// poll, instead of letting the claim loop persist the operation row from its
+// now-failed tasks immediately.
+func TestLocalClient_OperationGroupedResumeFailureSettlesTasksAndExitsCleanly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.Pending})
+	f.apply.Options = []byte(`{"defer_cutover":"true"}`)
+	f.eng.planChanges = []engine.SchemaChange{{
+		Namespace:    "testdb",
+		TableChanges: []engine.TableChange{{Table: "users", DDL: multiOpResumeDDL}},
+	}}
+	f.eng.rejectApply = true
+
+	require.NoError(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.opID),
+		"a non-retryable grouped failure settles the operation's tasks; the drive itself exits cleanly")
+
+	assert.Equal(t, state.Task.Failed, f.taskState(t, f.tasks[0]),
+		"a grouped failure must settle the driven task as failed")
+	f.requireParentUntouched(t)
+}
