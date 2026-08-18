@@ -447,14 +447,19 @@ type ApplyStore interface {
 
 	// AttachOperationWithTasks stores one additional apply_operations row and
 	// its tasks under an existing apply in a single transaction. The apply's
-	// state is re-read under a row lock inside the transaction and the attach
-	// fails with ErrApplyNotActive when it is terminal — new work must never
-	// land on an apply no drive will pick up again. The (apply_id, deployment,
-	// operation_key) unique index is the idempotency guard: a concurrent attach
-	// of the same operation loses with ErrApplyOperationExists, which the
-	// caller resolves by re-reading the winner's row. On success the operation's
-	// ID and every task's ID and ApplyOperationID are populated.
-	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
+	// state is re-read under a row lock inside the transaction. An attach to a
+	// COMPLETED apply reopens it — the apply is the deployment's shared
+	// container for one keyed generation of dispatches, so a fast sibling
+	// completing it must not seal it against siblings that have not dispatched
+	// yet; the reopen re-acquires the target reservation under the target lock
+	// and returns true. Every other terminal state fails with ErrApplyNotActive:
+	// a failed, cancelled, or reverted apply needs operator reconciliation, and
+	// new work must never land on it. The (apply_id, deployment, operation_key)
+	// unique index is the idempotency guard: a concurrent attach of the same
+	// operation loses with ErrApplyOperationExists, which the caller resolves by
+	// re-reading the winner's row. On success the operation's ID and every
+	// task's ID and ApplyOperationID are populated.
+	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) (reopened bool, err error)
 
 	// Get returns an apply by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*Apply, error)

@@ -160,11 +160,54 @@ func TestLocalClient_Apply_SharedKeySiblingDispatchAttaches(t *testing.T) {
 	assert.Len(t, tasks, 2, "the replay must not insert new tasks")
 }
 
-// A sibling dispatch arriving after its keyed apply terminalized fails closed:
-// no drive will claim new work under a terminal apply, so the dispatch is
-// rejected (visibly, for the control plane to surface) rather than attached as
-// a permanently pending operation or silently aliased to the terminal apply.
-func TestLocalClient_Apply_AttachToTerminalApplyFailsClosed(t *testing.T) {
+// A sibling dispatch arriving after a fast sibling already completed the keyed
+// apply reopens it: the shared apply moves back to running, the new operation
+// attaches, and a driver will pick the fresh work up. Sealing the apply on the
+// first sibling's completion would strand every slower shard of the same keyed
+// generation.
+func TestLocalClient_Apply_AttachReopensCompletedApply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:reopen-attach-test"
+
+	first, err := client.Apply(ctx, shardDispatchRequest(planID, key, "-80"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "first shard dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	completedAt := time.Now()
+	apply.State = state.Apply.Completed
+	apply.CompletedAt = &completedAt
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+
+	second, err := client.Apply(ctx, shardDispatchRequest(planID, key, "80-"))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "the sibling must reopen the completed apply and attach: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId, "the sibling attaches to the shared keyed apply, not a new one")
+
+	reopened, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, reopened)
+	assert.True(t, state.IsState(reopened.State, state.Apply.Running), "the reopened apply must be running, got %s", reopened.State)
+	assert.Nil(t, reopened.CompletedAt, "reopening must clear the completion timestamp")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the reopened apply must carry both siblings' operations")
+}
+
+// A sibling dispatch arriving after its keyed apply failed, was cancelled, or
+// reverted fails closed: those outcomes need operator reconciliation, so the
+// dispatch is rejected (visibly, for the control plane to surface) rather than
+// attached as a permanently pending operation under an apply no drive will
+// claim.
+func TestLocalClient_Apply_AttachToFailedApplyFailsClosed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -180,12 +223,12 @@ func TestLocalClient_Apply_AttachToTerminalApplyFailsClosed(t *testing.T) {
 	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
 	require.NoError(t, err)
 	require.NotNil(t, apply)
-	apply.State = state.Apply.Completed
+	apply.State = state.Apply.Failed
 	require.NoError(t, stor.Applies().Update(ctx, apply))
 
 	second, err := client.Apply(ctx, shardDispatchRequest(planID, key, "80-"))
 	require.NoError(t, err)
-	assert.False(t, second.Accepted, "attach to a terminal apply must be refused")
+	assert.False(t, second.Accepted, "attach to a failed apply must be refused")
 	assert.Contains(t, second.ErrorMessage, "terminal", "the refusal must name the terminal state as the cause")
 
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
@@ -241,7 +284,9 @@ func TestLocalClient_Apply_AttachRaceReplaysWinner(t *testing.T) {
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
-	require.NoError(t, stor.Applies().AttachOperationWithTasks(ctx, apply, winner, buildDispatchTasks(plan, scope, siblingReq.Environment, "spirit", []byte("{}"), now)))
+	winnerReopened, err := stor.Applies().AttachOperationWithTasks(ctx, apply, winner, buildDispatchTasks(plan, scope, siblingReq.Environment, "spirit", []byte("{}"), now))
+	require.NoError(t, err)
+	require.False(t, winnerReopened, "the apply is still active, so the winner's attach must not reopen it")
 
 	resp, err := client.attachDispatchOperation(ctx, siblingReq, apply, plan, scope, "testdb/80-/users", storage.ApplyOperationKindWork)
 	require.NoError(t, err)
@@ -255,10 +300,11 @@ func TestLocalClient_Apply_AttachRaceReplaysWinner(t *testing.T) {
 	assert.Len(t, ops, 2, "the lost race must not insert a duplicate operation")
 }
 
-// An apply that terminalizes between the attach's in-memory state check and
-// its storage write is still refused: the row-locked re-read inside the attach
-// transaction catches the transition and the dispatch fails closed.
-func TestLocalClient_Apply_AttachRefusesApplyTerminalizedUnderneath(t *testing.T) {
+// An apply that completes between the attach's in-memory state check and its
+// storage write is reopened by the row-locked re-read inside the attach
+// transaction: a sibling racing a fast finisher lands its operation instead of
+// bouncing off a completion it never observed.
+func TestLocalClient_Apply_AttachReopensApplyCompletedUnderneath(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -267,18 +313,56 @@ func TestLocalClient_Apply_AttachRefusesApplyTerminalizedUnderneath(t *testing.T
 	ctx := t.Context()
 	apply, plan, scope, siblingReq := attachFixture(t, stor, client, planID, "schemabot:v1:attach-toctou-test")
 
-	// Terminalize the stored row while the caller still holds a stale
-	// non-terminal snapshot, as a concurrent driver would.
+	// Complete the stored row while the caller still holds a stale active
+	// snapshot, as a concurrent driver finishing the first sibling would.
 	current, err := stor.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, current)
+	completedAt := time.Now()
 	current.State = state.Apply.Completed
+	current.CompletedAt = &completedAt
 	require.NoError(t, stor.Applies().Update(ctx, current))
 	require.False(t, state.IsTerminalApplyState(apply.State), "the caller's snapshot must still look active for the race to be exercised")
 
 	resp, err := client.attachDispatchOperation(ctx, siblingReq, apply, plan, scope, "testdb/80-/users", storage.ApplyOperationKindWork)
 	require.NoError(t, err)
-	assert.False(t, resp.Accepted, "the attach must fail closed when the apply terminalized underneath it")
+	require.True(t, resp.Accepted, "the attach must reopen the apply that completed underneath it: %s", resp.ErrorMessage)
+
+	reloaded, err := stor.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.True(t, state.IsState(reloaded.State, state.Apply.Running), "the reopened apply must be running, got %s", reloaded.State)
+	assert.Nil(t, reloaded.CompletedAt, "reopening must clear the completion timestamp")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the racing sibling's operation must land on the reopened apply")
+}
+
+// An apply that fails between the attach's in-memory state check and its
+// storage write is still refused: the row-locked re-read inside the attach
+// transaction catches the transition and the dispatch fails closed.
+func TestLocalClient_Apply_AttachRefusesApplyFailedUnderneath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	apply, plan, scope, siblingReq := attachFixture(t, stor, client, planID, "schemabot:v1:attach-toctou-fail-test")
+
+	// Fail the stored row while the caller still holds a stale non-terminal
+	// snapshot, as a concurrent driver would.
+	current, err := stor.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	current.State = state.Apply.Failed
+	require.NoError(t, stor.Applies().Update(ctx, current))
+	require.False(t, state.IsTerminalApplyState(apply.State), "the caller's snapshot must still look active for the race to be exercised")
+
+	resp, err := client.attachDispatchOperation(ctx, siblingReq, apply, plan, scope, "testdb/80-/users", storage.ApplyOperationKindWork)
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted, "the attach must fail closed when the apply failed underneath it")
 	assert.Contains(t, resp.ErrorMessage, "terminal", "the refusal must name the terminal state as the cause")
 
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
