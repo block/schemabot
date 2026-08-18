@@ -17,7 +17,7 @@ and what to look at when the throttle lasts longer than expected.
 ## replica-lag
 
 ```
-replica-lag 12000ms >= 120000ms
+replica-lag 125000ms >= 120000ms
 ```
 
 The schema change is configured with a read replica to protect

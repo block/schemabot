@@ -15,7 +15,7 @@ func TestThrottleTip(t *testing.T) {
 		reason string
 		want   string
 	}{
-		{"replica lag", "replica-lag 12000ms >= 120000ms",
+		{"replica lag", "replica-lag 125000ms >= 120000ms",
 			"waiting for the read replica to catch up"},
 		{"replica lag unobservable fails closed", "replica-lag unobservable for 45s (failing closed)",
 			"replication lag cannot be measured, pausing to protect the replica"},
