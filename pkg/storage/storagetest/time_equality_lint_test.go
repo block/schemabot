@@ -2,6 +2,7 @@ package storagetest
 
 import (
 	"go/ast"
+	"go/token"
 	"go/types"
 	"path/filepath"
 	"strings"
@@ -59,28 +60,52 @@ func isExactTimeAssertion(info *types.Info, call *ast.CallExpr) bool {
 		return false
 	}
 	if isExactEqualityName(selector.Sel.Name) {
-		for _, arg := range call.Args {
-			if isTimeType(info.TypeOf(arg)) {
+		// Only the expected/actual pair matters; a time.Time in the trailing
+		// msgAndArgs diagnostics does not make the comparison time-sensitive.
+		for _, arg := range valueArgs(info, selector, call.Args, 2) {
+			if containsTimeType(info.TypeOf(arg)) {
 				return true
 			}
 		}
 		return false
 	}
-	if selector.Sel.Name != "True" || len(call.Args) == 0 {
+	if selector.Sel.Name != "True" && selector.Sel.Name != "False" {
 		return false
 	}
 
-	for _, arg := range call.Args {
-		equalCall, ok := arg.(*ast.CallExpr)
-		if !ok {
-			continue
-		}
-		equalSelector, ok := equalCall.Fun.(*ast.SelectorExpr)
-		if ok && equalSelector.Sel.Name == "Equal" && isTimeType(info.TypeOf(equalSelector.X)) {
-			return true
-		}
+	condition := valueArgs(info, selector, call.Args, 1)
+	if len(condition) != 1 {
+		return false
 	}
-	return false
+	arg := condition[0]
+	for {
+		unary, ok := arg.(*ast.UnaryExpr)
+		if !ok || unary.Op != token.NOT {
+			break
+		}
+		arg = unary.X
+	}
+	equalCall, ok := arg.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	equalSelector, ok := equalCall.Fun.(*ast.SelectorExpr)
+	return ok && equalSelector.Sel.Name == "Equal" && isTimeType(info.TypeOf(equalSelector.X))
+}
+
+// valueArgs returns up to count compared-value arguments of a testify call,
+// skipping the leading *testing.T of the package-function form (the
+// assert.New(t) method form binds it at construction) and the trailing
+// msgAndArgs diagnostics.
+func valueArgs(info *types.Info, selector *ast.SelectorExpr, args []ast.Expr, count int) []ast.Expr {
+	start := 1
+	if sig, ok := info.ObjectOf(selector.Sel).Type().(*types.Signature); ok && sig.Recv() != nil {
+		start = 0
+	}
+	if start >= len(args) {
+		return nil
+	}
+	return args[start:min(start+count, len(args))]
 }
 
 func isExactEqualityName(name string) bool {
@@ -96,4 +121,40 @@ func isTestifyCall(info *types.Info, selector *ast.SelectorExpr) bool {
 
 func isTimeType(typ types.Type) bool {
 	return typ != nil && (types.TypeString(typ, nil) == "time.Time" || types.TypeString(typ, nil) == "*time.Time")
+}
+
+// containsTimeType reports whether a compared value's type is time.Time or
+// transitively carries one — a struct with a timestamp field compared
+// wholesale is just as dialect-sensitive as the field compared directly.
+func containsTimeType(typ types.Type) bool {
+	return typeContainsTime(typ, make(map[types.Type]bool))
+}
+
+func typeContainsTime(typ types.Type, seen map[types.Type]bool) bool {
+	if typ == nil || seen[typ] {
+		return false
+	}
+	seen[typ] = true
+	if types.TypeString(typ, nil) == "time.Time" {
+		return true
+	}
+	switch t := typ.(type) {
+	case *types.Pointer:
+		return typeContainsTime(t.Elem(), seen)
+	case *types.Named:
+		return typeContainsTime(t.Underlying(), seen)
+	case *types.Struct:
+		for field := range t.Fields() {
+			if typeContainsTime(field.Type(), seen) {
+				return true
+			}
+		}
+	case *types.Slice:
+		return typeContainsTime(t.Elem(), seen)
+	case *types.Array:
+		return typeContainsTime(t.Elem(), seen)
+	case *types.Map:
+		return typeContainsTime(t.Key(), seen) || typeContainsTime(t.Elem(), seen)
+	}
+	return false
 }
