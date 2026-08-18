@@ -153,7 +153,7 @@ func TestCPUScaledThreads(t *testing.T) {
 
 func TestSettingsToVolume(t *testing.T) {
 	assert.Equal(t, int32(1), settingsToVolume(1))
-	assert.Equal(t, int32(2), settingsToVolume(2)) // also covers vol 3 (same thread count)
+	assert.Equal(t, int32(3), settingsToVolume(2)) // the documented default; vol 2 shares this thread count
 	assert.Equal(t, int32(4), settingsToVolume(4))
 	assert.Equal(t, int32(5), settingsToVolume(8))
 	assert.Equal(t, int32(8), settingsToVolume(12))
@@ -322,12 +322,11 @@ func TestVolumeReportingUsesExplicitPerChangeValue(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
 
-	// The change starts on the configured defaults (2 threads), which map to
-	// volume 2 — the lowest level sharing that thread count now that lock wait
-	// timeout no longer varies by volume (volumes 2 and 3 are otherwise
-	// identical).
+	// The change starts on the configured defaults (2 threads), the documented
+	// default of volume 3 — even though volume 2 now derives the same thread
+	// count since lock wait timeout no longer varies by volume.
 	result := adjustVolume(t, eng, rm, 7)
-	assert.Equal(t, int32(2), result.PreviousVolume)
+	assert.Equal(t, int32(3), result.PreviousVolume)
 	assert.Equal(t, int32(7), result.NewVolume)
 
 	// Without a CPU hint, volumes 6 and 7 derive the same Spirit settings, so

@@ -541,8 +541,9 @@ const maxThreads = 16
 // at maxThreads.
 //
 // Thread count is the only lever volume adjusts: lock wait timeout is fixed
-// engine-wide (see DefaultLockWaitTimeout) now that Spirit's ForceKill clears
-// blockers well within it regardless of volume. Volumes 2 and 3, and 5-7
+// to the engine's configured value (see DefaultLockWaitTimeout) now that
+// Spirit's ForceKill clears blockers well within it regardless of volume.
+// Volumes 2 and 3, and 5-7
 // without a CPU hint, consequently derive the same thread count and are
 // indistinguishable in practice; when the engine's experimental autoscaling
 // is enabled (the default) and Aurora is detected, autoscaling overrides
@@ -591,17 +592,18 @@ func cpuScaledThreads(cpuHint, divisor, fallback int) int {
 
 // settingsToVolume approximates the volume level for a schema change that was
 // never given an explicit volume, mapping its starting thread count to the
-// closest level. Volume levels that share a derived thread count map to the
-// lowest such level — this includes volumes 2 and 3, which share a thread
-// count now that lock wait timeout no longer varies by volume. Once an
-// operator sets a volume, the explicit value is stored on the running schema
-// change and this approximation is not used.
+// closest level. It is only ever called with the engine's configured default
+// thread count, since an explicit volume is stored on the running schema
+// change and reported directly instead. That default is documented as volume
+// 3 (see DefaultThreads), even though volume 2 now derives the same thread
+// count now that lock wait timeout no longer varies by volume. Other volume
+// levels that share a derived thread count map to the lowest such level.
 func settingsToVolume(threads int) int32 {
 	switch {
 	case threads <= 1:
 		return 1
 	case threads <= 2:
-		return 2 // also covers vol 3 (same thread count)
+		return 3 // the documented default (DefaultThreads); vol 2 shares this thread count but is never the un-set starting point
 	case threads <= 4:
 		return 4
 	case threads <= 8:
