@@ -566,6 +566,113 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 	})
 }
 
+// TestUpdateApplyStateFromOperations_ManifestGatesCompletion verifies that an
+// apply carrying a generation manifest completes only when every declared
+// operation has attached and finished. A deployment-keyed apply's operations
+// attach one dispatch at a time, so the projection must not read "all attached
+// operations succeeded" as "the generation succeeded" while declared siblings
+// are still on their way — it holds the apply running instead. Failure verdicts
+// pass through unheld, and an apply without a manifest keeps the
+// attached-rows-only completion semantics.
+func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
+	const shardA, shardB = "ns/-80/users", "ns/80-/users"
+	cases := []struct {
+		name      string
+		manifest  []string
+		ops       []*storage.ApplyOperation
+		wantState string
+		wantDone  bool
+	}{
+		{
+			name:     "completed attached subset holds the apply running",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Completed},
+			},
+			wantState: state.Apply.Running,
+			wantDone:  false,
+		},
+		{
+			name:     "full manifest attached and completed completes the apply",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Completed},
+				{ID: 2, OperationKey: shardB, State: state.ApplyOperation.Completed},
+			},
+			wantState: state.Apply.Completed,
+			wantDone:  true,
+		},
+		{
+			name:     "failure passes through while manifest operations are missing",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Failed},
+			},
+			wantState: state.Apply.Failed,
+			wantDone:  true,
+		},
+		{
+			name:     "no manifest keeps attached-rows-only completion",
+			manifest: nil,
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Completed},
+			},
+			wantState: state.Apply.Completed,
+			wantDone:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applyStore := &recordingApplyStore{swapped: true}
+			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
+
+			apply := &storage.Apply{
+				ID:                    3,
+				ApplyIdentifier:       "apply-manifest",
+				State:                 state.Apply.Pending,
+				Environment:           "staging",
+				ExpectedOperationKeys: tc.manifest,
+			}
+
+			result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+			require.NoError(t, err)
+			require.NotNil(t, applyStore.updated, "derived state differs from pending, so the apply must be persisted")
+			assert.Equal(t, tc.wantState, applyStore.updated.State)
+			assert.Equal(t, tc.wantDone, result.BecameTerminal)
+			if tc.wantDone {
+				assert.NotNil(t, applyStore.updated.CompletedAt, "terminal derived state stamps completed_at")
+			} else {
+				assert.Nil(t, applyStore.updated.CompletedAt, "a held apply must not carry a completion time")
+			}
+		})
+	}
+}
+
+// A held apply already projected to running must not be rewritten on every
+// poll: when the manifest gate holds completion and the apply is already
+// running, the projection is a no-op rather than a repeated swap.
+func TestUpdateApplyStateFromOperations_ManifestHoldIsStableWhileRunning(t *testing.T) {
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "ns/-80/users", State: state.ApplyOperation.Completed},
+	}}, applyStore)
+
+	apply := &storage.Apply{
+		ID:                    3,
+		ApplyIdentifier:       "apply-manifest-stable",
+		State:                 state.Apply.Running,
+		Environment:           "staging",
+		ExpectedOperationKeys: []string{"ns/-80/users", "ns/80-/users"},
+		StartedAt:             &time.Time{},
+	}
+
+	result, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	assert.False(t, result.Swapped, "holding at the current running state is not a swap")
+	assert.Nil(t, applyStore.updated, "a stable hold must not rewrite the apply row")
+	assert.Equal(t, state.Apply.Running, result.DerivedState)
+}
+
 // releaseLatchControlStore returns a fixed release latch from GetByOperation so
 // the operator's apply-state writer can be driven with or without a release. It
 // records the queried applyID so a test can assert the latch is read for the

@@ -930,6 +930,7 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 	"attached":         true,
 	"attach_race":      true,
 	"terminal_refused": true,
+	"manifest_refused": true,
 }
 
 // RecordRemoteApplyAttach increments the counter for dispatches that resolved
@@ -944,6 +945,11 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 //     attach was refused fail-closed — the deployment's remaining operations
 //     cannot dispatch until an operator reconciles the apply, so investigate
 //     what terminalized it mid-fan-out.
+//   - "manifest_refused": the dispatch's operation key is not in the apply's
+//     stored generation manifest, so the attach was refused fail-closed — the
+//     two planes disagree about the generation's operation set (version or
+//     data skew), so compare the dispatcher's operation rows against the
+//     stored manifest before retrying.
 func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome string) {
 	if !knownRemoteApplyAttachOutcomes[outcome] {
 		outcome = "unknown"
@@ -953,6 +959,23 @@ func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordApplyManifestHold increments the counter for state-projection passes
+// that held an apply's success verdict because operations declared in its
+// generation manifest have not attached yet. A short-lived burst is the normal
+// fan-out window (siblings dispatch one at a time). A sustained series on one
+// apply means the dispatcher stopped sending the rest of the generation — its
+// driver died or its control plane is wedged — so the operator action is to
+// check the dispatcher's operation rows for that deployment and cancel the
+// held apply if the generation is abandoned.
+func RecordApplyManifestHold(ctx context.Context, database, deployment, environment string) {
+	addCounter(ctx, "schemabot.apply_manifest_hold_total",
+		"Total apply state projections held open awaiting manifest operations that have not attached", "{projection}",
+		attribute.String("database", database),
+		attribute.String("deployment", deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 

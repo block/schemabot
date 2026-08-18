@@ -2327,6 +2327,27 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	base := state.DeriveApplyState(childStates)
 	derived := state.DeriveRolloutApplyState(children)
 
+	// A deployment-keyed apply's operations attach one dispatch at a time, so
+	// the attached rows alone cannot prove the generation is complete. The
+	// stored generation manifest is the completion authority: the apply may
+	// derive completed only when every declared operation has attached (and,
+	// via the child derivation above, reached a terminal state). Until then the
+	// honest projection over an incomplete generation is running — the work the
+	// dispatcher declared is still on its way. Failure verdicts pass through
+	// unheld: a failed generation must not wait for siblings that may never
+	// dispatch.
+	if state.IsState(derived, state.Apply.Completed) {
+		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
+			derived = state.Apply.Running
+			s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",
+				append(apply.LogAttrs(),
+					"driver", driverID,
+					"missing_operation_keys", missing,
+					"operation_count", len(ops))...)
+			metrics.RecordApplyManifestHold(ctx, apply.Database, apply.Deployment, apply.Environment)
+		}
+	}
+
 	// A failed parent is the one terminal state the continue projection can
 	// legitimately reopen: a continuable sibling failure may have terminalized
 	// the parent before the rollout settled, and re-deriving over the operation

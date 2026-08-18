@@ -1776,7 +1776,14 @@ func vschemaOnlyDispatchNamespaces(changes []*ternv1.TableChange) []string {
 // dispatched namespace must hold a VSchema artifact in the stored plan —
 // otherwise the drive would have nothing to apply and the operation would fail
 // only after it was created.
-func finalizerDispatchScope(plan *storage.Plan, namespaces []string) (string, error) {
+//
+// A single-namespace dispatch is shape-ambiguous on its own: a sharded plan's
+// per-namespace finalizer and a deployment-scoped finalizer over a plan whose
+// only VSchema change is one namespace arrive identically. The dispatch's
+// generation manifest names the dispatcher's actual operation keys, so when
+// one is present it resolves the shape; without one the dispatch keeps the
+// namespace-scoped reading.
+func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationManifest []string) (string, error) {
 	if len(namespaces) == 0 {
 		return "", fmt.Errorf("group_finalizer dispatch names no namespaces")
 	}
@@ -1785,11 +1792,11 @@ func finalizerDispatchScope(plan *storage.Plan, namespaces []string) (string, er
 			return "", fmt.Errorf("group_finalizer dispatch for namespace %q: %w", namespace, err)
 		}
 	}
-	if len(namespaces) == 1 {
+	if len(namespaces) == 1 && !manifestNamesDeploymentScopedFinalizer(generationManifest, namespaces[0]) {
 		return namespaces[0], nil
 	}
 	// A deployment-scoped finalizer's drive applies every VSchema-changed
-	// namespace in the stored plan, so a multi-namespace dispatch must cover
+	// namespace in the stored plan, so a deployment-scoped dispatch must cover
 	// exactly that set — a partial dispatch would silently apply namespaces the
 	// dispatcher never named.
 	planNamespaces := plan.VSchemaNamespaces()
@@ -1800,6 +1807,24 @@ func finalizerDispatchScope(plan *storage.Plan, namespaces []string) (string, er
 			namespaces, plan.PlanIdentifier, planNamespaces)
 	}
 	return "", nil
+}
+
+// manifestNamesDeploymentScopedFinalizer reports whether a single-namespace
+// finalizer dispatch resolves to the deployment-scoped shape: its generation
+// manifest names the deployment-scoped finalizer key and not the namespace's
+// own finalizer key. The manifest is the dispatcher's declared operation-key
+// set, so the operation created here must carry a key from that set — the
+// manifest is the completion authority for the apply, and a key outside it is
+// refused at creation. An empty manifest (a dispatch without generation
+// tracking) resolves nothing and keeps the namespace-scoped reading.
+func manifestNamesDeploymentScopedFinalizer(generationManifest []string, namespace string) bool {
+	if len(generationManifest) == 0 {
+		return false
+	}
+	if slices.Contains(generationManifest, namespace+finalizerOperationKeySuffix) {
+		return false
+	}
+	return slices.Contains(generationManifest, finalizerDeploymentScopedKey)
 }
 
 // shardScopedDispatchOperationKey builds the operation key for a shard-scoped
@@ -2091,7 +2116,7 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		return scope, nil
 	}
 	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
-		namespace, err := finalizerDispatchScope(plan, namespaces)
+		namespace, err := finalizerDispatchScope(plan, namespaces, req.GenerationOperationKeys)
 		if err != nil {
 			return dispatchScope{}, err
 		}
@@ -2218,6 +2243,53 @@ func (c *LocalClient) dispatchIntoExistingApply(ctx context.Context, req *ternv1
 	return c.attachDispatchOperation(ctx, req, apply, plan, scope, operationKey, operationKind)
 }
 
+// validateDispatchAgainstManifest is the fail-closed gate for a dispatch's
+// operation key against a generation manifest. A key outside the manifest
+// means the two planes disagree about the generation — the dispatcher declared
+// one operation set and is now sending another — and accepting it would attach
+// an operation the completion gate never waits for. Empty manifests (an apply
+// created without one, or a dispatch that carries none) validate everything: a
+// dispatcher that never declared a generation keeps the attached-rows-only
+// completion semantics. A dispatch whose carried manifest disagrees with the
+// stored one is logged for triage but judged against the stored manifest,
+// which is immutable for the generation.
+func (c *LocalClient) validateDispatchAgainstManifest(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
+	if len(req.GenerationOperationKeys) > 0 && len(apply.ExpectedOperationKeys) > 0 &&
+		!slices.Equal(normalizedManifest(req.GenerationOperationKeys), apply.ExpectedOperationKeys) {
+		c.logger.Warn("Apply: dispatch carries a generation manifest that disagrees with the stored one; validating against the stored manifest",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"stored_manifest", apply.ExpectedOperationKeys,
+				"dispatch_manifest", req.GenerationOperationKeys)...)
+	}
+	if apply.AllowsOperationKey(operationKey) {
+		return nil
+	}
+	c.logger.Warn("Apply: refusing operation outside the apply's generation manifest; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"stored_manifest", apply.ExpectedOperationKeys)...)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "manifest_refused")
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("operation %s is not in apply %s's generation manifest %v; refusing to attach an operation its completion gate never waits for", operationKey, apply.ApplyIdentifier, apply.ExpectedOperationKeys),
+	}
+}
+
+// normalizedManifest returns the canonical stored form of a dispatched
+// generation manifest: sorted with duplicates removed, so equality checks and
+// the stored column are independent of dispatch ordering.
+func normalizedManifest(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	normalized := slices.Clone(keys)
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
+}
+
 // refuseAttachToTerminalApply is the fail-closed rejection for an attach
 // against an apply that is (or just became) terminal: its target reservation
 // is released and no drive will pick new work up, so accepting the operation
@@ -2242,6 +2314,9 @@ func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *tern
 func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey, operationKind string) (*ternv1.ApplyResponse, error) {
 	if state.IsTerminalApplyState(apply.State) {
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+	}
+	if refusal := c.validateDispatchAgainstManifest(ctx, req, apply, operationKey); refusal != nil {
+		return refusal, nil
 	}
 
 	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
@@ -2434,24 +2509,29 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// surfaces its VSchema status/diff from engine resume metadata, and a sharded
 	// apply runs VSchema as a task-less group_finalizer derived from the plan.
 
-	// Build the Apply record (1 Apply -> N Tasks).
+	// Build the Apply record (1 Apply -> N Tasks). The dispatch's generation
+	// manifest is stored on the apply at creation: sibling dispatches of the
+	// same keyed generation attach one at a time, and the manifest is what the
+	// state projection holds the apply's success verdict on until every
+	// declared operation has attached and finished.
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 	apply := &storage.Apply{
-		ApplyIdentifier: applyIdentifier,
-		PlanID:          plan.ID,
-		Database:        plan.Database,
-		DatabaseType:    plan.DatabaseType,
-		Deployment:      c.config.Database,
-		Repository:      plan.Repository,
-		PullRequest:     plan.PullRequest,
-		Environment:     req.Environment,
-		Caller:          caller,
-		Engine:          eng.Name(),
-		State:           state.Apply.Pending,
-		Options:         optionsJSON,
-		IdempotencyKey:  req.IdempotencyKey,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ApplyIdentifier:       applyIdentifier,
+		PlanID:                plan.ID,
+		Database:              plan.Database,
+		DatabaseType:          plan.DatabaseType,
+		Deployment:            c.config.Database,
+		Repository:            plan.Repository,
+		PullRequest:           plan.PullRequest,
+		Environment:           req.Environment,
+		Caller:                caller,
+		Engine:                eng.Name(),
+		State:                 state.Apply.Pending,
+		Options:               optionsJSON,
+		IdempotencyKey:        req.IdempotencyKey,
+		ExpectedOperationKeys: normalizedManifest(req.GenerationOperationKeys),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	c.logger.Info("Apply: creating tasks",
@@ -2471,6 +2551,23 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	operationKey, operationKind, err := operationIdentityForDispatch(scope)
 	if err != nil {
 		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+	}
+
+	// A dispatch that declares a generation manifest must name its own
+	// operation in it: the manifest is the completion authority for the apply
+	// this dispatch creates, and an apply whose first operation is outside its
+	// own manifest could never complete. Refuse the malformed dispatch instead
+	// of creating an apply that is wedged from birth.
+	if !apply.AllowsOperationKey(operationKey) {
+		c.logger.Error("Apply: dispatch's generation manifest does not name its own operation; refusing the malformed dispatch",
+			"plan_id", plan.PlanIdentifier,
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"manifest", apply.ExpectedOperationKeys)
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("dispatch generation manifest %v does not include its own operation key %q; refusing the malformed dispatch", apply.ExpectedOperationKeys, operationKey),
+		}, nil
 	}
 
 	// Dual-write one apply_operations row alongside the applies row in the

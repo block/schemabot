@@ -64,7 +64,7 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 	assert.Equal(t, []string{
 		"id", "apply_identifier", "lock_id", "plan_id", "database_name", "database_type",
 		"repository", "pull_request", "environment", "deployment", "caller", "installation_id",
-		"external_id", "idempotency_key", "engine", "state", "error_message", "options", "attempt",
+		"external_id", "idempotency_key", "expected_operation_keys", "engine", "state", "error_message", "options", "attempt",
 		"lease_owner", "lease_token", "lease_acquired_at", "started_at", "completed_at",
 		"revert_skipped_at", "created_at", "updated_at",
 	}, applies)
