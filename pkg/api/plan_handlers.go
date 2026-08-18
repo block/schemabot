@@ -20,6 +20,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -614,6 +615,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
+
 	route := storedPlanRoute{
 		DatabaseType: resolvedTarget.DatabaseType,
 		Deployment:   deployment,
@@ -629,6 +632,58 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	// at rollup time.
 	planResp.Deployment = deployment
 	return resp, planResp, nil
+}
+
+// normalizeExecutionVerdicts validates every table change's execution-mode
+// verdict against its closed vocabulary — empty (executable), "blocked", or
+// "direct" — before the plan is stored or returned. The verdict crosses the
+// wire as a free-form string and everything except "blocked" executes as the
+// engine's default path downstream, so a value this build does not recognize
+// (a skewed remote planner, a newer plan contract) must fail closed rather
+// than run.
+func (s *Service) normalizeExecutionVerdicts(resp *ternv1.PlanResponse, database, deployment string) {
+	if resp == nil {
+		return
+	}
+	for _, change := range resp.Changes {
+		if change == nil {
+			continue
+		}
+		for _, tc := range change.TableChanges {
+			s.normalizeExecutionVerdict(tc, database, deployment)
+		}
+	}
+	for _, shard := range resp.Shards {
+		if shard == nil {
+			continue
+		}
+		for _, tc := range shard.Changes {
+			s.normalizeExecutionVerdict(tc, database, deployment)
+		}
+	}
+}
+
+func (s *Service) normalizeExecutionVerdict(tc *ternv1.TableChange, database, deployment string) {
+	if tc == nil || recognizedExecutionMode(tc.ExecutionMode) {
+		return
+	}
+	s.logger.Warn("plan response carried an unrecognized execution-mode verdict; the change will be blocked",
+		"database", database,
+		"deployment", deployment,
+		"table", tc.TableName,
+		"execution_mode", tc.ExecutionMode,
+	)
+	tc.ModeReason = fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode)
+	tc.ExecutionMode = engine.ExecutionModeBlocked
+}
+
+// recognizedExecutionMode reports whether mode is in the closed execution-mode
+// vocabulary: empty (the engine executes the statement on its default path),
+// blocked, or direct.
+func recognizedExecutionMode(mode string) bool {
+	return mode == "" ||
+		strings.EqualFold(mode, engine.ExecutionModeBlocked) ||
+		strings.EqualFold(mode, engine.ExecutionModeDirect)
 }
 
 type storedPlanRoute struct {
@@ -1483,6 +1538,7 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if err != nil {
 		return nil, err
 	}
+	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
 		DatabaseType: apply.DatabaseType,
 		Deployment:   deployment,

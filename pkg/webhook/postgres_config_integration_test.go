@@ -98,6 +98,10 @@ func TestPostgresConfigFixtureSurfacesBlockedPlan(t *testing.T) {
 	require.Len(t, plan.Changes[0].TableChanges, 1)
 	assert.True(t, plan.Changes[0].TableChanges[0].EngineBlocked())
 	assert.Equal(t, engine.ExecutionModeBlocked, plan.Changes[0].TableChanges[0].ExecutionMode)
+	// The fixture's column type change routes to copy-and-swap; pin that cause
+	// so the test keeps proving the intended blocking reason, not just the
+	// fact of being blocked.
+	assert.Contains(t, plan.Changes[0].TableChanges[0].ModeReason, "copy-and-swap")
 
 	resp, applyID, err := svc.ExecuteApply(t.Context(), api.ApplyRequest{
 		PlanID:      plan.PlanID,
@@ -121,7 +125,7 @@ type postgresConfigFixture struct {
 
 func loadPostgresConfigFixture(t *testing.T, name string) postgresConfigFixture {
 	t.Helper()
-	dir := filepath.Join("..", "..", "integration", "testdata", "myapp", name, "schema")
+	dir := filepath.Join("testdata", "myapp", name, "schema")
 	configBytes, err := os.ReadFile(filepath.Join(dir, "schemabot.yaml"))
 	require.NoError(t, err)
 	var config ghconfig.SchemabotConfig
