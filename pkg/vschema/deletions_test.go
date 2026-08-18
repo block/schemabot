@@ -183,6 +183,18 @@ func TestDeletions_RemovedColumnVindex(t *testing.T) {
 	assert.Contains(t, deletions[0].Reason, `"email_lookup"`)
 }
 
+func TestDeletions_UnknownFieldsTolerated(t *testing.T) {
+	// A VSchema served by a newer Vitess can carry fields the vendored proto
+	// does not know about; they must not fail deletion detection.
+	current := `{"sharded": true, "future_field": {"x": 1}, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`
+	desired := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {}}`
+	deletions, err := Deletions(current, desired)
+	require.NoError(t, err)
+	require.Len(t, deletions, 1)
+	assert.Equal(t, DeletionKindTable, deletions[0].Kind)
+	assert.Equal(t, "users", deletions[0].Name)
+}
+
 func TestDeletions_UnparseableCurrentFailsClosed(t *testing.T) {
 	_, err := Deletions("{not json", shardedVSchema)
 	require.Error(t, err)

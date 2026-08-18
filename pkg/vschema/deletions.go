@@ -103,14 +103,16 @@ func vindexRemovalReason(name string, v *vschemapb.Vindex) string {
 // parseKeyspace decodes a VSchema keyspace JSON document. Unlike Normalize,
 // which is a best-effort canonicalizer for display comparison, this parse is
 // strict: deletion detection is a safety input and must not silently treat an
-// unreadable document as empty.
+// unreadable document as empty. Unknown fields are tolerated so a VSchema
+// served by a newer Vitess than the vendored proto still parses; malformed
+// JSON still fails.
 func parseKeyspace(s string) (*vschemapb.Keyspace, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		s = "{}"
 	}
 	var ks vschemapb.Keyspace
-	if err := protojson.Unmarshal([]byte(s), &ks); err != nil {
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(s), &ks); err != nil {
 		return nil, err
 	}
 	return &ks, nil

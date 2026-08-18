@@ -78,7 +78,7 @@ func (sc *SchemaChangeResponse) VSchemaUnsafeChanges() []UnsafeChange {
 	if err != nil {
 		return []UnsafeChange{{
 			Table:      sc.Namespace + "/vschema.json",
-			Reason:     "VSchema deletions were recorded on this plan but could not be decoded; treating the VSchema change as unsafe",
+			Reason:     "VSchema deletions were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe",
 			ChangeType: VSchemaChangeType,
 		}}
 	}
