@@ -100,6 +100,52 @@ func TestDeriveDeployState_InstantDDLRequestedControlsRevertWindow(t *testing.T)
 	require.Equal(t, dr.Complete, deriveDeployState(migrations, true, true))
 }
 
+// An unrecognized Vitess status counts as queued while the flag is unset, so
+// the processor keeps polling until Vitess resolves it. With the authoritative
+// ready_to_complete flag set, the schema change is cutover-ready regardless of
+// how the status reads.
+func TestDeriveDeployState_UnknownVitessStatus(t *testing.T) {
+	notReady := []migrationInfo{{status: "vreplicating"}}
+	require.Equal(t, dr.Queued, deriveDeployState(notReady, false, false))
+
+	ready := []migrationInfo{{status: "vreplicating", readyToComplete: true}}
+	require.Equal(t, dr.PendingCutover, deriveDeployState(ready, false, false))
+	require.Equal(t, dr.InProgressCutover, deriveDeployState(ready, true, false))
+}
+
+// Vitess can leave ready_to_complete set after a failure or cancel; the stale
+// flag must never resurrect a terminal schema change as cutover-ready.
+func TestDeriveDeployState_TerminalStatusWithStaleReadyFlag(t *testing.T) {
+	failed := []migrationInfo{{status: state.Vitess.Failed, readyToComplete: true}}
+	require.Equal(t, dr.CompleteError, deriveDeployState(failed, true, false))
+
+	cancelled := []migrationInfo{{status: state.Vitess.Cancelled, readyToComplete: true}}
+	require.Equal(t, vitessCancelledSignal, deriveDeployState(cancelled, true, false))
+}
+
+// The COMPLETE command is only issued while some schema change is genuinely
+// waiting for cutover. A terminal schema change with a stale ready_to_complete
+// flag must not trigger one, whatever casing Vitess reported the status in.
+func TestAnyWaitingCutover(t *testing.T) {
+	require.True(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Running, readyToComplete: true},
+	}))
+	require.True(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Complete},
+		{status: state.Vitess.Queued, readyToComplete: true},
+	}))
+
+	require.False(t, anyWaitingCutover(nil))
+	require.False(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Running},
+	}))
+	require.False(t, anyWaitingCutover([]migrationInfo{
+		{status: state.Vitess.Failed, readyToComplete: true},
+		{status: state.Vitess.Cancelled, readyToComplete: true},
+		{status: "COMPLETE", readyToComplete: true},
+	}))
+}
+
 func TestQualifyAlterTableName(t *testing.T) {
 	tests := []struct {
 		name   string
