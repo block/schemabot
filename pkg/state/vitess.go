@@ -47,3 +47,16 @@ func IsTerminalVitessState(s string) bool {
 		return false
 	}
 }
+
+// EffectiveVitessState resolves a Vitess status using its authoritative
+// ready_to_complete cutover-readiness signal. The flag can be set while the
+// status still reads running during a brief race, or queued, requested, or
+// ready for immediate operations such as CREATE or DROP TABLE. Terminal
+// statuses always win because Vitess can leave the flag set after cancel or
+// failure.
+func EffectiveVitessState(status string, readyToComplete bool) string {
+	if readyToComplete && !IsTerminalVitessState(status) {
+		return Vitess.ReadyToComplete
+	}
+	return status
+}

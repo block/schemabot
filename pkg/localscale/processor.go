@@ -169,7 +169,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			if cutoverRequested {
 				hasWaiting := false
 				for _, m := range migrations {
-					if m.readyToComplete && m.status != state.Vitess.Complete {
+					if state.EffectiveVitessState(m.status, m.readyToComplete) == state.Vitess.ReadyToComplete {
 						hasWaiting = true
 						break
 					}
@@ -346,12 +346,10 @@ type migrationInfo struct {
 //	failed           → Migration failed
 //	cancelled        → Migration was cancelled
 //
-// The readyToComplete field is the authoritative signal for whether a migration is
-// waiting for cutover — it is true even when migration_status is still "running"
-// (brief race) or "queued" (immediate operations like CREATE/DROP TABLE).
-// Instant DDL (ALGORITHM=INSTANT) skips ready_to_complete entirely and goes
-// straight to complete. Terminal states (complete, failed, cancelled) take
-// precedence over readyToComplete, which can remain true after cancel/fail.
+// state.EffectiveVitessState applies the authoritative readyToComplete cutover-
+// readiness signal while preserving terminal statuses. Instant DDL
+// (ALGORITHM=INSTANT) skips ready_to_complete entirely and goes straight to
+// complete.
 //
 // cutoverRequested tracks whether apply-deploy (cutover) has been triggered, enabling
 // the distinction between pending_cutover and in_progress_cutover states.
@@ -360,31 +358,19 @@ func deriveDeployState(migrations []migrationInfo, cutoverRequested bool, instan
 	var failed, cancelled, complete, running, waitingCutover, queued int
 
 	for _, m := range migrations {
-		switch m.status {
+		switch state.EffectiveVitessState(m.status, m.readyToComplete) {
 		case state.Vitess.Complete:
 			complete++
 		case state.Vitess.Failed:
 			failed++
 		case state.Vitess.Cancelled:
 			cancelled++
-		case state.Vitess.Running:
-			if m.readyToComplete {
-				waitingCutover++
-			} else {
-				running++
-			}
 		case state.Vitess.ReadyToComplete:
 			waitingCutover++
+		case state.Vitess.Running:
+			running++
 		case state.Vitess.Queued, state.Vitess.Requested, state.Vitess.Ready:
-			// Early states. Immediate operations (CREATE/DROP TABLE) set
-			// ready_to_complete=true before transitioning out of queued.
-			// Instant DDL (ALGORITHM=INSTANT ALTER) skips this entirely
-			// and goes straight to complete.
-			if m.readyToComplete {
-				waitingCutover++
-			} else {
-				queued++
-			}
+			queued++
 		default:
 			// Unknown Vitess status — count as queued so the processor keeps
 			// polling until Vitess resolves it to a known status.
