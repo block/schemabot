@@ -540,7 +540,9 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 }
 
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
-// schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
+// schemaSQL maps filename -> content. Plain filenames are placed under
+// schema/{namespace}/; filenames containing a "/" are placed under schema/
+// as-is, so a test can lay out multiple namespace subdirectories.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
@@ -710,6 +712,16 @@ func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.Tre
 	return level
 }
 
+// schemaFixturePath resolves a schemaSQL key to its repository path: plain
+// filenames live under the namespace subdirectory, keys with a "/" already
+// name their namespace subdirectory.
+func schemaFixturePath(ns, name string) string {
+	if strings.Contains(name, "/") {
+		return "schema/" + name
+	}
+	return "schema/" + ns + "/" + name
+}
+
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
@@ -775,7 +787,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
-				Filename: new("schema/" + ns + "/" + name),
+				Filename: new(schemaFixturePath(ns, name)),
 				Status:   new("added"),
 			})
 		}
@@ -805,7 +817,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		blobIndex++
 		blobContents[sha] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/" + ns + "/" + name),
+			Path: new(schemaFixturePath(ns, name)),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(sha),

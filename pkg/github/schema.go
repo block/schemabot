@@ -81,11 +81,19 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	}
 
 	// Group files by keyspace/namespace
-	schemaFiles, err := groupFilesByNamespace(files, schemaRoot, environment)
+	schemaFiles, err := groupFilesByNamespace(files, schemaRoot, environment, config.IgnoreNamespaces)
 	if err != nil {
 		return nil, err
 	}
+	if len(config.IgnoreNamespaces) > 0 {
+		ic.logger.Info("excluding ignored namespaces from schema request",
+			"repo", repo, "pr", pr, "database", config.Database,
+			"schema_root", schemaRoot, "ignore_namespaces", config.IgnoreNamespaces)
+	}
 	if len(schemaFiles) == 0 {
+		if len(config.IgnoreNamespaces) > 0 {
+			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, config.IgnoreNamespaces)
+		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}
 
@@ -183,7 +191,8 @@ func schemaPathWithinDirectory(directory, candidate string) bool {
 // Files in namespace subdirectories (schema/namespace/table.sql) use the
 // subdirectory name as the namespace. Flat files (schema/table.sql) use the
 // schema directory name as the namespace (the MySQL database name).
-func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (map[string]*ternv1.SchemaFiles, error) {
+// Namespaces listed in ignoreNamespaces are excluded from the result.
+func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string, ignoreNamespaces []string) (map[string]*ternv1.SchemaFiles, error) {
 	// Build relativePath → content map for the shared helper.
 	// file.Path is the full path (e.g., "schema/payments/transactions.sql"),
 	// so trimming schemaPath+"/" gives the relative path ("payments/transactions.sql"
@@ -198,7 +207,7 @@ func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (
 		rawFiles[relPath] = file.Content
 	}
 
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment)
+	grouped, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment, ignoreNamespaces)
 	if err != nil {
 		return nil, err
 	}

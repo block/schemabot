@@ -182,6 +182,7 @@ type: mysql
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
 | `type` | Yes | `"mysql"` or `"vitess"` |
+| `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
 

@@ -905,3 +905,76 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 }
 
 // --- Container helpers (matches e2e/setup_test.go patterns) ---
+
+// TestE2EPlanExcludesIgnoredNamespaces verifies that namespace directories
+// listed in schemabot.yaml ignore_namespaces never reach the plan: a schema
+// root carrying a local-test-only namespace alongside the real one produces a
+// plan (comment, stored record, check) covering only the real namespace, so
+// SchemaBot never tries to reconcile test fixtures against the live database.
+func TestE2EPlanExcludesIgnoredNamespaces(t *testing.T) {
+	dbName := "webhook_plan_ignore_ns"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n", dbName)
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"local_fixtures/widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	// The plan comment covers the real namespace only.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "users")
+		assert.NotContains(t, body, "widgets")
+		assert.NotContains(t, body, "local_fixtures")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+
+	// The stored plan record carries no trace of the ignored namespace.
+	ctx := t.Context()
+	plans, err := svc.Storage().Plans().GetByPR(ctx, "octocat/hello-world", 1)
+	require.NoError(t, err)
+	var plan *storage.Plan
+	for _, p := range plans {
+		if p.Database == dbName {
+			plan = p
+			break
+		}
+	}
+	require.NotNil(t, plan, "expected a plan record for database %s", dbName)
+	require.NotNil(t, plan.Namespaces)
+	assert.Contains(t, plan.Namespaces, dbName)
+	assert.NotContains(t, plan.Namespaces, "local_fixtures")
+}

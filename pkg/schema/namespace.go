@@ -44,7 +44,15 @@ import (
 // This allows a single directory like "bikeshare_$ENV/" to resolve to
 // "bikeshare_staging" or "bikeshare_production" depending on the target.
 // If environment is empty, "$ENV" is left as-is.
-func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string) (SchemaFiles, error) {
+//
+// ignoreNamespaces lists namespaces to exclude from the result — schema
+// directories that exist in the repository but must not be reconciled against
+// the live database (for example a keyspace only used by local test
+// infrastructure). Entries receive the same $ENV substitution as directory
+// names and are matched against the post-substitution namespace keys. Layout
+// validation still sees ignored directories: a mixed flat/subdirectory layout
+// is rejected even when the subdirectories are all ignored.
+func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string, ignoreNamespaces []string) (SchemaFiles, error) {
 	result := make(SchemaFiles)
 	var hasFlatFile, hasNamespacedFile bool
 
@@ -80,5 +88,27 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 		return nil, fmt.Errorf("schema directory has both flat files and namespace subdirectories — use one layout or the other")
 	}
 
+	for _, ignored := range ignoreNamespaces {
+		if environment != "" {
+			ignored = strings.ReplaceAll(ignored, "$ENV", environment)
+		}
+		delete(result, ignored)
+	}
+
 	return result, nil
+}
+
+// ValidateIgnoreNamespaces rejects ignore_namespaces entries that cannot name
+// a namespace subdirectory of the schema root: blank entries and entries with
+// path separators.
+func ValidateIgnoreNamespaces(namespaces []string) error {
+	for _, ns := range namespaces {
+		if strings.TrimSpace(ns) == "" {
+			return fmt.Errorf("ignore_namespaces entries must not be blank")
+		}
+		if strings.ContainsAny(ns, `/\`) {
+			return fmt.Errorf("ignore_namespaces entry %q must be a namespace name, not a path", ns)
+		}
+	}
+	return nil
 }

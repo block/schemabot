@@ -190,7 +190,7 @@ func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ks_sharded"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ks_sharded", "orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0o644))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	require.Contains(t, result, "ks_unsharded")
@@ -211,7 +211,7 @@ func TestReadSchemaFiles_SymlinkedDirectories(t *testing.T) {
 	symlinkDir := filepath.Join(dir, "ks_symlink")
 	require.NoError(t, os.Symlink(realDir, symlinkDir))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	// Both the real directory and the symlink should be read
@@ -237,7 +237,7 @@ func TestReadSchemaFiles_MixedRealAndSymlinked(t *testing.T) {
 	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_001")))
 	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_002")))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	// All four keyspaces should be present
@@ -260,11 +260,27 @@ func TestReadSchemaFiles_SkipsNonSchemaFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mydb", "README.md"), []byte("ignore me"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mydb", "vschema.json"), []byte("{}"), 0o644))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	require.Contains(t, result, "mydb")
 	assert.Contains(t, result["mydb"].Files, "users.sql")
 	assert.Contains(t, result["mydb"].Files, "vschema.json")
 	assert.NotContains(t, result["mydb"].Files, "README.md")
+}
+
+func TestReadSchemaFiles_IgnoreNamespaces(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ks_unsharded"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ks_unsharded", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "local_fixtures"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "local_fixtures", "widgets.sql"), []byte("CREATE TABLE widgets (id INT)"), 0o644))
+
+	result, err := ReadSchemaFiles(dir, "", []string{"local_fixtures"})
+	require.NoError(t, err)
+
+	require.Contains(t, result, "ks_unsharded")
+	assert.NotContains(t, result, "local_fixtures")
 }

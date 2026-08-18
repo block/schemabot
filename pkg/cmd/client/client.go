@@ -143,9 +143,10 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
-// flat files use the directory name as the namespace.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int) (*apitypes.PlanResponse, error) {
-	schemaFiles, err := ReadSchemaFiles(schemaDir, environment)
+// flat files use the directory name as the namespace. Namespaces listed in
+// ignoreNamespaces are excluded from the plan request.
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string) (*apitypes.PlanResponse, error) {
+	schemaFiles, err := ReadSchemaFiles(schemaDir, environment, ignoreNamespaces)
 	if err != nil {
 		return nil, fmt.Errorf("read schema files: %w", err)
 	}
@@ -291,7 +292,10 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // The environment parameter enables $ENV substitution in namespace names.
 // If non-empty, any "$ENV" in directory names or the default namespace is
 // replaced with the environment value (e.g., "bikeshare_$ENV" → "bikeshare_staging").
-func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.SchemaFiles, error) {
+//
+// Namespaces listed in ignoreNamespaces (schemabot.yaml ignore_namespaces) are
+// excluded from the result.
+func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) (map[string]*apitypes.SchemaFiles, error) {
 	// Collect all files as relativePath → content
 	rawFiles := make(map[string]string)
 
@@ -345,7 +349,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 
 	// Group by namespace using the shared helper.
 	// For flat files, the directory name is the database name.
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment)
+	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment, ignoreNamespaces)
 	if err != nil {
 		return nil, err
 	}
