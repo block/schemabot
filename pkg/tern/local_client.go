@@ -2218,20 +2218,11 @@ func (c *LocalClient) dispatchIntoExistingApply(ctx context.Context, req *ternv1
 	return c.attachDispatchOperation(ctx, req, apply, plan, scope, operationKey, operationKind)
 }
 
-// isReopenableForAttach reports whether a terminal keyed apply can accept a
-// new sibling operation by reopening. Only a COMPLETED apply qualifies: it ran
-// out of attached work cleanly, so more work from the same keyed generation
-// resumes the container. A failed, cancelled, or reverted apply carries an
-// outcome an operator must reconcile before the deployment takes new work.
-func isReopenableForAttach(applyState string) bool {
-	return state.IsState(applyState, state.Apply.Completed)
-}
-
 // refuseAttachToTerminalApply is the fail-closed rejection for an attach
-// against an apply whose terminal outcome cannot be reopened (or that reached
-// one mid-attach): its target reservation is released and no drive will pick
-// new work up, so accepting the operation would strand it. The deployment's
-// remaining operations cannot dispatch until an operator reconciles the apply.
+// against an apply that is (or just became) terminal: its target reservation
+// is released and no drive will pick new work up, so accepting the operation
+// would strand it. The deployment's remaining operations cannot dispatch until
+// an operator reconciles the apply.
 func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
 	c.logger.Warn("Apply: refusing to attach operation to terminal keyed apply; dispatch is rejected",
 		append(apply.LogAttrs(),
@@ -2247,11 +2238,9 @@ func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *tern
 // attachDispatchOperation adds a sibling dispatch's operation and its tasks to
 // the deployment's existing keyed apply. The attach runs the same conflict and
 // unsafe-DDL gates a fresh apply runs, so attaching never admits work a create
-// would have refused. A completed apply is reopened for the new operation —
-// fast siblings finishing first must not seal the shared keyed apply against
-// slower ones — while every other terminal state fails closed.
+// would have refused, and it fails closed on a terminal apply.
 func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey, operationKind string) (*ternv1.ApplyResponse, error) {
-	if state.IsTerminalApplyState(apply.State) && !isReopenableForAttach(apply.State) {
+	if state.IsTerminalApplyState(apply.State) {
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	}
 
@@ -2289,7 +2278,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
-	reopened, err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
 		// A concurrent same-operation attach won the insert; the winner's row
@@ -2311,19 +2300,6 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
-	}
-
-	if reopened {
-		// The attach transaction moved the completed apply back to running, a
-		// terminal→active transition the projection cannot observe, so the
-		// active-applies gauge is adjusted here. The projection owns the
-		// matching decrement when the apply re-terminalizes.
-		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
-		metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "reopened_completed")
-		c.logger.Info("Apply: reopened completed keyed apply for a sibling operation attach",
-			append(apply.LogAttrs(),
-				"operation_key", operationKey,
-				"idempotency_key", req.IdempotencyKey)...)
 	}
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,

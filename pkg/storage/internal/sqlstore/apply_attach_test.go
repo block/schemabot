@@ -111,9 +111,7 @@ func TestApplyStore_AttachOperationWithTasksAppendsSibling(t *testing.T) {
 	apply := createAttachFixtureApply(t, store)
 
 	operation, tasks := attachSiblingOperation("payments/80-/users", "80-")
-	reopened, err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
-	require.NoError(t, err)
-	assert.False(t, reopened, "attaching to an active apply must not report a reopen")
+	require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks))
 
 	// The operation and task structs are back-filled with their persisted IDs
 	// and links (same contract as CreateWithTasksAndOperations).
@@ -150,7 +148,7 @@ func TestApplyStore_AttachOperationWithTasksRejectsDuplicateKey(t *testing.T) {
 	apply := createAttachFixtureApply(t, store)
 
 	operation, tasks := attachSiblingOperation("payments/-80/users", "-80")
-	_, err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	require.ErrorIs(t, err, storage.ErrApplyOperationExists)
 
 	// The failed attach left no partial rows behind.
@@ -162,107 +160,24 @@ func TestApplyStore_AttachOperationWithTasksRejectsDuplicateKey(t *testing.T) {
 	assert.Len(t, storedTasks, 1, "the duplicate attach must not insert its tasks")
 }
 
-// Attaching to a completed apply reopens it: the row moves back to running
-// with its completion timestamp cleared, the new operation lands, and the
-// caller learns about the reopen so it can account for the terminal→active
-// transition. A fast sibling finishing first must not seal the shared keyed
-// apply against slower siblings of the same generation.
-func TestApplyStore_AttachOperationWithTasksReopensCompletedApply(t *testing.T) {
+// Attaching to a terminal apply fails closed with ErrApplyNotActive: the
+// apply's target reservation is released and no drive will claim new work
+// under it, so accepting the operation would strand it as permanently pending.
+func TestApplyStore_AttachOperationWithTasksRefusesTerminalApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 	apply := createAttachFixtureApply(t, store)
-	completedAt := time.Now()
 	apply.State = state.Apply.Completed
-	apply.CompletedAt = &completedAt
 	require.NoError(t, store.Applies().Update(ctx, apply))
 
 	operation, tasks := attachSiblingOperation("payments/80-/users", "80-")
-	reopened, err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
-	require.NoError(t, err)
-	assert.True(t, reopened, "attaching to a completed apply must report the reopen")
-
-	assert.True(t, state.IsState(apply.State, state.Apply.Running), "the in-memory apply must reflect the reopen, got %s", apply.State)
-	assert.Nil(t, apply.CompletedAt, "the in-memory apply must reflect the cleared completion timestamp")
-
-	stored, err := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	assert.True(t, state.IsState(stored.State, state.Apply.Running), "the stored apply must be running after the reopen, got %s", stored.State)
-	assert.Nil(t, stored.CompletedAt, "the reopen must clear the stored completion timestamp")
-
-	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
-	require.NoError(t, listErr)
-	assert.Len(t, ops, 2, "the attached operation must land on the reopened apply")
-}
-
-// Attaching to a failed, cancelled, or reverted apply fails closed with
-// ErrApplyNotActive: those outcomes need operator reconciliation before any
-// new work, so accepting the operation would strand it as permanently pending.
-func TestApplyStore_AttachOperationWithTasksRefusesFailedApply(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	apply := createAttachFixtureApply(t, store)
-	apply.State = state.Apply.Failed
-	require.NoError(t, store.Applies().Update(ctx, apply))
-
-	operation, tasks := attachSiblingOperation("payments/80-/users", "80-")
-	_, err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	require.ErrorIs(t, err, storage.ErrApplyNotActive)
 
 	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, listErr)
 	assert.Len(t, ops, 1, "the refused attach must not insert its operation")
-}
-
-// A reopen re-acquires the apply's released target reservation, so it must
-// refuse when another apply has since gone active on one of the targets:
-// reopening underneath it would put two active applies on the same target.
-func TestApplyStore_AttachOperationWithTasksReopenBlockedByActiveApply(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	apply := createAttachFixtureApply(t, store)
-	completedAt := time.Now()
-	apply.State = state.Apply.Completed
-	apply.CompletedAt = &completedAt
-	require.NoError(t, store.Applies().Update(ctx, apply))
-
-	// Another apply took the deployment target after the first one completed.
-	now := time.Now()
-	rival := &storage.Apply{
-		ApplyIdentifier: "apply_attach_rival",
-		LockID:          apply.LockID,
-		PlanID:          1,
-		Database:        "payments",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Repository:      "org/repo",
-		PullRequest:     124,
-		Environment:     "production",
-		Deployment:      "payments-a",
-		Engine:          storage.EngineSpirit,
-		State:           state.Apply.Running,
-		Options:         []byte("{}"),
-		IdempotencyKey:  "schemabot:v1:attach-rival",
-		CreatedAt:       now,
-		UpdatedAt:       now,
-	}
-	rivalID, createErr := store.Applies().Create(ctx, rival)
-	require.NoError(t, createErr)
-	rival.ID = rivalID
-
-	operation, tasks := attachSiblingOperation("payments/80-/users", "80-")
-	_, err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
-	require.Error(t, err, "the reopen must refuse while another apply holds the target")
-
-	stored, getErr := store.Applies().GetByApplyIdentifier(ctx, apply.ApplyIdentifier)
-	require.NoError(t, getErr)
-	require.NotNil(t, stored)
-	assert.True(t, state.IsState(stored.State, state.Apply.Completed), "the refused reopen must leave the apply completed, got %s", stored.State)
-	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
-	require.NoError(t, listErr)
-	assert.Len(t, ops, 1, "the refused reopen must not insert its operation")
 }
 
 // Attaching to an apply row that does not exist reports ErrApplyNotFound so
@@ -272,16 +187,9 @@ func TestApplyStore_AttachOperationWithTasksMissingApply(t *testing.T) {
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	missing := &storage.Apply{
-		ID:              999999,
-		ApplyIdentifier: "apply_attach_missing",
-		Database:        "payments",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "production",
-		Deployment:      "payments-a",
-	}
+	missing := &storage.Apply{ID: 999999, ApplyIdentifier: "apply_attach_missing"}
 	operation, tasks := attachSiblingOperation("payments/80-/users", "80-")
-	_, err := store.Applies().AttachOperationWithTasks(ctx, missing, operation, tasks)
+	err := store.Applies().AttachOperationWithTasks(ctx, missing, operation, tasks)
 	require.ErrorIs(t, err, storage.ErrApplyNotFound)
 }
 
@@ -294,7 +202,7 @@ func TestApplyStore_AttachOperationWithTasksRequiresTasksForWork(t *testing.T) {
 	apply := createAttachFixtureApply(t, store)
 
 	operation, _ := attachSiblingOperation("payments/80-/users", "80-")
-	_, err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, nil)
+	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, nil)
 	require.ErrorContains(t, err, "work operation has no tasks")
 
 	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
@@ -303,6 +211,5 @@ func TestApplyStore_AttachOperationWithTasksRequiresTasksForWork(t *testing.T) {
 
 	finalizer, _ := attachSiblingOperation("payments/finalizer", "80-")
 	finalizer.OperationKind = storage.ApplyOperationKindGroupFinalizer
-	_, err = store.Applies().AttachOperationWithTasks(ctx, apply, finalizer, nil)
-	require.NoError(t, err)
+	require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, apply, finalizer, nil))
 }

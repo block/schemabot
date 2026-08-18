@@ -610,113 +610,66 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 
 // AttachOperationWithTasks inserts one apply_operations row and its tasks
 // under an existing apply. The parent applies row is locked and re-read inside
-// the transaction so the attach cannot race a concurrent terminalization.
-//
-// An active apply keeps its target reservation and idempotency key untouched —
-// the attach adds work to the reservation the apply already holds. A keyed
-// apply that already ran to COMPLETED is reopened instead of refused: the apply
-// is the deployment's shared container for one keyed generation of sibling
-// dispatches, and a fast sibling completing (which terminalizes the container
-// once every attached operation is terminal) must not seal it against siblings
-// that have not dispatched yet. Completion released the target reservation, so
-// the reopen re-acquires it under the target lock — re-running the
-// one-active-apply-per-deployment overlap check across the apply's full target
-// set plus the new operation's deployment — and moves the apply back to
-// running with its completion cleared. Every other terminal outcome (failed,
-// cancelled, reverted) still refuses with ErrApplyNotActive: those need an
-// operator's reconciliation, and new work must never land on them.
-//
-// Returns whether the attach reopened a completed apply, so the caller can
-// surface the reopen and restore the apply-level accounting a terminalization
-// released.
-func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storage.Apply, operation *storage.ApplyOperation, tasks []*storage.Task) (bool, error) {
+// the transaction so the attach cannot race a concurrent terminalization; the
+// apply's target reservation and idempotency key are untouched — the attach
+// adds work to the reservation the apply already holds.
+func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storage.Apply, operation *storage.ApplyOperation, tasks []*storage.Task) error {
 	if apply == nil {
-		return false, fmt.Errorf("attach operation: apply is nil")
+		return fmt.Errorf("attach operation: apply is nil")
 	}
 	if operation == nil {
-		return false, fmt.Errorf("attach operation to apply %s: operation is nil", apply.ApplyIdentifier)
+		return fmt.Errorf("attach operation to apply %s: operation is nil", apply.ApplyIdentifier)
 	}
 	// A group_finalizer carries no tasks — it applies namespace-level work
 	// reconstructed from the plan at drive time. Every work operation must
 	// have at least one task so operation-scoped drives fail closed on bad
 	// scoping.
 	if len(tasks) == 0 && operation.OperationKind != storage.ApplyOperationKindGroupFinalizer {
-		return false, fmt.Errorf("attach operation %s to apply %s: work operation has no tasks", operation.OperationKey, apply.ApplyIdentifier)
+		return fmt.Errorf("attach operation %s to apply %s: work operation has no tasks", operation.OperationKey, apply.ApplyIdentifier)
 	}
 	for _, task := range tasks {
 		if task == nil {
-			return false, fmt.Errorf("attach operation %s to apply %s: operation has a nil task", operation.OperationKey, apply.ApplyIdentifier)
+			return fmt.Errorf("attach operation %s to apply %s: operation has a nil task", operation.OperationKey, apply.ApplyIdentifier)
 		}
 	}
 
-	// The attach may need to re-acquire the target reservation (reopening a
-	// completed apply), so it serializes on the same target lock a create
-	// takes — a concurrent create cannot slip a second active apply onto the
-	// target between the reopen's overlap check and its commit.
 	const opName = "attach operation to apply"
-	writeTx, err := beginApplyTargetWriteTx(ctx, s.db, s.locker, opName, apply.Database, apply.DatabaseType, apply.Environment)
+	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer writeTx.close(ctx, opName)
 
 	var currentState string
 	err = writeTx.tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotFound)
+		return fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotFound)
 	}
 	if err != nil {
-		return false, fmt.Errorf("lock apply %s to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
+		return fmt.Errorf("lock apply %s to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
 	}
-	reopened := false
-	reopenedAt := time.Now()
-	switch {
-	case isActiveApplyState(currentState):
-		// The apply still holds its target reservation; the attach adds work to it.
-	case state.IsState(currentState, state.Apply.Completed):
-		operationDeployments, err := operationDeploymentsForApply(ctx, writeTx.tx, apply.ID)
-		if err != nil {
-			return false, fmt.Errorf("load target set to reopen completed apply %s for operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
-		}
-		deployments := make([]string, 0, len(operationDeployments)+2)
-		deployments = append(deployments, operationDeployments...)
-		deployments = append(deployments, apply.Deployment, operation.Deployment)
-		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, deployments, apply.ID); err != nil {
-			return false, fmt.Errorf("reopen completed apply %s for operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
-		}
-		if _, err := writeTx.tx.ExecContext(ctx,
-			`UPDATE applies SET state = ?, completed_at = NULL, updated_at = ? WHERE id = ?`,
-			state.Apply.Running, reopenedAt, apply.ID); err != nil {
-			return false, fmt.Errorf("reopen completed apply %s for operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
-		}
-		reopened = true
-	default:
-		return false, fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
+	if !isActiveApplyState(currentState) {
+		return fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
 	}
 
 	operation.ApplyID = apply.ID
 	if _, err := insertApplyOperation(ctx, writeTx.tx, s.identity, s.classifier, operation); err != nil {
-		return false, fmt.Errorf("attach apply_operation (deployment=%s, operation_key=%s) to apply %s: %w", operation.Deployment, operation.OperationKey, apply.ApplyIdentifier, err)
+		return fmt.Errorf("attach apply_operation (deployment=%s, operation_key=%s) to apply %s: %w", operation.Deployment, operation.OperationKey, apply.ApplyIdentifier, err)
 	}
 	for _, task := range tasks {
 		task.ApplyID = apply.ID
 		task.ApplyOperationID = &operation.ID
 		taskID, err := insertTask(ctx, writeTx.tx, s.identity, task)
 		if err != nil {
-			return false, fmt.Errorf("insert task %s for attached operation %s of apply %s: %w", task.TaskIdentifier, operation.OperationKey, apply.ApplyIdentifier, err)
+			return fmt.Errorf("insert task %s for attached operation %s of apply %s: %w", task.TaskIdentifier, operation.OperationKey, apply.ApplyIdentifier, err)
 		}
 		task.ID = taskID
 	}
 
 	if err := writeTx.commit(); err != nil {
-		return false, fmt.Errorf("commit %s: %w", opName, err)
+		return fmt.Errorf("commit %s: %w", opName, err)
 	}
-	if reopened {
-		apply.State = state.Apply.Running
-		apply.CompletedAt = nil
-		apply.UpdatedAt = reopenedAt
-	}
-	return reopened, nil
+	return nil
 }
 
 func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
