@@ -100,6 +100,29 @@ func TestDeriveDeployState_InstantDDLRequestedControlsRevertWindow(t *testing.T)
 	require.Equal(t, dr.Complete, deriveDeployState(migrations, true, true))
 }
 
+// An unrecognized Vitess status counts as queued while the flag is unset, so
+// the processor keeps polling until Vitess resolves it. With the authoritative
+// ready_to_complete flag set, the schema change is cutover-ready regardless of
+// how the status reads.
+func TestDeriveDeployState_UnknownVitessStatus(t *testing.T) {
+	notReady := []migrationInfo{{status: "vreplicating"}}
+	require.Equal(t, dr.Queued, deriveDeployState(notReady, false))
+
+	ready := []migrationInfo{{status: "vreplicating", readyToComplete: true}}
+	require.Equal(t, dr.PendingCutover, deriveDeployState(ready, false))
+	require.Equal(t, dr.InProgressCutover, deriveDeployState(ready, true))
+}
+
+// Vitess can leave ready_to_complete set after a failure or cancel; the stale
+// flag must never resurrect a terminal schema change as cutover-ready.
+func TestDeriveDeployState_TerminalStatusWithStaleReadyFlag(t *testing.T) {
+	failed := []migrationInfo{{status: state.Vitess.Failed, readyToComplete: true}}
+	require.Equal(t, dr.CompleteError, deriveDeployState(failed, true))
+
+	cancelled := []migrationInfo{{status: state.Vitess.Cancelled, readyToComplete: true}}
+	require.Equal(t, vitessCancelledSignal, deriveDeployState(cancelled, true))
+}
+
 func TestQualifyAlterTableName(t *testing.T) {
 	tests := []struct {
 		name   string

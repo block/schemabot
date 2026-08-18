@@ -249,10 +249,7 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			}
 			allTerminal := true
 			for _, m := range migrations {
-				switch m.status {
-				case state.Vitess.Complete, state.Vitess.Failed, state.Vitess.Cancelled:
-					// terminal
-				default:
+				if !state.IsTerminalVitessState(m.status) {
 					allTerminal = false
 				}
 			}
@@ -358,7 +355,11 @@ func deriveDeployState(migrations []migrationInfo, cutoverRequested bool, instan
 	var failed, cancelled, complete, running, waitingCutover, queued int
 
 	for _, m := range migrations {
-		switch state.EffectiveVitessState(m.status, m.readyToComplete) {
+		effective := state.EffectiveVitessState(m.status, m.readyToComplete)
+		if !state.IsKnownVitessState(m.status) {
+			slog.Warn("unknown vitess schema change status", "vitess_status", m.status, "effective_state", effective, "ddl_action", m.ddlAction)
+		}
+		switch effective {
 		case state.Vitess.Complete:
 			complete++
 		case state.Vitess.Failed:
@@ -372,9 +373,8 @@ func deriveDeployState(migrations []migrationInfo, cutoverRequested bool, instan
 		case state.Vitess.Queued, state.Vitess.Requested, state.Vitess.Ready:
 			queued++
 		default:
-			// Unknown Vitess status — count as queued so the processor keeps
-			// polling until Vitess resolves it to a known status.
-			slog.Warn("unknown vitess schema change status, treating as pending", "vitess_status", m.status, "ddl_action", m.ddlAction)
+			// Unknown status without the cutover-ready flag — count as queued
+			// so the processor keeps polling until Vitess resolves it.
 			queued++
 		}
 	}
