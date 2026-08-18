@@ -285,8 +285,8 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	assert.Contains(t, result, "45% (throttled)",
 		"the annotation lands on the header line next to the percent")
-	assert.Contains(t, result, "- ℹ️ _Throttled: replica-lag 12s > 10s_",
-		"the reason renders as a tooltip bullet under the detail list")
+	assert.Contains(t, result, "- ℹ️ _Throttled: replica-lag 12s > 10s · waiting for the read replica to catch up ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"the reason renders as a tooltip bullet with its tip and the doc link")
 
 	data.Tables[0].ThrottleReason = ""
 	noReason := RenderApplyStatusComment(data)
@@ -325,7 +325,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21%) (throttled)")
-	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 130 > 128_")
+	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 130 > 128 · yielding to application query load on the database ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_")
 }
 
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {

@@ -400,7 +400,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	})
 	assert.Contains(t, copying, "45% (throttled)",
 		"the annotation lands on the header line next to the percent")
-	assert.Contains(t, copying, "ℹ️ Throttled: replica-lag 12s > 10s")
+	assert.Contains(t, copying, "ℹ️ Throttled: replica-lag 12s > 10s · waiting for the read replica to catch up")
 
 	noReason := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,

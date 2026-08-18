@@ -988,6 +988,14 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	if !table.Throttled || table.ThrottleReason == "" {
 		return
 	}
+	// The raw reason names the engine signal; the tip says what the pause
+	// protects, and links the reference doc for remediation prose. A reason
+	// whose signal has no tip renders alone so a new engine signal degrades
+	// to raw text rather than a wrong explanation.
+	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
+		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		return
+	}
 	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
