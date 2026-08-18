@@ -141,7 +141,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Check for unsafe changes
-	if planResult.HasErrors() && !cmd.AllowUnsafe {
+	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
@@ -173,7 +173,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
 
 	// Show unsafe warning if --allow-unsafe was used
-	if planResult.HasErrors() && cmd.AllowUnsafe {
+	if cmd.AllowUnsafe {
 		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges())
 	}
 

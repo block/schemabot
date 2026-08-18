@@ -99,10 +99,7 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 
 	// Show unsafe warning if any
-	if planResult.HasErrors() {
-		unsafeChanges := planResult.UnsafeChanges()
-		templates.WriteUnsafeWarningAllowed(unsafeChanges)
-	}
+	templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges())
 
 	// Show options if any flags are set
 	templates.WriteOptions(cmd.DeferCutover, false)

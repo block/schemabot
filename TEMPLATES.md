@@ -516,6 +516,64 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="vitess-plan-vschema-removal-unsafe"></a><strong>Vitess Plan: VSchema Removal (Unsafe)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `commerce` | **Type**: `Vitess`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `commerce_sharded`
+#### VSchema
+```diff
+--- a/commerce_sharded.json
++++ b/commerce_sharded.json
+@@ -3,10 +3,6 @@
+     "hash": {
+       "type": "hash"
+-    },
+-    "customers_email_lookup": {
+-      "type": "consistent_lookup_unique",
+-      "params": {
+-        "table": "customers_email_lookup",
+-        "from": "email",
+-        "to": "keyspace_id"
+-      },
+-      "owner": "customers"
+     }
+   },
+@@ -18,8 +14,4 @@
+         {
+           "column": "id",
+           "name": "hash"
+-        },
+-        {
+-          "column": "email",
+-          "name": "customers_email_lookup"
+         }
+       ]
+     }
+```
+
+⚠️ **Issues**: **2** unsafe changes detected
+- `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
+- `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
+
+📋 **Plan**: **1** vschema update
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="schema-change-apply-locked--options"></a><strong>Schema Change Apply (Locked + Options)</strong></summary>
 
 

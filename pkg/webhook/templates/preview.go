@@ -940,6 +940,65 @@ func PreviewCommentVitessPlan() string {
 	})
 }
 
+// PreviewCommentVitessPlanVSchemaRemoval renders a sample Vitess plan comment
+// where the VSchema change removes a lookup vindex and its column-vindex
+// association — the removals surface in the Issues section as unsafe changes.
+func PreviewCommentVitessPlanVSchemaRemoval() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "commerce",
+		SchemaName:  "commerce",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     false,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace:       "commerce_sharded",
+				VSchemaChanged: true,
+				VSchemaDiff: `--- a/commerce_sharded.json
++++ b/commerce_sharded.json
+@@ -3,10 +3,6 @@
+     "hash": {
+       "type": "hash"
+-    },
+-    "customers_email_lookup": {
+-      "type": "consistent_lookup_unique",
+-      "params": {
+-        "table": "customers_email_lookup",
+-        "from": "email",
+-        "to": "keyspace_id"
+-      },
+-      "owner": "customers"
+     }
+   },
+@@ -18,8 +14,4 @@
+         {
+           "column": "id",
+           "name": "hash"
+-        },
+-        {
+-          "column": "email",
+-          "name": "customers_email_lookup"
+         }
+       ]
+     }`,
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{
+				Table:  "commerce_sharded/vschema.json",
+				Reason: `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+			},
+			{
+				Table:  "commerce_sharded/vschema.json",
+				Reason: `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+			},
+		},
+	})
+}
+
 // PreviewCommentVitessApplyPlan renders a sample locked Vitess apply-plan with options.
 func PreviewCommentVitessApplyPlan() string {
 	return RenderPlanComment(PlanCommentData{

@@ -1160,6 +1160,52 @@ func TestVitess_Apply_DropIndex_BlockedWithoutFlag(t *testing.T) {
 	assert.Contains(t, out, "Unsafe Changes Detected")
 }
 
+// TestVitess_Apply_VSchemaVindexRemoval_BlockedWithoutFlag exercises the
+// VSchema safety gate. Removing a vindex from a keyspace's vschema.json is an
+// unsafe change: Vitess stops using the vindex for routing the moment the
+// VSchema is applied, and queries that depended on it can fail or scatter.
+// The plan must disclose the removal as unsafe, an apply without
+// --allow-unsafe must be refused before anything starts, and an apply that
+// acknowledges the removal with --allow-unsafe must complete.
+func TestVitess_Apply_VSchemaVindexRemoval_BlockedWithoutFlag(t *testing.T) {
+	vitessAvailable(t)
+	vitessRestoreBaseSchema(t, "staging")
+	defer vitessRestoreBaseSchema(t, "staging")
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+
+	// Seed a live VSchema carrying an extra xxhash vindex directly via the
+	// admin endpoint, so planning the base schema (which does not define
+	// xxhash) produces a vindex removal and nothing else.
+	vschemaWithXxhash := `{"sharded":true,"vindexes":{"hash":{"type":"hash"},"xxhash":{"type":"xxhash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"users_seq"}},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}],"auto_increment":{"column":"id","sequence":"orders_seq"}},"products":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"products_seq"}}}}`
+	seedBody := fmt.Sprintf(`{"org":%q,"database":%q,"keyspace":%q,"vschema":%s}`,
+		"localscale-staging", vitessDB, "testapp_sharded", vschemaWithXxhash)
+	_, err := localscaleAdminPost(t, "/admin/seed-vschema", seedBody)
+	require.NoError(t, err, "seed VSchema with extra vindex")
+	clearSchemaBotState(t)
+
+	baseSchema := newVitessSchemaDir(t, vitessBaseSchema())
+
+	// The plan discloses the vindex removal as an unsafe change on the
+	// keyspace's vschema.json.
+	planOut := e2eutil.RunCLIInDir(t, binPath, baseSchema, "plan",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint)
+	e2eutil.AssertContains(t, planOut, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, planOut, "xxhash")
+	e2eutil.AssertContains(t, planOut, "vschema.json")
+
+	// Applying without --allow-unsafe is refused.
+	out, err := e2eutil.RunCLIWithErrorInDir(t, binPath, baseSchema, "apply",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "-o", "log")
+	t.Logf("VSchema vindex removal apply output:\n%s", out)
+	require.Error(t, err, "expected apply to fail without --allow-unsafe")
+	assert.Contains(t, out, "Unsafe Changes Detected")
+
+	// Acknowledging the removal with --allow-unsafe lets the apply proceed.
+	clearSchemaBotState(t)
+	vitessApplyAndWait(t, baseSchema, "staging")
+}
+
 func TestVitess_Apply_DropTable_WithVSchema(t *testing.T) {
 	vitessAvailable(t)
 	clearSchemaBotState(t)

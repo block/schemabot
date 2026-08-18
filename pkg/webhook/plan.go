@@ -811,22 +811,42 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.Changes = append(data.Changes, ksData)
 	}
 
-	// Unsafe changes. For a sharded plan, derive them from the per-shard changes
-	// so an unsafe change confined to one shard (e.g. a column drop on a single
-	// drifted shard) is still flagged with the shard it applies to — the
-	// collapsed namespace-level Changes can omit it. Otherwise use the
-	// namespace-level view.
-	if unsafe := shardedUnsafeChanges(planResp.Shards); len(unsafe) > 0 {
-		data.HasUnsafeChanges = true
-		data.UnsafeChanges = unsafe
-	} else if unsafeChanges := planResp.UnsafeChanges(); len(unsafeChanges) > 0 {
-		data.HasUnsafeChanges = true
-		for _, uc := range unsafeChanges {
-			data.UnsafeChanges = append(data.UnsafeChanges, templates.UnsafeChangeData{
+	// Unsafe changes. For a sharded plan, derive table-level entries from the
+	// per-shard changes so an unsafe change confined to one shard (e.g. a column
+	// drop on a single drifted shard) is still flagged with the shard it applies
+	// to — the collapsed namespace-level Changes can omit it. Otherwise use the
+	// namespace-level table view. VSchema removals live only on the
+	// namespace-level change, so they are appended in both views.
+	unsafe := shardedUnsafeChanges(planResp.Shards)
+	if len(unsafe) == 0 {
+		for _, sc := range planResp.Changes {
+			if sc == nil {
+				continue
+			}
+			for _, t := range sc.TableChanges {
+				if uc, ok := t.UnsafeChange(); ok {
+					unsafe = append(unsafe, templates.UnsafeChangeData{
+						Table:  uc.Table,
+						Reason: uc.Reason,
+					})
+				}
+			}
+		}
+	}
+	for _, sc := range planResp.Changes {
+		if sc == nil {
+			continue
+		}
+		for _, uc := range sc.VSchemaUnsafeChanges() {
+			unsafe = append(unsafe, templates.UnsafeChangeData{
 				Table:  uc.Table,
 				Reason: uc.Reason,
 			})
 		}
+	}
+	if len(unsafe) > 0 {
+		data.HasUnsafeChanges = true
+		data.UnsafeChanges = unsafe
 	}
 
 	// Blocked changes — the apply commands will reject these. Like the
