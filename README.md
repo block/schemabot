@@ -78,6 +78,14 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 General design docs are in the [docs](./docs/) folder.
 
+## Releases
+
+Releases are published as binaries on the [GitHub Releases page](https://github.com/block/schemabot/releases), as container images at `ghcr.io/block/schemabot`, and, if you run Kubernetes, as a Helm chart at `oci://ghcr.io/block/charts/schemabot`.
+
+We run what we ship. Every tag is deployed to production at Block, where SchemaBot applies Block's own schema changes, which keeps the project continuously validated against real production workloads and gets fixes out fast. Because SchemaBot is pre-1.0, the release notes are the compatibility contract: give them a read before upgrading.
+
+See [docs/release.md](./docs/release.md) for how releases are cut and what is checked before a tag is published.
+
 ## Contributing
 
 Contributors are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).
