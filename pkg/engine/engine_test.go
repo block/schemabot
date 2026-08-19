@@ -193,6 +193,28 @@ func TestIsUnsupportedOperation(t *testing.T) {
 	t.Run("nil is not an unsupported-operation decline", func(t *testing.T) {
 		assert.False(t, IsUnsupportedOperation(nil))
 	})
+
+	t.Run("zero-args decline message with a literal percent renders verbatim", func(t *testing.T) {
+		// Exercise the runtime contract directly: with no args the message is
+		// used as-is, never interpreted as a format string. The indirect call
+		// reflects a caller vet's printf checker cannot see.
+		construct := NewUnsupportedOperationError
+		err := construct("volume is capped at 100% for this engine")
+		assert.Equal(t, "volume is capped at 100% for this engine", err.Error())
+	})
+
+	t.Run("extractor returns the typed decline from a wrapped error", func(t *testing.T) {
+		wrapped := fmt.Errorf("stop local engine for task t-1: %w", NewUnsupportedOperationError("stop is not supported"))
+		unsupported, ok := AsUnsupportedOperation(wrapped)
+		assert.True(t, ok)
+		assert.Equal(t, "stop is not supported", unsupported.Error())
+	})
+
+	t.Run("extractor reports absence for a plain error", func(t *testing.T) {
+		unsupported, ok := AsUnsupportedOperation(fmt.Errorf("connection refused"))
+		assert.False(t, ok)
+		assert.Nil(t, unsupported)
+	})
 }
 
 func TestIsTransientTransportError(t *testing.T) {

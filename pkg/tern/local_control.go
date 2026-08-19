@@ -1045,8 +1045,8 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 // handled=false when the error is not an unsupported-operation decline, so the
 // caller applies its normal error handling.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
-	var unsupported *engine.UnsupportedOperationError
-	if !errors.As(opErr, &unsupported) {
+	unsupported, ok := engine.AsUnsupportedOperation(opErr)
+	if !ok {
 		return false, nil
 	}
 	message := unsupported.Error()
@@ -1059,7 +1059,7 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
 	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
-		return true, err
+		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
 	}
 	engineName := "unknown"
 	if eng := c.getEngine(); eng != nil {

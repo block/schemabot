@@ -90,18 +90,32 @@ func (e *UnsupportedOperationError) Error() string { return e.Err.Error() }
 func (e *UnsupportedOperationError) Unwrap() error { return e.Err }
 
 // NewUnsupportedOperationError wraps err as an unsupported-operation error.
+// The message reaches operator-facing surfaces verbatim, so with no args it
+// is used as-is rather than interpreted as a format string — a literal `%`
+// in a decline reason must never render as a corrupted fmt verb.
 func NewUnsupportedOperationError(msg string, args ...any) error {
+	if len(args) == 0 {
+		return &UnsupportedOperationError{Err: errors.New(msg)}
+	}
 	return &UnsupportedOperationError{Err: fmt.Errorf(msg, args...)}
+}
+
+// AsUnsupportedOperation extracts the unsupported-operation decline from
+// err's tree, reporting whether one is present. Callers that only need the
+// boolean use IsUnsupportedOperation.
+func AsUnsupportedOperation(err error) (*UnsupportedOperationError, bool) {
+	var unsupported *UnsupportedOperationError
+	if errors.As(err, &unsupported) {
+		return unsupported, true
+	}
+	return nil, false
 }
 
 // IsUnsupportedOperation reports whether err indicates the engine cannot
 // perform the requested control operation for its database type.
 func IsUnsupportedOperation(err error) bool {
-	if err == nil {
-		return false
-	}
-	var unsupported *UnsupportedOperationError
-	return errors.As(err, &unsupported)
+	_, ok := AsUnsupportedOperation(err)
+	return ok
 }
 
 // IsRetryable returns true if the error should be retried by the operator.
