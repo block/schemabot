@@ -3,6 +3,7 @@ package ui
 import (
 	"os"
 	"regexp"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -20,6 +21,14 @@ func stdoutSupportsHyperlinks() bool {
 		return force != "" && force != "0"
 	}
 	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	// Terminal multiplexers swallow the hyperlink escape unless the user has
+	// opted into passing it through, leaving the link text with no URL at
+	// all. Operators frequently run inside tmux, so print the full URL there
+	// and let FORCE_HYPERLINK=1 re-enable links for multiplexers configured
+	// to pass them.
+	if os.Getenv("TMUX") != "" || strings.HasPrefix(os.Getenv("TERM"), "screen") {
 		return false
 	}
 	info, err := os.Stdout.Stat()

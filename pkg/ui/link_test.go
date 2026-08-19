@@ -46,6 +46,13 @@ func TestStdoutSupportsHyperlinksForceOverride(t *testing.T) {
 		t.Setenv("FORCE_HYPERLINK", "1")
 		assert.True(t, stdoutSupportsHyperlinks())
 	})
+
+	t.Run("multiplexers disable hyperlinks unless forced", func(t *testing.T) {
+		t.Setenv("TMUX", "/tmp/tmux-501/default,1234,0")
+		assert.False(t, stdoutSupportsHyperlinks())
+		t.Setenv("FORCE_HYPERLINK", "1")
+		assert.True(t, stdoutSupportsHyperlinks())
+	})
 }
 
 func TestVisibleWidth(t *testing.T) {
