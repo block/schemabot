@@ -42,6 +42,19 @@ func TestCallerAndSourceBoxRows(t *testing.T) {
 		assert.Equal(t, []BoxRow{{"Caller", "cli:jdoe@macbook.local"}}, rows)
 	})
 
+	t.Run("CLI caller keeps its host even alongside a server-provided source", func(t *testing.T) {
+		rows := callerAndSourceBoxRows("cli:jdoe@macbook.local", "https://github.com/acme/shop/pull/412")
+		assert.Equal(t, []BoxRow{
+			{"Caller", "cli:jdoe@macbook.local"},
+			{"Source", "https://github.com/acme/shop/pull/412"},
+		}, rows)
+	})
+
+	t.Run("server-substituted bare location renders only the source row", func(t *testing.T) {
+		rows := callerAndSourceBoxRows("acme/shop#412", "")
+		assert.Equal(t, []BoxRow{{"Source", "https://github.com/acme/shop/pull/412"}}, rows)
+	})
+
 	t.Run("empty caller with a server URL still shows the source", func(t *testing.T) {
 		rows := callerAndSourceBoxRows("", "https://github.com/acme/shop/pull/412")
 		assert.Equal(t, []BoxRow{{"Source", "https://github.com/acme/shop/pull/412"}}, rows)

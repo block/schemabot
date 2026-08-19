@@ -86,22 +86,64 @@ func PullRequest(caller string) (repo string, pr int, ok bool) {
 }
 
 // splitRepoPR splits an "<owner>/<repo>#<pr>" location into its repository
-// and PR number. The repository must be exactly owner/name — one slash with
-// non-empty segments — so a malformed location never yields a bogus PR link.
+// and PR number. The repository must be exactly owner/name — one slash, each
+// segment restricted to repository-shaped characters — and the PR number a
+// strictly positive plain decimal, so a malformed location never yields a
+// bogus PR link.
 func splitRepoPR(location string) (repo string, pr int, ok bool) {
 	repo, prText, found := strings.Cut(location, "#")
 	if !found {
 		return "", 0, false
 	}
 	owner, name, found := strings.Cut(repo, "/")
-	if !found || owner == "" || name == "" || strings.Contains(name, "/") {
+	if !found || !validRepoSegment(owner) || !validRepoSegment(name) {
 		return "", 0, false
 	}
-	n, err := strconv.Atoi(prText)
-	if err != nil || n <= 0 {
+	n, ok := parsePRNumber(prText)
+	if !ok {
 		return "", 0, false
 	}
 	return repo, n, true
+}
+
+// validRepoSegment reports whether an owner or repository-name segment is
+// safe to render as part of a PR link. Like ValidHost, the concern is that
+// callers reach the CLI display raw: the segment is restricted to the
+// characters GitHub allows in owners and repository names — no whitespace,
+// control characters, terminal escapes, or a second slash.
+func validRepoSegment(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// parsePRNumber parses a pull request number written as a strictly positive
+// plain decimal: ASCII digits only, no sign, no leading zero. Anything looser
+// (such as "+5" or "007") would render a link the location does not literally
+// name, so it is refused instead.
+func parsePRNumber(s string) (int, bool) {
+	if s == "" || s[0] == '0' {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // Short strips the trailing location from a caller for compact display and

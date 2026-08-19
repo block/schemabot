@@ -6421,7 +6421,7 @@ No recent schema changes
 1 active schema change
 
   APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        SOURCE
-  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  octocat
+  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6430,7 +6430,7 @@ Multiple matching operations:
 1 active schema change
 
   APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        SOURCE
-  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  octocat
+  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  https://github.com/acme/shop/pull/412
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6445,10 +6445,10 @@ Use 'schemabot status <apply_id>' to view details
 Schema change history for orders-db
 
   APPLY ID      ENV         STATE      STARTED         DURATION  SOURCE
-  apply_abc123  staging     Completed  1 hour ago      15m       cli
-  apply_def456  staging     Running    15 minutes ago  15m       PR 42
-  apply_ghi789  production  Failed     3 hours ago     30m       PR 42
-  apply_jkl012  production  Completed  1 day ago       30m       cli
+  apply_abc123  staging     Completed  1 hour ago      15m       cli:jdoe
+  apply_def456  staging     Running    15 minutes ago  15m       https://github.com/acme/shop/pull/42
+  apply_ghi789  production  Failed     3 hours ago     30m       https://github.com/acme/shop/pull/42
+  apply_jkl012  production  Completed  1 day ago       30m       cli:jdoe
 
 Use 'schemabot status <apply_id>' to view details
 

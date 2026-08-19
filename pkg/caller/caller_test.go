@@ -86,7 +86,9 @@ func TestPullRequest(t *testing.T) {
 	})
 
 	t.Run("bare subject with a slash-and-hash tail is rejected", func(t *testing.T) {
-		_, _, ok := PullRequest("jdoe@example.com")
+		_, _, ok := PullRequest("jdoe@example.com@acme/repo#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("jdoe@example.com")
 		assert.False(t, ok)
 	})
 
@@ -120,6 +122,24 @@ func TestPullRequest(t *testing.T) {
 		_, _, ok := PullRequest("github:jdoe@acme/repo#0")
 		assert.False(t, ok)
 		_, _, ok = PullRequest("github:jdoe@acme/repo#abc")
+		assert.False(t, ok)
+	})
+
+	t.Run("signed and zero-padded PR numbers are rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@acme/repo#+5")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo#-1")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo#007")
+		assert.False(t, ok)
+	})
+
+	t.Run("repo segments outside repository-shaped characters are rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@acme/repo name#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo\x1b[2K#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("acme/repo\nname#42")
 		assert.False(t, ok)
 	})
 }

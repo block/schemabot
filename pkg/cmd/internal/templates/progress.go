@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
@@ -1250,7 +1249,7 @@ func statusListShowsDeployment(data StatusListData) bool {
 }
 
 func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
-	actor := caller.Short(a.Caller)
+	actor := applySource(a.Caller)
 	if !showExternalID {
 		return actor
 	}

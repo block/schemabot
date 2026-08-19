@@ -18,18 +18,21 @@ func applySource(c string) string {
 }
 
 // callerAndSourceBoxRows renders an apply's attribution for detail boxes.
-// When the apply has PR provenance the two are separated: a short Caller row
-// (who drove it) and a clickable Source row (the PR it came from). Without
-// one, the raw caller is the whole story, so it stays a single Caller row
-// keeping its trailing location, such as the CLI host.
+// When the caller's own trailing location is a repo#pr, the two are
+// separated: a short Caller row (who drove it) and a clickable Source row
+// (the PR it came from). Any other caller keeps its trailing location — a
+// CLI caller's host says which machine drove the apply even when a
+// server-provided PR URL adds a Source row alongside it. A server-substituted
+// bare repo#pr location names no driver at all, so only the Source row
+// renders for it.
 func callerAndSourceBoxRows(c, serverURL string) []BoxRow {
 	sourceURL := applyPullRequestURL(c, serverURL)
 	var rows []BoxRow
 	if c != "" {
-		if sourceURL != "" {
-			rows = append(rows, BoxRow{"Caller", caller.Short(c)})
-		} else {
+		if _, _, ok := caller.PullRequest(c); !ok {
 			rows = append(rows, BoxRow{"Caller", c})
+		} else if short := caller.Short(c); short != c {
+			rows = append(rows, BoxRow{"Caller", short})
 		}
 	}
 	if sourceURL != "" {

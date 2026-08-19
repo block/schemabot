@@ -12,8 +12,10 @@ import (
 
 func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T) {
 	result := &apitypes.ProgressResponse{
-		State:  state.Apply.Running,
-		Volume: 3,
+		State:       state.Apply.Running,
+		Volume:      3,
+		Caller:      "github:octocat@acme/shop#412",
+		PullRequest: "https://github.com/acme/shop/pull/412",
 		Operations: []*apitypes.ProgressOperationResponse{
 			{
 				Deployment:          "deploy-a",
@@ -59,6 +61,8 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 	assert.Equal(t, "deploy-a", data.Tables[0].Deployment)
 	assert.Equal(t, state.Task.Running, data.Tables[0].Status)
 	assert.Equal(t, 3, data.Volume)
+	assert.Equal(t, "github:octocat@acme/shop#412", data.Caller)
+	assert.Equal(t, "https://github.com/acme/shop/pull/412", data.PullRequestURL)
 }
 
 // The detail box names the operator-set volume level only while the engine is
