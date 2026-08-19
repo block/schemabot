@@ -317,7 +317,7 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 			}
 			switch progress.State {
 			case ternv1.State_STATE_COMPLETED:
-				return true
+				return storedApplyTerminal(t, client, ctx, applyID)
 			case ternv1.State_STATE_FAILED:
 				t.Fatalf("apply %s failed: %s", applyID, progress.ErrorMessage)
 			case ternv1.State_STATE_NO_ACTIVE_CHANGE:
@@ -325,7 +325,7 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 				// the background goroutine hasn't created tasks yet, or they've
 				// been cleaned up after completion. Only treat as done if we
 				// previously saw the apply in progress.
-				return sawRunning
+				return sawRunning && storedApplyTerminal(t, client, ctx, applyID)
 			default:
 				sawRunning = true
 			}
@@ -333,6 +333,26 @@ func waitForApplyComplete(t *testing.T, client *LocalClient, ctx context.Context
 		},
 		func() string { return fmt.Sprintf("apply %s did not complete within 30s", applyID) },
 	)
+}
+
+// storedApplyTerminal reports whether the applies row has reached a terminal
+// state. Progress derives its state from task rows, which all settle a beat
+// before the drive persists the apply row's terminal state; a wait that
+// returns on the task-derived signal alone cancels the test context while the
+// drive is still finalizing, leaving a running applies row that blocks later
+// tests for the same database behind the active-apply gate.
+func storedApplyTerminal(t *testing.T, client *LocalClient, ctx context.Context, applyID string) bool {
+	t.Helper()
+	apply, err := client.storage.Applies().GetByApplyIdentifier(ctx, applyID)
+	if err != nil {
+		t.Logf("lookup apply %s: %v", applyID, err)
+		return false
+	}
+	if apply == nil {
+		t.Logf("apply %s not found in storage", applyID)
+		return false
+	}
+	return state.IsTerminalApplyState(apply.State)
 }
 
 type retryableFailureEngine struct {
@@ -1234,6 +1254,7 @@ func TestLocalClient_Apply_IdempotentDispatch(t *testing.T) {
 
 	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
 	cleanupTestTables(t, dsn)
 
 	ctx := t.Context()
@@ -1338,6 +1359,7 @@ func TestLocalClient_Apply_WritesApplyOperationRow(t *testing.T) {
 
 	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
 	cleanupTestTables(t, dsn)
 
 	ctx := t.Context()

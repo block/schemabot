@@ -118,6 +118,7 @@ func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposRes
 type PullSchemaOptions struct {
 	Namespaces    []string
 	CatalogDetail string
+	Lint          bool
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
@@ -133,6 +134,7 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 		Environment:   environment,
 		Namespaces:    opts.Namespaces,
 		CatalogDetail: opts.CatalogDetail,
+		Lint:          opts.Lint,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {

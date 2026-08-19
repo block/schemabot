@@ -800,6 +800,30 @@ func RecordRemoteControlRequestRejected(ctx context.Context, operation, engine, 
 	)
 }
 
+// RecordControlRequestUnsupportedDecline counts durable control requests
+// resolved terminally because the engine does not support the operation for
+// its database type (e.g. stop or cancel against a PostgreSQL apply, whose
+// statements commit or fail on their own). The decline itself is working as
+// designed — the request is failed with the engine's reason and the schema
+// change settles on its own — so a count here is an operator issuing a
+// command the engine can never honor. A sustained rate on one operation means
+// operators keep reaching for a control surface that does not exist on that
+// engine: improve the operator-facing guidance for it rather than chasing a
+// fault.
+func RecordControlRequestUnsupportedDecline(ctx context.Context, operation, engine, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.control.unsupported_declines_total",
+		"Total durable control requests resolved terminally because the engine does not support the operation", "{decline}",
+		attribute.String("operation", operation),
+		attribute.String("engine", engine),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordTasklessSettleDeferred counts task-less stop/cancel settles that lost
 // the parent apply lease mid-drive and settled only the drive's own leased
 // operation row, deferring the apply row to the operator's state projection.
@@ -930,6 +954,7 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 	"attached":         true,
 	"attach_race":      true,
 	"terminal_refused": true,
+	"manifest_refused": true,
 }
 
 // RecordRemoteApplyAttach increments the counter for dispatches that resolved
@@ -944,6 +969,11 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 //     attach was refused fail-closed — the deployment's remaining operations
 //     cannot dispatch until an operator reconciles the apply, so investigate
 //     what terminalized it mid-fan-out.
+//   - "manifest_refused": the dispatch's operation key is not in the apply's
+//     stored generation manifest, so the attach was refused fail-closed — the
+//     two planes disagree about the generation's operation set (version or
+//     data skew), so compare the dispatcher's operation rows against the
+//     stored manifest before retrying.
 func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome string) {
 	if !knownRemoteApplyAttachOutcomes[outcome] {
 		outcome = "unknown"
@@ -953,6 +983,23 @@ func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordApplyManifestHold increments the counter for state-projection passes
+// that held an apply's success verdict because operations declared in its
+// generation manifest have not attached yet. A short-lived burst is the normal
+// fan-out window (siblings dispatch one at a time). A sustained series on one
+// apply means the dispatcher stopped sending the rest of the generation — its
+// driver died or its control plane is wedged — so the operator action is to
+// check the dispatcher's operation rows for that deployment and cancel the
+// held apply if the generation is abandoned.
+func RecordApplyManifestHold(ctx context.Context, database, deployment, environment string) {
+	addCounter(ctx, "schemabot.apply_manifest_hold_total",
+		"Total apply state projections held open awaiting manifest operations that have not attached", "{projection}",
+		attribute.String("database", database),
+		attribute.String("deployment", deployment),
+		EnvironmentAttribute(environment),
 	)
 }
 

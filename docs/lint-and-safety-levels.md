@@ -6,6 +6,7 @@
 
 - [The severity ladder](#the-severity-ladder)
 - [Lint severity levels](#lint-severity-levels)
+- [Auditing a live schema (`pull --lint`)](#auditing-a-live-schema-pull---lint)
 - [What "unsafe" means](#what-unsafe-means)
 - [Issues versus the unsafe-changes rejection](#issues-versus-the-unsafe-changes-rejection)
 - [Blocked changes (⛔ Cannot apply)](#blocked-changes-cannot-apply)
@@ -62,6 +63,23 @@ lint finding
     └─ severity=warning/info ▶ 💡 Lint Warnings (advisory; never gates)
 ```
 
+## Auditing a live schema (`pull --lint`)
+
+`schemabot pull --lint` (the `lint` option on the pull API) runs the linters
+over every pulled table and attaches the violations per namespace, so you can
+see a database's lint findings without planning a change.
+
+The audit's scope is narrower than a plan's. It runs only the schema-shape
+linters (primary key types, allowed charsets, and other properties of the
+schema itself), using the same linter config a plan uses. Because a pull
+carries no proposed change, the diff-based linters a plan also runs (unsafe
+drops, invisible-index-before-drop) never fire on a pull. A clean pull audit
+means the existing schema is well-shaped, not that any particular change to it
+is safe: the safety gates above still apply when you plan one.
+
+The linters parse MySQL-family DDL only, so a lint request against any other
+dialect is rejected rather than reporting a misleadingly clean audit.
+
 ## What "unsafe" means
 
 A planned table change is unsafe when it is potentially destructive — it can
@@ -81,8 +99,19 @@ VSchema is applied — Vitess stops using the removed vindex, a lookup vindex's
 backing table stops being maintained and its rows go stale, and queries that
 depended on the removed entry can fail or scatter. Deleting a vindex is as
 dangerous as dropping a table, so it takes the same `--allow-unsafe`
-acknowledgment. Additions-only VSchema changes (new vindexes, new tables, new
-column-vindex associations) are not unsafe. Removals are detected structurally
+acknowledgment.
+
+A VSchema change is also unsafe when it mutates a vindex definition in place —
+the vindex keeps its name but its `type`, one of its `params`, or its `owner`
+changes. A type change computes every row's keyspace id differently, so
+queries routed through the vindex can miss rows or scatter; repointing a
+lookup vindex's backing `table` param makes Vitess read and write lookup rows
+in a different table immediately, leaving the old table stale. The blast
+radius matches removing the vindex outright, so mutations take the same
+`--allow-unsafe` acknowledgment.
+
+Additions-only VSchema changes (new vindexes, new tables, new column-vindex
+associations) are not unsafe. Removals and mutations are detected structurally
 by comparing the current and desired VSchema documents; a VSchema that cannot
 be parsed fails the plan rather than skipping detection.
 

@@ -7028,12 +7028,113 @@ func TestRemoteApplyIdempotencyKey_GenerationRotation(t *testing.T) {
 	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
 		"an operation's own advanced attempt must rotate the deployment key")
 
-	// Siblings redispatched to the same generation regroup on one fresh key.
+	// A retry key is stable across a re-dispatch of the same attempt, so an
+	// orphaned retry dispatch is reused rather than duplicated.
+	assert.Equal(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+		remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+		"the retry key must be stable within one attempt")
+
+	// A retry redispatches only its own operation — siblings that succeeded
+	// never dispatch again — so sibling retries must not share a remote apply:
+	// each retried operation gets its own operation-scoped key.
 	_, scopeSiblingRetried := opScope(1, 1)
 	scopeSiblingRetried.operation.OperationKey = "commerce/80-/users"
-	assert.Equal(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+	assert.NotEqual(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
 		remoteApplyIdempotencyKey(applyRetried, scopeSiblingRetried),
-		"siblings retried to the same generation must share the rotated key")
+		"retried siblings must dispatch to distinct operation-scoped remote applies")
+}
+
+// A deployment-keyed dispatch carries the generation manifest — the full
+// operation-key set its deployment will send under the shared idempotency key —
+// so the data plane's shared apply completes only when every declared sibling
+// has attached and finished. The manifest must cover exactly the claimed
+// operation's deployment (sorted, own key included), and whole-apply dispatches
+// must carry none: their single dispatch is the whole generation.
+func TestGenerationOperationKeys(t *testing.T) {
+	assert.Nil(t, wholeApplyTaskScope().generationOperationKeys(),
+		"a whole-apply dispatch carries no manifest")
+
+	// A single-operation drive shares the whole-apply key, so it must not carry
+	// a manifest either, even when the loader populated the deployment key set.
+	singleOp := applyTaskScope{
+		applyOperationID:        7,
+		operation:               &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/users"},
+		multiOperation:          false,
+		deploymentOperationKeys: []string{"commerce/users"},
+	}
+	assert.Nil(t, singleOp.generationOperationKeys(),
+		"a whole-apply-keyed drive must not declare a manifest the data plane would gate on")
+
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		1: {ID: 1, ApplyID: 100, Deployment: "region-a", OperationKey: "commerce/80-/users"},
+		2: {ID: 2, ApplyID: 100, Deployment: "region-a", OperationKey: "commerce/-80/users"},
+		3: {ID: 3, ApplyID: 100, Deployment: "region-a", OperationKey: "commerce/group_finalizer"},
+		4: {ID: 4, ApplyID: 100, Deployment: "region-b", OperationKey: "commerce/-80/users"},
+	}}
+	client := &GRPCClient{storage: &mockStorage{operations: ops}}
+	apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-abc123"}
+
+	scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+	require.NoError(t, err)
+	assert.Equal(t,
+		[]string{"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer"},
+		scope.generationOperationKeys(),
+		"the manifest is the claimed deployment's sorted key set, finalizer and own key included, siblings of other deployments excluded")
+
+	// Every sibling of the deployment declares the same manifest, so whichever
+	// dispatch lands first stores the full expected set.
+	scopeSibling, err := client.loadOperationApplyTaskScope(t.Context(), apply, 3)
+	require.NoError(t, err)
+	assert.Equal(t, scope.generationOperationKeys(), scopeSibling.generationOperationKeys(),
+		"sibling dispatches of one deployment must declare identical manifests")
+
+	// The other deployment's dispatch declares only its own key set.
+	scopeOther, err := client.loadOperationApplyTaskScope(t.Context(), apply, 4)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"commerce/-80/users"}, scopeOther.generationOperationKeys(),
+		"a deployment's manifest never includes another deployment's operations")
+
+	// A deliberate retry dispatches under an operation-scoped key, so its
+	// manifest declares only its own operation: the retry's remote apply never
+	// receives siblings, and declaring them would hold it open forever.
+	scope.operation.Attempt = 1
+	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
+		"a retry's manifest is its own operation key alone")
+}
+
+// The idempotency key and the generation manifest are derived independently
+// from the same scope, so they must rotate together on a deliberate retry: a
+// rotated key paired with a still-full manifest (or an unrotated key paired
+// with a narrowed one) creates a remote apply whose declared operation set can
+// never attach, holding it Running under the completion gate forever. This
+// exercises both derivations on one scope object across the attempt boundary
+// so the pairing cannot drift apart unnoticed.
+func TestRetryRotatesKeyAndManifestTogether(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-abc123"}
+	scope := applyTaskScope{
+		applyOperationID: 1,
+		operation: &storage.ApplyOperation{
+			Deployment:   "region-a",
+			OperationKey: "commerce/80-/users",
+		},
+		multiOperation:          true,
+		deploymentOperationKeys: []string{"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer"},
+	}
+
+	// First dispatch: a deployment-scoped key paired with the full deployment
+	// manifest, so the shared remote apply knows every sibling it must await.
+	firstKey := remoteApplyIdempotencyKey(apply, scope)
+	assert.Equal(t, scope.deploymentOperationKeys, scope.generationOperationKeys(),
+		"a first dispatch pairs its deployment key with the full deployment manifest")
+
+	// The operation's deliberate retry: the same scope must rotate the key to
+	// operation scope AND narrow the manifest to the retried operation alone —
+	// the retry's remote apply receives exactly this one operation.
+	scope.operation.Attempt = 1
+	assert.NotEqual(t, firstKey, remoteApplyIdempotencyKey(apply, scope),
+		"a deliberate retry rotates to an operation-scoped key")
+	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
+		"the retry narrows the manifest to its own operation in the same step as the key rotation")
 }
 
 // A deployment-keyed dispatch shares one remote apply across sibling

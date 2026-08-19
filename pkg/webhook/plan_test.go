@@ -185,6 +185,53 @@ func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
 	assert.Equal(t, "DROP TABLE removes all data", data.UnsafeChanges[0].Reason)
 }
 
+// A namespace whose plan carries recorded VSchema deletions and mutations —
+// with no unsafe table changes at all — must still surface every recorded
+// entry in the PR plan comment's unsafe-changes section, attributed to the
+// namespace's vschema.json, so the operator sees the full blast radius before
+// acknowledging with --allow-unsafe.
+func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{
+		Database: "testdb",
+		Type:     "vitess",
+	}
+
+	deletionsMeta, err := apitypes.EncodeVSchemaDeletions([]apitypes.VSchemaDeletion{{
+		Kind:   "vindex",
+		Name:   "email_lookup",
+		Reason: "removes lookup vindex \"email_lookup\": rows in its backing table go stale",
+	}})
+	require.NoError(t, err)
+	mutationsMeta, err := apitypes.EncodeVSchemaMutations([]apitypes.VSchemaMutation{{
+		Kind:   "vindex_type",
+		Name:   "user_idx",
+		Reason: "vindex \"user_idx\" changes type from \"hash\" to \"xxhash\": every row's keyspace id is computed differently the moment the VSchema is applied",
+	}})
+	require.NoError(t, err)
+
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp_sharded",
+			Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:   "true",
+				apitypes.VSchemaDeletionsMetadataKey: deletionsMeta,
+				apitypes.VSchemaMutationsMetadataKey: mutationsMeta,
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan records VSchema deletions and mutations")
+	require.Len(t, data.UnsafeChanges, 2)
+	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[0].Table)
+	assert.Contains(t, data.UnsafeChanges[0].Reason, "email_lookup")
+	assert.Contains(t, data.UnsafeChanges[0].Reason, "go stale")
+	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[1].Table)
+	assert.Contains(t, data.UnsafeChanges[1].Reason, "user_idx")
+	assert.Contains(t, data.UnsafeChanges[1].Reason, "changes type")
+}
+
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{
 		Database:   "testdb",

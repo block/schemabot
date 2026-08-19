@@ -294,6 +294,11 @@ type PulledNamespace struct {
 	Artifacts        map[string]string        `json:"artifacts,omitempty"`
 	NamespaceCatalog *NamespaceCatalog        `json:"namespace_catalog,omitempty"`
 	TableCatalog     map[string]*TableCatalog `json:"table_catalog,omitempty"`
+	// Lint holds the schema lint violations for this namespace's tables,
+	// populated only when the pull request asked for linting. A namespace
+	// with no violations serializes as an explicit empty list so a clean
+	// audit is distinguishable from lint not being requested (omitted).
+	Lint []*LintViolationResponse `json:"lint,omitzero"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
@@ -354,6 +359,10 @@ type PullSchemaRequest struct {
 	Type          string   `json:"type"`
 	Namespaces    []string `json:"namespaces,omitempty"`
 	CatalogDetail string   `json:"catalog_detail,omitempty"`
+	// Lint runs the schema linters over every pulled table and attaches the
+	// violations to each namespace, so a caller can audit a database's lint
+	// debt without planning a change. Off by default.
+	Lint bool `json:"lint,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
@@ -483,9 +492,9 @@ type UnsafeChange struct {
 }
 
 // UnsafeChanges returns all changes marked as unsafe across all namespaces:
-// unsafe table changes and VSchema removals. DROP table changes are treated as
-// unsafe even when an engine omits IsUnsafe, so destructive table deletion
-// fails closed.
+// unsafe table changes, VSchema removals, and in-place vindex mutations. DROP
+// table changes are treated as unsafe even when an engine omits IsUnsafe, so
+// destructive table deletion fails closed.
 func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	if r == nil {
 		return nil
