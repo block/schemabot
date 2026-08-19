@@ -2560,10 +2560,11 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// of creating an apply that is wedged from birth.
 	if !apply.AllowsOperationKey(operationKey) {
 		c.logger.Error("Apply: dispatch's generation manifest does not name its own operation; refusing the malformed dispatch",
-			"plan_id", plan.PlanIdentifier,
-			"operation_key", operationKey,
-			"idempotency_key", req.IdempotencyKey,
-			"manifest", apply.ExpectedOperationKeys)
+			append(apply.LogAttrs(),
+				"plan_id", plan.PlanIdentifier,
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"manifest", apply.ExpectedOperationKeys)...)
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: fmt.Sprintf("dispatch generation manifest %v does not include its own operation key %q; refusing the malformed dispatch", apply.ExpectedOperationKeys, operationKey),

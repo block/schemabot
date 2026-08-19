@@ -2260,6 +2260,17 @@ func anyPauseOnFailure(ops []*storage.ApplyOperation) bool {
 	})
 }
 
+// manifestGatedVerdict reports whether a derived apply state asserts a
+// whole-generation outcome: completed claims every declared operation applied,
+// and reverted claims every declared operation was unwound. Neither claim is
+// honest while manifest-declared operations have not attached, so the
+// generation-manifest hold gates both. Failure verdicts are not gated: a
+// failed generation must not wait for siblings that may never dispatch.
+func manifestGatedVerdict(derived string) bool {
+	return state.IsState(derived, state.Apply.Completed) ||
+		state.IsState(derived, state.Apply.Reverted)
+}
+
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
 // apply_operations rows and persists it when it differs from the current value.
 //
@@ -2328,15 +2339,15 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	derived := state.DeriveRolloutApplyState(children)
 
 	// A deployment-keyed apply's operations attach one dispatch at a time, so
-	// the attached rows alone cannot prove the generation is complete. The
-	// stored generation manifest is the completion authority: the apply may
-	// derive completed only when every declared operation has attached (and,
-	// via the child derivation above, reached a terminal state). Until then the
-	// honest projection over an incomplete generation is running — the work the
-	// dispatcher declared is still on its way. Failure verdicts pass through
-	// unheld: a failed generation must not wait for siblings that may never
-	// dispatch.
-	if state.IsState(derived, state.Apply.Completed) {
+	// the attached rows alone cannot prove the generation is done. The stored
+	// generation manifest is the completion authority: the apply may derive a
+	// whole-generation verdict only when every declared operation has attached
+	// (and, via the child derivation above, reached a terminal state). Until
+	// then the honest projection over an incomplete generation is running —
+	// the work the dispatcher declared is still on its way, and terminalizing
+	// early would make later dispatches refuse to attach, silently diverging
+	// the declared shards from the recorded outcome.
+	if manifestGatedVerdict(derived) {
 		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
 			derived = state.Apply.Running
 			s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",

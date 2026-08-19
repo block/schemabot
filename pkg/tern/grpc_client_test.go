@@ -7102,6 +7102,41 @@ func TestGenerationOperationKeys(t *testing.T) {
 		"a retry's manifest is its own operation key alone")
 }
 
+// The idempotency key and the generation manifest are derived independently
+// from the same scope, so they must rotate together on a deliberate retry: a
+// rotated key paired with a still-full manifest (or an unrotated key paired
+// with a narrowed one) creates a remote apply whose declared operation set can
+// never attach, holding it Running under the completion gate forever. This
+// exercises both derivations on one scope object across the attempt boundary
+// so the pairing cannot drift apart unnoticed.
+func TestRetryRotatesKeyAndManifestTogether(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-abc123"}
+	scope := applyTaskScope{
+		applyOperationID: 1,
+		operation: &storage.ApplyOperation{
+			Deployment:   "region-a",
+			OperationKey: "commerce/80-/users",
+		},
+		multiOperation:          true,
+		deploymentOperationKeys: []string{"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer"},
+	}
+
+	// First dispatch: a deployment-scoped key paired with the full deployment
+	// manifest, so the shared remote apply knows every sibling it must await.
+	firstKey := remoteApplyIdempotencyKey(apply, scope)
+	assert.Equal(t, scope.deploymentOperationKeys, scope.generationOperationKeys(),
+		"a first dispatch pairs its deployment key with the full deployment manifest")
+
+	// The operation's deliberate retry: the same scope must rotate the key to
+	// operation scope AND narrow the manifest to the retried operation alone —
+	// the retry's remote apply receives exactly this one operation.
+	scope.operation.Attempt = 1
+	assert.NotEqual(t, firstKey, remoteApplyIdempotencyKey(apply, scope),
+		"a deliberate retry rotates to an operation-scoped key")
+	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
+		"the retry narrows the manifest to its own operation in the same step as the key rotation")
+}
+
 // A deployment-keyed dispatch shares one remote apply across sibling
 // operations, so an accepted response only addresses this dispatch if it
 // echoes the operation key the request's shape derives to. The verifier must

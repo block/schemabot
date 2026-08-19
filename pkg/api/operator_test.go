@@ -567,13 +567,14 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 }
 
 // TestUpdateApplyStateFromOperations_ManifestGatesCompletion verifies that an
-// apply carrying a generation manifest completes only when every declared
-// operation has attached and finished. A deployment-keyed apply's operations
-// attach one dispatch at a time, so the projection must not read "all attached
-// operations succeeded" as "the generation succeeded" while declared siblings
-// are still on their way — it holds the apply running instead. Failure verdicts
-// pass through unheld, and an apply without a manifest keeps the
-// attached-rows-only completion semantics.
+// apply carrying a generation manifest reaches a whole-generation verdict only
+// when every declared operation has attached and finished. A deployment-keyed
+// apply's operations attach one dispatch at a time, so the projection must not
+// read "all attached operations succeeded" (or "an attached operation
+// reverted") as the generation's outcome while declared siblings are still on
+// their way — it holds the apply running instead, for completed and reverted
+// alike. Failure verdicts pass through unheld, and an apply without a manifest
+// keeps the attached-rows-only semantics.
 func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	const shardA, shardB = "ns/-80/users", "ns/80-/users"
 	cases := []struct {
@@ -600,6 +601,25 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 				{ID: 2, OperationKey: shardB, State: state.ApplyOperation.Completed},
 			},
 			wantState: state.Apply.Completed,
+			wantDone:  true,
+		},
+		{
+			name:     "reverted attached subset holds the apply running",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Reverted},
+			},
+			wantState: state.Apply.Running,
+			wantDone:  false,
+		},
+		{
+			name:     "full manifest attached with a revert takes the reverted verdict",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Reverted},
+				{ID: 2, OperationKey: shardB, State: state.ApplyOperation.Completed},
+			},
+			wantState: state.Apply.Reverted,
 			wantDone:  true,
 		},
 		{
