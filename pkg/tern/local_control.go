@@ -1042,8 +1042,11 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 // drive claim while the schema change keeps executing unwatched. The request
 // is failed with the engine's reason, and the apply is left untouched: the
 // running change settles itself through its own apply path. Returns
-// handled=false when the error is not an unsupported-operation decline, so the
-// caller applies its normal error handling.
+// declined=false when the error is not an unsupported-operation decline, so
+// the caller applies its normal error handling. When declined=true the caller
+// must report the request as not handled: no stop or cancel took effect, and
+// treating the resolved decline as an operator stop would let the drive loop
+// mark the still-running apply stopped.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	unsupported, ok := engine.AsUnsupportedOperation(opErr)
 	if !ok {
@@ -1128,8 +1131,11 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
-		if handled, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); handled {
-			return true, declineErr
+		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); declined {
+			// The request is resolved terminally but no stop took effect: the
+			// schema change keeps running, so the drive must not treat this as
+			// an operator stop.
+			return false, declineErr
 		}
 		return true, fmt.Errorf("process pending stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
@@ -1200,8 +1206,11 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
-		if handled, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); handled {
-			return true, declineErr
+		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); declined {
+			// The request is resolved terminally but no cancel took effect:
+			// the schema change keeps running, so the drive must not treat
+			// this as an operator cancel.
+			return false, declineErr
 		}
 		return true, fmt.Errorf("process pending cancel for apply %s: %w", apply.ApplyIdentifier, err)
 	}

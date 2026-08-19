@@ -1024,7 +1024,7 @@ func TestLocalClient_PendingStopResolvesPostgresUnsupportedDecline(t *testing.T)
 	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.False(t, handled, "a declined stop must not read as an operator stop, or the drive loop would mark the running apply stopped")
 	assert.Equal(t, state.Apply.Running, apply.State, "the running apply must be left untouched to settle on its own")
 	assert.Equal(t, state.Task.Running, task.State, "the running task must not be marked stopped by a declined stop")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
@@ -1071,7 +1071,7 @@ func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.
 	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.False(t, handled, "a declined cancel must not read as an operator cancel, or the drive loop would mark the running apply stopped")
 	assert.Equal(t, state.Apply.Running, apply.State, "the running apply must be left untouched to settle on its own")
 	assert.Equal(t, state.Task.Running, task.State, "the running task must not be marked cancelled by a declined cancel")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)

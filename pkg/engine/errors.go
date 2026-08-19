@@ -89,7 +89,8 @@ type UnsupportedOperationError struct {
 func (e *UnsupportedOperationError) Error() string { return e.Err.Error() }
 func (e *UnsupportedOperationError) Unwrap() error { return e.Err }
 
-// NewUnsupportedOperationError wraps err as an unsupported-operation error.
+// NewUnsupportedOperationError builds a typed unsupported-operation decline
+// from msg, optionally treating it as a format string when args are given.
 // The message reaches operator-facing surfaces verbatim, so with no args it
 // is used as-is rather than interpreted as a format string — a literal `%`
 // in a decline reason must never render as a corrupted fmt verb.
