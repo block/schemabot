@@ -464,6 +464,58 @@ type ShardPlanResponse struct {
 	Changes   []*TableChangeResponse `json:"changes,omitempty"`
 }
 
+// PlanSummaryResponse is one stored plan in the GET /api/plans listing: its
+// provenance plus change counts derived from the stored plan data, without
+// the plan content itself.
+type PlanSummaryResponse struct {
+	PlanID       string `json:"plan_id"`
+	Database     string `json:"database"`
+	DatabaseType string `json:"database_type"`
+	Deployment   string `json:"deployment,omitempty"`
+	Environment  string `json:"environment"`
+	// Repository and PullRequest identify the PR the plan was generated for.
+	// Both empty means an ad-hoc plan, such as a CLI plan invocation without
+	// a PR.
+	Repository  string    `json:"repository,omitempty"`
+	PullRequest int       `json:"pull_request,omitempty"`
+	HeadSHA     string    `json:"head_sha,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	// ChangeCounts maps a change operation ("create", "alter", "drop", ...) to
+	// how many table changes of that operation the plan carries across every
+	// namespace. Empty for a no-change plan.
+	ChangeCounts map[string]int `json:"change_counts,omitempty"`
+	// UnsafeCount is how many of those table changes the planner marked
+	// unsafe.
+	UnsafeCount int `json:"unsafe_count,omitempty"`
+	// BlockedCount is how many of those table changes the engine will
+	// deterministically refuse (execution mode "blocked").
+	BlockedCount int `json:"blocked_count,omitempty"`
+	// VSchemaChangeCount is how many namespaces carry a VSchema change.
+	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
+}
+
+// PlansResponse is the HTTP response for GET /api/plans.
+type PlansResponse struct {
+	Limit    int  `json:"limit"`
+	MaxLimit int  `json:"max_limit"`
+	HasMore  bool `json:"has_more"`
+	// Last echoes the requested creation window, when one was given.
+	Last  string                 `json:"last,omitempty"`
+	Plans []*PlanSummaryResponse `json:"plans"`
+}
+
+// StoredPlanResponse is the HTTP response for GET /api/plans/{plan_identifier}:
+// the summary plus the full stored plan content, reconstructed in the same
+// shape POST /api/plan returns so plan rendering is shared. Lint results and
+// errors are not persisted with a plan, so Plan carries changes only —
+// their absence means "not stored", not "clean".
+type StoredPlanResponse struct {
+	PlanSummaryResponse
+	SchemaPath string        `json:"schema_path,omitempty"`
+	Target     string        `json:"target,omitempty"`
+	Plan       *PlanResponse `json:"plan"`
+}
+
 // HasErrors returns true if any lint result has error severity.
 func (r *PlanResponse) HasErrors() bool {
 	for _, w := range r.LintResults {

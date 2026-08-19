@@ -654,6 +654,63 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 	return &result, nil
 }
 
+// PlansOptions filters the stored-plan listing.
+type PlansOptions struct {
+	Limit       int
+	Database    string
+	Environment string
+	// Repository restricts the listing to plans generated for PRs in that
+	// repository (owner/name).
+	Repository string
+	// PullRequest restricts the listing to plans generated for that PR
+	// number; the server requires Repository alongside it.
+	PullRequest int
+	// Last bounds the listing to plans created within this window; zero means
+	// unbounded.
+	Last time.Duration
+}
+
+// GetPlans retrieves recent stored plans as summaries, newest first.
+func GetPlans(endpoint string, opts PlansOptions) (*apitypes.PlansResponse, error) {
+	var result apitypes.PlansResponse
+	values := url.Values{}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.Database != "" {
+		values.Set("database", opts.Database)
+	}
+	if opts.Environment != "" {
+		values.Set("environment", opts.Environment)
+	}
+	if opts.Repository != "" {
+		values.Set("repository", opts.Repository)
+	}
+	if opts.PullRequest > 0 {
+		values.Set("pull_request", strconv.Itoa(opts.PullRequest))
+	}
+	if opts.Last > 0 {
+		values.Set("last", opts.Last.String())
+	}
+	requestPath := "/api/plans"
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
+	}
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStoredPlan retrieves one stored plan with its full content.
+func GetStoredPlan(endpoint, planID string) (*apitypes.StoredPlanResponse, error) {
+	var result apitypes.StoredPlanResponse
+	if err := doGetInto(endpoint, "/api/plans/"+url.PathEscape(planID), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 type LogEntry = apitypes.LogEntry
 
 // GetLogs retrieves apply logs for a database.
