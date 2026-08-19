@@ -492,9 +492,9 @@ type UnsafeChange struct {
 }
 
 // UnsafeChanges returns all changes marked as unsafe across all namespaces:
-// unsafe table changes and VSchema removals. DROP table changes are treated as
-// unsafe even when an engine omits IsUnsafe, so destructive table deletion
-// fails closed.
+// unsafe table changes, VSchema removals, and in-place vindex mutations. DROP
+// table changes are treated as unsafe even when an engine omits IsUnsafe, so
+// destructive table deletion fails closed.
 func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	if r == nil {
 		return nil

@@ -509,7 +509,7 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 	fmt.Println()
 	fmt.Println("🚨 Unsafe Changes (--allow-unsafe enabled)")
 	fmt.Println()
-	fmt.Println("The following changes will permanently delete data:")
+	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }

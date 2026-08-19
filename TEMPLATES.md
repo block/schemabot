@@ -7891,7 +7891,7 @@ Unsafe allowed: Proceeding with --allow-unsafe flag
 
 🚨 Unsafe Changes (--allow-unsafe enabled)
 
-The following changes will permanently delete data:
+The following unsafe changes will be applied:
   • users: DROP COLUMN email
   • orders: DROP TABLE
 
