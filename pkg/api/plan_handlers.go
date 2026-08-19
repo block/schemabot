@@ -21,6 +21,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -60,6 +61,18 @@ type unsupportedPullSchemaError struct {
 
 func (e *unsupportedPullSchemaError) Error() string {
 	return fmt.Sprintf("pull schema is not supported for %s databases on this deployment", e.DatabaseType)
+}
+
+// unsupportedLintDialectError reports a pull request that asked for linting on
+// a database whose dialect the schema linters cannot parse. Failing the
+// request is deliberate: silently returning zero violations would read as a
+// clean audit.
+type unsupportedLintDialectError struct {
+	DatabaseType string
+}
+
+func (e *unsupportedLintDialectError) Error() string {
+	return fmt.Sprintf("schema linting on pull is not supported for %s databases", e.DatabaseType)
 }
 
 // databaseTypeMismatchError reports a request whose declared database type
@@ -149,6 +162,12 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotImplemented, err.Error())
 			return
 		}
+		var lintDialectErr *unsupportedLintDialectError
+		if errors.As(err, &lintDialectErr) {
+			s.logger.Warn("pull schema lint rejected for unsupported dialect", "database", req.Database, "environment", req.Environment, "type", lintDialectErr.DatabaseType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		var unavailableErr *RemoteDeploymentUnavailableError
 		if errors.As(err, &unavailableErr) {
 			s.logger.Error("pull schema failed because remote deployment is unavailable",
@@ -196,6 +215,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
+	}
+	if req.Lint && schema.DialectForDatabaseType(resolvedTarget.DatabaseType) != schema.DialectMySQL {
+		lintErr := &unsupportedLintDialectError{DatabaseType: resolvedTarget.DatabaseType}
+		span.RecordError(lintErr)
+		span.SetStatus(otelcodes.Error, "lint dialect unsupported")
+		return nil, lintErr
 	}
 	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
 	if err != nil {
@@ -294,7 +319,53 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		"namespace_count", len(merged.Namespaces),
 	)
 
-	return pullSchemaResponseFromProto(merged), nil
+	httpResp := pullSchemaResponseFromProto(merged)
+	if req.Lint {
+		if err := lintPulledNamespaces(httpResp); err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "lint pulled schema")
+			return nil, err
+		}
+	}
+	return httpResp, nil
+}
+
+// lintPulledNamespaces runs the schema linters over every pulled table and
+// attaches the violations to each namespace, so the response reports the same
+// findings a plan against this schema would flag. Results are sorted for a
+// stable response body regardless of table iteration order.
+func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
+	linter := lint.New()
+	for name, ns := range resp.Namespaces {
+		results, err := linter.LintSchema(ns.Tables)
+		if err != nil {
+			return fmt.Errorf("lint pulled schema for database %q namespace %q: %w", resp.Database, name, err)
+		}
+		violations := make([]*apitypes.LintViolationResponse, 0, len(results))
+		for _, r := range results {
+			violations = append(violations, &apitypes.LintViolationResponse{
+				Message:  r.Message,
+				Table:    r.Table,
+				Column:   r.Column,
+				Linter:   r.Linter,
+				Severity: r.Severity,
+			})
+		}
+		sort.Slice(violations, func(i, j int) bool {
+			if violations[i].Table != violations[j].Table {
+				return violations[i].Table < violations[j].Table
+			}
+			if violations[i].Column != violations[j].Column {
+				return violations[i].Column < violations[j].Column
+			}
+			if violations[i].Linter != violations[j].Linter {
+				return violations[i].Linter < violations[j].Linter
+			}
+			return violations[i].Message < violations[j].Message
+		})
+		ns.Lint = violations
+	}
+	return nil
 }
 
 func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, error) {

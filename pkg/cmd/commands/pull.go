@@ -17,6 +17,7 @@ type PullCmd struct {
 	Type          string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces    []string `name:"namespace" help:"Concrete live namespace to pull. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
 	CatalogDetail string   `help:"Structured catalog detail to include" default:"basic" enum:"basic,detailed"`
+	Lint          bool     `help:"Run the schema linters over every pulled table and include the violations per namespace"`
 }
 
 // Run executes the pull command.
@@ -31,6 +32,7 @@ func (cmd *PullCmd) Run(g *Globals) error {
 		resp, pullErr = client.CallPullSchemaAPIWithOptions(ep, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{
 			Namespaces:    cmd.Namespaces,
 			CatalogDetail: cmd.CatalogDetail,
+			Lint:          cmd.Lint,
 		})
 		return pullErr
 	})

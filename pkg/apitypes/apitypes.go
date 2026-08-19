@@ -294,6 +294,9 @@ type PulledNamespace struct {
 	Artifacts        map[string]string        `json:"artifacts,omitempty"`
 	NamespaceCatalog *NamespaceCatalog        `json:"namespace_catalog,omitempty"`
 	TableCatalog     map[string]*TableCatalog `json:"table_catalog,omitempty"`
+	// Lint holds the schema lint violations for this namespace's tables,
+	// populated only when the pull request asked for linting.
+	Lint []*LintViolationResponse `json:"lint,omitempty"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
@@ -354,6 +357,10 @@ type PullSchemaRequest struct {
 	Type          string   `json:"type"`
 	Namespaces    []string `json:"namespaces,omitempty"`
 	CatalogDetail string   `json:"catalog_detail,omitempty"`
+	// Lint runs the schema linters over every pulled table and attaches the
+	// violations to each namespace, so a caller can audit a database's lint
+	// debt without planning a change. Off by default.
+	Lint bool `json:"lint,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.

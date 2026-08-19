@@ -1585,6 +1585,149 @@ func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
 	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[1].CatalogDetail)
 }
 
+// A pull with lint requested audits the live schema without planning a
+// change: every pulled table runs through the same linters a plan would use,
+// and the violations attach per namespace, sorted for a stable response body.
+func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{
+					"users": "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+				}},
+			},
+			TableCount: 1,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+		Lint:        true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	violations := resp.Namespaces["orders"].Lint
+	require.Len(t, violations, 2)
+	assert.Equal(t, "allow_charset", violations[0].Linter)
+	assert.Equal(t, "users", violations[0].Table)
+	assert.Contains(t, violations[0].Message, "latin1")
+	assert.Equal(t, "primary_key", violations[1].Linter)
+	assert.Equal(t, "users", violations[1].Table)
+	assert.Contains(t, violations[1].Message, "int")
+}
+
+// Linting is opt-in: a pull that does not ask for it returns no lint field,
+// so existing callers see an unchanged response body.
+func TestExecutePullSchemaLintOffByDefault(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{
+					"users": "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+				}},
+			},
+			TableCount: 1,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Nil(t, resp.Namespaces["orders"].Lint)
+}
+
+// The schema linters parse MySQL-family DDL only, so a lint request against
+// any other dialect fails closed before the pull is dispatched — silently
+// returning zero violations would read as a clean audit.
+func TestExecutePullSchemaRejectsLintForUnsupportedDialect(t *testing.T) {
+	mockClient := &mockTernClient{}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"ledger": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "ledger-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "ledger",
+		Environment: "production",
+		Lint:        true,
+	})
+
+	var lintDialectErr *unsupportedLintDialectError
+	require.ErrorAs(t, err, &lintDialectErr)
+	assert.Equal(t, storage.DatabaseTypePostgres, lintDialectErr.DatabaseType)
+	assert.Nil(t, mockClient.pullSchemaReq)
+}
+
 // Whether pull is supported for a database type is the data plane's answer:
 // the control plane dispatches the pull and converts the data plane's
 // "unsupported" reply — the local client's typed sentinel, or its gRPC
