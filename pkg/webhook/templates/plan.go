@@ -175,18 +175,20 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	sb.WriteString("\n")
 
-	// Disclosed before the change list (and before the no-changes
-	// short-circuit) so the exclusion is visible whether or not the remaining
-	// namespaces carry changes.
-	writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
-
 	// Count changes
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
-	// No changes — short-circuit with a single clean message
+	// No changes — short-circuit with a single clean message. The
+	// ignore_namespaces disclosure still renders: a no-changes result is
+	// exactly where a reviewer needs to tell a withheld namespace apart from a
+	// genuinely unchanged one.
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
+		if len(data.IgnoredNamespaces) > 0 {
+			sb.WriteString("\n")
+			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
+		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
@@ -404,6 +406,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if totalChanges == 0 {
 		writeNoChangesDetected(sb, data)
 		sb.WriteString("\n")
+		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 		return
 	}
 
@@ -430,6 +433,10 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		// Fallback for unrecognized statement types
 		fmt.Fprintf(sb, "📋 **Plan**: %d DDL %s\n\n", totalStatements, pluralize("statement", totalStatements))
 	}
+
+	// Disclosed directly under the plan summary so the exclusion reads as
+	// part of the plan result: what was counted, then what was withheld.
+	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 }
 
 // writeIgnoredNamespaces renders the ignore_namespaces disclosure line. No-op
@@ -444,6 +451,18 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 		quoted[i] = fmt.Sprintf("`%s`", ns)
 	}
 	fmt.Fprintf(sb, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+}
+
+// multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
+// namespaces, so callers can decide whether the disclosure (and its spacing)
+// renders at all.
+func multiEnvHasIgnoredNamespaces(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if plan, ok := data.Plans[env]; ok && plan != nil && len(plan.IgnoredNamespaces) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // writeMultiEnvIgnoredNamespaces renders the ignore_namespaces disclosure for
@@ -1006,12 +1025,15 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	hasErrors := len(data.Errors) > 0
 
 	// If no environments have changes and no errors, show simple message. The
-	// ignore_namespaces disclosure still renders: an all-clean result is
-	// exactly where a reviewer needs to see that a namespace was withheld
-	// rather than genuinely unchanged.
+	// ignore_namespaces disclosure still renders underneath it: an all-clean
+	// result is exactly where a reviewer needs to see that a namespace was
+	// withheld rather than genuinely unchanged.
 	if envsWithChanges == 0 && !hasErrors {
-		writeMultiEnvIgnoredNamespaces(&sb, data)
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
+		if multiEnvHasIgnoredNamespaces(data) {
+			sb.WriteString("\n")
+			writeMultiEnvIgnoredNamespaces(&sb, data)
+		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
@@ -1130,14 +1152,12 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
-	// Disclosed before the change list (and before the no-changes message) so
-	// the exclusion is visible whether or not the remaining namespaces carry
-	// changes. Rendered per environment because ignore_namespaces entries can
+	// The ignore_namespaces disclosure renders under each environment's
+	// summary (writePlanSummary) or no-changes message, because entries can
 	// resolve differently per environment.
-	writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
-
 	if totalChanges == 0 {
 		sb.WriteString("✅ **No schema changes detected**\n\n")
+		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		return
 	}
 
