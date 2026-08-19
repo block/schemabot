@@ -5,6 +5,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -116,6 +117,81 @@ func TestNamespacesFromEngineChangesSiblingShardKeepsVSchemaMetadata(t *testing.
 		require.Len(t, sp.Changes, 1)
 		assert.Equal(t, "users", sp.Changes[0].Table)
 	}
+}
+
+// TestNamespacesFromEngineChangesMergesDisjointSiblingMetadata verifies that
+// per-shard changes contributing different pieces of a namespace's VSchema
+// change-metadata all land in the persisted record: a shard recording only
+// deletions and a sibling recording only mutations must merge into one record
+// carrying both, so the apply-time gate sees every disclosure.
+func TestNamespacesFromEngineChangesMergesDisjointSiblingMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	deletions := `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`
+	mutations := `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`
+
+	namespaces, _ := client.namespacesFromEngineChanges([]engine.SchemaChange{
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "-80"},
+			TableChanges: []engine.TableChange{alterUsers},
+			Metadata: map[string]string{
+				storage.PlanMetadataVSchemaChanged:   "true",
+				storage.PlanMetadataVSchemaDeletions: deletions,
+			},
+		},
+		{
+			Namespace:    "payments",
+			Shard:        engine.Shard{Name: "80-"},
+			TableChanges: []engine.TableChange{alterUsers},
+			Metadata: map[string]string{
+				storage.PlanMetadataVSchemaChanged:   "true",
+				storage.PlanMetadataVSchemaMutations: mutations,
+			},
+		},
+	}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+	})
+
+	require.Contains(t, namespaces, "payments")
+	assert.Equal(t, map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: deletions,
+		storage.PlanMetadataVSchemaMutations: mutations,
+	}, namespaces["payments"].Metadata)
+}
+
+// TestNamespacesFromApplyRequestCarriesVSchemaMetadata verifies a deployment
+// materializing a plan from a dispatch request recovers the namespace's
+// VSchema change-metadata from the request's VSchema change, so its apply
+// admission gate reads the same recorded deletions and mutations as a
+// deployment loading its own stored plan — an additive change queues freely
+// while a recorded deletion still requires opt-in.
+func TestNamespacesFromApplyRequestCarriesVSchemaMetadata(t *testing.T) {
+	client := planNamespacesTestClient()
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+	}
+
+	namespaces, err := client.namespacesFromApplyRequest([]*ternv1.TableChange{{
+		Namespace:  "payments",
+		TableName:  "VSchema: payments",
+		ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+		Metadata:   metadata,
+	}}, schema.SchemaFiles{
+		"payments": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+	})
+	require.NoError(t, err)
+
+	require.Contains(t, namespaces, "payments")
+	nsData := namespaces["payments"]
+	assert.Equal(t, `{"sharded":true}`, nsData.Artifacts[storage.VSchemaArtifactName])
+	assert.Equal(t, metadata, nsData.Metadata)
 }
 
 // TestPlanResultToProtoChangesSiblingShardKeepsVSchemaMetadata verifies the

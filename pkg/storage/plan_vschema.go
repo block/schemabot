@@ -1,6 +1,9 @@
 package storage
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"sort"
+)
 
 // Plan change-metadata keys persisted into NamespacePlanData.Metadata. These
 // mirror the keys engines annotate plan changes with (and pkg/apitypes exposes
@@ -68,9 +71,11 @@ type vschemaChangeRecord struct {
 // UnsafeVSchemaChanges returns the stored plan's VSchema changes that require
 // explicit unsafe opt-in. It fails closed on uncertainty: a namespace that
 // changes its VSchema without persisted change-metadata has no deletion or
-// mutation record to consult, and a record that cannot be decoded may hide
-// one — both are reported as unsafe rather than skipped, so neither an old
-// stored plan nor a corrupt record can bypass the opt-in gate. Each record
+// mutation record to consult, a namespace carrying change-metadata without a
+// desired VSchema document is a divergent record whose disclosures cannot be
+// trusted, and a record that cannot be decoded may hide one — all are
+// reported as unsafe rather than skipped, so neither an old stored plan, a
+// divergent one, nor a corrupt record can bypass the opt-in gate. Each record
 // key fails closed independently so one corrupt key never hides the other's
 // disclosures. Re-planning records fresh metadata and clears the ambiguity.
 func (p *Plan) UnsafeVSchemaChanges() []VSchemaUnsafeChange {
@@ -78,8 +83,16 @@ func (p *Plan) UnsafeVSchemaChanges() []VSchemaUnsafeChange {
 		return nil
 	}
 	var result []VSchemaUnsafeChange
-	for _, namespace := range p.VSchemaNamespaces() {
-		meta := p.Namespaces[namespace].Metadata
+	for _, namespace := range p.vschemaGateNamespaces() {
+		nsData := p.Namespaces[namespace]
+		if !nsData.ChangesVSchema() {
+			result = append(result, VSchemaUnsafeChange{
+				Namespace: namespace,
+				Reason:    "the stored plan records VSchema change-metadata for this namespace but no desired VSchema document, so it is treated as unsafe; re-plan to record both",
+			})
+			continue
+		}
+		meta := nsData.Metadata
 		if meta[PlanMetadataVSchemaChanged] != "true" {
 			result = append(result, VSchemaUnsafeChange{
 				Namespace: namespace,
@@ -93,6 +106,31 @@ func (p *Plan) UnsafeVSchemaChanges() []VSchemaUnsafeChange {
 			"VSchema mutations were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe; re-plan to record them")...)
 	}
 	return result
+}
+
+// vschemaGateNamespaces returns, in sorted order, every namespace the unsafe
+// gate must inspect: those changing their VSchema (carrying the desired
+// document) and those carrying VSchema change-metadata. The union matters —
+// a namespace with metadata but no document is a divergent record the gate
+// must fail closed on, not skip.
+func (p *Plan) vschemaGateNamespaces() []string {
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData.ChangesVSchema() || len(nsData.vschemaMetadata()) > 0 {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// vschemaMetadata returns the namespace's persisted VSchema change-metadata,
+// nil-safe for absent namespaces.
+func (n *NamespacePlanData) vschemaMetadata() map[string]string {
+	if n == nil {
+		return nil
+	}
+	return n.Metadata
 }
 
 // unsafeVSchemaRecords decodes one persisted VSchema record key into unsafe

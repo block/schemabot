@@ -1987,8 +1987,20 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			continue
 		}
 		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-			ensure(ch.Namespace)
+			nsData := ensure(ch.Namespace)
 			vschemaChangedNamespaces[c.planNamespace(ch.Namespace)] = true
+			// The dispatch carries the namespace's persisted VSchema
+			// change-metadata on its VSchema change; merge it key by key
+			// (first write wins) so the materialized plan runs the same
+			// apply-time safety gates as a locally stored one.
+			for key, value := range storage.VSchemaPlanMetadata(ch.Metadata) {
+				if nsData.Metadata == nil {
+					nsData.Metadata = map[string]string{}
+				}
+				if _, ok := nsData.Metadata[key]; !ok {
+					nsData.Metadata[key] = value
+				}
+			}
 			continue
 		}
 		op, err := materializedTableChangeOperation(ch)
@@ -2047,6 +2059,26 @@ func rejectUnsafeDDLChangesWithoutOptIn(planIdentifier string, changes []storage
 		}
 	}
 	return nil
+}
+
+// rejectUnsafeVSchemaChangesWithoutOptIn is the VSchema counterpart of
+// rejectUnsafeDDLChangesWithoutOptIn: it re-checks the stored plan's recorded
+// VSchema deletions and mutations at apply admission, so a dispatched
+// VSchema-only operation — whose scope carries no table DDL for the DDL gate
+// to inspect — still requires the same explicit opt-in the queueing gate
+// enforced. The gate reads the whole plan rather than the dispatch scope: the
+// VSchema change is namespace-level, and admission must never accept work the
+// plan discloses as unsafe.
+func rejectUnsafeVSchemaChangesWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
+	if applyOpts.AllowUnsafe {
+		return nil
+	}
+	changes := plan.UnsafeVSchemaChanges()
+	if len(changes) == 0 {
+		return nil
+	}
+	change := changes[0]
+	return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
 }
 
 // existingIdempotentApply returns the apply previously created for
@@ -2307,6 +2339,12 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 			ErrorMessage: err.Error(),
 		}, nil
 	}
+	if err := rejectUnsafeVSchemaChangesWithoutOptIn(plan, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
 	optionsJSON := storage.MarshalApplyOptions(applyOpts)
 
 	now := time.Now()
@@ -2466,6 +2504,12 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	applyOpts.Target = plan.Target
 	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+	if err := rejectUnsafeVSchemaChangesWithoutOptIn(plan, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),

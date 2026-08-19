@@ -112,6 +112,43 @@ func TestPlanUnsafeVSchemaChanges(t *testing.T) {
 		assert.Contains(t, changes[0].Reason, "re-plan")
 	})
 
+	t.Run("metadata without vschema document fails closed", func(t *testing.T) {
+		plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+			"payments": {
+				Metadata: map[string]string{
+					PlanMetadataVSchemaChanged:   "true",
+					PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+				},
+			},
+		}}
+
+		changes := plan.UnsafeVSchemaChanges()
+
+		require.Len(t, changes, 1)
+		assert.Equal(t, "payments", changes[0].Namespace)
+		assert.Contains(t, changes[0].Reason, "records VSchema change-metadata for this namespace but no desired VSchema document")
+		assert.Contains(t, changes[0].Reason, "re-plan")
+	})
+
+	t.Run("undecodable deletions and mutations each fail closed", func(t *testing.T) {
+		plan := &Plan{Namespaces: map[string]*NamespacePlanData{
+			"payments": {
+				Artifacts: vschemaArtifact,
+				Metadata: map[string]string{
+					PlanMetadataVSchemaChanged:   "true",
+					PlanMetadataVSchemaDeletions: "not json",
+					PlanMetadataVSchemaMutations: "also not json",
+				},
+			},
+		}}
+
+		changes := plan.UnsafeVSchemaChanges()
+
+		require.Len(t, changes, 2)
+		assert.Contains(t, changes[0].Reason, "VSchema deletions were recorded on this plan but could not be decoded")
+		assert.Contains(t, changes[1].Reason, "VSchema mutations were recorded on this plan but could not be decoded")
+	})
+
 	t.Run("undecodable deletions fail closed without hiding mutations", func(t *testing.T) {
 		plan := &Plan{Namespaces: map[string]*NamespacePlanData{
 			"payments": {

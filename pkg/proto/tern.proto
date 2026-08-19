@@ -457,6 +457,11 @@ message TableChange {
   // deterministically refuses the statement and the apply will fail.
   string execution_mode = 7;
   string mode_reason = 8;
+  // Engine-agnostic annotations about this change. A VSchema change carries
+  // the namespace's persisted VSchema change-metadata here so a deployment
+  // that materializes the plan from a dispatch request runs the same
+  // apply-time safety gates as one reading its own stored plan.
+  map<string, string> metadata = 9;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
