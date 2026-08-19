@@ -7340,16 +7340,16 @@ schemabot apply -e production
 
 ```
 
-┌───────────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4                           │
-│  Environment:  production                                     │
-│  State:        running                                        │
-│  Caller:       github:octocat                                 │
-│  Source:       https://github.com/acme/shop/pull/412          │
-│  Started:      Jan 15 14:22:00 UTC                            │
-│  Duration:     8m                                             │
-│  Deployments:  1 ready for cutover · 1 running · 1 waiting    │
-└───────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                         │
+│  Environment:  production                                   │
+│  State:        running                                      │
+│  Caller:       github:octocat                               │
+│  Source:       https://github.com/acme/shop/pull/412        │
+│  Started:      Jan 15 14:22:00 UTC                          │
+│  Duration:     8m                                           │
+│  Deployments:  1 ready for cutover · 1 running · 1 waiting  │
+└─────────────────────────────────────────────────────────────┘
 
   Next: cut over us-east
 

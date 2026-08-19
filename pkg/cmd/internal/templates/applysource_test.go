@@ -1,10 +1,22 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/ui"
 )
+
+// enableHyperlinks turns on OSC 8 emission for one test; TestMain pins it off
+// everywhere else.
+func enableHyperlinks(t *testing.T) {
+	t.Helper()
+	ui.Hyperlinks = true
+	t.Cleanup(func() { ui.Hyperlinks = false })
+}
 
 // The status list's SOURCE column shows where an apply came from: the full
 // clickable PR URL for webhook-driven applies, and the short caller for
@@ -63,4 +75,57 @@ func TestCallerAndSourceBoxRows(t *testing.T) {
 	t.Run("no caller and no URL renders nothing", func(t *testing.T) {
 		assert.Empty(t, callerAndSourceBoxRows("", ""))
 	})
+}
+
+// On an interactive terminal the PR provenance renders as the short
+// "owner/repo#pr" hyperlinked to the PR, so wide URLs stop dominating the
+// table while staying clickable. Everywhere else (pipes, logs) the full URL
+// renders instead — the tests above pin that path.
+func TestApplySourceHyperlinked(t *testing.T) {
+	enableHyperlinks(t)
+
+	t.Run("list surfaces link the short PR name", func(t *testing.T) {
+		assert.Equal(t,
+			"\x1b]8;;https://github.com/acme/shop/pull/412\x1b\\acme/shop#412\x1b]8;;\x1b\\",
+			applySource("github:octocat@acme/shop#412"))
+	})
+
+	t.Run("CLI callers are unaffected", func(t *testing.T) {
+		assert.Equal(t, "cli:jdoe", applySource("cli:jdoe@macbook.local"))
+	})
+
+	t.Run("detail box links the short PR name", func(t *testing.T) {
+		rows := callerAndSourceBoxRows("github:octocat@acme/shop#412", "")
+		assert.Equal(t, []BoxRow{
+			{"Caller", "github:octocat"},
+			{"Source", "\x1b]8;;https://github.com/acme/shop/pull/412\x1b\\acme/shop#412\x1b]8;;\x1b\\"},
+		}, rows)
+	})
+
+	t.Run("a server URL naming a different PR is its own display text", func(t *testing.T) {
+		rows := callerAndSourceBoxRows("github:octocat@acme/shop#412", "https://github.com/acme/shop/pull/999")
+		require.Len(t, rows, 2)
+		assert.Equal(t,
+			BoxRow{"Source", "\x1b]8;;https://github.com/acme/shop/pull/999\x1b\\https://github.com/acme/shop/pull/999\x1b]8;;\x1b\\"},
+			rows[1])
+	})
+}
+
+// A hyperlinked value carries zero-width escape bytes; the box must size and
+// pad by visible width so its borders stay aligned.
+func TestWriteBoxAlignsHyperlinkedValues(t *testing.T) {
+	enableHyperlinks(t)
+	output := captureStdout(t, func() {
+		WriteBox([]BoxRow{
+			{"Database", "orders-db"},
+			{"Source", ui.Link("acme/shop#412", "https://github.com/acme/shop/pull/412")},
+		}, "", nil)
+	})
+
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	require.Len(t, lines, 4)
+	for _, line := range lines[1:] {
+		assert.Equal(t, ui.VisibleWidth(lines[0]), ui.VisibleWidth(line), "line %q misaligned", line)
+	}
+	assert.Contains(t, output, "acme/shop#412")
 }
