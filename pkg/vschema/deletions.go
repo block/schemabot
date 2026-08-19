@@ -71,15 +71,29 @@ func Deletions(current, desired string) ([]Deletion, error) {
 			continue
 		}
 		currentTable := currentKs.Tables[table]
-		desiredVindexes := columnVindexNames(desiredTable)
+		desiredAssociations, desiredColumnsByVindex := columnVindexAssociations(desiredTable)
 		for _, cv := range currentTable.GetColumnVindexes() {
-			if _, ok := desiredVindexes[cv.GetName()]; !ok {
-				deletions = append(deletions, Deletion{
-					Kind:   DeletionKindColumnVindex,
-					Name:   table + "." + cv.GetName(),
-					Reason: fmt.Sprintf("table %q no longer uses vindex %q: routing for queries on its columns changes immediately and lookup rows stop being maintained", table, cv.GetName()),
-				})
+			if _, ok := desiredAssociations[columnVindexKey(cv)]; ok {
+				continue
 			}
+			// The exact association is gone. A vindex that still appears on the
+			// table but covers different columns is a reassociation — the old
+			// columns' association is removed just as surely as if the vindex
+			// had left the table, so it gets the same unsafe disclosure.
+			if newColumns, ok := desiredColumnsByVindex[cv.GetName()]; ok {
+				deletions = append(deletions, Deletion{
+					Kind: DeletionKindColumnVindex,
+					Name: table + "." + cv.GetName(),
+					Reason: fmt.Sprintf("table %q moves vindex %q from columns (%s) to (%s): routing for queries on the old columns changes immediately and lookup rows for them stop being maintained",
+						table, cv.GetName(), strings.Join(columnVindexColumns(cv), ", "), strings.Join(newColumns, "), (")),
+				})
+				continue
+			}
+			deletions = append(deletions, Deletion{
+				Kind:   DeletionKindColumnVindex,
+				Name:   table + "." + cv.GetName(),
+				Reason: fmt.Sprintf("table %q no longer uses vindex %q: routing for queries on its columns changes immediately and lookup rows stop being maintained", table, cv.GetName()),
+			})
 		}
 	}
 
@@ -118,12 +132,39 @@ func parseKeyspace(s string) (*vschemapb.Keyspace, error) {
 	return &ks, nil
 }
 
-func columnVindexNames(t *vschemapb.Table) map[string]struct{} {
-	names := make(map[string]struct{}, len(t.GetColumnVindexes()))
+// columnVindexAssociations indexes a table's column-vindex associations two
+// ways: the full (vindex, ordered columns) association keys, and the rendered
+// column sets each vindex covers. The first answers "is this exact association
+// still present", the second lets a reassociation report where the vindex
+// moved to.
+func columnVindexAssociations(t *vschemapb.Table) (map[string]struct{}, map[string][]string) {
+	associations := make(map[string]struct{}, len(t.GetColumnVindexes()))
+	columnsByVindex := make(map[string][]string, len(t.GetColumnVindexes()))
 	for _, cv := range t.GetColumnVindexes() {
-		names[cv.GetName()] = struct{}{}
+		associations[columnVindexKey(cv)] = struct{}{}
+		columnsByVindex[cv.GetName()] = append(columnsByVindex[cv.GetName()], strings.Join(columnVindexColumns(cv), ", "))
 	}
-	return names
+	return associations, columnsByVindex
+}
+
+// columnVindexKey identifies one column-vindex association: the vindex name
+// plus the ordered columns it covers. Column order is part of the identity —
+// a multi-column vindex maps its columns positionally, so reordering them
+// changes routing the same way re-pointing the vindex does.
+func columnVindexKey(cv *vschemapb.ColumnVindex) string {
+	return cv.GetName() + "(" + strings.Join(columnVindexColumns(cv), ",") + ")"
+}
+
+// columnVindexColumns returns the ordered columns an association covers,
+// honoring the legacy single-column field when the list form is absent.
+func columnVindexColumns(cv *vschemapb.ColumnVindex) []string {
+	if columns := cv.GetColumns(); len(columns) > 0 {
+		return columns
+	}
+	if column := cv.GetColumn(); column != "" {
+		return []string{column}
+	}
+	return nil
 }
 
 func sortedKeys[V any](m map[string]V) []string {

@@ -183,6 +183,70 @@ func TestDeletions_RemovedColumnVindex(t *testing.T) {
 	assert.Contains(t, deletions[0].Reason, `"email_lookup"`)
 }
 
+func TestDeletions_ReassociatedColumnVindex(t *testing.T) {
+	// The users table keeps vindex email_lookup but moves it from the email
+	// column to phone. The old column's association is removed just as surely
+	// as if the vindex had left the table — routing for queries on email
+	// changes immediately — so the reassociation is disclosed as unsafe.
+	desired := `{
+		"sharded": true,
+		"vindexes": {
+			"hash": {"type": "hash"},
+			"email_lookup": {
+				"type": "consistent_lookup_unique",
+				"params": {"table": "email_lookup", "from": "email", "to": "keyspace_id"},
+				"owner": "users"
+			}
+		},
+		"tables": {
+			"users": {
+				"column_vindexes": [
+					{"column": "id", "name": "hash"},
+					{"column": "phone", "name": "email_lookup"}
+				]
+			},
+			"orders": {
+				"column_vindexes": [
+					{"column": "user_id", "name": "hash"}
+				]
+			}
+		}
+	}`
+	deletions, err := Deletions(shardedVSchema, desired)
+	require.NoError(t, err)
+	require.Len(t, deletions, 1)
+	assert.Equal(t, DeletionKindColumnVindex, deletions[0].Kind)
+	assert.Equal(t, "users.email_lookup", deletions[0].Name)
+	assert.Contains(t, deletions[0].Reason, "moves vindex")
+	assert.Contains(t, deletions[0].Reason, "(email)")
+	assert.Contains(t, deletions[0].Reason, "(phone)")
+}
+
+func TestDeletions_ReorderedMultiColumnVindex(t *testing.T) {
+	// A multi-column vindex maps its columns positionally, so reordering the
+	// columns changes routing and is disclosed like any other reassociation.
+	current := `{"sharded": true, "vindexes": {"multi": {"type": "multicol"}}, "tables": {"events": {"column_vindexes": [{"columns": ["tenant_id", "region"], "name": "multi"}]}}}`
+	desired := `{"sharded": true, "vindexes": {"multi": {"type": "multicol"}}, "tables": {"events": {"column_vindexes": [{"columns": ["region", "tenant_id"], "name": "multi"}]}}}`
+	deletions, err := Deletions(current, desired)
+	require.NoError(t, err)
+	require.Len(t, deletions, 1)
+	assert.Equal(t, DeletionKindColumnVindex, deletions[0].Kind)
+	assert.Equal(t, "events.multi", deletions[0].Name)
+	assert.Contains(t, deletions[0].Reason, "(tenant_id, region)")
+	assert.Contains(t, deletions[0].Reason, "(region, tenant_id)")
+}
+
+func TestDeletions_LegacyColumnFieldEquivalent(t *testing.T) {
+	// The legacy single-column field and the single-entry columns list express
+	// the same association; a document normalized from one form to the other
+	// must not be flagged as a removal.
+	current := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`
+	desired := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"columns": ["id"], "name": "hash"}]}}}`
+	deletions, err := Deletions(current, desired)
+	require.NoError(t, err)
+	assert.Empty(t, deletions)
+}
+
 func TestDeletions_UnknownFieldsTolerated(t *testing.T) {
 	// A VSchema served by a newer Vitess can carry fields the vendored proto
 	// does not know about; they must not fail deletion detection.
