@@ -10,17 +10,17 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-// The plans command lists stored plans by default and shows one plan's full
-// content when a plan ID is given, mirroring how status takes an optional
-// apply ID.
+// The list-plans command lists stored plans by default and shows one plan's
+// full content when a plan ID is given, mirroring how status takes an
+// optional apply ID.
 func TestPlansCmdParsesListFiltersAndPlanID(t *testing.T) {
 	var cli struct {
-		Plans PlansCmd `cmd:""`
+		Plans PlansCmd `cmd:"" name:"list-plans"`
 	}
 	parser, err := kong.New(&cli)
 	require.NoError(t, err)
 
-	_, err = parser.Parse([]string{"plans", "-e", "staging", "-d", "orders", "--repository", "org/repo", "--pr", "42", "--last", "24h", "-n", "50"})
+	_, err = parser.Parse([]string{"list-plans", "-e", "staging", "-d", "orders", "--repository", "org/repo", "--pr", "42", "--last", "24h", "-n", "50"})
 	require.NoError(t, err)
 	assert.Empty(t, cli.Plans.PlanIDArg)
 	assert.Equal(t, "staging", cli.Plans.Environment)
@@ -30,24 +30,9 @@ func TestPlansCmdParsesListFiltersAndPlanID(t *testing.T) {
 	assert.Equal(t, "24h", cli.Plans.Last)
 	assert.Equal(t, 50, cli.Plans.Limit)
 
-	_, err = parser.Parse([]string{"plans", "plan-1784327902264169990"})
+	_, err = parser.Parse([]string{"list-plans", "plan-1784327902264169990"})
 	require.NoError(t, err)
 	assert.Equal(t, "plan-1784327902264169990", cli.Plans.PlanIDArg)
-}
-
-// The command is also reachable as list-plans, so operators who reach for a
-// verb-prefixed name are not one letter away from the plan command.
-func TestPlansCmdListPlansAlias(t *testing.T) {
-	var cli struct {
-		Plans PlansCmd `cmd:"" aliases:"list-plans"`
-	}
-	parser, err := kong.New(&cli)
-	require.NoError(t, err)
-
-	ctx, err := parser.Parse([]string{"list-plans", "-e", "staging"})
-	require.NoError(t, err)
-	assert.Equal(t, "plans", ctx.Command())
-	assert.Equal(t, "staging", cli.Plans.Environment)
 }
 
 func TestPlanSource(t *testing.T) {

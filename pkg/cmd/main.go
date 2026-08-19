@@ -49,7 +49,7 @@ type CLI struct {
 	Locks      commands.LocksCmd      `cmd:"" help:"List all active database locks"`
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
 	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
-	Plans      commands.PlansCmd      `cmd:"" aliases:"list-plans" help:"List recently generated schema change plans"`
+	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
 	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
