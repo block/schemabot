@@ -1655,7 +1655,8 @@ func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
 
 // Every pulled table entry must be a CREATE TABLE statement: the linters
 // silently pass over other statement kinds, so a namespace containing one
-// would produce a partial audit. The request fails instead.
+// would produce a partial audit. The whole request fails instead — even when
+// other namespaces lint cleanly, no partial response is returned.
 func TestExecutePullSchemaRejectsNonCreateTableLintEntry(t *testing.T) {
 	mockClient := &mockTernClient{
 		pullSchemaResp: &ternv1.PullSchemaResponse{
@@ -1666,8 +1667,11 @@ func TestExecutePullSchemaRejectsNonCreateTableLintEntry(t *testing.T) {
 				"orders": {Tables: map[string]string{
 					"users": "DROP TABLE `users`;\n",
 				}},
+				"audit": {Tables: map[string]string{
+					"events": "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n",
+				}},
 			},
-			TableCount: 1,
+			TableCount: 2,
 		},
 	}
 	cfg := &ServerConfig{
@@ -1691,16 +1695,74 @@ func TestExecutePullSchemaRejectsNonCreateTableLintEntry(t *testing.T) {
 		"primary/production": mockClient,
 	}, logger)
 
-	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
 		Database:    "orders",
 		Environment: "production",
 		Type:        storage.DatabaseTypeMySQL,
 		Lint:        true,
 	})
 
-	require.Error(t, err)
+	var unlintableErr *unlintablePulledTableError
+	require.ErrorAs(t, err, &unlintableErr)
+	assert.Equal(t, "orders", unlintableErr.Namespace)
+	assert.Equal(t, "users", unlintableErr.Table)
 	assert.Contains(t, err.Error(), "expected CREATE TABLE")
-	assert.Contains(t, err.Error(), `"users"`)
+	assert.Nil(t, resp, "a failed lint must not return a partial response")
+}
+
+// The /api/pull handler maps lint rejections to 400: both an unlintable pulled
+// table entry and a lint request against a dialect the linters cannot parse
+// are audit-scope defects, not server faults, and must not pollute 5xx rates.
+func TestPullSchemaHandlerRejectsLintFailuresAsBadRequest(t *testing.T) {
+	tests := []struct {
+		name         string
+		databaseType string
+		client       *mockTernClient
+		wantBody     string
+	}{
+		{
+			name:         "non-CREATE table entry",
+			databaseType: storage.DatabaseTypeMySQL,
+			client: &mockTernClient{
+				pullSchemaResp: &ternv1.PullSchemaResponse{
+					Database:    "orders",
+					Type:        storage.DatabaseTypeMySQL,
+					Environment: "production",
+					Namespaces: map[string]*ternv1.PulledNamespace{
+						"orders": {Tables: map[string]string{"users": "DROP TABLE `users`;\n"}},
+					},
+					TableCount: 1,
+				},
+			},
+			wantBody: "expected CREATE TABLE",
+		},
+		{
+			name:         "unsupported dialect",
+			databaseType: storage.DatabaseTypePostgres,
+			client:       &mockTernClient{},
+			wantBody:     "schema linting on pull is not supported for postgres databases",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTypeVocabularyService(t, &mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, tt.client, "orders", tt.databaseType, "primary")
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			body := fmt.Sprintf(`{"database":"orders","environment":"production","type":%q,"lint":true}`, tt.databaseType)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tt.wantBody)
+		})
+	}
 }
 
 // Linting is opt-in: a pull that does not ask for it returns no lint field,

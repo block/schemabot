@@ -76,6 +76,21 @@ func (e *unsupportedLintDialectError) Error() string {
 	return fmt.Sprintf("schema linting on pull is not supported for %s databases", e.DatabaseType)
 }
 
+// unlintablePulledTableError reports a pulled table entry whose DDL the schema
+// linters cannot audit — it failed classification, or it is not a CREATE TABLE
+// statement. Failing the request is deliberate: skipping the entry would
+// silently turn the audit into a partial result.
+type unlintablePulledTableError struct {
+	Database  string
+	Namespace string
+	Table     string
+	Detail    string
+}
+
+func (e *unlintablePulledTableError) Error() string {
+	return fmt.Sprintf("lint pulled schema for database %q namespace %q: table %q %s", e.Database, e.Namespace, e.Table, e.Detail)
+}
+
 // databaseTypeMismatchError reports a request whose declared database type
 // disagrees with the server's configured type for that database. The declared
 // type is a caller assertion checked against server config — the one source
@@ -166,6 +181,12 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		var lintDialectErr *unsupportedLintDialectError
 		if errors.As(err, &lintDialectErr) {
 			s.logger.Warn("pull schema lint rejected for unsupported dialect", "database", req.Database, "environment", req.Environment, "type", lintDialectErr.DatabaseType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var unlintableErr *unlintablePulledTableError
+		if errors.As(err, &unlintableErr) {
+			s.logger.Warn("pull schema lint rejected unlintable pulled table", "database", req.Database, "environment", req.Environment, "namespace", unlintableErr.Namespace, "table", unlintableErr.Table, "detail", unlintableErr.Detail)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -331,10 +352,14 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	return httpResp, nil
 }
 
-// lintPulledNamespaces runs the schema linters over every pulled table and
-// attaches the violations to each namespace, so the response reports the same
-// findings a plan against this schema would flag. Results are sorted for a
-// stable response body regardless of table iteration order.
+// lintPulledNamespaces runs the schema-shape linters (primary key types,
+// charsets, and other properties of the schema itself) over every pulled table
+// and attaches the violations to each namespace, using the same linter config
+// a plan uses. A pull carries no proposed change, so the diff-based linters a
+// plan also runs (unsafe drops, invisible-index-before-drop) never apply here:
+// a clean pull audit says the existing schema is well-shaped, not that any
+// particular change to it is safe. Results are sorted for a stable response
+// body regardless of table iteration order.
 func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
 	linter := lint.New()
 	for name, ns := range resp.Namespaces {
@@ -345,10 +370,20 @@ func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
 		for tableName, tableDDL := range ns.Tables {
 			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
 			if err != nil {
-				return fmt.Errorf("lint pulled schema for database %q namespace %q table %q: %w", resp.Database, name, tableName, err)
+				return &unlintablePulledTableError{
+					Database:  resp.Database,
+					Namespace: name,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("cannot be classified: %v", err),
+				}
 			}
 			if stmtType != ddl.StatementCreateTable {
-				return fmt.Errorf("lint pulled schema for database %q namespace %q: table %q is a %s statement, expected CREATE TABLE", resp.Database, name, tableName, stmtType)
+				return &unlintablePulledTableError{
+					Database:  resp.Database,
+					Namespace: name,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("is a %s statement, expected CREATE TABLE", stmtType),
+				}
 			}
 		}
 		results, err := linter.LintSchema(ns.Tables)

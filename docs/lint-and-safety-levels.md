@@ -6,6 +6,7 @@
 
 - [The severity ladder](#the-severity-ladder)
 - [Lint severity levels](#lint-severity-levels)
+- [Auditing a live schema (`pull --lint`)](#auditing-a-live-schema-pull---lint)
 - [What "unsafe" means](#what-unsafe-means)
 - [Issues versus the unsafe-changes rejection](#issues-versus-the-unsafe-changes-rejection)
 - [Blocked changes (⛔ Cannot apply)](#blocked-changes-cannot-apply)
@@ -61,6 +62,23 @@ lint finding
     │
     └─ severity=warning/info ▶ 💡 Lint Warnings (advisory; never gates)
 ```
+
+## Auditing a live schema (`pull --lint`)
+
+`schemabot pull --lint` (the `lint` option on the pull API) runs the linters
+over every pulled table and attaches the violations per namespace, so you can
+see a database's lint findings without planning a change.
+
+The audit's scope is narrower than a plan's. It runs only the schema-shape
+linters (primary key types, allowed charsets, and other properties of the
+schema itself), using the same linter config a plan uses. Because a pull
+carries no proposed change, the diff-based linters a plan also runs (unsafe
+drops, invisible-index-before-drop) never fire on a pull. A clean pull audit
+means the existing schema is well-shaped, not that any particular change to it
+is safe: the safety gates above still apply when you plan one.
+
+The linters parse MySQL-family DDL only, so a lint request against any other
+dialect is rejected rather than reporting a misleadingly clean audit.
 
 ## What "unsafe" means
 
