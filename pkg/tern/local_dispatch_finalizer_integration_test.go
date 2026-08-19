@@ -214,6 +214,7 @@ func TestLocalClient_VSchemaOnlyKeyedDispatchAdoptsManifestFinalizerScope(t *tes
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"ks_sharded": {
 				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 			},
 		},
 	}
