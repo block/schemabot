@@ -118,6 +118,53 @@ func TestPlanStore_LoadsPlansWithoutShardPlans(t *testing.T) {
 	assert.Empty(t, got.Namespaces["commerce"].Shards)
 }
 
+// TestPlanStore_RoundTripsVSchemaMetadata verifies a namespace's gate-facing
+// VSchema change-metadata survives the plan_data SQL round-trip alongside its
+// artifact: the apply-time unsafe gate reads the recorded deletions and
+// mutations from the reloaded plan, so a stored VSchema removal keeps
+// requiring opt-in instead of failing closed as an ambiguous record.
+func TestPlanStore_RoundTripsVSchemaMetadata(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
+	}
+	_, err := store.Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: "plan_vschema_meta",
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Deployment:     "primary",
+		Target:         "commerce-target",
+		Repository:     "org/repo",
+		PullRequest:    123,
+		SchemaPath:     "schema/commerce",
+		Environment:    "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata:  metadata,
+			},
+		},
+		CreatedAt: time.Now(),
+	})
+	require.NoError(t, err)
+
+	got, err := store.Plans().Get(ctx, "plan_vschema_meta")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Contains(t, got.Namespaces, "commerce")
+	assert.Equal(t, metadata, got.Namespaces["commerce"].Metadata)
+
+	changes := got.UnsafeVSchemaChanges()
+	require.Len(t, changes, 2)
+	assert.Equal(t, "removing vindex email_idx changes query routing", changes[0].Reason)
+	assert.Equal(t, "changing vindex user_idx type re-computes keyspace ids", changes[1].Reason)
+}
+
 func TestPlanStore_RoundTripsNilPlanDataAsNull(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

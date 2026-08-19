@@ -1369,63 +1369,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		ddlChanges[i] = storageTableChangeFromEngine(t, "")
 	}
 
-	// Build per-namespace plan data from the engine's changes.
-	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
-	namespaces := make(map[string]*storage.NamespacePlanData)
-	seenTable := make(map[string]map[string]bool)
-	var allShardPlans []storage.ShardPlan
-	for _, sc := range result.Changes {
-		ns := c.planNamespace(sc.Namespace)
-		nsData := namespaces[ns]
-		if nsData == nil {
-			nsData = &storage.NamespacePlanData{}
-			namespaces[ns] = nsData
-			seenTable[ns] = make(map[string]bool)
-		}
-		// A plan is keyed by (namespace, shard), so a sharded engine emits one
-		// SchemaChange per shard and the same table repeats across a keyspace's
-		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
-		for _, tc := range sc.TableChanges {
-			if seenTable[ns][tc.Table] {
-				continue
-			}
-			seenTable[ns][tc.Table] = true
-			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
-		}
-		// Record each changing shard's own changes so apply-create can rebuild
-		// per-shard operation groups with per-shard DDL (a keyspace whose shards
-		// diverge is persisted per shard, not collapsed; a shard is changing iff
-		// it has changes). A SchemaChange with an empty shard targets the whole
-		// namespace (non-sharded engines) and contributes no shard rows.
-		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
-			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
-			for _, tc := range sc.TableChanges {
-				sp.Changes = append(sp.Changes, storageTableChangeFromEngine(tc, ns))
-			}
-			nsData.Shards = append(nsData.Shards, sp)
-			allShardPlans = append(allShardPlans, sp)
-		}
-		if len(sc.OriginalFiles) > 0 {
-			nsData.OriginalFiles = sc.OriginalFiles
-		}
-		if sc.OriginalFilesCaptured {
-			nsData.OriginalFilesCaptured = true
-			if nsData.OriginalFiles == nil {
-				nsData.OriginalFiles = map[string]string{}
-			}
-		}
-		// Only store VSchema artifacts when the Plan detected a change.
-		if sc.Metadata["vschema_changed"] == "true" {
-			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
-					if nsData.Artifacts == nil {
-						nsData.Artifacts = map[string]string{}
-					}
-					nsData.Artifacts[storage.VSchemaArtifactName] = vs
-				}
-			}
-		}
-	}
+	namespaces, allShardPlans := c.namespacesFromEngineChanges(result.Changes, schemaFiles)
 	if len(namespaces) == 0 {
 		namespaces[c.config.Database] = &storage.NamespacePlanData{
 			Tables: ddlChanges,
@@ -1570,13 +1514,26 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 		if protoSC == nil {
 			protoSC = &ternv1.SchemaChange{
 				Namespace:             ns,
-				Metadata:              sc.Metadata,
+				Metadata:              maps.Clone(sc.Metadata),
 				OriginalFiles:         sc.OriginalFiles,
 				OriginalFilesCaptured: sc.OriginalFilesCaptured,
 			}
 			protoByNS[ns] = protoSC
 			protoTableSeen[ns] = make(map[string]bool)
 			changes = append(changes, protoSC)
+		} else {
+			// A sharded namespace's changes collapse into one wire change, so
+			// merge metadata key by key (first write wins): the namespace's
+			// VSchema annotation must survive no matter which shard's change
+			// carries it.
+			for key, value := range sc.Metadata {
+				if protoSC.Metadata == nil {
+					protoSC.Metadata = map[string]string{}
+				}
+				if _, ok := protoSC.Metadata[key]; !ok {
+					protoSC.Metadata[key] = value
+				}
+			}
 		}
 		for _, t := range sc.TableChanges {
 			if protoTableSeen[ns][t.Table] {
@@ -1928,6 +1885,79 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	}
 	plan.ID = planID
 	return plan, nil
+}
+
+// namespacesFromEngineChanges builds per-namespace plan data from the engine's
+// plan changes. For Vitess, each namespace is a keyspace; for Spirit, there is
+// one namespace.
+func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, []storage.ShardPlan) {
+	namespaces := make(map[string]*storage.NamespacePlanData)
+	seenTable := make(map[string]map[string]bool)
+	var allShardPlans []storage.ShardPlan
+	for _, sc := range changes {
+		ns := c.planNamespace(sc.Namespace)
+		nsData := namespaces[ns]
+		if nsData == nil {
+			nsData = &storage.NamespacePlanData{}
+			namespaces[ns] = nsData
+			seenTable[ns] = make(map[string]bool)
+		}
+		// A plan is keyed by (namespace, shard), so a sharded engine emits one
+		// SchemaChange per shard and the same table repeats across a keyspace's
+		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
+		for _, tc := range sc.TableChanges {
+			if seenTable[ns][tc.Table] {
+				continue
+			}
+			seenTable[ns][tc.Table] = true
+			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
+		}
+		// Record each changing shard's own changes so apply-create can rebuild
+		// per-shard operation groups with per-shard DDL (a keyspace whose shards
+		// diverge is persisted per shard, not collapsed; a shard is changing iff
+		// it has changes). A SchemaChange with an empty shard targets the whole
+		// namespace (non-sharded engines) and contributes no shard rows.
+		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
+			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
+			for _, tc := range sc.TableChanges {
+				sp.Changes = append(sp.Changes, storageTableChangeFromEngine(tc, ns))
+			}
+			nsData.Shards = append(nsData.Shards, sp)
+			allShardPlans = append(allShardPlans, sp)
+		}
+		if len(sc.OriginalFiles) > 0 {
+			nsData.OriginalFiles = sc.OriginalFiles
+		}
+		if sc.OriginalFilesCaptured {
+			nsData.OriginalFilesCaptured = true
+			if nsData.OriginalFiles == nil {
+				nsData.OriginalFiles = map[string]string{}
+			}
+		}
+		// A sharded keyspace's SchemaChanges share one nsData, so merge the
+		// gate-facing VSchema metadata key by key: a sibling shard's change
+		// carrying less of it (or none) must not clear a deletion or mutation
+		// record another shard already persisted.
+		for key, value := range storage.VSchemaPlanMetadata(sc.Metadata) {
+			if nsData.Metadata == nil {
+				nsData.Metadata = map[string]string{}
+			}
+			if _, ok := nsData.Metadata[key]; !ok {
+				nsData.Metadata[key] = value
+			}
+		}
+		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
+				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
+					if nsData.Artifacts == nil {
+						nsData.Artifacts = map[string]string{}
+					}
+					nsData.Artifacts[storage.VSchemaArtifactName] = vs
+				}
+			}
+		}
+	}
+	return namespaces, allShardPlans
 }
 
 // namespacesFromApplyRequest rebuilds per-namespace plan data from a dispatch

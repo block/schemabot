@@ -382,6 +382,11 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+
+	// Metadata is the subset of the engine's plan change-metadata that
+	// apply-time safety gates read (see VSchemaPlanMetadata). Display-only
+	// metadata such as the rendered VSchema diff is deliberately not persisted.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
