@@ -349,6 +349,23 @@ func TestVolumeReportingUsesExplicitPerChangeValue(t *testing.T) {
 	eng.Drain()
 }
 
+// setSchemaChangeVolume must not apply settings, and Volume must not report
+// success, when the schema change it targets is no longer the tracked one —
+// e.g. it completed and a new change started while a volume adjustment was
+// in flight.
+func TestSetSchemaChangeVolumeNotAppliedWhenUntracked(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{database: "otherdb", threads: eng.threads}
+	eng.mu.Unlock()
+
+	applied := eng.setSchemaChangeVolume(rm, 7, 8)
+	assert.False(t, applied, "expected no-op when rm is no longer the tracked schema change")
+	assert.Equal(t, int32(0), rm.volume, "stale rm must not be mutated")
+}
+
 // Copy settings are shared between volume adjustments, progress pollers, and
 // the schema change execution path; adjusting volume while the settings are
 // read concurrently must be safe.

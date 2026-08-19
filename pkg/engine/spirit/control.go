@@ -434,7 +434,9 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	// When the requested volume maps to the settings the change is already
 	// running with, record the explicit volume and skip the restart.
 	if newThreads == currentThreads {
-		e.setSchemaChangeVolume(rm, req.Volume, newThreads)
+		if !e.setSchemaChangeVolume(rm, req.Volume, newThreads) {
+			return nil, fmt.Errorf("volume adjustment target is no longer the active schema change on database %s", database)
+		}
 		return &engine.VolumeResult{
 			Accepted:       true,
 			PreviousVolume: previousVolume,
@@ -468,7 +470,10 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 
 	// Retune the running schema change; the engine's configured defaults stay
 	// untouched so the next schema change starts from the defaults.
-	e.setSchemaChangeVolume(rm, req.Volume, newThreads)
+	if !e.setSchemaChangeVolume(rm, req.Volume, newThreads) {
+		e.setVolumeRestartInProgress(rm, false)
+		return nil, fmt.Errorf("volume adjustment target is no longer the active schema change on database %s", database)
+	}
 
 	// Restart the schema change
 	_, err = e.Start(ctx, &engine.ControlRequest{
@@ -500,7 +505,10 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 // setSchemaChangeVolume records the explicit volume and its derived thread
 // count on the tracked schema change. The setting ends with the change, so a
 // volume set during one schema change never carries into a later one.
-func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int) {
+// Returns false if rm is no longer the tracked schema change (e.g. it
+// completed or was replaced while the caller was mid-adjustment), in which
+// case nothing was applied and the caller must not report success.
+func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int) bool {
 	e.mu.Lock()
 	tracked := e.runningSchemaChange == rm
 	if tracked {
@@ -514,6 +522,7 @@ func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, th
 			"volume", volume,
 		)
 	}
+	return tracked
 }
 
 func (e *Engine) setVolumeRestartInProgress(rm *runningSchemaChange, inProgress bool) {
@@ -543,9 +552,9 @@ const maxThreads = 16
 // Thread count is the only lever volume adjusts: lock wait timeout is fixed
 // to the engine's configured value (see DefaultLockWaitTimeout) now that
 // Spirit's ForceKill clears blockers well within it regardless of volume.
-// Volumes 2 and 3, and 5-7
-// without a CPU hint, consequently derive the same thread count and are
-// indistinguishable in practice; when the engine's experimental autoscaling
+// Without a CPU hint, volumes 2/3, 5/6/7, 8/9, and 10/11 each derive the same
+// thread count and are pairwise (or group-wise) indistinguishable in
+// practice; when the engine's experimental autoscaling
 // is enabled (the default) and Aurora is detected, autoscaling overrides
 // these thread counts anyway on instances with more than a few vCPUs, so
 // volume increasingly has nothing left to tune. A future change may collapse

@@ -507,7 +507,9 @@ The defaults, and why they were chosen:
   dynamically from throttler feedback. A fixed thread count is the classic
   failure mode on large targets — throughput that made sense on one instance
   class silently starves or overloads another. The operator control for copy
-  aggressiveness is the apply's `volume`, not a thread count. Set
+  aggressiveness is the apply's `volume`, not a thread count — though on a
+  target where autoscaling is engaged, autoscaling's own thread counts take
+  over and `volume` has nothing left to tune. Set
   `enable_experimental_autoscaling: false` only as an incident kill switch when
   autoscaling misbehaves on a target fleet.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;

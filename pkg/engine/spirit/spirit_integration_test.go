@@ -873,6 +873,9 @@ func TestNew_Defaults(t *testing.T) {
 	assert.NotNil(t, eng.linter, "expected linter to be set")
 	assert.Equal(t, DefaultThreads, eng.threads)
 	assert.Equal(t, DefaultLockWaitTimeout, eng.lockWaitTimeout)
+	// Pin the literal value so a change to the constant itself is caught here,
+	// not just propagation from Config into the engine.
+	assert.Equal(t, 10*time.Second, eng.lockWaitTimeout)
 }
 
 func TestNew_CustomConfig(t *testing.T) {
@@ -885,6 +888,7 @@ func TestNew_CustomConfig(t *testing.T) {
 
 	assert.Equal(t, logger, eng.logger, "expected custom logger")
 	assert.Equal(t, 8, eng.threads)
+	assert.Equal(t, DefaultLockWaitTimeout*2, eng.lockWaitTimeout, "expected custom lock wait timeout to override the default")
 }
 
 func TestSetSchemaChangeCompleted(t *testing.T) {

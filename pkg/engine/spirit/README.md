@@ -12,7 +12,7 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 
 **Config** — Engine configuration:
 - `Threads` (default 2): Number of concurrent copier threads
-- `LockWaitTimeout` (default 10s): How long to wait for table locks during cutover. Spirit's ForceKill (on by default) clears blocking transactions at 90% of this timeout, so this is fixed regardless of volume rather than scaled up for higher volumes
+- `LockWaitTimeout` (default 10s): How long to wait for table locks during the checksum and cutover. Spirit's ForceKill (on by default) clears blocking transactions at 90% of this timeout — except an explicit LOCK TABLES holder or a transaction heavier than `dbconn.TransactionWeightThreshold`, which are left to finish naturally rather than killed — so this is fixed regardless of volume rather than scaled up for higher volumes
 - `DebugLogs`: Enable verbose Spirit debug output
 
 ## How It Works

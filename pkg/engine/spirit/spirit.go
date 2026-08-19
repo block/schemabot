@@ -40,9 +40,10 @@ const DefaultThreads = 2
 
 // DefaultLockWaitTimeout is how long Spirit waits for table locks. Spirit's
 // ForceKill (on by default) kills blocking transactions at 90% of this
-// timeout, so a long-running blocker is cleared in under 10s rather than
-// requiring the historical long lock-wait grace period. This is fixed
-// regardless of volume — see Volume in control.go.
+// timeout. It does not kill an explicit LOCK TABLES holder or a transaction
+// heavier than dbconn.TransactionWeightThreshold — those are left to finish
+// naturally within the timeout, since killing them is considered unsafe. This
+// is fixed regardless of volume — see Volume in control.go.
 const DefaultLockWaitTimeout = 10 * time.Second
 
 // Engine implements the engine.Engine interface for MySQL using Spirit.
