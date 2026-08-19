@@ -120,7 +120,7 @@ func TestApplyCommandCoreTransientConfigReadFailureIsRetryable(t *testing.T) {
 // A checks read failure leaves the gate unevaluated, so the apply remains
 // retryable and can be safely re-driven once GitHub recovers.
 func TestApplyCommandCoreChecksGateEvaluationFailureIsRetryable(t *testing.T) {
-	h, mux := newApplyGateContractHandler(t, &emptyStorage{})
+	h, mux, _ := newApplyGateContractHandler(t, &emptyStorage{})
 	mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/status", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
@@ -137,7 +137,7 @@ func TestApplyCommandCoreChecksGateEvaluationFailureIsRetryable(t *testing.T) {
 // A failing required check is a verified gate decision, so the apply is
 // terminal for this command delivery rather than retrying the same block.
 func TestApplyCommandCoreChecksGateMeritBlockIsTerminal(t *testing.T) {
-	h, mux := newApplyGateContractHandler(t, &emptyStorage{})
+	h, mux, _ := newApplyGateContractHandler(t, &emptyStorage{})
 	registerCheckStatusRESTHandlers(mux, []checkStatusNode{{
 		Typename: "CheckRun", Name: "CI / tests", Status: "completed", Conclusion: "failure", AppSlug: "github-actions",
 	}})
@@ -152,7 +152,7 @@ func TestApplyCommandCoreChecksGateMeritBlockIsTerminal(t *testing.T) {
 // later confirmation can still execute the plan the user reviewed.
 func TestApplyConfirmCommandCoreBaseFreshnessFailureIsRetryableAndKeepsPendingLock(t *testing.T) {
 	locks := newApplyConfirmContractLockStore()
-	h, mux := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
+	h, mux, _ := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
 	registerCheckStatusRESTHandlers(mux, nil)
 	registerBaseFreshnessRef(t, mux)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
@@ -171,7 +171,7 @@ func TestApplyConfirmCommandCoreBaseFreshnessFailureIsRetryableAndKeepsPendingLo
 // releasing the observed pending intent lets the PR create a fresh plan.
 func TestApplyConfirmCommandCoreStaleBaseIsTerminalAndReleasesPendingLock(t *testing.T) {
 	locks := newApplyConfirmContractLockStore()
-	h, mux := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
+	h, mux, _ := newApplyGateContractHandler(t, &actorAuthStorage{locks: locks})
 	registerCheckStatusRESTHandlers(mux, nil)
 	registerBaseFreshnessRef(t, mux)
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
@@ -200,14 +200,14 @@ func TestApplyConfirmCommandCoreStaleBaseIsTerminalAndReleasesPendingLock(t *tes
 	assert.Equal(t, []string{"plan_confirm123"}, locks.releasedIfPending)
 }
 
-func newApplyGateContractHandler(t *testing.T, store storage.Storage) (*Handler, *http.ServeMux) {
+func newApplyGateContractHandler(t *testing.T, store storage.Storage) (*Handler, *http.ServeMux, <-chan string) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
 	registerApplyDiscoveryEndpoints(t, mux, "orders")
 	comments := make(chan string, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 	h := actorAuthStorageTestHandler(actorAuthTestConfig(false), store, ghclient.NewInstallationClient(client, testLogger()))
-	return h, mux
+	return h, mux, comments
 }
 
 func newApplyConfirmContractLockStore() *actorAuthLockStore {
