@@ -357,10 +357,20 @@ type SupersededProgressData struct {
 // Every rotation flavor shares this shape and differs only in its headline
 // (which must start with that flavor's superseded prefix) and fold label.
 func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
+	return renderFoldWithMarker(headline, supersededFoldMarker, foldLabel, repo, pr, newCommentID, previousBody)
+}
+
+// renderFoldWithMarker is the shared fold shape behind every frozen body: a
+// headline whose successor link opens with the given marker, and the frozen
+// comment's last rendered body preserved inside a collapsed details block. The
+// marker names what the successor is — a fresh progress comment for rotation
+// flavors, the terminal summary for the terminal fold — and is what
+// IsSupersededProgressComment keys on.
+func renderFoldWithMarker(headline, marker, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
 	return fmt.Sprintf(
-		"%s"+supersededFoldMarker+"%s/pull/%d#issuecomment-%d).\n\n"+
+		"%s%s%s/pull/%d#issuecomment-%d).\n\n"+
 			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
-		headline, repo, pr, newCommentID, foldLabel, previousBody)
+		headline, marker, repo, pr, newCommentID, foldLabel, previousBody)
 }
 
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
@@ -449,16 +459,39 @@ func RenderSupersededProgressComment(data SupersededProgressData) string {
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
+// terminalSummarySupersededPrefix opens every frozen body written when the
+// terminal summary superseded the progress comment; IsSupersededProgressComment
+// keys on it so a freeze retry can tell an already-frozen comment from a live
+// one.
+const terminalSummarySupersededPrefix = "🏁 Schema change finished"
+
+// terminalSummaryFoldMarker is the successor-link text embedded in a frozen
+// headline when the successor is the terminal summary comment rather than a
+// fresh progress comment. IsSupersededProgressComment accepts it alongside
+// supersededFoldMarker so a terminal fold is recognized as already frozen.
+const terminalSummaryFoldMarker = " [the summary comment](https://github.com/"
+
+// RenderTerminalSummarySupersededProgressComment renders the frozen body
+// written over the progress comment once the terminal summary has posted. The
+// summary at the bottom of the PR is the authoritative final record, so the
+// progress comment folds its last per-operation rendering into a details block
+// pointing at it instead of standing as a near-identical duplicate above it.
+func RenderTerminalSummarySupersededProgressComment(data SupersededProgressData) string {
+	return renderFoldWithMarker(terminalSummarySupersededPrefix+" — the final status is in", terminalSummaryFoldMarker,
+		"Progress while the schema change ran",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
 // IsSupersededProgressComment reports whether a comment body is already a
-// frozen superseded rendering — any rotation flavor — so a freeze retry does
-// not wrap a frozen body in a second fold. A frozen body opens with a flavor
-// prefix and carries the successor link on that same headline; both are
-// required, so a live body that merely opens with the same words as a prefix
-// (e.g. an edited comment starting "Cutover complete") is never mistaken for
-// a frozen one and skipped by a freeze retry.
+// frozen superseded rendering — any rotation flavor or the terminal fold — so
+// a freeze retry does not wrap a frozen body in a second fold. A frozen body
+// opens with a flavor prefix and carries the successor link on that same
+// headline; both are required, so a live body that merely opens with the same
+// words as a prefix (e.g. an edited comment starting "Cutover complete") is
+// never mistaken for a frozen one and skipped by a freeze retry.
 func IsSupersededProgressComment(body string) bool {
 	headline, _, _ := strings.Cut(body, "\n")
-	if !strings.Contains(headline, supersededFoldMarker) {
+	if !strings.Contains(headline, supersededFoldMarker) && !strings.Contains(headline, terminalSummaryFoldMarker) {
 		return false
 	}
 	for _, prefix := range []string{
@@ -468,6 +501,7 @@ func IsSupersededProgressComment(body string) bool {
 		skipRevertSupersededPrefix,
 		cutoverSupersededPrefix,
 		genericSupersededPrefix,
+		terminalSummarySupersededPrefix,
 	} {
 		if strings.HasPrefix(headline, prefix) {
 			return true

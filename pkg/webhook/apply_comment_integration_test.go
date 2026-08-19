@@ -656,13 +656,8 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 	task.ProgressPercent = 100
 	obs.OnTerminal(apply, []*storage.Task{task})
 
-	// The terminal publish edits the progress comment to its final rendering
-	// and posts a fresh terminal summary comment.
-	select {
-	case <-capture.edits:
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the progress comment to be edited to its final rendering")
-	}
+	// The terminal publish posts a fresh terminal summary comment and folds
+	// the progress comment into a collapsed block pointing at it.
 	var terminalSummaryID int64
 	select {
 	case created := <-capture.creates:
@@ -672,6 +667,13 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 		t.Fatal("expected a terminal summary comment for the completed apply")
 	}
 	assert.NotEqual(t, stoppedSummaryID, terminalSummaryID, "the terminal summary is a fresh comment, not the stop's")
+	select {
+	case edited := <-capture.edits:
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", terminalSummaryID),
+			"the frozen progress comment points at the terminal summary")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the progress comment to be folded toward the terminal summary")
+	}
 
 	// The summary marker now records the terminal summary and is active again.
 	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
@@ -2474,10 +2476,10 @@ func TestE2ERevertRotationUntrackedFreshCommentAdoptedAtTerminal(t *testing.T) {
 
 // A cancel resolves the apply directly to a terminal state, so its effect
 // surfaces through the terminal flow rather than a progress-comment rotation:
-// the tracked progress comment is frozen at its final rendering in place, and
-// a brand-new summary comment lands at the bottom of the PR timeline — which
-// is where the operator looks for the effect of the command they just issued.
-// Exactly one new comment is posted; rotating as well would duplicate it.
+// the tracked progress comment is frozen in place, and a brand-new summary
+// comment lands at the bottom of the PR timeline — which is where the operator
+// looks for the effect of the command they just issued. Exactly one new
+// comment is posted; rotating as well would duplicate it.
 func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
 	ctx := t.Context()
 
@@ -2537,6 +2539,149 @@ func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, marker)
 	assert.Equal(t, summaryID, marker.GitHubCommentID)
+}
+
+// When an apply completes, exactly one live status rendering ends the PR: the
+// terminal summary posts at the bottom of the timeline, and the tracked
+// progress comment folds its final per-operation status into a collapsed
+// details block pointing at the summary — instead of standing above it as a
+// near-identical duplicate.
+func TestE2ETerminalSummarySupersedesProgressComment(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-terminal-fold",
+		pr:         148,
+		database:   "e2e_terminal_fold_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-terminal-fold", 148, 12345, apply, state.Comment.Progress, "Copying rows — 50%")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The summary posts as a fresh comment at the bottom of the PR.
+	var summaryID int64
+	select {
+	case created := <-capture.creates:
+		summaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Applied")
+		assert.Contains(t, created.Body, apply.ApplyIdentifier)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a terminal summary comment for the completed apply")
+	}
+
+	// The progress comment folds toward the summary, preserving its final
+	// per-operation status inside the collapsed block.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID, "the fold lands on the tracked progress comment")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", summaryID), "the fold points at the terminal summary")
+		assert.Contains(t, edited.Body, "<details>", "the final status collapses into a details block")
+		assert.Contains(t, edited.Body, "**Status**: Applied", "the final per-operation status is preserved inside the fold")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the progress comment to be folded toward the terminal summary")
+	}
+}
+
+// A repeated terminal publish — a fresh observer whose claim loses because the
+// summary is already posted, for example after a webhook redelivery — folds
+// the progress comment toward the recorded summary again instead of restoring
+// the full rendering and undoing the earlier fold.
+func TestE2ERepeatedTerminalPublishKeepsProgressCommentFolded(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-terminal-refold",
+		pr:         149,
+		database:   "e2e_terminal_refold_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-terminal-refold", 149, 12345, apply, state.Comment.Progress, "Copying rows — 50%")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	f.newObserver(st, fake).OnTerminal(apply, []*storage.Task{task})
+	summaryID := requireCommentCreate(t, capture)
+	select {
+	case <-capture.edits: // the first publish's fold
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first terminal publish to fold the progress comment")
+	}
+
+	// A second observer reaches the terminal publish. It loses the summary
+	// claim, reads the recorded summary from the marker, and folds again.
+	f.newObserver(st, fake).OnTerminal(apply, []*storage.Task{task})
+	select {
+	case duplicate := <-capture.creates:
+		t.Fatalf("the repeated publish must not post a second summary; got %d: %s", duplicate.ID, duplicate.Body)
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID, "the repeated fold lands on the tracked progress comment")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", summaryID), "the repeated fold still points at the recorded summary")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the repeated terminal publish to fold the progress comment again")
+	}
+
+	marker, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	assert.Equal(t, summaryID, marker.GitHubCommentID, "the marker still records the one posted summary")
+}
+
+// A stop is terminal but returns to active, so its terminal publish keeps the
+// progress comment at its full stopped rendering instead of folding it: the
+// resume rotation is what folds the frozen-at-stop comment, pointing at the
+// fresh comment that tracks the resumed apply.
+func TestE2EStoppedApplyKeepsFullProgressRenderingAtTerminal(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-stop-no-fold",
+		pr:         150,
+		database:   "e2e_stop_no_fold_db",
+		applyState: state.Apply.Running,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(t.Context(), "org/repo-stop-no-fold", 150, 12345, apply, state.Comment.Progress, "Copying rows — 50%")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The stop record posts as the summary comment.
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "Schema Change Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a stop summary comment")
+	}
+
+	// The progress comment freezes at its full stopped rendering — unfolded,
+	// so the resume rotation has the stop record to fold later.
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, progressID, edited.CommentID, "the status freeze lands on the tracked progress comment")
+		assert.Contains(t, edited.Body, "**Status**: Stopped")
+		assert.NotContains(t, edited.Body, "#issuecomment-", "a stopped apply's progress comment is not folded toward a successor")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the progress comment to be frozen at the stopped rendering")
+	}
 }
 
 // failingCommentUpsertStore wraps an ApplyCommentStore so every Upsert fails
