@@ -47,6 +47,11 @@ type PlanRequest struct {
 	// Optional — absent for non-webhook callers (e.g. CLI plan invocations without a PR).
 	HeadSHA    *string `json:"head_sha,omitempty"`
 	SchemaPath string  `json:"-"`
+	// IgnoredNamespaces lists the namespaces the caller removed from
+	// SchemaFiles per the config's ignore_namespaces, resolved for the
+	// environment. Forwarded to the data plane so it can refuse engine shapes
+	// that cannot honor the exclusion.
+	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
 
 	// SourceTrusted is set by the GitHub webhook path after SchemaBot has
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
@@ -546,13 +551,14 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 
 	ternReq := &ternv1.PlanRequest{
-		Database:    req.Database,
-		Type:        resolvedTarget.DatabaseType,
-		SchemaFiles: req.SchemaFiles,
-		Repository:  req.Repository,
-		Environment: req.Environment,
-		Target:      resolvedTarget.Target,
-		SchemaPath:  trustedSchemaPath,
+		Database:          req.Database,
+		Type:              resolvedTarget.DatabaseType,
+		SchemaFiles:       req.SchemaFiles,
+		Repository:        req.Repository,
+		Environment:       req.Environment,
+		Target:            resolvedTarget.Target,
+		SchemaPath:        trustedSchemaPath,
+		IgnoredNamespaces: req.IgnoredNamespaces,
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
@@ -569,6 +575,19 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		"is_remote", client.IsRemote(),
 		"schema_file_count", len(req.SchemaFiles),
 	)
+	if len(req.IgnoredNamespaces) > 0 {
+		// The desired state is deliberately partial: the caller withheld these
+		// namespaces per the config's ignore_namespaces. Recorded so an operator
+		// tracing "why does this plan not touch namespace X" finds the answer in
+		// server logs.
+		s.logger.Info("plan request excludes ignored namespaces",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"ignored_namespaces", req.IgnoredNamespaces,
+		)
+	}
 
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {

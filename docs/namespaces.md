@@ -14,8 +14,12 @@
 - [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
   - [Example](#example)
   - [Rules](#rules)
-- [Per-Target Schema Overrides](#per-target-schema-overrides)
+- [Ignoring Namespaces](#ignoring-namespaces)
   - [Rules](#rules-1)
+  - [Exclusions are disclosed](#exclusions-are-disclosed)
+  - [MySQL target DSN requirements](#mysql-target-dsn-requirements)
+- [Per-Target Schema Overrides](#per-target-schema-overrides)
+  - [Rules](#rules-2)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
 
@@ -225,6 +229,61 @@ schemabot plan -s myapp/schema -e production
 - You can mix `$ENV` directories with regular directories in the subdirectory layout.
 - When creating the directory from a shell, quote the name to prevent shell expansion: `mkdir 'bikeshare_$ENV'`
 
+## Ignoring Namespaces
+
+Some schema roots contain a namespace directory that should never be reconciled against a live database. A common example is a Vitess keyspace that exists only in local test infrastructure: the repository carries its schema files so local tooling can create the keyspace, but no real environment has it (or the environment keeps it intentionally empty). Without an exclusion, every plan would propose creating those tables.
+
+List such namespaces under `ignore_namespaces` in `schemabot.yaml`:
+
+```
+myapp/schema/
+├── schemabot.yaml
+├── commerce/
+│   ├── orders.sql
+│   └── vschema.json
+└── commerce_test/          ← ignored: never planned or applied
+    ├── fixtures.sql
+    └── vschema.json
+```
+
+```yaml
+# schemabot.yaml
+database: commerce
+type: vitess
+ignore_namespaces:
+  - commerce_test
+```
+
+### Rules
+
+- Entries are bare namespace names, not paths. An entry containing `/` or `\` (e.g., `schema/commerce_test`) is rejected when the config is loaded.
+- Ignored namespaces are excluded from plans, applies, and merge-gate checks. This applies to both the GitHub PR flow and the CLI (`schemabot plan` / `schemabot apply` read the same `schemabot.yaml`).
+- `$ENV` substitution applies to entries the same way it applies to directory names: `fixtures_$ENV` ignores the `fixtures_staging` namespace when planning for staging.
+- Matching is exact and case-sensitive. An entry that matches no namespace directory excludes nothing; the plan proceeds and the unmatched entry is reported (a CLI warning, a server-side log) so a typo or stale entry is visible.
+- Ignoring every namespace in the schema root is an error: the plan fails rather than reconciling an empty desired state.
+- Ignoring a namespace does not exempt the directory from layout validation; a schema root mixing flat files and subdirectories is still rejected.
+
+### Exclusions are disclosed
+
+Every plan that excluded namespaces says so: the PR plan comment renders an
+`ℹ️ Namespaces excluded from this plan by ignore_namespaces: …` line under the
+plan summary (also on "no changes" results, so a withheld namespace is
+distinguishable from an unchanged one), and the CLI prints the same disclosure
+for `plan` and `apply`.
+When reviewing a PR that *introduces* an `ignore_namespaces` entry, the
+disclosure plus the config diff is the review surface: the plan stops
+reconciling that namespace from this PR onward.
+
+### MySQL target DSN requirements
+
+For MySQL targets, `ignore_namespaces` requires a **namespace-free** target
+DSN (one that does not name a database), where each namespace directory is
+diffed against its own database. A DSN that already names a database diffs
+the whole database as one unit: an ignored namespace's live tables would
+have no declaring files and the diff would plan them as `DROP TABLE`, the
+inverse of "ignore". SchemaBot refuses this combination, and the plan fails with
+an error asking for a namespace-free DSN or removal of `ignore_namespaces`.
+
 ## Per-Target Schema Overrides
 
 `$ENV` substitution handles physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
@@ -261,6 +320,7 @@ The canonical namespace stays the name everywhere SchemaBot stores or shows it �
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
 | Environment-specific namespace | 1 | 1 per env | `bikeshare_$ENV/` |
+| Repo-only namespace (never deployed) | 1 | all except ignored | `ignore_namespaces: [commerce_test]` |
 | Deployment-specific physical schema | 1 | 1 canonical | `bikeshare/` + per-target `schema_overrides` |
 
 ## How Namespaces Flow Through the System

@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -79,11 +80,12 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	// Collect results for all environments
 	allResults := make(map[string]*apitypes.PlanResponse)
+	ignoredByEnv := make(map[string][]string)
 	for _, env := range environments {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces)
 			return planErr
 		})
 		if err != nil {
@@ -100,6 +102,20 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	if cmd.JSON {
 		return writeJSON(allResults)
+	}
+
+	// Disclose config-driven exclusions once per distinct resolution — the
+	// lists only differ between environments when entries use $ENV.
+	disclosed := make(map[string]bool)
+	for _, env := range environments {
+		ignored := ignoredByEnv[env]
+		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
+		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
+		if disclosed[key] {
+			continue
+		}
+		disclosed[key] = true
+		templates.WriteIgnoredNamespaces(ignored, unmatched)
 	}
 
 	// Human-readable output for all environments

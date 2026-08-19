@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -748,6 +749,28 @@ func TestLocalClient_Apply_RequiresEnvironmentField(t *testing.T) {
 		Options: map[string]string{"environment": "development"},
 	})
 	require.ErrorContains(t, err, "environment is required")
+}
+
+// A database-scoped MySQL target DSN diffs the whole database as one unit, so
+// a namespace withheld via ignore_namespaces would leave its live tables with
+// no declaring file and the diff would plan them as DROP TABLE — the inverse
+// of "ignore". The plan must refuse this combination up front rather than
+// emit a destructive plan.
+func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/testdb",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.planWithEngine(t.Context(), &ternv1.PlanRequest{
+		Database:          "testdb",
+		IgnoredNamespaces: []string{"local_fixtures"},
+	}, "testdb", schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ignore_namespaces is not supported for MySQL targets whose DSN names a database")
+	assert.Contains(t, err.Error(), "local_fixtures")
 }
 
 func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {

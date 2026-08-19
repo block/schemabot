@@ -398,6 +398,12 @@ type PlanRequest struct {
 	// cross-delivery race where HEAD advances between plan and confirm.
 	// Optional — absent for non-webhook callers (e.g. CLI plan invocations without a PR).
 	HeadSHA *string `json:"head_sha,omitempty"`
+	// IgnoredNamespaces lists the namespaces the caller removed from
+	// SchemaFiles per the config's ignore_namespaces, resolved for the
+	// environment. The data plane refuses engine shapes that diff the whole
+	// target as one unit (a database-scoped MySQL DSN), where a withheld
+	// namespace's live tables would otherwise be planned as drops.
+	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.

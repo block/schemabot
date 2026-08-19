@@ -180,8 +180,22 @@ type e2eServiceOpts struct {
 	skipOperator bool
 	// databaseType and targetDSN let integration scenarios exercise another
 	// built-in engine while retaining the same API, storage, and operator path.
+	// For MySQL, a non-empty targetDSN overrides the default database-scoped
+	// DSN — e.g. a namespace-free DSN for scenarios where the namespace
+	// selects the database.
 	databaseType string
 	targetDSN    string
+}
+
+// namespaceFreeTargetDSN returns the shared MySQL target's DSN with no
+// database selected — the shape where each namespace's directory name selects
+// the database it is planned against.
+func namespaceFreeTargetDSN(t *testing.T) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	return cfg.FormatDSN()
 }
 
 // setupE2EServiceOpts creates a real api.Service with a LocalClient for the
@@ -211,10 +225,12 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 			}
 		})
 
-		cfg, err := mysql.ParseDSN(e2eTargetDSN)
-		require.NoError(t, err)
-		cfg.DBName = appDBName
-		appDSN = cfg.FormatDSN()
+		if appDSN == "" {
+			cfg, err := mysql.ParseDSN(e2eTargetDSN)
+			require.NoError(t, err)
+			cfg.DBName = appDBName
+			appDSN = cfg.FormatDSN()
+		}
 	}
 	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -540,7 +556,9 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 }
 
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
-// schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
+// schemaSQL maps filename -> content. Plain filenames are placed under
+// schema/{namespace}/; filenames containing a "/" are placed under schema/
+// as-is, so a test can lay out multiple namespace subdirectories.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
@@ -710,6 +728,16 @@ func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.Tre
 	return level
 }
 
+// schemaFixturePath resolves a schemaSQL key to its repository path: plain
+// filenames live under the namespace subdirectory, keys with a "/" already
+// name their namespace subdirectory.
+func schemaFixturePath(ns, name string) string {
+	if strings.Contains(name, "/") {
+		return "schema/" + name
+	}
+	return "schema/" + ns + "/" + name
+}
+
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
@@ -775,7 +803,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
-				Filename: new("schema/" + ns + "/" + name),
+				Filename: new(schemaFixturePath(ns, name)),
 				Status:   new("added"),
 			})
 		}
@@ -805,7 +833,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		blobIndex++
 		blobContents[sha] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/" + ns + "/" + name),
+			Path: new(schemaFixturePath(ns, name)),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(sha),

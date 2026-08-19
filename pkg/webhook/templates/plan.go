@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"html"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
@@ -87,6 +88,14 @@ type PlanCommentData struct {
 	LintViolations []LintViolationData
 	Errors         []string
 
+	// IgnoredNamespaces lists the namespaces whose schema files were excluded
+	// from this plan by the repository's ignore_namespaces config — only entries
+	// that actually removed a namespace, resolved and sorted. Disclosed on the
+	// comment so a reviewer can tell "this namespace has no changes" apart from
+	// "this namespace was withheld by config", which is what makes a PR that
+	// introduces an ignore_namespaces entry visible in review.
+	IgnoredNamespaces []string
+
 	// Unsafe change tracking
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
@@ -170,9 +179,16 @@ func RenderPlanComment(data PlanCommentData) string {
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
-	// No changes — short-circuit with a single clean message
+	// No changes — short-circuit with a single clean message. The
+	// ignore_namespaces disclosure still renders: a no-changes result is
+	// exactly where a reviewer needs to tell a withheld namespace apart from a
+	// genuinely unchanged one.
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
+		if len(data.IgnoredNamespaces) > 0 {
+			sb.WriteString("\n")
+			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
+		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
@@ -390,6 +406,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if totalChanges == 0 {
 		writeNoChangesDetected(sb, data)
 		sb.WriteString("\n")
+		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 		return
 	}
 
@@ -415,6 +432,79 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	} else {
 		// Fallback for unrecognized statement types
 		fmt.Fprintf(sb, "📋 **Plan**: %d DDL %s\n\n", totalStatements, pluralize("statement", totalStatements))
+	}
+
+	// Disclosed directly under the plan summary so the exclusion reads as
+	// part of the plan result: what was counted, then what was withheld.
+	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
+}
+
+// writeIgnoredNamespaces renders the ignore_namespaces disclosure line. No-op
+// when nothing was excluded, so plans from repos without the config render
+// unchanged.
+func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
+	if len(ignored) == 0 {
+		return
+	}
+	quoted := make([]string, len(ignored))
+	for i, ns := range ignored {
+		quoted[i] = fmt.Sprintf("`%s`", ns)
+	}
+	fmt.Fprintf(sb, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+}
+
+// multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
+// namespaces, so callers can decide whether the disclosure (and its spacing)
+// renders at all.
+func multiEnvHasIgnoredNamespaces(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if plan, ok := data.Plans[env]; ok && plan != nil && len(plan.IgnoredNamespaces) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// writeMultiEnvIgnoredNamespaces renders the ignore_namespaces disclosure for
+// the all-environments-clean path, where no per-environment sections exist to
+// carry it. When every environment excluded the same namespaces it renders the
+// single shared line; otherwise one line per environment, since entries can
+// resolve differently per environment.
+func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	anyIgnored := false
+	identical := true
+	var first []string
+	for i, env := range data.Environments {
+		var ignored []string
+		if plan, ok := data.Plans[env]; ok && plan != nil {
+			ignored = plan.IgnoredNamespaces
+		}
+		if len(ignored) > 0 {
+			anyIgnored = true
+		}
+		if i == 0 {
+			first = ignored
+		} else if !slices.Equal(ignored, first) {
+			identical = false
+		}
+	}
+	if !anyIgnored {
+		return
+	}
+	if identical {
+		writeIgnoredNamespaces(sb, first)
+		return
+	}
+	for _, env := range data.Environments {
+		plan, ok := data.Plans[env]
+		if !ok || plan == nil || len(plan.IgnoredNamespaces) == 0 {
+			continue
+		}
+		quoted := make([]string, len(plan.IgnoredNamespaces))
+		for i, ns := range plan.IgnoredNamespaces {
+			quoted[i] = fmt.Sprintf("`%s`", ns)
+		}
+		fmt.Fprintf(sb, "ℹ️ **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
 	}
 }
 
@@ -934,9 +1024,16 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	}
 	hasErrors := len(data.Errors) > 0
 
-	// If no environments have changes and no errors, show simple message
+	// If no environments have changes and no errors, show simple message. The
+	// ignore_namespaces disclosure still renders underneath it: an all-clean
+	// result is exactly where a reviewer needs to see that a namespace was
+	// withheld rather than genuinely unchanged.
 	if envsWithChanges == 0 && !hasErrors {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
+		if multiEnvHasIgnoredNamespaces(data) {
+			sb.WriteString("\n")
+			writeMultiEnvIgnoredNamespaces(&sb, data)
+		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
@@ -1055,8 +1152,12 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
+	// The ignore_namespaces disclosure renders under each environment's
+	// summary (writePlanSummary) or no-changes message, because entries can
+	// resolve differently per environment.
 	if totalChanges == 0 {
 		sb.WriteString("✅ **No schema changes detected**\n\n")
+		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		return
 	}
 
@@ -1194,8 +1295,13 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 	return firstPlan != nil
 }
 
-// plansIdentical checks if two plans have the same DDL statements.
+// plansIdentical checks if two plans have the same DDL statements. Plans that
+// excluded different namespaces are never identical: deduplicating them into
+// one section would show one environment's exclusion disclosure for both.
 func plansIdentical(a, b *PlanCommentData) bool {
+	if !slices.Equal(a.IgnoredNamespaces, b.IgnoredNamespaces) {
+		return false
+	}
 	if len(a.Changes) != len(b.Changes) {
 		return false
 	}

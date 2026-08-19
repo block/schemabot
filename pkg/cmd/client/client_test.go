@@ -190,7 +190,7 @@ func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ks_sharded"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ks_sharded", "orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0o644))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	require.Contains(t, result, "ks_unsharded")
@@ -211,7 +211,7 @@ func TestReadSchemaFiles_SymlinkedDirectories(t *testing.T) {
 	symlinkDir := filepath.Join(dir, "ks_symlink")
 	require.NoError(t, os.Symlink(realDir, symlinkDir))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	// Both the real directory and the symlink should be read
@@ -237,7 +237,7 @@ func TestReadSchemaFiles_MixedRealAndSymlinked(t *testing.T) {
 	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_001")))
 	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_002")))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	// All four keyspaces should be present
@@ -260,11 +260,75 @@ func TestReadSchemaFiles_SkipsNonSchemaFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mydb", "README.md"), []byte("ignore me"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mydb", "vschema.json"), []byte("{}"), 0o644))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	require.Contains(t, result, "mydb")
 	assert.Contains(t, result["mydb"].Files, "users.sql")
 	assert.Contains(t, result["mydb"].Files, "vschema.json")
 	assert.NotContains(t, result["mydb"].Files, "README.md")
+}
+
+func TestReadSchemaFiles_IgnoreNamespaces(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ks_unsharded"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ks_unsharded", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "local_fixtures"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "local_fixtures", "widgets.sql"), []byte("CREATE TABLE widgets (id INT)"), 0o644))
+
+	result, removed, err := ReadSchemaFiles(dir, "", []string{"local_fixtures"})
+	require.NoError(t, err)
+
+	require.Contains(t, result, "ks_unsharded")
+	assert.NotContains(t, result, "local_fixtures")
+	assert.Equal(t, []string{"local_fixtures"}, removed)
+}
+
+// A flat-layout schema directory has exactly one namespace — the directory
+// name itself — so ignoring it removes every schema file. The plan call must
+// fail with an error naming the exclusion rather than planning an empty
+// desired state, which on a live database would read as "drop everything".
+func TestCallPlanAPI_IgnoreSoleFlatNamespace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "orders")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, []string{"orders"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "after excluding ignored namespaces")
+	assert.Contains(t, err.Error(), "orders")
+	assert.Equal(t, []string{"orders"}, ignored)
+}
+
+// The namespaces removed by ignore_namespaces must reach the server on the
+// plan request: their files are already absent from schema_files, and the
+// server needs the ignored list to refuse engine shapes that cannot honor
+// the exclusion.
+func TestCallPlanAPI_SendsIgnoredNamespaces(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "local_fixtures"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "local_fixtures", "widgets.sql"), []byte("CREATE TABLE widgets (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/plan", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, []string{"local_fixtures"})
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"local_fixtures"}, ignored)
+	assert.Equal(t, []string{"local_fixtures"}, gotReq.IgnoredNamespaces)
+	require.Contains(t, gotReq.SchemaFiles, "payments")
+	assert.NotContains(t, gotReq.SchemaFiles, "local_fixtures")
 }
