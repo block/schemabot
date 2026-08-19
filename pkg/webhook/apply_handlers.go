@@ -72,7 +72,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, result.Tenant, installationID, result.CommentID)
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, result.Tenant, installationID, result.DeliveryID, result.CommentID)
 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)

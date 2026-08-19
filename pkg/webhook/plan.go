@@ -17,7 +17,7 @@ import (
 )
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string, commentID int64) {
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, deliveryID, requestedBy string, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -44,7 +44,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
-	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, tenant, installationID, commentID)
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, tenant, installationID, deliveryID, commentID)
 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)

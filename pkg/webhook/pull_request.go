@@ -129,7 +129,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup queued"})
 			return
 		}
-		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
+		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, deliveryID, func() {
 			// One-shot: a failure here (including a lock lookup/release error,
 			// which also skips the check-state delete) is logged and not
 			// retried. That direction is fail-closed — retained locks and
@@ -223,7 +223,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		return
 	}
 
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 		if err != nil {
 			metrics.RecordWebhookEvent(context.Background(), metricApp, "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
@@ -481,7 +481,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	// Clean up stale checks from databases no longer in the PR.
 	// Pass the new HEAD SHA so cleanup can create new check runs on the correct commit.
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
 	})
 
@@ -520,7 +520,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		if h.leaderExpectsParticipantsForPR(repo, files) {
 			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
-			h.goSafe(repo, pr, installationID, func() {
+			h.goSafe(repo, pr, installationID, deliveryID, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				c, err := h.clientForRepo(repo, installationID)
@@ -539,7 +539,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// recreated on the new commit. If stale per-database check records exist,
 		// cleanupStaleChecks (above) also updates the aggregate — both converge
 		// to the same result (passing aggregate on new SHA) so the overlap is safe.
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			c, err := h.clientForRepo(repo, installationID)
@@ -579,7 +579,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	}
 	for _, cfg := range configs {
 		database := cfg.Config.Database
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, postPlanComment, 0)
 		})
 	}
