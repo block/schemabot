@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -102,7 +103,7 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 	return nil
 }
 
-func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
+func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, logger *slog.Logger) error {
 	if !state.IsState(apply.State, state.Apply.WaitingForCutover) && !state.IsRunningApplyState(apply.State) {
 		return nil
 	}
@@ -117,6 +118,16 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 	now := time.Now()
 	apply.State = state.Apply.CuttingOver
 	apply.UpdatedAt = now
+	// A multi-operation drive owns only its operation: the parent cutting_over
+	// write is the operator's projection to make — a direct write here fails
+	// closed under the operation-only lease and would block a cutover the
+	// engine is ready to accept. The in-memory transition still stands so this
+	// drive proceeds to dispatch the cutover.
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("pending cutover request accepted under operation lease; parent cutting_over state is the operator's projection",
+			"state", apply.State)
+		return nil
+	}
 	if err := applyStore.Update(ctx, apply); err != nil {
 		*apply = previous
 		return fmt.Errorf("mark apply %s cutting over for pending cutover request: %w", apply.ApplyIdentifier, err)
