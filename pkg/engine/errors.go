@@ -76,12 +76,16 @@ func IsAlreadyCompleted(err error) bool {
 	return errors.As(err, &alreadyCompleted)
 }
 
-// UnsupportedOperationError wraps an error to indicate the engine cannot
-// perform the requested control operation for its database type — ever, not
-// just for this schema change or this moment. Retrying can never succeed, so
-// a caller consuming a durable control request should resolve the request
-// terminally with the engine's reason instead of retrying, leaving the
-// underlying schema change untouched to settle on its own.
+// UnsupportedOperationError wraps an error to indicate the engine declines
+// the requested control operation deterministically: it will refuse it for
+// every schema change on its database type, not just for this one or this
+// moment, so retrying through the engine can never succeed. A caller
+// consuming a durable control request should resolve the request terminally
+// with the engine's reason instead of retrying, leaving the underlying
+// schema change untouched to settle on its own. The decline speaks for the
+// engine, not the database: the operation may still be possible out of band
+// at the database itself, and the decline reason should tell the operator
+// how when it is.
 type UnsupportedOperationError struct {
 	Err error
 }

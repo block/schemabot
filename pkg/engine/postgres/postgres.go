@@ -226,10 +226,13 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
 }
 
-// Cancel declines: a PostgreSQL schema change has no engine phase to
-// terminate — an in-flight statement either commits or fails on its own.
+// Cancel declines: the engine runs each statement as one transaction and does
+// not track the database backend executing it, so it cannot terminate the
+// statement itself. An in-flight DDL can still be interrupted at the database
+// — during a lock pileup that is exactly what an operator needs — so the
+// decline reason points at the out-of-band path instead of stopping at "no".
 func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("cancel is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
+	return nil, engine.NewUnsupportedOperationError("cancel is not implemented for PostgreSQL schema changes: the engine cannot terminate its in-flight statement, which commits or fails as one transaction; to interrupt it at the database, find the backend running the DDL in pg_stat_activity and cancel it with pg_cancel_backend")
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is

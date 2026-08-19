@@ -1043,10 +1043,10 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 // is failed with the engine's reason, and the apply is left untouched: the
 // running change settles itself through its own apply path. Returns
 // declined=false when the error is not an unsupported-operation decline, so
-// the caller applies its normal error handling. When declined=true the caller
-// must report the request as not handled: no stop or cancel took effect, and
-// treating the resolved decline as an operator stop would let the drive loop
-// mark the still-running apply stopped.
+// the caller applies its normal error handling. When declined=true the
+// operation did not take effect: a stop or cancel caller must report the
+// request as not handled, or the drive loop would mark the still-running
+// apply stopped.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	unsupported, ok := engine.AsUnsupportedOperation(opErr)
 	if !ok {
@@ -1991,6 +1991,13 @@ func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, ap
 		Credentials: creds,
 	})
 	if err != nil {
+		// A typed unsupported-operation decline resolves through the shared
+		// helper so it is counted on the decline metric like stop and cancel:
+		// an operator repeatedly reaching for volume on an engine without a
+		// tunable copy is exactly the signal that metric exists to surface.
+		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply, storage.ControlOperationVolume, storage.LogEventVolumeRequested, controlReq, err); declined {
+			return declineErr
+		}
 		c.logger.Warn("engine rejected pending volume request; schema change continues at its current volume",
 			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "error", err)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,
