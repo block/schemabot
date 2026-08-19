@@ -1520,6 +1520,23 @@ func TestRenderApplySummaryComment_StartedAtUsesApplyStart(t *testing.T) {
 	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
 }
 
+// The duration is decoration: valid timestamps render it, and a completed
+// timestamp earlier than the started timestamp (bad data, clock skew) drops it
+// rather than rendering a negative duration.
+func TestRenderApplySummaryComment_Duration(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		StartedAt:   "2026-06-16T19:42:00Z",
+		CompletedAt: "2026-06-16T19:59:00Z",
+	}
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
+
+	data.CompletedAt = "2026-06-16T19:00:00Z"
+	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
+}
+
 func TestRenderPRCommandNotAuthorized(t *testing.T) {
 	result := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "mona",

@@ -58,6 +58,92 @@ func TestValidHost(t *testing.T) {
 	})
 }
 
+func TestPullRequest(t *testing.T) {
+	t.Run("webhook caller yields its repo and PR number", func(t *testing.T) {
+		repo, pr, ok := PullRequest("github:jdoe@acme/repo#42")
+		assert.True(t, ok)
+		assert.Equal(t, "acme/repo", repo)
+		assert.Equal(t, 42, pr)
+	})
+
+	t.Run("email-shaped user splits at the last at-sign", func(t *testing.T) {
+		repo, pr, ok := PullRequest("github:jdoe@example.com@acme/repo#42")
+		assert.True(t, ok)
+		assert.Equal(t, "acme/repo", repo)
+		assert.Equal(t, 42, pr)
+	})
+
+	t.Run("bare server-substituted location yields its repo and PR number", func(t *testing.T) {
+		repo, pr, ok := PullRequest("acme/repo#42")
+		assert.True(t, ok)
+		assert.Equal(t, "acme/repo", repo)
+		assert.Equal(t, 42, pr)
+	})
+
+	t.Run("CLI caller is rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("cli:jdoe@macbook.local")
+		assert.False(t, ok)
+	})
+
+	t.Run("bare subject with a slash-and-hash tail is rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("jdoe@example.com@acme/repo#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("jdoe@example.com")
+		assert.False(t, ok)
+	})
+
+	t.Run("webhook caller without a location is rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe")
+		assert.False(t, ok)
+	})
+
+	t.Run("location without a PR number is rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@acme/repo")
+		assert.False(t, ok)
+	})
+
+	t.Run("location without an owner/name repo is rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@repo#42")
+		assert.False(t, ok)
+	})
+
+	t.Run("repo with extra path segments or empty segments is rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@owner/repo/extra#123")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("owner/repo/extra#123")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@/repo#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@owner/#42")
+		assert.False(t, ok)
+	})
+
+	t.Run("non-positive and non-numeric PR numbers are rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@acme/repo#0")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo#abc")
+		assert.False(t, ok)
+	})
+
+	t.Run("signed and zero-padded PR numbers are rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@acme/repo#+5")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo#-1")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo#007")
+		assert.False(t, ok)
+	})
+
+	t.Run("repo segments outside repository-shaped characters are rejected", func(t *testing.T) {
+		_, _, ok := PullRequest("github:jdoe@acme/repo name#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("github:jdoe@acme/repo\x1b[2K#42")
+		assert.False(t, ok)
+		_, _, ok = PullRequest("acme/repo\nname#42")
+		assert.False(t, ok)
+	})
+}
+
 func TestShort(t *testing.T) {
 	t.Run("CLI caller drops the machine", func(t *testing.T) {
 		assert.Equal(t, "cli:jdoe", Short("cli:jdoe@macbook.local"))

@@ -36,7 +36,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
 	github.com/aws/smithy-go v1.27.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/block/pg-sprite v0.0.0-20260814025010-d6cf677e4feb // indirect
+	github.com/block/pg-sprite v0.1.0 // indirect
 	github.com/block/spirit v0.16.1-0.20260818201143-cc006c921a50 // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect

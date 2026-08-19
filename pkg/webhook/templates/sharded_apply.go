@@ -29,6 +29,11 @@ type ShardedApplyData struct {
 	StartedAt   string
 	CompletedAt string
 
+	// ErrorMessage is the apply-level error. It is surfaced when the apply
+	// failed without any shard in a failure state — a failure outside shard work
+	// (e.g. a finalizer) leaves no failed shard row to carry the cause.
+	ErrorMessage string
+
 	// Shards is the per-shard rollup in resolved order: one entry per shard with
 	// its aggregate state. It drives the count histogram, each group's status
 	// rows, and the first-failure callout.
@@ -99,30 +104,86 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeShardedMetadata(&sb, data, renderedAt)
 
 	writeShardCounts(&sb, data.Shards)
-	writeShardFirstFailure(&sb, data.Shards)
-
-	fmt.Fprintf(&sb, "\n#### Keyspace `%s`\n", data.Keyspace)
-	// The applied comment shows shard status only. The DDL (what changes) is
-	// already shown in the plan and apply-gate comments, so repeating it here adds
-	// nothing — and rendering "DDL unavailable" when the apply path has no per-shard
-	// DDL is pure noise. Shards are still grouped by change so a divergent apply
-	// shows which shards moved together.
-	groups := groupShardsBySignature(data.Shards, data.Cells)
-	if len(groups) <= 1 {
-		writeShardStatusTable(&sb, data.Shards)
-	} else {
-		sb.WriteString("\nShards diverge — grouped by change:\n")
-		for _, g := range groups {
-			fmt.Fprintf(&sb, "\n**%s**\n", shardList(g.Shards))
-			writeShardStatusTable(&sb, g.Shards)
-		}
-	}
+	writeShardedFailure(&sb, data)
+	writeShardKeyspaceSection(&sb, data)
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
 		writeLastUpdatedFooter(&sb, renderedAt)
 	}
 	return sb.String()
+}
+
+// RenderShardedApplySummaryComment renders the final summary PR comment for a
+// terminal sharded apply — the shard-unit analogue of RenderApplySummaryComment.
+// It leads with the state-specific verdict header and outcome line every other
+// apply shape's summary shares, then carries the same shard rollup the status
+// comment shows (counts, first failure, per-shard tables grouped by change
+// signature) so the outcome record names every shard's final state.
+func RenderShardedApplySummaryComment(data ShardedApplyData) string {
+	var sb strings.Builder
+
+	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
+	writeShardedSummaryMetadata(&sb, data)
+	if state.IsState(data.State, state.Apply.Completed) {
+		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data.Cells), data.Rollback))
+	}
+	writeShardCounts(&sb, data.Shards)
+	writeShardedFailure(&sb, data)
+	writeShardKeyspaceSection(&sb, data)
+	writeShardedFooter(&sb, data)
+	return sb.String()
+}
+
+// shardedChangeIsSingular reports whether the shards apply a single table's
+// change, driving the outcome line's singular/plural wording. An apply with no
+// per-shard DDL cells reads as plural — the shard count alone does not prove a
+// single change. VSchema changes are not counted: the sharded data model
+// carries no VSchema display data (the engine display pipeline is
+// PlanetScale-only), so the grammar reflects table changes alone until that
+// data exists for sharded applies.
+func shardedChangeIsSingular(cells []ShardCell) bool {
+	tables := make(map[string]struct{}, len(cells))
+	for _, c := range cells {
+		tables[c.Table] = struct{}{}
+	}
+	return len(tables) == 1
+}
+
+// writeShardedSummaryMetadata writes the terminal metadata line — database,
+// engine type, apply ID, and duration when both timestamps are known — followed
+// by the attribution line: the sharded analogue of writeSummaryMetadata.
+func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
+	parts := []string{
+		fmt.Sprintf("**Database**: `%s`", data.Database),
+		"**Type**: `Strata`",
+		fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID),
+	}
+	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
+		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
+	}
+	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
+}
+
+// writeShardKeyspaceSection writes the keyspace heading and the per-shard
+// status tables grouped by change signature. The section shows shard status
+// only: the DDL (what changes) is already shown in the plan and apply-gate
+// comments, so repeating it here adds nothing — and rendering "DDL unavailable"
+// when the apply path has no per-shard DDL is pure noise. Shards are still
+// grouped by change so a divergent apply shows which shards moved together.
+func writeShardKeyspaceSection(sb *strings.Builder, data ShardedApplyData) {
+	fmt.Fprintf(sb, "\n#### Keyspace `%s`\n", data.Keyspace)
+	groups := groupShardsBySignature(data.Shards, data.Cells)
+	if len(groups) <= 1 {
+		writeShardStatusTable(sb, data.Shards)
+		return
+	}
+	sb.WriteString("\nShards diverge — grouped by change:\n")
+	for _, g := range groups {
+		fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards))
+		writeShardStatusTable(sb, g.Shards)
+	}
 }
 
 func writeShardedMetadata(sb *strings.Builder, data ShardedApplyData, renderedAt string) {
@@ -232,11 +293,14 @@ func isShardFailureState(opState string) bool {
 	return opState == state.ApplyOperation.Failed || opState == state.ApplyOperation.FailedRetryable
 }
 
-// writeShardFirstFailure lifts the first failed shard's error to the top so an
-// operator sees the cause without scanning the table. Renders nothing when no
-// shard has failed or is retrying after a failure.
-func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
-	for _, s := range shards {
+// writeShardedFailure lifts the failure cause to the top so an operator sees
+// it without scanning the table: the first failed shard's error when shard
+// work failed, otherwise the apply-level error — a failure outside shard work
+// (e.g. a finalizer) leaves no failed shard row to carry the cause, and a
+// failed apply must still name it. Renders nothing when the apply carries no
+// failure to explain.
+func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
+	for _, s := range data.Shards {
 		if !isShardFailureState(s.State) {
 			continue
 		}
@@ -247,6 +311,12 @@ func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
 			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))
 		}
 		return
+	}
+	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
+		return
+	}
+	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
+		fmt.Fprintf(sb, "\n> ⚠️ **Failure:** %s\n", html.EscapeString(msg))
 	}
 }
 
@@ -278,8 +348,9 @@ func shardStatusCell(s ShardStatus) string {
 
 // writeShardedFooter renders the single next operator action, matching the
 // single-deployment footer vocabulary: a failed apply is retried, an
-// auto-retrying (failed_retryable) apply offers the stop-retrying command, and a
-// stopped apply is resumed.
+// auto-retrying (failed_retryable) apply offers the stop-retrying command, a
+// stopped apply is resumed, and a cancelled apply — permanent, unlike stopped —
+// directs the operator to open a new schema change.
 func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 	switch {
 	case state.IsState(data.State, state.Apply.Failed):
@@ -288,5 +359,7 @@ func writeShardedFooter(sb *strings.Builder, data ShardedApplyData) {
 		writeFooterAction(sb, "An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:", appendTenantFlag(fmt.Sprintf("schemabot stop %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.IsState(data.State, state.Apply.Stopped):
 		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+	case state.IsState(data.State, state.Apply.Cancelled):
+		sb.WriteString("\n---\n\nThis schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	}
 }
