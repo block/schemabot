@@ -788,6 +788,13 @@ func writeThrottleTooltip(b *strings.Builder, t TableProgress) {
 	if !t.Throttled || t.ThrottleReason == "" {
 		return
 	}
+	// The raw reason names the engine signal; the tip says what the pause
+	// protects. A reason whose signal has no tip renders alone so a new
+	// engine signal degrades to raw text rather than a wrong explanation.
+	if tip := ui.ThrottleTip(t.ThrottleReason); tip != "" {
+		fmt.Fprintf(b, indentDetail+"%sℹ️ Throttled: %s · %s%s\n", ANSIDim, t.ThrottleReason, tip, ANSIReset)
+		return
+	}
 	fmt.Fprintf(b, indentDetail+"%sℹ️ Throttled: %s%s\n", ANSIDim, t.ThrottleReason, ANSIReset)
 }
 
