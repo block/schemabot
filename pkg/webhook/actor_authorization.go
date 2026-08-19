@@ -13,9 +13,14 @@ import (
 
 // actorAuthorizationClient resolves the installation-scoped GitHub client used
 // for actor authorization team membership lookups. The client is only needed
-// when PR command authorization is enabled. A client resolution failure fails
-// closed: the command is blocked and an authorization-unavailable comment is
-// posted so the actor knows no schema change action was taken.
+// when PR command authorization is enabled; a nil client with a nil error
+// means authorization is skipped — either the gate is disabled or no GitHub
+// clients are configured. A client resolution failure fails closed: the
+// command is blocked, a best-effort authorization-unavailable comment is
+// posted so the actor knows no schema change action was taken, and the cause
+// is returned so durable callers can classify it — a deterministic GitHub App
+// resolution failure (errGitHubAppResolution) is terminal, while a transient
+// client-creation failure stays retryable.
 func (h *Handler) actorAuthorizationClient(
 	repo string,
 	pr int,
@@ -24,9 +29,9 @@ func (h *Handler) actorAuthorizationClient(
 	database string,
 	environment string,
 	commandName string,
-) (*ghclient.InstallationClient, bool) {
+) (*ghclient.InstallationClient, error) {
 	if !h.service.Config().PRCommandAuthorizationEnabled() || h.ghClients.Len() == 0 {
-		return nil, false
+		return nil, nil
 	}
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
@@ -40,9 +45,9 @@ func (h *Handler) actorAuthorizationClient(
 			Database:    database,
 			Environment: environment,
 		}))
-		return nil, true
+		return nil, fmt.Errorf("actor authorization GitHub client for %s command %s#%d: %w", commandName, repo, pr, err)
 	}
-	return client, false
+	return client, nil
 }
 
 func (h *Handler) enforcePRCommandActorAuthorization(
