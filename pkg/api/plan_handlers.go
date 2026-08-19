@@ -1620,11 +1620,14 @@ func buildApplyTask(
 
 // ExecuteRollbackPlanForApply generates a rollback plan for a specific apply.
 func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storage.Apply) (*apitypes.PlanResponse, error) {
+	// Every caller resolves the apply through the rollback source guardrails
+	// first, so a nil apply is a programmer invariant violation: an internal
+	// failure that retrying the same request cannot repair.
 	if apply == nil {
-		return nil, fmt.Errorf("apply is required")
+		return nil, terminalControlf("apply is required")
 	}
 	if !state.IsState(apply.State, state.Apply.Completed) {
-		return nil, fmt.Errorf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
+		return nil, controlConflictf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
 
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
@@ -1632,28 +1635,31 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		return nil, fmt.Errorf("get rollback source plan: %w", err)
 	}
 	if plan == nil {
-		return nil, fmt.Errorf("plan not found for apply %s", apply.ApplyIdentifier)
+		return nil, terminalControlf("plan not found for apply %s", apply.ApplyIdentifier)
 	}
 	if !rollbackSourcePlanMatchesApply(plan, apply) {
-		return nil, fmt.Errorf("source plan %s belongs to %s/%s/%s, not apply %s for %s/%s/%s",
+		return nil, terminalControlf("source plan %s belongs to %s/%s/%s, not apply %s for %s/%s/%s",
 			plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Environment,
 			apply.ApplyIdentifier, apply.Database, apply.DatabaseType, apply.Environment)
 	}
 	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
-		return nil, err
+		return nil, terminalControlf("rollback source plan is invalid: %w", err)
 	}
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		return nil, err
+		return nil, terminalControlf("rollback source apply is invalid: %w", err)
 	}
 	if plan.Target == "" {
-		return nil, fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
+		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
+	// Client resolution is a config lookup: a deployment that cannot resolve a
+	// Tern client resolves the same way on every attempt, so the failure is
+	// terminal until an operator fixes the routing configuration.
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		return nil, fmt.Errorf("database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, terminalControlf("database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 
 	prNumber := int32(apply.PullRequest)
@@ -1675,7 +1681,19 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		Target:      plan.Target,
 	})
 	if err != nil {
-		return nil, err
+		// Mirror ExecutePlanProto's transport classification: only remote
+		// unavailability is worth retrying, because the same rollback plan
+		// request is safe to re-send. Every other failure is the engine's
+		// deterministic answer for this stored plan, so it is terminal for
+		// durable command processing.
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
+			return nil, &RemoteDeploymentUnavailableError{
+				Deployment: deployment,
+				Target:     plan.Target,
+				Err:        err,
+			}
+		}
+		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
