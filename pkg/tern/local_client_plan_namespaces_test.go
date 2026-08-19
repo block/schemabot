@@ -20,17 +20,17 @@ func planNamespacesTestClient() *LocalClient {
 }
 
 // TestNamespacesFromEngineChangesPersistsVSchemaMetadata verifies the local
-// plan-persistence path stores the same gate-facing VSchema change-metadata as
-// the gRPC path: the changed flag and the recorded deletions and mutations
-// survive into the namespace's plan data, alongside the desired-VSchema
-// artifact, so the apply-time unsafe gate can read them from the stored plan.
+// plan-persistence path stores the same apply-time VSchema change-metadata as
+// the gRPC path: the changed flag, the recorded deletions and mutations the
+// unsafe gate reads, and the rendered diff apply-time display shows survive
+// into the namespace's plan data, alongside the desired-VSchema artifact.
 func TestNamespacesFromEngineChangesPersistsVSchemaMetadata(t *testing.T) {
 	client := planNamespacesTestClient()
 	metadata := map[string]string{
 		storage.PlanMetadataVSchemaChanged:   "true",
 		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
 		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
-		"vschema":                            "rendered diff for display",
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
 	}
 	desiredVSchema := `{"sharded":true,"tables":{"users":{}}}`
 
@@ -53,11 +53,7 @@ func TestNamespacesFromEngineChangesPersistsVSchemaMetadata(t *testing.T) {
 	assert.Equal(t, "users", nsData.Tables[0].Table)
 	assert.Equal(t, desiredVSchema, nsData.Artifacts[storage.VSchemaArtifactName])
 	assert.Equal(t, storage.VSchemaPlanMetadata(metadata), nsData.Metadata)
-	assert.Equal(t, map[string]string{
-		storage.PlanMetadataVSchemaChanged:   "true",
-		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
-		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
-	}, nsData.Metadata)
+	assert.Equal(t, metadata, nsData.Metadata)
 }
 
 // TestNamespacesFromEngineChangesSiblingShardKeepsVSchemaMetadata verifies a

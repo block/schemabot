@@ -77,8 +77,22 @@ func PreviewCommentShardedSummaryCompleted() string {
 			{Deployment: "80-c0", State: state.ApplyOperation.Completed},
 			{Deployment: "c0-", State: state.ApplyOperation.Completed},
 		}),
-		Cells:          []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
-		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applied"}},
+		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		VSchemaChanges: []apitypes.VSchemaChange{{
+			Namespace: "cdb_resolute_sharded",
+			Status:    "applied",
+			Diff: `--- current
++++ new
+@@ -3,6 +3,11 @@
+   "tables": {
+     "mutes": {
++      "column_vindexes": [
++        {"column": "target_id", "name": "hash"}
++      ]
+     }
+   }
+ }`,
+		}},
 	})
 }
 

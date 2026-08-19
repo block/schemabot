@@ -385,8 +385,8 @@ type NamespacePlanData struct {
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
 
 	// Metadata is the subset of the engine's plan change-metadata that
-	// apply-time safety gates read (see VSchemaPlanMetadata). Display-only
-	// metadata such as the rendered VSchema diff is deliberately not persisted.
+	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
+	// keys and the rendered VSchema diff apply-time display shows.
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 

@@ -309,11 +309,13 @@ func TestRenderShardedApplyComment_VSchemaSection(t *testing.T) {
 			{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
 		},
 		Cells:          []ShardCell{mutesCell("-40"), mutesCell("80-")},
-		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applying"}},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applying", Diff: "--- current\n+++ new\n+ vindex hash"}},
 	})
 
 	assert.Contains(t, out, "### VSchema")
 	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applying...")
+	assert.Contains(t, out, "```diff\n--- current\n+++ new\n+ vindex hash\n```",
+		"the stored plan's diff renders as a diff block under the keyspace entry")
 }
 
 // A completed sharded apply that landed both a table change and a VSchema

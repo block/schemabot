@@ -21,17 +21,19 @@ func TestVSchemaPlanMetadata(t *testing.T) {
 		assert.Equal(t, map[string]string{PlanMetadataVSchemaChanged: "true"}, got)
 	})
 
-	t.Run("flag with deletions and mutations persists all three and drops display metadata", func(t *testing.T) {
+	t.Run("flag with deletions, mutations, and diff persists all four and drops other metadata", func(t *testing.T) {
 		got := VSchemaPlanMetadata(map[string]string{
 			PlanMetadataVSchemaChanged:   "true",
 			PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
 			PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
-			"vschema":                    "some rendered diff",
+			PlanMetadataVSchemaDiff:      "--- current\n+++ new\n+ vindex hash",
+			"branch":                     "engine-internal detail",
 		})
 		assert.Equal(t, map[string]string{
 			PlanMetadataVSchemaChanged:   "true",
 			PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
 			PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
+			PlanMetadataVSchemaDiff:      "--- current\n+++ new\n+ vindex hash",
 		}, got)
 	})
 }

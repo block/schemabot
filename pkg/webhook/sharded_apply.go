@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"context"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -81,12 +83,14 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // with the shard name as the operation identity, so the ordering labels
 // ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
 // (VSchema) operations are not shard work: each one becomes a VSchema change —
-// its keyspace from the operation key and its display status from the
-// operation state — rendered in the comment's VSchema section. A failed
+// its keyspace from the operation key, its display status from the operation
+// state, and its diff from the stored plan's per-namespace diffs
+// (vschemaDiffs, see resolveShardedVSchemaDiffs) — rendered in the comment's
+// VSchema section. A failed
 // finalizer's error also stands in for the apply-level failure cause when the
 // apply row carries none, since a finalizer failure is operation-scoped and
 // leaves no failed shard row to name it.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, tenant string) templates.ShardedApplyData {
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, vschemaDiffs map[string]string, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
 	// signature derived from it) is deterministic without depending on the
@@ -117,6 +121,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 			vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
 				Namespace: finalizerNS,
 				Status:    vschemaStatusForOperationState(op.State),
+				Diff:      vschemaDiffs[finalizerNS],
 			})
 			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
 				finalizerError = op.ErrorMessage
@@ -173,6 +178,54 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		data.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
 	return data
+}
+
+// resolveShardedVSchemaDiffs loads the stored plan's per-namespace rendered
+// VSchema diffs for a sharded apply's comment: the diff the engine annotated
+// at plan time and plan persistence kept (PlanMetadataVSchemaDiff), so the
+// comment shows the change the operator approved rather than a re-diff
+// against live state. Returns nil when the apply carries no finalizer
+// operation — only finalizer rows render VSchema entries, so there is nothing
+// to attach a diff to. Best-effort: a plan load failure, a missing plan row,
+// or a stored plan without diffs (recorded before diffs were persisted)
+// contributes nothing rather than blocking the comment.
+func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+	hasFinalizer := false
+	for _, op := range ops {
+		if _, ok := parseFinalizerOperationKey(op.OperationKey); ok {
+			hasFinalizer = true
+			break
+		}
+	}
+	if !hasFinalizer {
+		return nil
+	}
+
+	plan, err := stor.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		slog.Warn("comment will omit VSchema diffs: failed to load stored plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if plan == nil {
+		slog.Warn("comment will omit VSchema diffs: stored plan row not found",
+			apply.LogAttrs()...)
+		return nil
+	}
+
+	var diffs map[string]string
+	for namespace, nsData := range plan.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
+			if diffs == nil {
+				diffs = make(map[string]string)
+			}
+			diffs[namespace] = d
+		}
+	}
+	return diffs
 }
 
 // vschemaStatusForOperationState projects a finalizer operation's state onto

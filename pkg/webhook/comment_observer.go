@@ -625,7 +625,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -648,6 +648,16 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
+}
+
+// resolveVSchemaDiffs loads the stored plan's per-namespace VSchema diffs for
+// a sharded apply's comment rendering. It uses a short, independent deadline
+// so a slow storage read degrades to a comment without diffs rather than
+// blocking the update.
+func (o *CommentObserver) resolveVSchemaDiffs(apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return resolveShardedVSchemaDiffs(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -679,7 +689,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.tenant)
+		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
 	}
 	body += controlRejectionSection(ctx, o.stor, o.logger, apply, body)
 	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)

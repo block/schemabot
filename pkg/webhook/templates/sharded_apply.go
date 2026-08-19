@@ -47,8 +47,9 @@ type ShardedApplyData struct {
 	// VSchemaChanges holds per-keyspace VSchema application state, derived from
 	// the apply's finalizer operations rather than engine display metadata. Each
 	// entry renders in the shared VSchema section and counts toward the outcome
-	// line's grammar. Diff is empty for sharded applies — the rendered VSchema
-	// diff is display-only and not persisted — and the section omits it.
+	// line's grammar. Diff carries the stored plan's rendered VSchema diff —
+	// the change the operator approved at plan time — and the section omits it
+	// when the stored plan carries none.
 	VSchemaChanges []apitypes.VSchemaChange
 
 	// Tenant is the deployment's tenant identity, appended as --tenant to every
