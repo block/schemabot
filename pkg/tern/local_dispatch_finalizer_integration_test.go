@@ -63,6 +63,7 @@ func TestLocalClient_VSchemaOnlyDispatchCreatesGroupFinalizer(t *testing.T) {
 					{Namespace: "ks_sharded", Table: "mutes", DDL: "ALTER TABLE `mutes` ADD COLUMN `note` varchar(32)", Operation: "alter"},
 				},
 				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 			},
 		},
 	}
@@ -138,6 +139,7 @@ func TestLocalClient_VSchemaOnlyPlanDispatchCreatesGroupFinalizer(t *testing.T) 
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"ks_sharded": {
 				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 			},
 		},
 	}
@@ -212,6 +214,7 @@ func TestLocalClient_VSchemaOnlyKeyedDispatchAdoptsManifestFinalizerScope(t *tes
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"ks_sharded": {
 				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 			},
 		},
 	}
@@ -283,8 +286,14 @@ func TestLocalClient_VSchemaOnlyMultiNamespaceDispatchCreatesDeploymentScopedFin
 		Environment:    localClientTestEnvironment,
 		CreatedAt:      time.Now(),
 		Namespaces: map[string]*storage.NamespacePlanData{
-			"ks_sharded":   {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
-			"ks_unsharded": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+			"ks_sharded": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			},
+			"ks_unsharded": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			},
 		},
 	}
 	planID, err := stor.Plans().Create(ctx, plan)

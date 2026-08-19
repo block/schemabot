@@ -248,12 +248,24 @@ func TestWriteStatusListFailedOnly(t *testing.T) {
 					Caller:       "github:alice",
 					ErrorMessage: "failed to apply schema change\nbecause duplicate column name 'status'",
 				},
+				{
+					ApplyID:      "apply-failed-pr",
+					ExternalID:   "external-failed-pr",
+					Database:     "billing",
+					Environment:  "production",
+					State:        state.Apply.Failed,
+					StartedAt:    "2026-05-28T12:00:00Z",
+					CompletedAt:  "2026-05-28T12:00:03Z",
+					Caller:       "github:alice@acme/pay#77",
+					ErrorMessage: "cutover failed",
+				},
 			},
 		})
 	})
 
 	assert.Contains(t, output, "Recent failed schema changes")
 	assert.Contains(t, output, "payments staging: Failed (github:alice; external_id=external-failed) [2026-05-28 11:00:03 UTC]")
+	assert.Contains(t, output, "billing production: Failed (https://github.com/acme/pay/pull/77; external_id=external-failed-pr) [2026-05-28 12:00:03 UTC]")
 	assert.Contains(t, output, "failed to apply schema change because duplicate column name 'status'")
 	assert.Contains(t, output, "schemabot status apply-failed")
 	assert.NotContains(t, output, "APPLY ID")

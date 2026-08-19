@@ -1170,19 +1170,23 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeSummaryCompletedMetadata(sb, data)
 	// A VSchema update counts as a schema change alongside table changes, so the
 	// singular/plural wording reflects the total operation count.
-	singular := totalTables+len(data.VSchemaChanges) == 1
-	msg := "Applied successfully — your schema changes are live!"
-	if singular {
-		msg = "Applied successfully — your schema change is live!"
-	}
-	if data.Rollback {
-		msg = "Rolled back successfully — the schema changes have been reverted."
-		if singular {
-			msg = "Rolled back successfully — the schema change has been reverted."
-		}
-	}
-	writeSuccessBlock(sb, msg)
+	writeSuccessBlock(sb, completedOutcomeMessage(totalTables+len(data.VSchemaChanges) == 1, data.Rollback))
 	writeCompletedSummaryDetails(sb, data)
+}
+
+// completedOutcomeMessage is the completed summary's outcome line, shared by
+// every apply shape so the terminal vocabulary stays identical.
+func completedOutcomeMessage(singular, rollback bool) string {
+	if rollback {
+		if singular {
+			return "Rolled back successfully — the schema change has been reverted."
+		}
+		return "Rolled back successfully — the schema changes have been reverted."
+	}
+	if singular {
+		return "Applied successfully — your schema change is live!"
+	}
+	return "Applied successfully — your schema changes are live!"
 }
 
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
@@ -1245,15 +1249,30 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
-	if data.StartedAt != "" && data.CompletedAt != "" {
-		startTime, err1 := time.Parse(time.RFC3339, data.StartedAt)
-		endTime, err2 := time.Parse(time.RFC3339, data.CompletedAt)
-		if err1 == nil && err2 == nil {
-			parts = append(parts, fmt.Sprintf("**Duration**: %s", formatDuration(endTime.Sub(startTime))))
-		}
+	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
+		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
+}
+
+// durationDisplay formats the elapsed time between two RFC3339 timestamps for a
+// summary metadata line, or "" when either timestamp is missing or unparseable
+// — the duration is decoration, so a bad timestamp drops it rather than failing
+// the render.
+func durationDisplay(startedAt, completedAt string) string {
+	if startedAt == "" || completedAt == "" {
+		return ""
+	}
+	startTime, err1 := time.Parse(time.RFC3339, startedAt)
+	endTime, err2 := time.Parse(time.RFC3339, completedAt)
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	if endTime.Before(startTime) {
+		return ""
+	}
+	return formatDuration(endTime.Sub(startTime))
 }
 
 // formatDuration formats a time.Duration as a human-readable string.

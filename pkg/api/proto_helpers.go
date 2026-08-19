@@ -268,7 +268,8 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 				nsData.OriginalFiles = map[string]string{}
 			}
 		}
-		if sc.Metadata["vschema_changed"] == "true" {
+		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
+		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
 				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {
 					nsData.Artifacts = map[string]string{storage.VSchemaArtifactName: vschema}
