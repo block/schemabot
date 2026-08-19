@@ -232,7 +232,13 @@ func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply
 // the VSchema display status vocabulary the single-deployment comment uses, so
 // both comment shapes describe VSchema application identically: applied when
 // the finalizer completed, applying while it runs, failed on a failure
-// (terminal or auto-retrying), and pending (empty) before it starts.
+// (terminal or auto-retrying), and pending (empty) before it starts. A
+// finalizer whose rollout ended without running it — the operation row holds
+// cancelled or reverted, written by the cancel path or mirrored from the
+// settled parent by the stranded-operation reaper — reads as cancelled rather
+// than pending, so the terminal summary never promises VSchema work that no
+// claim arm will run. Stopped stays its own status: a stopped apply is
+// resumable, so its finalizer may yet run, but "pending" would overpromise.
 func vschemaStatusForOperationState(opState string) string {
 	switch {
 	case state.IsState(opState, state.ApplyOperation.Completed):
@@ -241,6 +247,10 @@ func vschemaStatusForOperationState(opState string) string {
 		return "applying"
 	case isFinalizerFailureState(opState):
 		return "failed"
+	case state.IsState(opState, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted):
+		return "cancelled"
+	case state.IsState(opState, state.ApplyOperation.Stopped):
+		return "stopped"
 	default:
 		return ""
 	}

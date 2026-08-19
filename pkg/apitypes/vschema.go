@@ -164,7 +164,7 @@ func (sc *SchemaChangeResponse) HasVSchemaChange() bool {
 // multi-keyspace deploy renders each keyspace independently.
 type VSchemaChange struct {
 	Namespace string `json:"namespace"`
-	Status    string `json:"status"` // "applying", "applied", "failed", or "" (pending)
+	Status    string `json:"status"` // "applying", "applied", "failed", "cancelled", "stopped", or "" (pending)
 	Diff      string `json:"diff"`   // VSchema diff (not SQL); empty when unavailable
 }
 

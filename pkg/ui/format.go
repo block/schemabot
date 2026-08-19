@@ -39,6 +39,10 @@ func VSchemaStatusLabel(status string) string {
 		return "Applied"
 	case "failed":
 		return "Failed"
+	case "cancelled":
+		return "Cancelled"
+	case "stopped":
+		return "Stopped"
 	case "":
 		return "Pending"
 	default:

@@ -216,6 +216,20 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 	assert.Empty(t, data.VSchemaChanges[0].Diff, "a stored plan without diffs renders the status-only entry")
 }
 
+// A finalizer whose rollout ended without running it must not read as pending:
+// a cancelled apply's finalizer row (written by the cancel path or mirrored
+// from the settled parent by the stranded-operation reaper) reads as
+// cancelled, and a stopped apply's — resumable, so its finalizer may yet run —
+// reads as stopped, so the comment never promises VSchema work that is not
+// coming.
+func TestVSchemaStatusForOperationState_TerminalInertStates(t *testing.T) {
+	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.ApplyOperation.Cancelled))
+	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.ApplyOperation.Reverted))
+	assert.Equal(t, "stopped", vschemaStatusForOperationState(state.ApplyOperation.Stopped))
+	assert.Equal(t, "", vschemaStatusForOperationState(state.ApplyOperation.Pending),
+		"a pending finalizer under a live apply still reads as pending")
+}
+
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
 // Every store other than Plans() panics if touched, so a test that must not
 // read storage can pass a zero-valued stub and rely on the panic.
