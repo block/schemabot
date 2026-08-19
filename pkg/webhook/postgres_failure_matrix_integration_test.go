@@ -51,10 +51,11 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	queued := findFixtureApply(t, svcA, fixture.config.Database)
+	queued, err := findFixtureApply(t, svcA, fixture.config.Database)
+	require.NoError(t, err)
 	require.NotNil(t, queued, "accepted apply must be durably stored before any driving")
-	assert.False(t, state.IsTerminalApplyState(queued.State),
-		"apply must still be queued when the first instance dies")
+	assert.True(t, state.IsState(queued.State, state.Apply.Pending),
+		"apply must still be pending when the first instance dies, state=%s", queued.State)
 	assert.False(t, postgresColumnExists(t, db, "users", "email"),
 		"no DDL may reach the target before an operator drives the apply")
 
@@ -68,9 +69,13 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 		targetDSN:            dsn,
 		preserveDurableState: true,
 	})
-	require.Eventually(t, func() bool {
-		apply := findFixtureApply(t, svcB, fixture.config.Database)
-		return apply != nil && state.IsState(apply.State, state.Apply.Completed)
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, err := findFixtureApply(t, svcB, fixture.config.Database)
+		if !assert.NoError(c, err) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		assert.True(c, state.IsState(apply.State, state.Apply.Completed),
+			"recovered apply not completed yet, state=%s", apply.State)
 	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
 
 	assert.True(t, postgresColumnExists(t, db, "users", "email"),
@@ -118,13 +123,16 @@ func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	require.NoError(t, err)
 
 	var failed *storage.Apply
-	require.Eventually(t, func() bool {
-		apply := findFixtureApply(t, svc, fixture.config.Database)
-		if apply == nil || !state.IsTerminalApplyState(apply.State) {
-			return false
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, err := findFixtureApply(t, svc, fixture.config.Database)
+		if !assert.NoError(c, err) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		if !assert.True(c, applyIsSettled(apply.State),
+			"apply not settled yet, state=%s", apply.State) {
+			return
 		}
 		failed = apply
-		return true
 	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
 	assert.True(t, state.IsState(failed.State, state.Apply.Failed),
 		"a privilege refusal must fail the apply, state=%s", failed.State)
@@ -135,6 +143,8 @@ func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	task := tasks[0]
 	assert.True(t, state.IsState(task.State, state.Task.Failed),
 		"a refusal is permanent and must not be marked retryable, state=%s", task.State)
+	assert.Contains(t, task.ErrorMessage, "insufficient privileges; provision with:",
+		"the stored error must be the classified refusal detail built from typed error fields, never wrapped server output")
 	assert.Contains(t, task.ErrorMessage, "GRANT",
 		"the stored error must carry the exact provisioning statement")
 	assert.NotNil(t, task.CompletedAt, "a permanently failed task is settled, not awaiting retry")
@@ -164,22 +174,27 @@ func postgresColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
 	return exists
 }
 
+// applyIsSettled reports whether the drive has finished deciding the apply's
+// outcome: any terminal state, or failed_retryable, which parks the apply
+// awaiting operator recovery. Waits that gate on this instead of terminality
+// let the assertions that follow name a wrongly-retryable outcome directly,
+// rather than reporting it as a timeout.
+func applyIsSettled(s string) bool {
+	return state.IsTerminalApplyState(s) || state.IsState(s, state.Apply.FailedRetryable)
+}
+
 // findFixtureApply returns the fixture database's apply on the fixture PR, or
-// nil when none exists yet. A storage error is logged and treated as "not
-// found": the helper runs inside require.Eventually goroutines where a fatal
-// assertion is unsafe, so callers fail on their own nil checks or deadlines
-// with the logged cause alongside.
-func findFixtureApply(t *testing.T, svc *api.Service, database string) *storage.Apply {
+// nil when none exists yet.
+func findFixtureApply(t *testing.T, svc *api.Service, database string) (*storage.Apply, error) {
 	t.Helper()
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
 	if err != nil {
-		t.Logf("findFixtureApply: listing applies for fixture PR: %v", err)
-		return nil
+		return nil, fmt.Errorf("listing applies for fixture PR: %w", err)
 	}
 	for _, apply := range applies {
 		if apply.Database == database {
-			return apply
+			return apply, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
