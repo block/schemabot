@@ -31,6 +31,23 @@ func TestLink(t *testing.T) {
 	})
 }
 
+// FORCE_HYPERLINK is the cross-ecosystem override convention: "0" or empty
+// forces links off (terminals that silently drop the escape), any other
+// value forces them on (environments that render links without a TTY).
+func TestStdoutSupportsHyperlinksForceOverride(t *testing.T) {
+	t.Run("zero and empty force hyperlinks off", func(t *testing.T) {
+		t.Setenv("FORCE_HYPERLINK", "0")
+		assert.False(t, stdoutSupportsHyperlinks())
+		t.Setenv("FORCE_HYPERLINK", "")
+		assert.False(t, stdoutSupportsHyperlinks())
+	})
+
+	t.Run("any other value forces hyperlinks on", func(t *testing.T) {
+		t.Setenv("FORCE_HYPERLINK", "1")
+		assert.True(t, stdoutSupportsHyperlinks())
+	})
+}
+
 func TestVisibleWidth(t *testing.T) {
 	t.Run("plain text counts its runes", func(t *testing.T) {
 		assert.Equal(t, 5, VisibleWidth("hello"))

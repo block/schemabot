@@ -10,10 +10,15 @@ import (
 // stdout. It is enabled only when stdout is an interactive terminal: in
 // pipes, redirects, and CI logs an escape sequence is unreadable bytes, so
 // Link falls back to printing the bare URL there and the address is never
-// lost.
+// lost. FORCE_HYPERLINK overrides the detection either way — "0" or empty
+// disables (for terminals that silently drop the escape, such as tmux
+// without hyperlink features enabled), any other value enables.
 var Hyperlinks = stdoutSupportsHyperlinks()
 
 func stdoutSupportsHyperlinks() bool {
+	if force, ok := os.LookupEnv("FORCE_HYPERLINK"); ok {
+		return force != "" && force != "0"
+	}
 	if os.Getenv("TERM") == "dumb" {
 		return false
 	}
