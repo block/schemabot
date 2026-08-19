@@ -145,19 +145,20 @@ const (
 // ParseProgressResponse converts a typed ProgressResponse to ProgressData for rendering.
 func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	data := ProgressData{
-		ApplyID:      result.ApplyID,
-		Database:     result.Database,
-		Environment:  result.Environment,
-		Caller:       result.Caller,
-		State:        state.NormalizeState(result.State),
-		Engine:       result.Engine,
-		ErrorMessage: result.ErrorMessage,
-		StartedAt:    result.StartedAt,
-		CompletedAt:  result.CompletedAt,
-		Options:      result.Options,
-		Metadata:     result.Metadata,
-		Volume:       int(result.Volume),
-		Released:     result.Released,
+		ApplyID:        result.ApplyID,
+		Database:       result.Database,
+		Environment:    result.Environment,
+		Caller:         result.Caller,
+		PullRequestURL: result.PullRequest,
+		State:          state.NormalizeState(result.State),
+		Engine:         result.Engine,
+		ErrorMessage:   result.ErrorMessage,
+		StartedAt:      result.StartedAt,
+		CompletedAt:    result.CompletedAt,
+		Options:        result.Options,
+		Metadata:       result.Metadata,
+		Volume:         int(result.Volume),
+		Released:       result.Released,
 	}
 
 	for _, op := range result.Operations {
