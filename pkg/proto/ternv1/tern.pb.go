@@ -1708,8 +1708,16 @@ type ApplyRequest struct {
 	// duplicate, so a re-dispatch after a lost response does not re-run the
 	// schema change. Empty preserves the non-deduplicated behavior.
 	IdempotencyKey string `protobuf:"bytes,11,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The generation manifest for a deployment-keyed dispatch: every operation
+	// key the dispatcher will send to this deployment's shared apply under the
+	// idempotency key, this dispatch's own key included. The data plane stores
+	// it on the keyed apply at creation and completes the apply only when every
+	// listed operation has attached and reached a terminal state, so a fast
+	// first operation can never terminalize the apply while sibling dispatches
+	// are still on their way. Empty means this dispatch is the whole generation.
+	GenerationOperationKeys []string `protobuf:"bytes,12,rep,name=generation_operation_keys,json=generationOperationKeys,proto3" json:"generation_operation_keys,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ApplyRequest) Reset() {
@@ -1817,6 +1825,13 @@ func (x *ApplyRequest) GetIdempotencyKey() string {
 		return x.IdempotencyKey
 	}
 	return ""
+}
+
+func (x *ApplyRequest) GetGenerationOperationKeys() []string {
+	if x != nil {
+		return x.GenerationOperationKeys
+	}
+	return nil
 }
 
 // ApplyResponse indicates whether the apply was accepted.
@@ -3842,7 +3857,7 @@ const file_tern_proto_rawDesc = "" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
 	"\x0flint_violations\x18\x03 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
 	"\x06errors\x18\x04 \x03(\tR\x06errors\x12*\n" +
-	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\xc9\x04\n" +
+	"\x06shards\x18\x05 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\"\x85\x05\n" +
 	"\fApplyRequest\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12<\n" +
 	"\aoptions\x18\x02 \x03(\v2\".tern.v1.ApplyRequest.OptionsEntryR\aoptions\x12I\n" +
@@ -3856,7 +3871,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x06caller\x18\t \x01(\tR\x06caller\x12#\n" +
 	"\rtarget_shards\x18\n" +
 	" \x03(\tR\ftargetShards\x12'\n" +
-	"\x0fidempotency_key\x18\v \x01(\tR\x0eidempotencyKey\x1a:\n" +
+	"\x0fidempotency_key\x18\v \x01(\tR\x0eidempotencyKey\x12:\n" +
+	"\x19generation_operation_keys\x18\f \x03(\tR\x17generationOperationKeys\x1a:\n" +
 	"\fOptionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aT\n" +

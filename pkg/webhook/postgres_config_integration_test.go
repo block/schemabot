@@ -33,8 +33,7 @@ const postgresConfigFixtureDeadline = 30 * time.Second
 func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
-	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
-	require.NoError(t, err)
+	createFixtureUsersTable(t, db)
 
 	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
 		databaseType: string(fixture.config.Type),
@@ -70,12 +69,7 @@ func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 		return false
 	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
 
-	var exists bool
-	err = db.QueryRowContext(t.Context(), `SELECT EXISTS (
-		SELECT 1 FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'email')`).Scan(&exists)
-	require.NoError(t, err)
-	assert.True(t, exists)
+	assert.True(t, postgresColumnExists(t, db, "users", "email"))
 }
 
 // A repository config selecting PostgreSQL surfaces a statement outside the

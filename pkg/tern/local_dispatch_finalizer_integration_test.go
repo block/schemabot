@@ -175,6 +175,79 @@ func TestLocalClient_VSchemaOnlyPlanDispatchCreatesGroupFinalizer(t *testing.T) 
 	assert.Equal(t, state.ApplyOperation.Pending, ops[0].State)
 }
 
+// A control plane driving a VSchema-only apply keys its single finalizer
+// operation deployment-scoped and declares that key in the dispatch's
+// generation manifest. The data plane must create its operation under the same
+// key — a single-namespace dispatch read as namespace-scoped would carry a key
+// outside the manifest and be refused at creation, failing an apply whose
+// shape both planes agree on.
+func TestLocalClient_VSchemaOnlyKeyedDispatchAdoptsManifestFinalizerScope(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-vschema-manifest-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"ks_sharded": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Environment: localClientTestEnvironment,
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "ks_sharded",
+			TableName:  "VSchema: ks_sharded",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+		}},
+		IdempotencyKey:          "schemabot:v1:vschema-manifest-test",
+		GenerationOperationKeys: []string{"group_finalizer"},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "deployment-keyed VSchema-only dispatch was not accepted: %s", resp.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, []string{"group_finalizer"}, apply.ExpectedOperationKeys, "the dispatch's generation manifest must be stored on the keyed apply")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, ops[0].OperationKind)
+	assert.Equal(t, "group_finalizer", ops[0].OperationKey, "the operation must carry the manifest's deployment-scoped key")
+	assert.Equal(t, state.ApplyOperation.Pending, ops[0].State)
+}
+
 // A VSchema-only dispatch naming every VSchema-changed namespace of a
 // VSchema-only plan creates one deployment-scoped group_finalizer operation
 // whose drive applies all the namespaces' VSchemas in a single engine apply. A
