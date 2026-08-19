@@ -790,6 +790,44 @@ func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
 	assert.NoError(t, rejectUnsafeDDLChangesWithoutOptIn("plan-unsafe", changes, storage.ApplyOptions{AllowUnsafe: true}))
 }
 
+// TestRejectUnsafeVSchemaChangesWithoutOptIn verifies dispatch admission
+// re-checks the stored plan's VSchema disclosures: a recorded deletion is
+// refused without opt-in even though a VSchema-only scope carries no table
+// DDL, opt-in admits it, and an additive VSchema change queues freely.
+func TestRejectUnsafeVSchemaChangesWithoutOptIn(t *testing.T) {
+	unsafePlan := &storage.Plan{
+		PlanIdentifier: "plan-vschema-unsafe",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata: map[string]string{
+					storage.PlanMetadataVSchemaChanged:   "true",
+					storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+				},
+			},
+		},
+	}
+
+	err := rejectUnsafeVSchemaChangesWithoutOptIn(unsafePlan, storage.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsafe VSchema change in namespace "payments"`)
+	assert.Contains(t, err.Error(), "removing vindex email_idx changes query routing")
+	assert.Contains(t, err.Error(), "allow_unsafe=true")
+
+	assert.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(unsafePlan, storage.ApplyOptions{AllowUnsafe: true}))
+
+	additivePlan := &storage.Plan{
+		PlanIdentifier: "plan-vschema-additive",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			},
+		},
+	}
+	assert.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(additivePlan, storage.ApplyOptions{}))
+}
+
 func TestLocalClient_ProgressRequiresApplyID(t *testing.T) {
 	client := &LocalClient{logger: slog.Default()}
 

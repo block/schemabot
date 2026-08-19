@@ -2066,7 +2066,19 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		}
 		changes := make([]*ternv1.TableChange, 0, len(namespaces))
 		for _, namespace := range namespaces {
-			changes = append(changes, &ternv1.TableChange{Namespace: namespace, TableName: "VSchema: " + namespace, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA})
+			// Carry the namespace's persisted VSchema change-metadata so a
+			// deployment materializing the plan from this dispatch runs the
+			// same apply-time safety gates as one reading its own stored plan.
+			var meta map[string]string
+			if nsData := plan.Namespaces[namespace]; nsData != nil {
+				meta = storage.VSchemaPlanMetadata(nsData.Metadata)
+			}
+			changes = append(changes, &ternv1.TableChange{
+				Namespace:  namespace,
+				TableName:  "VSchema: " + namespace,
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+				Metadata:   meta,
+			})
 		}
 		req := &ternv1.ApplyRequest{
 			PlanId:      plan.PlanIdentifier,

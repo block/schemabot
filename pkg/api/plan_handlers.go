@@ -1315,12 +1315,15 @@ func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.Ap
 	if applyOpts.AllowUnsafe {
 		return nil
 	}
-	unsafeChanges := plan.UnsafeDDLChanges()
-	if len(unsafeChanges) == 0 {
-		return nil
+	if unsafeChanges := plan.UnsafeDDLChanges(); len(unsafeChanges) > 0 {
+		change := unsafeChanges[0]
+		return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
 	}
-	change := unsafeChanges[0]
-	return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
+	if vschemaChanges := plan.UnsafeVSchemaChanges(); len(vschemaChanges) > 0 {
+		change := vschemaChanges[0]
+		return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
+	}
+	return nil
 }
 
 // rejectBlockedStoredPlan refuses to queue an apply for a plan carrying an
