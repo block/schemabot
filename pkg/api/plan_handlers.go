@@ -20,6 +20,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/metrics"
@@ -337,6 +338,19 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
 	linter := lint.New()
 	for name, ns := range resp.Namespaces {
+		// Every pulled table entry must be a CREATE TABLE statement. The
+		// linters silently pass over other statement kinds, so an entry of
+		// another kind would go unlinted and turn the audit into a partial
+		// result — fail the request instead.
+		for tableName, tableDDL := range ns.Tables {
+			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
+			if err != nil {
+				return fmt.Errorf("lint pulled schema for database %q namespace %q table %q: %w", resp.Database, name, tableName, err)
+			}
+			if stmtType != ddl.StatementCreateTable {
+				return fmt.Errorf("lint pulled schema for database %q namespace %q: table %q is a %s statement, expected CREATE TABLE", resp.Database, name, tableName, stmtType)
+			}
+		}
 		results, err := linter.LintSchema(ns.Tables)
 		if err != nil {
 			return fmt.Errorf("lint pulled schema for database %q namespace %q: %w", resp.Database, name, err)

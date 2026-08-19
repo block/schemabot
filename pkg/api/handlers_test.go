@@ -1598,8 +1598,11 @@ func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
 				"orders": {Tables: map[string]string{
 					"users": "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
 				}},
+				"audit": {Tables: map[string]string{
+					"events": "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n",
+				}},
 			},
-			TableCount: 1,
+			TableCount: 2,
 		},
 	}
 	cfg := &ServerConfig{
@@ -1640,6 +1643,64 @@ func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
 	assert.Equal(t, "primary_key", violations[1].Linter)
 	assert.Equal(t, "users", violations[1].Table)
 	assert.Contains(t, violations[1].Message, "int")
+
+	// A linted namespace with no violations reports an explicit empty list,
+	// so a clean audit is distinguishable from lint not being requested.
+	require.NotNil(t, resp.Namespaces["audit"].Lint)
+	assert.Empty(t, resp.Namespaces["audit"].Lint)
+	cleanJSON, err := json.Marshal(resp.Namespaces["audit"])
+	require.NoError(t, err)
+	assert.Contains(t, string(cleanJSON), `"lint":[]`)
+}
+
+// Every pulled table entry must be a CREATE TABLE statement: the linters
+// silently pass over other statement kinds, so a namespace containing one
+// would produce a partial audit. The request fails instead.
+func TestExecutePullSchemaRejectsNonCreateTableLintEntry(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{
+					"users": "DROP TABLE `users`;\n",
+				}},
+			},
+			TableCount: 1,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+		Lint:        true,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected CREATE TABLE")
+	assert.Contains(t, err.Error(), `"users"`)
 }
 
 // Linting is opt-in: a pull that does not ask for it returns no lint field,

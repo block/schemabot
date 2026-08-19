@@ -295,8 +295,10 @@ type PulledNamespace struct {
 	NamespaceCatalog *NamespaceCatalog        `json:"namespace_catalog,omitempty"`
 	TableCatalog     map[string]*TableCatalog `json:"table_catalog,omitempty"`
 	// Lint holds the schema lint violations for this namespace's tables,
-	// populated only when the pull request asked for linting.
-	Lint []*LintViolationResponse `json:"lint,omitempty"`
+	// populated only when the pull request asked for linting. A namespace
+	// with no violations serializes as an explicit empty list so a clean
+	// audit is distinguishable from lint not being requested (omitted).
+	Lint []*LintViolationResponse `json:"lint,omitzero"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
