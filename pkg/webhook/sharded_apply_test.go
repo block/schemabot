@@ -40,9 +40,13 @@ func TestParseShardOperationKey(t *testing.T) {
 		assert.False(t, ok, "key %q must not parse as a shard work key", key)
 	}
 
-	assert.True(t, isFinalizerOperationKey("cdb_resolute_sharded/group_finalizer"))
-	assert.False(t, isFinalizerOperationKey("cdb_resolute_sharded/-40/mutes"))
-	assert.False(t, isFinalizerOperationKey(""))
+	finalizerNS, ok := parseFinalizerOperationKey("cdb_resolute_sharded/group_finalizer")
+	require.True(t, ok)
+	assert.Equal(t, "cdb_resolute_sharded", finalizerNS)
+	for _, key := range []string{"cdb_resolute_sharded/-40/mutes", "group_finalizer", ""} {
+		_, ok := parseFinalizerOperationKey(key)
+		assert.False(t, ok, "key %q must not parse as a finalizer key", key)
+	}
 }
 
 func TestIsShardedApply(t *testing.T) {
@@ -180,6 +184,55 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 		"all non-empty task DDLs are joined in order")
 }
 
+// A sharded apply's finalizer operations are its keyspace VSchema changes:
+// each one surfaces as a VSchema change whose keyspace comes from the
+// operation key and whose display status tracks the operation state, so the
+// PR comment shows the finalizer's progress alongside the shard rollout.
+func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "ks/-40/mutes", state.ApplyOperation.Completed),
+		mk(2, "ks/80-/mutes", state.ApplyOperation.Completed),
+		mk(3, "ks/group_finalizer", state.ApplyOperation.Running),
+	}
+
+	data := buildShardedApplyData(apply, ops, false, nil, "")
+
+	require.Len(t, data.VSchemaChanges, 1)
+	assert.Equal(t, "ks", data.VSchemaChanges[0].Namespace)
+	assert.Equal(t, "applying", data.VSchemaChanges[0].Status)
+	assert.Empty(t, data.VSchemaChanges[0].Diff, "the rendered VSchema diff is not persisted, so sharded applies carry none")
+	require.Len(t, data.Shards, 2, "the finalizer is not a shard row")
+}
+
+// A finalizer failure is operation-scoped: it does not write the parent
+// apply's error. When the apply row carries no cause of its own, the failed
+// finalizer's error stands in so the failure callout still names the cause —
+// but an apply-level error, when present, wins.
+func TestBuildShardedApplyData_FailedFinalizerErrorFallsBack(t *testing.T) {
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "ks/-40/mutes", state.ApplyOperation.Completed, ""),
+		mk(2, "ks/group_finalizer", state.ApplyOperation.Failed, "finalize vschema: apply vschema to keyspace: context deadline exceeded"),
+	}
+
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Failed}
+	data := buildShardedApplyData(apply, ops, false, nil, "")
+	assert.Equal(t, "finalize vschema: apply vschema to keyspace: context deadline exceeded", data.ErrorMessage,
+		"the failed finalizer's error stands in when the apply row carries none")
+	require.Len(t, data.VSchemaChanges, 1)
+	assert.Equal(t, "failed", data.VSchemaChanges[0].Status)
+
+	apply.ErrorMessage = "apply-level cause"
+	data = buildShardedApplyData(apply, ops, false, nil, "")
+	assert.Equal(t, "apply-level cause", data.ErrorMessage, "the apply row's own error wins when present")
+}
+
 // A terminal sharded apply's summary comment renders the verdict-titled
 // shard-unit summary — not the status snapshot the progress comment shows — so
 // the last word on the PR states the outcome, with every shard's final state.
@@ -217,6 +270,31 @@ func TestFormatApplySummaryComment_ShardedRendersVerdict(t *testing.T) {
 	assert.Contains(t, out, "**Duration**: 28m")
 	assert.Contains(t, out, "| `-40` | ✅ completed |")
 	assert.NotContains(t, out, "**Deployments**:", "must not use the deployment-unit layout")
+}
+
+// A completed sharded apply with a finalizer operation renders the applied
+// VSchema change in the terminal summary, end to end from the operation rows.
+func TestFormatApplySummaryComment_ShardedVSchemaSection(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging",
+		State: state.Apply.Completed, Caller: "morgo",
+	}
+	mk := func(id int64, key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "cdb_resolute_sharded/-40/mutes"),
+		mk(2, "cdb_resolute_sharded/80-/mutes"),
+		mk(3, "cdb_resolute_sharded/group_finalizer"),
+	}
+
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, "")
+
+	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
+	assert.Contains(t, out, "### VSchema")
+	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applied")
+	assert.Contains(t, out, "your schema changes are live!", "a table change plus a VSchema update reads as plural")
+	assert.Contains(t, out, "**Shards**: 2 completed", "the finalizer is not counted as a shard")
 }
 
 // A sharded apply that fails outside shard work (e.g. its finalizer operation)

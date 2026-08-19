@@ -7286,7 +7286,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
 
-> Applied successfully — your schema change is live!
+> Applied successfully — your schema changes are live!
 
 **Shards**: 4 completed
 
@@ -7298,6 +7298,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 | `40-80` | ✅ completed |
 | `80-c0` | ✅ completed |
 | `c0-` | ✅ completed |
+
+### VSchema
+
+**`cdb_resolute_sharded`**: Applied
+
 
 </details>
 

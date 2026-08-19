@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -293,6 +294,64 @@ func TestRenderShardedApplySummaryComment_NegativeDurationOmitted(t *testing.T) 
 	})
 
 	assert.NotContains(t, out, "**Duration**:")
+}
+
+// A sharded apply that carries a keyspace VSchema update renders it in its own
+// VSchema section — the same section the single-deployment comment uses — with
+// the keyspace and its display status, so the operator sees the finalizer's
+// progress alongside the shard rollout.
+func TestRenderShardedApplyComment_VSchemaSection(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+			{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		},
+		Cells:          []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applying"}},
+	})
+
+	assert.Contains(t, out, "### VSchema")
+	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applying...")
+}
+
+// A completed sharded apply that landed both a table change and a VSchema
+// update shows the applied VSchema section in the terminal summary and counts
+// the VSchema update in the outcome line's grammar: two changes read as plural.
+func TestRenderShardedApplySummaryComment_VSchemaSectionAndPluralGrammar(t *testing.T) {
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+			{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		},
+		Cells:          []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applied"}},
+	})
+
+	assert.Contains(t, out, "Applied successfully — your schema changes are live!",
+		"a table change plus a VSchema update reads as plural")
+	assert.Contains(t, out, "### VSchema")
+	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applied")
+}
+
+// The outcome line's grammar counts distinct tables and VSchema updates
+// together: exactly one change in total reads as singular, anything else as
+// plural.
+func TestShardedChangeIsSingular_CountsVSchemaChanges(t *testing.T) {
+	oneTable := []ShardCell{mutesCell("-40"), mutesCell("80-")}
+	oneVSchema := []apitypes.VSchemaChange{{Namespace: "ks", Status: "applied"}}
+
+	assert.True(t, shardedChangeIsSingular(ShardedApplyData{Cells: oneTable}),
+		"one table across shards is one change")
+	assert.False(t, shardedChangeIsSingular(ShardedApplyData{Cells: oneTable, VSchemaChanges: oneVSchema}),
+		"a table change plus a VSchema update is two changes")
+	assert.True(t, shardedChangeIsSingular(ShardedApplyData{VSchemaChanges: oneVSchema}),
+		"a lone VSchema update is one change")
+	assert.False(t, shardedChangeIsSingular(ShardedApplyData{}),
+		"no cells and no VSchema changes does not prove a single change")
 }
 
 // The status comment is frozen at terminal with the same failure callout the

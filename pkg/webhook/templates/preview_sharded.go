@@ -3,6 +3,7 @@ package templates
 import (
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -61,8 +62,9 @@ func PreviewCommentShardedApplyFailed() string {
 }
 
 // PreviewCommentShardedSummaryCompleted renders the terminal summary for a
-// sharded apply whose shards all completed: the applied verdict header and
-// outcome line over the final per-shard results.
+// sharded apply whose shards all completed alongside a keyspace VSchema
+// update: the applied verdict header and outcome line over the final
+// per-shard results, with the applied VSchema change in its own section.
 func PreviewCommentShardedSummaryCompleted() string {
 	return RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Completed, Environment: "production", Database: "cdb_resolute",
@@ -75,7 +77,8 @@ func PreviewCommentShardedSummaryCompleted() string {
 			{Deployment: "80-c0", State: state.ApplyOperation.Completed},
 			{Deployment: "c0-", State: state.ApplyOperation.Completed},
 		}),
-		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		Cells:          []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applied"}},
 	})
 }
 

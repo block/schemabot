@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -28,11 +29,16 @@ func parseShardOperationKey(key string) (namespace, shard, table string, ok bool
 	return parts[0], parts[1], parts[2], true
 }
 
-// isFinalizerOperationKey reports whether the key is a "namespace/group_finalizer"
-// finalizer operation key.
-func isFinalizerOperationKey(key string) bool {
+// parseFinalizerOperationKey splits a "namespace/group_finalizer" finalizer
+// operation key into its namespace. ok is false for any other shape, including
+// the bare "group_finalizer" key a vschema-only plan produces — that shape has
+// no shard work alongside it, so it never reaches the sharded layout.
+func parseFinalizerOperationKey(key string) (namespace string, ok bool) {
 	ns, ok := strings.CutSuffix(key, "/"+finalizerKeySegment)
-	return ok && ns != "" && !strings.Contains(ns, "/")
+	if !ok || ns == "" || strings.Contains(ns, "/") {
+		return "", false
+	}
+	return ns, true
 }
 
 // isShardedApply reports whether the apply's operations are the per-shard
@@ -49,7 +55,7 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 	hasShard := false
 	for _, op := range ops {
 		ns, _, _, isShard := parseShardOperationKey(op.OperationKey)
-		if !isShard && !isFinalizerOperationKey(op.OperationKey) {
+		if _, isFinalizer := parseFinalizerOperationKey(op.OperationKey); !isShard && !isFinalizer {
 			return false
 		}
 		if deployment == "" {
@@ -74,8 +80,12 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // cell carrying its DDL; per-shard status is derived through pkg/presentation
 // with the shard name as the operation identity, so the ordering labels
 // ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
-// (VSchema) operations are not shard work and are omitted from the shard view;
-// their outcome is still reflected in the aggregate headline state.
+// (VSchema) operations are not shard work: each one becomes a VSchema change —
+// its keyspace from the operation key and its display status from the
+// operation state — rendered in the comment's VSchema section. A failed
+// finalizer's error also stands in for the apply-level failure cause when the
+// apply row carries none, since a finalizer failure is operation-scoped and
+// leaves no failed shard row to name it.
 func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
@@ -93,9 +103,24 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	// one table change (a divergent shard) collapses to one status row.
 	var shardOrder []string
 	opsByShard := make(map[string][]*storage.ApplyOperation)
+	var vschemaChanges []apitypes.VSchemaChange
+	finalizerError := ""
 	for _, op := range ops {
 		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
 		if !ok {
+			// isShardedApply admits only shard work and finalizer keys, so a
+			// non-shard key here is a finalizer: one keyspace's VSchema change.
+			finalizerNS, isFinalizer := parseFinalizerOperationKey(op.OperationKey)
+			if !isFinalizer {
+				continue
+			}
+			vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
+				Namespace: finalizerNS,
+				Status:    vschemaStatusForOperationState(op.State),
+			})
+			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
+				finalizerError = op.ErrorMessage
+			}
 			continue
 		}
 		if keyspace == "" {
@@ -119,18 +144,27 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		opsByShard[shard] = append(opsByShard[shard], op)
 	}
 
+	// A finalizer failure is operation-scoped and does not write the parent
+	// apply's error, so when the apply row carries no cause of its own the
+	// failed finalizer's error is the one to surface.
+	errorMessage := apply.ErrorMessage
+	if errorMessage == "" {
+		errorMessage = finalizerError
+	}
+
 	data := templates.ShardedApplyData{
-		State:        apply.State,
-		Environment:  apply.Environment,
-		Database:     apply.Database,
-		Keyspace:     keyspace,
-		ApplyID:      apply.ApplyIdentifier,
-		RequestedBy:  actorFromCaller(apply.Caller),
-		ErrorMessage: apply.ErrorMessage,
-		Shards:       shardStatuses(shardOrder, opsByShard, released, tasksByOp),
-		Cells:        cells,
-		Tenant:       tenant,
-		Rollback:     apply.IsRollback(),
+		State:          apply.State,
+		Environment:    apply.Environment,
+		Database:       apply.Database,
+		Keyspace:       keyspace,
+		ApplyID:        apply.ApplyIdentifier,
+		RequestedBy:    actorFromCaller(apply.Caller),
+		ErrorMessage:   errorMessage,
+		Shards:         shardStatuses(shardOrder, opsByShard, released, tasksByOp),
+		Cells:          cells,
+		VSchemaChanges: vschemaChanges,
+		Tenant:         tenant,
+		Rollback:       apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -139,6 +173,31 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		data.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
 	return data
+}
+
+// vschemaStatusForOperationState projects a finalizer operation's state onto
+// the VSchema display status vocabulary the single-deployment comment uses, so
+// both comment shapes describe VSchema application identically: applied when
+// the finalizer completed, applying while it runs, failed on a failure
+// (terminal or auto-retrying), and pending (empty) before it starts.
+func vschemaStatusForOperationState(opState string) string {
+	switch {
+	case state.IsState(opState, state.ApplyOperation.Completed):
+		return "applied"
+	case state.IsState(opState, state.ApplyOperation.Running):
+		return "applying"
+	case isFinalizerFailureState(opState):
+		return "failed"
+	default:
+		return ""
+	}
+}
+
+// isFinalizerFailureState reports whether a finalizer operation's state carries
+// an operator-facing error — a terminal failure or an automatic retry after
+// one, mirroring the shard-failure vocabulary.
+func isFinalizerFailureState(opState string) bool {
+	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // shardStatuses derives one status per shard. Each shard's operations are

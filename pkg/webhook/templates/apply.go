@@ -175,7 +175,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// VSchema application status, surfaced from engine metadata rather than as a
 	// per-table task (a VSchema-only apply has no tables at all).
-	writeVSchemaStatus(&sb, data)
+	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	// Error message for apply states that need operator triage.
 	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
@@ -575,16 +575,16 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 }
 
-// writeVSchemaStatus renders the VSchema application status and diff surfaced
-// from the engine's display metadata. It is shown as its own section because
-// VSchema application is not a per-table task. Renders nothing when the apply
-// carries no VSchema change.
-func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
-	if len(data.VSchemaChanges) == 0 {
+// writeVSchemaStatus renders the VSchema application status and, when
+// available, the diff. It is shown as its own section because VSchema
+// application is not a per-table task. Renders nothing when the apply carries
+// no VSchema change.
+func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	for _, c := range data.VSchemaChanges {
+	for _, c := range changes {
 		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
 			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
@@ -1338,7 +1338,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) > 0 {
 		writeSummaryTableListWithOptions(sb, data, false)
 	}
-	writeVSchemaStatus(sb, data)
+	writeVSchemaStatus(sb, data.VSchemaChanges)
 	sb.WriteString("</details>\n")
 }
 

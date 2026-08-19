@@ -5,6 +5,7 @@ import (
 	"html"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -42,6 +43,13 @@ type ShardedApplyData struct {
 	// Cells is one entry per (shard, table) operation — the unit that carries the
 	// DDL and defines a shard's change signature for grouping.
 	Cells []ShardCell
+
+	// VSchemaChanges holds per-keyspace VSchema application state, derived from
+	// the apply's finalizer operations rather than engine display metadata. Each
+	// entry renders in the shared VSchema section and counts toward the outcome
+	// line's grammar. Diff is empty for sharded applies — the rendered VSchema
+	// diff is display-only and not persisted — and the section omits it.
+	VSchemaChanges []apitypes.VSchemaChange
 
 	// Tenant is the deployment's tenant identity, appended as --tenant to every
 	// pasteable command hint so copied commands address this deployment in
@@ -106,6 +114,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeShardCounts(&sb, data.Shards)
 	writeShardedFailure(&sb, data)
 	writeShardKeyspaceSection(&sb, data)
+	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	writeShardedFooter(&sb, data)
 	if !state.IsTerminalApplyState(data.State) {
@@ -126,28 +135,27 @@ func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedSummaryMetadata(&sb, data)
 	if state.IsState(data.State, state.Apply.Completed) {
-		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data.Cells), data.Rollback))
+		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data), data.Rollback))
 	}
 	writeShardCounts(&sb, data.Shards)
 	writeShardedFailure(&sb, data)
 	writeShardKeyspaceSection(&sb, data)
+	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeShardedFooter(&sb, data)
 	return sb.String()
 }
 
-// shardedChangeIsSingular reports whether the shards apply a single table's
-// change, driving the outcome line's singular/plural wording. An apply with no
-// per-shard DDL cells reads as plural — the shard count alone does not prove a
-// single change. VSchema changes are not counted: the sharded data model
-// carries no VSchema display data (the engine display pipeline is
-// PlanetScale-only), so the grammar reflects table changes alone until that
-// data exists for sharded applies.
-func shardedChangeIsSingular(cells []ShardCell) bool {
-	tables := make(map[string]struct{}, len(cells))
-	for _, c := range cells {
+// shardedChangeIsSingular reports whether the apply lands exactly one change —
+// one table's DDL across the shards, or one VSchema update — driving the
+// outcome line's singular/plural wording. Distinct tables and VSchema changes
+// each count as one change; an apply with neither reads as plural, since the
+// shard count alone does not prove a single change.
+func shardedChangeIsSingular(data ShardedApplyData) bool {
+	tables := make(map[string]struct{}, len(data.Cells))
+	for _, c := range data.Cells {
 		tables[c.Table] = struct{}{}
 	}
-	return len(tables) == 1
+	return len(tables)+len(data.VSchemaChanges) == 1
 }
 
 // writeShardedSummaryMetadata writes the terminal metadata line — database,
