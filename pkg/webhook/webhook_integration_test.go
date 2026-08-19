@@ -185,6 +185,11 @@ type e2eServiceOpts struct {
 	// selects the database.
 	databaseType string
 	targetDSN    string
+	// preserveDurableState skips the stale-data cleanup so a second service
+	// instance can adopt durable work queued by a previous instance — the
+	// restart fixtures' crash/recovery seam. Only the first instance of a
+	// test may clean; a recovering instance must see the queued rows.
+	preserveDurableState bool
 }
 
 // namespaceFreeTargetDSN returns the shared MySQL target's DSN with no
@@ -244,16 +249,18 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		st = opts.wrapStorage(st)
 	}
 
-	// Clean up any stale data from previous test runs (shared storage DB)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	// Delete child apply_operations rows before their parent applies rows so the
-	// operator claim loop cannot re-claim orphan operations whose parent lookup
-	// returns nil.
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
+	if !opts.preserveDurableState {
+		// Clean up any stale data from previous test runs (shared storage DB)
+		_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
+		_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+		_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+		// Delete child apply_operations rows before their parent applies rows so the
+		// operator claim loop cannot re-claim orphan operations whose parent lookup
+		// returns nil.
+		_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
+		_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
+		_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
+	}
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
