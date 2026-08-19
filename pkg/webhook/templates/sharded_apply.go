@@ -138,7 +138,10 @@ func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 // shardedChangeIsSingular reports whether the shards apply a single table's
 // change, driving the outcome line's singular/plural wording. An apply with no
 // per-shard DDL cells reads as plural — the shard count alone does not prove a
-// single change.
+// single change. VSchema changes are not counted: the sharded data model
+// carries no VSchema display data (the engine display pipeline is
+// PlanetScale-only), so the grammar reflects table changes alone until that
+// data exists for sharded applies.
 func shardedChangeIsSingular(cells []ShardCell) bool {
 	tables := make(map[string]struct{}, len(cells))
 	for _, c := range cells {

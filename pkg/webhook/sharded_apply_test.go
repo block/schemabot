@@ -218,3 +218,31 @@ func TestFormatApplySummaryComment_ShardedRendersVerdict(t *testing.T) {
 	assert.Contains(t, out, "| `-40` | ✅ completed |")
 	assert.NotContains(t, out, "**Deployments**:", "must not use the deployment-unit layout")
 }
+
+// A sharded apply that fails outside shard work (e.g. its finalizer operation)
+// records the cause on the apply row, not on any shard operation. The terminal
+// summary must carry that apply-level error through to the failure callout so
+// the failed verdict names its cause.
+func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging",
+		State: state.Apply.Failed, Caller: "morgo",
+		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
+	}
+	op := func(id int64, shard string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			ID: id, ApplyID: 1, Deployment: "cake",
+			OperationKey:  "cdb_resolute_sharded/" + shard + "/mutes",
+			State:         state.ApplyOperation.Completed,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		}
+	}
+	ops := []*storage.ApplyOperation{op(1, "-40"), op(2, "80-")}
+
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, "")
+
+	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
+	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
+		"the apply row's error reaches the callout when no shard carries the failure")
+	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
+}

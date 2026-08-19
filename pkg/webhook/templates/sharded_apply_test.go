@@ -233,6 +233,7 @@ func TestRenderShardedApplySummaryComment_CancelledOffersNoResume(t *testing.T) 
 		Cells: []ShardCell{mutesCell("-40")},
 	})
 
+	assert.Contains(t, out, "## 🚫 Schema Change Cancelled — Staging")
 	assert.Contains(t, out, "This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.")
 	assert.NotContains(t, out, "schemabot start", "a cancelled apply offers no resume command")
 }
@@ -292,4 +293,23 @@ func TestRenderShardedApplySummaryComment_NegativeDurationOmitted(t *testing.T) 
 	})
 
 	assert.NotContains(t, out, "**Duration**:")
+}
+
+// The status comment is frozen at terminal with the same failure callout the
+// summary uses, so a failure outside shard work must surface the apply-level
+// error on the status path too — not just in the summary.
+func TestRenderShardedApplyComment_FailureOutsideShardWorkSurfacesApplyError(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.Contains(t, out, "## Schema Change Status — Staging")
+	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")
+	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
 }
