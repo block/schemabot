@@ -270,15 +270,26 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 	if apply.StartedAt == nil {
 		apply.StartedAt = &now
 	}
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return true, fmt.Errorf("update started deferred deploy apply %s: %w", apply.ApplyIdentifier, err)
+	// A multi-operation drive owns only its operation: the parent running
+	// write is the operator's projection to make — a direct write here fails
+	// closed under the operation-only lease and would abort a deploy the
+	// engine has already accepted. The start request also stays pending, so
+	// sibling operations' deferred-deploy claims can still fire; the claim arm
+	// closes once the projection moves the parent out of waiting_for_deploy.
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("pending start request accepted under operation lease; parent running state is the operator's projection and the request stays pending for sibling operations",
+			"requested_by", controlRequestCaller(controlReq))
+	} else {
+		if err := c.storage.Applies().Update(ctx, apply); err != nil {
+			return true, fmt.Errorf("update started deferred deploy apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
+			return true, err
+		}
+		logger.Info("pending start request accepted and completed",
+			"requested_by", controlRequestCaller(controlReq),
+			"state", apply.State)
 	}
-	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
-		return true, err
-	}
-	logger.Info("pending start request accepted and completed",
-		"requested_by", controlRequestCaller(controlReq),
-		"state", apply.State)
 	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier)
 	return true, ctx.Err()
 }
@@ -1615,8 +1626,8 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		c.failApplyWithTasks(ctx, apply, activeTasks, message)
 		// A multi-operation drive owns only its operation; the operator's
 		// projection settles the parent and posts the terminal summary.
+		// failApplyWithTasks already logged the suppressed settle.
 		if suppressParentApplyWrites(ctx) {
-			logger.Info("deferred cutover recovery failed the operation's tasks; operator derives the operation row and projects the parent")
 			return nil
 		}
 		c.notifyTerminalObserver(apply, tasks)
@@ -1725,9 +1736,8 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	// tasks, and an error here would read as a transient drive failure that
 	// leaves the operation claimable, re-leasing already-settled work instead
 	// of letting the claim loop persist the operation row from its now-failed
-	// tasks immediately.
+	// tasks immediately. failApplyWithTasks already logged the suppressed settle.
 	if suppressParentApplyWrites(ctx) {
-		logger.Info("operation drive failed during recovery; operator derives the operation row and projects the parent")
 		return nil
 	}
 	if startRequested {

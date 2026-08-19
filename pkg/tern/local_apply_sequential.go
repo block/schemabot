@@ -647,7 +647,9 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	// the outcome, the operator derives the operation row from them and projects
 	// the parent, so the parent terminal write, control-request completion,
 	// apply-level metric, and terminal observer are all the operator's to make.
-	// Pending tasks after a failed one are still this drive's to settle.
+	// Pending tasks after a failed one are still this drive's to settle, and the
+	// in-memory outcome is still adopted so the drive's own logs report what the
+	// operation settled to rather than the projection's stale running state.
 	if suppressParentApplyWrites(ctx) {
 		if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
 			for _, task := range tasks {
@@ -656,8 +658,9 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 				}
 			}
 		}
+		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
-			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil)
+			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil, "settled_state", apply.State)
 		return
 	}
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
@@ -675,27 +678,14 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		return
 	}
 	previousState := apply.State
-	switch {
-	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
-		apply.State = state.Apply.FailedRetryable
-		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
-		apply.CompletedAt = nil
-	case failedTask != nil:
-		apply.State = state.Apply.Failed
-		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
-		apply.CompletedAt = &now
+	if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
 		for _, task := range tasks {
 			if task.State == state.Task.Pending {
 				c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
 			}
 		}
-	case stoppedByUser:
-		apply.State = state.Apply.Stopped
-	default:
-		apply.State = state.Apply.Completed
-		apply.CompletedAt = &now
 	}
-	apply.UpdatedAt = now
+	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 	} else {
@@ -730,4 +720,27 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		obs.OnTerminal(apply, tasks)
 		c.clearObserver(apply.ID)
 	}
+}
+
+// adoptSequentialOutcome mutates the in-memory apply to the outcome its
+// sequential task results settle to: failed_retryable for a retryable task
+// failure, failed for a permanent one, stopped for an operator stop, completed
+// otherwise. Callers own persisting (or not persisting) the mutated row.
+func adoptSequentialOutcome(apply *storage.Apply, failedTask *storage.Task, stoppedByUser bool, now time.Time) {
+	switch {
+	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
+		apply.State = state.Apply.FailedRetryable
+		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
+		apply.CompletedAt = nil
+	case failedTask != nil:
+		apply.State = state.Apply.Failed
+		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
+		apply.CompletedAt = &now
+	case stoppedByUser:
+		apply.State = state.Apply.Stopped
+	default:
+		apply.State = state.Apply.Completed
+		apply.CompletedAt = &now
+	}
+	apply.UpdatedAt = now
 }

@@ -288,7 +288,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply); err != nil {
+	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
 	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
@@ -1652,6 +1652,25 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	}
 	if applyID == 0 {
 		return 0, fmt.Errorf("%s found the schema change already completed on the engine, but resolved no apply to settle: %w", operation, rejection)
+	}
+	// A multi-operation drive owns only its operation: the tasks settled above
+	// carry the completed outcome, the operator derives the operation row from
+	// them and projects the parent completed, so the parent write, apply event,
+	// and terminal observer are the operator's to make — a direct write here
+	// fails closed under the operation-only lease and would turn an accepted
+	// settle into a drive error the claim loop re-runs forever.
+	if suppressParentApplyWrites(ctx) {
+		attrs := []any{"database", c.config.Database}
+		if targetApply != nil {
+			attrs = targetApply.LogAttrs()
+		}
+		c.logger.Info("engine rejected "+operation+" because the schema change already completed; operation drive settled its tasks and the operator projects the parent",
+			append(attrs,
+				"requested_by", caller,
+				"completed_task_count", completedCount,
+				"terminal_task_count", skippedCount,
+				"error", rejection)...)
+		return skippedCount, nil
 	}
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
