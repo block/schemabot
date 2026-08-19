@@ -68,7 +68,7 @@ func multiDeploymentProgressData(ops []ProgressOperation, tables []TableProgress
 	return ProgressData{
 		ApplyID:     "apply-multi-a1b2c3d4",
 		Environment: "production",
-		Caller:      "octocat",
+		Caller:      "github:octocat@acme/shop#412",
 		State:       state.Apply.Running,
 		StartedAt:   previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
 		Operations:  ops,

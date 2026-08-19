@@ -9,10 +9,16 @@
 // so parsers split at the last "@".
 package caller
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // CLIPrefix is the channel prefix on CLI-driven caller attributions.
 const CLIPrefix = "cli:"
+
+// GitHubPrefix is the channel prefix on webhook-driven caller attributions.
+const GitHubPrefix = "github:"
 
 // maxHostChars caps a hostname at the DNS length limit for a fully qualified
 // domain name.
@@ -56,6 +62,32 @@ func ValidHost(host string) bool {
 		}
 	}
 	return true
+}
+
+// PullRequest extracts the repository and pull request number from a
+// webhook-shaped caller "github:<user>@<owner>/<repo>#<pr>". The location is
+// the segment after the last "@" — matching how Short cuts, so email-shaped
+// users parse correctly. It returns ok=false when the caller is not
+// webhook-shaped or its location does not carry a repo#pr, so CLI and
+// bare-subject callers pass through untouched.
+func PullRequest(caller string) (repo string, pr int, ok bool) {
+	rest, found := strings.CutPrefix(caller, GitHubPrefix)
+	if !found {
+		return "", 0, false
+	}
+	at := strings.LastIndex(rest, "@")
+	if at < 0 {
+		return "", 0, false
+	}
+	repo, prText, found := strings.Cut(rest[at+1:], "#")
+	if !found || !strings.Contains(repo, "/") {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(prText)
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return repo, n, true
 }
 
 // Short strips the trailing location from a caller for compact display and

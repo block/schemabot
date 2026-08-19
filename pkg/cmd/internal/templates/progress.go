@@ -109,12 +109,7 @@ func WriteProgress(data ProgressData) {
 	if row, ok := volumeBoxRow(data.Volume, data.State); ok {
 		rows = append(rows, row)
 	}
-	if data.Caller != "" {
-		rows = append(rows, BoxRow{"Caller", data.Caller})
-	}
-	if data.PullRequestURL != "" {
-		rows = append(rows, BoxRow{"PR", data.PullRequestURL})
-	}
+	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if len(data.Options) > 0 {
 		var opts []string
 		if data.Options["defer_deploy"] == "true" {
@@ -1085,7 +1080,7 @@ func WriteStatusList(data StatusListData) {
 			maxDeployment, "DEPLOYMENT",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			"CALLER",
+			"SOURCE",
 			ANSIReset)
 	case data.ShowExternalID:
 		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
@@ -1096,7 +1091,7 @@ func WriteStatusList(data StatusListData) {
 			maxEnv, "ENV",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			"CALLER",
+			"SOURCE",
 			ANSIReset)
 	case showDeployment:
 		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
@@ -1107,7 +1102,7 @@ func WriteStatusList(data StatusListData) {
 			maxDeployment, "DEPLOYMENT",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			"CALLER",
+			"SOURCE",
 			ANSIReset)
 	default:
 		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
@@ -1117,7 +1112,7 @@ func WriteStatusList(data StatusListData) {
 			maxEnv, "ENV",
 			maxState, "STATE",
 			maxStarted, "STARTED",
-			"CALLER",
+			"SOURCE",
 			ANSIReset)
 	}
 
@@ -1141,7 +1136,7 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				caller.Short(a.Caller))
+				applySource(a.Caller))
 		case data.ShowExternalID:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1150,7 +1145,7 @@ func WriteStatusList(data StatusListData) {
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				caller.Short(a.Caller))
+				applySource(a.Caller))
 		case showDeployment:
 			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1159,7 +1154,7 @@ func WriteStatusList(data StatusListData) {
 				maxDeployment, a.Deployment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				caller.Short(a.Caller))
+				applySource(a.Caller))
 		default:
 			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 				maxID, a.ApplyID,
@@ -1167,7 +1162,7 @@ func WriteStatusList(data StatusListData) {
 				maxEnv, a.Environment,
 				coloredState,
 				maxStarted, formatStartedAt(a.StartedAt),
-				caller.Short(a.Caller))
+				applySource(a.Caller))
 		}
 	}
 
@@ -1354,7 +1349,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 		maxState, "STATE",
 		maxStarted, "STARTED",
 		maxDur, "DURATION",
-		"CALLER",
+		"SOURCE",
 		ANSIReset)
 
 	// Table rows
@@ -1373,7 +1368,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 			coloredState,
 			maxStarted, formatStartedAt(a.StartedAt),
 			maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
-			caller.Short(a.Caller))
+			applySource(a.Caller))
 	}
 
 	fmt.Println()

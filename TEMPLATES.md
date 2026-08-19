@@ -6399,10 +6399,10 @@ Volume: ██░░░░░░░░░ 2/11
 
 3 active schema changes
 
-  APPLY ID      DATABASE   ENV         STATE                STARTED         CALLER
-  apply_abc123  orders-db  staging     Running              15 minutes ago  
-  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  
-  apply_ghi789  analytics  staging     Stopped              2 hours ago     
+  APPLY ID      DATABASE   ENV         STATE                STARTED         SOURCE
+  apply_abc123  orders-db  staging     Running              15 minutes ago  https://github.com/acme/shop/pull/412
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  cli:jdoe
+  apply_ghi789  analytics  staging     Stopped              2 hours ago     https://github.com/acme/analytics/pull/87
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6420,7 +6420,7 @@ No recent schema changes
 
 1 active schema change
 
-  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        CALLER
+  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        SOURCE
   apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  octocat
 
 Use 'schemabot status <apply_id>' to view details
@@ -6429,7 +6429,7 @@ Multiple matching operations:
 
 1 active schema change
 
-  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        CALLER
+  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        SOURCE
   apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  octocat
 
 Use 'schemabot status <apply_id>' to view details
@@ -6444,7 +6444,7 @@ Use 'schemabot status <apply_id>' to view details
 
 Schema change history for orders-db
 
-  APPLY ID      ENV         STATE      STARTED         DURATION  CALLER
+  APPLY ID      ENV         STATE      STARTED         DURATION  SOURCE
   apply_abc123  staging     Completed  1 hour ago      15m       cli
   apply_def456  staging     Running    15 minutes ago  15m       PR 42
   apply_ghi789  production  Failed     3 hours ago     30m       PR 42
@@ -7286,7 +7286,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 │  Apply ID:     apply-multi-a1b2c3d4                           │
 │  Environment:  production                                     │
 │  State:        running                                        │
-│  Caller:       octocat                                        │
+│  Caller:       github:octocat                                 │
+│  Source:       https://github.com/acme/shop/pull/412          │
 │  Started:      Jan 15 14:22:00 UTC                            │
 │  Duration:     8m                                             │
 │  Deployments:  1 ready for cutover · 1 running · 1 waiting    │
@@ -7322,15 +7323,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ```
 
-┌─────────────────────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4                 │
-│  Environment:  production                           │
-│  State:        failed                               │
-│  Caller:       octocat                              │
-│  Started:      Jan 15 14:22:00 UTC                  │
-│  Duration:     8m                                   │
-│  Deployments:  1 completed · 1 halted · 1 failed    │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        failed                                 │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Deployments:  1 completed · 1 halted · 1 failed      │
+└───────────────────────────────────────────────────────┘
 
   ⚠ First failure: eu-west — duplicate key name 'idx_orders_source'
 
@@ -7364,15 +7366,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ```
 
-┌──────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4  │
-│  Environment:  production            │
-│  State:        completed             │
-│  Caller:       octocat               │
-│  Started:      Jan 15 14:22:00 UTC   │
-│  Duration:     7m                    │
-│  Deployments:  3 completed           │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        completed                              │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     7m                                     │
+│  Deployments:  3 completed                            │
+└───────────────────────────────────────────────────────┘
 
 ✅ us-east — completed (orders-us-east)
 
