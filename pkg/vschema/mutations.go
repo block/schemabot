@@ -81,9 +81,12 @@ func Mutations(current, desired string) ([]Mutation, error) {
 }
 
 // paramMutations reports each changed, added, or removed param on a same-name
-// vindex. The backing-table param of a lookup-family vindex gets its own
-// reason: repointing it makes Vitess read and write lookup rows in a
-// different table immediately, which is the highest-impact param change.
+// vindex. Presence is part of a param's identity — a key set to the empty
+// string is not the same as an absent key — so add and remove are detected by
+// presence, not by comparing zero values. The backing-table param gets its
+// own reason when both definitions are lookup-family: repointing it makes
+// Vitess read and write lookup rows in a different table immediately, which
+// is the highest-impact param change.
 func paramMutations(name string, current, desired *vschemapb.Vindex) []Mutation {
 	keys := make(map[string]struct{}, len(current.GetParams())+len(desired.GetParams()))
 	for k := range current.GetParams() {
@@ -98,18 +101,29 @@ func paramMutations(name string, current, desired *vschemapb.Vindex) []Mutation 
 	}
 	sort.Strings(sorted)
 
+	bothLookup := strings.Contains(current.GetType(), "lookup") && strings.Contains(desired.GetType(), "lookup")
+
 	var mutations []Mutation
 	for _, key := range sorted {
-		currentValue := current.GetParams()[key]
-		desiredValue := desired.GetParams()[key]
-		if currentValue == desiredValue {
+		currentValue, inCurrent := current.GetParams()[key]
+		desiredValue, inDesired := desired.GetParams()[key]
+		if inCurrent == inDesired && currentValue == desiredValue {
 			continue
 		}
-		reason := fmt.Sprintf("vindex %q changes parameter %q from %q to %q: routing and lookup behavior changes the moment the VSchema is applied",
-			name, key, currentValue, desiredValue)
-		if key == "table" && strings.Contains(current.GetType(), "lookup") {
+		var reason string
+		switch {
+		case key == "table" && bothLookup && inCurrent && inDesired:
 			reason = fmt.Sprintf("lookup vindex %q repoints its backing table from %q to %q: Vitess immediately reads and writes lookup rows in the new table, the old table's rows go stale, and lookups can fail until the new table is populated",
 				name, currentValue, desiredValue)
+		case !inCurrent:
+			reason = fmt.Sprintf("vindex %q adds parameter %q with value %q: routing and lookup behavior changes the moment the VSchema is applied",
+				name, key, desiredValue)
+		case !inDesired:
+			reason = fmt.Sprintf("vindex %q removes parameter %q (was %q): routing and lookup behavior changes the moment the VSchema is applied",
+				name, key, currentValue)
+		default:
+			reason = fmt.Sprintf("vindex %q changes parameter %q from %q to %q: routing and lookup behavior changes the moment the VSchema is applied",
+				name, key, currentValue, desiredValue)
 		}
 		mutations = append(mutations, Mutation{
 			Kind:   MutationKindVindexParams,

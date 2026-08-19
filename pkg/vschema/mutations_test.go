@@ -87,11 +87,40 @@ func TestMutations_GenericParamChangeAddAndRemove(t *testing.T) {
 		assert.Equal(t, MutationKindVindexParams, m.Kind)
 		assert.Equal(t, "v", m.Name)
 	}
-	assert.Contains(t, mutations[0].Reason, `"extra"`)
-	assert.Contains(t, mutations[1].Reason, `"region_bytes"`)
-	assert.Contains(t, mutations[2].Reason, `"region_map"`)
+	assert.Contains(t, mutations[0].Reason, `adds parameter "extra"`)
+	assert.Contains(t, mutations[1].Reason, `removes parameter "region_bytes"`)
+	assert.Contains(t, mutations[2].Reason, `changes parameter "region_map"`)
 	assert.Contains(t, mutations[2].Reason, `"/etc/a.json"`)
 	assert.Contains(t, mutations[2].Reason, `"/etc/b.json"`)
+}
+
+func TestMutations_EmptyValuedParamAddAndRemove(t *testing.T) {
+	// A param's presence is part of its identity: adding or removing a key
+	// whose value is the empty string still changes the vindex definition and
+	// must be disclosed, not silently equated with the key being absent.
+	current := `{"sharded": true, "vindexes": {"v": {"type": "region_json", "params": {"blank": ""}}}, "tables": {}}`
+	desired := `{"sharded": true, "vindexes": {"v": {"type": "region_json", "params": {"empty": ""}}}, "tables": {}}`
+	mutations, err := Mutations(current, desired)
+	require.NoError(t, err)
+	require.Len(t, mutations, 2)
+	assert.Contains(t, mutations[0].Reason, `removes parameter "blank"`)
+	assert.Contains(t, mutations[1].Reason, `adds parameter "empty"`)
+}
+
+func TestMutations_TableParamChangeOnNonLookupDesired(t *testing.T) {
+	// When the vindex is simultaneously retyped out of the lookup family, the
+	// backing-table repoint framing no longer describes the desired state —
+	// the table param change is reported with the generic reason, and the
+	// type change carries its own disclosure.
+	current := `{"sharded": true, "vindexes": {"l": {"type": "lookup_unique", "params": {"table": "l1", "from": "a", "to": "b"}, "owner": "users"}}, "tables": {}}`
+	desired := `{"sharded": true, "vindexes": {"l": {"type": "region_json", "params": {"table": "l2", "from": "a", "to": "b"}, "owner": "users"}}, "tables": {}}`
+	mutations, err := Mutations(current, desired)
+	require.NoError(t, err)
+	require.Len(t, mutations, 2)
+	assert.Equal(t, MutationKindVindexType, mutations[0].Kind)
+	assert.Equal(t, MutationKindVindexParams, mutations[1].Kind)
+	assert.Contains(t, mutations[1].Reason, `changes parameter "table"`)
+	assert.NotContains(t, mutations[1].Reason, "repoints its backing table")
 }
 
 func TestMutations_OwnerChange(t *testing.T) {
