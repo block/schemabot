@@ -222,3 +222,15 @@ func TestPlanStore_ListRejectsNonPositiveLimit(t *testing.T) {
 	_, err := store.Plans().List(ctx, storage.ListPlansOptions{})
 	require.ErrorContains(t, err, "limit must be positive")
 }
+
+// TestPlanStore_ListRejectsPullRequestWithoutRepository verifies that a PR
+// filter without a repository is refused rather than silently matching plans
+// with the same PR number across every repository.
+func TestPlanStore_ListRejectsPullRequestWithoutRepository(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	_, err := store.Plans().List(ctx, storage.ListPlansOptions{PullRequest: 42, Limit: 10})
+	require.ErrorContains(t, err, "repository filter is required")
+}

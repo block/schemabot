@@ -121,6 +121,9 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 	if opts.Limit <= 0 {
 		return nil, fmt.Errorf("list plans for database %q environment %q: limit must be positive, got %d", opts.Database, opts.Environment, opts.Limit)
 	}
+	if opts.PullRequest > 0 && opts.Repository == "" {
+		return nil, fmt.Errorf("list plans for pull request %d: a repository filter is required, since a pull request number is only meaningful within one repository", opts.PullRequest)
+	}
 
 	var where []string
 	var args []any

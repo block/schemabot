@@ -405,7 +405,8 @@ type ListPlansOptions struct {
 	// that repository (owner/name).
 	Repository string
 	// PullRequest, when positive, restricts results to plans generated for
-	// that PR number. Meaningful only together with Repository.
+	// that PR number. Requires Repository — a PR number is only meaningful
+	// within one repository, so List errors when it is set alone.
 	PullRequest int
 	// Since, when set, restricts results to plans created at or after this
 	// instant.
@@ -438,7 +439,8 @@ type PlanStore interface {
 	// rationale). Returned plans omit SchemaFiles — the full desired-schema
 	// DDL is the bulk of a plan row and listings never need it; fetch a single
 	// plan via Get for the complete record. Returns an error when opts.Limit
-	// is not positive.
+	// is not positive, or when opts.PullRequest is set without
+	// opts.Repository.
 	List(ctx context.Context, opts ListPlansOptions) ([]*Plan, error)
 
 	// Delete removes a plan by ID.
