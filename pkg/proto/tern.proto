@@ -556,6 +556,14 @@ message ApplyRequest {
   // duplicate, so a re-dispatch after a lost response does not re-run the
   // schema change. Empty preserves the non-deduplicated behavior.
   string idempotency_key = 11;
+  // The generation manifest for a deployment-keyed dispatch: every operation
+  // key the dispatcher will send to this deployment's shared apply under the
+  // idempotency key, this dispatch's own key included. The data plane stores
+  // it on the keyed apply at creation and completes the apply only when every
+  // listed operation has attached and reached a terminal state, so a fast
+  // first operation can never terminalize the apply while sibling dispatches
+  // are still on their way. Empty means this dispatch is the whole generation.
+  repeated string generation_operation_keys = 12;
 }
 
 // ApplyResponse indicates whether the apply was accepted.

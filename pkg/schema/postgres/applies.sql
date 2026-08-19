@@ -13,6 +13,7 @@ CREATE TABLE applies (
   installation_id bigint NOT NULL DEFAULT 0,
   external_id varchar(255) NOT NULL DEFAULT '',
   idempotency_key varchar(255) DEFAULT NULL,
+  expected_operation_keys jsonb DEFAULT NULL,
   engine varchar(50) NOT NULL,
   state varchar(100) NOT NULL,
   error_message text,
