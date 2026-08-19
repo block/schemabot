@@ -130,6 +130,11 @@ SchemaBot plans all keyspaces together — a single plan can contain changes acr
 
 A plan can have DDL-only changes, VSchema-only changes, or both.
 
+A VSchema change that removes a vindex, a table routing entry, or a table's
+column-vindex association is an unsafe change and requires the same
+`--allow-unsafe` acknowledgment as destructive DDL — see
+[lint-and-safety-levels.md](./lint-and-safety-levels.md#what-unsafe-means).
+
 ## Where to Put the Schema Directory
 
 SchemaBot is location-agnostic: config discovery finds `schemabot.yaml` anywhere

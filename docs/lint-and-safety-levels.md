@@ -74,6 +74,18 @@ classified unsafe when any of the following hold:
 - a lint rule raised it at error severity (for example dropping an index that
   was never made invisible).
 
+A Vitess VSchema change is unsafe when it removes anything from the current
+VSchema: a vindex definition, a table's routing entry, or a table's
+column-vindex association. A removal changes query routing the moment the
+VSchema is applied — Vitess stops using the removed vindex, a lookup vindex's
+backing table stops being maintained and its rows go stale, and queries that
+depended on the removed entry can fail or scatter. Deleting a vindex is as
+dangerous as dropping a table, so it takes the same `--allow-unsafe`
+acknowledgment. Additions-only VSchema changes (new vindexes, new tables, new
+column-vindex associations) are not unsafe. Removals are detected structurally
+by comparing the current and desired VSchema documents; a VSchema that cannot
+be parsed fails the plan rather than skipping detection.
+
 Unsafe does not mean broken. An unsafe change will usually apply successfully —
 the point of the gate is that it is destructive or irreversible, so SchemaBot
 requires an explicit, auditable acknowledgment (`--allow-unsafe`) instead of
