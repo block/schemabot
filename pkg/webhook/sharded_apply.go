@@ -120,16 +120,17 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	}
 
 	data := templates.ShardedApplyData{
-		State:       apply.State,
-		Environment: apply.Environment,
-		Database:    apply.Database,
-		Keyspace:    keyspace,
-		ApplyID:     apply.ApplyIdentifier,
-		RequestedBy: actorFromCaller(apply.Caller),
-		Shards:      shardStatuses(shardOrder, opsByShard, released, tasksByOp),
-		Cells:       cells,
-		Tenant:      tenant,
-		Rollback:    apply.IsRollback(),
+		State:        apply.State,
+		Environment:  apply.Environment,
+		Database:     apply.Database,
+		Keyspace:     keyspace,
+		ApplyID:      apply.ApplyIdentifier,
+		RequestedBy:  actorFromCaller(apply.Caller),
+		ErrorMessage: apply.ErrorMessage,
+		Shards:       shardStatuses(shardOrder, opsByShard, released, tasksByOp),
+		Cells:        cells,
+		Tenant:       tenant,
+		Rollback:     apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

@@ -236,3 +236,60 @@ func TestRenderShardedApplySummaryComment_CancelledOffersNoResume(t *testing.T) 
 	assert.Contains(t, out, "This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.")
 	assert.NotContains(t, out, "schemabot start", "a cancelled apply offers no resume command")
 }
+
+// A sharded apply can fail outside shard work (e.g. a finalizer operation),
+// leaving no shard in a failure state. The failed verdict must still name the
+// cause, so the apply-level error is lifted to the top in that case — sanitized
+// like every other PR-facing error.
+func TestRenderShardedApplySummaryComment_FailureOutsideShardWorkSurfacesApplyError(t *testing.T) {
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ErrorMessage: "finalize vschema: dial tcp db-primary.internal:3306: connect refused retry | later\nsecond line",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
+	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: dial tcp [endpoint redacted]: connect refused retry | later second line",
+		"the apply-level error is surfaced when no shard failed, sanitized to one line")
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints never render in PR comments")
+	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
+}
+
+// When a shard did fail, the shard's error owns the failure callout and the
+// apply-level error is not repeated below it.
+func TestRenderShardedApplyComment_ShardFailureOwnsCallout(t *testing.T) {
+	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ErrorMessage: "apply failed",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+failErr)
+	assert.NotContains(t, out, "**Failure:** apply failed")
+}
+
+// The duration is decoration: a completed timestamp earlier than the started
+// timestamp (bad data, clock skew) drops it rather than rendering a negative
+// duration.
+func TestRenderShardedApplySummaryComment_NegativeDurationOmitted(t *testing.T) {
+	out := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		StartedAt: "2026-01-01T01:00:00Z", CompletedAt: "2026-01-01T00:00:00Z",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.NotContains(t, out, "**Duration**:")
+}

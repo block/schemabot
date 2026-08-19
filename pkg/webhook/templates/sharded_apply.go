@@ -29,6 +29,11 @@ type ShardedApplyData struct {
 	StartedAt   string
 	CompletedAt string
 
+	// ErrorMessage is the apply-level error. It is surfaced when the apply
+	// failed without any shard in a failure state — a failure outside shard work
+	// (e.g. a finalizer) leaves no failed shard row to carry the cause.
+	ErrorMessage string
+
 	// Shards is the per-shard rollup in resolved order: one entry per shard with
 	// its aggregate state. It drives the count histogram, each group's status
 	// rows, and the first-failure callout.
@@ -99,7 +104,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeShardedMetadata(&sb, data, renderedAt)
 
 	writeShardCounts(&sb, data.Shards)
-	writeShardFirstFailure(&sb, data.Shards)
+	writeShardedFailure(&sb, data)
 	writeShardKeyspaceSection(&sb, data)
 
 	writeShardedFooter(&sb, data)
@@ -124,7 +129,7 @@ func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data.Cells), data.Rollback))
 	}
 	writeShardCounts(&sb, data.Shards)
-	writeShardFirstFailure(&sb, data.Shards)
+	writeShardedFailure(&sb, data)
 	writeShardKeyspaceSection(&sb, data)
 	writeShardedFooter(&sb, data)
 	return sb.String()
@@ -285,11 +290,14 @@ func isShardFailureState(opState string) bool {
 	return opState == state.ApplyOperation.Failed || opState == state.ApplyOperation.FailedRetryable
 }
 
-// writeShardFirstFailure lifts the first failed shard's error to the top so an
-// operator sees the cause without scanning the table. Renders nothing when no
-// shard has failed or is retrying after a failure.
-func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
-	for _, s := range shards {
+// writeShardedFailure lifts the failure cause to the top so an operator sees
+// it without scanning the table: the first failed shard's error when shard
+// work failed, otherwise the apply-level error — a failure outside shard work
+// (e.g. a finalizer) leaves no failed shard row to carry the cause, and a
+// failed apply must still name it. Renders nothing when the apply carries no
+// failure to explain.
+func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
+	for _, s := range data.Shards {
 		if !isShardFailureState(s.State) {
 			continue
 		}
@@ -300,6 +308,12 @@ func writeShardFirstFailure(sb *strings.Builder, shards []ShardStatus) {
 			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))
 		}
 		return
+	}
+	if !state.IsState(data.State, state.Apply.Failed, state.Apply.FailedRetryable) {
+		return
+	}
+	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
+		fmt.Fprintf(sb, "\n> ⚠️ **Failure:** %s\n", html.EscapeString(msg))
 	}
 }
 

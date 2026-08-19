@@ -1269,6 +1269,9 @@ func durationDisplay(startedAt, completedAt string) string {
 	if err1 != nil || err2 != nil {
 		return ""
 	}
+	if endTime.Before(startTime) {
+		return ""
+	}
 	return formatDuration(endTime.Sub(startTime))
 }
 
