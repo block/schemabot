@@ -587,7 +587,7 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
-			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
+			writeVSchemaDiffFence(sb, c.Diff)
 		}
 	}
 }

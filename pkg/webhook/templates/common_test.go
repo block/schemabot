@@ -182,3 +182,28 @@ func TestTaskErrorAddsDetail(t *testing.T) {
 		assert.False(t, taskErrorAddsDetail("  \n", "copy failed"))
 	})
 }
+
+func TestWriteVSchemaDiffFence(t *testing.T) {
+	t.Run("small diff renders intact without a truncation marker", func(t *testing.T) {
+		var sb strings.Builder
+		writeVSchemaDiffFence(&sb, "--- current\n+++ new\n+ vindex hash")
+		assert.Equal(t, "```diff\n--- current\n+++ new\n+ vindex hash\n```\n\n", sb.String())
+	})
+
+	t.Run("oversized diff is clamped with a visible marker", func(t *testing.T) {
+		var sb strings.Builder
+		writeVSchemaDiffFence(&sb, strings.Repeat("+", maxCommentVSchemaDiffLen+100))
+		out := sb.String()
+		assert.Less(t, len(out), maxCommentVSchemaDiffLen+200, "rendered section stays near the diff budget")
+		assert.Contains(t, out, "Diff truncated to fit GitHub's comment size limit")
+		assert.Contains(t, out, "```diff\n", "the fence still opens")
+		assert.Contains(t, out, "\n```\n", "the fence still closes after the clamped diff")
+	})
+
+	t.Run("clamp never splits a UTF-8 rune", func(t *testing.T) {
+		var sb strings.Builder
+		writeVSchemaDiffFence(&sb, strings.Repeat("é", maxCommentVSchemaDiffLen))
+		assert.True(t, strings.HasSuffix(strings.SplitAfter(sb.String(), "\n```")[0], "é\n```"),
+			"the clamped diff ends on a whole rune before the closing fence")
+	})
+}

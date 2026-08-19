@@ -601,9 +601,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		if hasVSchemaChanges {
 			sb.WriteString("#### VSchema\n")
 			if ks.VSchemaDiff != "" {
-				sb.WriteString("```diff\n")
-				sb.WriteString(ks.VSchemaDiff)
-				sb.WriteString("\n```\n\n")
+				writeVSchemaDiffFence(sb, ks.VSchemaDiff)
 			} else {
 				sb.WriteString("_(diff not available)_\n\n")
 			}

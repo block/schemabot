@@ -172,6 +172,31 @@ func escapeInlineMarkdown(text string) string {
 // render intact; anything longer is clamped with a truncation marker.
 const maxCommentErrorLen = 500
 
+// maxCommentVSchemaDiffLen bounds a rendered VSchema diff so one enormous
+// diff — such as the first sharding pass over a keyspace with many tables —
+// cannot push the comment body past GitHub's size cap, which would make every
+// post or edit of that comment fail and freeze the PR's status surface.
+// Typical vindex and routing diffs are far smaller and render intact; the
+// full change always remains reviewable in the PR's own file diff.
+const maxCommentVSchemaDiffLen = 16384
+
+// writeVSchemaDiffFence renders a VSchema diff inside a diff fence,
+// truncating an oversized diff with a visible marker instead of letting it
+// grow the comment past GitHub's limit.
+func writeVSchemaDiffFence(sb *strings.Builder, diff string) {
+	truncated := false
+	if len(diff) > maxCommentVSchemaDiffLen {
+		diff = truncateToBytes(diff, maxCommentVSchemaDiffLen)
+		truncated = true
+	}
+	sb.WriteString("```diff\n")
+	sb.WriteString(diff)
+	sb.WriteString("\n```\n\n")
+	if truncated {
+		sb.WriteString("_Diff truncated to fit GitHub's comment size limit; this PR's file diff shows the full VSchema change._\n\n")
+	}
+}
+
 var (
 	// dsnFragmentRe matches Go MySQL driver DSN fragments such as
 	// user:pass@tcp(host:3306)/db, which leak credentials and endpoints.
