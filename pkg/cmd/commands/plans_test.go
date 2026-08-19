@@ -36,7 +36,7 @@ func TestPlansCmdParsesListFiltersAndPlanID(t *testing.T) {
 }
 
 func TestPlanSource(t *testing.T) {
-	assert.Equal(t, "org/repo#42", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo", PullRequest: 42}))
+	assert.Equal(t, "https://github.com/org/repo/pull/42", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo", PullRequest: 42}))
 	assert.Equal(t, "org/repo", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo"}))
 	assert.Equal(t, "ad-hoc", planSource(&apitypes.PlanSummaryResponse{}))
 }

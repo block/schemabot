@@ -122,11 +122,11 @@ func showStoredPlan(endpoint, planID string, outputJSON bool) error {
 	return nil
 }
 
-// planSource renders a plan's provenance: the PR it was generated for, or
-// "ad-hoc" when it was created without one.
+// planSource renders a plan's provenance: the PR it was generated for as a
+// full clickable URL, or "ad-hoc" when it was created without one.
 func planSource(p *apitypes.PlanSummaryResponse) string {
 	if p.Repository != "" && p.PullRequest > 0 {
-		return fmt.Sprintf("%s#%d", p.Repository, p.PullRequest)
+		return fmt.Sprintf("https://github.com/%s/pull/%d", p.Repository, p.PullRequest)
 	}
 	if p.Repository != "" {
 		return p.Repository
