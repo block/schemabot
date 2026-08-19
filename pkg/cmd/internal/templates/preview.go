@@ -111,6 +111,7 @@ const (
 
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
+	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
 	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements

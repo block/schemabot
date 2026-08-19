@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -102,13 +103,18 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 1: Generate plan
 	var planResult *apitypes.PlanResponse
+	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces)
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces)
 		return planErr
 	})
 	if err != nil {
 		return err
+	}
+	if cmd.Output != OutputFormatJSON {
+		templates.WriteIgnoredNamespaces(ignoredNamespaces,
+			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
 	}
 
 	// Validate engine-specific options

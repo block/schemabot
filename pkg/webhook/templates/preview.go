@@ -58,6 +58,16 @@ func previewPlanData() PlanCommentData {
 	}
 }
 
+// PreviewCommentPlanIgnoredNamespaces renders a sample plan from a schema root
+// whose config withholds a namespace via ignore_namespaces, showing the
+// exclusion disclosure alongside the remaining namespace's changes.
+func PreviewCommentPlanIgnoredNamespaces() string {
+	data := previewPlanData()
+	data.LintViolations = nil
+	data.IgnoredNamespaces = []string{"local_fixtures"}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {

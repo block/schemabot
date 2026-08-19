@@ -1042,9 +1042,15 @@ type PlanRequest struct {
 	// without a PR context).
 	HeadSha string `protobuf:"bytes,9,opt,name=head_sha,json=headSha,proto3" json:"head_sha,omitempty"`
 	// Repo-relative schema directory discovered by SchemaBot from the PR.
-	SchemaPath    string `protobuf:"bytes,10,opt,name=schema_path,json=schemaPath,proto3" json:"schema_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SchemaPath string `protobuf:"bytes,10,opt,name=schema_path,json=schemaPath,proto3" json:"schema_path,omitempty"`
+	// Namespaces the caller removed from schema_files per the config's
+	// ignore_namespaces, resolved for the environment. The data plane refuses
+	// engine shapes that diff the whole target as one unit (a database-scoped
+	// MySQL DSN), where a withheld namespace's live tables would otherwise be
+	// planned as drops.
+	IgnoredNamespaces []string `protobuf:"bytes,11,rep,name=ignored_namespaces,json=ignoredNamespaces,proto3" json:"ignored_namespaces,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1138,6 +1144,13 @@ func (x *PlanRequest) GetSchemaPath() string {
 		return x.SchemaPath
 	}
 	return ""
+}
+
+func (x *PlanRequest) GetIgnoredNamespaces() []string {
+	if x != nil {
+		return x.IgnoredNamespaces
+	}
+	return nil
 }
 
 // TableChange represents a DDL change to a table.
@@ -3747,7 +3760,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\x9c\x03\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xcb\x03\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -3761,7 +3774,8 @@ const file_tern_proto_rawDesc = "" +
 	"\bhead_sha\x18\t \x01(\tR\aheadSha\x12\x1f\n" +
 	"\vschema_path\x18\n" +
 	" \x01(\tR\n" +
-	"schemaPath\x1aT\n" +
+	"schemaPath\x12-\n" +
+	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\x9c\x02\n" +

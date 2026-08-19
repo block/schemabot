@@ -435,6 +435,12 @@ message PlanRequest {
   string head_sha = 9;
   // Repo-relative schema directory discovered by SchemaBot from the PR.
   string schema_path = 10;
+  // Namespaces the caller removed from schema_files per the config's
+  // ignore_namespaces, resolved for the environment. The data plane refuses
+  // engine shapes that diff the whole target as one unit (a database-scoped
+  // MySQL DSN), where a withheld namespace's live tables would otherwise be
+  // planned as drops.
+  repeated string ignored_namespaces = 11;
 }
 
 // TableChange represents a DDL change to a table.

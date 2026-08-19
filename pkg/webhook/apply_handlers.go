@@ -243,15 +243,16 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Generate plan
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
-		Database:      schemaResult.Database,
-		Environment:   environment,
-		Type:          schemaResult.Type,
-		SchemaFiles:   schemaResult.SchemaFiles,
-		Repository:    repo,
-		PullRequest:   &prNumber,
-		HeadSHA:       &schemaResult.HeadSHA,
-		SchemaPath:    schemaResult.SchemaPath,
-		SourceTrusted: true,
+		Database:          schemaResult.Database,
+		Environment:       environment,
+		Type:              schemaResult.Type,
+		SchemaFiles:       schemaResult.SchemaFiles,
+		Repository:        repo,
+		PullRequest:       &prNumber,
+		HeadSHA:           &schemaResult.HeadSHA,
+		SchemaPath:        schemaResult.SchemaPath,
+		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		SourceTrusted:     true,
 	}
 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)

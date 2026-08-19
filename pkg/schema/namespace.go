@@ -3,6 +3,7 @@ package schema
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 )
 
@@ -52,7 +53,14 @@ import (
 // names and are matched against the post-substitution namespace keys. Layout
 // validation still sees ignored directories: a mixed flat/subdirectory layout
 // is rejected even when the subdirectories are all ignored.
-func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string, ignoreNamespaces []string) (SchemaFiles, error) {
+//
+// The second return value lists the namespace keys that were actually removed
+// by ignoreNamespaces, sorted. An entry that matches no namespace removes
+// nothing (matching is exact and case-sensitive); callers that report
+// exclusions must report the removed keys, and should warn when a configured
+// entry is absent from them so a typo or stale entry is visible instead of
+// silently reconciling the namespace it was meant to exclude.
+func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string, ignoreNamespaces []string) (SchemaFiles, []string, error) {
 	result := make(SchemaFiles)
 	var hasFlatFile, hasNamespacedFile bool
 
@@ -85,21 +93,28 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 
 	// Reject mixed flat + namespaced files
 	if hasFlatFile && hasNamespacedFile {
-		return nil, fmt.Errorf("schema directory has both flat files and namespace subdirectories — use one layout or the other")
+		return nil, nil, fmt.Errorf("schema directory has both flat files and namespace subdirectories — use one layout or the other")
 	}
 
+	var removed []string
 	for _, ignored := range ResolveIgnoreNamespaces(ignoreNamespaces, environment) {
+		if _, ok := result[ignored]; !ok {
+			continue
+		}
 		delete(result, ignored)
+		removed = append(removed, ignored)
 	}
+	sort.Strings(removed)
 
-	return result, nil
+	return result, removed, nil
 }
 
 // ResolveIgnoreNamespaces applies the same $ENV substitution to
 // ignore_namespaces entries that GroupFilesByNamespace applies to namespace
-// directory names, returning the namespace keys that are actually excluded
-// for the environment. Callers that log or report ignored namespaces should
-// use the resolved values so operators see the real excluded keys.
+// directory names, returning the configured entries as they will be matched
+// against namespace keys for the environment. Resolution does not check
+// existence — an entry may match no namespace; GroupFilesByNamespace reports
+// which entries actually removed one.
 func ResolveIgnoreNamespaces(namespaces []string, environment string) []string {
 	if len(namespaces) == 0 {
 		return nil
@@ -112,6 +127,25 @@ func ResolveIgnoreNamespaces(namespaces []string, environment string) []string {
 		resolved[i] = ns
 	}
 	return resolved
+}
+
+// UnmatchedIgnoreEntries returns the resolved ignore_namespaces entries that
+// removed no namespace during grouping — a typo, a case mismatch, or a stale
+// entry for a directory that no longer exists. The namespaces such entries
+// name are fully reconciled, so callers should warn with the returned values
+// rather than letting the config imply an exclusion that is not happening.
+func UnmatchedIgnoreEntries(configured []string, environment string, removed []string) []string {
+	removedSet := make(map[string]bool, len(removed))
+	for _, ns := range removed {
+		removedSet[ns] = true
+	}
+	var unmatched []string
+	for _, ns := range ResolveIgnoreNamespaces(configured, environment) {
+		if !removedSet[ns] {
+			unmatched = append(unmatched, ns)
+		}
+	}
+	return unmatched
 }
 
 // ValidateIgnoreNamespaces rejects ignore_namespaces entries that cannot match

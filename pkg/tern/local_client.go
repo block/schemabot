@@ -1623,6 +1623,19 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		return nil, err
 	}
 	if hasDatabase {
+		// A database-scoped target DSN diffs the whole database as one unit:
+		// the engine loads every live table while the desired state is only
+		// the files the caller sent. A namespace withheld via
+		// ignore_namespaces leaves its live tables with no declaring file, so
+		// the declarative diff would plan them as drops — the inverse of
+		// "ignore". No reliable live-table→namespace mapping exists on this
+		// shape, so refuse rather than emit a plan that proposes dropping the
+		// namespace the config says to leave alone.
+		if len(req.GetIgnoredNamespaces()) > 0 {
+			return nil, fmt.Errorf(
+				"ignore_namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so ignored namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove ignore_namespaces",
+				req.GetIgnoredNamespaces())
+		}
 		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
 	}
 	if len(schemaFiles) == 0 {

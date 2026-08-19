@@ -106,15 +106,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		deployment = resolvedTarget.Deployment
 	}
 	planReq := api.PlanRequest{
-		Database:      schemaResult.Database,
-		Environment:   environment,
-		Type:          schemaResult.Type,
-		SchemaFiles:   schemaResult.SchemaFiles,
-		Repository:    repo,
-		PullRequest:   &prNumber,
-		HeadSHA:       &schemaResult.HeadSHA,
-		SchemaPath:    schemaResult.SchemaPath,
-		SourceTrusted: true,
+		Database:          schemaResult.Database,
+		Environment:       environment,
+		Type:              schemaResult.Type,
+		SchemaFiles:       schemaResult.SchemaFiles,
+		Repository:        repo,
+		PullRequest:       &prNumber,
+		HeadSHA:           &schemaResult.HeadSHA,
+		SchemaPath:        schemaResult.SchemaPath,
+		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		SourceTrusted:     true,
 	}
 
 	// Execute plan via the service
@@ -390,15 +391,16 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		prNumber := int32(pr)
 		planReq := api.PlanRequest{
-			Database:      schemaResult.Database,
-			Environment:   env,
-			Type:          schemaResult.Type,
-			SchemaFiles:   schemaResult.SchemaFiles,
-			Repository:    repo,
-			PullRequest:   &prNumber,
-			HeadSHA:       &schemaResult.HeadSHA,
-			SchemaPath:    schemaResult.SchemaPath,
-			SourceTrusted: true,
+			Database:          schemaResult.Database,
+			Environment:       env,
+			Type:              schemaResult.Type,
+			SchemaFiles:       schemaResult.SchemaFiles,
+			Repository:        repo,
+			PullRequest:       &prNumber,
+			HeadSHA:           &schemaResult.HeadSHA,
+			SchemaPath:        schemaResult.SchemaPath,
+			IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+			SourceTrusted:     true,
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
@@ -748,15 +750,16 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
-		Database:     schema.Database,
-		Environment:  environment,
-		Tenant:       tenant,
-		AgentHint:    agentHint,
-		HeadSHA:      schema.HeadSHA,
-		Repository:   schema.Repository,
-		RequestedBy:  requestedBy,
-		DatabaseType: schema.Type,
-		IsMySQL:      schema.Type == "mysql",
+		Database:          schema.Database,
+		Environment:       environment,
+		Tenant:            tenant,
+		AgentHint:         agentHint,
+		HeadSHA:           schema.HeadSHA,
+		Repository:        schema.Repository,
+		RequestedBy:       requestedBy,
+		DatabaseType:      schema.Type,
+		IsMySQL:           schema.Type == "mysql",
+		IgnoredNamespaces: schema.IgnoredNamespaces,
 	}
 
 	// Per-shard changes, grouped by keyspace, so a sharded keyspace can show what

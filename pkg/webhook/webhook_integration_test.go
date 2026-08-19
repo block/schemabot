@@ -180,8 +180,22 @@ type e2eServiceOpts struct {
 	skipOperator bool
 	// databaseType and targetDSN let integration scenarios exercise another
 	// built-in engine while retaining the same API, storage, and operator path.
+	// For MySQL, a non-empty targetDSN overrides the default database-scoped
+	// DSN — e.g. a namespace-free DSN for scenarios where the namespace
+	// selects the database.
 	databaseType string
 	targetDSN    string
+}
+
+// namespaceFreeTargetDSN returns the shared MySQL target's DSN with no
+// database selected — the shape where each namespace's directory name selects
+// the database it is planned against.
+func namespaceFreeTargetDSN(t *testing.T) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	return cfg.FormatDSN()
 }
 
 // setupE2EServiceOpts creates a real api.Service with a LocalClient for the
@@ -211,10 +225,12 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 			}
 		})
 
-		cfg, err := mysql.ParseDSN(e2eTargetDSN)
-		require.NoError(t, err)
-		cfg.DBName = appDBName
-		appDSN = cfg.FormatDSN()
+		if appDSN == "" {
+			cfg, err := mysql.ParseDSN(e2eTargetDSN)
+			require.NoError(t, err)
+			cfg.DBName = appDBName
+			appDSN = cfg.FormatDSN()
+		}
 	}
 	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
