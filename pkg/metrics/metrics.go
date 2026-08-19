@@ -800,6 +800,30 @@ func RecordRemoteControlRequestRejected(ctx context.Context, operation, engine, 
 	)
 }
 
+// RecordControlRequestUnsupportedDecline counts durable control requests
+// resolved terminally because the engine does not support the operation for
+// its database type (e.g. stop or cancel against a PostgreSQL apply, whose
+// statements commit or fail on their own). The decline itself is working as
+// designed — the request is failed with the engine's reason and the schema
+// change settles on its own — so a count here is an operator issuing a
+// command the engine can never honor. A sustained rate on one operation means
+// operators keep reaching for a control surface that does not exist on that
+// engine: improve the operator-facing guidance for it rather than chasing a
+// fault.
+func RecordControlRequestUnsupportedDecline(ctx context.Context, operation, engine, database, deployment, environment string) {
+	if !knownControlOperations[operation] {
+		operation = "unknown"
+	}
+	addCounter(ctx, "schemabot.control.unsupported_declines_total",
+		"Total durable control requests resolved terminally because the engine does not support the operation", "{decline}",
+		attribute.String("operation", operation),
+		attribute.String("engine", engine),
+		attribute.String("database", database),
+		DeploymentAttribute(deployment),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // RecordTasklessSettleDeferred counts task-less stop/cancel settles that lost
 // the parent apply lease mid-drive and settled only the drive's own leased
 // operation row, deferring the apply row to the operator's state projection.

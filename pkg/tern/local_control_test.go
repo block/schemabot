@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/engine/postgres"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -969,6 +970,122 @@ func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resolved)
 	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase cancel is a permanent rejection")
+}
+
+// newPostgresControlTestClient wires the real PostgreSQL engine so durable
+// control tests exercise the engine's own typed declines end to end, not a
+// fake standing in for them.
+func newPostgresControlTestClient(apply *storage.Apply, tasks []*storage.Task, controlRequests *testControlRequestStore) *LocalClient {
+	return &LocalClient{
+		config: LocalConfig{
+			Database:  "testdb",
+			Type:      storage.DatabaseTypePostgres,
+			TargetDSN: "postgres://localhost:5432/testdb",
+		},
+		storage: &controlTestStorage{
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: tasks},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		postgresEngine: postgres.New(),
+		logger:         slog.Default(),
+	}
+}
+
+// A durable stop request against a running PostgreSQL apply is resolved as
+// permanently failed: the engine declines stop as unsupported for its database
+// type, and no retry can ever succeed — leaving the request pending would
+// re-run the same rejection on every drive claim while the DDL keeps
+// executing. The apply and its task keep their states so the running change
+// settles through its own apply path.
+func TestLocalClient_PendingStopResolvesPostgresUnsupportedDecline(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-postgres-pending-stop",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-postgres-pending-stop",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, state.Apply.Running, apply.State, "the running apply must be left untouched to settle on its own")
+	assert.Equal(t, state.Task.Running, task.State, "the running task must not be marked stopped by a declined stop")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable stop request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
+	assert.NotEmpty(t, resolved.ErrorMessage, "the failed request must carry the engine's reason for the operator")
+
+	handled, err = client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
+}
+
+// A durable cancel request against a running PostgreSQL apply is resolved as
+// permanently failed for the same reason as stop: the engine's decline is
+// deterministic, so failing the stored request terminally is the only way to
+// end the operator-owned retry loop without misrepresenting the healthy
+// running change.
+func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-postgres-pending-cancel",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-postgres-pending-cancel",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, state.Apply.Running, apply.State, "the running apply must be left untouched to settle on its own")
+	assert.Equal(t, state.Task.Running, task.State, "the running task must not be marked cancelled by a declined cancel")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable cancel request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
+	assert.NotEmpty(t, resolved.ErrorMessage, "the failed request must carry the engine's reason for the operator")
+
+	handled, err = client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
 }
 
 // Cancelled must never overwrite a revert-phase apply state, whichever path

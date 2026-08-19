@@ -1035,6 +1035,40 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 	return true, nil
 }
 
+// failPendingRequestForUnsupportedOperation resolves a pending control request
+// terminally when the engine declined the operation as unsupported for its
+// database type. The decline is deterministic — no retry can ever succeed —
+// so leaving the request pending would re-run the same rejection on every
+// drive claim while the schema change keeps executing unwatched. The request
+// is failed with the engine's reason, and the apply is left untouched: the
+// running change settles itself through its own apply path. Returns
+// handled=false when the error is not an unsupported-operation decline, so the
+// caller applies its normal error handling.
+func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
+	var unsupported *engine.UnsupportedOperationError
+	if !errors.As(opErr, &unsupported) {
+		return false, nil
+	}
+	message := unsupported.Error()
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the engine does not support the operation; the schema change continues and settles on its own",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error", opErr)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return true, err
+	}
+	engineName := "unknown"
+	if eng := c.getEngine(); eng != nil {
+		engineName = eng.Name()
+	}
+	metrics.RecordControlRequestUnsupportedDecline(ctx, string(operation), engineName, apply.Database, apply.Deployment, apply.Environment)
+	return true, nil
+}
+
 func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -1094,6 +1128,9 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if handled, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); handled {
+			return true, declineErr
+		}
 		return true, fmt.Errorf("process pending stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil || !resp.Accepted {
@@ -1163,6 +1200,9 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if handled, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); handled {
+			return true, declineErr
+		}
 		return true, fmt.Errorf("process pending cancel for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil || !resp.Accepted {

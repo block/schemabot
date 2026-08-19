@@ -76,6 +76,34 @@ func IsAlreadyCompleted(err error) bool {
 	return errors.As(err, &alreadyCompleted)
 }
 
+// UnsupportedOperationError wraps an error to indicate the engine cannot
+// perform the requested control operation for its database type — ever, not
+// just for this schema change or this moment. Retrying can never succeed, so
+// a caller consuming a durable control request should resolve the request
+// terminally with the engine's reason instead of retrying, leaving the
+// underlying schema change untouched to settle on its own.
+type UnsupportedOperationError struct {
+	Err error
+}
+
+func (e *UnsupportedOperationError) Error() string { return e.Err.Error() }
+func (e *UnsupportedOperationError) Unwrap() error { return e.Err }
+
+// NewUnsupportedOperationError wraps err as an unsupported-operation error.
+func NewUnsupportedOperationError(msg string, args ...any) error {
+	return &UnsupportedOperationError{Err: fmt.Errorf(msg, args...)}
+}
+
+// IsUnsupportedOperation reports whether err indicates the engine cannot
+// perform the requested control operation for its database type.
+func IsUnsupportedOperation(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unsupported *UnsupportedOperationError
+	return errors.As(err, &unsupported)
+}
+
 // IsRetryable returns true if the error should be retried by the operator.
 // All errors are retryable by default, and engines explicitly wrap only
 // permanent errors with PermanentError.
@@ -87,6 +115,13 @@ func IsAlreadyCompleted(err error) bool {
 // already-completed rejection must reconcile to the completed outcome via
 // IsAlreadyCompleted instead; anywhere that doesn't, retrying keeps the stored
 // state honest until a drive that reconciles picks it up.
+//
+// UnsupportedOperationError stays retryable for the same reason: the schema
+// change itself is not failed — only the control operation is undeliverable —
+// so classifying it permanent here would let a generic failure path record a
+// healthy change as failed. Paths that can receive an unsupported rejection
+// must resolve the control request terminally via IsUnsupportedOperation
+// instead.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false

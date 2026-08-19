@@ -168,6 +168,33 @@ func TestIsNotReady(t *testing.T) {
 	})
 }
 
+func TestIsUnsupportedOperation(t *testing.T) {
+	t.Run("plain error is not an unsupported-operation decline", func(t *testing.T) {
+		assert.False(t, IsUnsupportedOperation(fmt.Errorf("connection refused")))
+	})
+
+	t.Run("UnsupportedOperationError is an unsupported-operation decline", func(t *testing.T) {
+		assert.True(t, IsUnsupportedOperation(NewUnsupportedOperationError("stop is not supported")))
+	})
+
+	t.Run("wrapped UnsupportedOperationError is an unsupported-operation decline", func(t *testing.T) {
+		err := fmt.Errorf("stop local engine for task t-1: %w", NewUnsupportedOperationError("stop is not supported"))
+		assert.True(t, IsUnsupportedOperation(err))
+	})
+
+	t.Run("UnsupportedOperationError stays retryable", func(t *testing.T) {
+		// The schema change itself is healthy — only the control operation is
+		// undeliverable — so the generic failure path must not record it as a
+		// permanent failure. Paths that can receive the decline resolve the
+		// control request terminally via IsUnsupportedOperation instead.
+		assert.True(t, IsRetryable(NewUnsupportedOperationError("stop is not supported")))
+	})
+
+	t.Run("nil is not an unsupported-operation decline", func(t *testing.T) {
+		assert.False(t, IsUnsupportedOperation(nil))
+	})
+}
+
 func TestIsTransientTransportError(t *testing.T) {
 	tests := []struct {
 		name string
