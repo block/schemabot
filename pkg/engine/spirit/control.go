@@ -5,7 +5,7 @@
 //   - Stop/Start: pause and resume copying (with checkpoint preservation)
 //   - Cutover: trigger the final atomic table swap
 //   - Revert/SkipRevert: roll back or skip rollback of completed changes
-//   - Volume: adjust concurrency and chunk timing on the fly
+//   - Volume: adjust copier concurrency on the fly
 package spirit
 
 import (
@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"math"
 	"strings"
-	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -417,28 +416,27 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 	if previousVolume == 0 {
 		// No explicit volume was set for this schema change; report the
 		// closest level for the settings it started with.
-		previousVolume = settingsToVolume(rm.threads, rm.targetChunkTime)
+		previousVolume = settingsToVolume(rm.threads)
 	}
 	currentThreads := rm.threads
-	currentChunkTime := rm.targetChunkTime
-	currentLockTimeout := rm.lockWaitTimeout
 	e.mu.Unlock()
 
 	// Calculate settings from volume level (1-11)
-	newThreads, newChunkTime, newLockTimeout := volumeToSpiritSettings(req.Volume, cpuHint)
+	newThreads := volumeToSpiritSettings(req.Volume, cpuHint)
 
 	e.schemaChangeLogger(rm).Info("adjusting volume",
 		"database", database,
 		"volume", req.Volume,
 		"previous_volume", previousVolume,
 		"new_threads", newThreads,
-		"new_chunk_time", newChunkTime,
 	)
 
 	// When the requested volume maps to the settings the change is already
 	// running with, record the explicit volume and skip the restart.
-	if newThreads == currentThreads && newChunkTime == currentChunkTime && newLockTimeout == currentLockTimeout {
-		e.setSchemaChangeVolume(rm, req.Volume, newThreads, newChunkTime, newLockTimeout)
+	if newThreads == currentThreads {
+		if !e.setSchemaChangeVolume(rm, req.Volume, newThreads) {
+			return nil, fmt.Errorf("volume adjustment target is no longer the active schema change on database %s", database)
+		}
 		return &engine.VolumeResult{
 			Accepted:       true,
 			PreviousVolume: previousVolume,
@@ -472,7 +470,10 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 
 	// Retune the running schema change; the engine's configured defaults stay
 	// untouched so the next schema change starts from the defaults.
-	e.setSchemaChangeVolume(rm, req.Volume, newThreads, newChunkTime, newLockTimeout)
+	if !e.setSchemaChangeVolume(rm, req.Volume, newThreads) {
+		e.setVolumeRestartInProgress(rm, false)
+		return nil, fmt.Errorf("volume adjustment target is no longer the active schema change on database %s", database)
+	}
 
 	// Restart the schema change
 	_, err = e.Start(ctx, &engine.ControlRequest{
@@ -497,21 +498,22 @@ func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine
 		Accepted:       true,
 		PreviousVolume: previousVolume,
 		NewVolume:      req.Volume,
-		Message:        fmt.Sprintf("Volume changed: %d -> %d (%d threads, %v chunks)", previousVolume, req.Volume, newThreads, newChunkTime),
+		Message:        fmt.Sprintf("Volume changed: %d -> %d (%d threads)", previousVolume, req.Volume, newThreads),
 	}, nil
 }
 
-// setSchemaChangeVolume records the explicit volume and its derived Spirit copy
-// settings on the tracked schema change. The settings end with the change, so a
+// setSchemaChangeVolume records the explicit volume and its derived thread
+// count on the tracked schema change. The setting ends with the change, so a
 // volume set during one schema change never carries into a later one.
-func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int, chunkTime, lockTimeout time.Duration) {
+// Returns false if rm is no longer the tracked schema change (e.g. it
+// completed or was replaced while the caller was mid-adjustment), in which
+// case nothing was applied and the caller must not report success.
+func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int) bool {
 	e.mu.Lock()
 	tracked := e.runningSchemaChange == rm
 	if tracked {
 		rm.volume = volume
 		rm.threads = threads
-		rm.targetChunkTime = chunkTime
-		rm.lockWaitTimeout = lockTimeout
 	}
 	e.mu.Unlock()
 	if !tracked {
@@ -520,6 +522,7 @@ func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, th
 			"volume", volume,
 		)
 	}
+	return tracked
 }
 
 func (e *Engine) setVolumeRestartInProgress(rm *runningSchemaChange, inProgress bool) {
@@ -540,36 +543,47 @@ const minThreads = 2
 // is set to a very high value.
 const maxThreads = 16
 
-// volumeToSpiritSettings converts a volume level (1-11) to Spirit settings.
-// Volumes 1-5 use fixed thread counts.
-// Volumes 6-11 use CPU-scaled formulas (ceil(cpus/N)) when cpuHint > 0,
-// falling back to fixed thread counts when CPU info is unavailable.
-// Thread counts are always capped at maxThreads.
-// Spirit requires TargetChunkTime to be in range 100ms-5s.
-func volumeToSpiritSettings(volume int32, cpuHint int) (threads int, chunkTime time.Duration, lockTimeout time.Duration) {
+// volumeToSpiritSettings converts a volume level (1-11) to a Spirit copier
+// thread count. Volumes 1-5 use fixed thread counts. Volumes 6-11 use
+// CPU-scaled formulas (ceil(cpus/N)) when cpuHint > 0, falling back to fixed
+// thread counts when CPU info is unavailable. Thread counts are always capped
+// at maxThreads.
+//
+// Thread count is the only lever volume adjusts: lock wait timeout is fixed
+// to the engine's configured value (see DefaultLockWaitTimeout) now that
+// Spirit's ForceKill clears blockers well within it regardless of volume.
+// Without a CPU hint, volumes 2/3, 5/6/7, 8/9, and 10/11 each derive the same
+// thread count and are pairwise (or group-wise) indistinguishable in
+// practice; when the engine's experimental autoscaling
+// is enabled (the default) and Aurora is detected, autoscaling overrides
+// these thread counts anyway on instances with more than a few vCPUs, so
+// volume increasingly has nothing left to tune. A future change may collapse
+// volume into fewer levels, or drop it, once autoscaling covers non-Aurora
+// targets too.
+func volumeToSpiritSettings(volume int32, cpuHint int) (threads int) {
 	switch volume {
 	case 1:
-		return 1, 100 * time.Millisecond, 10 * time.Second
+		return 1
 	case 2:
-		return 2, 500 * time.Millisecond, 15 * time.Second
+		return 2
 	case 4:
-		return 4, 2 * time.Second, 60 * time.Second
+		return 4
 	case 5:
-		return 8, 2 * time.Second, 60 * time.Second
+		return 8
 	case 6:
-		return cpuScaledThreads(cpuHint, 16, 8), 5 * time.Second, 60 * time.Second
+		return cpuScaledThreads(cpuHint, 16, 8)
 	case 7:
-		return cpuScaledThreads(cpuHint, 12, 8), 5 * time.Second, 60 * time.Second
+		return cpuScaledThreads(cpuHint, 12, 8)
 	case 8:
-		return cpuScaledThreads(cpuHint, 8, 12), 5 * time.Second, 60 * time.Second
+		return cpuScaledThreads(cpuHint, 8, 12)
 	case 9:
-		return cpuScaledThreads(cpuHint, 6, 12), 5 * time.Second, 60 * time.Second
+		return cpuScaledThreads(cpuHint, 6, 12)
 	case 10:
-		return cpuScaledThreads(cpuHint, 4, maxThreads), 5 * time.Second, 600 * time.Second
+		return cpuScaledThreads(cpuHint, 4, maxThreads)
 	case 11:
-		return cpuScaledThreads(cpuHint, 2, maxThreads), 5 * time.Second, 600 * time.Second
+		return cpuScaledThreads(cpuHint, 2, maxThreads)
 	default: // 3
-		return 2, 2 * time.Second, 30 * time.Second
+		return 2
 	}
 }
 
@@ -586,26 +600,23 @@ func cpuScaledThreads(cpuHint, divisor, fallback int) int {
 }
 
 // settingsToVolume approximates the volume level for a schema change that was
-// never given an explicit volume, mapping its starting Spirit copy settings to
-// the closest level. Volume levels that share derived settings map to the
-// lowest such level. Once an operator sets a volume, the explicit value is
-// stored on the running schema change and this approximation is not used.
-func settingsToVolume(threads int, chunkTime time.Duration) int32 {
+// never given an explicit volume, mapping its starting thread count to the
+// closest level. It is only ever called with the engine's configured default
+// thread count, since an explicit volume is stored on the running schema
+// change and reported directly instead. That default is documented as volume
+// 3 (see DefaultThreads), even though volume 2 now derives the same thread
+// count now that lock wait timeout no longer varies by volume. Other volume
+// levels that share a derived thread count map to the lowest such level.
+func settingsToVolume(threads int) int32 {
 	switch {
 	case threads <= 1:
 		return 1
 	case threads <= 2:
-		if chunkTime <= 1*time.Second {
-			return 2
-		}
-		return 3
+		return 3 // the documented default (DefaultThreads); vol 2 shares this thread count but is never the un-set starting point
 	case threads <= 4:
 		return 4
 	case threads <= 8:
-		if chunkTime <= 2*time.Second {
-			return 5
-		}
-		return 6 // also covers vol 7 (same settings)
+		return 5 // also covers vol 6, 7 (same settings without a CPU hint)
 	case threads <= 12:
 		return 8 // also covers vol 9 (same settings)
 	default:

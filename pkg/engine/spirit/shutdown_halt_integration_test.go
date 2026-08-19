@@ -139,10 +139,9 @@ func startCopyForcingAlter(t *testing.T, tableName string) (*Engine, *sql.DB) {
 
 	eng := New(Config{
 		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		// Small chunks and a single thread keep the copy observable for long
-		// enough to act on it partway through.
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         1,
+		// A single thread keeps the copy observable for long enough to act on
+		// it partway through.
+		Threads: 1,
 	})
 
 	applyResult, err := eng.Apply(t.Context(), &engine.ApplyRequest{
