@@ -29,6 +29,37 @@ func TestLink(t *testing.T) {
 			"https://github.com/acme/shop/pull/412",
 			Link("acme/shop#412", "https://github.com/acme/shop/pull/412"))
 	})
+
+	t.Run("a control byte in the URL falls back to plain output", func(t *testing.T) {
+		setHyperlinks(t, true)
+		assert.Equal(t,
+			"https://example.com/\x1b]8;;evil",
+			Link("acme/shop#412", "https://example.com/\x1b]8;;evil"))
+		assert.Equal(t,
+			"https://example.com/a\nb",
+			Link("acme/shop#412", "https://example.com/a\nb"))
+	})
+
+	t.Run("a non-ASCII URL falls back to plain output", func(t *testing.T) {
+		setHyperlinks(t, true)
+		assert.Equal(t,
+			"https://example.com/ünïcode",
+			Link("acme/shop#412", "https://example.com/ünïcode"))
+	})
+
+	t.Run("a control rune in the text falls back to plain output", func(t *testing.T) {
+		setHyperlinks(t, true)
+		assert.Equal(t,
+			"https://example.com/pr/1",
+			Link("acme\x07shop#1", "https://example.com/pr/1"))
+	})
+
+	t.Run("printable Unicode text stays linked", func(t *testing.T) {
+		setHyperlinks(t, true)
+		assert.Equal(t,
+			"\x1b]8;;https://example.com/pr/1\x1b\\dépôt#1\x1b]8;;\x1b\\",
+			Link("dépôt#1", "https://example.com/pr/1"))
+	})
 }
 
 // FORCE_HYPERLINK is the cross-ecosystem override convention: "0" or empty
