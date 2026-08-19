@@ -179,3 +179,70 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Cells[0].DDL,
 		"all non-empty task DDLs are joined in order")
 }
+
+// A terminal sharded apply's summary comment renders the verdict-titled
+// shard-unit summary — not the status snapshot the progress comment shows — so
+// the last word on the PR states the outcome, with every shard's final state.
+func TestFormatApplySummaryComment_ShardedRendersVerdict(t *testing.T) {
+	started := time.Unix(1700000000, 0).UTC()
+	completed := started.Add(28 * time.Minute)
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging",
+		State: state.Apply.Completed, Caller: "morgo", StartedAt: &started, CompletedAt: &completed,
+	}
+	op := func(id int64, shard string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			ID: id, ApplyID: 1, Deployment: "cake",
+			OperationKey:  "cdb_resolute_sharded/" + shard + "/mutes",
+			State:         state.ApplyOperation.Completed,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		}
+	}
+	ops := []*storage.ApplyOperation{op(1, "-40"), op(2, "80-")}
+	task := func(id, opID int64, shard string) *storage.Task {
+		oid := opID
+		return &storage.Task{
+			ID: id, ApplyID: 1, ApplyOperationID: &oid, Shard: shard,
+			Namespace: "cdb_resolute_sharded", TableName: "mutes",
+			DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);",
+		}
+	}
+	tasks := []*storage.Task{task(1, 1, "-40"), task(2, 2, "80-")}
+
+	out := formatApplySummaryComment(apply, ops, false, tasks, nil, nil, "")
+
+	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
+	assert.NotContains(t, out, "Schema Change Status", "the summary is a verdict, not a status snapshot")
+	assert.Contains(t, out, "**Shards**: 2 completed")
+	assert.Contains(t, out, "**Duration**: 28m")
+	assert.Contains(t, out, "| `-40` | ✅ completed |")
+	assert.NotContains(t, out, "**Deployments**:", "must not use the deployment-unit layout")
+}
+
+// A sharded apply that fails outside shard work (e.g. its finalizer operation)
+// records the cause on the apply row, not on any shard operation. The terminal
+// summary must carry that apply-level error through to the failure callout so
+// the failed verdict names its cause.
+func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging",
+		State: state.Apply.Failed, Caller: "morgo",
+		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
+	}
+	op := func(id int64, shard string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			ID: id, ApplyID: 1, Deployment: "cake",
+			OperationKey:  "cdb_resolute_sharded/" + shard + "/mutes",
+			State:         state.ApplyOperation.Completed,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		}
+	}
+	ops := []*storage.ApplyOperation{op(1, "-40"), op(2, "80-")}
+
+	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, "")
+
+	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
+	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
+		"the apply row's error reaches the callout when no shard carries the failure")
+	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
+}

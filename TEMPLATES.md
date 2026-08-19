@@ -7273,6 +7273,64 @@ Shards diverge — grouped by change:
 | `40-80` | ⏳ waiting for -40 |
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-all-shards-completed"></a><strong>Summary: All Shards Completed</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+> Applied successfully — your schema change is live!
+
+**Shards**: 4 completed
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ✅ completed |
+| `40-80` | ✅ completed |
+| `80-c0` | ✅ completed |
+| `c0-` | ✅ completed |
+
+</details>
+
+<details>
+<summary><a name="summary-halt-on-failure-one-shard-failed"></a><strong>Summary: Halt On Failure (One Shard Failed)</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 1 failed, 3 halted
+
+> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
+| `40-80` | ⏸ halted — -40 failed |
+| `80-c0` | ⏸ halted — -40 failed |
+| `c0-` | ⏸ halted — -40 failed |
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
 </details>
 
 ## Multi-Deployment Apply (CLI)
