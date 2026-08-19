@@ -33,8 +33,7 @@ const postgresConfigFixtureDeadline = 30 * time.Second
 func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
-	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
-	require.NoError(t, err)
+	createFixtureUsersTable(t, db)
 
 	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
 		databaseType: string(fixture.config.Type),

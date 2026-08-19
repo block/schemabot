@@ -4,6 +4,7 @@ package webhook
 
 import (
 	"database/sql"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -26,8 +27,7 @@ import (
 func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
-	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
-	require.NoError(t, err)
+	createFixtureUsersTable(t, db)
 
 	// First instance: accept and durably queue the apply, but never drive it —
 	// the process "crashes" before its operator claims the work.
@@ -39,6 +39,10 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 	plan, err := svcA.ExecutePlan(t.Context(), fixture.planRequest())
 	require.NoError(t, err)
 	require.False(t, plan.HasBlockedChanges())
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	assert.Empty(t, plan.Changes[0].TableChanges[0].ExecutionMode,
+		"the fixture change must plan as native-safe, never routed to a synchronous execution path")
 
 	_, _, err = svcA.ExecuteApply(t.Context(), api.ApplyRequest{
 		PlanID:      plan.PlanID,
@@ -49,7 +53,7 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 
 	queued := findFixtureApply(t, svcA, fixture.config.Database)
 	require.NotNil(t, queued, "accepted apply must be durably stored before any driving")
-	require.False(t, state.IsTerminalApplyState(queued.State),
+	assert.False(t, state.IsTerminalApplyState(queued.State),
 		"apply must still be queued when the first instance dies")
 	assert.False(t, postgresColumnExists(t, db, "users", "email"),
 		"no DDL may reach the target before an operator drives the apply")
@@ -71,6 +75,8 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 
 	assert.True(t, postgresColumnExists(t, db, "users", "email"),
 		"the recovered apply must land the planned column on the target")
+
+	require.NoError(t, svcB.Close())
 }
 
 // A native-safe plan whose apply is refused at execution time — here a target
@@ -81,14 +87,14 @@ func TestPostgresConfigFixtureQueuedApplySurvivesRestart(t *testing.T) {
 func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
 	// The limited role can plan (CONNECT, USAGE, and CREATE for the diff
 	// planner's scratch schema) but does not own public.users, so the apply's
 	// privilege preflight must refuse the ALTER.
-	_, err := db.ExecContext(t.Context(), `
-		CREATE TABLE public.users (id bigint PRIMARY KEY);
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
 		CREATE ROLE limited LOGIN PASSWORD 'limited';
-		GRANT CONNECT, CREATE ON DATABASE postgres_fixture TO limited;
-		GRANT USAGE ON SCHEMA public TO limited`)
+		GRANT CONNECT, CREATE ON DATABASE %s TO limited;
+		GRANT USAGE ON SCHEMA public TO limited`, fixture.config.Database))
 	require.NoError(t, err)
 
 	limitedDSN, err := url.Parse(dsn)
@@ -131,10 +137,18 @@ func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 		"a refusal is permanent and must not be marked retryable, state=%s", task.State)
 	assert.Contains(t, task.ErrorMessage, "GRANT",
 		"the stored error must carry the exact provisioning statement")
-	require.NotNil(t, task.CompletedAt, "a permanently failed task is settled, not awaiting retry")
+	assert.NotNil(t, task.CompletedAt, "a permanently failed task is settled, not awaiting retry")
 
 	assert.False(t, postgresColumnExists(t, db, "users", "email"),
 		"a refused apply must not execute any DDL on the target")
+}
+
+// createFixtureUsersTable creates the fixture's starting users table on the
+// target: the declared schema minus the email column the plan will add.
+func createFixtureUsersTable(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
 }
 
 // postgresColumnExists reports whether the named column exists on a public
@@ -151,11 +165,15 @@ func postgresColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
 }
 
 // findFixtureApply returns the fixture database's apply on the fixture PR, or
-// nil when none exists yet.
+// nil when none exists yet. A storage error is logged and treated as "not
+// found": the helper runs inside require.Eventually goroutines where a fatal
+// assertion is unsafe, so callers fail on their own nil checks or deadlines
+// with the logged cause alongside.
 func findFixtureApply(t *testing.T, svc *api.Service, database string) *storage.Apply {
 	t.Helper()
 	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
 	if err != nil {
+		t.Logf("findFixtureApply: listing applies for fixture PR: %v", err)
 		return nil
 	}
 	for _, apply := range applies {
