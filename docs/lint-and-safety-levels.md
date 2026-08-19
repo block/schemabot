@@ -81,8 +81,19 @@ VSchema is applied — Vitess stops using the removed vindex, a lookup vindex's
 backing table stops being maintained and its rows go stale, and queries that
 depended on the removed entry can fail or scatter. Deleting a vindex is as
 dangerous as dropping a table, so it takes the same `--allow-unsafe`
-acknowledgment. Additions-only VSchema changes (new vindexes, new tables, new
-column-vindex associations) are not unsafe. Removals are detected structurally
+acknowledgment.
+
+A VSchema change is also unsafe when it mutates a vindex definition in place —
+the vindex keeps its name but its `type`, one of its `params`, or its `owner`
+changes. A type change computes every row's keyspace id differently, so
+queries routed through the vindex can miss rows or scatter; repointing a
+lookup vindex's backing `table` param makes Vitess read and write lookup rows
+in a different table immediately, leaving the old table stale. The blast
+radius matches removing the vindex outright, so mutations take the same
+`--allow-unsafe` acknowledgment.
+
+Additions-only VSchema changes (new vindexes, new tables, new column-vindex
+associations) are not unsafe. Removals and mutations are detected structurally
 by comparing the current and desired VSchema documents; a VSchema that cannot
 be parsed fails the plan rather than skipping detection.
 

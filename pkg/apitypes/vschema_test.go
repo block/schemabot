@@ -71,3 +71,93 @@ func TestEncodeVSchemaDeletions_EmptyOmitsKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, meta)
 }
+
+// A VSchema change that mutates a same-name vindex definition (type, params,
+// or owner) gates the apply behind the unsafe opt-in, the same as a removal:
+// the vindex keeps its name but Vitess routes through it differently the
+// moment the change lands.
+func TestPlanResponse_UnsafeChangesIncludesVSchemaMutations(t *testing.T) {
+	meta, err := EncodeVSchemaMutations([]VSchemaMutation{
+		{Kind: "vindex_type", Name: "user_idx", Reason: `vindex "user_idx" changes type from "hash" to "xxhash"`},
+		{Kind: "vindex_params", Name: "email_lookup", Reason: `lookup vindex "email_lookup" repoints its backing table`},
+	})
+	require.NoError(t, err)
+
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "commerce",
+			Metadata: map[string]string{
+				VSchemaChangedMetadataKey:   "true",
+				VSchemaMutationsMetadataKey: meta,
+			},
+		}},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 2)
+	assert.Equal(t, "commerce/vschema.json", changes[0].Table)
+	assert.Equal(t, VSchemaChangeType, changes[0].ChangeType)
+	assert.Contains(t, changes[0].Reason, `"xxhash"`)
+	assert.Contains(t, changes[1].Reason, "repoints its backing table")
+}
+
+// Deletions and mutations recorded on the same namespace both surface, in
+// that order, so a VSchema change that removes one vindex and mutates another
+// discloses both risks.
+func TestPlanResponse_UnsafeChangesCombinesVSchemaDeletionsAndMutations(t *testing.T) {
+	deletionsMeta, err := EncodeVSchemaDeletions([]VSchemaDeletion{
+		{Kind: "vindex", Name: "region_idx", Reason: `vindex "region_idx" is removed`},
+	})
+	require.NoError(t, err)
+	mutationsMeta, err := EncodeVSchemaMutations([]VSchemaMutation{
+		{Kind: "vindex_type", Name: "user_idx", Reason: `vindex "user_idx" changes type`},
+	})
+	require.NoError(t, err)
+
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "commerce",
+			Metadata: map[string]string{
+				VSchemaChangedMetadataKey:   "true",
+				VSchemaDeletionsMetadataKey: deletionsMeta,
+				VSchemaMutationsMetadataKey: mutationsMeta,
+			},
+		}},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 2)
+	assert.Contains(t, changes[0].Reason, "is removed")
+	assert.Contains(t, changes[1].Reason, "changes type")
+}
+
+// A corrupt mutations record fails closed without hiding the intact
+// deletions record, and vice versa: each key is decoded independently.
+func TestPlanResponse_UnsafeChangesUndecodableVSchemaMutationsFailClosed(t *testing.T) {
+	deletionsMeta, err := EncodeVSchemaDeletions([]VSchemaDeletion{
+		{Kind: "vindex", Name: "region_idx", Reason: `vindex "region_idx" is removed`},
+	})
+	require.NoError(t, err)
+
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "commerce",
+			Metadata: map[string]string{
+				VSchemaChangedMetadataKey:   "true",
+				VSchemaDeletionsMetadataKey: deletionsMeta,
+				VSchemaMutationsMetadataKey: "{corrupt",
+			},
+		}},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 2)
+	assert.Contains(t, changes[0].Reason, "is removed")
+	assert.Contains(t, changes[1].Reason, "could not be decoded")
+}
+
+func TestEncodeVSchemaMutations_EmptyOmitsKey(t *testing.T) {
+	meta, err := EncodeVSchemaMutations(nil)
+	require.NoError(t, err)
+	assert.Empty(t, meta)
+}

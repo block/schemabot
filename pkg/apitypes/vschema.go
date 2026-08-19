@@ -68,25 +68,86 @@ func ParseVSchemaDeletions(metadata map[string]string) ([]VSchemaDeletion, error
 	return deletions, nil
 }
 
+// VSchemaMutationsMetadataKey is the plan change-metadata key under which
+// engines record in-place vindex definition changes in a namespace's VSchema
+// change as a JSON-encoded []VSchemaMutation. A mutation keeps the vindex's
+// name but changes how Vitess routes through it — a type change re-computes
+// every row's keyspace id, a repointed lookup backing table moves lookup rows
+// — so any recorded mutation makes the plan's VSchema change an unsafe change
+// requiring the same operator opt-in as a removal.
+const VSchemaMutationsMetadataKey = "vschema_mutations"
+
+// VSchemaMutation is one in-place vindex definition change in a namespace's
+// VSchema change. It mirrors the engine-side mutation type (pkg/vschema);
+// apitypes keeps its own copy so this package stays dependency-free.
+type VSchemaMutation struct {
+	Kind   string `json:"kind"`   // "vindex_type", "vindex_params", or "vindex_owner"
+	Name   string `json:"name"`   // vindex name
+	Reason string `json:"reason"` // operator-facing explanation of the risk
+}
+
+// EncodeVSchemaMutations marshals VSchema mutations for plan change metadata.
+// Returns "" for an empty list so the metadata key is omitted.
+func EncodeVSchemaMutations(mutations []VSchemaMutation) (string, error) {
+	if len(mutations) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(mutations)
+	if err != nil {
+		return "", fmt.Errorf("encode %d VSchema mutations: %w", len(mutations), err)
+	}
+	return string(b), nil
+}
+
+// ParseVSchemaMutations decodes the VSchema mutations recorded in a
+// namespace's plan change metadata. Returns nil when the change carries none.
+func ParseVSchemaMutations(metadata map[string]string) ([]VSchemaMutation, error) {
+	raw := metadata[VSchemaMutationsMetadataKey]
+	if raw == "" {
+		return nil, nil
+	}
+	var mutations []VSchemaMutation
+	if err := json.Unmarshal([]byte(raw), &mutations); err != nil {
+		return nil, fmt.Errorf("decode VSchema mutations metadata: %w", err)
+	}
+	return mutations, nil
+}
+
 // VSchemaUnsafeChanges returns the unsafe-change view of this namespace's
-// recorded VSchema deletions. Metadata that cannot be decoded fails closed:
-// the namespace reports a single unsafe change explaining that deletions are
-// present but unreadable, so a corrupt record can never bypass the opt-in
-// gate.
+// recorded VSchema deletions and mutations. Metadata that cannot be decoded
+// fails closed: the namespace reports an unsafe change explaining that the
+// record is present but unreadable, so a corrupt record can never bypass the
+// opt-in gate. Each record fails closed independently so one corrupt key
+// never hides the other's disclosures.
 func (sc *SchemaChangeResponse) VSchemaUnsafeChanges() []UnsafeChange {
+	var result []UnsafeChange
 	deletions, err := ParseVSchemaDeletions(sc.Metadata)
 	if err != nil {
-		return []UnsafeChange{{
+		result = append(result, UnsafeChange{
 			Table:      sc.Namespace + "/vschema.json",
 			Reason:     "VSchema deletions were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe",
 			ChangeType: VSchemaChangeType,
-		}}
+		})
 	}
-	result := make([]UnsafeChange, 0, len(deletions))
 	for _, d := range deletions {
 		result = append(result, UnsafeChange{
 			Table:      sc.Namespace + "/vschema.json",
 			Reason:     d.Reason,
+			ChangeType: VSchemaChangeType,
+		})
+	}
+	mutations, err := ParseVSchemaMutations(sc.Metadata)
+	if err != nil {
+		result = append(result, UnsafeChange{
+			Table:      sc.Namespace + "/vschema.json",
+			Reason:     "VSchema mutations were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe",
+			ChangeType: VSchemaChangeType,
+		})
+	}
+	for _, m := range mutations {
+		result = append(result, UnsafeChange{
+			Table:      sc.Namespace + "/vschema.json",
+			Reason:     m.Reason,
 			ChangeType: VSchemaChangeType,
 		})
 	}

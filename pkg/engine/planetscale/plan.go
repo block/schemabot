@@ -40,6 +40,27 @@ func vschemaDeletionsMetadata(currentRaw, desired string) (string, error) {
 	return apitypes.EncodeVSchemaDeletions(converted)
 }
 
+// vschemaMutationsMetadata detects in-place vindex definition changes between
+// the current and desired VSchema and encodes them for plan change metadata.
+// Mutations gate the apply behind the unsafe opt-in just like removals: a
+// same-name vindex whose type, params, or owner changes alters Vitess query
+// routing and lookup maintenance the moment the VSchema lands. Returns ""
+// when no vindex definition changes.
+func vschemaMutationsMetadata(currentRaw, desired string) (string, error) {
+	mutations, err := vschema.Mutations(currentRaw, desired)
+	if err != nil {
+		return "", err
+	}
+	if len(mutations) == 0 {
+		return "", nil
+	}
+	converted := make([]apitypes.VSchemaMutation, len(mutations))
+	for i, m := range mutations {
+		converted[i] = apitypes.VSchemaMutation{Kind: m.Kind, Name: m.Name, Reason: m.Reason}
+	}
+	return apitypes.EncodeVSchemaMutations(converted)
+}
+
 // Plan computes the schema changes needed by diffing current schema against desired.
 // For each keyspace in the schema files, it fetches the current schema and uses
 // Spirit's PlanChanges to diff and lint in a single pass.
@@ -114,6 +135,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				}
 				if deletionsMeta != "" {
 					sc.Metadata[apitypes.VSchemaDeletionsMetadataKey] = deletionsMeta
+				}
+				mutationsMeta, mutErr := vschemaMutationsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
+				if mutErr != nil {
+					return fmt.Errorf("detect VSchema mutations for keyspace %s: %w", ks, mutErr)
+				}
+				if mutationsMeta != "" {
+					sc.Metadata[apitypes.VSchemaMutationsMetadataKey] = mutationsMeta
 				}
 				if strings.TrimSpace(currentVSchemaRaw) == "" {
 					currentVSchemaRaw = "{}"
