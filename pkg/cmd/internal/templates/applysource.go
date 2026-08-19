@@ -7,9 +7,9 @@ import (
 )
 
 // applySource renders an apply's provenance for list surfaces: the full
-// clickable PR URL when the caller records a webhook-driven apply, or the
-// short caller such as "cli:jdoe" for everything else, so CLI-driven applies
-// still show where they came from.
+// clickable PR URL when the caller carries PR provenance, or the short
+// caller such as "cli:jdoe" for everything else, so CLI-driven applies still
+// show where they came from.
 func applySource(c string) string {
 	if url := applyPullRequestURL(c, ""); url != "" {
 		return url
@@ -39,8 +39,8 @@ func callerAndSourceBoxRows(c, serverURL string) []BoxRow {
 }
 
 // applyPullRequestURL resolves the PR an apply came from as a clickable URL:
-// the server-provided URL when present, otherwise the one embedded in a
-// webhook-shaped caller. Empty when the apply has no PR provenance.
+// the server-provided URL when present, otherwise the one embedded in the
+// caller attribution. Empty when the apply has no PR provenance.
 func applyPullRequestURL(c, serverURL string) string {
 	if serverURL != "" {
 		return serverURL

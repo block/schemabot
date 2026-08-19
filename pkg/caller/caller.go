@@ -64,23 +64,37 @@ func ValidHost(host string) bool {
 	return true
 }
 
-// PullRequest extracts the repository and pull request number from a
-// webhook-shaped caller "github:<user>@<owner>/<repo>#<pr>". The location is
-// the segment after the last "@" — matching how Short cuts, so email-shaped
-// users parse correctly. It returns ok=false when the caller is not
-// webhook-shaped or its location does not carry a repo#pr, so CLI and
-// bare-subject callers pass through untouched.
+// PullRequest extracts the repository and pull request number from an apply's
+// caller attribution. It accepts the webhook wire format
+// "github:<user>@<owner>/<repo>#<pr>" — the location is the segment after the
+// last "@", matching how Short cuts, so email-shaped users parse correctly —
+// and the bare "<owner>/<repo>#<pr>" form the server substitutes when an
+// apply carries PR provenance but no recorded caller. It returns ok=false
+// otherwise, so CLI and bare-subject callers pass through untouched.
 func PullRequest(caller string) (repo string, pr int, ok bool) {
-	rest, found := strings.CutPrefix(caller, GitHubPrefix)
+	if rest, found := strings.CutPrefix(caller, GitHubPrefix); found {
+		at := strings.LastIndex(rest, "@")
+		if at < 0 {
+			return "", 0, false
+		}
+		return splitRepoPR(rest[at+1:])
+	}
+	if strings.ContainsAny(caller, ":@") {
+		return "", 0, false
+	}
+	return splitRepoPR(caller)
+}
+
+// splitRepoPR splits an "<owner>/<repo>#<pr>" location into its repository
+// and PR number. The repository must be exactly owner/name — one slash with
+// non-empty segments — so a malformed location never yields a bogus PR link.
+func splitRepoPR(location string) (repo string, pr int, ok bool) {
+	repo, prText, found := strings.Cut(location, "#")
 	if !found {
 		return "", 0, false
 	}
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return "", 0, false
-	}
-	repo, prText, found := strings.Cut(rest[at+1:], "#")
-	if !found || !strings.Contains(repo, "/") {
+	owner, name, found := strings.Cut(repo, "/")
+	if !found || owner == "" || name == "" || strings.Contains(name, "/") {
 		return "", 0, false
 	}
 	n, err := strconv.Atoi(prText)

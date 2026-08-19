@@ -11,6 +11,7 @@ import (
 // CLI-driven ones so their origin still reads at a glance.
 func TestApplySource(t *testing.T) {
 	assert.Equal(t, "https://github.com/acme/shop/pull/412", applySource("github:octocat@acme/shop#412"))
+	assert.Equal(t, "https://github.com/acme/shop/pull/412", applySource("acme/shop#412"))
 	assert.Equal(t, "cli:jdoe", applySource("cli:jdoe@macbook.local"))
 	assert.Equal(t, "jdoe@example.com", applySource("jdoe@example.com@somehost"))
 	assert.Equal(t, "", applySource(""))
