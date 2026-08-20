@@ -206,10 +206,11 @@ func TestProtoChangesToNamespacesPreservesOriginalFiles(t *testing.T) {
 }
 
 // TestProtoChangesToNamespacesPersistsVSchemaMetadata verifies the gRPC
-// plan-persistence path stores the gate-facing VSchema change-metadata — the
-// changed flag and the recorded deletions and mutations — while dropping
-// display-only metadata, matching what the local persistence path stores for
-// the same change so the apply-time unsafe gate reads either identically.
+// plan-persistence path stores the apply-time VSchema change-metadata — the
+// changed flag, the recorded deletions and mutations the unsafe gate reads,
+// and the rendered diff apply-time display shows — while dropping other
+// engine metadata, matching what the local persistence path stores for the
+// same change so apply-time consumers read either identically.
 func TestProtoChangesToNamespacesPersistsVSchemaMetadata(t *testing.T) {
 	deletions := `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`
 	mutations := `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`
@@ -220,6 +221,7 @@ func TestProtoChangesToNamespacesPersistsVSchemaMetadata(t *testing.T) {
 			"vschema_deletions": deletions,
 			"vschema_mutations": mutations,
 			"vschema":           "rendered diff for display",
+			"branch":            "engine-internal detail",
 		},
 	}}, map[string]*ternv1.SchemaFiles{
 		"commerce": {Files: map[string]string{"vschema.json": `{"tables":{"users":{}}}`}},
@@ -232,6 +234,7 @@ func TestProtoChangesToNamespacesPersistsVSchemaMetadata(t *testing.T) {
 		storage.PlanMetadataVSchemaChanged:   "true",
 		storage.PlanMetadataVSchemaDeletions: deletions,
 		storage.PlanMetadataVSchemaMutations: mutations,
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
 	}, nsData.Metadata)
 	assert.JSONEq(t, `{"tables":{"users":{}}}`, nsData.Artifacts["vschema.json"])
 }

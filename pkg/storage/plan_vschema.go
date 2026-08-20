@@ -14,6 +14,13 @@ const (
 	// carries VSchema work.
 	PlanMetadataVSchemaChanged = "vschema_changed"
 
+	// PlanMetadataVSchemaDiff holds the rendered VSchema diff the engine
+	// annotated on the namespace's plan change. Persisting it lets apply-time
+	// surfaces (PR comments) show the diff the operator approved at plan time,
+	// rather than re-diffing against live state that changes as the apply
+	// lands. Display-only: no safety gate reads it.
+	PlanMetadataVSchemaDiff = "vschema"
+
 	// PlanMetadataVSchemaDeletions holds the structural removals in the
 	// namespace's VSchema change as a JSON-encoded list of {kind, name,
 	// reason} records. A removal changes Vitess query routing the moment the
@@ -31,17 +38,18 @@ const (
 )
 
 // VSchemaPlanMetadata extracts the subset of an engine's plan change-metadata
-// that must survive plan persistence because apply-time safety gates read it:
-// the VSchema-changed flag and the recorded structural deletions and vindex
-// mutations. Every plan persistence site uses this helper so stored plans
-// carry the same metadata regardless of which plane persisted them. Returns
-// nil for a change without VSchema work, so such namespaces store no metadata.
+// that must survive plan persistence: the keys apply-time safety gates read
+// (the VSchema-changed flag and the recorded structural deletions and vindex
+// mutations) plus the rendered diff apply-time display reads. Every plan
+// persistence site uses this helper so stored plans carry the same metadata
+// regardless of which plane persisted them. Returns nil for a change without
+// VSchema work, so such namespaces store no metadata.
 func VSchemaPlanMetadata(metadata map[string]string) map[string]string {
 	if metadata[PlanMetadataVSchemaChanged] != "true" {
 		return nil
 	}
 	persisted := map[string]string{PlanMetadataVSchemaChanged: "true"}
-	for _, key := range []string{PlanMetadataVSchemaDeletions, PlanMetadataVSchemaMutations} {
+	for _, key := range []string{PlanMetadataVSchemaDeletions, PlanMetadataVSchemaMutations, PlanMetadataVSchemaDiff} {
 		if raw := metadata[key]; raw != "" {
 			persisted[key] = raw
 		}
