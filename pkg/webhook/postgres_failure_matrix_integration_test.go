@@ -136,9 +136,16 @@ func TestPostgresConfigFixtureStopDeclineIsTerminalAndApplyCompletes(t *testing.
 	})
 	require.NoError(t, err)
 	require.True(t, stopResp.Accepted)
-	pending, err := svc.Storage().ControlRequests().GetPending(t.Context(), running.ID, storage.ControlOperationStop)
+	// The driver's progress ticker consumes pending control requests while the
+	// engine change runs, so this read races with that consumption. Durability
+	// is provable without the race: the request row must exist regardless of
+	// status, and its status must be pending (not yet consumed) or the
+	// terminal decline — never a successful stop.
+	stored, err := svc.Storage().ControlRequests().GetByOperation(t.Context(), running.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
-	require.NotNil(t, pending, "accepted stop must be durable before the driver consumes it")
+	require.NotNil(t, stored, "accepted stop must be durably recorded")
+	require.Contains(t, []storage.ControlRequestStatus{storage.ControlRequestPending, storage.ControlRequestFailed},
+		stored.Status, "durable stop must be pending or terminally declined, never completed")
 
 	var declined *storage.ApplyControlRequest
 	require.EventuallyWithT(t, func(c *assert.CollectT) {
