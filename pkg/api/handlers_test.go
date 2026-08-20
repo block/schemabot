@@ -6641,6 +6641,26 @@ func TestRollbackSchemaFilesRejectsPlanWithoutCapturedOriginalFiles(t *testing.T
 	assert.Contains(t, err.Error(), `no original schema files available for rollback namespace "shop"`)
 }
 
+// A source plan without captured original schema files can never produce a
+// rollback plan, no matter how often the same request is retried, so
+// ExecuteRollbackPlanForApply must reject it with the terminal marker that
+// durable command processing keys retry decisions on.
+func TestExecuteRollbackPlanForApplyUncapturedFilesIsTerminal(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_no_schema", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, false), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	resp, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.True(t, IsTerminalControlError(err), "an uncapturable source plan re-reads the same on every retry; the failure must never be re-driven")
+	assert.Contains(t, err.Error(), "rollback source plan is invalid")
+	assert.Contains(t, err.Error(), "no original schema files available")
+}
+
 // setRevertSkippedMetadata surfaces the skip-revert flag from the apply's stored
 // revert_skipped_at, so progress consumers show that revert was skipped — read
 // from apply state, not an engine-specific side table.

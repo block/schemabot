@@ -43,6 +43,47 @@ func TestIsInternalControlError(t *testing.T) {
 	})
 }
 
+// TestIsTerminalControlError verifies the retry disposition durable command
+// processing hinges on: typed terminal errors and operator-actionable
+// rejections must never be re-driven, while untyped internal failures and
+// remote unavailability stay retryable.
+func TestIsTerminalControlError(t *testing.T) {
+	t.Run("typed terminal error is terminal", func(t *testing.T) {
+		assert.True(t, IsTerminalControlError(terminalControlf("plan not found for apply %s", "apply-123")))
+	})
+
+	t.Run("wrapped terminal error stays terminal", func(t *testing.T) {
+		wrapped := fmt.Errorf("rollback command plan: %w", terminalControlf("rollback source plan is invalid"))
+		assert.True(t, IsTerminalControlError(wrapped))
+	})
+
+	t.Run("guardrail conflict is terminal", func(t *testing.T) {
+		assert.True(t, IsTerminalControlError(controlConflictf("apply is in state %q; only completed applies can be rolled back", "running")))
+	})
+
+	t.Run("client-facing status is terminal", func(t *testing.T) {
+		assert.True(t, IsTerminalControlError(controlHTTPErrorf(http.StatusBadRequest, "apply is required")))
+		assert.True(t, IsTerminalControlError(controlHTTPErrorf(http.StatusNotFound, "apply not found: %s", "apply-123")))
+	})
+
+	t.Run("untyped error is not terminal", func(t *testing.T) {
+		assert.False(t, IsTerminalControlError(errors.New("storage unavailable")))
+		assert.False(t, IsTerminalControlError(fmt.Errorf("get rollback source plan: %w", errors.New("connection reset"))))
+	})
+
+	t.Run("remote unavailability is not terminal", func(t *testing.T) {
+		assert.False(t, IsTerminalControlError(&RemoteDeploymentUnavailableError{
+			Deployment: "tenant-a",
+			Target:     "orders-staging",
+			Err:        errors.New("connection refused"),
+		}))
+	})
+
+	t.Run("explicit server status without terminal marker is not terminal", func(t *testing.T) {
+		assert.False(t, IsTerminalControlError(controlHTTPErrorf(http.StatusBadGateway, "tern unavailable")))
+	})
+}
+
 // A failed control operation is triaged from logs alone, so the failure line
 // must carry the apply's full triage attributes — including external_id, the
 // join key to the data plane's logs — alongside the error itself.
