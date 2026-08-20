@@ -670,6 +670,18 @@ func (s *Service) HandlePlan(w http.ResponseWriter, r *http.Request) {
 	s.handlePlan(w, r)
 }
 
+// HandlePlansList is the HTTP handler for GET /api/plans.
+// Returns recent stored plans as summaries, newest first.
+func (s *Service) HandlePlansList(w http.ResponseWriter, r *http.Request) {
+	s.handlePlansList(w, r)
+}
+
+// HandlePlanGet is the HTTP handler for GET /api/plans/{plan_identifier}.
+// Returns one stored plan with its full content.
+func (s *Service) HandlePlanGet(w http.ResponseWriter, r *http.Request) {
+	s.handlePlanGet(w, r)
+}
+
 // HandleApply is the HTTP handler for POST /api/apply.
 func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 	s.handleApply(w, r)
@@ -772,6 +784,8 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"POST /api/skip-revert", s.handleSkipRevert},
 		{"POST /api/rollback/plan", s.handleRollbackPlan},
 		{"GET /api/status", s.handleStatus},
+		{"GET /api/plans", s.handlePlansList},
+		{"GET /api/plans/{plan_identifier}", s.handlePlanGet},
 		{"GET /api/logs/{database}", s.handleLogs},
 		{"GET /api/logs", s.handleLogsWithoutDatabase},
 		{"POST /api/webhooks/redrive", s.handleWebhookRedrive},
