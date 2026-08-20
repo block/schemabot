@@ -321,6 +321,47 @@ const (
 	ExecutionModeDirect = "direct"
 )
 
+// CopyDisposition is what applying a plan will do with work an earlier schema
+// change already did on the target and left behind — for engines that copy a
+// table, the partly filled copy and the checkpoint describing it.
+type CopyDisposition string
+
+const (
+	// CopyNone means the target holds no unfinished work for any table in the
+	// plan. This is the ordinary case and is not surfaced.
+	CopyNone CopyDisposition = "none"
+
+	// CopyAdopt means applying continues the existing work rather than
+	// repeating it. Nothing is destroyed, so it is disclosed and proceeds.
+	CopyAdopt CopyDisposition = "adopt"
+
+	// CopyDiscard means applying destroys the existing work and starts the
+	// affected tables over. The cost is everything the earlier schema change
+	// had done, which can be days of copying.
+	CopyDiscard CopyDisposition = "discard"
+)
+
+// Discard reasons, kept distinct because they call for different operator
+// advice: a plan that drifted from the copy's own batch can be restored, an
+// expired checkpoint cannot, and a partial copy is not the operator's doing at
+// all.
+const (
+	// DiscardStatementDiffers means the existing work was done for a different
+	// set of statements than this plan will run, so the engine will not
+	// continue it.
+	DiscardStatementDiffers = "statement_differs"
+
+	// DiscardCheckpointExpired means the statements match but the engine's
+	// record of the existing work is too old to resume from.
+	DiscardCheckpointExpired = "checkpoint_expired"
+
+	// DiscardCopyIncomplete means the existing work covers only some of the
+	// tables this plan changes. An engine that continues work continues all of
+	// it or none, so the tables that did get copied are destroyed along with the
+	// ones that never started.
+	DiscardCopyIncomplete = "copy_incomplete"
+)
+
 // Engine metadata keys carrying the direct execution policy from config
 // surfaces (server config, embedder assemblers) to an engine via request
 // credentials. Exported so producers and consumers share one spelling and
