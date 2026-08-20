@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 func TestSanitizeCommentError(t *testing.T) {
@@ -186,13 +188,13 @@ func TestTaskErrorAddsDetail(t *testing.T) {
 func TestWriteVSchemaDiffFence(t *testing.T) {
 	t.Run("small diff renders intact without a truncation marker", func(t *testing.T) {
 		var sb strings.Builder
-		writeVSchemaDiffFence(&sb, "--- current\n+++ new\n+ vindex hash")
+		writeVSchemaDiffFence(&sb, "--- current\n+++ new\n+ vindex hash", maxCommentVSchemaDiffLen)
 		assert.Equal(t, "```diff\n--- current\n+++ new\n+ vindex hash\n```\n\n", sb.String())
 	})
 
 	t.Run("oversized diff is clamped with a visible marker", func(t *testing.T) {
 		var sb strings.Builder
-		writeVSchemaDiffFence(&sb, strings.Repeat("+", maxCommentVSchemaDiffLen+100))
+		writeVSchemaDiffFence(&sb, strings.Repeat("+", maxCommentVSchemaDiffLen+100), maxCommentVSchemaDiffLen)
 		out := sb.String()
 		assert.Less(t, len(out), maxCommentVSchemaDiffLen+200, "rendered section stays near the diff budget")
 		assert.Contains(t, out, "Diff truncated to fit GitHub's comment size limit")
@@ -202,8 +204,32 @@ func TestWriteVSchemaDiffFence(t *testing.T) {
 
 	t.Run("clamp never splits a UTF-8 rune", func(t *testing.T) {
 		var sb strings.Builder
-		writeVSchemaDiffFence(&sb, strings.Repeat("é", maxCommentVSchemaDiffLen))
+		writeVSchemaDiffFence(&sb, strings.Repeat("é", maxCommentVSchemaDiffLen), maxCommentVSchemaDiffLen)
 		assert.True(t, strings.HasSuffix(strings.SplitAfter(sb.String(), "\n```")[0], "é\n```"),
 			"the clamped diff ends on a whole rune before the closing fence")
 	})
+}
+
+// The diff budget is shared by every VSchema entry in one comment, so a
+// multi-keyspace apply with several oversized diffs still renders a section
+// bounded near the per-comment budget — the shape that would otherwise push
+// the whole body past GitHub's cap and freeze the status surface.
+func TestVSchemaDiffBudget_SharedAcrossKeyspaces(t *testing.T) {
+	assert.Equal(t, maxCommentVSchemaDiffLen, vschemaDiffBudget(0))
+	assert.Equal(t, maxCommentVSchemaDiffLen, vschemaDiffBudget(1))
+	assert.Equal(t, maxCommentVSchemaDiffLen/4, vschemaDiffBudget(4))
+
+	changes := make([]apitypes.VSchemaChange, 0, 4)
+	for _, ns := range []string{"ks_a", "ks_b", "ks_c", "ks_d"} {
+		changes = append(changes, apitypes.VSchemaChange{
+			Namespace: ns,
+			Status:    "applied",
+			Diff:      strings.Repeat("+", maxCommentVSchemaDiffLen),
+		})
+	}
+	var sb strings.Builder
+	writeVSchemaStatus(&sb, changes)
+	assert.Less(t, sb.Len(), maxCommentVSchemaDiffLen+4*200,
+		"four oversized keyspace diffs render one budget's worth of diff, not four")
+	assert.Equal(t, 4, strings.Count(sb.String(), "Diff truncated to fit GitHub's comment size limit"))
 }

@@ -31,6 +31,7 @@ func TestNamespacesFromEngineChangesPersistsVSchemaMetadata(t *testing.T) {
 		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
 		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
 		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
+		"branch":                             "engine-internal detail",
 	}
 	desiredVSchema := `{"sharded":true,"tables":{"users":{}}}`
 
@@ -52,8 +53,12 @@ func TestNamespacesFromEngineChangesPersistsVSchemaMetadata(t *testing.T) {
 	require.Len(t, nsData.Tables, 1)
 	assert.Equal(t, "users", nsData.Tables[0].Table)
 	assert.Equal(t, desiredVSchema, nsData.Artifacts[storage.VSchemaArtifactName])
-	assert.Equal(t, storage.VSchemaPlanMetadata(metadata), nsData.Metadata)
-	assert.Equal(t, metadata, nsData.Metadata)
+	assert.Equal(t, map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
+	}, nsData.Metadata, "only the VSchema plan keys persist; engine-internal metadata does not leak")
 }
 
 // TestNamespacesFromEngineChangesSiblingShardKeepsVSchemaMetadata verifies a

@@ -3,6 +3,8 @@ package webhook
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -216,18 +218,30 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 	assert.Empty(t, data.VSchemaChanges[0].Diff, "a stored plan without diffs renders the status-only entry")
 }
 
-// A finalizer whose rollout ended without running it must not read as pending:
-// a cancelled apply's finalizer row (written by the cancel path or mirrored
-// from the settled parent by the stranded-operation reaper) reads as
-// cancelled, and a stopped apply's — resumable, so its finalizer may yet run —
-// reads as stopped, so the comment never promises VSchema work that is not
-// coming.
+// A finalizer whose rollout ended without running it must not read as
+// pending, whichever record says so: a cancelled/reverted operation row
+// (written by the cancel path or mirrored by the stranded-operation reaper)
+// reads as cancelled, and so does a row still pending under a parent whose
+// verdict is final — a halted rollout terminalizes the apply immediately,
+// while the reaper only settles the stranded row minutes after the summary
+// posted. Stopped — on the operation or the parent — reads as stopped: a
+// stopped apply is resumable, so its finalizer may yet run.
 func TestVSchemaStatusForOperationState_TerminalInertStates(t *testing.T) {
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.ApplyOperation.Cancelled))
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.ApplyOperation.Reverted))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(state.ApplyOperation.Stopped))
-	assert.Equal(t, "", vschemaStatusForOperationState(state.ApplyOperation.Pending),
+	running := state.Apply.Running
+	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Cancelled))
+	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Reverted))
+	assert.Equal(t, "stopped", vschemaStatusForOperationState(running, state.ApplyOperation.Stopped))
+	assert.Equal(t, "", vschemaStatusForOperationState(running, state.ApplyOperation.Pending),
 		"a pending finalizer under a live apply still reads as pending")
+
+	pending := state.ApplyOperation.Pending
+	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Failed, pending),
+		"a halted rollout's terminal summary must not promise VSchema work no claim arm will run")
+	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Cancelled, pending))
+	assert.Equal(t, "stopped", vschemaStatusForOperationState(state.Apply.Stopped, pending),
+		"a stopped apply's pending finalizer may yet run on resume")
+	assert.Equal(t, "failed", vschemaStatusForOperationState(state.Apply.Failed, state.ApplyOperation.Failed),
+		"the operation's own failure outranks the parent verdict")
 }
 
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
@@ -283,6 +297,37 @@ func TestResolveShardedVSchemaDiffs(t *testing.T) {
 	// No finalizer operation → nothing to attach a diff to; the nil Storage
 	// would panic on any read, proving the resolver does not touch storage.
 	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), nil, apply, []*storage.ApplyOperation{shardOp}))
+
+	// A shape that is not the sharded layout — here a two-deployment apply —
+	// discards the diffs downstream, so the resolver must not pay the
+	// stored-plan read for it: the nil Storage would panic on any read.
+	multiDeployment := []*storage.ApplyOperation{
+		{OperationKey: "ks/-40/mutes", Deployment: "cake"},
+		{OperationKey: "ks/group_finalizer", Deployment: "ski"},
+	}
+	assert.Nil(t, resolveShardedVSchemaDiffs(t.Context(), nil, apply, multiDeployment))
+}
+
+// The stored-plan diff must reach a real PR comment through the production
+// observer path: the observer resolves the diffs from storage and threads
+// them into the comment body, so a sharded apply's progress comment shows the
+// change the operator approved at plan time.
+func TestCommentObserverResolvedDiffReachesShardedComment(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running, PlanID: 7}
+	mk := func(id int64, key string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{mk(1, "ks/-40/mutes"), mk(2, "ks/80-/mutes"), mk(3, "ks/group_finalizer")}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+		"ks": {Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: "+ vindex hash"}},
+	}}
+
+	o := &CommentObserver{stor: &stubPlanStorage{plan: plan}, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	body := formatApplyStatusComment(apply, ops, false, nil, nil, nil, o.resolveVSchemaDiffs(apply, ops), "")
+
+	assert.Contains(t, body, "### VSchema")
+	assert.Contains(t, body, "```diff\n+ vindex hash\n```",
+		"the stored plan's diff renders in the observer-built comment body")
 }
 
 // A finalizer failure is operation-scoped: it does not write the parent
@@ -308,6 +353,52 @@ func TestBuildShardedApplyData_FailedFinalizerErrorFallsBack(t *testing.T) {
 	apply.ErrorMessage = "apply-level cause"
 	data = buildShardedApplyData(apply, ops, false, nil, nil, "")
 	assert.Equal(t, "apply-level cause", data.ErrorMessage, "the apply row's own error wins when present")
+}
+
+// An auto-retrying finalizer carries an operator-facing error just like a
+// terminal failure: it renders as failed with its error surfaced, so the
+// operator sees the cause while the retry is still in flight.
+func TestBuildShardedApplyData_RetryingFinalizerSurfacesError(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "ks/-40/mutes", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{ID: 2, ApplyID: 1, Deployment: "cake", OperationKey: "ks/group_finalizer", State: state.ApplyOperation.FailedRetryable, ErrorMessage: "finalize vschema: transient topo error", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+	require.Len(t, data.VSchemaChanges, 1)
+	assert.Equal(t, "failed", data.VSchemaChanges[0].Status)
+	assert.Equal(t, "finalize vschema: transient topo error", data.ErrorMessage)
+}
+
+// A finalizer that failed, retried, and completed keeps its last error on the
+// operation row; a completed finalizer's stale error must not become the
+// apply's failure callout.
+func TestBuildShardedApplyData_CompletedFinalizerStaleErrorIgnored(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "ks/-40/mutes", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{ID: 2, ApplyID: 1, Deployment: "cake", OperationKey: "ks/group_finalizer", State: state.ApplyOperation.Completed, ErrorMessage: "finalize vschema: transient topo error", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Completed}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+	require.Len(t, data.VSchemaChanges, 1)
+	assert.Equal(t, "applied", data.VSchemaChanges[0].Status)
+	assert.Empty(t, data.ErrorMessage, "a completed finalizer's stale error is not a failure cause")
+}
+
+// When more than one finalizer failed, the surfaced cause is the first failed
+// finalizer's error in operation order — deterministic across comment edits,
+// never flipping between causes from one render to the next.
+func TestBuildShardedApplyData_FirstFailedFinalizerErrorWins(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, ApplyID: 1, Deployment: "cake", OperationKey: "ks_a/group_finalizer", State: state.ApplyOperation.Failed, ErrorMessage: "finalize ks_a: first cause", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{ID: 2, ApplyID: 1, Deployment: "cake", OperationKey: "ks_b/group_finalizer", State: state.ApplyOperation.Failed, ErrorMessage: "finalize ks_b: second cause", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Failed}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+	assert.Equal(t, "finalize ks_a: first cause", data.ErrorMessage)
 }
 
 // A terminal sharded apply's summary comment renders the verdict-titled

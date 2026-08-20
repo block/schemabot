@@ -120,7 +120,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 			}
 			vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
 				Namespace: finalizerNS,
-				Status:    vschemaStatusForOperationState(op.State),
+				Status:    vschemaStatusForOperationState(apply.State, op.State),
 				Diff:      vschemaDiffs[finalizerNS],
 			})
 			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
@@ -184,12 +184,17 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 // VSchema diffs for a sharded apply's comment: the diff the engine annotated
 // at plan time and plan persistence kept (PlanMetadataVSchemaDiff), so the
 // comment shows the change the operator approved rather than a re-diff
-// against live state. Returns nil when the apply carries no finalizer
-// operation — only finalizer rows render VSchema entries, so there is nothing
-// to attach a diff to. Best-effort: a plan load failure, a missing plan row,
-// or a stored plan without diffs (recorded before diffs were persisted)
-// contributes nothing rather than blocking the comment.
+// against live state. Returns nil without touching storage unless the apply
+// renders the sharded layout and carries a finalizer operation — only the
+// sharded layout consumes these diffs, and only finalizer rows render VSchema
+// entries, so any other shape would pay a stored-plan read on every comment
+// edit just to discard the result. Best-effort: a plan load failure, a
+// missing plan row, or a stored plan without diffs (recorded before diffs
+// were persisted) contributes nothing rather than blocking the comment.
 func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+	if !isShardedApply(ops) {
+		return nil
+	}
 	hasFinalizer := false
 	for _, op := range ops {
 		if _, ok := parseFinalizerOperationKey(op.OperationKey); ok {
@@ -233,13 +238,17 @@ func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply
 // both comment shapes describe VSchema application identically: applied when
 // the finalizer completed, applying while it runs, failed on a failure
 // (terminal or auto-retrying), and pending (empty) before it starts. A
-// finalizer whose rollout ended without running it — the operation row holds
-// cancelled or reverted, written by the cancel path or mirrored from the
-// settled parent by the stranded-operation reaper — reads as cancelled rather
+// finalizer whose rollout ended without running it reads as cancelled rather
 // than pending, so the terminal summary never promises VSchema work that no
-// claim arm will run. Stopped stays its own status: a stopped apply is
+// claim arm will run. That covers both routes to a dead row: the operation
+// itself holds cancelled or reverted (written by the cancel path or mirrored
+// from the settled parent by the stranded-operation reaper), and the row
+// still pending under a parent whose verdict is already final — a halted
+// rollout terminalizes the apply immediately, while the reaper only settles
+// the stranded row minutes later, well after the summary posted. Stopped —
+// on the operation or the parent — stays its own status: a stopped apply is
 // resumable, so its finalizer may yet run, but "pending" would overpromise.
-func vschemaStatusForOperationState(opState string) string {
+func vschemaStatusForOperationState(applyState, opState string) string {
 	switch {
 	case state.IsState(opState, state.ApplyOperation.Completed):
 		return "applied"
@@ -249,8 +258,10 @@ func vschemaStatusForOperationState(opState string) string {
 		return "failed"
 	case state.IsState(opState, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted):
 		return "cancelled"
-	case state.IsState(opState, state.ApplyOperation.Stopped):
+	case state.IsState(opState, state.ApplyOperation.Stopped) || state.IsState(applyState, state.Apply.Stopped):
 		return "stopped"
+	case state.IsTerminalApplyState(applyState):
+		return "cancelled"
 	default:
 		return ""
 	}

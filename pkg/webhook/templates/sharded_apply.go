@@ -30,9 +30,11 @@ type ShardedApplyData struct {
 	StartedAt   string
 	CompletedAt string
 
-	// ErrorMessage is the apply-level error. It is surfaced when the apply
-	// failed without any shard in a failure state — a failure outside shard work
-	// (e.g. a finalizer) leaves no failed shard row to carry the cause.
+	// ErrorMessage is the failure cause to surface when the apply failed
+	// without any shard in a failure state: the apply-level error when the
+	// apply row carries one, otherwise a failed finalizer's operation-scoped
+	// error — a failure outside shard work (e.g. a finalizer) leaves no
+	// failed shard row to carry the cause.
 	ErrorMessage string
 
 	// Shards is the per-shard rollup in resolved order: one entry per shard with

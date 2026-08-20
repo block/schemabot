@@ -584,10 +584,19 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
+	// The diff budget is per comment, not per keyspace: split it across the
+	// entries that carry a diff so a multi-keyspace apply stays bounded.
+	diffCount := 0
+	for _, c := range changes {
+		if c.Diff != "" {
+			diffCount++
+		}
+	}
+	budget := vschemaDiffBudget(diffCount)
 	for _, c := range changes {
 		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
-			writeVSchemaDiffFence(sb, c.Diff)
+			writeVSchemaDiffFence(sb, c.Diff, budget)
 		}
 	}
 }

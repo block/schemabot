@@ -583,6 +583,17 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 	// the database name — it's redundant with the metadata line.
 	singleKeyspace := len(data.Changes) == 1 && data.IsMySQL && data.Changes[0].Keyspace == data.Database
 
+	// The VSchema diff budget is per comment, not per keyspace: split it
+	// across the keyspaces that will render a diff so a multi-keyspace plan
+	// stays bounded.
+	diffCount := 0
+	for _, ks := range data.Changes {
+		if ks.VSchemaChanged && !data.IsMySQL && ks.VSchemaDiff != "" {
+			diffCount++
+		}
+	}
+	diffBudget := vschemaDiffBudget(diffCount)
+
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
 		hasDDLChanges := len(ks.Statements) > 0 || len(ks.Shards) > 0
@@ -601,7 +612,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		if hasVSchemaChanges {
 			sb.WriteString("#### VSchema\n")
 			if ks.VSchemaDiff != "" {
-				writeVSchemaDiffFence(sb, ks.VSchemaDiff)
+				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
 			} else {
 				sb.WriteString("_(diff not available)_\n\n")
 			}

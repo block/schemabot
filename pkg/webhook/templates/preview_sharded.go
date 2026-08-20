@@ -98,8 +98,9 @@ func PreviewCommentShardedSummaryCompleted() string {
 
 // PreviewCommentShardedSummaryFailed renders the terminal summary for a sharded
 // apply where one shard failed and the rest halted behind it: the failed
-// verdict header, the surfaced error, the final per-shard results, and the
-// retry action.
+// verdict header, the surfaced error, the final per-shard results, the
+// keyspace's VSchema change that will now never run (Cancelled, not Pending),
+// and the retry action.
 func PreviewCommentShardedSummaryFailed() string {
 	return RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute",
@@ -112,7 +113,8 @@ func PreviewCommentShardedSummaryFailed() string {
 			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
 			{Deployment: "c0-", State: state.ApplyOperation.Pending},
 		}),
-		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		Cells:          []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "cancelled"}},
 	})
 }
 

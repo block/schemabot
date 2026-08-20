@@ -7344,6 +7344,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 | `80-c0` | ⏸ halted — -40 failed |
 | `c0-` | ⏸ halted — -40 failed |
 
+### VSchema
+
+**`cdb_resolute_sharded`**: Cancelled
+
+
 ---
 
 To retry:
