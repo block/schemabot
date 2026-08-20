@@ -163,6 +163,39 @@ func TestExistingCopyDiscardsWhenAnUnrelatedTableLeavesTheBatch(t *testing.T) {
 	assert.Contains(t, found.Statement, ledgerAlter)
 }
 
+// Spirit reads the shadow table of every table in the batch before it resumes,
+// and rebuilds all of them if any one is missing. A batch that adds a table to
+// an existing copy therefore destroys the copy it already had, even though the
+// checkpoint is current and its statement matches this batch byte for byte.
+// This is the one discard an operator cannot see coming from the schema change
+// alone, so predicting adopt here would promise survival to a copy that is
+// about to be dropped.
+func TestExistingCopyDiscardsWhenTheBatchCoversMoreTablesThanTheCopy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const xfersAlter = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	const ledgerAlter = "ALTER TABLE `ledger_entries` ADD COLUMN note VARCHAR(64)"
+	batch := xfersAlter + "; " + ledgerAlter
+
+	// The checkpoint is for the whole batch, but only one of its tables ever got
+	// a shadow table: the copy came down before Spirit built the second.
+	seedCopy(t, db, []string{"xfers"}, sharedCheckpointTable, batch)
+
+	found, err := findCopy(t, dsn, []string{"xfers", "ledger_entries"})
+	require.NoError(t, err, "findExistingCopy")
+	require.NotNil(t, found)
+	assert.Equal(t, []string{"xfers"}, found.CopiedTables, "only one table was copied")
+	assert.Equal(t, []string{"xfers", "ledger_entries"}, found.BatchTables,
+		"the batch alters both, so Spirit reads both shadow tables")
+	require.Equal(t, batch, found.Statement,
+		"the checkpoint matches this batch exactly; only the missing shadow table disqualifies it")
+
+	disposition, reason := found.Disposition(batch, DefaultCheckpointMaxAge)
+	assert.Equal(t, engine.CopyDiscard, disposition)
+	assert.Equal(t, engine.DiscardCopyIncomplete, reason)
+}
+
 // A checkpoint older than the configured maximum cannot be replayed, so Spirit
 // starts fresh and the copy is lost. The operator is warned that applying
 // re-copies from zero.
@@ -182,6 +215,14 @@ func TestExistingCopyDiscardsExpiredCheckpoint(t *testing.T) {
 	// age rather than waiting for a real expiry.
 	disposition, reason := found.Disposition(batch, -time.Second)
 	assert.Equal(t, engine.CopyDiscard, disposition)
+	assert.Equal(t, engine.DiscardCheckpointExpired, reason)
+
+	// Spirit's bound is inclusive, so a checkpoint exactly at the limit is
+	// already too old. Predicting adopt at the boundary would be optimistic in
+	// the destructive direction, since Spirit re-measures the age later than
+	// this does and can only find it larger.
+	atTheBound, reason := found.Disposition(batch, found.Age)
+	assert.Equal(t, engine.CopyDiscard, atTheBound)
 	assert.Equal(t, engine.DiscardCheckpointExpired, reason)
 }
 

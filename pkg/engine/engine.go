@@ -343,7 +343,8 @@ const (
 
 // Discard reasons, kept distinct because they call for different operator
 // advice: a plan that drifted from the copy's own batch can be restored, an
-// expired checkpoint cannot.
+// expired checkpoint cannot, and a partial copy is not the operator's doing at
+// all.
 const (
 	// DiscardStatementDiffers means the existing work was done for a different
 	// set of statements than this plan will run, so the engine will not
@@ -353,6 +354,12 @@ const (
 	// DiscardCheckpointExpired means the statements match but the engine's
 	// record of the existing work is too old to resume from.
 	DiscardCheckpointExpired = "checkpoint_expired"
+
+	// DiscardCopyIncomplete means the existing work covers only some of the
+	// tables this plan changes. An engine that continues work continues all of
+	// it or none, so the tables that did get copied are destroyed along with the
+	// ones that never started.
+	DiscardCopyIncomplete = "copy_incomplete"
 )
 
 // Engine metadata keys carrying the direct execution policy from config

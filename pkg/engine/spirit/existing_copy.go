@@ -39,6 +39,12 @@ import (
 // this batch will never read.
 const sharedCheckpointTable = "_spirit_checkpoint"
 
+// copyDetectionTimeout bounds one existing-copy lookup: two small reads against
+// a target that is already being used for the plan or apply around it. Generous
+// enough that a loaded target still answers, short enough that an unresponsive
+// one costs a log line instead of a stalled apply.
+const copyDetectionTimeout = 10 * time.Second
+
 // existingCopy is a Spirit row copy found on a target: the shadow tables that
 // hold the copied rows, and the checkpoint that says what batch they were made
 // for. A copy with no reachable checkpoint still has shadow tables, which is
@@ -47,6 +53,10 @@ type existingCopy struct {
 	// CopiedTables are the tables in the planned batch that already have a
 	// shadow table on the target, in the order the batch names them.
 	CopiedTables []string
+	// BatchTables are all the tables the planned batch alters, in batch order.
+	// Spirit reads the shadow table of every one of them before it resumes, so
+	// this is what says whether CopiedTables is the whole batch or part of it.
+	BatchTables []string
 	// CheckpointTable is the checkpoint this batch will read, whether or not it
 	// exists. Named for logs and comments, never parsed.
 	CheckpointTable string
@@ -62,20 +72,33 @@ type existingCopy struct {
 // why. statement must be the exact string the apply will hand Spirit: the
 // joined batch, not the statement for any one table.
 //
-// Adopt is the narrow case. It requires that the checkpoint this batch reads
-// exists, that its statement matches byte for byte, and that it is young
-// enough to replay from. Everything else destroys the copy. A copy whose
-// checkpoint this batch cannot reach at all — because a batch of a different
-// size reads the other checkpoint name — has an empty Statement here, and so
-// resolves to the same statement-drift discard.
+// Adopt is the narrow case. It requires that every table in the batch already
+// has a copy, that the checkpoint this batch reads exists, that its statement
+// matches byte for byte, and that it is young enough to replay from. Everything
+// else destroys the copy. A copy whose checkpoint this batch cannot reach at
+// all — because a batch of a different size reads the other checkpoint name —
+// has an empty Statement here, and so resolves to the same statement-drift
+// discard.
+//
+// The checks run in the order Spirit runs them, so the reason reported is the
+// one Spirit would hit first.
 func (c *existingCopy) Disposition(statement string, maxAge time.Duration) (engine.CopyDisposition, string) {
 	if c == nil || len(c.CopiedTables) == 0 {
 		return engine.CopyNone, ""
 	}
+	// Spirit reads the shadow table of every table in the batch before it will
+	// resume, and rebuilds all of them if any one is unreadable. A batch that
+	// only partly overlaps an existing copy therefore destroys the part that
+	// exists, even when the checkpoint is current and its statement matches.
+	if len(c.CopiedTables) != len(c.BatchTables) {
+		return engine.CopyDiscard, engine.DiscardCopyIncomplete
+	}
 	if c.Statement != statement {
 		return engine.CopyDiscard, engine.DiscardStatementDiffers
 	}
-	if c.Age > maxAge {
+	// Spirit's own bound is inclusive, and it evaluates the age later than this
+	// does, so anything this reports as adoptable must be strictly younger.
+	if c.Age >= maxAge {
 		return engine.CopyDiscard, engine.DiscardCheckpointExpired
 	}
 	return engine.CopyAdopt, ""
@@ -121,8 +144,11 @@ func (e *Engine) reportExistingCopy(ctx context.Context, target *lazyTargetDB, d
 		logger.Info("continuing an existing copy on the target", attrs...)
 		return
 	}
+	// The batch is named on a discard so the copy_incomplete case reads without
+	// a second lookup: the tables in the batch that are absent from
+	// copied_tables are the ones whose missing copy costs the others theirs.
 	logger.Warn("discarding an existing copy on the target; its tables are re-copied from zero",
-		append(attrs, "reason", reason)...)
+		append(attrs, "reason", reason, "batch_tables", found.BatchTables)...)
 }
 
 // checkpointTableForBatch returns the checkpoint table Spirit reads for a batch
@@ -155,6 +181,15 @@ func findExistingCopy(ctx context.Context, target *lazyTargetDB, tables []string
 		return nil, nil
 	}
 
+	// The lookup describes an apply and decides nothing, so it must never be
+	// what holds one up. Neither caller's context carries a deadline: a plan
+	// serves an interactive comment, and an apply runs in the background for
+	// hours. Without a bound of its own, a target that accepts a connection and
+	// then stops answering would stall the fresh pool's dial or either query for
+	// as long as the operating system allows.
+	ctx, cancel := context.WithTimeout(ctx, copyDetectionTimeout)
+	defer cancel()
+
 	targetDB, err := target.get(ctx)
 	if err != nil {
 		return nil, err
@@ -169,6 +204,7 @@ func findExistingCopy(ctx context.Context, target *lazyTargetDB, tables []string
 
 	found := &existingCopy{
 		CopiedTables:    copied,
+		BatchTables:     tables,
 		CheckpointTable: checkpointTableForBatch(tables),
 	}
 
