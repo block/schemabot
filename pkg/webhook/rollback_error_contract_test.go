@@ -8,24 +8,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // rollbackCommandCore returns a durability disposition (retry, err) that a
 // future durable issue_comment driver consumes. The synchronous goSafe wrapper
 // discards it, so these tests pin the contract directly on the core.
-//
-// The retryable plan-generation disposition (remote-deployment unavailability
-// inside ExecuteRollbackPlanForApply) is not exercised here: producing it
-// requires a live remote gRPC target, which this layer fakes at the storage
-// boundary. The deterministic plan-generation rejection, and every other exit
-// site, are pinned below — deterministic answers are terminal, infrastructure
-// failures are retryable.
 
 // rollbackTestStorage serves the stores the rollback command core touches:
 // applies for the source lookup, plans and tasks for the source-apply
@@ -229,6 +226,40 @@ func rollbackCommand() CommandResult {
 	return CommandResult{Action: action.Rollback, ApplyID: "apply-123", Environment: "staging"}
 }
 
+// rollbackPlanTernClient is a Tern client whose Plan call fails, standing in
+// for the remote engine's answer during rollback plan generation.
+type rollbackPlanTernClient struct {
+	tern.Client
+	planErr error
+}
+
+func (c *rollbackPlanTernClient) Plan(context.Context, *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
+	return nil, c.planErr
+}
+
+func (c *rollbackPlanTernClient) IsRemote() bool { return true }
+
+func (c *rollbackPlanTernClient) Endpoint() string { return "test-endpoint" }
+
+// remotePlanRollbackStorage returns storage where every guardrail passes and
+// the stored plan carries the routing metadata needed to reach the remote
+// Plan RPC, positioned exactly at the engine's answer.
+func remotePlanRollbackStorage(locks storage.LockStore) *rollbackTestStorage {
+	apply := completedSourceApply()
+	apply.Deployment = "tenant-a"
+	plan := capturedSourcePlan()
+	plan.Database = apply.Database
+	plan.DatabaseType = apply.DatabaseType
+	plan.Environment = apply.Environment
+	plan.Target = "orders-staging"
+	return &rollbackTestStorage{
+		applies: &rollbackTestApplyStore{apply: apply},
+		plans:   &rollbackTestPlanStore{plan: plan},
+		tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+		locks:   locks,
+	}
+}
+
 // Transient infrastructure failures — the source-apply lookup, a storage read
 // inside the source guardrails, the lock status read, lock acquisition, or an
 // unevaluable authorization gate — are failures the same delivery could clear
@@ -269,6 +300,27 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		assert.True(t, retry, "an internal source validation failure must stay retryable, not become the command's answer")
 		body := requireComment(t, comments, "source validation failure comment")
 		assert.Contains(t, body, "load source plan")
+	})
+
+	t.Run("rollback plan source read failure is retryable", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackFlakyPlanStore{plan: capturedSourcePlan(), failAfter: 2},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.Error(t, err)
+		assert.True(t, retry, "a failed plan storage read must stay retryable")
+		assert.Equal(t, 1, lockStore.releaseCalls)
+		body := requireComment(t, comments, "rollback plan read failure comment")
+		assert.Contains(t, body, "get rollback source plan")
 	})
 
 	// The source apply is revalidated after lock acquisition; an internal
@@ -396,6 +448,27 @@ func TestRollbackCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		body := requireComment(t, comments, "authorization failure comment")
 		assert.Contains(t, body, "SchemaBot Authorization Check Failed")
 	})
+
+	// An unreachable remote deployment is a transport condition, not the
+	// engine's answer: the same rollback plan request is safe to re-send once
+	// the deployment is reachable, so the delivery stays retryable.
+	t.Run("remote plan unavailability is retryable", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := remotePlanRollbackStorage(lockStore)
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+		h.service.RegisterTernClient("tenant-a", "staging",
+			&rollbackPlanTernClient{planErr: grpcstatus.Error(grpccodes.Unavailable, "connection refused")})
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.Error(t, err)
+		assert.True(t, retry, "remote unavailability during plan generation must stay retryable")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released so a re-drive can start over")
+		body := requireComment(t, comments, "plan unavailability comment")
+		assert.Contains(t, body, "connection refused")
+	})
 }
 
 // Terminal outcomes are the command's answer — a missing apply ID, an apply
@@ -515,6 +588,25 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "rollback requires a completed apply")
 	})
 
+	t.Run("missing source plan invariant is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: completedSourceApply()},
+			plans:   &rollbackTestPlanStore{},
+			tasks:   &rollbackTestTaskStore{},
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "missing required stored data cannot be repaired by re-driving")
+		body := requireComment(t, comments, "missing source plan comment")
+		assert.Contains(t, body, "source plan 10 not found")
+		assert.NotContains(t, body, "Rollback Not Allowed")
+	})
+
 	// A concurrent apply can change which schema change the rollback planner
 	// would select between validation and the post-lock revalidation. The
 	// revalidation's guardrail rejection is deterministic for the re-driven
@@ -594,6 +686,75 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
 		body := requireComment(t, comments, "plan-generation failure comment")
 		assert.Contains(t, body, "missing server-side routing metadata")
+	})
+
+	// A stored plan whose identity fields do not match the apply it is being
+	// rolled back for is corrupt cross-reference data a re-drive re-reads
+	// unchanged; the posted error is the command's answer.
+	t.Run("mismatched source plan is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := validRollbackStorage(lockStore)
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a source plan that belongs to another database is a data invariant violation a re-drive re-reads unchanged")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
+		body := requireComment(t, comments, "plan mismatch comment")
+		assert.Contains(t, body, "belongs to")
+	})
+
+	// An apply that predates stored deployment metadata cannot be routed to
+	// its engine; the stored record does not change between re-drives.
+	t.Run("missing stored deployment is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		apply := completedSourceApply()
+		plan := capturedSourcePlan()
+		plan.Database = apply.Database
+		plan.DatabaseType = apply.DatabaseType
+		plan.Environment = apply.Environment
+		st := &rollbackTestStorage{
+			applies: &rollbackTestApplyStore{apply: apply},
+			plans:   &rollbackTestPlanStore{plan: plan},
+			tasks:   &rollbackTestTaskStore{tasks: []*storage.Task{latestCompletedSourceTask()}},
+			locks:   lockStore,
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "an apply without stored deployment metadata cannot be routed on any attempt")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
+		body := requireComment(t, comments, "missing deployment comment")
+		assert.Contains(t, body, "rollback source apply is invalid")
+		assert.Contains(t, body, "missing stored deployment metadata")
+	})
+
+	// The engine's rejection of the rollback plan request is deterministic for
+	// the same stored plan: re-driving would re-send the same doomed RPC, so
+	// the posted error is the command's answer.
+	t.Run("deterministic remote plan rejection is terminal", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := remotePlanRollbackStorage(lockStore)
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+		h.service.RegisterTernClient("tenant-a", "staging",
+			&rollbackPlanTernClient{planErr: grpcstatus.Error(grpccodes.InvalidArgument, "rollback DDL rejected by engine")})
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a deterministic engine rejection is the command's answer; re-driving would re-send the same doomed RPC")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
+		body := requireComment(t, comments, "engine rejection comment")
+		assert.Contains(t, body, "rollback DDL rejected by engine")
 	})
 
 	t.Run("lock held by another PR is terminal", func(t *testing.T) {
