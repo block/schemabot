@@ -71,6 +71,21 @@ func TestRenderPlanComment_DiscardedCopyNamesExpiryCause(t *testing.T) {
 	assert.Contains(t, out, "- `orders` in `testapp` (last progress 9d 4h ago): it is too old to resume")
 }
 
+// A copy covering only part of the schema change is discarded for a cause the
+// operator did not create and cannot undo by restoring the batch, so the
+// section says so plainly rather than implying the schema change drifted.
+func TestRenderPlanComment_DiscardedCopyNamesPartialCoverage(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"}}},
+		DiscardedCopies: []ExistingCopyData{
+			{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardCopyIncomplete, Age: "3h 12m"},
+		},
+	})
+
+	assert.Contains(t, out, "- `orders` in `testapp` (last progress 3h 12m ago): it covers only some of the tables this schema change alters")
+}
+
 // A copy with no recorded progress to date it by still names the tables it
 // covers; the age is omitted rather than rendered as a bare zero, which would
 // read as "started just now" and understate what is being thrown away.

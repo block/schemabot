@@ -96,6 +96,8 @@ func existingCopyReason(reason string) string {
 		return "the schema change differs from the one that started it"
 	case engine.DiscardCheckpointExpired:
 		return "it is too old to resume"
+	case engine.DiscardCopyIncomplete:
+		return "it covers only some of the tables this schema change alters"
 	default:
 		return "`" + reason + "`"
 	}
