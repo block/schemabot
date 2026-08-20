@@ -552,6 +552,19 @@ on the storage dialect:
   produces destructive DDL. Apply column changes to already-bootstrapped
   PostgreSQL databases before deploying schema files that expect them.
 
+  Non-unique indexes work the same way, and the consequence is quieter: an
+  index added to an embedded schema file reaches newly created databases only,
+  so an already-bootstrapped database keeps answering the queries that index
+  was added for — correctly, but without it. Create those by hand. A database
+  bootstrapped before `idx_plans_created_at` was added to `plans` needs:
+
+  ```sql
+  CREATE INDEX idx_plans_created_at ON plans (created_at);
+  ```
+
+  Without it, listing recent plans is a sequential scan plus a top-N sort,
+  which gets slower as plan history grows.
+
 The rest of this section describes the MySQL flow.
 
 By default, destructive statements in that diff — `DROP TABLE`, or an
