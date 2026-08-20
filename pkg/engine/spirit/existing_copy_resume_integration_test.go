@@ -48,6 +48,13 @@ func haltCopyMidFlight(t *testing.T, tableName string) haltedCopy {
 	rowsCopied := waitForCopyProgress(t, started.eng, 2000)
 	t.Logf("halting after %d rows copied", rowsCopied)
 
+	// Rows copied proves chunks are landing, not that the copy is resumable: a
+	// checkpoint records the contiguous low watermark, which only exists once
+	// every chunk behind it has fed back. Halting before then leaves a shadow
+	// table with nothing to resume from, which is not the copy these tests are
+	// about.
+	waitForCheckpointReadiness(t, started.eng)
+
 	haltCtx, cancelHalt := context.WithTimeout(t.Context(), haltDeadline)
 	defer cancelHalt()
 	require.NoError(t, started.eng.HaltForShutdown(haltCtx), "HaltForShutdown()")
