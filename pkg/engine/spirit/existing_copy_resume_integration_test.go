@@ -42,71 +42,41 @@ type haltedCopy struct {
 func haltCopyMidFlight(t *testing.T, tableName string) haltedCopy {
 	t.Helper()
 
-	dsn, db := setupTestMySQL(t)
-	cleanupTables(t, db)
+	started := startCopyForcingAlter(t, tableName)
+	defer started.eng.Drain()
 
-	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s` ("+
-		"id INT PRIMARY KEY AUTO_INCREMENT, "+
-		"name VARCHAR(50) NOT NULL)", tableName))
-	require.NoError(t, err, "create table %s", tableName)
-	seedTableRows(t, db, tableName)
-
-	// Widening the column past the length-prefix boundary forces a full copy
-	// rather than an in-place change, so there is a copy to halt.
-	alter := fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `name` varchar(100) NOT NULL", tableName)
-
-	eng := New(Config{
-		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		// A single thread keeps the copy in flight long enough to halt it
-		// partway through.
-		Threads: 1,
-	})
-	defer eng.Drain()
-
-	applyResult, err := eng.Apply(t.Context(), &engine.ApplyRequest{
-		Database: "testdb",
-		Changes: []engine.SchemaChange{{
-			Namespace:    "testdb",
-			TableChanges: []engine.TableChange{{Table: tableName, DDL: alter}},
-		}},
-		Credentials: &engine.Credentials{DSN: dsn},
-	})
-	require.NoError(t, err, "Apply()")
-	require.True(t, applyResult.Accepted, "apply not accepted: %s", applyResult.Message)
-
-	rowsCopied := waitForCopyProgress(t, eng, 2000)
+	rowsCopied := waitForCopyProgress(t, started.eng, 2000)
 	t.Logf("halting after %d rows copied", rowsCopied)
 
 	haltCtx, cancelHalt := context.WithTimeout(t.Context(), haltDeadline)
 	defer cancelHalt()
-	require.NoError(t, eng.HaltForShutdown(haltCtx), "HaltForShutdown()")
+	require.NoError(t, started.eng.HaltForShutdown(haltCtx), "HaltForShutdown()")
 
 	shadowTable := utils.NewTableName(tableName)
-	require.True(t, tableExists(t, db, shadowTable),
+	require.True(t, tableExists(t, started.db, shadowTable),
 		"the halted copy leaves its shadow table on the target")
-	require.Equal(t, 1, checkpointRowCount(t, db, utils.CheckpointTableName(tableName)),
+	require.Equal(t, 1, checkpointRowCount(t, started.db, utils.CheckpointTableName(tableName)),
 		"the halted copy leaves a checkpoint naming the batch it was made for")
 
 	return haltedCopy{
-		dsn:           dsn,
-		db:            db,
+		dsn:           started.dsn,
+		db:            started.db,
 		table:         tableName,
-		alter:         alter,
-		shadowTableID: innodbTableID(t, db, shadowTable),
+		alter:         started.alter,
+		shadowTableID: innodbTableID(t, started.db, shadowTable),
 	}
 }
 
-// runAlterToCompletion runs alter through the full engine path — routing, the
-// existing-copy report, then Spirit — and waits for it to finish.
-func runAlterToCompletion(t *testing.T, c haltedCopy, alter string) {
+// trackingEngine builds an engine already tracking a running schema change for
+// c's table, which is what the execution paths expect to find when a test drives
+// them directly rather than through Apply. The caller drains it.
+func trackingEngine(t *testing.T, c haltedCopy, logger *slog.Logger) *Engine {
 	t.Helper()
 
-	host, username, password, database, err := parseDSN(c.dsn)
+	_, _, _, database, err := parseDSN(c.dsn)
 	require.NoError(t, err, "parseDSN")
 
-	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))})
-	defer eng.Drain()
-
+	eng := New(Config{Logger: logger})
 	eng.mu.Lock()
 	eng.runningSchemaChange = &runningSchemaChange{
 		database: database,
@@ -115,15 +85,50 @@ func runAlterToCompletion(t *testing.T, c haltedCopy, alter string) {
 		started:  time.Now(),
 	}
 	eng.mu.Unlock()
+	return eng
+}
+
+// runAlterToCompletion runs alter through the initial-apply path — routing, the
+// existing-copy report, then Spirit — on eng, and waits for it to finish.
+func runAlterToCompletion(t *testing.T, eng *Engine, c haltedCopy, alter string) {
+	t.Helper()
+
+	runToCompletion(t, eng, c, func(ctx context.Context, host, username, password, database string) {
+		eng.executeSchemaChange(ctx, host, username, password, database, []string{alter}, false, directPolicy{})
+	})
+}
+
+// resumeAlterToCompletion runs alter through the operator start path, which
+// hands Spirit the stored statement directly instead of re-routing the plan,
+// and waits for it to finish. This is the path a stopped copy comes back on.
+func resumeAlterToCompletion(t *testing.T, eng *Engine, c haltedCopy, alter string) {
+	t.Helper()
+
+	runToCompletion(t, eng, c, func(ctx context.Context, host, username, password, database string) {
+		eng.resumeSchemaChange(ctx, host, username, password, database, []string{alter}, alter, false, directPolicy{})
+	})
+}
+
+func runToCompletion(t *testing.T, eng *Engine, c haltedCopy, run func(ctx context.Context, host, username, password, database string)) {
+	t.Helper()
+
+	host, username, password, database, err := parseDSN(c.dsn)
+	require.NoError(t, err, "parseDSN")
 
 	ctx, cancel := context.WithTimeout(t.Context(), resumeDeadline)
 	defer cancel()
-	eng.executeSchemaChange(ctx, host, username, password, database, []string{alter}, false, directPolicy{})
+	run(ctx, host, username, password, database)
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
 	eng.mu.Unlock()
 	require.Equal(t, engine.StateCompleted, finalState, "the schema change did not finish within %s", resumeDeadline)
+}
+
+// stdoutLogger is the logger the resume tests use when the assertion is about
+// what happened on the target rather than what was logged.
+func stdoutLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 // innodbTableID returns the InnoDB identity of a table in the test database.
@@ -178,7 +183,9 @@ func TestHaltedCopyResumesForTheSameStatement(t *testing.T) {
 	require.Equal(t, engine.CopyAdopt, predicted)
 	require.Empty(t, reason)
 
-	runAlterToCompletion(t, halted, halted.alter)
+	eng := trackingEngine(t, halted, stdoutLogger())
+	defer eng.Drain()
+	runAlterToCompletion(t, eng, halted, halted.alter)
 
 	assert.Equal(t, predicted, observedDisposition(t, halted),
 		"the copy the operator was told would be continued is the one that was cut over")
@@ -209,10 +216,46 @@ func TestHaltedCopyIsDiscardedForADifferentStatement(t *testing.T) {
 	require.Equal(t, engine.CopyDiscard, predicted)
 	require.Equal(t, engine.DiscardStatementDiffers, reason)
 
-	runAlterToCompletion(t, halted, widerAlter)
+	eng := trackingEngine(t, halted, stdoutLogger())
+	defer eng.Drain()
+	runAlterToCompletion(t, eng, halted, widerAlter)
 
 	assert.Equal(t, predicted, observedDisposition(t, halted),
 		"the copy the operator was warned about was destroyed and the table re-copied from zero")
 	assert.Equal(t, "varchar(200)", columnType(t, halted.db, halted.table, "name"),
 		"the fresh copy cut the new definition over")
+}
+
+// An operator who stops a copy and starts it again later meets the discard that
+// matters most: the start is what destroys the copy, and the operator asked for
+// it. The resumed apply hands Spirit its stored statement without going back
+// through routing, so it must disclose the discard on that path too — otherwise
+// the one apply an operator most needs warned about is the one that says
+// nothing.
+func TestResumedApplyDisclosesADiscardedCopy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running integration test in short mode")
+	}
+
+	halted := haltCopyMidFlight(t, "resume_disclosure_test")
+
+	// A different width for the same column: still a full copy, and still a
+	// statement the halted copy's checkpoint does not match, so the resume
+	// rebuilds rather than continues.
+	widerAlter := fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `name` varchar(200) NOT NULL", halted.table)
+
+	logger, sink := capturingLogger()
+	eng := trackingEngine(t, halted, logger)
+	defer eng.Drain()
+	resumeAlterToCompletion(t, eng, halted, widerAlter)
+
+	line := onlyCopyReportLine(t, sink)
+	assert.Equal(t, slog.LevelWarn, line.level,
+		"the start an operator issued destroyed a copy, so the resume warns about it")
+	assert.Equal(t, engine.DiscardStatementDiffers, line.attrs["reason"])
+	assert.Equal(t, "["+halted.table+"]", line.attrs["copied_tables"],
+		"the table whose copy was destroyed is named")
+
+	assert.Equal(t, engine.CopyDiscard, observedDisposition(t, halted),
+		"the copy the resume warned about was destroyed and the table re-copied from zero")
 }

@@ -60,11 +60,15 @@ type existingCopy struct {
 	// CheckpointTable is the checkpoint this batch will read, whether or not it
 	// exists. Named for logs and comments, never parsed.
 	CheckpointTable string
+	// CheckpointFound reports whether that checkpoint was there to read. When it
+	// was not, Statement and Age describe nothing and must not be reported as
+	// though they described the copy.
+	CheckpointFound bool
 	// Statement is the batch the copy was made for, verbatim, empty when this
 	// batch cannot reach the copy's checkpoint.
 	Statement string
-	// Age is how long ago the checkpoint was written. Zero when Statement is
-	// empty.
+	// Age is how long ago the checkpoint was written. Zero when no checkpoint
+	// was found.
 	Age time.Duration
 }
 
@@ -115,8 +119,14 @@ func (c *existingCopy) Disposition(statement string, maxAge time.Duration) (engi
 // about to happen, it does not decide anything, so a read failure must not turn
 // a working apply into a failed one. It is logged and the apply continues,
 // which leaves behavior exactly as it is without this check.
-func (e *Engine) reportExistingCopy(ctx context.Context, target *lazyTargetDB, database, statement string, tables []string) {
+func (e *Engine) reportExistingCopy(ctx context.Context, dsn, database, statement string, tables []string) {
 	logger := e.changeLogger()
+
+	// The pool exists only for the two reads below. The apply that follows can
+	// run for hours on Spirit's own connections, so a pool held for its duration
+	// would be a connection spent on nothing.
+	target := &lazyTargetDB{dsn: dsn}
+	defer target.close()
 
 	found, err := findExistingCopy(ctx, target, tables)
 	if err != nil {
@@ -138,7 +148,12 @@ func (e *Engine) reportExistingCopy(ctx context.Context, target *lazyTargetDB, d
 		"database", database,
 		"copied_tables", found.CopiedTables,
 		"checkpoint_table", found.CheckpointTable,
-		"checkpoint_age", found.Age.String(),
+	}
+	// A copy whose checkpoint this batch cannot read has no age to report. Zero
+	// would read as "written moments ago", which is the opposite of what an
+	// unreachable checkpoint tells the operator about what is being lost.
+	if found.CheckpointFound {
+		attrs = append(attrs, "checkpoint_age", found.Age.String())
 	}
 	if disposition == engine.CopyAdopt {
 		logger.Info("continuing an existing copy on the target", attrs...)
@@ -219,6 +234,7 @@ func findExistingCopy(ctx context.Context, target *lazyTargetDB, tables []string
 		return nil, err
 	}
 	if ok {
+		found.CheckpointFound = true
 		found.Statement = rec.Statement
 		found.Age = rec.Age()
 	}

@@ -252,11 +252,6 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 
 	combinedStatement := strings.Join(routing.spiritAlters, "; ")
 
-	// The batch is only final here, after routing has re-evaluated each
-	// statement against the target's live schema, so this is the first point
-	// where what Spirit will compare against the checkpoint is known.
-	e.reportExistingCopy(ctx, target, database, combinedStatement, routing.spiritTables)
-
 	logger.Info("executing ALTER via Spirit",
 		"database", database,
 		"tables", routing.spiritTables,
@@ -361,6 +356,16 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		tables = append(tables, p.Table)
 		ddls = append(ddls, p.Statement)
 	}
+
+	// Every batch Spirit runs arrives here, whether it is a first apply whose
+	// statements routing has just re-evaluated against the target's live schema
+	// or an operator resuming a stopped one from its stored statement. Both hand
+	// Spirit exactly this string, so this is where what Spirit compares against
+	// the checkpoint is known, and the only place a disclosure covers both. The
+	// resumed apply is the one that matters most: a copy stopped for days is
+	// discarded the moment it starts again, and the operator asked for that
+	// start.
+	e.reportExistingCopy(ctx, targetDSN(host, username, password, database), database, combinedStatement, tables)
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover

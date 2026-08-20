@@ -3,8 +3,11 @@
 package spirit
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +18,167 @@ import (
 
 	"github.com/block/schemabot/pkg/engine"
 )
+
+// testDatabase is the schema every target in this package's integration tests
+// serves, and the one the engine is told it is applying to.
+const testDatabase = "testdb"
+
+// recordedLog is one line the engine emitted, reduced to the parts an operator
+// alert keys on: how loud it was, what it said, and the attributes carrying the
+// identifiers to triage from.
+type recordedLog struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string
+}
+
+// logSink collects the lines a capturingHandler and every handler derived from
+// it record.
+type logSink struct {
+	mu   sync.Mutex
+	logs []recordedLog
+}
+
+func (s *logSink) record(entry recordedLog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.logs = append(s.logs, entry)
+}
+
+func (s *logSink) recorded() []recordedLog {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]recordedLog(nil), s.logs...)
+}
+
+// capturingHandler records what the engine logs so a test can assert on the
+// level and attributes operator alerting keys on, not only on the decision
+// behind them. Attributes bound with Logger.With are merged into each line the
+// derived logger emits, the way a text handler renders them.
+type capturingHandler struct {
+	sink  *logSink
+	bound []slog.Attr
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, rec slog.Record) error {
+	entry := recordedLog{level: rec.Level, msg: rec.Message, attrs: make(map[string]string)}
+	for _, a := range h.bound {
+		entry.attrs[a.Key] = a.Value.String()
+	}
+	rec.Attrs(func(a slog.Attr) bool {
+		entry.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	h.sink.record(entry)
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &capturingHandler{sink: h.sink, bound: append(append([]slog.Attr(nil), h.bound...), attrs...)}
+}
+
+func (h *capturingHandler) WithGroup(string) slog.Handler { return h }
+
+// capturingLogger returns a logger that records to the sink it also returns.
+func capturingLogger() (*slog.Logger, *logSink) {
+	sink := &logSink{}
+	return slog.New(&capturingHandler{sink: sink}), sink
+}
+
+// onlyCopyReportLine returns the single line the copy report emitted, failing
+// when the report said nothing or said more than one thing. The disclosure is
+// one line per apply by design: an operator scanning an apply's log for what
+// happened to a copy must not have to reconcile several.
+func onlyCopyReportLine(t *testing.T, sink *logSink) recordedLog {
+	t.Helper()
+
+	var lines []recordedLog
+	for _, line := range sink.recorded() {
+		if _, ok := line.attrs["checkpoint_table"]; ok {
+			lines = append(lines, line)
+		}
+	}
+	require.Len(t, lines, 1, "the copy report emits exactly one line")
+	return lines[0]
+}
+
+// The disclosure an operator alerts on is the log line itself, so its level and
+// its attributes are part of the contract, not just the adopt/discard decision
+// behind them. A discard is a warning that names the cause, the tables whose
+// copy is being destroyed, and the whole batch that costs them.
+func TestReportExistingCopyWarnsOnADiscardAndNamesItsCause(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const batch = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	seedCopy(t, db, []string{"xfers"}, utils.CheckpointTableName("xfers"), batch)
+
+	logger, sink := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	widened := "ALTER TABLE `xfers` ADD INDEX r_token (r_token, id)"
+	eng.reportExistingCopy(t.Context(), dsn, testDatabase, widened, []string{"xfers"})
+
+	line := onlyCopyReportLine(t, sink)
+	assert.Equal(t, slog.LevelWarn, line.level,
+		"a discard destroys work already paid for, so it must be loud enough to alert on")
+	assert.Equal(t, "discarding an existing copy on the target; its tables are re-copied from zero", line.msg)
+	assert.Equal(t, engine.DiscardStatementDiffers, line.attrs["reason"])
+	assert.Equal(t, testDatabase, line.attrs["database"])
+	assert.Equal(t, "[xfers]", line.attrs["copied_tables"])
+	assert.Equal(t, "[xfers]", line.attrs["batch_tables"])
+	assert.Equal(t, "_xfers_chkpnt", line.attrs["checkpoint_table"])
+	assert.Contains(t, line.attrs, "checkpoint_age", "the checkpoint was read, so its age is a fact")
+}
+
+// A copy the apply continues is reported, but as information rather than a
+// warning: nothing is destroyed, so it must not reach an alert keyed on the
+// discard warning.
+func TestReportExistingCopyLogsAnAdoptedCopyAtInfo(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const batch = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	seedCopy(t, db, []string{"xfers"}, utils.CheckpointTableName("xfers"), batch)
+
+	logger, sink := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	eng.reportExistingCopy(t.Context(), dsn, testDatabase, batch, []string{"xfers"})
+
+	line := onlyCopyReportLine(t, sink)
+	assert.Equal(t, slog.LevelInfo, line.level)
+	assert.Equal(t, "continuing an existing copy on the target", line.msg)
+	assert.NotContains(t, line.attrs, "reason", "there is no cause to report when nothing is discarded")
+}
+
+// A shadow table whose checkpoint this batch cannot read is still a copy the
+// apply destroys, so it is still reported. Its age is not reported at all: the
+// zero value would read as "written moments ago" and understate a copy that may
+// be days old.
+func TestReportExistingCopyOmitsTheAgeOfAnUnreachableCheckpoint(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	seedCopy(t, db, []string{"xfers"}, "", "")
+
+	logger, sink := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	eng.reportExistingCopy(t.Context(), dsn, testDatabase,
+		"ALTER TABLE `xfers` ADD INDEX r_token (r_token)", []string{"xfers"})
+
+	line := onlyCopyReportLine(t, sink)
+	assert.Equal(t, slog.LevelWarn, line.level)
+	assert.Equal(t, engine.DiscardStatementDiffers, line.attrs["reason"])
+	assert.NotContains(t, line.attrs, "checkpoint_age",
+		"no checkpoint was read, so there is no age to state as a fact")
+}
 
 // findCopy looks for a copy on the target the way the engine does, on a pool of
 // its own that lives no longer than the lookup.
