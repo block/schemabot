@@ -1424,7 +1424,7 @@ func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply Blocked")
 		assert.Contains(t, body, "Staging")
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for blocked production comment")
 	}
 
@@ -1440,7 +1440,7 @@ func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "No schema changes detected")
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for no-op staging plan comment")
 	}
 
@@ -1466,7 +1466,7 @@ func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
 		assert.NotContains(t, body, "Apply Blocked",
 			"production apply should not be blocked after the staging no-op apply recorded the passing check")
 		assert.Contains(t, body, "No schema changes detected")
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for production comment")
 	}
 }

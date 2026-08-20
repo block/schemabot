@@ -280,14 +280,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// regular plan comment (no lock, no confirm footer).
 	if !planResp.HasChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
-		headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeApplyNoOpPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
-		if checkErr != nil {
+		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
 			h.logger.Error("failed to record no-changes check for apply command",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
 		} else if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		}
-		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	}
