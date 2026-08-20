@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -114,4 +115,93 @@ func TestApplyConfirmCommandCoreTransientConfigReadFailureIsRetryable(t *testing
 
 	require.Error(t, err)
 	assert.True(t, retry, "a transient GitHub config read failure must stay retryable for a durable driver")
+}
+
+// Lock lookup uncertainty remains retryable, while known lock rejections are
+// terminal and report a specific operator action unless fan-out requires silence.
+func TestApplyConfirmCommandCoreLockPathDispositions(t *testing.T) {
+	t.Run("lock lookup failure is retryable", func(t *testing.T) {
+		h, mux, _ := newApplyGateContractHandler(t, &actorAuthStorage{locks: &actorAuthLockStore{getErr: errors.New("lock storage unavailable")}})
+		registerCheckStatusRESTHandlers(mux, nil)
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.Error(t, err)
+		assert.True(t, retry, "storage uncertainty must be re-driven")
+	})
+
+	t.Run("missing lock is terminal", func(t *testing.T) {
+		h, mux, comments := newApplyGateContractHandler(t, &actorAuthStorage{locks: &actorAuthLockStore{}})
+		registerCheckStatusRESTHandlers(mux, nil)
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "no pending confirmation is the command's terminal answer")
+		body := requireComment(t, comments, "missing-lock apply-confirm comment")
+		assert.Contains(t, body, "No apply lock is held for this database.")
+	})
+
+	t.Run("missing lock on unscoped fan-out is terminal", func(t *testing.T) {
+		cfg := actorAuthTestConfig(false)
+		cfg.Repos = aggregateLeaderConfig().Repos
+		h, mux, comments := newFanOutSkipHandler(t, cfg)
+		registerApplyDiscoveryEndpoints(t, mux, "orders")
+		registerCheckStatusRESTHandlers(mux, nil)
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "an unscoped deployment with no pending confirmation must terminate silently")
+		assert.Empty(t, comments, "the terminal skip must stay silent")
+	})
+
+	t.Run("rollback lock is terminal", func(t *testing.T) {
+		lock := applyConfirmContractLock("octocat/hello-world#1", "rollback:rbplan-1")
+		h, mux, comments := newApplyGateContractHandler(t, &actorAuthStorage{locks: &actorAuthLockStore{locks: []*storage.Lock{lock}}})
+		registerCheckStatusRESTHandlers(mux, nil)
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a rollback lock requires a different command and is a terminal rejection")
+		body := requireComment(t, comments, "rollback-lock apply-confirm comment")
+		assert.Contains(t, body, "This lock belongs to a rollback plan. Use `schemabot rollback-confirm` to execute it")
+	})
+
+	t.Run("lock held by another PR is terminal", func(t *testing.T) {
+		lock := applyConfirmContractLock("octocat/hello-world#2", "plan_confirm123")
+		lock.PullRequest = 2
+		h, mux, comments := newApplyGateContractHandler(t, &actorAuthStorage{locks: &actorAuthLockStore{locks: []*storage.Lock{lock}}})
+		registerCheckStatusRESTHandlers(mux, nil)
+		registerCurrentBaseSchema(t, mux)
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "a confirmed lock conflict is the command's terminal answer")
+		body := requireComment(t, comments, "foreign-lock apply-confirm comment")
+		assert.Contains(t, body, "**Locked by**: [octocat/hello-world#2]")
+	})
+}
+
+func applyConfirmContractLock(owner, pendingPlanID string) *storage.Lock {
+	return &storage.Lock{
+		DatabaseName: "orders", DatabaseType: storage.DatabaseTypeMySQL,
+		Owner: owner, Repository: "octocat/hello-world", PullRequest: 1,
+		PendingPlanID: pendingPlanID,
+	}
+}
+
+func registerCurrentBaseSchema(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	registerBaseFreshnessRef(t, mux)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"merge_base_commit": map[string]string{"sha": "base-tip-sha"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-tip-sha", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": []any{}}))
+	})
 }
