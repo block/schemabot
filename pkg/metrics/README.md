@@ -407,6 +407,36 @@ environment. Environment-specific operation metrics use the real environment.
 
 ## Adding New Metrics
 
+### Does it belong in a metric?
+
+Metrics earn their place on volume. A rate, a trend, or a threshold only means
+something when the underlying event happens often enough to have a baseline:
+retry storms, claim contention, throttling, error rates on a hot path. A counter
+for a rare dangerous branch reads zero for weeks, so there is nothing to alert
+against, and an increment tells an operator far less than the `slog.Warn` or
+`slog.Error` beside it, which already carries the identifiers, the affected
+objects, and the reason. Log the rare branch well and leave it there — a
+log-based monitor can still count it if that day arrives.
+
+Adding a status, reason, or outcome value to an existing counter is a different
+decision from adding an instrument, and is usually the right one. The hot-path
+counter already has the baseline, so the rare case becomes an alertable slice of
+it instead of a series that is almost always zero: `app_repo_mismatch` on
+`schemabot.webhook.events_total` is the shape to copy — it shares a series with
+every other webhook outcome, which is what makes "the second one, never the
+first" expressible as an alert.
+
+Several counters here predate this bar and would not be added today —
+`schemabot.check_ownership_misses_total` and
+`schemabot.promotion.config_error_blocks_total` among them. They stay because
+removing an emitted series breaks whatever consumes it, not because they are the
+pattern to follow.
+
+This is the reasoning behind the *Metrics are for what can go haywire* item in
+[AGENTS.md](../../AGENTS.md) § PR Self-Review Bar.
+
+### The recipe
+
 Define recording functions in `metrics.go` following the existing pattern:
 
 ```go
