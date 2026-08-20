@@ -14,8 +14,9 @@ type PlanSummaryData struct {
 	PlanID      string
 	Database    string
 	Environment string
-	// Source is the plan's provenance: "owner/repo#123" for a PR-generated
-	// plan, "ad-hoc" for a plan created without one.
+	// Source is the plan's provenance, rendered for the operator: the PR's URL
+	// when the plan came from one, the repository alone when the plan names a
+	// repository but no PR, and "ad-hoc" for a plan created without either.
 	Source    string
 	CreatedAt time.Time
 	// Changes is the rendered change summary, such as

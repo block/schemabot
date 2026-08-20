@@ -30,17 +30,17 @@ const (
 func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 	limit, err := parsePlansLimit(r)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 		return
 	}
 	last, err := parsePlansLast(r)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 		return
 	}
 	pullRequest, err := parsePlansPullRequest(r)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
 		return
 	}
 
@@ -63,7 +63,7 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 			"repository", opts.Repository,
 			"pull_request", opts.PullRequest,
 			"error", err)
-		s.writeError(w, http.StatusInternalServerError, "failed to list plans")
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to list plans")
 		return
 	}
 	hasMore := len(plans) > limit
