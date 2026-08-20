@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // setHyperlinks forces hyperlink emission on or off for the duration of a
@@ -13,6 +15,15 @@ func setHyperlinks(t *testing.T, enabled bool) {
 	restore := Hyperlinks
 	Hyperlinks = enabled
 	t.Cleanup(func() { Hyperlinks = restore })
+}
+
+// clearEnv unsets key for the duration of a test, restoring any ambient
+// value afterwards. t.Setenv alone cannot express "unset", and detection
+// distinguishes an unset variable from an empty one.
+func clearEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	require.NoError(t, os.Unsetenv(key))
 }
 
 func TestLink(t *testing.T) {
@@ -30,13 +41,13 @@ func TestLink(t *testing.T) {
 			Link("acme/shop#412", "https://github.com/acme/shop/pull/412"))
 	})
 
-	t.Run("a control byte in the URL falls back to plain output", func(t *testing.T) {
+	t.Run("a control byte in the URL falls back to plain output with the control bytes stripped", func(t *testing.T) {
 		setHyperlinks(t, true)
 		assert.Equal(t,
-			"https://example.com/\x1b]8;;evil",
+			"https://example.com/]8;;evil",
 			Link("acme/shop#412", "https://example.com/\x1b]8;;evil"))
 		assert.Equal(t,
-			"https://example.com/a\nb",
+			"https://example.com/ab",
 			Link("acme/shop#412", "https://example.com/a\nb"))
 	})
 
@@ -79,10 +90,20 @@ func TestStdoutSupportsHyperlinksForceOverride(t *testing.T) {
 	})
 
 	t.Run("multiplexers disable hyperlinks unless forced", func(t *testing.T) {
+		clearEnv(t, "FORCE_HYPERLINK")
 		t.Setenv("TMUX", "/tmp/tmux-501/default,1234,0")
 		assert.False(t, stdoutSupportsHyperlinks())
 		t.Setenv("FORCE_HYPERLINK", "1")
 		assert.True(t, stdoutSupportsHyperlinks())
+	})
+
+	t.Run("a multiplexer TERM disables hyperlinks even without TMUX set", func(t *testing.T) {
+		clearEnv(t, "FORCE_HYPERLINK")
+		clearEnv(t, "TMUX")
+		t.Setenv("TERM", "tmux-256color")
+		assert.False(t, stdoutSupportsHyperlinks())
+		t.Setenv("TERM", "screen-256color")
+		assert.False(t, stdoutSupportsHyperlinks())
 	})
 }
 

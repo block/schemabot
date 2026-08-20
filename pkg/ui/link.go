@@ -20,15 +20,18 @@ func stdoutSupportsHyperlinks() bool {
 	if force, ok := os.LookupEnv("FORCE_HYPERLINK"); ok {
 		return force != "" && force != "0"
 	}
-	if os.Getenv("TERM") == "dumb" {
+	term := os.Getenv("TERM")
+	if term == "dumb" {
 		return false
 	}
 	// Terminal multiplexers swallow the hyperlink escape unless the user has
 	// opted into passing it through, leaving the link text with no URL at
 	// all. Operators frequently run inside tmux, so print the full URL there
 	// and let FORCE_HYPERLINK=1 re-enable links for multiplexers configured
-	// to pass them.
-	if os.Getenv("TMUX") != "" || strings.HasPrefix(os.Getenv("TERM"), "screen") {
+	// to pass them. TERM is checked alongside TMUX because environments like
+	// ssh or sudo can strip the TMUX variable while TERM still names the
+	// multiplexer.
+	if os.Getenv("TMUX") != "" || strings.HasPrefix(term, "screen") || strings.HasPrefix(term, "tmux") {
 		return false
 	}
 	info, err := os.Stdout.Stat()
@@ -47,10 +50,11 @@ func stdoutSupportsHyperlinks() bool {
 // The URL may come from a server response, so both parts are validated
 // before being embedded in the escape: a control byte inside either would
 // terminate the sequence early and leak the remainder as live terminal
-// input. Unsafe values render as the plain URL.
+// input. Unsafe values render as the plain URL with control runes stripped,
+// so they cannot inject escapes on the plain path either.
 func Link(text, url string) string {
 	if !Hyperlinks || !osc8SafeURL(url) || containsControl(text) {
-		return url
+		return stripControl(url)
 	}
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
@@ -72,9 +76,22 @@ func osc8SafeURL(url string) bool {
 // be any printable Unicode, but a control rune inside the hyperlink escape
 // would corrupt the terminal's parse of it.
 func containsControl(s string) bool {
-	return strings.ContainsFunc(s, func(r rune) bool {
-		return r < 32 || r == 127
-	})
+	return strings.ContainsFunc(s, isControl)
+}
+
+// stripControl removes control runes so a value from a server response is
+// safe to print as plain terminal output.
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if isControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func isControl(r rune) bool {
+	return r < 32 || r == 127
 }
 
 // terminalEscapePattern matches the zero-width escape sequences this CLI
