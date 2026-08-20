@@ -1381,6 +1381,96 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	})
 }
 
+// TestE2EApplyNoOpUnblocksPriorEnvironmentGate verifies that a no-op apply
+// repairs a stale prior-environment check: production is blocked while
+// staging's stored check says pending changes, a no-op `apply -e staging`
+// records the passing staging check, and production unblocks.
+func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
+	dbName := "webhook_noop_unblocks_prior_env"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
+
+	// The target already has the table (reconciled out-of-band), but the
+	// stored staging check still says pending changes.
+	seedTargetTable(t, dbName,
+		"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	seedCheck(t, svc, dbName, "staging", "action_required")
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	// Production is blocked by the stale staging check.
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "Staging")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for blocked production comment")
+	}
+
+	// A staging apply finds no changes and records the passing staging check.
+	req = buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No schema changes detected")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for no-op staging plan comment")
+	}
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, "completed", check.Status)
+	assert.Equal(t, "success", check.Conclusion)
+	assert.False(t, check.HasChanges)
+
+	// Production unblocks. Its target is the same test database, so this
+	// apply is also a no-op plan comment rather than a locked apply.
+	req = buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.NotContains(t, body, "Apply Blocked",
+			"production apply should not be blocked after the staging no-op apply recorded the passing check")
+		assert.Contains(t, body, "No schema changes detected")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for production comment")
+	}
+}
+
 // TestE2EApplyExecutesAutomatically verifies that `schemabot apply -e staging`
 // plans, acquires a lock, and executes the apply after safety rechecks.
 func TestE2EApplyExecutesAutomatically(t *testing.T) {

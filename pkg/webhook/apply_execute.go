@@ -99,7 +99,7 @@ func (h *Handler) executeApply(
 		// Record the passing (no-change) check result and refresh the aggregate so
 		// the schema check reflects that the target is up to date, the same as the
 		// no-change plan path.
-		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
+		if headSHA, _, checkErr := h.storeApplyNoOpPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
 			h.logger.Error("failed to record no-changes check after apply",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
 		} else if headSHA != "" {

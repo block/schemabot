@@ -19,6 +19,17 @@ func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclien
 	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
 }
 
+// storeApplyNoOpPlanCheckRecord stores the passing check record when an
+// apply's fresh plan finds no changes and reconciles same-head apply-owned
+// stored check state, the same as the manual plan path. The prior-environment
+// gate reads the stored conclusion, so the proven no-op must replace a stale
+// non-success record. Like storeApplyPlanCheckRecord, the apply-time plan does
+// not evaluate review-time deployment drift, so a stored drift block is
+// preserved. Returns the head SHA and whether apply-owned state was recovered.
+func (h *Handler) storeApplyNoOpPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, bool, error) {
+	return h.storeManualPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
+}
+
 // updateCheckRecordForApplyStart updates the stored check state to "in_progress"
 // when an apply begins execution. The aggregate check is updated to reflect the
 // state. If the apply is already terminal by the time the claim lands, the
