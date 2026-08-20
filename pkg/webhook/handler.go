@@ -994,11 +994,15 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 // was in scope at the panic site (DSN fragments, hostnames, driver internals),
 // and a PR comment is a public surface — the raw value and stack stay
 // server-side in the log.
-// Usage: defer h.recoverPanic(repo, pr, installationID)
-func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
+// Usage: defer h.recoverPanic(repo, pr, installationID, deliveryID)
+func (h *Handler) recoverPanic(repo string, pr int, installationID int64, deliveryID string) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
+		attrs := []any{"repo", repo, "pr", pr, "installation_id", installationID}
+		if deliveryID != "" {
+			attrs = append(attrs, "delivery_id", deliveryID)
+		}
+		h.logger.Error("goroutine panic", append(attrs, "error", r, "stack", string(stack))...)
 		h.postComment(repo, pr, installationID,
 			"**Internal error while processing this request. This is a bug — please report it.** Details are in the server logs.")
 	}
@@ -1016,9 +1020,9 @@ func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 // (the delayed time.AfterFunc timer case) runs untracked: the drain has
 // committed to a bounded wait and reached empty, so it will not wait for late
 // timers.
-func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
+func (h *Handler) goSafe(repo string, pr int, installationID int64, deliveryID string, fn func()) {
 	run := func() {
-		defer h.recoverPanic(repo, pr, installationID)
+		defer h.recoverPanic(repo, pr, installationID, deliveryID)
 		fn()
 	}
 

@@ -25,7 +25,7 @@ func TestDrainInProcessWebhookWorkWaitsForGoroutines(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
 	var ran atomic.Bool
-	h.goSafe("octocat/hello-world", 1, 1, func() {
+	h.goSafe("octocat/hello-world", 1, 1, "", func() {
 		close(started)
 		<-release
 		ran.Store(true)
@@ -62,8 +62,8 @@ func TestDrainInProcessWebhookWorkWaitsForNestedGoroutines(t *testing.T) {
 	release := make(chan struct{})
 	outerStarted := make(chan struct{})
 	var nestedRan atomic.Bool
-	h.goSafe("octocat/hello-world", 1, 1, func() {
-		h.goSafe("octocat/hello-world", 1, 1, func() {
+	h.goSafe("octocat/hello-world", 1, 1, "", func() {
+		h.goSafe("octocat/hello-world", 1, 1, "", func() {
 			<-release
 			nestedRan.Store(true)
 		})
@@ -100,7 +100,7 @@ func TestDrainInProcessWebhookWorkTimesOut(t *testing.T) {
 
 	release := make(chan struct{})
 	started := make(chan struct{})
-	h.goSafe("octocat/hello-world", 1, 1, func() {
+	h.goSafe("octocat/hello-world", 1, 1, "", func() {
 		close(started)
 		<-release
 	})
@@ -138,7 +138,7 @@ func TestDrainInProcessWebhookWorkGoSafeAfterDrainRunsUntracked(t *testing.T) {
 	h.DrainInProcessWebhookWork(t.Context())
 
 	ran := make(chan struct{})
-	h.goSafe("octocat/hello-world", 1, 1, func() {
+	h.goSafe("octocat/hello-world", 1, 1, "", func() {
 		close(ran)
 	})
 
@@ -165,10 +165,10 @@ func TestDrainInProcessWebhookWorkWaitsForChildSpawnedDuringDrain(t *testing.T) 
 
 	// The parent stays in flight until spawnChild fires, then registers a child
 	// and returns. The child outlives the parent and only finishes on release.
-	h.goSafe("octocat/hello-world", 1, 1, func() {
+	h.goSafe("octocat/hello-world", 1, 1, "", func() {
 		close(parentStarted)
 		<-spawnChild
-		h.goSafe("octocat/hello-world", 1, 1, func() {
+		h.goSafe("octocat/hello-world", 1, 1, "", func() {
 			<-releaseChild
 			childRan.Store(true)
 		})
