@@ -772,17 +772,6 @@ func (a *Apply) MissingExpectedOperationKeys(ops []*ApplyOperation) []string {
 	return missing
 }
 
-// ManifestDeclaresUnattachedWork reports whether the apply's generation
-// manifest declares operation keys that have no attached operation row yet. A
-// keyed apply's operations attach one dispatch at a time, so the attached rows
-// alone understate a mid-fan-out generation; any decision that treats the
-// attached set as the whole generation — drive-mode selection, completion —
-// must consult this instead of the row count. An apply without a manifest
-// declares nothing beyond its attached rows.
-func (a *Apply) ManifestDeclaresUnattachedWork(ops []*ApplyOperation) bool {
-	return len(a.MissingExpectedOperationKeys(ops)) > 0
-}
-
 // IsRollback reports whether this apply reverts a previously applied schema
 // change. It reads the durable rollback option so any terminal path can tell a
 // rollback from an ordinary apply without the rollback command's in-memory

@@ -775,12 +775,14 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return
 	}
-	if apply.ManifestDeclaresUnattachedWork(ops) {
+	if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
 		s.logger.Info("operator: generation manifest expects operations that have not attached; driving under the operation lease so the projection owns the parent",
 			append(apply.LogAttrs(),
 				"driver", driverID,
+				"lease_owner", owner,
 				"operation_key", op.OperationKey,
-				"missing_operation_keys", apply.MissingExpectedOperationKeys(ops))...)
+				"operation_deployment", op.Deployment,
+				"missing_operation_count", len(missing))...)
 		s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
 		return
 	}
