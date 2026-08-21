@@ -423,12 +423,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Discarding an unfinished copy destroys work already done on the target —
-	// often hours of it — so it never happens in one step unless the operator
-	// asked for one. `-y` is that ask: it is the operator saying "apply without
-	// stopping to confirm", which is exactly the acknowledgement this needs.
-	// Without it, downgrade to the two-step confirm against the locked comment
-	// that discloses what is being thrown away.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 && !result.AutoConfirm {
+	// often hours of it — so it never happens in one step. Downgrade to the
+	// two-step confirm against the locked comment that discloses what is being
+	// thrown away, the same way a direct-execution change does: the operator
+	// spends the hours, so the operator decides, and there is no flag that
+	// converts an automatic apply into that consent.
+	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
 			"discarded_copies", len(discarded))

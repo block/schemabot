@@ -116,30 +116,3 @@ func TestE2EDiscardingCopyDowngradesToConfirm(t *testing.T) {
 		t.Fatal("timed out waiting for the downgraded plan comment")
 	}
 }
-
-// `-y` is the operator saying "apply without stopping to confirm", which is
-// the acknowledgement the discard needs. An apply carrying it proceeds in one
-// step, disclosing the copy on the way rather than pausing for a second
-// command.
-func TestE2EDiscardingCopyProceedsWithAutoConfirm(t *testing.T) {
-	f := setupDiscardGate(t, "webhook_copy_discard_yes")
-
-	rr := httptest.NewRecorder()
-	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
-		isPR:    true,
-	}, nil))
-	require.Equal(t, http.StatusOK, rr.Code)
-
-	select {
-	case body := <-f.result.comments:
-		assert.Contains(t, body, "ℹ️ **This apply destroys work in progress**",
-			"the copy is still disclosed on the way through, as a record of what this apply threw away")
-		assert.NotContains(t, body, "⚠️ **This apply destroys work in progress**",
-			"-y took the decision, so what is left to say is informational")
-		assert.NotContains(t, body, "Automatic apply paused",
-			"-y acknowledges the discard, so the apply does not stop")
-	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatal("timed out waiting for the apply comment")
-	}
-}
