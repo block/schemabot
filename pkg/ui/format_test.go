@@ -123,6 +123,22 @@ func TestCleanLintReason(t *testing.T) {
 	}
 }
 
+func TestLintReasons(t *testing.T) {
+	t.Run("splits engine-joined violations into cleaned messages", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{"DROP COLUMN removes data", "Index should be invisible first"},
+			LintReasons("[ERROR] unsafe: DROP COLUMN removes data; [ERROR] invisible_index_before_drop: Index should be invisible first"))
+	})
+
+	t.Run("single violation yields one message", func(t *testing.T) {
+		assert.Equal(t, []string{"DROP TABLE removes all data"}, LintReasons("DROP TABLE removes all data"))
+	})
+
+	t.Run("empty reason yields nothing", func(t *testing.T) {
+		assert.Empty(t, LintReasons(""))
+	})
+}
+
 func TestCodeQuoteIdentifiers(t *testing.T) {
 	tests := []struct {
 		name   string

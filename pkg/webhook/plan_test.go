@@ -891,6 +891,68 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
 }
 
+// A table can carry several lint violations in one engine-joined reason
+// string. The blocking comment must render each violation as its own nested
+// bullet — not one run-on line — and the header must count the violations
+// the list shows.
+func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"CREATE TABLE `uploads` (`uid` varchar(64) NOT NULL, PRIMARY KEY(`uid`))"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "uploads",
+			Reason: `Column "expires_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.; Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.; Primary key column "uid" has type "varchar"`,
+		}},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "⛔ 3 Unsafe Changes Detected")
+	assert.Contains(t, rendered, "- `uploads`:\n")
+	assert.Contains(t, rendered, "  - Column `expires_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
+	assert.Contains(t, rendered, "  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
+	assert.Contains(t, rendered, "  - Primary key column `uid` has type `varchar`\n")
+	assert.NotContains(t, rendered, "instead.; ")
+}
+
+// The plan comment's unsafe-issues section renders the same engine-joined
+// reasons, so it splits them the same way and counts individual violations
+// in its header.
+func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `orders` DROP COLUMN `legacy`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{
+				Table:  "orders",
+				Reason: `[ERROR] unsafe: DROP COLUMN removes data; [ERROR] has_timestamp: Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`,
+			},
+			{Table: "users", Reason: "DROP TABLE removes all data"},
+		},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "**3** unsafe changes detected")
+	assert.Contains(t, rendered, "- `orders`:\n")
+	assert.Contains(t, rendered, "  - DROP COLUMN removes data\n")
+	assert.Contains(t, rendered, "  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
+	assert.Contains(t, rendered, "- `users`: DROP TABLE removes all data\n")
+	assert.NotContains(t, rendered, "data; ")
+}
+
 func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:     "testdb",

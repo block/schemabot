@@ -1080,9 +1080,11 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 ---
 
-**⛔ 2 Unsafe Changes Detected:**
-- `orders`: Primary key column "id" has type "int"
-- `users`: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+**⛔ 3 Unsafe Changes Detected:**
+- `orders`:
+  - Primary key column `id` has type `int`
+  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
