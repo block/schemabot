@@ -10,10 +10,9 @@ import (
 
 // A copy the apply will throw away is disclosed as a warning that leads with
 // what applying costs — how long the copy has been running — then names the
-// tables, the namespace, and why it cannot be resumed. The section also renders
-// on the locked apply comment, because confirming against that comment is what
-// destroys the copy.
-func TestRenderPlanComment_DiscardedCopyShownOnPlanAndApply(t *testing.T) {
+// tables, the namespace, why it cannot be resumed, and the remedy. This is the
+// rendering that reaches an operator who still has the decision.
+func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
 		Changes: []KeyspaceChangeData{{
@@ -33,10 +32,42 @@ func TestRenderPlanComment_DiscardedCopyShownOnPlanAndApply(t *testing.T) {
 	assert.Contains(t, plan, "the 3h 12m already spent is lost and cannot be recovered")
 	assert.Contains(t, plan, "apply the same schema change that started it")
 
+	// A locked apply that stopped for confirmation is the same situation: the
+	// copy is still there and confirming is what destroys it, so the warning
+	// and its remedy belong on the comment the confirmation acts on.
 	data.IsLocked = true
-	apply := RenderPlanComment(data)
-	assert.Contains(t, apply, "⚠️ **Applying destroys work in progress**",
-		"the locked apply comment keeps the disclosure the confirmation acts on")
+	data.AutoConfirmDowngradeReason = "Applying discards work in progress on the target"
+	paused := RenderPlanComment(data)
+	assert.Contains(t, paused, "⚠️ **Applying destroys work in progress**")
+	assert.Contains(t, paused, "apply the same schema change that started it")
+}
+
+// An apply that is already running has nothing to ask and no remedy to offer:
+// the copy is destroyed as the comment is posted. So the section becomes a
+// record of what the apply threw away rather than a warning, and it does not
+// coach a recovery that is already out of reach.
+func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
+		LockOwner: "block/schemabot#42",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+		DiscardedCopies: []ExistingCopyData{
+			{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
+		},
+	})
+
+	assert.Contains(t, out, "**Applying automatically**",
+		"the fixture is the automatic path, which is what makes the section a record")
+	assert.Contains(t, out, "ℹ️ **Discarding work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
+	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it")
+	assert.Contains(t, out, "the 3h 12m already spent is gone")
+	assert.NotContains(t, out, "⚠️ **Applying destroys work in progress**",
+		"there is no decision left to warn about")
+	assert.NotContains(t, out, "apply the same schema change that started it",
+		"the remedy is out of reach once the copy is being destroyed")
 }
 
 // A copy the apply will resume is disclosed as a continuation rather than a

@@ -162,10 +162,42 @@ func PreviewCommentPlanDirect() string {
 	})
 }
 
-// PreviewCommentPlanCopyDiscarded renders a sample locked apply-confirmation
-// comment for a plan whose apply will throw away an unfinished copy already on
-// the target, showing what the operator is consenting to lose by confirming.
+// PreviewCommentPlanCopyDiscarded renders a sample plan comment for a plan
+// whose apply will throw away an unfinished copy already on the target, showing
+// what the operator would lose by applying while that decision is still theirs.
 func PreviewCommentPlanCopyDiscarded() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on the
+// comment of an apply that is already running. Nothing is being asked of the
+// reader and the copy is already gone, so the section is a record of what the
+// apply threw away rather than a warning with a remedy.
+func PreviewCommentPlanCopyDiscardedApplying() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
 		SchemaName:   "testapp",

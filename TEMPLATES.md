@@ -278,6 +278,37 @@ schemabot apply -e staging
 <summary><a name="mysql-plan-existing-copy-discarded"></a><strong>MySQL Plan (Existing Copy Discarded)</strong></summary>
 
 
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying
+- `orders` in `testapp`: the schema change differs from the one that started it
+
+Applying copies each of these tables again from the start; the 3h 12m already spent is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-applying"></a><strong>MySQL Plan (Existing Copy Discarded, Applying)</strong></summary>
+
+
 ## Schema Change Apply — Staging
 
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
@@ -290,10 +321,10 @@ schemabot apply -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying
+ℹ️ **Discarding work in progress**: **1** unfinished copy on the target, 3h 12m of copying
 - `orders` in `testapp`: the schema change differs from the one that started it
 
-Applying copies each of these tables again from the start; the 3h 12m already spent is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
+This apply copies each of these tables again from the start; the 3h 12m already spent is gone.
 
 📋 **Plan**: **1** table to alter
 

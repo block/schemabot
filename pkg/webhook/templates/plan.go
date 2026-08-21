@@ -169,6 +169,17 @@ type DeploymentDriftEntry struct {
 	Detail string
 }
 
+// applyingWithoutConfirmation reports whether this comment announces an apply
+// that is already running rather than one waiting on the operator: a locked
+// comment with nothing pausing it. Nothing on such a comment is a question, so
+// the disclosures above the footer state what the apply is doing instead of
+// warning about what confirming would cost, and never offer a remedy that is
+// already out of reach. The footer reads the same predicate, so the two cannot
+// disagree about whether the reader still has a decision to make.
+func (d PlanCommentData) applyingWithoutConfirmation() bool {
+	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
+}
+
 // KeyspaceChangeData contains changes for a single keyspace/schema.
 type KeyspaceChangeData struct {
 	Keyspace       string
@@ -274,7 +285,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	// read from the target at plan time, so it can appear on the apply comment
 	// without having been on the plan comment that preceded it.
 	if len(data.DiscardedCopies) > 0 {
-		writeDiscardedCopies(&sb, data.DiscardedCopies)
+		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
 	}
 	if len(data.AdoptedCopies) > 0 {
 		writeAdoptedCopies(&sb, data.AdoptedCopies)
@@ -323,7 +334,7 @@ func RenderPlanComment(data PlanCommentData) string {
 			applyConfirmCmd += " --skip-revert"
 		}
 
-		if data.AutoConfirmDowngradeReason != "" {
+		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
 			fmt.Fprintf(&sb, "⚠️ **Automatic apply paused**: %s\n\n", data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
@@ -1380,7 +1391,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	// Copies already on the target — read per environment, since each
 	// environment has its own target.
 	if len(plan.DiscardedCopies) > 0 {
-		writeDiscardedCopies(sb, plan.DiscardedCopies)
+		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
 	}
 	if len(plan.AdoptedCopies) > 0 {
 		writeAdoptedCopies(sb, plan.AdoptedCopies)

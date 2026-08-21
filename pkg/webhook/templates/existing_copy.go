@@ -24,17 +24,28 @@ type ExistingCopyData struct {
 }
 
 // writeDiscardedCopies writes the section for unfinished copies the apply
-// throws away. This is the disclosure the operator most needs before
-// confirming: the work already done on the target is lost and every table in
+// throws away. The work already done on the target is lost and every table in
 // the copy is read again from the start, which on a large table is hours.
 //
 // How long the copy has been running is what makes an operator stop, so it
 // leads the section rather than sitting in a parenthetical below the headline.
-func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData) {
+//
+// alreadyApplying selects between the two things this section can be. While the
+// operator still has a decision, it is a warning about what confirming costs,
+// and it names the remedy. On a comment announcing an apply that is already
+// running, there is nothing to warn about and no remedy left: the copy is
+// destroyed as that comment is posted, so the section is a record of what went
+// with it.
+func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
 	headlineAge := soleCopyAge(copies)
-	fmt.Fprintf(sb, "⚠️ **Applying destroys work in progress**: **%d** unfinished %s on the target",
-		n, copyNoun(n))
+	if alreadyApplying {
+		fmt.Fprintf(sb, "ℹ️ **Discarding work in progress**: **%d** unfinished %s on the target",
+			n, copyNoun(n))
+	} else {
+		fmt.Fprintf(sb, "⚠️ **Applying destroys work in progress**: **%d** unfinished %s on the target",
+			n, copyNoun(n))
+	}
 	if headlineAge != "" {
 		fmt.Fprintf(sb, ", %s of copying", headlineAge)
 	}
@@ -43,6 +54,10 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData) {
 	lost := "the work already done"
 	if headlineAge != "" {
 		lost = "the " + headlineAge + " already spent"
+	}
+	if alreadyApplying {
+		fmt.Fprintf(sb, "\nThis apply copies each of these tables again from the start; %s is gone.\n\n", lost)
+		return
 	}
 	fmt.Fprintf(sb, "\nApplying copies each of these tables again from the start; %s is lost and cannot be recovered. "+
 		"To continue the existing copy instead, apply the same schema change that started it.\n\n", lost)

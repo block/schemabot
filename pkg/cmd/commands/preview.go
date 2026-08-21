@@ -74,7 +74,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
 		templates.PreviewCommentPlanDirect,
-		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyAdopted,
+		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
+		templates.PreviewCommentPlanCopyAdopted,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
