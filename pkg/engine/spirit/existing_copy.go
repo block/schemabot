@@ -28,6 +28,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
@@ -106,6 +107,88 @@ func (c *existingCopy) Disposition(statement string, maxAge time.Duration) (engi
 		return engine.CopyDiscard, engine.DiscardCheckpointExpired
 	}
 	return engine.CopyAdopt, ""
+}
+
+// planned converts the copy into the engine-agnostic disclosure a plan carries
+// to the surfaces that render it, as the one-element list a single-database
+// engine can produce. It returns nothing when applying statement destroys
+// nothing, so a plan meeting a clean target carries no disclosure.
+func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration) []*engine.ExistingCopy {
+	disposition, reason := c.Disposition(statement, maxAge)
+	if disposition == engine.CopyNone {
+		return nil
+	}
+	return []*engine.ExistingCopy{{
+		Namespace:   namespace,
+		Disposition: disposition,
+		Reason:      reason,
+		Tables:      c.CopiedTables,
+		Age:         c.Age,
+	}}
+}
+
+// plannedExistingCopies predicts what applying these planned changes will do
+// with a row copy already on the target, for the plan to disclose before anyone
+// confirms it. Spirit plans one database at a time, so this reports at most one
+// copy; a caller planning several databases concatenates their results.
+//
+// A plan is a read: it must describe the target, never fail because of it. A
+// target that cannot be read is logged and the plan carries no disclosure,
+// which leaves the plan exactly as it is without this check.
+//
+// Two things keep this a prediction rather than a fact, and both fail quiet
+// rather than wrong. The target may be unreadable, as above. And the batch is
+// the one this plan expects: routing runs again at apply time against the
+// target as it is then, so a statement this plan reads as directly executable —
+// or as refused outright — can reach Spirit after all, in a batch that no
+// longer matches the one predicted here. The prediction runs again at apply
+// time against the routing the apply actually took, and Spirit decides for
+// itself regardless, so a plan that discloses nothing is never the last word on
+// whether a copy survives.
+func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB, database string, changes []engine.TableChange) []*engine.ExistingCopy {
+	batch, tables, ok := plannedSpiritBatch(changes)
+	if !ok {
+		e.logger.Debug("plan has no statements that reach the engine's copy path, so no existing copy is at stake",
+			"database", database)
+		return nil
+	}
+
+	found, err := findExistingCopy(ctx, target, tables)
+	if err != nil {
+		// The raw error carries target infrastructure detail and a plan is
+		// rendered into a PR comment, so it stays in the logs.
+		e.logger.Warn("cannot tell whether applying this plan continues or discards an existing copy; the plan discloses nothing",
+			"database", database, "tables", tables, "error", err)
+		return nil
+	}
+	return found.planned(database, batch, e.checkpointMaxAge)
+}
+
+// plannedSpiritBatch returns the ALTER batch the apply will hand Spirit for
+// these planned changes and the tables it covers, in plan order. It reports
+// ok=false when the plan reaches no copy at all, either because it has no
+// engine-run ALTER or because it carries a statement the engine refuses and the
+// database's policy will not route directly — that apply fails during routing,
+// before Spirit sees a checkpoint, so nothing on the target is at stake.
+func plannedSpiritBatch(changes []engine.TableChange) (string, []string, bool) {
+	var alters, tables []string
+	for _, change := range changes {
+		if change.Operation != ddl.StatementAlterTable {
+			continue
+		}
+		switch change.ExecutionMode {
+		case engine.ExecutionModeBlocked:
+			return "", nil, false
+		case engine.ExecutionModeDirect:
+			continue
+		}
+		alters = append(alters, change.DDL)
+		tables = append(tables, change.Table)
+	}
+	if len(alters) == 0 {
+		return "", nil, false
+	}
+	return strings.Join(alters, "; "), tables, true
 }
 
 // reportExistingCopy records what this batch is about to do with a row copy
