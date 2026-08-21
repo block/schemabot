@@ -1381,7 +1381,10 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 //
 // Returns true when this driver spent its tick here, including on failure, so a
 // repair that could not complete is retried rather than falling through to
-// claim new work behind a target that is still blocked.
+// claim new work behind a target that is still blocked. Returns false when the
+// claimed apply turned out to be a manifest-held deployment-keyed rollout —
+// nothing needs repair there, so the tick falls through to claim operation
+// work instead.
 func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForOperationProjection(ctx, owner)
 	if err != nil {
@@ -1416,6 +1419,19 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 			append(apply.LogAttrs(),
 				"driver", driverID, "error", err)...)
 		return true
+	}
+	if !result.Swapped && result.ManifestHeld {
+		// A deployment-keyed apply whose attached operations have all settled
+		// matches the claim predicate while its generation manifest still
+		// expects siblings. That is a healthy rollout awaiting dispatches, not
+		// a stranded parent: the derive held it open, the claim refreshed the
+		// heartbeat so it is not reconsidered until the staleness window
+		// elapses again, and this driver's tick moves on to claim real
+		// operation work — including the very dispatches the manifest waits for.
+		s.logger.Info("operator: claimed apply is a deployment-keyed rollout whose generation manifest still expects operations that have not attached; it stays open for the declared dispatches and needs no repair",
+			append(apply.LogAttrs(),
+				"driver", driverID, "operation_count", result.OperationCount)...)
+		return false
 	}
 	if !result.Swapped {
 		// The claim refreshed the heartbeat, so this apply is not reconsidered
@@ -2283,6 +2299,12 @@ type applyProjectionResult struct {
 	// observer) from an aggregate multi-operation apply (count > 1, whose summary
 	// is published once by the CAS winner) without re-listing operations.
 	OperationCount int
+	// ManifestHeld is true when the attached operations derived a
+	// whole-generation verdict that the generation manifest gated back to
+	// running because declared operations have not attached yet. The apply is
+	// a healthy deployment-keyed rollout awaiting its remaining dispatches,
+	// not a stranded parent.
+	ManifestHeld bool
 }
 
 // anyPauseOnFailure reports whether any operation uses the on_failure=pause
@@ -2292,6 +2314,18 @@ func anyPauseOnFailure(ops []*storage.ApplyOperation) bool {
 	return slices.ContainsFunc(ops, func(op *storage.ApplyOperation) bool {
 		return op.OnFailure == storage.OnFailurePause
 	})
+}
+
+// projectionOwnsActiveAppliesGauge reports whether the winning projection owns
+// adjusting the active-applies gauge for this apply. Drives that run under the
+// operation lease only — a multi-operation rollout, or a deployment-keyed
+// apply whose generation manifest still expects unattached operations —
+// suppress the parent-level gauge in their own drive, so the projection that
+// wins the parent transition is the single point that must adjust it. A legacy
+// single-operation apply drives under the parent lease and releases the gauge
+// in its direct drive, so its projection leaves the gauge alone.
+func projectionOwnsActiveAppliesGauge(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	return len(ops) > 1 || len(apply.MissingExpectedOperationKeys(ops)) > 0
 }
 
 // manifestGatedVerdict reports whether a derived apply state asserts a
@@ -2381,9 +2415,11 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// the work the dispatcher declared is still on its way, and terminalizing
 	// early would make later dispatches refuse to attach, silently diverging
 	// the declared shards from the recorded outcome.
+	manifestHeld := false
 	if manifestGatedVerdict(derived) {
 		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
 			derived = state.Apply.Running
+			manifestHeld = true
 			s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",
 				append(apply.LogAttrs(),
 					"driver", driverID,
@@ -2425,7 +2461,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops)}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld}, nil
 	}
 
 	var completedAt *time.Time
@@ -2466,7 +2502,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Info("operator: derived apply state write lost a race; skipping",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops)}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		append(apply.LogAttrs(),
@@ -2496,15 +2532,16 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		}, "how the derived apply state was reached", append(apply.LogAttrs(), "driver", driverID)...)
 	}
 
-	// Own the active-apply gauge for multi-operation applies. The enqueue-time
-	// increment is keyed to the parent's primary deployment, and operation-scoped
-	// drives suppress the parent-level metric, so the projection that wins the
-	// parent transition is the single point that must release it: -1 when the
-	// rollout first reaches a terminal state, and +1 if a continuable failure
-	// reopens the parent to keep it running, so the gauge tracks whether the
-	// apply is still in flight. Single-operation applies keep decrementing in
-	// their direct drive and are left untouched here.
-	if len(ops) > 1 {
+	// Own the active-apply gauge when the apply's drives suppressed it. The
+	// enqueue-time increment is keyed to the parent's primary deployment, and
+	// operation-lease-only drives suppress the parent-level metric, so the
+	// projection that wins the parent transition is the single point that must
+	// release it: -1 when the rollout first reaches a terminal state, and +1
+	// if a continuable failure reopens the parent to keep it running, so the
+	// gauge tracks whether the apply is still in flight. A legacy
+	// single-operation apply keeps decrementing in its direct parent-lease
+	// drive and is left untouched here.
+	if projectionOwnsActiveAppliesGauge(apply, ops) {
 		switch {
 		case !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived):
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
@@ -2519,6 +2556,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		DerivedState:   derived,
 		BecameTerminal: !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
 		OperationCount: len(ops),
+		ManifestHeld:   manifestHeld,
 	}, nil
 }
 

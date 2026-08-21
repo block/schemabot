@@ -22,9 +22,7 @@ import (
 // operation lease, the projection holds the parent apply open after that
 // operation completes, a late sibling dispatch still attaches, and the apply
 // reaches its whole-generation verdict only once every declared key has
-// attached and finished. Without the manifest-aware mode decision the first
-// drive would terminalize the parent and every later dispatch would be refused
-// against the terminal apply.
+// attached and finished.
 func TestOperatorManifestKeyedApplyWaitsForLateSiblings(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -44,8 +42,13 @@ func TestOperatorManifestKeyedApplyWaitsForLateSiblings(t *testing.T) {
 	seed := seedKeyedManifestApply(t, ctx, stor, deployment, keyUsers, []string{keyUsers, keyOrders})
 
 	rec := &driveRecorder{}
+	// Each drive also probes that a direct parent applies write fails closed:
+	// on a manifest-carrying apply the parent row is owned solely by the
+	// projection CAS, so a drive holding only an operation lease must be
+	// refused — a successful write here would terminalize the parent and make
+	// the late sibling dispatch unattachable.
 	svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
-		deployment: {taskState: state.Task.Completed},
+		deployment: {taskState: state.Task.Completed, probeParentWrite: true},
 	}))
 
 	// Drive the lone attached operation to completion. The manifest still
@@ -86,6 +89,13 @@ func TestOperatorManifestKeyedApplyWaitsForLateSiblings(t *testing.T) {
 	for _, op := range ops {
 		assert.Equal(t, state.ApplyOperation.Completed, op.State,
 			"operation %s must be completed", op.OperationKey)
+	}
+
+	parentWriteErrs := rec.parentWriteErrors()
+	require.Len(t, parentWriteErrs, 2, "both drives must have probed the parent write")
+	for _, err := range parentWriteErrs {
+		assert.ErrorIs(t, err, storage.ErrApplyLeaseLost,
+			"a manifest-carrying apply's drives hold only operation leases, so a direct parent applies write must be refused")
 	}
 }
 
