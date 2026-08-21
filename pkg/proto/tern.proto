@@ -510,6 +510,11 @@ message ExistingCopy {
   // How long ago the engine last recorded progress on the work. Zero when the
   // engine has no record to resume from, which is itself a discard.
   int64 age_seconds = 5;
+  // The schema change the work was started for, verbatim as the engine
+  // recorded it. Empty when the engine has no record of it. This is what lets
+  // a surface show what a drifted schema change differs *from*, rather than
+  // only that it differs; for an adopt it repeats the plan.
+  string statement = 6;
 }
 
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing

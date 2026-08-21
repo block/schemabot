@@ -21,6 +21,12 @@ type ExistingCopyData struct {
 	// Age is how long ago the copy last made progress, already humanized.
 	// Empty for a copy with no recorded progress to date it by.
 	Age string
+	// Statement is the schema change the copy was started for. Empty when the
+	// engine has no record of it, which is itself a reason it cannot be
+	// resumed. Rendered only where it explains the cause: told the schema
+	// change differs from the one that started the copy, the next thing an
+	// operator needs is what it differs from.
+	Statement string
 }
 
 // writeDiscardedCopies writes the section for unfinished copies the apply
@@ -115,7 +121,7 @@ func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, wi
 		if withAge && c.Age != "" {
 			line += fmt.Sprintf(" (last progress %s ago)", c.Age)
 		}
-		if reason := existingCopyReason(c.Reason); reason != "" {
+		if reason := existingCopyReason(c); reason != "" {
 			line += ": " + reason
 		}
 		fmt.Fprintf(sb, "- %s\n", line)
@@ -146,17 +152,51 @@ func existingCopyTableList(tables []string) string {
 // so an unknown value means a missing translation, not a copy that discards for
 // no reason. It goes through the shared sanitizer for the same reason the table
 // names do, since this build cannot know what a future value contains.
-func existingCopyReason(reason string) string {
-	switch reason {
+func existingCopyReason(c ExistingCopyData) string {
+	switch c.Reason {
 	case "":
 		return ""
 	case engine.DiscardStatementDiffers:
-		return "the schema change differs from the one that started it"
+		// The cause is a comparison, so naming only one side of it leaves the
+		// operator to guess the other. The plan's own statements are already
+		// in the comment above; this supplies the one they are being compared
+		// against, which is also the change the closing line tells them to
+		// re-apply to keep the copy.
+		differs := "the schema change differs from the one that started it"
+		if started := existingCopyStatement(c.Statement); started != "" {
+			return differs + ", " + started
+		}
+		return differs
 	case engine.DiscardCheckpointExpired:
 		return "it is too old to resume"
 	case engine.DiscardCopyIncomplete:
 		return "it covers only some of the tables this schema change alters"
 	default:
-		return markdownInlineCode(reason)
+		return markdownInlineCode(c.Reason)
 	}
+}
+
+// maxExistingCopyStatementLen clamps the statement a copy was started for by
+// rune count. A disclosure entry has to stay scannable next to the others in
+// its section, and the statement is read off a live target, so its length is
+// not this build's to assume.
+const maxExistingCopyStatementLen = 200
+
+// existingCopyStatement renders the schema change a copy was started for as a
+// single-line inline code span, introduced so the entry reads as a sentence.
+//
+// The statement comes off a live target, so it is stripped of control text and
+// clamped before it is wrapped: an entry in this section has to survive a value
+// that is long, multi-line, or hostile. The shared inline-code helper drops the
+// backticks around identifiers, which costs nothing here because the statement
+// is being shown for comparison rather than to be copied.
+func existingCopyStatement(statement string) string {
+	s := strings.Join(strings.Fields(stripControlText(statement)), " ")
+	if s == "" {
+		return ""
+	}
+	if runes := []rune(s); len(runes) > maxExistingCopyStatementLen {
+		s = string(runes[:maxExistingCopyStatementLen-1]) + "…"
+	}
+	return "which was " + markdownInlineCode(s)
 }

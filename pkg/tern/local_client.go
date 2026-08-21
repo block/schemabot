@@ -1585,6 +1585,7 @@ func protoExistingCopies(result *engine.PlanResult) []*ternv1.ExistingCopy {
 			Reason:      c.Reason,
 			Tables:      c.Tables,
 			AgeSeconds:  int64(c.Age.Seconds()),
+			Statement:   c.Statement,
 		}
 	}
 	return copies

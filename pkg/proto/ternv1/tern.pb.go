@@ -1459,7 +1459,12 @@ type ExistingCopy struct {
 	Tables []string `protobuf:"bytes,4,rep,name=tables,proto3" json:"tables,omitempty"`
 	// How long ago the engine last recorded progress on the work. Zero when the
 	// engine has no record to resume from, which is itself a discard.
-	AgeSeconds    int64 `protobuf:"varint,5,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
+	AgeSeconds int64 `protobuf:"varint,5,opt,name=age_seconds,json=ageSeconds,proto3" json:"age_seconds,omitempty"`
+	// The schema change the work was started for, verbatim as the engine
+	// recorded it. Empty when the engine has no record of it. This is what lets
+	// a surface show what a drifted schema change differs *from*, rather than
+	// only that it differs; for an adopt it repeats the plan.
+	Statement     string `protobuf:"bytes,6,opt,name=statement,proto3" json:"statement,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1527,6 +1532,13 @@ func (x *ExistingCopy) GetAgeSeconds() int64 {
 		return x.AgeSeconds
 	}
 	return 0
+}
+
+func (x *ExistingCopy) GetStatement() string {
+	if x != nil {
+		return x.Statement
+	}
+	return ""
 }
 
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing
@@ -3938,14 +3950,15 @@ const file_tern_proto_rawDesc = "" +
 	"\x06column\x18\x03 \x01(\tR\x06column\x12\x16\n" +
 	"\x06linter\x18\x04 \x01(\tR\x06linter\x12\x19\n" +
 	"\bfix_type\x18\x05 \x01(\tR\afixType\x12\x1a\n" +
-	"\bseverity\x18\x06 \x01(\tR\bseverity\"\x9f\x01\n" +
+	"\bseverity\x18\x06 \x01(\tR\bseverity\"\xbd\x01\n" +
 	"\fExistingCopy\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12 \n" +
 	"\vdisposition\x18\x02 \x01(\tR\vdisposition\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x16\n" +
 	"\x06tables\x18\x04 \x03(\tR\x06tables\x12\x1f\n" +
 	"\vage_seconds\x18\x05 \x01(\x03R\n" +
-	"ageSeconds\"o\n" +
+	"ageSeconds\x12\x1c\n" +
+	"\tstatement\x18\x06 \x01(\tR\tstatement\"o\n" +
 	"\tShardPlan\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12.\n" +

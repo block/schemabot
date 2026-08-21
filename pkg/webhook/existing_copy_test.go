@@ -21,6 +21,7 @@ func TestSplitExistingCopies(t *testing.T) {
 			Reason:      engine.DiscardStatementDiffers,
 			Tables:      []string{"orders"},
 			AgeSeconds:  11520,
+			Statement:   "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)",
 		},
 		{
 			Namespace:   "products_ks",
@@ -35,6 +36,8 @@ func TestSplitExistingCopies(t *testing.T) {
 	assert.Equal(t, []string{"orders"}, discarded[0].Tables)
 	assert.Equal(t, engine.DiscardStatementDiffers, discarded[0].Reason)
 	assert.Equal(t, "3h 12m", discarded[0].Age)
+	assert.Equal(t, "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)", discarded[0].Statement,
+		"the entry carries what the plan differs from, not just that it differs")
 
 	require.Len(t, adopted, 1)
 	assert.Equal(t, "products_ks", adopted[0].Namespace)

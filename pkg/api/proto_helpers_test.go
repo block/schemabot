@@ -349,6 +349,7 @@ func TestPlanResponseFromProto_CarriesEveryExistingCopy(t *testing.T) {
 				Reason:      "statement_differs",
 				Tables:      []string{"orders"},
 				AgeSeconds:  11520,
+				Statement:   "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)",
 			},
 			{
 				Namespace:   "products_ks",
@@ -367,6 +368,8 @@ func TestPlanResponseFromProto_CarriesEveryExistingCopy(t *testing.T) {
 	assert.Equal(t, "statement_differs", result.ExistingCopies[0].Reason)
 	assert.Equal(t, []string{"orders"}, result.ExistingCopies[0].Tables)
 	assert.Equal(t, int64(11520), result.ExistingCopies[0].AgeSeconds)
+	assert.Equal(t, "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)", result.ExistingCopies[0].Statement,
+		"the statement the copy was started for is what a discard disclosure compares the plan against")
 	assert.Equal(t, "products_ks", result.ExistingCopies[1].Namespace)
 	assert.Equal(t, "adopt", result.ExistingCopies[1].Disposition)
 }

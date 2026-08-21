@@ -188,6 +188,7 @@ func PreviewCommentPlanCopyDiscarded() string {
 				Tables:    []string{"orders"},
 				Reason:    "statement_differs",
 				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
 	})
@@ -223,6 +224,7 @@ func PreviewCommentPlanCopyDiscardedApplying() string {
 				Tables:    []string{"orders"},
 				Reason:    "statement_differs",
 				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
 	})

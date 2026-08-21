@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,13 +21,21 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
 		}},
 		DiscardedCopies: []ExistingCopyData{
-			{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    engine.DiscardStatementDiffers,
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
 		},
 	}
 
 	plan := RenderPlanComment(data)
 	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
-	assert.Contains(t, plan, "- `orders` in `testapp`: the schema change differs from the one that started it")
+	assert.Contains(t, plan, "- `orders` in `testapp`: the schema change differs from the one that started it, "+
+		"which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`",
+		"a cause that is a comparison names the side the operator cannot see from the plan above")
 	assert.NotContains(t, plan, "(last progress 3h 12m ago)",
 		"the headline already carries the age, so the entry does not repeat it")
 	assert.Contains(t, plan, "it runs as long as a first copy would; the 3h 12m already spent is lost and cannot be recovered",
@@ -102,6 +111,57 @@ func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *test
 		"identifiers and an untranslated reason render as one entry on one line")
 	assert.NotContains(t, out, "ord`ers", "a backtick in an identifier cannot end the code span early")
 	assert.NotContains(t, out, "future`reason", "a backtick in a reason cannot end the code span early")
+}
+
+// The statement a copy was started for is read off a live target, so an entry
+// has to survive one that is long or multi-line: it is folded onto one line and
+// clamped, because a disclosure entry only does its job if it stays scannable
+// next to the others in its section.
+func TestRenderPlanComment_DiscardedCopyClampsTheStartingStatement(t *testing.T) {
+	long := "ALTER TABLE `orders`\n  ADD INDEX `idx_" + strings.Repeat("x", 300) + "` (`user_id`)"
+
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"}}},
+		DiscardedCopies: []ExistingCopyData{
+			{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Statement: long},
+		},
+	})
+
+	entry := entryLine(t, out, "- `orders` in `testapp`:")
+	assert.Contains(t, entry, "which was `ALTER TABLE orders ADD INDEX idx_")
+	assert.Contains(t, entry, "…`", "an over-long statement is truncated with an ellipsis inside the code span")
+	assert.LessOrEqual(t, len([]rune(entry)), 300, "the entry stays scannable next to the others in its section")
+}
+
+// A copy the engine has no starting statement for still names the cause. The
+// clause that would explain it is omitted rather than left dangling, since
+// there is nothing to compare the plan against.
+func TestRenderPlanComment_DiscardedCopyWithoutAStartingStatement(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"}}},
+		DiscardedCopies: []ExistingCopyData{
+			{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Statement: "   "},
+		},
+	})
+
+	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it\n")
+	assert.NotContains(t, out, "which was")
+}
+
+// entryLine returns the single copy entry beginning with prefix, so an
+// assertion can hold the whole entry to itself rather than matching a substring
+// that may have wrapped onto a neighbouring line.
+func entryLine(t *testing.T, out, prefix string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	t.Fatalf("no copy entry starting with %q in:\n%s", prefix, out)
+	return ""
 }
 
 // A copy the apply will resume is disclosed as a continuation rather than a

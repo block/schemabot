@@ -256,6 +256,7 @@ func existingCopiesFromProto(copies []*ternv1.ExistingCopy) []*apitypes.Existing
 			Reason:      c.Reason,
 			Tables:      c.Tables,
 			AgeSeconds:  c.AgeSeconds,
+			Statement:   c.Statement,
 		})
 	}
 	return result

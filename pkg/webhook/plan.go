@@ -769,6 +769,7 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 			Namespace: c.Namespace,
 			Tables:    c.Tables,
 			Reason:    c.Reason,
+			Statement: c.Statement,
 		}
 		if c.AgeSeconds > 0 {
 			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)

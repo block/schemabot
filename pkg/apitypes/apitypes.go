@@ -478,6 +478,7 @@ type ExistingCopyResponse struct {
 	Reason      string   `json:"reason,omitempty"`
 	Tables      []string `json:"tables,omitempty"`
 	AgeSeconds  int64    `json:"age_seconds,omitempty"`
+	Statement   string   `json:"statement,omitempty"`
 }
 
 // ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and
