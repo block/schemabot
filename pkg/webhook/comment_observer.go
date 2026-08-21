@@ -55,6 +55,15 @@ type CommentObserver struct {
 	// apply-lease checks and lease-scoped storage writes accordingly.
 	aggregateTerminalCASWinner bool
 
+	// authorityOwner identifies this process to the durable progress-comment
+	// authority claim (see ClaimProgressCommentAuthority). It is
+	// process-scoped, not observer-instance-scoped, so a replacement observer
+	// in the same process (e.g. after a re-registration) takes the authority
+	// over immediately instead of waiting out its predecessor's staleness
+	// window, while observers on other pods still hand over only through the
+	// claim.
+	authorityOwner string
+
 	mu                sync.Mutex
 	lastProgressPost  time.Time
 	lastState         string
@@ -218,6 +227,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
+		authorityOwner: storage.LeaseOwnerProcess() + "/comment-observer",
 	}
 }
 
@@ -725,9 +735,11 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 		lease = apply.Lease()
 	}
 	if !lease.Valid() {
-		o.logError(apply, "observer: apply lease unavailable; skipping GitHub side effect",
-			"operation", operation)
-		return false
+		// No parent apply lease exists anywhere — not on this observer and not
+		// on the apply row. For an apply whose work runs under operation
+		// leases, that is the normal shape between dispatch waves, so the
+		// durable progress-comment authority decides instead of the lease.
+		return o.progressCommentAuthorityOwnsObserver(apply, operation)
 	}
 
 	// GitHub comments and check updates are side effects outside MySQL's
@@ -737,6 +749,14 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {
+		if apply != nil && !apply.Lease().Valid() {
+			// This observer's construction-time lease no longer matches, and
+			// the apply row records no parent lease at all — the lease was
+			// released back (an operation-scoped drive holds the parent only
+			// transiently per dispatch wave), not claimed by a newer owner.
+			// The durable progress-comment authority decides instead.
+			return o.progressCommentAuthorityOwnsObserver(apply, operation)
+		}
 		o.logError(apply, "observer: apply lease no longer owns apply; skipping GitHub side effect",
 			"operation", operation,
 			"lease_owner", lease.Owner,
@@ -746,6 +766,85 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	return true
 }
 
+// progressCommentAuthorityOwnsObserver reports whether this observer may
+// perform a GitHub side effect for an apply whose parent apply lease is
+// legitimately unheld. An apply whose operations are dispatched under
+// operation leases holds the parent lease only transiently per dispatch wave,
+// so the progress comment would otherwise go silent for the whole rollout and
+// operators would read a live apply as dead. The authority granted here is
+// durable and cross-pod safe: a compare-and-swap ownership recorded on the
+// tracked progress comment row (see ClaimProgressCommentAuthority), renewed on
+// every admitted side effect, so exactly one observer at a time edits the
+// comment and a crashed holder hands over only after its heartbeat goes stale.
+// It is granted only while operation-scoped work is in flight — an apply that
+// holds (or should hold) a parent lease stays governed by the lease checks.
+func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Apply, operation string) bool {
+	if apply == nil {
+		o.logError(apply, "observer: apply lease unavailable and no apply loaded to resolve progress-comment authority; skipping GitHub side effect",
+			"operation", operation)
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	inFlight, err := o.operationScopedWorkInFlight(ctx, apply)
+	if err != nil {
+		o.logger.Error("observer: failed to determine whether operation-scoped work is in flight; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "error", err)...)
+		return false
+	}
+	if !inFlight {
+		o.logger.Error("observer: apply lease unavailable and no operation-scoped work in flight; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation)...)
+		return false
+	}
+
+	held, err := o.stor.ApplyComments().ClaimProgressCommentAuthority(ctx, o.applyID, o.authorityOwner)
+	if err != nil {
+		o.logger.Error("observer: failed to claim progress-comment authority; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner, "error", err)...)
+		return false
+	}
+	if !held {
+		// Another observer holds a fresh authority (or no tracked progress
+		// comment row exists yet to claim) — that observer's edits carry the
+		// PR, so this one skips. Expected on every peer pod polling the same
+		// apply, hence Info.
+		o.logger.Info("observer: progress-comment authority held by another observer; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner)...)
+		return false
+	}
+	return true
+}
+
+// operationScopedWorkInFlight reports whether the apply's schema-change work
+// is still in flight under operation-scoped dispatch — the one shape whose
+// parent apply lease is legitimately unheld mid-apply. True when the apply is
+// non-terminal and either its generation manifest still lists keys with no
+// attached operation (the dispatcher owes more dispatch waves) or an attached
+// operation-keyed row has not reached a terminal state. Whole-deployment
+// operations (empty key) are deliberately not counted: their drives hold the
+// parent apply lease, so for them an unheld lease means no driver, and the
+// lease checks stay authoritative.
+func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply *storage.Apply) (bool, error) {
+	if state.IsTerminalApplyState(apply.State) {
+		return false, nil
+	}
+	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	if err != nil {
+		return false, fmt.Errorf("load apply operations for progress-comment authority of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(apply.MissingExpectedOperationKeys(ops)) > 0 {
+		return true, nil
+	}
+	for _, op := range ops {
+		if op.OperationKey != "" && !state.IsTerminalApplyState(op.State) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
 	// The aggregate terminal observer holds the operation lease, not the parent
 	// apply lease. Attaching an apply lease it does not hold would make every
@@ -753,6 +852,13 @@ func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *stor
 	// these writes take storage's no-apply-lease path; the won projection CAS,
 	// not an apply lease, authorizes this one terminal publish.
 	if o.aggregateTerminalCASWinner {
+		return ctx
+	}
+	// An apply row that records no parent lease has no lease to attach: the
+	// side-effect gate admitted this write under the progress-comment
+	// authority, so it takes storage's no-apply-lease path — the claim, not an
+	// apply lease, authorizes it, mirroring the aggregate CAS winner above.
+	if apply != nil && !apply.Lease().Valid() {
 		return ctx
 	}
 	// Storage writes that record GitHub side effects must use the same lease as

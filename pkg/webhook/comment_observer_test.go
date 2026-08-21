@@ -331,6 +331,72 @@ func TestAggregateTerminalObserverBypassesApplyLeaseCheck(t *testing.T) {
 	assert.False(t, hasLease, "aggregate terminal observer must not attach an apply lease to storage writes")
 }
 
+// The progress-comment authority exists only for applies whose work runs under
+// operation leases while the parent apply lease is legitimately unheld. This
+// pins the shape gate: operation-keyed work still in flight (attached and
+// non-terminal, or promised by the generation manifest) qualifies; terminal
+// applies, settled keyed work, and whole-deployment operations — whose drives
+// hold the parent lease, so an unheld lease there means no driver — do not.
+func TestOperationScopedWorkInFlight(t *testing.T) {
+	runningApply := &storage.Apply{ApplyIdentifier: "apply-1", State: state.Apply.Running}
+
+	t.Run("terminal apply has no in-flight work", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), &storage.Apply{ApplyIdentifier: "apply-1", State: state.Apply.Completed})
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("non-terminal operation-keyed row is in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "primary", OperationKey: "orders/80-", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.True(t, inFlight)
+	})
+
+	t.Run("settled keyed work is not in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("whole-deployment operations are governed by the parent lease", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", State: state.ApplyOperation.Running},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.NoError(t, err)
+		assert.False(t, inFlight)
+	})
+
+	t.Run("manifest keys with no attached operation are in flight", func(t *testing.T) {
+		manifestApply := &storage.Apply{
+			ApplyIdentifier:       "apply-1",
+			State:                 state.Apply.Running,
+			ExpectedOperationKeys: []string{"orders/-80", "orders/80-"},
+		}
+		o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "primary", OperationKey: "orders/-80", State: state.ApplyOperation.Completed},
+		}})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), manifestApply)
+		require.NoError(t, err)
+		assert.True(t, inFlight)
+	})
+
+	t.Run("an operation-load failure is surfaced, never treated as in flight", func(t *testing.T) {
+		o := newDispatchTestObserver(&stubApplyOperationStore{err: errors.New("db unavailable")})
+		inFlight, err := o.operationScopedWorkInFlight(t.Context(), runningApply)
+		require.Error(t, err)
+		assert.False(t, inFlight)
+	})
+}
+
 // A per-driver observer for a multi-operation apply must not publish a separate
 // apply-level summary comment: it holds only one operation's task slice, so
 // publishing here would post a duplicate, partial summary. The aggregate

@@ -322,6 +322,54 @@ func (s *applyCommentStore) ReclaimStaleSummaryClaim(ctx context.Context, applyI
 	return rows == 1, nil
 }
 
+// ClaimProgressCommentAuthority claims — or renews for its current holder —
+// the durable authority to edit an apply's tracked progress comment while the
+// parent apply lease is legitimately unheld. It is a single conditional update
+// on the tracked progress comment row, so concurrent claimants race on the row
+// lock and exactly one sees the affected row: the update lands when the row
+// records no observer, when the caller already holds the authority (a
+// renewal, which also refreshes the heartbeat), or when the recorded holder's
+// heartbeat is older than storage.ProgressCommentAuthorityStaleAfter (a
+// crashed holder being taken over). Zero affected rows means another observer
+// holds a fresh authority or no tracked progress comment row exists — either
+// way the caller must skip its GitHub side effect. Deliberately
+// lease-agnostic, mirroring ClaimSummaryComment: the claim is the authority.
+func (s *applyCommentStore) ClaimProgressCommentAuthority(ctx context.Context, applyID int64, owner string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET observer_owner = ?, observer_heartbeat_at = NOW(), updated_at = NOW()
+		WHERE apply_id = ? AND comment_state = ?
+		  AND (observer_owner IS NULL
+		       OR observer_owner = ?
+		       OR observer_heartbeat_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
+	`, owner, applyID, state.Comment.Progress, owner, int64(storage.ProgressCommentAuthorityStaleAfter.Seconds()))
+	if err != nil {
+		return false, fmt.Errorf("claim progress-comment authority for apply %d owner %s: %w", applyID, owner, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read progress-comment authority claim rows affected for apply %d owner %s: %w", applyID, owner, err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+	// MySQL reports rows changed, not rows matched: a holder renewing inside
+	// the heartbeat column's timestamp granularity writes identical values and
+	// reports zero rows. Distinguish that held-by-the-caller no-op from a lost
+	// or unclaimable authority by re-reading the recorded owner.
+	var current sql.NullString
+	err = s.db.QueryRowContext(ctx, `
+		SELECT observer_owner FROM apply_comments WHERE apply_id = ? AND comment_state = ?
+	`, applyID, state.Comment.Progress).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify progress-comment authority for apply %d owner %s: %w", applyID, owner, err)
+	}
+	return current.Valid && current.String == owner, nil
+}
+
 // ReleaseSummaryClaim deletes the summary claim sentinel for an apply so a
 // later publisher can retry without waiting out the stale-claim window. Only
 // the sentinel form (github_comment_id = 0) is deleted — a marker that already

@@ -66,6 +66,98 @@ func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
 	assert.False(t, reclaimed, "a posted summary must never be reclaimed")
 }
 
+// TestApplyCommentStore_ReleaseSummaryClaim verifies release deletes only the
+// sentinel form of the summary marker: a released claim can be re-won, a
+// missing marker releases without error, and a marker recording a real posted
+// comment survives release untouched.
+func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_comment_release", 1)
+
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID), "releasing a missing claim is not an error")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, won, "a released claim must be re-winnable")
+
+	// Convert the claim to a posted summary; release must not delete it.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
+	posted, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, posted, "a recorded posted summary must survive release")
+	assert.Equal(t, int64(9001), posted.GitHubCommentID)
+}
+
+// TestApplyCommentStore_ClaimProgressCommentAuthority verifies the durable
+// progress-comment edit authority for applies whose parent lease is unheld
+// mid-apply: the first observer to claim the tracked progress comment row
+// wins, renews freely, and excludes every other owner until its heartbeat goes
+// stale, at which point exactly one successor takes the authority over. An
+// apply with no tracked progress comment row has nothing to claim.
+func TestApplyCommentStore_ClaimProgressCommentAuthority(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_comment_authority", 1)
+
+	held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+	require.NoError(t, err)
+	assert.False(t, held, "no tracked progress comment row means nothing to claim")
+
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 555,
+	}))
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+	require.NoError(t, err)
+	assert.True(t, held, "first claim on an unowned progress comment must win")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+	require.NoError(t, err)
+	assert.True(t, held, "the holder renews its own authority")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+	require.NoError(t, err)
+	assert.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
+
+	// A crashed holder hands over only after its heartbeat goes stale, and
+	// exactly one successor wins the handover.
+	backdateProgressObserverHeartbeat(t, apply.ID)
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+	require.NoError(t, err)
+	assert.True(t, held, "a stale authority transfers to the next claimant")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-c/3/comment-observer")
+	require.NoError(t, err)
+	assert.False(t, held, "a just-transferred authority is fresh again; a third owner loses")
+}
+
+// backdateProgressObserverHeartbeat pushes an apply's progress-comment
+// authority heartbeat past the stale window, simulating an observer that
+// stopped renewing (crashed pod or cleared observer).
+func backdateProgressObserverHeartbeat(t *testing.T, applyID int64) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE apply_comments SET observer_heartbeat_at = NOW() - INTERVAL ? SECOND
+		WHERE apply_id = ? AND comment_state = ?
+	`, int64(storage.ProgressCommentAuthorityStaleAfter.Seconds())+1, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+}
+
 // backdateSummaryClaim pushes an apply's summary marker updated_at past the
 // stale-claim window, simulating a publisher that crashed after claiming.
 func backdateSummaryClaim(t *testing.T, applyID int64) {
