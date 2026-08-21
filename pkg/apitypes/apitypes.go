@@ -903,6 +903,11 @@ type ProgressResponse struct {
 // ProgressOperationResponse represents progress for one deployment operation.
 type ProgressOperationResponse struct {
 	Deployment string `json:"deployment"`
+	// OperationKey disambiguates multiple execution operations in the same
+	// apply and deployment, correlating this row with the stored
+	// apply_operation and its data-plane work. Empty is the legacy
+	// single-operation key.
+	OperationKey string `json:"operation_key,omitempty"`
 	// ExternalID is the remote data plane's stable apply identifier.
 	ExternalID string `json:"external_id,omitempty"`
 	// ExternalOperationID is the remote data plane's numeric operation row ID.
