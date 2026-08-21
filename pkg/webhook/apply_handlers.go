@@ -273,10 +273,19 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// No changes (neither table DDL nor a VSchema update) — post a regular plan
-	// comment (no lock, no confirm footer)
+	// No changes (neither table DDL nor a VSchema update) — record the passing
+	// check and refresh the aggregate the same as the no-change plan path, so a
+	// stale non-success record (e.g. a target reconciled out-of-band) cannot
+	// keep the prior-environment gate blocking later environments. Then post a
+	// regular plan comment (no lock, no confirm footer).
 	if !planResp.HasChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		if headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment); checkErr != nil {
+			h.logger.Error("failed to record no-changes check for apply command",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
+		} else if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	}
