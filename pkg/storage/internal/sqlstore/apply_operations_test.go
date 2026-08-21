@@ -98,12 +98,147 @@ func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, operationID, "remote-apply-1"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, "remote-apply-1", got.ExternalID)
+}
+
+// A deployment has exactly one data-plane apply, so every sibling operation
+// of the deployment records the same remote apply id. Recording the id the
+// siblings already share succeeds, and another deployment's different id on
+// the same apply never blocks it — sibling deployments own their own remote
+// applies.
+func TestApplyOperationStore_SaveExternalIDSharesDeploymentRemoteApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_save_external_shared", 1)
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "ns/-80/users", Target: "payments", ExternalID: "remote-apply-a",
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OperationKey: "ns/-80/users", Target: "payments", ExternalID: "remote-apply-b",
+	})
+	require.NoError(t, err)
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "ns/80-/users", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a"))
+
+	got, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "remote-apply-a", got.ExternalID)
+}
+
+// Recording a remote apply id that disagrees with the one a sibling operation
+// of the same deployment already holds is refused inside the writing
+// transaction, so the deployment can never end up correlated to two remote
+// applies — even when the conflicting sibling persisted concurrently. A
+// sibling id living only in the legacy engine resume context carrier pins the
+// deployment the same way.
+func TestApplyOperationStore_SaveExternalIDRefusesDeploymentConflict(t *testing.T) {
+	cases := []struct {
+		name    string
+		sibling storage.ApplyOperation
+	}{
+		{"sibling id on external_id", storage.ApplyOperation{Deployment: "region-a", OperationKey: "ns/-80/users", Target: "payments", ExternalID: "remote-apply-a"}},
+		{"sibling id on legacy resume context carrier", storage.ApplyOperation{Deployment: "region-a", OperationKey: "ns/-80/users", Target: "payments", EngineResumeContext: "remote-apply-a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_save_external_conflict", 1)
+
+			sibling := tc.sibling
+			sibling.ApplyID = apply.ID
+			_, err := store.ApplyOperations().Insert(ctx, &sibling)
+			require.NoError(t, err)
+			operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", OperationKey: "ns/80-/users", Target: "payments",
+			})
+			require.NoError(t, err)
+
+			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+			require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
+			assert.Contains(t, err.Error(), `"remote-apply-a"`)
+			assert.Contains(t, err.Error(), `"remote-apply-other"`)
+
+			got, err := store.ApplyOperations().Get(ctx, operationID)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Empty(t, got.ExternalID, "a refused remote apply id must not be persisted")
+		})
+	}
+}
+
+// An idempotent replay whose id matches the operation's own recorded remote
+// apply id is still refused while a sibling of the same deployment holds a
+// different one: the deployment's operations disagree, so no further id is
+// recorded until the planes are reconciled.
+func TestApplyOperationStore_SaveExternalIDRefusesReplayWhenSiblingsDiverged(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_save_external_replay", 1)
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "ns/-80/users", Target: "payments", ExternalID: "remote-apply-a",
+	})
+	require.NoError(t, err)
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "ns/80-/users", Target: "payments", ExternalID: "remote-apply-other",
+	})
+	require.NoError(t, err)
+
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+	require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
+
+	got, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "remote-apply-other", got.ExternalID, "a refused replay must not clear the operation's recorded id")
+}
+
+// The atomic write also refuses an operation that does not belong to the
+// apply whose rows it locked, so a caller cannot verify one apply's
+// deployment invariant while writing another's row.
+func TestApplyOperationStore_SaveExternalIDRefusesForeignOperation(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_save_external_foreign_a", 1)
+	otherApply := createTestApplyWithStateAndEnv(t, store, lock, "apply_save_external_foreign_b", 2, state.Apply.Pending, "production")
+
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: otherApply.ID, Deployment: "region-a", OperationKey: "ns/-80/users", Target: "payments",
+	})
+	require.NoError(t, err)
+
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a")
+	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+
+	got, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Empty(t, got.ExternalID)
 }
 
 // TestApplyOperationStore_WritesStampUpdatedAt verifies that every operation
@@ -150,7 +285,7 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
 		}},
 		{"save external id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
 		}},
 		{"save engine resume state", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
@@ -160,7 +295,7 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 			}))
 		}},
 		{"identical-value replay", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
 		}},
 	}
 	for _, w := range writes {

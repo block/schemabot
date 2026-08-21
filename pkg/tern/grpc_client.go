@@ -1424,15 +1424,12 @@ func (s applyTaskScope) tasklessOperationScope() bool {
 
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
 // Progress/Stop/Start/Cutover calls. Operation-owning drives read the claimed
-// operation's external_id (which may be empty before dispatch); whole-apply
-// drives read the parent external_id.
+// operation's recorded remote apply id (which may be empty before dispatch);
+// whole-apply drives read the parent external_id.
 func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 	if s.usesOperationRemoteResume() {
-		if s.operation.ExternalID != "" {
-			return s.operation.ExternalID
-		}
-		if s.operation.EngineResumeContext != "" {
-			return s.operation.EngineResumeContext
+		if id := s.operation.RemoteApplyID(); id != "" {
+			return id
 		}
 		// A sole operation's remote apply id is unambiguously its own, so a drive
 		// that finds one recorded on the parent resumes it rather than dispatching
@@ -1625,7 +1622,21 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	if remoteOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != remoteOperationID {
 		return fmt.Errorf("apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", op.ID, current.ExternalOperationID, remoteOperationID)
 	}
-	if err := c.storage.ApplyOperations().SaveExternalID(ctx, op.ID, remoteID); err != nil {
+	if err := c.storage.ApplyOperations().SaveExternalID(ctx, apply.ID, op.ID, remoteID); err != nil {
+		// The store re-verifies the deployment invariant under row locks inside
+		// the writing transaction, so a sibling dispatch that persisted between
+		// the guard's read above and this write still cannot give the deployment
+		// a second remote apply — it is refused here instead.
+		if errors.Is(err, storage.ErrRemoteApplyDeploymentIDConflict) {
+			c.applyLogger(apply).ErrorContext(ctx, "a concurrent sibling dispatch recorded a different remote apply id for the deployment; refusing to give one deployment two remote applies",
+				append(apply.MutableLogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", current.Deployment,
+					"operation_key", current.OperationKey,
+					"refused_remote_apply_id", remoteID,
+					"error", err)...)
+			metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
+		}
 		return fmt.Errorf("store remote apply id for apply_operation %d: %w", op.ID, err)
 	}
 	op.ExternalID = remoteID
@@ -1652,6 +1663,11 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 // (the planes diverged before this dispatch) or between the siblings and the
 // id this dispatch returned. Sibling deployments of the same apply are
 // exempt: they own their own remote applies.
+//
+// This read is unlocked, so it exists for precise triage logging on the
+// common divergence shapes; the authoritative check is the store's, which
+// re-verifies the same invariant under row locks inside the writing
+// transaction so concurrent sibling persists serialize.
 func (c *GRPCClient) guardDeploymentRemoteApplyID(ctx context.Context, apply *storage.Apply, current *storage.ApplyOperation, remoteID string) error {
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
