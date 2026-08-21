@@ -357,6 +357,55 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	})
 }
 
+// TestPostgresSaveExternalIDDeploymentInvariant pins the atomic remote apply
+// id write against a real PostgreSQL server: the store must lock the apply's
+// operation rows and verify the operation's deployment records no other
+// remote apply id inside the writing transaction, so a dispatch whose id
+// disagrees with a sibling's is refused fail-closed while the deployment's
+// shared id persists cleanly.
+func TestPostgresSaveExternalIDDeploymentInvariant(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_extid")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+	ops := store.ApplyOperations()
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options)
+		VALUES ('apply-extid-invariant', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', 'running', '{}')
+		RETURNING id`).Scan(&applyID))
+	seedOperation := func(t *testing.T, key, externalID string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, external_id)
+			VALUES ($1, 'dep-1', $2, 'running', NULLIF($3, ''))
+			RETURNING id`, applyID, key, externalID).Scan(&id))
+		return id
+	}
+	_ = seedOperation(t, "op-sibling", "remote-apply-a")
+	opID := seedOperation(t, "op-current", "")
+
+	err = ops.SaveExternalID(t.Context(), applyID, opID, "remote-apply-other")
+	require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
+	var stored sql.NullString
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT external_id FROM apply_operations WHERE id = $1`, opID).Scan(&stored))
+	assert.False(t, stored.Valid, "a refused remote apply id must not be persisted")
+
+	require.NoError(t, ops.SaveExternalID(t.Context(), applyID, opID, "remote-apply-a"))
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT external_id FROM apply_operations WHERE id = $1`, opID).Scan(&stored))
+	assert.Equal(t, "remote-apply-a", stored.String)
+}
+
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	entries, err := schema.PostgresFS.ReadDir("postgres")

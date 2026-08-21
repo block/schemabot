@@ -1019,6 +1019,24 @@ func RecordRemoteApplyKeyEchoMismatch(ctx context.Context, database, environment
 	)
 }
 
+// RecordRemoteApplyDeploymentIDConflict increments the counter for remote
+// dispatch results refused because the deployment already correlates to a
+// different remote apply id. One deployment maps to exactly one data-plane
+// apply, so a second id means the planes have diverged — an in-flight apply
+// spanning a dispatch-key rollout, or a data plane that lost its keyed apply
+// and minted a fresh one. The refusal fails the dispatch closed; the operator
+// action is to inspect the named database's apply operations, decide which
+// remote apply is authoritative, and re-dispatch under a fresh generation once
+// the planes agree.
+func RecordRemoteApplyDeploymentIDConflict(ctx context.Context, database, environment, deployment string) {
+	addCounter(ctx, "schemabot.remote_apply_deployment_id_conflict_total",
+		"Total remote apply dispatches refused because the deployment already correlates to a different remote apply id", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("deployment", deployment),
+	)
+}
+
 // operatorMetricNames returns the canonical operator metric name alongside its
 // deprecated schemabot.scheduler.* alias. Both are emitted for one release so
 // dashboards and alerts can migrate before the legacy series is removed.
