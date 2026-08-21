@@ -968,8 +968,15 @@ type ApplyOperationStore interface {
 	SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error
 
 	// SaveExternalID stores the remote data plane's apply_id on the operation
-	// that owns the dispatch.
-	SaveExternalID(ctx context.Context, operationID int64, externalID string) error
+	// that owns the dispatch. The write is atomic with its deployment
+	// invariant: in one transaction the store locks the apply's operation
+	// rows, verifies the operation's deployment records no remote apply id
+	// other than the one being stored, and only then writes. Sibling
+	// operations of one deployment persist concurrently across the driver
+	// pool, so a check outside the writing transaction cannot stop two of
+	// them from recording divergent ids. Divergence returns an error wrapping
+	// ErrRemoteApplyDeploymentIDConflict.
+	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
 
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error

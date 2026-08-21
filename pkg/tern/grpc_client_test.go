@@ -1064,13 +1064,16 @@ func (m *mockApplyOperationStore) SaveExternalOperationID(_ context.Context, ope
 	return nil
 }
 
-func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, operationID int64, externalID string) error {
+func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID string) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
 	op, ok := m.ops[operationID]
 	if !ok {
 		return storage.ErrApplyOperationNotFound
+	}
+	if op.ApplyID != applyID {
+		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
 	}
 	op.ExternalID = externalID
 	return nil

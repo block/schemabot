@@ -959,6 +959,43 @@ func TestHandleDeploymentLogsUsesParentExternalIDForSingleOperation(t *testing.T
 	assert.Equal(t, "apply complete", response.Sources[0].Logs[0].Message)
 }
 
+// A remotely dispatched operation whose remote apply id lives only in the
+// legacy engine resume context carrier still contributes a data-plane log
+// source: the deployment routes to a remote client, so the carrier holds a
+// remote apply id, not engine resume state, and its logs must not be silently
+// missing from the fan-out.
+func TestHandleDeploymentLogsHonorsLegacyResumeContextCarrier(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", EngineResumeContext: "remote-legacy"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 21, Level: "info", Message: "copying", CreatedAt: "2026-07-18T18:33:10Z"}}}, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 2)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "remote-legacy", client.logsReqs[1].ApplyId)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 2)
+	assert.Equal(t, "remote-a", response.Sources[0].ExternalID)
+	assert.Equal(t, "remote-legacy", response.Sources[1].ExternalID)
+	require.Len(t, response.Sources[1].Operations, 1)
+	assert.Equal(t, "commerce/80-/orders", response.Sources[1].Operations[0].OperationKey)
+}
+
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
 	m.cutoverReq = req
 	if m.cutoverResp != nil {
