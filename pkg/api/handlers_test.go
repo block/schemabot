@@ -459,6 +459,9 @@ func (s *capturingApplyStore) CreateWithTasksAndOperations(ctx context.Context, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.capture(apply)
+	// Real storage materializes the row with its auto-increment ID; readers
+	// resolving the apply by the returned ID must find it.
+	s.apply.ID = applyID
 	for _, op := range operations {
 		snapshot := *op
 		s.operations = append(s.operations, &snapshot)

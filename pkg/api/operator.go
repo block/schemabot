@@ -729,10 +729,11 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// operation lease, and shutdown has to hand it back whichever path it took.
 	defer s.trackHeldOperationClaim(op, opLease)()
 
-	// Branch on the operation count. A single-operation apply keeps the legacy
-	// parent-lease drive byte-for-byte. A multi-operation apply drives under the
-	// operation lease only: siblings must not serialize on a shared parent lease,
-	// and the parent applies.state is moved solely by the projection CAS.
+	// Choose the drive mode. A single-operation apply keeps the legacy
+	// parent-lease drive byte-for-byte. A multi-operation apply — by attached
+	// rows or by a generation manifest still expecting siblings — drives under
+	// the operation lease only: siblings must not serialize on a shared parent
+	// lease, and the parent applies.state is moved solely by the projection CAS.
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
 		s.logger.Error("operator: failed to list operations for claimed apply; operation will not be driven",
@@ -749,6 +750,37 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		return
 	}
 	if len(ops) > 1 {
+		s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
+		return
+	}
+	// One attached operation does not prove a single-operation apply: a
+	// deployment-keyed apply's operations attach one dispatch at a time, and
+	// its generation manifest is the authority for whether siblings are still
+	// on their way. Consult it before choosing the drive mode — a parent-lease
+	// drive of the first-attached operation would terminalize the parent apply
+	// while the manifest still expects siblings, and every later dispatch would
+	// then be refused against the terminal apply.
+	apply, err := s.storage.Applies().Get(ctx, op.ApplyID)
+	if err != nil {
+		s.logger.Error("operator: failed to load parent apply for the drive-mode decision; operation will not be driven",
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "error", err)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
+		return
+	}
+	if apply == nil {
+		s.logger.Error("operator: parent apply not found for the drive-mode decision; operation will not be driven",
+			append(op.LogAttrs(),
+				"driver", driverID, "lease_owner", owner)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
+		return
+	}
+	if apply.ManifestDeclaresUnattachedWork(ops) {
+		s.logger.Info("operator: generation manifest expects operations that have not attached; driving under the operation lease so the projection owns the parent",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"operation_key", op.OperationKey,
+				"missing_operation_keys", apply.MissingExpectedOperationKeys(ops))...)
 		s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
 		return
 	}

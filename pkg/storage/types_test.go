@@ -395,4 +395,24 @@ func TestApplyGenerationManifestHelpers(t *testing.T) {
 				"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer")),
 			"a fully attached manifest has no missing keys")
 	})
+
+	t.Run("ManifestDeclaresUnattachedWork", func(t *testing.T) {
+		attached := func(keys ...string) []*ApplyOperation {
+			ops := make([]*ApplyOperation, 0, len(keys))
+			for _, key := range keys {
+				ops = append(ops, &ApplyOperation{OperationKey: key})
+			}
+			return ops
+		}
+
+		noManifest := &Apply{}
+		assert.False(t, noManifest.ManifestDeclaresUnattachedWork(attached("commerce/-80/users")),
+			"an apply without a manifest declares nothing beyond its attached rows")
+
+		apply := &Apply{ExpectedOperationKeys: []string{"commerce/-80/users", "commerce/80-/users"}}
+		assert.True(t, apply.ManifestDeclaresUnattachedWork(attached("commerce/-80/users")),
+			"a declared key without an attached row means siblings are still on their way")
+		assert.False(t, apply.ManifestDeclaresUnattachedWork(attached("commerce/-80/users", "commerce/80-/users")),
+			"a fully attached manifest declares no further work")
+	})
 }
