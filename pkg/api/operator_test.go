@@ -691,6 +691,8 @@ func TestUpdateApplyStateFromOperations_ManifestHoldIsStableWhileRunning(t *test
 	assert.False(t, result.Swapped, "holding at the current running state is not a swap")
 	assert.Nil(t, applyStore.updated, "a stable hold must not rewrite the apply row")
 	assert.Equal(t, state.Apply.Running, result.DerivedState)
+	assert.True(t, result.ManifestHeld,
+		"the result must mark the manifest hold so callers can tell a held rollout from a stranded parent")
 }
 
 // releaseLatchControlStore returns a fixed release latch from GetByOperation so
