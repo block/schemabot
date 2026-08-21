@@ -43,11 +43,11 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	assert.Contains(t, paused, "apply the same schema change that started it")
 }
 
-// An apply that is already running has nothing to ask and no remedy to offer:
-// the copy is destroyed as the comment is posted. So the section records what
-// the apply threw away instead of coaching a recovery that is already out of
-// reach — still under ⚠️, since work destroyed is a warning whether or not the
-// reader could have stopped it.
+// An apply that is already running has nothing to ask and no move to offer: the
+// copy is dropped as the comment is posted, and neither stopping the apply nor
+// restoring the earlier schema change brings it back. So the section states what
+// went and stops, under ℹ️ — a reader who cannot act on something is being
+// informed, not warned.
 func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
@@ -63,14 +63,16 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 
 	assert.Contains(t, out, "**Applying automatically**",
 		"the fixture is the automatic path, which is what makes the section a record")
-	assert.Contains(t, out, "⚠️ **This apply destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
+	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
 	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it")
-	assert.Contains(t, out, "it runs as long as a first copy would; the 3h 12m already spent does not shorten it",
-		"the useful thing left to say is how long this apply now takes, not that the copy is gone")
+	assert.NotContains(t, out, "⚠️ **This apply destroys work in progress**",
+		"a reader with no move to make is being informed, not warned")
 	assert.NotContains(t, out, "**Applying destroys work in progress**",
 		"the hypothetical subject belongs to a comment where applying is still a choice")
 	assert.NotContains(t, out, "apply the same schema change that started it",
 		"the remedy is out of reach once the copy is being destroyed")
+	assert.NotContains(t, out, "runs as long as a first copy would",
+		"the entries are the whole record; a closing line here could only restate them")
 }
 
 // A copy the apply will resume is disclosed as a continuation rather than a

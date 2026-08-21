@@ -30,42 +30,43 @@ type ExistingCopyData struct {
 // How long the copy has been running is what makes an operator stop, so it
 // leads the section rather than sitting in a parenthetical below the headline.
 //
-// The closing line spends itself on the consequence rather than restating the
-// headline: the copy restarting from zero rows means this apply takes as long as
-// one against an untouched table, and the hours already spent buy nothing off
-// that. That is the number an operator plans around, and on a running apply it
-// also explains why the progress they are about to watch starts at nothing.
+// alreadyApplying selects between the two things this section can be, and the
+// difference is whether the reader has a move.
 //
-// alreadyApplying selects between the two things this section can be. While the
-// operator still has a decision, it warns about what confirming costs and names
-// the remedy. On a comment announcing an apply that is already running there is
-// no decision and no remedy left — the copy is destroyed as that comment is
-// posted — so the section records what went with it. Only the subject and the
-// remedy change: destroying hours of work is a warning either way, so it keeps
-// ⚠️ rather than softening to an informational marker once it is too late to
-// act, and it keeps the same verb so the two are recognizably one disclosure.
+// While the copy is still there, applying is a choice with a cost, and the cost
+// can be avoided: applying the schema change the copy was made for resumes it
+// instead. That is a warning with a remedy, so it takes ⚠️ and closes on what
+// confirming spends and how to spend less.
+//
+// On a comment announcing an apply already under way there is no move. The copy
+// is dropped as that comment is posted, and nothing brings it back: not stopping
+// the apply, not restoring the earlier schema change. So the section states what
+// went and stops. It takes ℹ️, because a reader who cannot act on something is
+// being informed, not warned, and it closes after the entries rather than
+// offering a remedy that is out of reach or restating the headline as advice.
+//
+// Both keep the same verb so the two read as one disclosure rather than two.
 func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
 	headlineAge := soleCopyAge(copies)
-	subject := "Applying"
+	marker, subject := "⚠️", "Applying"
 	if alreadyApplying {
-		subject = "This apply"
+		marker, subject = "ℹ️", "This apply"
 	}
-	fmt.Fprintf(sb, "⚠️ **%s destroys work in progress**: **%d** unfinished %s on the target",
-		subject, n, copyNoun(n))
+	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target",
+		marker, subject, n, copyNoun(n))
 	if headlineAge != "" {
 		fmt.Fprintf(sb, ", %s of copying", headlineAge)
 	}
 	sb.WriteString("\n")
 	writeExistingCopyEntries(sb, copies, headlineAge == "")
+	if alreadyApplying {
+		sb.WriteString("\n")
+		return
+	}
 	lost := "the work already done"
 	if headlineAge != "" {
 		lost = "the " + headlineAge + " already spent"
-	}
-	if alreadyApplying {
-		fmt.Fprintf(sb, "\nThis apply copies the tables above again from zero rows, so it runs as long as a first copy would; "+
-			"%s does not shorten it.\n\n", lost)
-		return
 	}
 	fmt.Fprintf(sb, "\nApplying copies the tables above again from zero rows, so it runs as long as a first copy would; "+
 		"%s is lost and cannot be recovered. "+
