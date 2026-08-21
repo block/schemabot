@@ -230,11 +230,17 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 	})
 }
 
-// PreviewCommentPlanCopyDiscardedApplying renders the same discard on the
-// comment of an apply that is already running — the path an operator reaches
-// with `-y`, having already accepted the cost. Nothing is being asked of the
-// reader and the copy is already gone, so the section is a record of what the
-// apply threw away rather than a warning with a remedy.
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on a
+// comment that announces an apply already under way rather than asking for
+// confirmation. Nothing is being asked of the reader and the copy is already
+// gone, so the section is a record of what the apply threw away rather than a
+// warning with a remedy.
+//
+// The copy-discard gate stops every automatic apply that would discard, so it
+// is the paused rendering above that an operator meets in practice. This one is
+// the shape the section takes on any locked comment carrying no confirmation
+// request, and it is here so that shape stays correct: a comment posted after
+// the copy is destroyed must not offer the remedy for saving it.
 func PreviewCommentPlanCopyDiscardedApplying() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",

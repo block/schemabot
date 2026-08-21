@@ -32,12 +32,6 @@ type CommandSpec struct {
 	// SupportsDB means `-d <db>` is recognized.
 	SupportsDB bool
 
-	// SupportsAutoConfirm means `-y` / `--yes` is recognized. Only apply uses
-	// this today; other commands have the flag silently dropped from the
-	// CommandResult so the dispatcher can post an "unsupported flag" comment
-	// via HasAutoConfirmFlag.
-	SupportsAutoConfirm bool
-
 	// SupportsSkipRevert means `--skip-revert` is recognized.
 	SupportsSkipRevert bool
 
@@ -67,7 +61,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Plan, RequiresEnv: true, SupportsDB: true},
 	{Name: action.Apply, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
-		SupportsAllowUnsafe: true, SupportsAutoConfirm: true},
+		SupportsAllowUnsafe: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
@@ -174,7 +168,6 @@ type CommandResult struct {
 	DeferCutover bool
 	AllowUnsafe  bool
 	Force        bool
-	AutoConfirm  bool
 	// VolumeLevel is the numeric level from `-v` / `--volume` on commands whose
 	// spec opts into SupportsVolumeLevel. Zero means the flag was absent.
 	VolumeLevel int32
@@ -325,9 +318,6 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	if spec.SupportsForce {
 		result.Force = p.forceRegex.MatchString(body)
 	}
-	if spec.SupportsAutoConfirm {
-		result.AutoConfirm = p.autoConfirmRegex.MatchString(body)
-	}
 	if spec.SupportsVolumeLevel {
 		result.VolumeLevel, result.VolumeLevelError = p.extractVolumeLevel(body)
 	}
@@ -362,9 +352,13 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 }
 
 // HasAutoConfirmFlag reports whether the body contains the `-y` / `--yes`
-// flag, regardless of which command it accompanies. The dispatcher uses this
-// to post an "unsupported flag" comment when an operator pairs `-y` with a
-// command whose spec does not opt into SupportsAutoConfirm.
+// flag. No comment command takes it: a comment has no prompt to skip, and the
+// gates that stop an apply — direct-execution changes, a discarded copy — stop
+// it because the operator has to see what they are consenting to, which a flag
+// cannot express. The dispatcher uses this to say so rather than accept the
+// flag and ignore it, which would read as consent that was never recorded.
+// This is distinct from the CLI's own `-y` (`--auto-approve`), which skips an
+// interactive terminal prompt that genuinely exists.
 func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 	return p.autoConfirmRegex.MatchString(body)
 }

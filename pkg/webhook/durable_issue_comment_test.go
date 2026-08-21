@@ -95,6 +95,7 @@ func TestIssueCommentGateBlockParity(t *testing.T) {
 		{name: "rollback missing apply ID", comment: "schemabot rollback -e production -t alpha", want: issueCommentGateMissingApplyID},
 		{name: "command not found", comment: "schemabot frobnicate", want: issueCommentGateCommandNotFound},
 		{name: "unsupported auto-confirm", comment: "schemabot apply-confirm -e production -y -t alpha", want: issueCommentGateAutoConfirm},
+		{name: "unsupported auto-confirm on apply", comment: "schemabot apply -e production --yes -t alpha", want: issueCommentGateAutoConfirm},
 		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover -t alpha", want: issueCommentGateDeferCutover},
 		{name: "unsupported database", comment: "schemabot stop -e production -d accounts -t alpha", want: issueCommentGateDatabase},
 	}

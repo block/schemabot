@@ -31,9 +31,14 @@ func RenderRollbackMissingEnv() string {
 }
 
 // RenderUnsupportedAutoConfirm renders the message posted when the `-y` /
-// `--yes` auto-confirm flag is supplied to a command that does not support it.
+// `--yes` flag is supplied to a comment command. No comment command takes it,
+// so the reply names the surface it does belong to rather than leaving an
+// operator who copied it from a CLI example with nowhere to go.
 func RenderUnsupportedAutoConfirm(action string) string {
-	return fmt.Sprintf("The `-y` flag is not supported for `%s`.", action)
+	return fmt.Sprintf("The `-y` flag is not supported for `%s`.\n\n"+
+		"`-y` belongs to the CLI, where it skips an interactive confirmation prompt. "+
+		"A PR comment has no prompt to skip: when a command stops for confirmation, "+
+		"it is asking you to read what it discloses and reply with the confirm command it posts.", action)
 }
 
 // RenderUnsupportedDatabaseFlag renders the message posted when `-d` is
