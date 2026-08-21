@@ -110,7 +110,7 @@ func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, wi
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
 		if c.Namespace != "" {
-			line += fmt.Sprintf(" in `%s`", c.Namespace)
+			line += " in " + markdownInlineCode(c.Namespace)
 		}
 		if withAge && c.Age != "" {
 			line += fmt.Sprintf(" (last progress %s ago)", c.Age)
@@ -122,22 +122,30 @@ func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, wi
 	}
 }
 
+// existingCopyTableList renders the copy's tables as a comma-separated list of
+// inline code spans. The names are identifiers read off a live target, so they
+// are rendered through the shared sanitizer: a quoted identifier may legally
+// carry a backtick or a newline, and either one would end the code span early
+// or split this entry across lines in a section an operator reads to decide
+// whether hours of copying are expendable.
 func existingCopyTableList(tables []string) string {
 	if len(tables) == 0 {
 		return "unnamed tables"
 	}
 	quoted := make([]string, len(tables))
 	for i, t := range tables {
-		quoted[i] = "`" + t + "`"
+		quoted[i] = markdownInlineCode(t)
 	}
 	return strings.Join(quoted, ", ")
 }
 
 // existingCopyReason renders the engine's discard reason as operator-facing
-// copy. The engine emits a fixed set of identifiers, so an unrecognized one is
-// a missing translation rather than untrusted text: it is shown verbatim in
-// code ticks, because naming a cause the operator can search for beats dropping
-// it.
+// copy. An identifier this build does not translate is still shown, in code
+// ticks, because naming a cause the operator can search for beats dropping it:
+// the reason arrives over the wire from a server that may be a version ahead,
+// so an unknown value means a missing translation, not a copy that discards for
+// no reason. It goes through the shared sanitizer for the same reason the table
+// names do, since this build cannot know what a future value contains.
 func existingCopyReason(reason string) string {
 	switch reason {
 	case "":
@@ -149,6 +157,6 @@ func existingCopyReason(reason string) string {
 	case engine.DiscardCopyIncomplete:
 		return "it covers only some of the tables this schema change alters"
 	default:
-		return "`" + reason + "`"
+		return markdownInlineCode(reason)
 	}
 }

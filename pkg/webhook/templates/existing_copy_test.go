@@ -75,6 +75,35 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 		"the entries are the whole record; a closing line here could only restate them")
 }
 
+// The names in a copy entry are read off a live target and the reason arrives
+// from a server that may be a version ahead, so each is rendered through the
+// shared inline-code sanitizer. A quoted identifier may legally carry a
+// backtick or a newline, and either would end a code span early or split the
+// entry across lines in the one section an operator reads to decide whether
+// hours of copying are expendable. The sanitizer drops the backtick rather than
+// escaping it, so a name that carries one is shown closed up; a readable entry
+// that survives is worth more here than byte fidelity for a name no target
+// realistically has.
+func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"}}},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "app`\ndb",
+				Tables:    []string{"ord`ers", "line\nitems"},
+				Reason:    "future`reason\nvalue",
+				Age:       "3h 12m",
+			},
+		},
+	})
+
+	assert.Contains(t, out, "- `orders`, `line items` in `app db`: `futurereason value`\n",
+		"identifiers and an untranslated reason render as one entry on one line")
+	assert.NotContains(t, out, "ord`ers", "a backtick in an identifier cannot end the code span early")
+	assert.NotContains(t, out, "future`reason", "a backtick in a reason cannot end the code span early")
+}
+
 // A copy the apply will resume is disclosed as a continuation rather than a
 // warning: nothing is destroyed, so an operator seeing the apply reappear
 // knows it is not starting over.
