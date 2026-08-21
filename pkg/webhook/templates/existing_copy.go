@@ -30,6 +30,12 @@ type ExistingCopyData struct {
 // How long the copy has been running is what makes an operator stop, so it
 // leads the section rather than sitting in a parenthetical below the headline.
 //
+// The closing line spends itself on the consequence rather than restating the
+// headline: the copy restarting from zero rows means this apply takes as long as
+// one against an untouched table, and the hours already spent buy nothing off
+// that. That is the number an operator plans around, and on a running apply it
+// also explains why the progress they are about to watch starts at nothing.
+//
 // alreadyApplying selects between the two things this section can be. While the
 // operator still has a decision, it warns about what confirming costs and names
 // the remedy. On a comment announcing an apply that is already running there is
@@ -57,10 +63,12 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alread
 		lost = "the " + headlineAge + " already spent"
 	}
 	if alreadyApplying {
-		fmt.Fprintf(sb, "\nThis apply copies each of these tables again from the start; %s is gone.\n\n", lost)
+		fmt.Fprintf(sb, "\nThis apply copies the tables above again from zero rows, so it runs as long as a first copy would; "+
+			"%s does not shorten it.\n\n", lost)
 		return
 	}
-	fmt.Fprintf(sb, "\nApplying copies each of these tables again from the start; %s is lost and cannot be recovered. "+
+	fmt.Fprintf(sb, "\nApplying copies the tables above again from zero rows, so it runs as long as a first copy would; "+
+		"%s is lost and cannot be recovered. "+
 		"To continue the existing copy instead, apply the same schema change that started it.\n\n", lost)
 }
 

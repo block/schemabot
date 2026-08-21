@@ -29,7 +29,8 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	assert.Contains(t, plan, "- `orders` in `testapp`: the schema change differs from the one that started it")
 	assert.NotContains(t, plan, "(last progress 3h 12m ago)",
 		"the headline already carries the age, so the entry does not repeat it")
-	assert.Contains(t, plan, "the 3h 12m already spent is lost and cannot be recovered")
+	assert.Contains(t, plan, "it runs as long as a first copy would; the 3h 12m already spent is lost and cannot be recovered",
+		"what confirming costs is the whole copy over again, not just the hours already lost")
 	assert.Contains(t, plan, "apply the same schema change that started it")
 
 	// A locked apply that stopped for confirmation is the same situation: the
@@ -64,7 +65,8 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 		"the fixture is the automatic path, which is what makes the section a record")
 	assert.Contains(t, out, "⚠️ **This apply destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
 	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it")
-	assert.Contains(t, out, "the 3h 12m already spent is gone")
+	assert.Contains(t, out, "it runs as long as a first copy would; the 3h 12m already spent does not shorten it",
+		"the useful thing left to say is how long this apply now takes, not that the copy is gone")
 	assert.NotContains(t, out, "**Applying destroys work in progress**",
 		"the hypothetical subject belongs to a comment where applying is still a choice")
 	assert.NotContains(t, out, "apply the same schema change that started it",
