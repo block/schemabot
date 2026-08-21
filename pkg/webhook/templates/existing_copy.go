@@ -27,13 +27,36 @@ type ExistingCopyData struct {
 // throws away. This is the disclosure the operator most needs before
 // confirming: the work already done on the target is lost and every table in
 // the copy is read again from the start, which on a large table is hours.
+//
+// How long the copy has been running is what makes an operator stop, so it
+// leads the section rather than sitting in a parenthetical below the headline.
 func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData) {
 	n := len(copies)
-	fmt.Fprintf(sb, "🗑️ **Discarding work in progress**: **%d** unfinished %s on the target will be thrown away\n",
+	headlineAge := soleCopyAge(copies)
+	fmt.Fprintf(sb, "⚠️ **Applying destroys work in progress**: **%d** unfinished %s on the target",
 		n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies)
-	sb.WriteString("\nApplying copies each of these tables again from the start; the work already done is lost. " +
-		"To continue the existing copy instead, apply the same schema change that started it.\n\n")
+	if headlineAge != "" {
+		fmt.Fprintf(sb, ", %s of copying", headlineAge)
+	}
+	sb.WriteString("\n")
+	writeExistingCopyEntries(sb, copies, headlineAge == "")
+	lost := "the work already done"
+	if headlineAge != "" {
+		lost = "the " + headlineAge + " already spent"
+	}
+	fmt.Fprintf(sb, "\nApplying copies each of these tables again from the start; %s is lost and cannot be recovered. "+
+		"To continue the existing copy instead, apply the same schema change that started it.\n\n", lost)
+}
+
+// soleCopyAge is the age to put in the headline: the copy's own, when exactly
+// one copy is being reported and its age is known. Empty otherwise — several
+// copies have several ages and no one of them describes what applying costs, so
+// each keeps its age on its own entry.
+func soleCopyAge(copies []ExistingCopyData) string {
+	if len(copies) != 1 {
+		return ""
+	}
+	return copies[0].Age
 }
 
 // writeAdoptedCopies writes the section for unfinished copies the apply
@@ -44,7 +67,7 @@ func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData) {
 	n := len(copies)
 	fmt.Fprintf(sb, "♻️ **Resuming work in progress**: **%d** unfinished %s on the target will be continued\n",
 		n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies)
+	writeExistingCopyEntries(sb, copies, true)
 	sb.WriteString("\nApplying picks up where the existing copy stopped rather than starting over.\n\n")
 }
 
@@ -56,13 +79,15 @@ func copyNoun(count int) string {
 	return "copies"
 }
 
-func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
+// writeExistingCopyEntries writes one entry per copy. withAge is false when the
+// section headline already carries the age, so the entry does not repeat it.
+func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, withAge bool) {
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
 		if c.Namespace != "" {
 			line += fmt.Sprintf(" in `%s`", c.Namespace)
 		}
-		if c.Age != "" {
+		if withAge && c.Age != "" {
 			line += fmt.Sprintf(" (last progress %s ago)", c.Age)
 		}
 		if reason := existingCopyReason(c.Reason); reason != "" {
