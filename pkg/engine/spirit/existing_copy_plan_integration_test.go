@@ -3,9 +3,13 @@
 package spirit
 
 import (
+	"context"
+	"database/sql"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -14,44 +18,65 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// planTarget is a target holding one table and the desired schema that widens
-// it, which is the shape every disclosure case here needs: a plan that produces
-// exactly one ALTER the engine runs itself.
+// planTarget is a target holding the named tables and the desired schema that
+// widens each of them, which is the shape every disclosure case here needs: a
+// plan that produces exactly one ALTER per table, all of them run by the engine.
 type planTarget struct {
-	eng   *Engine
-	dsn   string
-	table string
-	files map[string]string
+	eng    *Engine
+	dsn    string
+	db     *sql.DB
+	tables []string
+	files  map[string]string
 }
 
-func newPlanTarget(t *testing.T, tableName string) planTarget {
+func newPlanTarget(t *testing.T, tables ...string) planTarget {
 	t.Helper()
 
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
 
-	_, err := db.ExecContext(t.Context(), "CREATE TABLE `"+tableName+"` ("+
-		"id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, "+
-		"name VARCHAR(50) NOT NULL"+
-		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
-	require.NoError(t, err, "create table %s", tableName)
+	files := make(map[string]string, len(tables))
+	for _, tableName := range tables {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE `"+tableName+"` ("+
+			"id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, "+
+			"name VARCHAR(50) NOT NULL"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+		require.NoError(t, err, "create table %s", tableName)
+
+		files[tableName+".sql"] = "CREATE TABLE `" + tableName + "` (" +
+			"id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, " +
+			"name VARCHAR(100) NOT NULL" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	}
 
 	return planTarget{
-		eng:   New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))}),
-		dsn:   dsn,
-		table: tableName,
-		files: map[string]string{
-			tableName + ".sql": "CREATE TABLE `" + tableName + "` (" +
-				"id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, " +
-				"name VARCHAR(100) NOT NULL" +
-				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-		},
+		eng:    newPlanEngine(Settings{}),
+		dsn:    dsn,
+		db:     db,
+		tables: tables,
+		files:  files,
 	}
 }
 
+func newPlanEngine(settings Settings) *Engine {
+	return New(Config{
+		Logger:   slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Settings: settings,
+	})
+}
+
+// expireCheckpoints replans against an engine whose checkpoint bound sits below
+// the age of any checkpoint a test can write, so a copy recorded moments ago is
+// already too old to replay from rather than the test waiting out a real expiry.
+func (p planTarget) expireCheckpoints() planTarget {
+	p.eng = newPlanEngine(Settings{CheckpointMaxAge: -time.Second})
+	return p
+}
+
 // plan runs the plan the operator would run, and returns it along with the
-// single ALTER it produced — the batch an apply hands the engine, and so the
-// batch a copy on the target has to have been made for to be continued.
+// batch it produced — every ALTER joined the way an apply hands them to the
+// engine, and so the statement a copy on the target has to have been made for
+// to be continued.
 func (p planTarget) plan(t *testing.T) (*engine.PlanResult, string) {
 	t.Helper()
 
@@ -61,11 +86,11 @@ func (p planTarget) plan(t *testing.T) (*engine.PlanResult, string) {
 		Credentials: &engine.Credentials{DSN: p.dsn},
 	})
 	require.NoError(t, err, "Plan()")
-	require.False(t, result.NoChanges, "the desired schema widens a column, so the plan has a change")
+	require.False(t, result.NoChanges, "the desired schema widens a column on every table, so the plan has changes")
 
 	ddl := result.FlatDDL()
-	require.Len(t, ddl, 1, "the plan produces one ALTER")
-	return result, ddl[0]
+	require.Len(t, ddl, len(p.tables), "the plan produces one ALTER per table")
+	return result, strings.Join(ddl, "; ")
 }
 
 // A plan against a clean target discloses nothing: there is no copy to continue
@@ -82,10 +107,9 @@ func TestPlanDisclosesNoCopyOnACleanTarget(t *testing.T) {
 // and the plan is otherwise unchanged.
 func TestPlanDisclosesAContinuedCopy(t *testing.T) {
 	target := newPlanTarget(t, "plan_continued_copy")
-	_, alter := target.plan(t)
+	_, batch := target.plan(t)
 
-	_, db := setupTestMySQL(t)
-	seedCopy(t, db, []string{target.table}, utils.CheckpointTableName(target.table), alter)
+	seedCopy(t, target.db, target.tables, utils.CheckpointTableName(target.tables[0]), batch)
 
 	result, _ := target.plan(t)
 	require.Len(t, result.ExistingCopies, 1, "the plan meets a copy of its own table")
@@ -93,7 +117,7 @@ func TestPlanDisclosesAContinuedCopy(t *testing.T) {
 	assert.Equal(t, "testdb", disclosed.Namespace, "the disclosure names where the copy sits")
 	assert.Equal(t, engine.CopyAdopt, disclosed.Disposition)
 	assert.Empty(t, disclosed.Reason)
-	assert.Equal(t, []string{target.table}, disclosed.Tables)
+	assert.Equal(t, target.tables, disclosed.Tables)
 	assert.Positive(t, disclosed.Age, "the disclosure carries how long the copy has been sitting there")
 }
 
@@ -104,9 +128,8 @@ func TestPlanDisclosesAContinuedCopy(t *testing.T) {
 func TestPlanDisclosesADiscardedCopy(t *testing.T) {
 	target := newPlanTarget(t, "plan_discarded_copy")
 
-	_, db := setupTestMySQL(t)
-	seedCopy(t, db, []string{target.table}, utils.CheckpointTableName(target.table),
-		"ALTER TABLE `"+target.table+"` ADD INDEX idx_name (name)")
+	seedCopy(t, target.db, target.tables, utils.CheckpointTableName(target.tables[0]),
+		"ALTER TABLE `"+target.tables[0]+"` ADD INDEX idx_name (name)")
 
 	result, _ := target.plan(t)
 	require.Len(t, result.ExistingCopies, 1, "the plan meets a copy of its own table")
@@ -114,5 +137,62 @@ func TestPlanDisclosesADiscardedCopy(t *testing.T) {
 	assert.Equal(t, "testdb", disclosed.Namespace, "the disclosure names where the copy sits")
 	assert.Equal(t, engine.CopyDiscard, disclosed.Disposition)
 	assert.Equal(t, engine.DiscardStatementDiffers, disclosed.Reason)
-	assert.Equal(t, []string{target.table}, disclosed.Tables)
+	assert.Equal(t, target.tables, disclosed.Tables)
+}
+
+// A copy whose statement still matches this plan but whose checkpoint is too
+// old to replay from is destroyed all the same. The plan discloses the expiry
+// as the cause, because it is the one discard re-running the same schema change
+// cannot avoid.
+func TestPlanDisclosesADiscardedCopyWithAnExpiredCheckpoint(t *testing.T) {
+	target := newPlanTarget(t, "plan_expired_checkpoint").expireCheckpoints()
+	_, batch := target.plan(t)
+
+	seedCopy(t, target.db, target.tables, utils.CheckpointTableName(target.tables[0]), batch)
+
+	result, _ := target.plan(t)
+	require.Len(t, result.ExistingCopies, 1, "the plan meets a copy of its own table")
+	disclosed := result.ExistingCopies[0]
+	assert.Equal(t, engine.CopyDiscard, disclosed.Disposition)
+	assert.Equal(t, engine.DiscardCheckpointExpired, disclosed.Reason,
+		"the statement matches; only the age disqualifies the copy")
+	assert.Equal(t, target.tables, disclosed.Tables)
+}
+
+// A plan that alters two tables where only one was ever copied destroys the
+// copy that exists: the engine resumes all of a batch or none of it. Nothing in
+// the schema change hints at this, so the plan discloses the whole batch's copy
+// as lost and names the partial copy as the cause.
+func TestPlanDisclosesADiscardedCopyCoveringPartOfTheBatch(t *testing.T) {
+	target := newPlanTarget(t, "plan_partial_copy_one", "plan_partial_copy_two")
+	_, batch := target.plan(t)
+
+	// The checkpoint is for the whole batch and matches it byte for byte; only
+	// the second table's shadow table never got built.
+	seedCopy(t, target.db, target.tables[:1], sharedCheckpointTable, batch)
+
+	result, _ := target.plan(t)
+	require.Len(t, result.ExistingCopies, 1, "one target, so one disclosure covering the batch")
+	disclosed := result.ExistingCopies[0]
+	assert.Equal(t, engine.CopyDiscard, disclosed.Disposition)
+	assert.Equal(t, engine.DiscardCopyIncomplete, disclosed.Reason)
+	assert.Equal(t, target.tables[:1], disclosed.Tables,
+		"only the copied table is disclosed as work lost; the other never started")
+}
+
+// A target that cannot be read leaves the plan exactly as it would be without
+// the disclosure. A plan describes a target and decides nothing, so failing to
+// read one must never fail the plan an operator is waiting on.
+func TestPlanDisclosesNothingWhenTheTargetCannotBeRead(t *testing.T) {
+	eng := newPlanEngine(Settings{})
+
+	ctx, cancel := context.WithTimeout(t.Context(), copyDetectionTimeout)
+	defer cancel()
+	target := &lazyTargetDB{dsn: "root:nopass@tcp(127.0.0.1:1)/absent"}
+	defer target.close()
+
+	disclosed := eng.plannedExistingCopies(ctx, target, "absent", []engine.TableChange{
+		engineRun("xfers", "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"),
+	})
+	assert.Nil(t, disclosed, "an unreadable target is logged, not disclosed and not returned as an error")
 }
