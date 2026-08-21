@@ -372,9 +372,15 @@ const (
 // that applying this plan will either continue or destroy. It never carries
 // CopyNone: a plan that destroys nothing reports no ExistingCopy at all.
 type ExistingCopy struct {
-	// Namespace is where the work sits. A plan spanning several namespaces
-	// reports one ExistingCopy per namespace that holds any, so an operator can
-	// tell which target a disclosure is about.
+	// Namespace names the target the work sits on, as the engine that read it
+	// addresses that target. An engine planning each namespace separately
+	// reports one ExistingCopy per namespace that holds any. Where several
+	// namespaces share one target — schema subdirectories dividing a single
+	// connection-scoped database only logically — the engine reads that target
+	// once and this names the database it read, not the subdirectory the change
+	// came from. Either way it names something an operator can go and look at,
+	// which is what a disclosure has to do; it is not a key to group or route
+	// on.
 	Namespace string
 	// Disposition is what applying will do with the existing work.
 	Disposition CopyDisposition

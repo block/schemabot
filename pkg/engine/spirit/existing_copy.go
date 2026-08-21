@@ -134,9 +134,17 @@ func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration
 //
 // A plan is a read: it must describe the target, never fail because of it. A
 // target that cannot be read is logged and the plan carries no disclosure,
-// which leaves the plan exactly as it is without this check. The same
-// prediction runs again at apply time against the routing the apply actually
-// took, so a plan-time miss is not the last word.
+// which leaves the plan exactly as it is without this check.
+//
+// Two things keep this a prediction rather than a fact, and both fail quiet
+// rather than wrong. The target may be unreadable, as above. And the batch is
+// the one this plan expects: routing runs again at apply time against the
+// target as it is then, so a statement this plan reads as directly executable —
+// or as refused outright — can reach Spirit after all, in a batch that no
+// longer matches the one predicted here. The prediction runs again at apply
+// time against the routing the apply actually took, and Spirit decides for
+// itself regardless, so a plan that discloses nothing is never the last word on
+// whether a copy survives.
 func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB, database string, changes []engine.TableChange) []*engine.ExistingCopy {
 	batch, tables, ok := plannedSpiritBatch(changes)
 	if !ok {
