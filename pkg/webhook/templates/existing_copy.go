@@ -31,21 +31,22 @@ type ExistingCopyData struct {
 // leads the section rather than sitting in a parenthetical below the headline.
 //
 // alreadyApplying selects between the two things this section can be. While the
-// operator still has a decision, it is a warning about what confirming costs,
-// and it names the remedy. On a comment announcing an apply that is already
-// running, there is nothing to warn about and no remedy left: the copy is
-// destroyed as that comment is posted, so the section is a record of what went
-// with it.
+// operator still has a decision, it warns about what confirming costs and names
+// the remedy. On a comment announcing an apply that is already running there is
+// no decision and no remedy left — the copy is destroyed as that comment is
+// posted — so the section records what went with it. Only the subject and the
+// remedy change: destroying hours of work is a warning either way, so it keeps
+// ⚠️ rather than softening to an informational marker once it is too late to
+// act, and it keeps the same verb so the two are recognizably one disclosure.
 func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
 	headlineAge := soleCopyAge(copies)
+	subject := "Applying"
 	if alreadyApplying {
-		fmt.Fprintf(sb, "ℹ️ **Discarding work in progress**: **%d** unfinished %s on the target",
-			n, copyNoun(n))
-	} else {
-		fmt.Fprintf(sb, "⚠️ **Applying destroys work in progress**: **%d** unfinished %s on the target",
-			n, copyNoun(n))
+		subject = "This apply"
 	}
+	fmt.Fprintf(sb, "⚠️ **%s destroys work in progress**: **%d** unfinished %s on the target",
+		subject, n, copyNoun(n))
 	if headlineAge != "" {
 		fmt.Fprintf(sb, ", %s of copying", headlineAge)
 	}

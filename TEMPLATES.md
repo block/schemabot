@@ -321,7 +321,7 @@ schemabot apply -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-ℹ️ **Discarding work in progress**: **1** unfinished copy on the target, 3h 12m of copying
+⚠️ **This apply destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying
 - `orders` in `testapp`: the schema change differs from the one that started it
 
 This apply copies each of these tables again from the start; the 3h 12m already spent is gone.
