@@ -1980,6 +1980,19 @@ func PreviewCommentCutoverSuperseded() string {
 	})
 }
 
+// PreviewCommentCutoverAckSuperseded renders a spent cutover command
+// acknowledgement after the cutover-driven apply reached its terminal state:
+// the ack collapses into a details block under a pointer to the schema change
+// summary, so the outcome stays the last meaningful comment on the PR.
+func PreviewCommentCutoverAckSuperseded() string {
+	return RenderCutoverAckSupersededComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: PreviewCommentCutoverCommandAccepted(),
+	})
+}
+
 // PreviewCommentSupersededProgress renders an old progress comment after a
 // freeze retry folded it without knowing which rotation superseded it: the
 // final progress collapses into a details block under a pointer to the fresh

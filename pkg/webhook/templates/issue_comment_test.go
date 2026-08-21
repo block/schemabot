@@ -169,6 +169,34 @@ func TestRenderCutoverCommandAcceptedAlreadyInProgress(t *testing.T) {
 	assert.Contains(t, rendered, "Cutover is already in progress")
 }
 
+// TestRenderCutoverAckSupersededComment verifies the fold written over a spent
+// cutover acknowledgement points at the completion comment and preserves the
+// ack's body inside a collapsed details block, and that the folded rendering —
+// but not a live ack — is detected as already folded so a fold retry never
+// nests it.
+func TestRenderCutoverAckSupersededComment(t *testing.T) {
+	ack := RenderCutoverCommandAccepted(CutoverCommandAcceptedData{
+		ApplyID:     "apply_abc123",
+		Environment: "staging",
+		RequestedBy: "alice",
+	})
+	assert.False(t, IsSupersededCutoverAckComment(ack), "a live ack must not read as already folded")
+
+	folded := RenderCutoverAckSupersededComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: ack,
+	})
+	assert.Contains(t, folded, "Cutover request superseded")
+	assert.Contains(t, folded, "the outcome is posted in")
+	assert.Contains(t, folded, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, folded, "<details>")
+	assert.Contains(t, folded, "<summary>Cutover request acknowledgement</summary>")
+	assert.Contains(t, folded, "Cutover Request Accepted", "the ack body is preserved inside the fold")
+	assert.True(t, IsSupersededCutoverAckComment(folded), "the folded rendering must be detected so a retry never nests it")
+}
+
 // TestRenderVolumeCommandAccepted verifies the volume acknowledgement says the
 // speed changes shortly — rather than claiming the change already took effect —
 // and carries the apply id, environment, requester, and requested level.

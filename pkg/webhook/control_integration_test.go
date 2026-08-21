@@ -520,6 +520,19 @@ func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	assert.Contains(t, comment, "`"+applyIdentifier+"`")
 	assert.Contains(t, comment, "@alice")
 
+	// The ack is tracked in storage so the driver's observer can fold it once
+	// the cutover's outcome lands on the PR. The tracking write lands after
+	// the comment post, so poll for the row.
+	var ackRow *storage.ApplyComment
+	require.Eventually(t, func() bool {
+		var err error
+		ackRow, err = store.ApplyComments().Get(ctx, applyID, state.Comment.CutoverAck)
+		require.NoError(t, err)
+		return ackRow != nil
+	}, webhookIntegrationCheckRunDeadline, 50*time.Millisecond, "the cutover ack comment is tracked")
+	assert.EqualValues(t, 99, ackRow.GitHubCommentID)
+	assert.Nil(t, ackRow.SupersededAt, "a freshly acknowledged cutover is not yet folded")
+
 	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCutover)
 	require.NoError(t, err)
 	require.NotNil(t, controlReq)
@@ -1005,10 +1018,11 @@ func cleanupStopCommandTestRows(t *testing.T, db *sql.DB, applyIdentifier, datab
 	statements := []string{
 		"DELETE al FROM `apply_logs` al JOIN `applies` a ON al.`apply_id` = a.`id` WHERE a.`apply_identifier` = ?",
 		"DELETE acr FROM `apply_control_requests` acr JOIN `applies` a ON acr.`apply_id` = a.`id` WHERE a.`apply_identifier` = ?",
+		"DELETE ac FROM `apply_comments` ac JOIN `applies` a ON ac.`apply_id` = a.`id` WHERE a.`apply_identifier` = ?",
 		"DELETE FROM `tasks` WHERE `database_name` = ?",
 		"DELETE FROM `applies` WHERE `apply_identifier` = ?",
 	}
-	args := [][]any{{applyIdentifier}, {applyIdentifier}, {database}, {applyIdentifier}}
+	args := [][]any{{applyIdentifier}, {applyIdentifier}, {applyIdentifier}, {database}, {applyIdentifier}}
 	for i, stmt := range statements {
 		_, err := db.ExecContext(cleanupCtx, stmt, args[i]...)
 		require.NoError(t, err)

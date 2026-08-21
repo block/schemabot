@@ -32,6 +32,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // commentCapture records all GitHub comment API calls (creates and edits) and
@@ -779,6 +780,21 @@ func requireCommentCreate(t *testing.T, capture *commentCapture) int64 {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for comment create")
 		return 0
+	}
+}
+
+// requireCommentEdit waits for the next captured comment edit, requires it to
+// land on the expected comment, and returns the edited body for further
+// assertions.
+func requireCommentEdit(t *testing.T, capture *commentCapture, wantCommentID int64, msg string) string {
+	t.Helper()
+	select {
+	case edited := <-capture.edits:
+		require.Equal(t, wantCommentID, edited.CommentID, msg)
+		return edited.Body
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for comment edit: %s", msg)
+		return ""
 	}
 }
 
@@ -1768,6 +1784,131 @@ func TestE2EDeferredCutoverFastTerminalFinalizesProgressComment(t *testing.T) {
 	require.NotNil(t, prog)
 	assert.Equal(t, progressID, prog.GitHubCommentID)
 	assert.Nil(t, prog.SupersededAt, "the frozen progress comment stays tracked, not superseded")
+}
+
+// When the operator's cutover command resolves a parked deferred-cutover apply
+// directly to a terminal state, the completion summary is an in-place edit of
+// the cutover prompt — above the command acknowledgement that was posted at
+// the bottom of the PR. The observer folds the spent ack into a details block
+// pointing at the summary, so the outcome — not the request ack — is the last
+// meaningful comment on the timeline. The superseded ack row is the durable
+// at-most-once marker: a fresh observer re-running the terminal publish never
+// folds the ack a second time.
+func TestE2EDeferredCutoverTerminalFoldsCutoverAck(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         "org/repo-cutover-ack-fold",
+		pr:           156,
+		database:     "e2e_cutover_ack_fold_db",
+		applyState:   state.Apply.WaitingForCutover,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-ack-fold", 156, 12345, apply, state.Comment.Progress, "Copy complete — waiting for cutover")
+	progressID := requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The tick at the parked gate posts and tracks the cutover prompt.
+	obs.OnProgress(apply, []*storage.Task{task})
+	promptID := requireCommentCreate(t, capture)
+
+	// The operator's cutover command posts and tracks its acknowledgement at
+	// the bottom of the PR.
+	h.postAndTrackComment(ctx, "org/repo-cutover-ack-fold", 156, 12345, apply, state.Comment.CutoverAck,
+		templates.RenderCutoverCommandAccepted(templates.CutoverCommandAcceptedData{
+			ApplyID:     apply.ApplyIdentifier,
+			Environment: apply.Environment,
+			RequestedBy: "alice",
+		}))
+	ackID := requireCommentCreate(t, capture)
+
+	// The cutover completes the apply before another progress tick lands.
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	// The prompt is edited into the terminal summary, the tracked progress
+	// comment receives its status freeze, and the ack — now the bottom-most
+	// comment — is folded pointing at the summary.
+	requireCommentEdit(t, capture, promptID, "the terminal summary lands on the cutover prompt")
+	requireCommentEdit(t, capture, progressID, "the status freeze lands on the tracked progress comment")
+	foldEdit := requireCommentEdit(t, capture, ackID, "the fold lands on the cutover ack")
+	assert.Contains(t, foldEdit, fmt.Sprintf("#issuecomment-%d", promptID), "the folded ack links to the completion comment")
+	assert.Contains(t, foldEdit, "<details>", "the ack collapses into a details block")
+	assert.Contains(t, foldEdit, "Cutover Request Accepted", "the ack body is preserved inside the fold")
+
+	ack, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.CutoverAck)
+	require.NoError(t, err)
+	require.NotNil(t, ack)
+	assert.NotNil(t, ack.SupersededAt, "the fold consumes the ack row")
+
+	// A fresh observer re-running the terminal publish re-edits the prompt and
+	// the progress freeze, but the superseded ack row stops a second fold.
+	obs2 := f.newObserver(st, fake)
+	obs2.OnTerminal(apply, []*storage.Task{task})
+	for range 2 {
+		select {
+		case edited := <-capture.edits:
+			assert.NotEqual(t, ackID, edited.CommentID, "the ack is folded at most once")
+		case <-time.After(5 * time.Second):
+			t.Fatal("expected the second terminal publish to re-edit the prompt and the progress freeze")
+		}
+	}
+	select {
+	case edited := <-capture.edits:
+		t.Fatalf("the ack must not be edited again; got an extra edit on comment %d: %s", edited.CommentID, edited.Body)
+	case created := <-capture.creates:
+		t.Fatalf("a cutover apply's terminal publish must not post a new comment; got %d: %s", created.ID, created.Body)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// A cutover-driven apply that fails still folds the acknowledgement: the ack
+// carries no failure signal of its own — the failure summary the fold points
+// at is the comment that does — so the outcome stays the last meaningful
+// comment on the PR while the failure record stays fully visible.
+func TestE2EFailedDeferredCutoverFoldsCutoverAck(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-cutover-ack-fold-failed",
+		pr:         157,
+		database:   "e2e_cutover_ack_fold_failed_db",
+		applyState: state.Apply.WaitingForCutover,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, "org/repo-cutover-ack-fold-failed", 157, 12345, apply, state.Comment.Cutover, "Ready for cutover")
+	promptID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-cutover-ack-fold-failed", 157, 12345, apply, state.Comment.CutoverAck,
+		templates.RenderCutoverCommandAccepted(templates.CutoverCommandAcceptedData{
+			ApplyID:     apply.ApplyIdentifier,
+			Environment: apply.Environment,
+			RequestedBy: "alice",
+		}))
+	ackID := requireCommentCreate(t, capture)
+
+	apply.State = state.Apply.Failed
+	task.State = state.Task.Failed
+	obs := f.newObserver(st, clock.NewFake(task.CreatedAt))
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	promptEdit := requireCommentEdit(t, capture, promptID, "the failure summary lands on the cutover prompt")
+	assert.Contains(t, promptEdit, "Failed", "the prompt carries the failure outcome")
+	foldEdit := requireCommentEdit(t, capture, ackID, "the fold lands on the cutover ack")
+	assert.Contains(t, foldEdit, fmt.Sprintf("#issuecomment-%d", promptID), "the folded ack links to the failure summary")
+	assert.Contains(t, foldEdit, "Cutover Request Accepted", "the ack body is preserved inside the fold")
+
+	ack, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.CutoverAck)
+	require.NoError(t, err)
+	require.NotNil(t, ack)
+	assert.NotNil(t, ack.SupersededAt, "the fold consumes the ack row")
 }
 
 // An apply stopped at the deferred-cutover gate completes the prompt itself:
