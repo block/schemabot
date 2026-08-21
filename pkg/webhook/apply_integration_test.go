@@ -25,6 +25,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -305,6 +306,112 @@ func TestE2EApplyNoChanges(t *testing.T) {
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 	assert.Nil(t, lock, "expected no lock when there are no changes")
+}
+
+// TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck proves the safety property
+// documented on storeApplyPlanCheckRecord: when the apply command's no-changes
+// branch records its passing check, an in_progress row owned by a live apply
+// must survive untouched — the started apply remains authoritative for the
+// row's terminal outcome.
+//
+// The state is reachable: the active-apply gate only inspects applies while
+// this PR holds the lock, so a concurrent apply can claim the row between the
+// gate and the no-changes write. The test also pins the call-site choice —
+// swapping storeApplyPlanCheckRecord for the manual plan path would run
+// RecoverApplyOwnedCheckWithNoOpPlan, which releases same-head apply-owned
+// rows on exactly this write (completed/success/no-changes), and the ApplyID
+// assertion below would fail.
+func TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck(t *testing.T) {
+	dbName := "webhook_noop_preserves_apply_owned"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Pre-create the table so the apply command's plan finds no changes.
+	seedTargetTable(t, dbName,
+		"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	// A live apply owns the stored check row. The apply must be non-terminal so
+	// the pre-plan stale-check reconciliation leaves the row alone, and no lock
+	// is seeded so the command skips the active-apply gate and reaches the
+	// no-changes branch — the post-gate claim window this test materializes.
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-noop-preserve",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	// Same head SHA as the fake GitHub PR: the manual plan path's no-op
+	// recovery only releases same-head rows, so an old-SHA row would not
+	// discriminate the call-site swap this test guards against.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The no-changes branch must be the path taken: a regular plan comment,
+	// not a blocked-apply comment.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No schema changes detected")
+		assert.NotContains(t, body, "Apply Blocked")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for no-op plan comment")
+	}
+
+	// The apply-owned in_progress row survived the no-changes check write
+	// untouched: still in_progress, still owned by the live apply, plan facts
+	// unchanged. The running apply's terminal update remains the only writer
+	// that may complete this row.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusInProgress, check.Status,
+		"no-op apply plan must not complete a check owned by a live apply")
+	assert.Equal(t, applyID, check.ApplyID,
+		"no-op apply plan must not release a live apply's ownership claim")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.True(t, check.HasChanges,
+		"no-op apply plan must not rewrite the plan facts on an apply-owned row")
+	assert.Empty(t, check.Conclusion)
 }
 
 func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
