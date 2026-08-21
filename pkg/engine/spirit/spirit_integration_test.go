@@ -871,23 +871,24 @@ func TestNew_Defaults(t *testing.T) {
 
 	assert.NotNil(t, eng.logger, "expected logger to be set")
 	assert.NotNil(t, eng.linter, "expected linter to be set")
-	assert.Equal(t, DefaultTargetChunkTime, eng.targetChunkTime)
 	assert.Equal(t, DefaultThreads, eng.threads)
 	assert.Equal(t, DefaultLockWaitTimeout, eng.lockWaitTimeout)
+	// Pin the literal value so a change to the constant itself is caught here,
+	// not just propagation from Config into the engine.
+	assert.Equal(t, 10*time.Second, eng.lockWaitTimeout)
 }
 
 func TestNew_CustomConfig(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	eng := New(Config{
 		Logger:          logger,
-		TargetChunkTime: DefaultTargetChunkTime * 2,
 		Threads:         8,
 		LockWaitTimeout: DefaultLockWaitTimeout * 2,
 	})
 
 	assert.Equal(t, logger, eng.logger, "expected custom logger")
-	assert.Equal(t, DefaultTargetChunkTime*2, eng.targetChunkTime)
 	assert.Equal(t, 8, eng.threads)
+	assert.Equal(t, DefaultLockWaitTimeout*2, eng.lockWaitTimeout, "expected custom lock wait timeout to override the default")
 }
 
 func TestSetSchemaChangeCompleted(t *testing.T) {
@@ -2000,9 +2001,8 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{
-		Logger:          logger,
-		TargetChunkTime: 100 * time.Millisecond, // Small chunks for more progress updates (Spirit minimum is 100ms)
-		Threads:         1,                      // Start slow
+		Logger:  logger,
+		Threads: 1, // Start slow
 	})
 
 	ctx := t.Context()
@@ -2232,9 +2232,8 @@ func TestEngine_Stop_DuringAlterWithPendingDrop(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{
-		Logger:          logger,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         1,
+		Logger:  logger,
+		Threads: 1,
 	})
 
 	ctx := t.Context()

@@ -153,6 +153,9 @@ func NewCommandParser() *CommandParser {
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
 	Action string
+	// DeliveryID identifies the webhook delivery that carried the command for
+	// logs emitted by asynchronous command work.
+	DeliveryID string
 	// SuppressRetryComments is set by the durable driver so retryable failures
 	// do not post an answer the driver is about to supersede. The driver posts
 	// the single terminal answer after exhaustion; synchronous handling leaves

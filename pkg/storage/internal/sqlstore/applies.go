@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,13 +24,13 @@ import (
 
 // applyColumns lists all columns for SELECT queries.
 const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, database_type,
-	repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
+	repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, expected_operation_keys, engine,
 	state, error_message, options, attempt,
 	lease_owner, lease_token, lease_acquired_at,
 	created_at, started_at, completed_at, updated_at, revert_skipped_at`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
-	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.idempotency_key, a.engine,
+	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.idempotency_key, a.expected_operation_keys, a.engine,
 	a.state, a.error_message, a.options, a.attempt,
 	a.lease_owner, a.lease_token, a.lease_acquired_at,
 	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
@@ -546,15 +547,19 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		}
 	}
 
+	expectedOperationKeys, err := expectedOperationKeysValue(apply)
+	if err != nil {
+		return 0, err
+	}
 	id, err := s.identity.InsertID(ctx, writeTx.tx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
-			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
+			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, expected_operation_keys, engine,
 			state, error_message, options, attempt
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
-		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), apply.Engine,
+		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), expectedOperationKeys, apply.Engine,
 		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
@@ -569,6 +574,20 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	}
 
 	return id, nil
+}
+
+// expectedOperationKeysValue renders the expected_operation_keys column value
+// for an apply insert: NULL when the apply carries no generation manifest,
+// else the manifest as a JSON array.
+func expectedOperationKeysValue(apply *storage.Apply) (any, error) {
+	if len(apply.ExpectedOperationKeys) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(apply.ExpectedOperationKeys)
+	if err != nil {
+		return nil, fmt.Errorf("marshal expected operation keys for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return string(encoded), nil
 }
 
 // CreateWithTasks stores an apply and its initial tasks in one transaction.
@@ -704,15 +723,19 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		}
 	}
 
+	expectedOperationKeys, err := expectedOperationKeysValue(apply)
+	if err != nil {
+		return 0, err
+	}
 	id, err := s.identity.InsertID(ctx, writeTx.tx, `
 		INSERT INTO applies (
 			apply_identifier, lock_id, plan_id, database_name, database_type,
-			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, engine,
+			repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, expected_operation_keys, engine,
 			state, error_message, options, attempt
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		apply.ApplyIdentifier, apply.LockID, apply.PlanID, apply.Database, apply.DatabaseType,
-		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), apply.Engine,
+		apply.Repository, apply.PullRequest, apply.Environment, apply.Deployment, apply.Caller, apply.InstallationID, apply.ExternalID, nullString(apply.IdempotencyKey), expectedOperationKeys, apply.Engine,
 		apply.State, apply.ErrorMessage, string(options), apply.Attempt,
 	)
 	if err != nil {
@@ -2405,13 +2428,13 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 	var apply storage.Apply
 	var leaseAcquiredAt, startedAt, completedAt, revertSkippedAt sql.NullTime
 	var idempotencyKey sql.NullString
-	var options []byte
+	var options, expectedOperationKeys []byte
 
 	err := s.Scan(
 		&apply.ID, &apply.ApplyIdentifier, &apply.LockID, &apply.PlanID,
 		&apply.Database, &apply.DatabaseType,
 		&apply.Repository, &apply.PullRequest, &apply.Environment, &apply.Deployment,
-		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &idempotencyKey, &apply.Engine,
+		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &idempotencyKey, &expectedOperationKeys, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
 		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt,
@@ -2422,6 +2445,11 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 
 	apply.IdempotencyKey = idempotencyKey.String
 	apply.Options = options
+	if len(expectedOperationKeys) > 0 {
+		if err := json.Unmarshal(expectedOperationKeys, &apply.ExpectedOperationKeys); err != nil {
+			return nil, fmt.Errorf("unmarshal expected_operation_keys for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+	}
 
 	if leaseAcquiredAt.Valid {
 		apply.LeaseAcquiredAt = &leaseAcquiredAt.Time

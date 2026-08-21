@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -102,13 +103,18 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 1: Generate plan
 	var planResult *apitypes.PlanResponse
+	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces)
 		return planErr
 	})
 	if err != nil {
 		return err
+	}
+	if cmd.Output != OutputFormatJSON {
+		templates.WriteIgnoredNamespaces(ignoredNamespaces,
+			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
 	}
 
 	// Validate engine-specific options
@@ -141,7 +147,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Check for unsafe changes
-	if planResult.HasErrors() && !cmd.AllowUnsafe {
+	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
@@ -173,7 +179,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
 
 	// Show unsafe warning if --allow-unsafe was used
-	if planResult.HasErrors() && cmd.AllowUnsafe {
+	if cmd.AllowUnsafe {
 		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges())
 	}
 

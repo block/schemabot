@@ -350,3 +350,49 @@ func TestVSchemaPredicates(t *testing.T) {
 		}
 	})
 }
+
+// The generation manifest is the completion authority for a deployment-keyed
+// apply: an operation key outside it must never attach, and the apply must not
+// complete while a declared key has no attached row. An apply without a
+// manifest keeps the attached-rows-only semantics.
+func TestApplyGenerationManifestHelpers(t *testing.T) {
+	t.Run("AllowsOperationKey", func(t *testing.T) {
+		var noApply *Apply
+		assert.True(t, noApply.AllowsOperationKey("commerce/-80/users"),
+			"a missing apply row cannot refuse; the caller's own guards decide")
+
+		noManifest := &Apply{}
+		assert.True(t, noManifest.AllowsOperationKey("commerce/-80/users"),
+			"an apply without a manifest accepts any key")
+
+		apply := &Apply{ExpectedOperationKeys: []string{"commerce/-80/users", "commerce/80-/users"}}
+		assert.True(t, apply.AllowsOperationKey("commerce/80-/users"))
+		assert.False(t, apply.AllowsOperationKey("commerce/c0-/users"),
+			"a key the completion gate never waits for must be refused")
+	})
+
+	t.Run("MissingExpectedOperationKeys", func(t *testing.T) {
+		attached := func(keys ...string) []*ApplyOperation {
+			ops := make([]*ApplyOperation, 0, len(keys))
+			for _, key := range keys {
+				ops = append(ops, &ApplyOperation{OperationKey: key})
+			}
+			return ops
+		}
+
+		noManifest := &Apply{}
+		assert.Nil(t, noManifest.MissingExpectedOperationKeys(attached("commerce/-80/users")),
+			"no manifest means nothing can be missing")
+
+		apply := &Apply{ExpectedOperationKeys: []string{
+			"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer",
+		}}
+		assert.Equal(t, []string{"commerce/80-/users", "commerce/group_finalizer"},
+			apply.MissingExpectedOperationKeys(attached("commerce/-80/users")),
+			"every declared key without an attached row is missing, finalizers included")
+		assert.Nil(t,
+			apply.MissingExpectedOperationKeys(attached(
+				"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer")),
+			"a fully attached manifest has no missing keys")
+	})
+}

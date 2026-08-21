@@ -15,177 +15,93 @@ func TestVolumeToSpiritSettings(t *testing.T) {
 	// Volumes 1-5 use fixed thread counts regardless of CPU hint.
 
 	t.Run("volume 1 - minimal", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(1, 20)
-		assert.Equal(t, 1, threads)
-		assert.Equal(t, 100*time.Millisecond, chunkTime)
-		assert.Equal(t, 10*time.Second, lockTimeout)
+		assert.Equal(t, 1, volumeToSpiritSettings(1, 20))
 	})
 
 	t.Run("volume 2 - conservative", func(t *testing.T) {
 		// CPUs not factored, always 2
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(2, 20)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 500*time.Millisecond, chunkTime)
-		assert.Equal(t, 15*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(2, 48)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 500*time.Millisecond, chunkTime)
-		assert.Equal(t, 15*time.Second, lockTimeout)
+		assert.Equal(t, 2, volumeToSpiritSettings(2, 20))
+		assert.Equal(t, 2, volumeToSpiritSettings(2, 48))
 	})
 
 	t.Run("volume 3 - default", func(t *testing.T) {
 		// CPUs not factored, always 2
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(3, 20)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 30*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(3, 48)
-		assert.Equal(t, 2, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 30*time.Second, lockTimeout)
+		assert.Equal(t, 2, volumeToSpiritSettings(3, 20))
+		assert.Equal(t, 2, volumeToSpiritSettings(3, 48))
 	})
 
 	t.Run("volume 4", func(t *testing.T) {
 		// CPUs not factored, always 4
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(4, 20)
-		assert.Equal(t, 4, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(4, 48)
-		assert.Equal(t, 4, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
+		assert.Equal(t, 4, volumeToSpiritSettings(4, 20))
+		assert.Equal(t, 4, volumeToSpiritSettings(4, 48))
 	})
 
 	t.Run("volume 5", func(t *testing.T) {
 		// CPUs not factored, always 8
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(5, 20)
-		assert.Equal(t, 8, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, chunkTime, lockTimeout = volumeToSpiritSettings(5, 48)
-		assert.Equal(t, 8, threads)
-		assert.Equal(t, 2*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
+		assert.Equal(t, 8, volumeToSpiritSettings(5, 20))
+		assert.Equal(t, 8, volumeToSpiritSettings(5, 48))
 	})
 
 	// Volumes 6-11 use CPU-scaled thread counts, capped at maxThreads.
 	// Thread counts are capped at maxThreads (16).
 
 	t.Run("volume 6 - ceil(cpus/16)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(6, 20)
-		assert.Equal(t, 2, threads) // ceil(20/16) = 2
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(6, 48)
-		assert.Equal(t, 3, threads) // ceil(48/16) = 3
-
-		threads, _, _ = volumeToSpiritSettings(6, 128)
-		assert.Equal(t, 8, threads) // ceil(128/16) = 8
+		assert.Equal(t, 2, volumeToSpiritSettings(6, 20))  // ceil(20/16) = 2
+		assert.Equal(t, 3, volumeToSpiritSettings(6, 48))  // ceil(48/16) = 3
+		assert.Equal(t, 8, volumeToSpiritSettings(6, 128)) // ceil(128/16) = 8
 	})
 
 	t.Run("volume 7 - ceil(cpus/12)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(7, 20)
-		assert.Equal(t, 2, threads) // ceil(20/12) = 2
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(7, 48)
-		assert.Equal(t, 4, threads) // ceil(48/12) = 4
-
-		threads, _, _ = volumeToSpiritSettings(7, 128)
-		assert.Equal(t, 11, threads) // ceil(128/12) = 11
+		assert.Equal(t, 2, volumeToSpiritSettings(7, 20))   // ceil(20/12) = 2
+		assert.Equal(t, 4, volumeToSpiritSettings(7, 48))   // ceil(48/12) = 4
+		assert.Equal(t, 11, volumeToSpiritSettings(7, 128)) // ceil(128/12) = 11
 	})
 
 	t.Run("volume 8 - ceil(cpus/8)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(8, 20)
-		assert.Equal(t, 3, threads) // ceil(20/8) = 3
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(8, 48)
-		assert.Equal(t, 6, threads) // ceil(48/8) = 6
-
-		threads, _, _ = volumeToSpiritSettings(8, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/8) = 16
+		assert.Equal(t, 3, volumeToSpiritSettings(8, 20))           // ceil(20/8) = 3
+		assert.Equal(t, 6, volumeToSpiritSettings(8, 48))           // ceil(48/8) = 6
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(8, 128)) // ceil(128/8) = 16
 	})
 
 	t.Run("volume 9 - ceil(cpus/6)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(9, 20)
-		assert.Equal(t, 4, threads) // ceil(20/6) = 4
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 60*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(9, 48)
-		assert.Equal(t, 8, threads) // ceil(48/6) = 8
-
+		assert.Equal(t, 4, volumeToSpiritSettings(9, 20)) // ceil(20/6) = 4
+		assert.Equal(t, 8, volumeToSpiritSettings(9, 48)) // ceil(48/6) = 8
 		// ceil(128/6) = 22, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(9, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/6) = 22, capped
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(9, 128))
 	})
 
 	t.Run("volume 10 - ceil(cpus/4)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(10, 20)
-		assert.Equal(t, 5, threads) // ceil(20/4) = 5
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 600*time.Second, lockTimeout)
-
-		threads, _, _ = volumeToSpiritSettings(10, 48)
-		assert.Equal(t, 12, threads) // ceil(48/4) = 12
-
+		assert.Equal(t, 5, volumeToSpiritSettings(10, 20))  // ceil(20/4) = 5
+		assert.Equal(t, 12, volumeToSpiritSettings(10, 48)) // ceil(48/4) = 12
 		// ceil(128/4) = 32, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(10, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/4) = 32, capped
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(10, 128))
 	})
 
 	t.Run("volume 11 - ceil(cpus/2)", func(t *testing.T) {
-		threads, chunkTime, lockTimeout := volumeToSpiritSettings(11, 20)
-		assert.Equal(t, 10, threads) // ceil(20/2) = 10
-		assert.Equal(t, 5*time.Second, chunkTime)
-		assert.Equal(t, 600*time.Second, lockTimeout)
-
+		assert.Equal(t, 10, volumeToSpiritSettings(11, 20)) // ceil(20/2) = 10
 		// ceil(48/2) = 24, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(11, 48)
-		assert.Equal(t, maxThreads, threads) // ceil(48/2) = 24, capped
-
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(11, 48))
 		// ceil(128/2) = 64, capped to maxThreads.
-		threads, _, _ = volumeToSpiritSettings(11, 128)
-		assert.Equal(t, maxThreads, threads) // ceil(128/2) = 64, capped
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(11, 128))
 	})
 }
 
 func TestVolumeToSpiritSettings_NoCPUHint(t *testing.T) {
 	// When cpuHint is 0, volumes 6-11 fall back to fixed thread counts.
 	t.Run("fallback thread counts", func(t *testing.T) {
-		threads, _, _ := volumeToSpiritSettings(6, 0)
-		assert.Equal(t, 8, threads)
-
-		threads, _, _ = volumeToSpiritSettings(7, 0)
-		assert.Equal(t, 8, threads)
-
-		threads, _, _ = volumeToSpiritSettings(8, 0)
-		assert.Equal(t, 12, threads)
-
-		threads, _, _ = volumeToSpiritSettings(9, 0)
-		assert.Equal(t, 12, threads)
-
-		threads, _, _ = volumeToSpiritSettings(10, 0)
-		assert.Equal(t, maxThreads, threads)
-
-		threads, _, _ = volumeToSpiritSettings(11, 0)
-		assert.Equal(t, maxThreads, threads)
+		assert.Equal(t, 8, volumeToSpiritSettings(6, 0))
+		assert.Equal(t, 8, volumeToSpiritSettings(7, 0))
+		assert.Equal(t, 12, volumeToSpiritSettings(8, 0))
+		assert.Equal(t, 12, volumeToSpiritSettings(9, 0))
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(10, 0))
+		assert.Equal(t, maxThreads, volumeToSpiritSettings(11, 0))
 	})
 }
 
 func TestVolumeToSpiritSettings_ThreadCap(t *testing.T) {
 	// Even with very high CPU hints, threads never exceed maxThreads.
 	for vol := int32(6); vol <= 11; vol++ {
-		threads, _, _ := volumeToSpiritSettings(vol, 256)
+		threads := volumeToSpiritSettings(vol, 256)
 		require.LessOrEqual(t, threads, maxThreads, "volume %d with 256 CPUs exceeded max threads", vol)
 		require.GreaterOrEqual(t, threads, 2, "volume %d returned fewer than 2 threads", vol)
 	}
@@ -236,14 +152,12 @@ func TestCPUScaledThreads(t *testing.T) {
 }
 
 func TestSettingsToVolume(t *testing.T) {
-	assert.Equal(t, int32(1), settingsToVolume(1, 100*time.Millisecond))
-	assert.Equal(t, int32(2), settingsToVolume(2, 500*time.Millisecond))
-	assert.Equal(t, int32(3), settingsToVolume(2, 2*time.Second))
-	assert.Equal(t, int32(4), settingsToVolume(4, 2*time.Second))
-	assert.Equal(t, int32(5), settingsToVolume(8, 2*time.Second))
-	assert.Equal(t, int32(6), settingsToVolume(8, 5*time.Second))
-	assert.Equal(t, int32(8), settingsToVolume(12, 5*time.Second))
-	assert.Equal(t, int32(10), settingsToVolume(maxThreads, 5*time.Second))
+	assert.Equal(t, int32(1), settingsToVolume(1))
+	assert.Equal(t, int32(3), settingsToVolume(2)) // the documented default; vol 2 shares this thread count
+	assert.Equal(t, int32(4), settingsToVolume(4))
+	assert.Equal(t, int32(5), settingsToVolume(8))
+	assert.Equal(t, int32(8), settingsToVolume(12))
+	assert.Equal(t, int32(10), settingsToVolume(maxThreads))
 }
 
 // Volume adjustments store a stopped state so Spirit can resume from checkpoint
@@ -301,14 +215,12 @@ func TestVolumeReportsRunningWhileStoredStoppedStateRestarts(t *testing.T) {
 // rm.wg.
 func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
 	rm := &runningSchemaChange{
-		database:        "testdb",
-		tableNamespace:  map[string]string{},
-		state:           engine.StateRunning,
-		host:            "127.0.0.1:1",
-		username:        "root",
-		threads:         eng.threads,
-		targetChunkTime: eng.targetChunkTime,
-		lockWaitTimeout: eng.lockWaitTimeout,
+		database:       "testdb",
+		tableNamespace: map[string]string{},
+		state:          engine.StateRunning,
+		host:           "127.0.0.1:1",
+		username:       "root",
+		threads:        eng.threads,
 	}
 	eng.mu.Lock()
 	eng.runningSchemaChange = rm
@@ -366,17 +278,14 @@ func TestVolumeScopedToRunningSchemaChange(t *testing.T) {
 	result := adjustVolume(t, eng, rm, 11)
 	assert.Equal(t, int32(11), result.NewVolume)
 
-	wantThreads, wantChunkTime, wantLockTimeout := volumeToSpiritSettings(11, 0)
+	wantThreads := volumeToSpiritSettings(11, 0)
 	eng.mu.Lock()
 	assert.Equal(t, wantThreads, rm.threads)
-	assert.Equal(t, wantChunkTime, rm.targetChunkTime)
-	assert.Equal(t, wantLockTimeout, rm.lockWaitTimeout)
 	assert.Equal(t, int32(11), rm.volume)
 	eng.mu.Unlock()
 
 	// The engine's configured defaults are not modified by the adjustment.
 	assert.Equal(t, DefaultThreads, eng.threads)
-	assert.Equal(t, DefaultTargetChunkTime, eng.targetChunkTime)
 	assert.Equal(t, DefaultLockWaitTimeout, eng.lockWaitTimeout)
 
 	eng.Drain()
@@ -399,9 +308,8 @@ func TestVolumeScopedToRunningSchemaChange(t *testing.T) {
 	require.NoError(t, err)
 	defer eng.Drain()
 
-	threads, chunkTime, lockTimeout := eng.copySettings()
+	threads, lockTimeout := eng.copySettings()
 	assert.Equal(t, DefaultThreads, threads)
-	assert.Equal(t, DefaultTargetChunkTime, chunkTime)
 	assert.Equal(t, DefaultLockWaitTimeout, lockTimeout)
 	eng.mu.Lock()
 	assert.Equal(t, int32(0), eng.runningSchemaChange.volume)
@@ -414,7 +322,9 @@ func TestVolumeReportingUsesExplicitPerChangeValue(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
 
-	// The change starts on the configured defaults, which map to volume 3.
+	// The change starts on the configured defaults (2 threads), the documented
+	// default of volume 3 — even though volume 2 now derives the same thread
+	// count since lock wait timeout no longer varies by volume.
 	result := adjustVolume(t, eng, rm, 7)
 	assert.Equal(t, int32(3), result.PreviousVolume)
 	assert.Equal(t, int32(7), result.NewVolume)
@@ -439,6 +349,23 @@ func TestVolumeReportingUsesExplicitPerChangeValue(t *testing.T) {
 	eng.Drain()
 }
 
+// setSchemaChangeVolume must not apply settings, and Volume must not report
+// success, when the schema change it targets is no longer the tracked one —
+// e.g. it completed and a new change started while a volume adjustment was
+// in flight.
+func TestSetSchemaChangeVolumeNotAppliedWhenUntracked(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{database: "otherdb", threads: eng.threads}
+	eng.mu.Unlock()
+
+	applied := eng.setSchemaChangeVolume(rm, 7, 8)
+	assert.False(t, applied, "expected no-op when rm is no longer the tracked schema change")
+	assert.Equal(t, int32(0), rm.volume, "stale rm must not be mutated")
+}
+
 // Copy settings are shared between volume adjustments, progress pollers, and
 // the schema change execution path; adjusting volume while the settings are
 // read concurrently must be safe.
@@ -455,9 +382,8 @@ func TestVolumeConcurrentWithSettingsReads(t *testing.T) {
 				return
 			default:
 			}
-			threads, chunkTime, lockTimeout := eng.copySettings()
+			threads, lockTimeout := eng.copySettings()
 			assert.Positive(t, threads)
-			assert.Positive(t, chunkTime)
 			assert.Positive(t, lockTimeout)
 			_, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
 			assert.NoError(t, err)

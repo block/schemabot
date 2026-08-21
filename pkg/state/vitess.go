@@ -47,3 +47,34 @@ func IsTerminalVitessState(s string) bool {
 		return false
 	}
 }
+
+// EffectiveVitessState resolves a Vitess status using its authoritative
+// ready_to_complete cutover-readiness signal. The flag can be set while the
+// status still reads running during a brief race, or queued, requested, or
+// ready for immediate operations such as CREATE or DROP TABLE. Terminal
+// statuses always win because Vitess can leave the flag set after cancel or
+// failure. The returned status is canonicalized to lower case so callers can
+// compare it against the Vitess constants regardless of how
+// SHOW VITESS_MIGRATIONS cased it.
+func EffectiveVitessState(status string, readyToComplete bool) string {
+	if readyToComplete && !IsTerminalVitessState(status) {
+		return Vitess.ReadyToComplete
+	}
+	return strings.ToLower(status)
+}
+
+// IsKnownVitessState reports whether a status is one of the Vitess OnlineDDL
+// statuses SchemaBot recognizes, including the synthesized ready_to_complete
+// state. Comparison is case-insensitive so it tolerates whatever casing
+// SHOW VITESS_MIGRATIONS reports. Callers use this to surface genuinely
+// unrecognized statuses (a new or malformed Vitess value) before resolving
+// them through EffectiveVitessState.
+func IsKnownVitessState(s string) bool {
+	switch strings.ToLower(s) {
+	case Vitess.Requested, Vitess.Cancelled, Vitess.Queued, Vitess.Ready,
+		Vitess.Running, Vitess.Complete, Vitess.Failed, Vitess.ReadyToComplete:
+		return true
+	default:
+		return false
+	}
+}

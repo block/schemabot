@@ -294,6 +294,11 @@ type PulledNamespace struct {
 	Artifacts        map[string]string        `json:"artifacts,omitempty"`
 	NamespaceCatalog *NamespaceCatalog        `json:"namespace_catalog,omitempty"`
 	TableCatalog     map[string]*TableCatalog `json:"table_catalog,omitempty"`
+	// Lint holds the schema lint violations for this namespace's tables,
+	// populated only when the pull request asked for linting. A namespace
+	// with no violations serializes as an explicit empty list so a clean
+	// audit is distinguishable from lint not being requested (omitted).
+	Lint []*LintViolationResponse `json:"lint,omitzero"`
 }
 
 // NamespaceCatalog contains structured metadata for a pulled namespace.
@@ -354,6 +359,10 @@ type PullSchemaRequest struct {
 	Type          string   `json:"type"`
 	Namespaces    []string `json:"namespaces,omitempty"`
 	CatalogDetail string   `json:"catalog_detail,omitempty"`
+	// Lint runs the schema linters over every pulled table and attaches the
+	// violations to each namespace, so a caller can audit a database's lint
+	// debt without planning a change. Off by default.
+	Lint bool `json:"lint,omitempty"`
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
@@ -398,6 +407,12 @@ type PlanRequest struct {
 	// cross-delivery race where HEAD advances between plan and confirm.
 	// Optional — absent for non-webhook callers (e.g. CLI plan invocations without a PR).
 	HeadSHA *string `json:"head_sha,omitempty"`
+	// IgnoredNamespaces lists the namespaces the caller removed from
+	// SchemaFiles per the config's ignore_namespaces, resolved for the
+	// environment. The data plane refuses engine shapes that diff the whole
+	// target as one unit (a database-scoped MySQL DSN), where a withheld
+	// namespace's live tables would otherwise be planned as drops.
+	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -458,6 +473,58 @@ type ShardPlanResponse struct {
 	Changes   []*TableChangeResponse `json:"changes,omitempty"`
 }
 
+// PlanSummaryResponse is one stored plan in the GET /api/plans listing: its
+// provenance plus change counts derived from the stored plan data, without
+// the plan content itself.
+type PlanSummaryResponse struct {
+	PlanID       string `json:"plan_id"`
+	Database     string `json:"database"`
+	DatabaseType string `json:"database_type"`
+	Deployment   string `json:"deployment,omitempty"`
+	Environment  string `json:"environment"`
+	// Repository and PullRequest identify the PR the plan was generated for.
+	// Both empty means an ad-hoc plan, such as a CLI plan invocation without
+	// a PR.
+	Repository  string    `json:"repository,omitempty"`
+	PullRequest int       `json:"pull_request,omitempty"`
+	HeadSHA     string    `json:"head_sha,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	// ChangeCounts maps a change operation ("create", "alter", "drop", ...) to
+	// how many table changes of that operation the plan carries across every
+	// namespace. Empty for a no-change plan.
+	ChangeCounts map[string]int `json:"change_counts,omitempty"`
+	// UnsafeCount is how many of those table changes the planner marked
+	// unsafe.
+	UnsafeCount int `json:"unsafe_count,omitempty"`
+	// BlockedCount is how many of those table changes the engine will
+	// deterministically refuse (execution mode "blocked").
+	BlockedCount int `json:"blocked_count,omitempty"`
+	// VSchemaChangeCount is how many namespaces carry a VSchema change.
+	VSchemaChangeCount int `json:"vschema_change_count,omitempty"`
+}
+
+// PlansResponse is the HTTP response for GET /api/plans.
+type PlansResponse struct {
+	Limit    int  `json:"limit"`
+	MaxLimit int  `json:"max_limit"`
+	HasMore  bool `json:"has_more"`
+	// Last echoes the requested creation window, when one was given.
+	Last  string                 `json:"last,omitempty"`
+	Plans []*PlanSummaryResponse `json:"plans"`
+}
+
+// StoredPlanResponse is the HTTP response for GET /api/plans/{plan_identifier}:
+// the summary plus the full stored plan content, reconstructed in the same
+// shape POST /api/plan returns so plan rendering is shared. Lint results and
+// errors are not persisted with a plan, so Plan carries changes only —
+// their absence means "not stored", not "clean".
+type StoredPlanResponse struct {
+	PlanSummaryResponse
+	SchemaPath string        `json:"schema_path,omitempty"`
+	Target     string        `json:"target,omitempty"`
+	Plan       *PlanResponse `json:"plan"`
+}
+
 // HasErrors returns true if any lint result has error severity.
 func (r *PlanResponse) HasErrors() bool {
 	for _, w := range r.LintResults {
@@ -476,9 +543,10 @@ type UnsafeChange struct {
 	ChangeType string
 }
 
-// UnsafeChanges returns all table changes marked as unsafe across all
-// namespaces. DROP table changes are treated as unsafe even when an engine omits
-// IsUnsafe, so destructive table deletion fails closed.
+// UnsafeChanges returns all changes marked as unsafe across all namespaces:
+// unsafe table changes, VSchema removals, and in-place vindex mutations. DROP
+// table changes are treated as unsafe even when an engine omits IsUnsafe, so
+// destructive table deletion fails closed.
 func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 	if r == nil {
 		return nil
@@ -493,6 +561,7 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 				result = append(result, unsafeChange)
 			}
 		}
+		result = append(result, sc.VSchemaUnsafeChanges()...)
 	}
 	return result
 }

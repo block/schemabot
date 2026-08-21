@@ -103,6 +103,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -622,7 +623,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply); err != nil {
+	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
 	resp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
@@ -1380,6 +1381,13 @@ type applyTaskScope struct {
 	// tasklessOperation is true when the claimed operation carries no task rows,
 	// so nothing derives its terminal state but this drive.
 	tasklessOperation bool
+
+	// deploymentOperationKeys is the full operation-key set of the claimed
+	// operation's deployment, captured from the parent's operation rows at claim
+	// load. Deployment-keyed dispatches send it as the generation manifest so
+	// the data plane knows the whole generation from the first dispatch. Empty
+	// for whole-apply scopes.
+	deploymentOperationKeys []string
 }
 
 func wholeApplyTaskScope() applyTaskScope {
@@ -1424,15 +1432,12 @@ func (s applyTaskScope) tasklessOperationScope() bool {
 
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
 // Progress/Stop/Start/Cutover calls. Operation-owning drives read the claimed
-// operation's external_id (which may be empty before dispatch); whole-apply
-// drives read the parent external_id.
+// operation's recorded remote apply id (which may be empty before dispatch);
+// whole-apply drives read the parent external_id.
 func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 	if s.usesOperationRemoteResume() {
-		if s.operation.ExternalID != "" {
-			return s.operation.ExternalID
-		}
-		if s.operation.EngineResumeContext != "" {
-			return s.operation.EngineResumeContext
+		if id := s.operation.RemoteApplyID(); id != "" {
+			return id
 		}
 		// A sole operation's remote apply id is unambiguously its own, so a drive
 		// that finds one recorded on the parent resumes it rather than dispatching
@@ -1446,6 +1451,31 @@ func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 		return ""
 	}
 	return apply.ExternalID
+}
+
+// generationOperationKeys returns the generation manifest a deployment-keyed
+// dispatch carries: every operation key this deployment will send to the
+// shared remote apply under the dispatch's idempotency key, the dispatch's own
+// key included. It is non-empty exactly when the dispatch is deployment-keyed
+// (usesOperationRemoteResume, mirroring remoteApplyIdempotencyKey): those are
+// the dispatches that arrive one operation at a time, so the data plane needs
+// the whole expected set to know when the shared apply's generation is
+// complete. Whole-apply dispatches carry none — the dispatch is the whole
+// generation.
+//
+// A deliberate retry (the operation's own attempt above zero) declares only
+// its own key, mirroring its operation-scoped idempotency key: the retry's
+// remote apply receives exactly this one operation, and declaring the whole
+// deployment set would hold that apply open forever for siblings that are
+// never redispatched.
+func (s applyTaskScope) generationOperationKeys() []string {
+	if !s.usesOperationRemoteResume() {
+		return nil
+	}
+	if s.operation.Attempt > 0 {
+		return []string{s.operation.OperationKey}
+	}
+	return s.deploymentOperationKeys
 }
 
 // dispatchState returns the state that governs the dispatch / ambiguity
@@ -1486,20 +1516,25 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		return applyTaskScope{}, fmt.Errorf("list operations for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	found := false
+	deploymentOperationKeys := make([]string, 0, len(ops))
 	for _, op := range ops {
 		if op.ID == applyOperationID {
 			found = true
-			break
+		}
+		if op.Deployment == operation.Deployment {
+			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}
 	if !found {
 		return applyTaskScope{}, fmt.Errorf("apply_operation %d is not part of apply %s operation set", applyOperationID, apply.ApplyIdentifier)
 	}
+	slices.Sort(deploymentOperationKeys)
 	return applyTaskScope{
-		applyOperationID:   applyOperationID,
-		operation:          operation,
-		multiOperation:     len(ops) > 1,
-		operationLeaseOnly: operationLeaseOnly(ctx),
+		applyOperationID:        applyOperationID,
+		operation:               operation,
+		multiOperation:          len(ops) > 1,
+		operationLeaseOnly:      operationLeaseOnly(ctx),
+		deploymentOperationKeys: deploymentOperationKeys,
 	}, nil
 }
 
@@ -1522,22 +1557,29 @@ func operationLeaseOnly(ctx context.Context) bool {
 // reused rather than duplicated — and rotates when the dispatched work is
 // deliberately retried.
 //
-// Operation-scoped drives key on the deployment, not the individual operation:
-// every sibling operation a deployment dispatches in one generation carries the
-// same key, so the data plane lands them on one remote apply — the first
-// dispatch creates it, each sibling attaches its own operation, and the data
-// plane tells the dispatches apart by the operation key it derives from each
-// request's shape. The generation is the operation's own attempt, never the
-// shared apply.Attempt: the parent counter advances when any sibling operation
-// of any deployment is redispatched (it feeds the apply's retry budget), so
-// keying on it would let one deployment's genuine retry rotate the key under
-// another deployment's orphaned dispatch and duplicate its remote apply.
-// Siblings of one deployment share a key because their attempts advance in
-// lockstep within a generation — they all start at zero and only a deliberate
-// per-operation redispatch advances one. Whole-apply drives key on the parent
-// apply alone and rotate on its attempt. The tuple is hashed so the stored key
-// stays within the column width and is free of delimiter collisions between
-// variable-length identifiers.
+// Operation-scoped drives key generation zero on the deployment, not the
+// individual operation: every sibling operation a deployment dispatches in its
+// first generation carries the same key, so the data plane lands them on one
+// remote apply — the first dispatch creates it, each sibling attaches its own
+// operation, and the data plane tells the dispatches apart by the operation
+// key it derives from each request's shape. The generation is the operation's
+// own attempt, never the shared apply.Attempt: the parent counter advances
+// when any sibling operation of any deployment is redispatched (it feeds the
+// apply's retry budget), so keying on it would let one deployment's genuine
+// retry rotate the key under another deployment's orphaned dispatch and
+// duplicate its remote apply.
+//
+// A deliberate retry (the operation's own attempt above zero) keys on the
+// operation as well: a retry redispatches only its own operation — siblings
+// that succeeded stay on the generation-zero apply and are never sent again —
+// so a deployment-shared retry key would land the retry on a remote apply
+// whose declared generation includes work that can never arrive, and its
+// completion gate would hold it open forever. An operation-scoped key gives
+// each retried operation its own remote apply that completes on its own work.
+//
+// Whole-apply drives key on the parent apply alone and rotate on its attempt.
+// The tuple is hashed so the stored key stays within the column width and is
+// free of delimiter collisions between variable-length identifiers.
 func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) string {
 	parts := []string{
 		"schemabot-remote-apply-v1",
@@ -1545,6 +1587,9 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 	}
 	if scope.usesOperationRemoteResume() {
 		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(scope.operation.Attempt))
+		if scope.operation.Attempt > 0 {
+			parts = append(parts, "operation", scope.operation.OperationKey)
+		}
 	} else {
 		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
 	}
@@ -1625,7 +1670,21 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	if remoteOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != remoteOperationID {
 		return fmt.Errorf("apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", op.ID, current.ExternalOperationID, remoteOperationID)
 	}
-	if err := c.storage.ApplyOperations().SaveExternalID(ctx, op.ID, remoteID); err != nil {
+	if err := c.storage.ApplyOperations().SaveExternalID(ctx, apply.ID, op.ID, remoteID); err != nil {
+		// The store re-verifies the deployment invariant under row locks inside
+		// the writing transaction, so a sibling dispatch that persisted between
+		// the guard's read above and this write still cannot give the deployment
+		// a second remote apply — it is refused here instead.
+		if errors.Is(err, storage.ErrRemoteApplyDeploymentIDConflict) {
+			c.applyLogger(apply).ErrorContext(ctx, "a concurrent sibling dispatch recorded a different remote apply id for the deployment; refusing to give one deployment two remote applies",
+				append(apply.MutableLogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", current.Deployment,
+					"operation_key", current.OperationKey,
+					"refused_remote_apply_id", remoteID,
+					"error", err)...)
+			metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
+		}
 		return fmt.Errorf("store remote apply id for apply_operation %d: %w", op.ID, err)
 	}
 	op.ExternalID = remoteID
@@ -1652,6 +1711,11 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 // (the planes diverged before this dispatch) or between the siblings and the
 // id this dispatch returned. Sibling deployments of the same apply are
 // exempt: they own their own remote applies.
+//
+// This read is unlocked, so it exists for precise triage logging on the
+// common divergence shapes; the authoritative check is the store's, which
+// re-verifies the same invariant under row locks inside the writing
+// transaction so concurrent sibling persists serialize.
 func (c *GRPCClient) guardDeploymentRemoteApplyID(ctx context.Context, apply *storage.Apply, current *storage.ApplyOperation, remoteID string) error {
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -2078,7 +2142,19 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		}
 		changes := make([]*ternv1.TableChange, 0, len(namespaces))
 		for _, namespace := range namespaces {
-			changes = append(changes, &ternv1.TableChange{Namespace: namespace, TableName: "VSchema: " + namespace, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA})
+			// Carry the namespace's persisted VSchema change-metadata so a
+			// deployment materializing the plan from this dispatch runs the
+			// same apply-time safety gates as one reading its own stored plan.
+			var meta map[string]string
+			if nsData := plan.Namespaces[namespace]; nsData != nil {
+				meta = storage.VSchemaPlanMetadata(nsData.Metadata)
+			}
+			changes = append(changes, &ternv1.TableChange{
+				Namespace:  namespace,
+				TableName:  "VSchema: " + namespace,
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+				Metadata:   meta,
+			})
 		}
 		req := &ternv1.ApplyRequest{
 			PlanId:      plan.PlanIdentifier,
@@ -2091,7 +2167,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			Target:      target,
 			Caller:      apply.Caller,
 			// No TargetShards: the VSchema is namespace-level, not per shard.
-			IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
+			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
+			GenerationOperationKeys: scope.generationOperationKeys(),
 		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
@@ -2831,17 +2908,18 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	}
 
 	req := &ternv1.ApplyRequest{
-		PlanId:         plan.PlanIdentifier,
-		Options:        options,
-		Database:       apply.Database,
-		Type:           apply.DatabaseType,
-		DdlChanges:     tasksToProtoTableChanges(tasks),
-		SchemaFiles:    schemaFilesToProto(plan.SchemaFiles),
-		Environment:    apply.Environment,
-		Target:         target,
-		Caller:         apply.Caller,
-		TargetShards:   targetShards,
-		IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
+		PlanId:                  plan.PlanIdentifier,
+		Options:                 options,
+		Database:                apply.Database,
+		Type:                    apply.DatabaseType,
+		DdlChanges:              tasksToProtoTableChanges(tasks),
+		SchemaFiles:             schemaFilesToProto(plan.SchemaFiles),
+		Environment:             apply.Environment,
+		Target:                  target,
+		Caller:                  apply.Caller,
+		TargetShards:            targetShards,
+		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
+		GenerationOperationKeys: scope.generationOperationKeys(),
 	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {

@@ -175,7 +175,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// VSchema application status, surfaced from engine metadata rather than as a
 	// per-table task (a VSchema-only apply has no tables at all).
-	writeVSchemaStatus(&sb, data)
+	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	// Error message for apply states that need operator triage.
 	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
@@ -575,19 +575,28 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 }
 
-// writeVSchemaStatus renders the VSchema application status and diff surfaced
-// from the engine's display metadata. It is shown as its own section because
-// VSchema application is not a per-table task. Renders nothing when the apply
-// carries no VSchema change.
-func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
-	if len(data.VSchemaChanges) == 0 {
+// writeVSchemaStatus renders the VSchema application status and, when
+// available, the diff. It is shown as its own section because VSchema
+// application is not a per-table task. Renders nothing when the apply carries
+// no VSchema change.
+func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	for _, c := range data.VSchemaChanges {
+	// The diff budget is per comment, not per keyspace: split it across the
+	// entries that carry a diff so a multi-keyspace apply stays bounded.
+	diffCount := 0
+	for _, c := range changes {
+		if c.Diff != "" {
+			diffCount++
+		}
+	}
+	budget := vschemaDiffBudget(diffCount)
+	for _, c := range changes {
 		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
-			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
+			writeVSchemaDiffFence(sb, c.Diff, budget)
 		}
 	}
 }
@@ -988,6 +997,14 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	if !table.Throttled || table.ThrottleReason == "" {
 		return
 	}
+	// The raw reason names the engine signal; the tip says what the pause
+	// protects, and links the reference doc for remediation prose. A reason
+	// whose signal has no tip renders alone so a new engine signal degrades
+	// to raw text rather than a wrong explanation.
+	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
+		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		return
+	}
 	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
@@ -1162,19 +1179,23 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeSummaryCompletedMetadata(sb, data)
 	// A VSchema update counts as a schema change alongside table changes, so the
 	// singular/plural wording reflects the total operation count.
-	singular := totalTables+len(data.VSchemaChanges) == 1
-	msg := "Applied successfully — your schema changes are live!"
-	if singular {
-		msg = "Applied successfully — your schema change is live!"
-	}
-	if data.Rollback {
-		msg = "Rolled back successfully — the schema changes have been reverted."
-		if singular {
-			msg = "Rolled back successfully — the schema change has been reverted."
-		}
-	}
-	writeSuccessBlock(sb, msg)
+	writeSuccessBlock(sb, completedOutcomeMessage(totalTables+len(data.VSchemaChanges) == 1, data.Rollback))
 	writeCompletedSummaryDetails(sb, data)
+}
+
+// completedOutcomeMessage is the completed summary's outcome line, shared by
+// every apply shape so the terminal vocabulary stays identical.
+func completedOutcomeMessage(singular, rollback bool) string {
+	if rollback {
+		if singular {
+			return "Rolled back successfully — the schema change has been reverted."
+		}
+		return "Rolled back successfully — the schema changes have been reverted."
+	}
+	if singular {
+		return "Applied successfully — your schema change is live!"
+	}
+	return "Applied successfully — your schema changes are live!"
 }
 
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
@@ -1237,15 +1258,30 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
-	if data.StartedAt != "" && data.CompletedAt != "" {
-		startTime, err1 := time.Parse(time.RFC3339, data.StartedAt)
-		endTime, err2 := time.Parse(time.RFC3339, data.CompletedAt)
-		if err1 == nil && err2 == nil {
-			parts = append(parts, fmt.Sprintf("**Duration**: %s", formatDuration(endTime.Sub(startTime))))
-		}
+	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
+		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
+}
+
+// durationDisplay formats the elapsed time between two RFC3339 timestamps for a
+// summary metadata line, or "" when either timestamp is missing or unparseable
+// — the duration is decoration, so a bad timestamp drops it rather than failing
+// the render.
+func durationDisplay(startedAt, completedAt string) string {
+	if startedAt == "" || completedAt == "" {
+		return ""
+	}
+	startTime, err1 := time.Parse(time.RFC3339, startedAt)
+	endTime, err2 := time.Parse(time.RFC3339, completedAt)
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	if endTime.Before(startTime) {
+		return ""
+	}
+	return formatDuration(endTime.Sub(startTime))
 }
 
 // formatDuration formats a time.Duration as a human-readable string.
@@ -1311,7 +1347,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) > 0 {
 		writeSummaryTableListWithOptions(sb, data, false)
 	}
-	writeVSchemaStatus(sb, data)
+	writeVSchemaStatus(sb, data.VSchemaChanges)
 	sb.WriteString("</details>\n")
 }
 

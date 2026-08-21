@@ -288,7 +288,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply); err != nil {
+	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
 	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
@@ -1035,6 +1035,43 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 	return true, nil
 }
 
+// failPendingRequestForUnsupportedOperation resolves a pending control request
+// terminally when the engine declined the operation as unsupported for its
+// database type. The decline is deterministic — no retry can ever succeed —
+// so leaving the request pending would re-run the same rejection on every
+// drive claim while the schema change keeps executing unwatched. The request
+// is failed with the engine's reason, and the apply is left untouched: the
+// running change settles itself through its own apply path. Returns
+// declined=false when the error is not an unsupported-operation decline, so
+// the caller applies its normal error handling. When declined=true the
+// operation did not take effect: a stop or cancel caller must report the
+// request as not handled, or the drive loop would mark the still-running
+// apply stopped.
+func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
+	unsupported, ok := engine.AsUnsupportedOperation(opErr)
+	if !ok {
+		return false, nil
+	}
+	message := unsupported.Error()
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the engine does not support the operation; the schema change continues and settles on its own",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error", opErr)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	}
+	engineName := "unknown"
+	if eng := c.getEngine(); eng != nil {
+		engineName = eng.Name()
+	}
+	metrics.RecordControlRequestUnsupportedDecline(ctx, string(operation), engineName, apply.Database, apply.Deployment, apply.Environment)
+	return true, nil
+}
+
 func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -1094,6 +1131,12 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); declined {
+			// The request is resolved terminally but no stop took effect: the
+			// schema change keeps running, so the drive must not treat this as
+			// an operator stop.
+			return false, declineErr
+		}
 		return true, fmt.Errorf("process pending stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil || !resp.Accepted {
@@ -1163,6 +1206,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); declined {
+			// The request is resolved terminally but no cancel took effect:
+			// the schema change keeps running, so the drive must not treat
+			// this as an operator cancel.
+			return false, declineErr
+		}
 		return true, fmt.Errorf("process pending cancel for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil || !resp.Accepted {
@@ -1653,6 +1702,25 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	if applyID == 0 {
 		return 0, fmt.Errorf("%s found the schema change already completed on the engine, but resolved no apply to settle: %w", operation, rejection)
 	}
+	// A multi-operation drive owns only its operation: the tasks settled above
+	// carry the completed outcome, the operator derives the operation row from
+	// them and projects the parent completed, so the parent write, apply event,
+	// and terminal observer are the operator's to make — a direct write here
+	// fails closed under the operation-only lease and would turn an accepted
+	// settle into a drive error the claim loop re-runs forever.
+	if suppressParentApplyWrites(ctx) {
+		attrs := []any{"database", c.config.Database}
+		if targetApply != nil {
+			attrs = targetApply.LogAttrs()
+		}
+		c.logger.Info("engine rejected "+operation+" because the schema change already completed; operation drive settled its tasks and the operator projects the parent",
+			append(attrs,
+				"requested_by", caller,
+				"completed_task_count", completedCount,
+				"terminal_task_count", skippedCount,
+				"error", rejection)...)
+		return skippedCount, nil
+	}
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
 		return 0, fmt.Errorf("load apply %d to settle %s for a completed schema change: %w", applyID, operation, err)
@@ -1942,6 +2010,13 @@ func (c *LocalClient) processPendingVolumeControlRequest(ctx context.Context, ap
 		Credentials: creds,
 	})
 	if err != nil {
+		// A typed unsupported-operation decline resolves through the shared
+		// helper so it is counted on the decline metric like stop and cancel:
+		// an operator repeatedly reaching for volume on an engine without a
+		// tunable copy is exactly the signal that metric exists to surface.
+		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply, storage.ControlOperationVolume, storage.LogEventVolumeRequested, controlReq, err); declined {
+			return declineErr
+		}
 		c.logger.Warn("engine rejected pending volume request; schema change continues at its current volume",
 			append(apply.LogAttrs(), "volume", volume, "requested_by", caller, "error", err)...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError, storage.LogSourceSchemaBot,

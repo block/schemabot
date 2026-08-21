@@ -868,11 +868,8 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 			// failed schema change without clearing ready_to_complete, so a retried shard
 			// briefly renders as ready for cutover until Vitess recomputes the flag once
 			// the copy restarts. This affects display only — apply state comes from the
-			// deploy request, and terminal statuses always win over a stale flag.
-			shardState := sh.status
-			if sh.readyToComplete && !state.IsTerminalVitessState(sh.status) {
-				shardState = state.Vitess.ReadyToComplete
-			}
+			// deploy request.
+			shardState := state.EffectiveVitessState(sh.status, sh.readyToComplete)
 
 			shardPct := min(sh.progress, 100)
 			shardCopied := sh.rowsCopied

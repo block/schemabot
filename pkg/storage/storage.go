@@ -393,6 +393,28 @@ type WebhookEventStore interface {
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 
+// ListPlansOptions filters and bounds a plan listing. Zero-value fields are
+// not applied, so an empty options value with a Limit lists the newest plans
+// across every database and environment.
+type ListPlansOptions struct {
+	// Database, when set, restricts results to plans for that database name.
+	Database string
+	// Environment, when set, restricts results to plans for that environment.
+	Environment string
+	// Repository, when set, restricts results to plans generated for PRs in
+	// that repository (owner/name).
+	Repository string
+	// PullRequest, when positive, restricts results to plans generated for
+	// that PR number. Requires Repository — a PR number is only meaningful
+	// within one repository, so List errors when it is set alone.
+	PullRequest int
+	// Since, when set, restricts results to plans created at or after this
+	// instant.
+	Since time.Time
+	// Limit bounds the number of plans returned and must be positive.
+	Limit int
+}
+
 // PlanStore manages schema change plans.
 // Plans are created by Plan() and stored for Apply() and staleness detection.
 // Both GRPCClient and LocalClient are stateless - SchemaBot owns plan storage.
@@ -411,6 +433,15 @@ type PlanStore interface {
 
 	// GetByPR returns all plans for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Plan, error)
+
+	// List returns plans matching opts, newest first. Ordering is
+	// deterministic on created_at ties (see the sqlstore GetByPR ordering
+	// rationale). Returned plans omit SchemaFiles — the full desired-schema
+	// DDL is the bulk of a plan row and listings never need it; fetch a single
+	// plan via Get for the complete record. Returns an error when opts.Limit
+	// is not positive, or when opts.PullRequest is set without
+	// opts.Repository.
+	List(ctx context.Context, opts ListPlansOptions) ([]*Plan, error)
 
 	// Delete removes a plan by ID.
 	Delete(ctx context.Context, id int64) error
@@ -937,8 +968,15 @@ type ApplyOperationStore interface {
 	SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error
 
 	// SaveExternalID stores the remote data plane's apply_id on the operation
-	// that owns the dispatch.
-	SaveExternalID(ctx context.Context, operationID int64, externalID string) error
+	// that owns the dispatch. The write is atomic with its deployment
+	// invariant: in one transaction the store locks the apply's operation
+	// rows, verifies the operation's deployment records no remote apply id
+	// other than the one being stored, and only then writes. Sibling
+	// operations of one deployment persist concurrently across the driver
+	// pool, so a check outside the writing transaction cannot stop two of
+	// them from recording divergent ids. Divergence returns an error wrapping
+	// ErrRemoteApplyDeploymentIDConflict.
+	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
 
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error

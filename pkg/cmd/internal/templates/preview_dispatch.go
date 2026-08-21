@@ -105,6 +105,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewStatusDeploymentOutput()
 	case PreviewStatusHistory:
 		previewStatusHistoryOutput()
+	case PreviewPlansList:
+		previewPlansListOutput()
 	case PreviewLintViolations:
 		previewLintViolationsOutput()
 	case PreviewUnsafeBlocked:
@@ -116,6 +118,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 	// Comment template previews
 	case PreviewCommentPlan:
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
+	case PreviewCommentPlanIgnoredNamespaces:
+		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces())
 	case PreviewCommentPlanBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
 	case PreviewCommentPlanDirect:
@@ -144,6 +148,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanLint())
 	case PreviewCommentVitessPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlan())
+	case PreviewCommentVitessPlanVSchemaRemoval:
+		fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval())
 	case PreviewCommentVitessApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan())
 	case PreviewCommentMySQLMultiSchema:

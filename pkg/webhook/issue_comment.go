@@ -146,7 +146,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// their Check Runs change, and GitHub delivers check_run events only to the
 	// App that created the check.
 	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
-		if h.participantCommentNudge(ctx, repo, pr, installationID, requestedBy) {
+		if h.participantCommentNudge(ctx, repo, pr, installationID, deliveryID, requestedBy) {
 			h.writeJSON(w, http.StatusOK, map[string]string{
 				"message": "participant comment triggered aggregate re-fold",
 			})
@@ -162,6 +162,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.DeliveryID = deliveryID
 
 	if !result.IsMention {
 		h.writeJSON(w, http.StatusOK, map[string]string{
@@ -267,7 +268,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		h.logger.Info("rejecting command with invalid environment value",
 			"repo", repo, "pr", pr, "action", result.Action)
-		h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID,
 			templates.RenderInvalidEnv(result.Action, h.knownEnvironments()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid environment value"})
@@ -287,9 +288,9 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			// handler's act-point once discovery resolves owned schema.
 			h.logger.Info("plan without -e flag", "repo", repo, "pr", pr)
 			if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
-				h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
-			h.goSafe(repo, pr, installationID, func() {
+			h.goSafe(repo, pr, installationID, deliveryID, func() {
 				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true, result.CommentID)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
@@ -351,7 +352,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			}
 			h.logger.Info("rejecting command for unknown environment",
 				"repo", repo, "pr", pr, "environment", result.Environment, "action", result.Action)
-			h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+			h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			h.postComment(repo, pr, installationID,
 				templates.RenderInvalidEnv(result.Action, h.knownEnvironments()))
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unknown environment"})
@@ -445,7 +446,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// aggregate-role repos defer to each handler's act-point, after the
 	// fan-out silent-skip gates, where ownership is actually known.
 	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" || result.Tenant != "" {
-		h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 	}
 
 	h.logger.Info("processing command",
@@ -457,7 +458,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	switch result.Action {
 	case action.Plan:
-		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, requestedBy, result.CommentID)
+		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, deliveryID, requestedBy, result.CommentID)
 	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
@@ -466,7 +467,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.enqueueDurableIssueCommentCommand(ctx, w, metricApp, body, deliveryID, repo, pr, installationID, result.Action)
 			return
 		}
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleApplyCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply started"})
@@ -475,7 +476,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.enqueueDurableIssueCommentCommand(ctx, w, metricApp, body, deliveryID, repo, pr, installationID, result.Action)
 			return
 		}
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleApplyConfirmCommand(repo, pr, result.Environment, result.Database, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "apply-confirm started"})
@@ -484,57 +485,57 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.enqueueDurableIssueCommentCommand(ctx, w, metricApp, body, deliveryID, repo, pr, installationID, result.Action)
 			return
 		}
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleUnlockCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unlock started"})
 	case action.Rollback:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleRollbackCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback started"})
 	case action.RollbackConfirm:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleRollbackConfirmCommand(repo, pr, result.Environment, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "rollback-confirm started"})
 	case action.Stop:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleStopCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "stop started"})
 	case action.Cancel:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleCancelCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cancel started"})
 	case action.Start:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleStartCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "start started"})
 	case action.Release:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleReleaseCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "release started"})
 	case action.Cutover:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
 	case action.Volume:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleVolumeCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "volume started"})
 	case action.SkipRevert:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "skip-revert started"})
 	case action.Revert:
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleRevertCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "revert started"})
@@ -758,7 +759,7 @@ func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID
 	if h.service == nil || h.service.Config().AggregateRoleForRepo(repo) == "" {
 		return
 	}
-	h.acknowledgeCommand(repo, pr, installationID, result.CommentID)
+	h.acknowledgeCommand(repo, pr, installationID, result.DeliveryID, result.CommentID)
 }
 
 // acknowledgeCommandEarlyIfOwned acknowledges an unscoped command on an
@@ -770,7 +771,7 @@ func (h *Handler) acknowledgeCommandActPoint(repo string, pr int, installationID
 // the source-policy predicates without their logs and metrics, the authoritative
 // checks still run in discovery immediately after, and any probe miss defers to
 // the handler's act-point acknowledgment. Returns whether it acknowledged.
-func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, databaseName, tenant string, installationID, commentID int64) bool {
+func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, databaseName, tenant string, installationID int64, deliveryID string, commentID int64) bool {
 	if tenant != "" {
 		return false
 	}
@@ -799,7 +800,7 @@ func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *gh
 	if config.Database(sbConfig.Database) == nil {
 		return false
 	}
-	h.acknowledgeCommand(repo, pr, installationID, commentID)
+	h.acknowledgeCommand(repo, pr, installationID, deliveryID, commentID)
 	return true
 }
 
@@ -814,11 +815,11 @@ func (h *Handler) knownEnvironments() []string {
 
 // acknowledgeCommand adds the eyes reaction to the command comment,
 // signalling "this deployment is acting on your command".
-func (h *Handler) acknowledgeCommand(repo string, pr int, installationID, commentID int64) {
+func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, deliveryID string, commentID int64) {
 	if commentID <= 0 || h.ghClients.Len() == 0 {
 		return
 	}
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		client, err := h.clientForRepo(repo, installationID)
@@ -968,6 +969,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 	parser := NewCommandParser()
 	result := parser.ParseCommand(payload.Comment.Body)
 	result.CommentID = payload.Comment.ID
+	result.DeliveryID = event.DeliveryID
 	result.SuppressRetryComments = true
 	// The two drop paths below can swallow a command the user already saw
 	// acknowledged: a config or command-spec change between enqueue and drive

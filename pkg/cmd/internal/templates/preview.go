@@ -85,6 +85,7 @@ const (
 	PreviewStatusList       PreviewType = "status_list"       // List of active schema changes
 	PreviewStatusDeployment PreviewType = "status_deployment" // Deployment-scoped schema change status
 	PreviewStatusHistory    PreviewType = "status_history"    // Database apply history
+	PreviewPlansList        PreviewType = "plans_list"        // List of recently generated plans
 
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output
@@ -111,6 +112,7 @@ const (
 
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
+	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
 	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
@@ -125,6 +127,7 @@ const (
 	PreviewCommentMultiEnvDiff                 PreviewType = "comment_multi_env_diff"                  // Multi-env plan (different per env)
 	PreviewCommentMultiEnvLint                 PreviewType = "comment_multi_env_lint"                  // Multi-env plan with lint violations
 	PreviewCommentVitessPlan                   PreviewType = "comment_vitess_plan"                     // Vitess plan with keyspaces + VSchema
+	PreviewCommentVitessPlanVSchemaRemoval     PreviewType = "comment_vitess_plan_vschema_removal"     // Vitess plan with unsafe VSchema removals
 	PreviewCommentVitessApplyPlan              PreviewType = "comment_vitess_apply_plan"               // Locked Vitess apply-plan with options
 	PreviewCommentMySQLMultiSchema             PreviewType = "comment_mysql_multi_schema"              // MySQL plan with multiple schema names
 	PreviewCommentHelp                         PreviewType = "comment_help"                            // Help command reference comment

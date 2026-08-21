@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // DatabaseType represents the type of database backend.
@@ -27,6 +29,11 @@ type SchemabotConfig struct {
 	Database string       `yaml:"database" json:"database"`
 	Name     string       `yaml:"name" json:"name"`
 	Type     DatabaseType `yaml:"type,omitempty" json:"type,omitempty"`
+	// IgnoreNamespaces lists namespace subdirectories of the schema root that
+	// SchemaBot must not reconcile against the live database — for example a
+	// keyspace that only exists in local test infrastructure. Ignored
+	// namespaces are excluded from plans, applies, and checks.
+	IgnoreNamespaces []string `yaml:"ignore_namespaces,omitempty" json:"ignore_namespaces,omitempty"`
 }
 
 // GetType returns the database type. Type is always set — FetchConfig rejects empty values.
@@ -106,6 +113,9 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata, DatabaseTypePostgres:
 	default:
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', 'strata', or 'postgres', got '%s'", configPath, config.Type)
+	}
+	if err := schema.ValidateIgnoreNamespaces(config.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
 
 	return &config, nil

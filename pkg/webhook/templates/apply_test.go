@@ -263,9 +263,10 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 // A table slowed by the engine's throttler carries a "(throttled)" annotation
 // on its header line — right where the eye checks progress — with the trigger
 // explained in a tooltip bullet, so a slow bar reads as deliberate backpressure
-// (e.g. replica lag) rather than a hang. The reason is sanitized at the engine
-// boundary, and the annotation renders only on active tables — a throttled flag
-// on a terminal table would be stale.
+// (e.g. thread pressure) rather than a hang. The reason is sanitized at the
+// engine boundary, and the annotation renders only on active tables — a
+// throttled flag on a terminal table would be stale. Composite reasons join
+// their tips, and a reason with an unrecognized signal renders raw with no tip.
 func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -276,7 +277,7 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 		Tables: []TableProgressData{
 			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "running",
 				RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
-				Throttled: true, ThrottleReason: "replica-lag 12s > 10s"},
+				Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
 			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
 		},
 	}
@@ -285,8 +286,18 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	assert.Contains(t, result, "45% (throttled)",
 		"the annotation lands on the header line next to the percent")
-	assert.Contains(t, result, "- ℹ️ _Throttled: replica-lag 12s > 10s_",
-		"the reason renders as a tooltip bullet under the detail list")
+	assert.Contains(t, result, "- ℹ️ _Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"the reason renders as a tooltip bullet with its tip and the doc link")
+
+	data.Tables[0].ThrottleReason = "redo-aware 4 > 3; commit-latency 112.4ms >= 100ms"
+	composite := RenderApplyStatusComment(data)
+	assert.Contains(t, composite, "- ℹ️ _Throttled: redo-aware 4 > 3; commit-latency 112.4ms >= 100ms · backing off while the database's active threads exceed its budget; backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"concurrently-throttling signals join their tips in reason order")
+
+	data.Tables[0].ThrottleReason = "commit-latency 112.4ms >= `100ms` [gradual]"
+	escapedWithTip := RenderApplyStatusComment(data)
+	assert.Contains(t, escapedWithTip, "- ℹ️ _Throttled: commit-latency 112.4ms >= \\`100ms\\` \\[gradual\\] · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"a recognized reason is escaped before its tip is appended")
 
 	data.Tables[0].ThrottleReason = ""
 	noReason := RenderApplyStatusComment(data)
@@ -302,7 +313,7 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 	data.Tables[0].ThrottleReason = "signal_a 1_000ms >= `500ms` [gradual]"
 	escaped := RenderApplyStatusComment(data)
 	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal\\_a 1\\_000ms >= \\`500ms\\` \\[gradual\\]_",
-		"markdown delimiters in an engine reason are escaped so they cannot cut the italic span short")
+		"markdown delimiters in an unrecognized reason are escaped and render with no tip")
 }
 
 // A throttled checksum verify carries the same header annotation and tooltip
@@ -318,14 +329,14 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 		Tables: []TableProgressData{
 			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming",
 				ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
-				Throttled: true, ThrottleReason: "threads-running 130 > 128"},
+				Throttled: true, ThrottleReason: "threads-running 21 > 18"},
 		},
 	}
 
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21%) (throttled)")
-	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 130 > 128_")
+	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_")
 }
 
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
@@ -1507,6 +1518,23 @@ func TestRenderApplySummaryComment_StartedAtUsesApplyStart(t *testing.T) {
 
 	assert.Contains(t, result, "*Started at 2026-06-16 19:42:00 UTC*")
 	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
+}
+
+// The duration is decoration: valid timestamps render it, and a completed
+// timestamp earlier than the started timestamp (bad data, clock skew) drops it
+// rather than rendering a negative duration.
+func TestRenderApplySummaryComment_Duration(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		StartedAt:   "2026-06-16T19:42:00Z",
+		CompletedAt: "2026-06-16T19:59:00Z",
+	}
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
+
+	data.CompletedAt = "2026-06-16T19:00:00Z"
+	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
 }
 
 func TestRenderPRCommandNotAuthorized(t *testing.T) {

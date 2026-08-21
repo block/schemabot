@@ -98,11 +98,9 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 		}
 	}
 
-	// Show unsafe warning if any
-	if planResult.HasErrors() {
-		unsafeChanges := planResult.UnsafeChanges()
-		templates.WriteUnsafeWarningAllowed(unsafeChanges)
-	}
+	// Disclose unsafe changes before the confirmation prompt. Rollback has no
+	// --allow-unsafe flag; the interactive confirmation is the acknowledgment.
+	templates.WriteUnsafeChangesWarning(planResult.UnsafeChanges())
 
 	// Show options if any flags are set
 	templates.WriteOptions(cmd.DeferCutover, false)

@@ -58,6 +58,13 @@ var (
 	// row does not exist for the given lookup key.
 	ErrApplyOperationNotFound = errors.New("apply operation not found")
 
+	// ErrRemoteApplyDeploymentIDConflict is returned when storing a remote
+	// apply id would correlate one deployment to more than one remote
+	// data-plane apply — either the deployment's operations already disagree
+	// with each other, or the id being stored disagrees with the one they
+	// share. Callers must fail closed rather than pick one.
+	ErrRemoteApplyDeploymentIDConflict = errors.New("deployment already correlates to a different remote apply")
+
 	// ErrApplyOperationExists is returned when an apply_operations row for
 	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")

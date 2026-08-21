@@ -943,6 +943,9 @@ func (m *mockPlanStore) GetByLock(context.Context, int64) ([]*storage.Plan, erro
 func (m *mockPlanStore) GetByPR(context.Context, string, int) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+	return nil, nil
+}
 func (m *mockPlanStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanStore) DeleteByPR(context.Context, string, int) error { return nil }
 

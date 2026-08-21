@@ -248,12 +248,24 @@ func TestWriteStatusListFailedOnly(t *testing.T) {
 					Caller:       "github:alice",
 					ErrorMessage: "failed to apply schema change\nbecause duplicate column name 'status'",
 				},
+				{
+					ApplyID:      "apply-failed-pr",
+					ExternalID:   "external-failed-pr",
+					Database:     "billing",
+					Environment:  "production",
+					State:        state.Apply.Failed,
+					StartedAt:    "2026-05-28T12:00:00Z",
+					CompletedAt:  "2026-05-28T12:00:03Z",
+					Caller:       "github:alice@acme/pay#77",
+					ErrorMessage: "cutover failed",
+				},
 			},
 		})
 	})
 
 	assert.Contains(t, output, "Recent failed schema changes")
 	assert.Contains(t, output, "payments staging: Failed (github:alice; external_id=external-failed) [2026-05-28 11:00:03 UTC]")
+	assert.Contains(t, output, "billing production: Failed (https://github.com/acme/pay/pull/77; external_id=external-failed-pr) [2026-05-28 12:00:03 UTC]")
 	assert.Contains(t, output, "failed to apply schema change because duplicate column name 'status'")
 	assert.Contains(t, output, "schemabot status apply-failed")
 	assert.NotContains(t, output, "APPLY ID")
@@ -389,18 +401,19 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 
 // A table slowed by the engine's throttler carries a "(throttled)" annotation
 // on its header line with the trigger explained in a dimmed tooltip, so a slow
-// progress bar reads as deliberate backpressure (e.g. replica lag) rather than
-// a hang. The annotation renders for the active copy and checksum phases only —
-// a throttled flag on a terminal table would be stale.
+// progress bar reads as deliberate backpressure (e.g. thread pressure) rather
+// than a hang. The annotation renders for the active copy and checksum phases
+// only — a throttled flag on a terminal table would be stale. A reason with an
+// unrecognized signal still renders raw, with no tip attached.
 func TestFormatTableProgress_Throttled(t *testing.T) {
 	copying := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
-		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
+		Throttled: true, ThrottleReason: "redo-aware 4 > 3",
 	})
 	assert.Contains(t, copying, "45% (throttled)",
 		"the annotation lands on the header line next to the percent")
-	assert.Contains(t, copying, "ℹ️ Throttled: replica-lag 12s > 10s")
+	assert.Contains(t, copying, "ℹ️ Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget")
 
 	noReason := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
@@ -410,13 +423,22 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.Contains(t, noReason, "45% (throttled)")
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
+	unknownSignal := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+		Throttled: true, ThrottleReason: "disk-usage 95% > 90%",
+	})
+	assert.Contains(t, unknownSignal, "ℹ️ Throttled: disk-usage 95% > 90%",
+		"an unrecognized signal still surfaces its raw reason")
+	assert.NotContains(t, unknownSignal, "·", "no tip separator without a recognized tip")
+
 	checksumming := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
-		Throttled: true, ThrottleReason: "threads-running 130 > 128",
+		Throttled: true, ThrottleReason: "threads-running 21 > 18",
 	})
 	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21%) (throttled)")
-	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 130 > 128")
+	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
 
 	notThrottled := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,

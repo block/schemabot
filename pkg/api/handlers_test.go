@@ -65,6 +65,9 @@ func (m *mockPlanLookupStore) GetByLock(context.Context, int64) ([]*storage.Plan
 func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+	return nil, nil
+}
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
@@ -456,6 +459,9 @@ func (s *capturingApplyStore) CreateWithTasksAndOperations(ctx context.Context, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.capture(apply)
+	// Real storage materializes the row with its auto-increment ID; readers
+	// resolving the apply by the returned ID must find it.
+	s.apply.ID = applyID
 	for _, op := range operations {
 		snapshot := *op
 		s.operations = append(s.operations, &snapshot)
@@ -951,6 +957,43 @@ func TestHandleDeploymentLogsUsesParentExternalIDForSingleOperation(t *testing.T
 	assert.Equal(t, "remote-parent", response.Sources[0].ExternalID)
 	require.Len(t, response.Sources[0].Logs, 1)
 	assert.Equal(t, "apply complete", response.Sources[0].Logs[0].Message)
+}
+
+// A remotely dispatched operation whose remote apply id lives only in the
+// legacy engine resume context carrier still contributes a data-plane log
+// source: the deployment routes to a remote client, so the carrier holds a
+// remote apply id, not engine resume state, and its logs must not be silently
+// missing from the fan-out.
+func TestHandleDeploymentLogsHonorsLegacyResumeContextCarrier(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", EngineResumeContext: "remote-legacy"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		return &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: []*ternv1.ApplyLog{{Id: 21, Level: "info", Message: "copying", CreatedAt: "2026-07-18T18:33:10Z"}}}, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 2)
+	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
+	assert.Equal(t, "remote-legacy", client.logsReqs[1].ApplyId)
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 2)
+	assert.Equal(t, "remote-a", response.Sources[0].ExternalID)
+	assert.Equal(t, "remote-legacy", response.Sources[1].ExternalID)
+	require.Len(t, response.Sources[1].Operations, 1)
+	assert.Equal(t, "commerce/80-/orders", response.Sources[1].Operations[0].OperationKey)
 }
 
 func (m *mockTernClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
@@ -1583,6 +1626,272 @@ func TestExecutePullSchemaPullsRequestedNamespaces(t *testing.T) {
 	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[0].CatalogDetail)
 	assert.Equal(t, "orders_audit_production", mockClient.pullSchemaReqs[1].Namespace)
 	assert.Equal(t, ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED, mockClient.pullSchemaReqs[1].CatalogDetail)
+}
+
+// A pull with lint requested audits the live schema without planning a
+// change: every pulled table runs through the same linters a plan would use,
+// and the violations attach per namespace, sorted for a stable response body.
+func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{
+					"users": "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+				}},
+				"audit": {Tables: map[string]string{
+					"events": "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n",
+				}},
+			},
+			TableCount: 2,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+		Lint:        true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	violations := resp.Namespaces["orders"].Lint
+	require.Len(t, violations, 2)
+	assert.Equal(t, "allow_charset", violations[0].Linter)
+	assert.Equal(t, "users", violations[0].Table)
+	assert.Contains(t, violations[0].Message, "latin1")
+	assert.Equal(t, "primary_key", violations[1].Linter)
+	assert.Equal(t, "users", violations[1].Table)
+	assert.Contains(t, violations[1].Message, "int")
+
+	// A linted namespace with no violations reports an explicit empty list,
+	// so a clean audit is distinguishable from lint not being requested.
+	require.NotNil(t, resp.Namespaces["audit"].Lint)
+	assert.Empty(t, resp.Namespaces["audit"].Lint)
+	cleanJSON, err := json.Marshal(resp.Namespaces["audit"])
+	require.NoError(t, err)
+	assert.Contains(t, string(cleanJSON), `"lint":[]`)
+}
+
+// Every pulled table entry must be a CREATE TABLE statement: the linters
+// silently pass over other statement kinds, so a namespace containing one
+// would produce a partial audit. The whole request fails instead — even when
+// other namespaces lint cleanly, no partial response is returned.
+func TestExecutePullSchemaRejectsNonCreateTableLintEntry(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{
+					"users": "DROP TABLE `users`;\n",
+				}},
+				"audit": {Tables: map[string]string{
+					"events": "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n",
+				}},
+			},
+			TableCount: 2,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+		Lint:        true,
+	})
+
+	var unlintableErr *unlintablePulledTableError
+	require.ErrorAs(t, err, &unlintableErr)
+	assert.Equal(t, "orders", unlintableErr.Namespace)
+	assert.Equal(t, "users", unlintableErr.Table)
+	assert.Contains(t, err.Error(), "expected CREATE TABLE")
+	assert.Nil(t, resp, "a failed lint must not return a partial response")
+}
+
+// The /api/pull handler maps lint rejections to 400: both an unlintable pulled
+// table entry and a lint request against a dialect the linters cannot parse
+// are audit-scope defects, not server faults, and must not pollute 5xx rates.
+func TestPullSchemaHandlerRejectsLintFailuresAsBadRequest(t *testing.T) {
+	tests := []struct {
+		name         string
+		databaseType string
+		client       *mockTernClient
+		wantBody     string
+	}{
+		{
+			name:         "non-CREATE table entry",
+			databaseType: storage.DatabaseTypeMySQL,
+			client: &mockTernClient{
+				pullSchemaResp: &ternv1.PullSchemaResponse{
+					Database:    "orders",
+					Type:        storage.DatabaseTypeMySQL,
+					Environment: "production",
+					Namespaces: map[string]*ternv1.PulledNamespace{
+						"orders": {Tables: map[string]string{"users": "DROP TABLE `users`;\n"}},
+					},
+					TableCount: 1,
+				},
+			},
+			wantBody: "expected CREATE TABLE",
+		},
+		{
+			name:         "unsupported dialect",
+			databaseType: storage.DatabaseTypePostgres,
+			client:       &mockTernClient{},
+			wantBody:     "schema linting on pull is not supported for postgres databases",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newTypeVocabularyService(t, &mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, tt.client, "orders", tt.databaseType, "primary")
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			body := fmt.Sprintf(`{"database":"orders","environment":"production","type":%q,"lint":true}`, tt.databaseType)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tt.wantBody)
+		})
+	}
+}
+
+// Linting is opt-in: a pull that does not ask for it returns no lint field,
+// so existing callers see an unchanged response body.
+func TestExecutePullSchemaLintOffByDefault(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{
+					"users": "CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+				}},
+			},
+			TableCount: 1,
+		},
+	}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "orders",
+		Environment: "production",
+		Type:        storage.DatabaseTypeMySQL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Nil(t, resp.Namespaces["orders"].Lint)
+}
+
+// The schema linters parse MySQL-family DDL only, so a lint request against
+// any other dialect fails closed before the pull is dispatched — silently
+// returning zero violations would read as a clean audit.
+func TestExecutePullSchemaRejectsLintForUnsupportedDialect(t *testing.T) {
+	mockClient := &mockTernClient{}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"ledger": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "ledger-production", Deployment: "primary"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"primary": {"production": "tern.example.com:80"},
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, cfg, map[string]tern.Client{
+		"primary/production": mockClient,
+	}, logger)
+
+	_, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "ledger",
+		Environment: "production",
+		Lint:        true,
+	})
+
+	var lintDialectErr *unsupportedLintDialectError
+	require.ErrorAs(t, err, &lintDialectErr)
+	assert.Equal(t, storage.DatabaseTypePostgres, lintDialectErr.DatabaseType)
+	assert.Nil(t, mockClient.pullSchemaReq)
 }
 
 // Whether pull is supported for a database type is the data plane's answer:
@@ -2601,6 +2910,7 @@ func TestCreateStoredApplyFansOutShardedPlanWithFinalizerOperation(t *testing.T)
 	plan.Namespaces = map[string]*storage.NamespacePlanData{
 		"commerce": {
 			Artifacts: map[string]string{storage.VSchemaArtifactName: "{\"sharded\":true}"},
+			Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 			Tables: []storage.TableChange{
 				{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"},
 			},
@@ -2665,6 +2975,7 @@ func TestCreateStoredApplyDoesNotDropFinalizerOnlyNamespace(t *testing.T) {
 		},
 		"routing": {
 			Artifacts: map[string]string{storage.VSchemaArtifactName: "{\"routing\":true}"},
+			Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
 		},
 	}
 	plan.Shards = []storage.ShardPlan{{Namespace: "commerce", Shard: "-", Changes: []storage.TableChange{{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", Operation: "alter"}}}}
@@ -6371,6 +6682,26 @@ func TestRollbackSchemaFilesRejectsPlanWithoutCapturedOriginalFiles(t *testing.T
 	require.Error(t, err)
 	assert.Nil(t, schemaFiles)
 	assert.Contains(t, err.Error(), `no original schema files available for rollback namespace "shop"`)
+}
+
+// A source plan without captured original schema files can never produce a
+// rollback plan, no matter how often the same request is retried, so
+// ExecuteRollbackPlanForApply must reject it with the terminal marker that
+// durable command processing keys retry decisions on.
+func TestExecuteRollbackPlanForApplyUncapturedFilesIsTerminal(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_no_schema", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, false), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+
+	resp, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.True(t, IsTerminalControlError(err), "an uncapturable source plan re-reads the same on every retry; the failure must never be re-driven")
+	assert.Contains(t, err.Error(), "rollback source plan is invalid")
+	assert.Contains(t, err.Error(), "no original schema files available")
 }
 
 // setRevertSkippedMetadata surfaces the skip-revert flag from the apply's stored

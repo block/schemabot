@@ -17,7 +17,7 @@ import (
 )
 
 // handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, requestedBy string, commentID int64) {
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, deliveryID, requestedBy string, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -44,7 +44,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
-	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, tenant, installationID, commentID)
+	ackedEarly := h.acknowledgeCommandEarlyIfOwned(ctx, client, repo, pr, databaseName, tenant, installationID, deliveryID, commentID)
 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
@@ -106,15 +106,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		deployment = resolvedTarget.Deployment
 	}
 	planReq := api.PlanRequest{
-		Database:      schemaResult.Database,
-		Environment:   environment,
-		Type:          schemaResult.Type,
-		SchemaFiles:   schemaResult.SchemaFiles,
-		Repository:    repo,
-		PullRequest:   &prNumber,
-		HeadSHA:       &schemaResult.HeadSHA,
-		SchemaPath:    schemaResult.SchemaPath,
-		SourceTrusted: true,
+		Database:          schemaResult.Database,
+		Environment:       environment,
+		Type:              schemaResult.Type,
+		SchemaFiles:       schemaResult.SchemaFiles,
+		Repository:        repo,
+		PullRequest:       &prNumber,
+		HeadSHA:           &schemaResult.HeadSHA,
+		SchemaPath:        schemaResult.SchemaPath,
+		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		SourceTrusted:     true,
 	}
 
 	// Execute plan via the service
@@ -390,15 +391,16 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		prNumber := int32(pr)
 		planReq := api.PlanRequest{
-			Database:      schemaResult.Database,
-			Environment:   env,
-			Type:          schemaResult.Type,
-			SchemaFiles:   schemaResult.SchemaFiles,
-			Repository:    repo,
-			PullRequest:   &prNumber,
-			HeadSHA:       &schemaResult.HeadSHA,
-			SchemaPath:    schemaResult.SchemaPath,
-			SourceTrusted: true,
+			Database:          schemaResult.Database,
+			Environment:       env,
+			Type:              schemaResult.Type,
+			SchemaFiles:       schemaResult.SchemaFiles,
+			Repository:        repo,
+			PullRequest:       &prNumber,
+			HeadSHA:           &schemaResult.HeadSHA,
+			SchemaPath:        schemaResult.SchemaPath,
+			IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+			SourceTrusted:     true,
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
@@ -748,15 +750,16 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
-		Database:     schema.Database,
-		Environment:  environment,
-		Tenant:       tenant,
-		AgentHint:    agentHint,
-		HeadSHA:      schema.HeadSHA,
-		Repository:   schema.Repository,
-		RequestedBy:  requestedBy,
-		DatabaseType: schema.Type,
-		IsMySQL:      schema.Type == "mysql",
+		Database:          schema.Database,
+		Environment:       environment,
+		Tenant:            tenant,
+		AgentHint:         agentHint,
+		HeadSHA:           schema.HeadSHA,
+		Repository:        schema.Repository,
+		RequestedBy:       requestedBy,
+		DatabaseType:      schema.Type,
+		IsMySQL:           schema.Type == "mysql",
+		IgnoredNamespaces: schema.IgnoredNamespaces,
 	}
 
 	// Per-shard changes, grouped by keyspace, so a sharded keyspace can show what
@@ -811,22 +814,42 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.Changes = append(data.Changes, ksData)
 	}
 
-	// Unsafe changes. For a sharded plan, derive them from the per-shard changes
-	// so an unsafe change confined to one shard (e.g. a column drop on a single
-	// drifted shard) is still flagged with the shard it applies to — the
-	// collapsed namespace-level Changes can omit it. Otherwise use the
-	// namespace-level view.
-	if unsafe := shardedUnsafeChanges(planResp.Shards); len(unsafe) > 0 {
-		data.HasUnsafeChanges = true
-		data.UnsafeChanges = unsafe
-	} else if unsafeChanges := planResp.UnsafeChanges(); len(unsafeChanges) > 0 {
-		data.HasUnsafeChanges = true
-		for _, uc := range unsafeChanges {
-			data.UnsafeChanges = append(data.UnsafeChanges, templates.UnsafeChangeData{
+	// Unsafe changes. For a sharded plan, derive table-level entries from the
+	// per-shard changes so an unsafe change confined to one shard (e.g. a column
+	// drop on a single drifted shard) is still flagged with the shard it applies
+	// to — the collapsed namespace-level Changes can omit it. Otherwise use the
+	// namespace-level table view. VSchema removals live only on the
+	// namespace-level change, so they are appended in both views.
+	unsafe := shardedUnsafeChanges(planResp.Shards)
+	if len(unsafe) == 0 {
+		for _, sc := range planResp.Changes {
+			if sc == nil {
+				continue
+			}
+			for _, t := range sc.TableChanges {
+				if uc, ok := t.UnsafeChange(); ok {
+					unsafe = append(unsafe, templates.UnsafeChangeData{
+						Table:  uc.Table,
+						Reason: uc.Reason,
+					})
+				}
+			}
+		}
+	}
+	for _, sc := range planResp.Changes {
+		if sc == nil {
+			continue
+		}
+		for _, uc := range sc.VSchemaUnsafeChanges() {
+			unsafe = append(unsafe, templates.UnsafeChangeData{
 				Table:  uc.Table,
 				Reason: uc.Reason,
 			})
 		}
+	}
+	if len(unsafe) > 0 {
+		data.HasUnsafeChanges = true
+		data.UnsafeChanges = unsafe
 	}
 
 	// Blocked changes — the apply commands will reject these. Like the

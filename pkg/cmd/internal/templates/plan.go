@@ -458,6 +458,23 @@ func WriteErrors(errors []string) {
 	fmt.Println()
 }
 
+// WriteIgnoredNamespaces disclosure: the plan was built from a deliberately
+// partial desired state, so a reader can distinguish "this namespace has no
+// changes" from "this namespace was withheld by config". Unmatched entries are
+// configured exclusions that removed nothing (typo, case mismatch, or stale
+// entry) — the namespaces they name are fully reconciled.
+func WriteIgnoredNamespaces(ignored, unmatched []string) {
+	if len(ignored) > 0 {
+		fmt.Printf("ℹ️  Namespaces excluded by ignore_namespaces: %s\n", strings.Join(ignored, ", "))
+	}
+	for _, entry := range unmatched {
+		fmt.Printf("⚠️  ignore_namespaces entry %q matched no namespace and excluded nothing\n", entry)
+	}
+	if len(ignored) > 0 || len(unmatched) > 0 {
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 
@@ -492,7 +509,7 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 	fmt.Println()
 	fmt.Println("🚨 Unsafe Changes (--allow-unsafe enabled)")
 	fmt.Println()
-	fmt.Println("The following changes will permanently delete data:")
+	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }

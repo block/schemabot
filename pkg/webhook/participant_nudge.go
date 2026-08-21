@@ -30,7 +30,7 @@ const defaultParticipantNudgeRefoldDelay = 45 * time.Second
 //
 // Returns false when the comment is not a nudge — not a led repo, or not a
 // trusted sibling's bot — so the caller keeps its normal bot handling.
-func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr int, installationID int64, authorLogin string) bool {
+func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr int, installationID int64, deliveryID, authorLogin string) bool {
 	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
 		return false
 	}
@@ -46,11 +46,11 @@ func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr i
 		Status:     "success",
 	})
 
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		h.refoldAggregateForPR(repo, pr, installationID, "participant comment")
 	})
 	time.AfterFunc(h.nudgeRefoldDelay(), func() {
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.refoldAggregateForPR(repo, pr, installationID, "participant comment delayed pass")
 		})
 	})
@@ -155,7 +155,7 @@ func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr
 	})
 
 	time.AfterFunc(delay, func() {
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, "", func() {
 			h.refoldAggregateForPR(repo, pr, installationID, "unresolved participant delayed re-fold")
 		})
 	})

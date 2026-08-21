@@ -507,7 +507,9 @@ The defaults, and why they were chosen:
   dynamically from throttler feedback. A fixed thread count is the classic
   failure mode on large targets — throughput that made sense on one instance
   class silently starves or overloads another. The operator control for copy
-  aggressiveness is the apply's `volume`, not a thread count. Set
+  aggressiveness is the apply's `volume`, not a thread count — though on a
+  target where autoscaling is engaged, autoscaling's own thread counts take
+  over and `volume` has nothing left to tune. Set
   `enable_experimental_autoscaling: false` only as an incident kill switch when
   autoscaling misbehaves on a target fleet.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
@@ -549,6 +551,19 @@ on the storage dialect:
   and `allow_destructive_schema_changes` has no effect because this flow never
   produces destructive DDL. Apply column changes to already-bootstrapped
   PostgreSQL databases before deploying schema files that expect them.
+
+  Non-unique indexes work the same way, and the consequence is quieter: an
+  index added to an embedded schema file reaches newly created databases only,
+  so an already-bootstrapped database keeps answering the queries that index
+  was added for — correctly, but without it. Create those by hand. A database
+  bootstrapped before `idx_plans_created_at` was added to `plans` needs:
+
+  ```sql
+  CREATE INDEX idx_plans_created_at ON plans (created_at);
+  ```
+
+  Without it, listing recent plans is a sequential scan plus a top-N sort,
+  which gets slower as plan history grows.
 
 The rest of this section describes the MySQL flow.
 

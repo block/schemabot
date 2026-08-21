@@ -40,6 +40,7 @@ func previewCommentAllOutput() {
 		fn   func()
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"PLAN COMMENT (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
@@ -131,6 +132,7 @@ func previewCommentPlanAllOutput() {
 		fn   func()
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
@@ -146,6 +148,7 @@ func previewCommentPlanAllOutput() {
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
+		{"VITESS PLAN: VSCHEMA REMOVAL (UNSAFE)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval()) }},
 		{"SCHEMA CHANGE APPLY (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"MYSQL MULTI-SCHEMA PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentMySQLMultiSchema()) }},
 		{"MULTI-ENV PLAN (IDENTICAL)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan()) }},
@@ -320,6 +323,8 @@ func previewCommentShardedAllOutput() {
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},
 		{"APPLY FAILED (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyFailed()) }},
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
+		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
+		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
 	}
 	printSections(sections)
 }

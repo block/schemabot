@@ -517,7 +517,17 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 // SaveExternalID stores the remote data plane's apply_id on the operation row.
 // It refuses empty IDs so callers do not convert a missing remote field into an
 // apparent successful correlation.
-func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID int64, externalID string) error {
+//
+// The write is atomic with the deployment's one-remote-apply invariant: in one
+// transaction it locks the apply's operation rows, verifies the operation's
+// deployment records no remote apply id other than the one being stored, and
+// only then writes. Sibling operations of one deployment persist concurrently
+// across the driver pool, so a check outside the writing transaction cannot
+// stop two of them from each seeing "no id recorded yet" and committing
+// divergent ids. Divergence — among the siblings themselves or between the
+// siblings and this id — returns an error wrapping
+// storage.ErrRemoteApplyDeploymentIDConflict.
+func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error {
 	if externalID == "" {
 		return fmt.Errorf("save external id for apply_operation %d: external id is empty", operationID)
 	}
@@ -525,15 +535,65 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 	if err != nil {
 		return err
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin save external id transaction for apply_operation %d: %w", operationID, err)
+	}
+	defer rollbackTx(ctx, tx, "save apply_operation external id")
+
+	ops, err := lockApplyOperationsForUpdate(ctx, tx, applyID)
+	if err != nil {
+		return fmt.Errorf("lock apply_operations of apply %d before storing remote apply id for apply_operation %d: %w", applyID, operationID, err)
+	}
+	var current *storage.ApplyOperation
+	for _, op := range ops {
+		if op.ID == operationID {
+			current = op
+			break
+		}
+	}
+	if current == nil {
+		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
+	}
+	sharedID, err := storage.DeploymentRemoteApplyID(ops, current.Deployment)
+	if err != nil {
+		return fmt.Errorf("refusing to store remote apply id %q for apply_operation %d: %w: %w", externalID, operationID, err, storage.ErrRemoteApplyDeploymentIDConflict)
+	}
+	if sharedID != "" && sharedID != externalID {
+		return fmt.Errorf("deployment %q of apply %d already correlates to remote apply %q; refusing to store %q for apply_operation %d: %w", current.Deployment, applyID, sharedID, externalID, operationID, storage.ErrRemoteApplyDeploymentIDConflict)
+	}
+
 	args := append([]any{externalID, operationID}, guard.args()...)
 	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
 		{Column: "external_id", Expr: "?"},
 	})
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save external id for apply_operation %d: %w", operationID, err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save external id transaction for apply_operation %d: %w", operationID, err)
+	}
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
+}
+
+// lockApplyOperationsForUpdate returns all child rows for an apply, locked
+// FOR UPDATE inside the given transaction so concurrent writers that must
+// agree across sibling rows serialize against each other.
+func lockApplyOperationsForUpdate(ctx context.Context, tx *rebindTx, applyID int64) ([]*storage.ApplyOperation, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE apply_id = ?
+		ORDER BY created_at, id
+		FOR UPDATE
+	`, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("lock apply_operations for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplyOperations(rows)
 }
 
 // SaveEngineResumeState stores opaque engine state on the operation that owns
