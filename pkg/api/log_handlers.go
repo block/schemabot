@@ -159,20 +159,46 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
 		return
 	}
-	fetches := make(map[string]*deploymentLogFetch)
 	matched := false
+	for _, op := range ops {
+		if op.Deployment == deployment {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no operations for apply %q", deployment, apply.ApplyIdentifier))
+		return
+	}
+	client, err := s.TernClient(deployment, apply.Environment)
+	if err != nil {
+		s.logger.Error("failed to resolve deployment for data-plane logs",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q; check server logs", deployment))
+		return
+	}
+	if !client.IsRemote() {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q is local-only; omit --deployment to read control-plane logs", deployment))
+		return
+	}
+	fetches := make(map[string]*deploymentLogFetch)
 	for _, op := range ops {
 		if op.Deployment != deployment {
 			continue
 		}
-		matched = true
-		externalID := op.ExternalID
+		// The deployment is proven remote above, so the operation's recorded
+		// remote apply id — including one living only in the legacy engine
+		// resume context carrier — is a data-plane apply id, not engine resume
+		// state.
+		externalID := op.RemoteApplyID()
 		if externalID == "" && len(ops) == 1 {
 			externalID = apply.ExternalID
 		}
 		if externalID == "" {
-			// An operation without a remote apply id ran on the control plane;
-			// its logs live in control-plane storage, not behind this fan-out.
+			// An operation without a remote apply id has not been dispatched to
+			// the data plane; its logs live in control-plane storage, not behind
+			// this fan-out.
 			s.logger.Debug("skipping operation without a remote apply id for data-plane logs",
 				append(apply.LogAttrs(),
 					"operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
@@ -186,24 +212,8 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		}
 		fetch.operations = append(fetch.operations, &apitypes.LogOperationProvenance{OperationKey: op.OperationKey, Target: op.Target, OperationKind: op.OperationKind})
 	}
-	if !matched {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no operations for apply %q", deployment, apply.ApplyIdentifier))
-		return
-	}
 	if len(fetches) == 0 {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no remote operation logs; omit --deployment to read control-plane logs", deployment))
-		return
-	}
-	client, err := s.TernClient(deployment, apply.Environment)
-	if err != nil {
-		s.logger.Error("failed to resolve deployment for data-plane logs",
-			append(apply.LogAttrs(),
-				"operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q; check server logs", deployment))
-		return
-	}
-	if !client.IsRemote() {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q is local-only; omit --deployment to read control-plane logs", deployment))
 		return
 	}
 	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
