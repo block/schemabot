@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // The list-plans command lists stored plans by default and shows one plan's
@@ -35,8 +36,33 @@ func TestPlansCmdParsesListFiltersAndPlanID(t *testing.T) {
 	assert.Equal(t, "plan-1784327902264169990", cli.Plans.PlanIDArg)
 }
 
+// setHyperlinks pins the terminal hyperlink detection for the test, so
+// assertions on linked or plain sources don't depend on where the test runs.
+func setHyperlinks(t *testing.T, on bool) {
+	t.Helper()
+	prev := ui.Hyperlinks
+	ui.Hyperlinks = on
+	t.Cleanup(func() { ui.Hyperlinks = prev })
+}
+
+// A plan's source renders like the status list's: the full PR URL off a
+// terminal, the repository alone without a PR, and "ad-hoc" without either.
 func TestPlanSource(t *testing.T) {
+	setHyperlinks(t, false)
 	assert.Equal(t, "https://github.com/org/repo/pull/42", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo", PullRequest: 42}))
+	assert.Equal(t, "org/repo", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo"}))
+	assert.Equal(t, "ad-hoc", planSource(&apitypes.PlanSummaryResponse{}))
+}
+
+// On an interactive terminal the plan's PR provenance renders as the short
+// "owner/repo#pr" hyperlinked to the PR, matching the status list's source
+// column; sources without a PR are unaffected.
+func TestPlanSourceHyperlinked(t *testing.T) {
+	setHyperlinks(t, true)
+
+	assert.Equal(t,
+		"\x1b]8;;https://github.com/org/repo/pull/42\x1b\\org/repo#42\x1b]8;;\x1b\\",
+		planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo", PullRequest: 42}))
 	assert.Equal(t, "org/repo", planSource(&apitypes.PlanSummaryResponse{Repository: "org/repo"}))
 	assert.Equal(t, "ad-hoc", planSource(&apitypes.PlanSummaryResponse{}))
 }

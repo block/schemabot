@@ -14,9 +14,12 @@ type PlanSummaryData struct {
 	PlanID      string
 	Database    string
 	Environment string
-	// Source is the plan's provenance, rendered for the operator: the PR's URL
-	// when the plan came from one, the repository alone when the plan names a
-	// repository but no PR, and "ad-hoc" for a plan created without either.
+	// Source is the plan's provenance, pre-rendered for the operator the same
+	// way the status list renders an apply's source: the short "owner/repo#pr"
+	// as an OSC 8 hyperlink on an interactive terminal (the full URL otherwise),
+	// the repository alone when the plan names no PR, and "ad-hoc" for a plan
+	// created without either. It may carry zero-width escape bytes, so it
+	// renders as the unpadded last column.
 	Source    string
 	CreatedAt time.Time
 	// Changes is the rendered change summary, such as
@@ -34,7 +37,10 @@ type PlansListData struct {
 	Plans []PlanSummaryData
 }
 
-// WritePlansList renders stored plans newest-first as a column table.
+// WritePlansList renders stored plans newest-first as a column table, in the
+// status list's column order: the identifier first, then the target, then what
+// the plan holds, with the linkable source last so its escape bytes never sit
+// inside a padded column.
 func WritePlansList(data PlansListData) {
 	if len(data.Plans) == 0 {
 		window := ""
@@ -47,36 +53,39 @@ func WritePlansList(data PlansListData) {
 
 	fmt.Printf("%sRecent plans%s%s\n\n", ANSIBold, ANSIReset, plansWindowSuffix(data))
 
-	maxCreated := len("CREATED")
 	maxID := len("PLAN ID")
 	maxDB := len("DATABASE")
 	maxEnv := len("ENV")
-	maxSource := len("SOURCE")
+	maxChanges := len("CHANGES")
+	maxCreated := len("CREATED")
 	for _, p := range data.Plans {
-		maxCreated = maxLen(maxCreated, len(ui.FormatTimeAgo(p.CreatedAt)))
 		maxID = maxLen(maxID, len(p.PlanID))
 		maxDB = maxLen(maxDB, len(p.Database))
 		maxEnv = maxLen(maxEnv, len(p.Environment))
-		maxSource = maxLen(maxSource, len(p.Source))
+		maxChanges = maxLen(maxChanges, ui.VisibleWidth(p.Changes))
+		maxCreated = maxLen(maxCreated, len(ui.FormatTimeAgo(p.CreatedAt)))
 	}
 
 	fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 		ANSIDim,
-		maxCreated, "CREATED",
 		maxID, "PLAN ID",
 		maxDB, "DATABASE",
 		maxEnv, "ENV",
-		maxSource, "SOURCE",
-		"CHANGES",
+		maxChanges, "CHANGES",
+		maxCreated, "CREATED",
+		"SOURCE",
 		ANSIReset)
 	for _, p := range data.Plans {
-		fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n",
-			maxCreated, ui.FormatTimeAgo(p.CreatedAt),
+		// The change summary can carry multi-byte runes (its unsafe/blocked
+		// markers), so it is padded by visible width rather than %-*s's bytes.
+		paddedChanges := p.Changes + strings.Repeat(" ", maxChanges-ui.VisibleWidth(p.Changes))
+		fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 			maxID, p.PlanID,
 			maxDB, p.Database,
 			maxEnv, p.Environment,
-			maxSource, p.Source,
-			p.Changes)
+			paddedChanges,
+			maxCreated, ui.FormatTimeAgo(p.CreatedAt),
+			p.Source)
 	}
 	if data.HasMore {
 		fmt.Printf("\n  %sShowing %d plans; more available — raise --limit (max %d) or narrow with filters%s\n",

@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // PlansCmd lists recently generated plans, or shows one stored plan's content.
@@ -122,11 +123,14 @@ func showStoredPlan(endpoint, planID string, outputJSON bool) error {
 	return nil
 }
 
-// planSource renders a plan's provenance: the PR it was generated for as a
-// full clickable URL, or "ad-hoc" when it was created without one.
+// planSource renders a plan's provenance the way the status list renders an
+// apply's source: the short "owner/repo#pr" as an OSC 8 hyperlink to the PR on
+// an interactive terminal (the full URL everywhere else), the repository alone
+// when the plan names no PR, and "ad-hoc" for a plan created without either.
 func planSource(p *apitypes.PlanSummaryResponse) string {
 	if p.Repository != "" && p.PullRequest > 0 {
-		return fmt.Sprintf("https://github.com/%s/pull/%d", p.Repository, p.PullRequest)
+		url := fmt.Sprintf("https://github.com/%s/pull/%d", p.Repository, p.PullRequest)
+		return ui.Link(fmt.Sprintf("%s#%d", p.Repository, p.PullRequest), url)
 	}
 	if p.Repository != "" {
 		return p.Repository
