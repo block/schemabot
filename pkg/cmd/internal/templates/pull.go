@@ -1,6 +1,8 @@
 package templates
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -40,7 +42,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		for _, artifact := range sortedKeys(ns.Artifacts) {
 			fmt.Println()
 			fmt.Printf("-- Artifact `%s`\n", artifact)
-			writeCommented("-- ", ns.Artifacts[artifact])
+			writeCommented("-- ", formatArtifact(ns.Artifacts[artifact]))
 		}
 	}
 }
@@ -67,6 +69,18 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 		}
 		writeCommented("--   ", line+v.Message)
 	}
+}
+
+// formatArtifact re-indents a JSON artifact body (e.g. a VSchema, often
+// stored compactly) so each key reads on its own line. Non-JSON content is
+// returned unchanged — like FormatDDL, this is a best-effort display
+// formatter, so falling back to the original content is acceptable.
+func formatArtifact(content string) string {
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, []byte(content), "", "  "); err != nil {
+		return content
+	}
+	return indented.String()
 }
 
 // writeCommented prints content with every line prefixed as a SQL comment, so

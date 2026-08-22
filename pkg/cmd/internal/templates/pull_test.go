@@ -12,7 +12,8 @@ import (
 // The pretty pull rendering is a summary box followed by executable SQL:
 // tables print in name order with a ";" terminator whether or not the engine
 // included one, and non-table artifacts render entirely as "--" comments so
-// the output stays valid SQL.
+// the output stays valid SQL. JSON artifact bodies (often stored compactly)
+// are re-indented for reading; non-JSON artifacts pass through unchanged.
 func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 	out := captureStdout(t, func() {
 		WritePullSchema(&apitypes.PullSchemaResponse{
@@ -27,7 +28,8 @@ func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 						"orders": "CREATE TABLE `orders` (`order_id` bigint NOT NULL)\n",
 					},
 					Artifacts: map[string]string{
-						"vschema.json": "{\r\n  \"sharded\": false\r\n}\n",
+						"vschema.json": "{\"sharded\": false}\n",
+						"README.txt":   "usage notes\r\nsecond line\n",
 					},
 				},
 			},
@@ -49,7 +51,10 @@ func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 
 	assert.Contains(t, out, "-- Artifact `vschema.json`\n")
 	assert.Contains(t, out, "-- {\n--   \"sharded\": false\n-- }\n",
-		"every artifact line is a SQL comment, with CRLF normalized")
+		"a compact JSON artifact re-indents, with every line a SQL comment")
+	assert.Contains(t, out, "-- Artifact `README.txt`\n")
+	assert.Contains(t, out, "-- usage notes\n-- second line\n",
+		"a non-JSON artifact passes through unchanged, with CRLF normalized")
 	assert.NotContains(t, out, "\n{", "artifact bodies never render as uncommented lines")
 }
 
