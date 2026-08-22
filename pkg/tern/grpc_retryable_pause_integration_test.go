@@ -273,7 +273,10 @@ func TestGRPCClient_RemoteRetryablePauseSurvivesDataPlaneRetry(t *testing.T) {
 		select {
 		case <-driveExited:
 		case <-time.After(30 * time.Second):
-			t.Log("control-plane drive did not exit during cleanup")
+			// Proceeding would close the client and storage under a live
+			// goroutine; there is no way to reclaim it, so mark the stuck
+			// drive as a failure rather than tearing down beneath it.
+			t.Errorf("control-plane drive did not exit during cleanup; teardown will race the live drive goroutine")
 		}
 	})
 

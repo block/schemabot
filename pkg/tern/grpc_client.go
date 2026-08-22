@@ -4009,6 +4009,14 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, all
 	// onto the same apply. The task rows carry the pause for operator
 	// surfaces; the drive keeps polling until the data plane settles.
 	if state.IsState(remoteApplyState, state.Apply.FailedRetryable) {
+		// The in-memory apply can still carry its pre-claim snapshot: the
+		// claim moves the row to running but hands the driver the pre-claim
+		// state. Echoing a parked snapshot back would persist an immediately
+		// claimable state onto a leased row, so normalize it to the running
+		// state the claim already wrote.
+		if state.IsState(storedApplyState, state.Apply.FailedRetryable, state.Apply.Pending) {
+			return state.Apply.Running
+		}
 		return storedApplyState
 	}
 	if allowStoppedStoredApply && state.IsState(storedApplyState, state.Apply.Stopped) {
