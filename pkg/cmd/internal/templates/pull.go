@@ -13,10 +13,11 @@ import (
 )
 
 // WritePullSchema renders a pulled live schema for human reading: a summary
-// box followed by each namespace's DDL. Everything after the box is valid SQL
-// (statements terminated with ";", annotations and artifact bodies as "--"
-// comments), so the output can be read in the terminal or redirected into a
-// .sql file as-is.
+// box followed by each namespace's DDL. The DDL renders as valid SQL
+// (statements terminated with ";", annotations as "--" comments) so a
+// DDL-only pull can be redirected into a .sql file as-is. Artifact bodies
+// (e.g. a VSchema) print raw under their comment header so they can be
+// copy-pasted straight out of the terminal.
 func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	rows := []BoxRow{
 		{Label: "Database", Value: resp.Database},
@@ -42,7 +43,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		for _, artifact := range sortedKeys(ns.Artifacts) {
 			fmt.Println()
 			fmt.Printf("-- Artifact `%s`\n", artifact)
-			writeCommented("-- ", formatArtifact(ns.Artifacts[artifact]))
+			fmt.Println(formatArtifact(ns.Artifacts[artifact]))
 		}
 	}
 }
@@ -72,20 +73,22 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 }
 
 // formatArtifact re-indents a JSON artifact body (e.g. a VSchema, often
-// stored compactly) so each key reads on its own line. Non-JSON content is
-// returned unchanged — like FormatDDL, this is a best-effort display
+// stored compactly) so each key reads on its own line, and normalizes
+// line endings and trailing whitespace. Non-JSON content passes through with
+// only the normalization — like FormatDDL, this is a best-effort display
 // formatter, so falling back to the original content is acceptable.
 func formatArtifact(content string) string {
 	var indented bytes.Buffer
-	if err := json.Indent(&indented, []byte(content), "", "  "); err != nil {
-		return content
+	if err := json.Indent(&indented, []byte(content), "", "  "); err == nil {
+		content = indented.String()
 	}
-	return indented.String()
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	return strings.TrimRight(content, "\n")
 }
 
 // writeCommented prints content with every line prefixed as a SQL comment, so
-// multi-line values (artifact bodies, lint messages) never break the
-// executable-SQL contract of the surrounding output.
+// multi-line values (e.g. lint messages) never break the executable-SQL
+// contract of the DDL rendering.
 func writeCommented(prefix, content string) {
 	content = strings.ReplaceAll(content, "\r\n", "\n")
 	content = strings.TrimRight(content, "\n")

@@ -9,11 +9,12 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 )
 
-// The pretty pull rendering is a summary box followed by executable SQL:
-// tables print in name order with a ";" terminator whether or not the engine
-// included one, and non-table artifacts render entirely as "--" comments so
-// the output stays valid SQL. JSON artifact bodies (often stored compactly)
-// are re-indented for reading; non-JSON artifacts pass through unchanged.
+// The pretty pull rendering is a summary box followed by the schema: tables
+// print in name order as valid SQL with a ";" terminator whether or not the
+// engine included one, and non-table artifacts follow under a comment header
+// with their body printed raw so it can be copy-pasted from the terminal.
+// JSON artifact bodies (often stored compactly) are re-indented for reading;
+// non-JSON artifacts pass through unchanged.
 func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 	out := captureStdout(t, func() {
 		WritePullSchema(&apitypes.PullSchemaResponse{
@@ -50,12 +51,11 @@ func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 		"tables render in name order")
 
 	assert.Contains(t, out, "-- Artifact `vschema.json`\n")
-	assert.Contains(t, out, "-- {\n--   \"sharded\": false\n-- }\n",
-		"a compact JSON artifact re-indents, with every line a SQL comment")
+	assert.Contains(t, out, "{\n  \"sharded\": false\n}\n",
+		"a compact JSON artifact re-indents and prints raw for copy-paste")
 	assert.Contains(t, out, "-- Artifact `README.txt`\n")
-	assert.Contains(t, out, "-- usage notes\n-- second line\n",
+	assert.Contains(t, out, "usage notes\nsecond line\n",
 		"a non-JSON artifact passes through unchanged, with CRLF normalized")
-	assert.NotContains(t, out, "\n{", "artifact bodies never render as uncommented lines")
 }
 
 // A pull that asked for linting renders the audit as SQL comments under the
