@@ -11,7 +11,8 @@ import (
 
 // The pretty pull rendering is a summary box followed by executable SQL:
 // tables print in name order with a ";" terminator whether or not the engine
-// included one, and non-table artifacts follow under a comment header.
+// included one, and non-table artifacts render entirely as "--" comments so
+// the output stays valid SQL.
 func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 	out := captureStdout(t, func() {
 		WritePullSchema(&apitypes.PullSchemaResponse{
@@ -26,7 +27,7 @@ func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 						"orders": "CREATE TABLE `orders` (`order_id` bigint NOT NULL)\n",
 					},
 					Artifacts: map[string]string{
-						"vschema.json": "{\"sharded\": false}\n",
+						"vschema.json": "{\r\n  \"sharded\": false\r\n}\n",
 					},
 				},
 			},
@@ -47,7 +48,9 @@ func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 		"tables render in name order")
 
 	assert.Contains(t, out, "-- Artifact `vschema.json`\n")
-	assert.Contains(t, out, "{\"sharded\": false}\n")
+	assert.Contains(t, out, "-- {\n--   \"sharded\": false\n-- }\n",
+		"every artifact line is a SQL comment, with CRLF normalized")
+	assert.NotContains(t, out, "\n{", "artifact bodies never render as uncommented lines")
 }
 
 // A pull that asked for linting renders the audit as SQL comments under the
@@ -72,12 +75,13 @@ func TestWritePullSchema_LintAuditRendersAsComments(t *testing.T) {
 	violations := captureStdout(t, func() {
 		WritePullSchema(response([]*apitypes.LintViolationResponse{
 			{Table: "users", Severity: "warning", Message: `Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`},
-			{Table: "users", Severity: "error", Message: `Primary key column "id" has type "int"`},
+			{Table: "users", Severity: "error", Message: "Primary key column \"id\" has type \"int\"\nUse BIGINT UNSIGNED instead."},
 		}))
 	})
 	assert.Contains(t, violations, "-- Lint: 2 violations\n")
 	assert.Contains(t, violations, "--   [warning] users: Column \"created_at\" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
-	assert.Contains(t, violations, "--   [error] users: Primary key column \"id\" has type \"int\"\n")
+	assert.Contains(t, violations, "--   [error] users: Primary key column \"id\" has type \"int\"\n--   Use BIGINT UNSIGNED instead.\n",
+		"every line of a multi-line message is a SQL comment")
 
 	clean := captureStdout(t, func() {
 		WritePullSchema(response([]*apitypes.LintViolationResponse{}))

@@ -12,8 +12,9 @@ import (
 
 // WritePullSchema renders a pulled live schema for human reading: a summary
 // box followed by each namespace's DDL. Everything after the box is valid SQL
-// (statements terminated with ";", annotations as "--" comments), so the
-// output can be read in the terminal or redirected into a .sql file as-is.
+// (statements terminated with ";", annotations and artifact bodies as "--"
+// comments), so the output can be read in the terminal or redirected into a
+// .sql file as-is.
 func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	rows := []BoxRow{
 		{Label: "Database", Value: resp.Database},
@@ -39,7 +40,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 		for _, artifact := range sortedKeys(ns.Artifacts) {
 			fmt.Println()
 			fmt.Printf("-- Artifact `%s`\n", artifact)
-			fmt.Println(strings.TrimRight(ns.Artifacts[artifact], "\n"))
+			writeCommented("-- ", ns.Artifacts[artifact])
 		}
 	}
 }
@@ -57,14 +58,25 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 	}
 	fmt.Printf("-- Lint: %d %s\n", len(violations), ui.Pluralize("violation", len(violations)))
 	for _, v := range violations {
-		line := "--   "
+		line := ""
 		if v.Severity != "" {
 			line += "[" + v.Severity + "] "
 		}
 		if v.Table != "" {
 			line += v.Table + ": "
 		}
-		fmt.Println(line + v.Message)
+		writeCommented("--   ", line+v.Message)
+	}
+}
+
+// writeCommented prints content with every line prefixed as a SQL comment, so
+// multi-line values (artifact bodies, lint messages) never break the
+// executable-SQL contract of the surrounding output.
+func writeCommented(prefix, content string) {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.TrimRight(content, "\n")
+	for line := range strings.SplitSeq(content, "\n") {
+		fmt.Println(prefix + line)
 	}
 }
 
