@@ -106,6 +106,44 @@ func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T
 	assert.Contains(t, rendered, "▶️ **To apply**")
 }
 
+// The attribution disclosure coaches re-planning, which is only actionable
+// before the apply starts: the plan comment carries it for review, and the
+// locked apply comment omits it — an apply already in flight has no re-plan
+// move left.
+func TestRenderPlanComment_LockedApplyCommentOmitsAttributedChanges(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "drinks",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+		IsLocked:     true,
+		LockOwner:    "block/schemabot#7",
+		LockAcquired: "2026-08-22 00:13:52 UTC",
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "🔒 **Lock acquired by**")
+	assert.NotContains(t, rendered, "Check before applying")
+	assert.NotContains(t, rendered, "block/schemabot#42")
+
+	data.IsLocked = false
+	data.LockOwner = ""
+	data.LockAcquired = ""
+	planRendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, planRendered, "🛑 **Check before applying**")
+	assert.Contains(t, planRendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+}
+
 // The unsafe-blocked comment is where an operator is told how to override the
 // block, so it carries the attribution alongside the override it coaches.
 func TestRenderUnsafeChangesBlocked_CarriesAttributedChange(t *testing.T) {

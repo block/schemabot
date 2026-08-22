@@ -203,10 +203,12 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
-	// Destructive changes to tables another pull request owns. Shown on the
-	// locked apply comment too, for the same reason as the direct-execution
-	// disclosure: it must sit on the comment the confirmation acts on.
-	if len(data.AttributedChanges) > 0 {
+	// Destructive changes to tables another pull request owns — shown on the
+	// plan comment for review, omitted on the locked apply comment: the
+	// disclosure coaches re-planning ("merge that PR ... then re-plan"), which
+	// is only actionable before the apply starts. By apply time the operator
+	// has already reviewed it, so repeating it there is noise.
+	if len(data.AttributedChanges) > 0 && !data.IsLocked {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
