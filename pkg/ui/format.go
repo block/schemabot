@@ -223,13 +223,6 @@ func TableStatePriority(taskState string) int {
 	}
 }
 
-// CleanLintReason strips severity prefixes like "[ERROR] linter_name:" from
-// Spirit's raw lint violation strings for cleaner display. Handles multiple
-// violations joined by "; " by cleaning each segment individually.
-func CleanLintReason(reason string) string {
-	return strings.Join(LintReasons(reason), "; ")
-}
-
 // LintReasons splits an engine-reported unsafe reason into its individual
 // lint violations. Engines join a table's violations with "; ", so renderers
 // use this to give each violation its own line instead of one run-on string.

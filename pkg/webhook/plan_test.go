@@ -953,6 +953,55 @@ func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
 	assert.NotContains(t, rendered, "data; ")
 }
 
+// An engine can report an unsafe change without a parseable reason. The
+// blocking comment still lists the table — as a bare bullet, no dangling
+// colon — and the header counts it as one finding.
+func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{Table: "users", Reason: ""},
+			{Table: "orders", Reason: "DROP TABLE removes all data"},
+		},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "⛔ 2 Unsafe Changes Detected")
+	assert.Contains(t, rendered, "- `users`\n")
+	assert.NotContains(t, rendered, "- `users`:")
+	assert.Contains(t, rendered, "- `orders`: DROP TABLE removes all data\n")
+}
+
+// The plan comment's unsafe-issues section handles a reasonless change the
+// same way: a bare table bullet that still counts once in the header.
+func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []templates.UnsafeChangeData{{Table: "users", Reason: ""}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "**1** unsafe change detected")
+	assert.Contains(t, rendered, "- `users`\n")
+	assert.NotContains(t, rendered, "- `users`:")
+}
+
 func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:     "testdb",
