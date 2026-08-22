@@ -7,6 +7,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -2130,6 +2131,26 @@ func PreviewCommentSummaryFailed() string {
 	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
 	return RenderApplySummaryComment(data) +
 		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
+}
+
+// PreviewCommentSummaryFailedAfterRetries renders the failed summary for an
+// apply that exhausted its operator retry budget. Each retry relaunches the
+// engine's row copy, so the live per-table progress is whichever attempt was
+// sampled last — here 12% — while the failure label reports the run's
+// high-water: the furthest any attempt got (47%).
+func PreviewCommentSummaryFailedAfterRetries() string {
+	tables := sampleApplyTables()[:2]
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Failed
+	tables[1].RowsCopied = 173201
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 12
+	tables[1].BestRowsCopied = 689129
+	tables[1].BestPercentComplete = 47
+	data := sampleSummaryDataWithDuration(state.Apply.Failed, tables, 2*time.Hour+15*time.Minute)
+	data.Attempt = storage.MaxRecoveryAttempts
+	data.ErrorMessage = PreviewErrorMiddleFailed
+	return RenderApplySummaryComment(data)
 }
 
 // PreviewCommentSummaryStopped renders a sample stopped summary comment.

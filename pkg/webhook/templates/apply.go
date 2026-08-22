@@ -24,7 +24,13 @@ type TableProgressData struct {
 	RowsCopied      int64
 	RowsTotal       int64
 	PercentComplete int
-	ETASeconds      int64
+	// High-water row-copy progress across the whole run. An operator retry
+	// relaunches the row copy, so the live fields above hold whichever attempt
+	// was sampled last; failure labels render from these so a retry that
+	// restarted the copy cannot understate how far the run actually got.
+	BestRowsCopied      int64
+	BestPercentComplete int
+	ETASeconds          int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -780,8 +786,10 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		// before copying a single row (e.g. a preflight check rejected the
 		// change), a red 0% bar reads as a copy that started and stalled — render
 		// the failure without one. An instant DDL change has no row copy phase
-		// at all, so its failure label does not mention one.
-		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
+		// at all, so its failure label does not mention one. The bar shows the
+		// run's high-water progress (see failedCopyPercent), not whichever
+		// attempt happened to be sampled last.
+		switch pct := failedCopyPercent(table); {
 		case pct > 0:
 			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
 		case table.IsInstant:
@@ -1558,6 +1566,19 @@ func groupStateEmoji(tables []TableProgressData) string {
 	return "✅"
 }
 
+// failedCopyPercent returns the display percent for a failed table's row copy:
+// the furthest the copy ever got across the whole run. An operator retry
+// relaunches the row copy, so the live sample holds whichever attempt was
+// written last — rendering it would understate a run whose earlier attempt got
+// further (or overstate one whose earlier attempt finished its copy). The live
+// sample is folded in as a floor for rows written before high-water tracking.
+// Zero means the copy never started.
+func failedCopyPercent(t TableProgressData) int {
+	pct := max(t.BestPercentComplete, t.PercentComplete)
+	rows := max(t.BestRowsCopied, t.RowsCopied)
+	return ui.RowCopyDisplayPercent(pct, rows)
+}
+
 // writeSummaryTableEntry writes a single table with DDL block.
 // No emoji — the header carries the group state. Non-success tables get a text label.
 func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
@@ -1568,8 +1589,8 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
 	case state.Task.Failed:
 		label := "Failed"
-		if t.PercentComplete > 0 || t.RowsCopied > 0 {
-			label = fmt.Sprintf("Failed at %d%%", ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
+		if pct := failedCopyPercent(t); pct > 0 {
+			label = fmt.Sprintf("Failed at %d%%", pct)
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case state.Task.Stopped:

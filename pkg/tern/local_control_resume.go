@@ -1594,7 +1594,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				cancelGeneration := c.setApplyCancel(cancelResume)
 				defer c.clearApplyCancel(cancelGeneration)
 				defer cancelResume()
-				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false, releaseAtCutoverBarrier); err != nil {
+				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering apply (engine cutover signal present)", true, false, releaseAtCutoverBarrier); err != nil {
 					if errors.Is(err, errGroupedResumeStateUnavailable) {
 						logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
 							"error", err)
@@ -1674,7 +1674,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
-		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply, options)), true, startRequested, releaseAtCutoverBarrier); err != nil {
+		// The event says only that the drive relaunched the engine work; whether
+		// the engine reattaches to a durable checkpoint or restarts the copy from
+		// scratch is its own outcome, reported by logEngineResumeOnce when the
+		// engine confirms it.
+		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed (%s)", groupedApplyModeDescription(apply, options)), true, startRequested, releaseAtCutoverBarrier); err != nil {
 			if errors.Is(err, errGroupedResumeStateUnavailable) {
 				logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
 					"error", err)
@@ -1703,8 +1707,12 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				}
 			}
 
+			// The event says only that the drive relaunched the engine work;
+			// whether the engine reattaches to a durable checkpoint or restarts
+			// the copy from scratch is its own outcome, reported by
+			// logEngineResumeOnce when the engine confirms it.
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-				"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
+				"Apply resumed (sequential)", "", state.Apply.Running)
 		}
 
 		resumeCtx, cancelResume := context.WithCancel(ctx)

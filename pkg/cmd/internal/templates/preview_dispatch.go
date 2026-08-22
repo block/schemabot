@@ -230,6 +230,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted())
 	case PreviewCommentSummaryFailed:
 		fmt.Print(webhooktemplates.PreviewCommentSummaryFailed())
+	case PreviewCommentSummaryFailedRetries:
+		fmt.Print(webhooktemplates.PreviewCommentSummaryFailedAfterRetries())
 	case PreviewCommentSummaryStopped:
 		fmt.Print(webhooktemplates.PreviewCommentSummaryStopped())
 	case PreviewCommentSummaryCompletedLarge:

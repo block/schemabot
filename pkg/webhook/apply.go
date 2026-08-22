@@ -130,6 +130,8 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
 			PercentComplete:     t.ProgressPercent,
+			BestRowsCopied:      t.BestRowsCopied,
+			BestPercentComplete: t.BestProgressPercent,
 			ETASeconds:          int64(t.ETASeconds),
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,

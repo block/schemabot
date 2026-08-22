@@ -61,6 +61,7 @@ type Harness interface {
 func Run(t *testing.T, h Harness) {
 	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
 	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
+	t.Run("Tasks", func(t *testing.T) { TestTasks(t, h) })
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the
