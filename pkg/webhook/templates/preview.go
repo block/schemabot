@@ -789,7 +789,7 @@ func PreviewCommentLintErrorsBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"`},
+			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`},
 			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
 		},
 	})

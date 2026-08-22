@@ -517,20 +517,17 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 // writeUnsafeChangesList writes the list of unsafe changes, splitting multi-reason entries.
 func writeUnsafeChangesList(changes []UnsafeChange) {
 	for _, c := range changes {
-		reason := ui.CleanLintReason(c.Reason)
-		if reason != "" {
-			// Split multiple reasons (joined by "; " in the engine)
-			reasons := strings.Split(reason, "; ")
-			if len(reasons) > 1 {
-				fmt.Printf("  • %s:\n", c.Table)
-				for _, r := range reasons {
-					fmt.Printf("      - %s\n", r)
-				}
-			} else {
-				fmt.Printf("  • %s: %s\n", c.Table, reason)
-			}
-		} else {
+		reasons := ui.LintReasons(c.Reason)
+		switch len(reasons) {
+		case 0:
 			fmt.Printf("  • %s: %s\n", c.Table, c.ChangeType)
+		case 1:
+			fmt.Printf("  • %s: %s\n", c.Table, reasons[0])
+		default:
+			fmt.Printf("  • %s:\n", c.Table)
+			for _, r := range reasons {
+				fmt.Printf("      - %s\n", r)
+			}
 		}
 	}
 }
