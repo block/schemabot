@@ -2,6 +2,44 @@ package templates
 
 import "github.com/block/schemabot/pkg/apitypes"
 
+// previewPullVitessSchemaOutput shows a multi-keyspace Vitess pull: each
+// keyspace renders as its own namespace section with its VSchema artifact,
+// and the summary box carries the namespace count.
+func previewPullVitessSchemaOutput() {
+	WritePullSchema(&apitypes.PullSchemaResponse{
+		Database:    "orders-db",
+		Type:        "vitess",
+		Environment: "production",
+		TableCount:  2,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"commerce": {
+				Tables: map[string]string{
+					"settings": "CREATE TABLE `settings` (\n" +
+						"  `id` bigint NOT NULL,\n" +
+						"  `name` varchar(255) DEFAULT NULL,\n" +
+						"  PRIMARY KEY (`id`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n",
+				},
+				Artifacts: map[string]string{
+					"vschema.json": "{\"sharded\":false}\n",
+				},
+			},
+			"commerce_sharded": {
+				Tables: map[string]string{
+					"users": "CREATE TABLE `users` (\n" +
+						"  `id` bigint NOT NULL,\n" +
+						"  `email` varchar(255) DEFAULT NULL,\n" +
+						"  PRIMARY KEY (`id`)\n" +
+						") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n",
+				},
+				Artifacts: map[string]string{
+					"vschema.json": "{\"sharded\":true,\"vindexes\":{\"hash\":{\"type\":\"hash\"}},\"tables\":{\"users\":{\"column_vindexes\":[{\"column\":\"id\",\"name\":\"hash\"}]}}}\n",
+				},
+			},
+		},
+	})
+}
+
 // previewPullSchemaOutput shows a pulled live schema with a lint audit: the
 // summary box, per-namespace DDL as executable SQL, and lint findings as
 // comments.

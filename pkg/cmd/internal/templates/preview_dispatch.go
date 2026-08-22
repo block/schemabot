@@ -109,6 +109,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewPlansListOutput()
 	case PreviewPullSchema:
 		previewPullSchemaOutput()
+	case PreviewPullVitessSchema:
+		previewPullVitessSchemaOutput()
 	case PreviewLintViolations:
 		previewLintViolationsOutput()
 	case PreviewUnsafeBlocked:

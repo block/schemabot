@@ -65,7 +65,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Status types
 	case templates.PreviewStatusList, templates.PreviewStatusDeployment, templates.PreviewStatusHistory,
-		templates.PreviewPlansList, templates.PreviewPullSchema:
+		templates.PreviewPlansList, templates.PreviewPullSchema, templates.PreviewPullVitessSchema:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
@@ -228,6 +228,7 @@ Status:
   status_history        Database apply history
   plans_list            List of recently generated plans
   pull_schema           Pulled live schema rendered as readable SQL
+  pull_schema_vitess    Multi-keyspace Vitess pull with VSchema artifacts
 
 Lint and Unsafe:
   lint_violations         Lint violations output
