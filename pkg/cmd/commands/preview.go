@@ -65,7 +65,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Status types
 	case templates.PreviewStatusList, templates.PreviewStatusDeployment, templates.PreviewStatusHistory,
-		templates.PreviewPlansList:
+		templates.PreviewPlansList, templates.PreviewPullSchema:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
@@ -227,6 +227,7 @@ Status:
   status_deployment     Deployment-scoped schema change status
   status_history        Database apply history
   plans_list            List of recently generated plans
+  pull_schema           Pulled live schema rendered as readable SQL
 
 Lint and Unsafe:
   lint_violations         Lint violations output

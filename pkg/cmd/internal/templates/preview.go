@@ -86,6 +86,7 @@ const (
 	PreviewStatusDeployment PreviewType = "status_deployment" // Deployment-scoped schema change status
 	PreviewStatusHistory    PreviewType = "status_history"    // Database apply history
 	PreviewPlansList        PreviewType = "plans_list"        // List of recently generated plans
+	PreviewPullSchema       PreviewType = "pull_schema"       // Pulled live schema rendered as readable SQL
 
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output
