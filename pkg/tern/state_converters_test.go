@@ -46,6 +46,17 @@ func TestRevertingStateConversions(t *testing.T) {
 	assert.False(t, isTerminalProtoState(ternv1.State_STATE_REVERTING), "reverting is in-flight, not terminal")
 }
 
+// A retryable pause round-trips across the wire as its own state so the
+// polling plane can tell "parked for the serving plane's own retry" apart from
+// a settled failure without inspecting per-table statuses.
+func TestFailedRetryableStateConversions(t *testing.T) {
+	assert.Equal(t, ternv1.State_STATE_FAILED_RETRYABLE, storageStateToProto(state.Task.FailedRetryable))
+	assert.Equal(t, ternv1.State_STATE_FAILED_RETRYABLE, storageStateToProto(state.Apply.FailedRetryable))
+	assert.Equal(t, state.Apply.FailedRetryable, ProtoStateToStorage(ternv1.State_STATE_FAILED_RETRYABLE))
+	assert.False(t, isTerminalProtoState(ternv1.State_STATE_FAILED_RETRYABLE), "a retryable pause is in-flight, not terminal")
+	assert.True(t, isTerminalProtoState(ternv1.State_STATE_FAILED), "a settled failure stays terminal")
+}
+
 // The post-copy phases round-trip across the task and proto boundaries so a
 // drain or verify in progress is reported end-to-end as its phase rather than
 // collapsing to pending on the wire.
