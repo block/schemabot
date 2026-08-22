@@ -33,19 +33,46 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	for _, name := range sortedKeys(resp.Namespaces) {
 		ns := resp.Namespaces[name]
 		fmt.Println()
-		fmt.Printf("-- Namespace `%s` — %d %s\n", name, len(ns.Tables), ui.Pluralize("table", len(ns.Tables)))
+		fmt.Println(annotation(fmt.Sprintf("-- Namespace %s — %d %s",
+			emphasis("`"+name+"`"), len(ns.Tables), ui.Pluralize("table", len(ns.Tables)))))
 		writePulledLint(ns.Lint)
 
 		for _, table := range sortedKeys(ns.Tables) {
 			fmt.Println()
-			fmt.Println(terminateStatement(ns.Tables[table]))
+			stmt := terminateStatement(ns.Tables[table])
+			if ui.Colors {
+				stmt = FormatSQL(stmt)
+			}
+			fmt.Println(stmt)
 		}
 		for _, artifact := range sortedKeys(ns.Artifacts) {
 			fmt.Println()
-			fmt.Printf("-- Artifact `%s`\n", artifact)
-			fmt.Println(formatArtifact(ns.Artifacts[artifact]))
+			fmt.Println(annotation(fmt.Sprintf("-- Artifact %s", emphasis("`"+artifact+"`"))))
+			body, isJSON := formatArtifact(ns.Artifacts[artifact])
+			if ui.Colors && isJSON {
+				body = colorizeJSON(body)
+			}
+			fmt.Println(body)
 		}
 	}
+}
+
+// annotation renders a "--" comment line dimmed on interactive terminals, so
+// the schema content stands out from its scaffolding. Plain everywhere else.
+func annotation(s string) string {
+	if !ui.Colors {
+		return s
+	}
+	return ANSIDim + s + ANSIReset
+}
+
+// emphasis bolds a name inside an annotation line, resuming the dim style
+// afterwards. Only meaningful within annotation(); plain when colors are off.
+func emphasis(s string) string {
+	if !ui.Colors {
+		return s
+	}
+	return ANSIReset + ANSIBold + s + ANSIReset + ANSIDim
 }
 
 // writePulledLint renders a namespace's lint audit as SQL comments. A nil
@@ -56,14 +83,14 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 		return
 	}
 	if len(violations) == 0 {
-		fmt.Println("-- Lint: no violations")
+		fmt.Println(annotation("-- Lint: no violations"))
 		return
 	}
-	fmt.Printf("-- Lint: %d %s\n", len(violations), ui.Pluralize("violation", len(violations)))
+	fmt.Println(annotation(fmt.Sprintf("-- Lint: %d %s", len(violations), ui.Pluralize("violation", len(violations)))))
 	for _, v := range violations {
 		line := ""
 		if v.Severity != "" {
-			line += "[" + v.Severity + "] "
+			line += severityTag(v.Severity) + " "
 		}
 		if v.Table != "" {
 			line += v.Table + ": "
@@ -72,18 +99,99 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 	}
 }
 
+// severityTag renders a lint severity as its bracketed tag, colored on
+// interactive terminals so warnings and errors are scannable at a glance.
+func severityTag(severity string) string {
+	tag := "[" + severity + "]"
+	if !ui.Colors {
+		return tag
+	}
+	switch strings.ToLower(severity) {
+	case "warning":
+		return ANSIYellow + tag + ANSIReset
+	case "error":
+		return ANSIRed + tag + ANSIReset
+	default:
+		return tag
+	}
+}
+
 // formatArtifact re-indents a JSON artifact body (e.g. a VSchema, often
 // stored compactly) so each key reads on its own line, and normalizes
-// line endings and trailing whitespace. Non-JSON content passes through with
+// line endings and trailing whitespace. It reports whether the body was JSON
+// so the caller can colorize it. Non-JSON content passes through with
 // only the normalization — like FormatDDL, this is a best-effort display
 // formatter, so falling back to the original content is acceptable.
-func formatArtifact(content string) string {
+func formatArtifact(content string) (string, bool) {
 	var indented bytes.Buffer
-	if err := json.Indent(&indented, []byte(content), "", "  "); err == nil {
+	isJSON := json.Indent(&indented, []byte(content), "", "  ") == nil
+	if isJSON {
 		content = indented.String()
 	}
 	content = strings.ReplaceAll(content, "\r\n", "\n")
-	return strings.TrimRight(content, "\n")
+	return strings.TrimRight(content, "\n"), isJSON
+}
+
+// colorizeJSON adds jq-style coloring to an indented JSON document: object
+// keys in cyan, string values in green, structural punctuation dimmed. The
+// document is colored by a scan of its string literals and punctuation, not
+// re-encoded, so the text content is byte-identical to the plain rendering.
+func colorizeJSON(doc string) string {
+	var b strings.Builder
+	for i := 0; i < len(doc); {
+		c := doc[i]
+		switch {
+		case c == '"':
+			end := jsonStringEnd(doc, i)
+			color := ANSIGreen
+			if jsonKeyFollows(doc, end) {
+				color = ANSICyan
+			}
+			b.WriteString(color)
+			b.WriteString(doc[i:end])
+			b.WriteString(ANSIReset)
+			i = end
+		case strings.ContainsRune("{}[],:", rune(c)):
+			b.WriteString(ANSIDim)
+			b.WriteByte(c)
+			b.WriteString(ANSIReset)
+			i++
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// jsonStringEnd returns the index just past the string literal whose opening
+// quote is at doc[start], honoring backslash escapes.
+func jsonStringEnd(doc string, start int) int {
+	for i := start + 1; i < len(doc); i++ {
+		switch doc[i] {
+		case '\\':
+			i++
+		case '"':
+			return i + 1
+		}
+	}
+	return len(doc)
+}
+
+// jsonKeyFollows reports whether the string literal ending at doc[end] is an
+// object key, i.e. the next non-whitespace character is a colon.
+func jsonKeyFollows(doc string, end int) bool {
+	for i := end; i < len(doc); i++ {
+		switch doc[i] {
+		case ' ', '\t', '\n':
+			continue
+		case ':':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // writeCommented prints content with every line prefixed as a SQL comment, so

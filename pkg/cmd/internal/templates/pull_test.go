@@ -7,7 +7,17 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ui"
 )
+
+// setColors pins the interactive-terminal color detection for the test, so
+// assertions on styled or plain output don't depend on where the test runs.
+func setColors(t *testing.T, on bool) {
+	t.Helper()
+	prev := ui.Colors
+	ui.Colors = on
+	t.Cleanup(func() { ui.Colors = prev })
+}
 
 // The pretty pull rendering is a summary box followed by the schema: tables
 // print in name order as valid SQL with a ";" terminator whether or not the
@@ -16,6 +26,7 @@ import (
 // JSON artifact bodies (often stored compactly) are re-indented for reading;
 // non-JSON artifacts pass through unchanged.
 func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
+	setColors(t, false)
 	out := captureStdout(t, func() {
 		WritePullSchema(&apitypes.PullSchemaResponse{
 			Database:    "orders-db",
@@ -62,6 +73,7 @@ func TestWritePullSchema_RendersSchemaAsExecutableSQL(t *testing.T) {
 // namespace header, so the output stays executable. An explicit empty audit
 // reads as clean; a pull without linting shows no lint line at all.
 func TestWritePullSchema_LintAuditRendersAsComments(t *testing.T) {
+	setColors(t, false)
 	response := func(lint []*apitypes.LintViolationResponse) *apitypes.PullSchemaResponse {
 		return &apitypes.PullSchemaResponse{
 			Database:    "orders-db",
@@ -102,6 +114,7 @@ func TestWritePullSchema_LintAuditRendersAsComments(t *testing.T) {
 // A multi-namespace pull renders each namespace in name order and surfaces
 // the namespace count in the summary box.
 func TestWritePullSchema_MultipleNamespacesRenderInOrder(t *testing.T) {
+	setColors(t, false)
 	out := captureStdout(t, func() {
 		WritePullSchema(&apitypes.PullSchemaResponse{
 			Database:    "orders-db",
@@ -120,4 +133,42 @@ func TestWritePullSchema_MultipleNamespacesRenderInOrder(t *testing.T) {
 	assert.Contains(t, out, "-- Namespace `shipping` — 1 table\n")
 	assert.Less(t, strings.Index(out, "-- Namespace `billing`"), strings.Index(out, "-- Namespace `shipping`"),
 		"namespaces render in name order")
+}
+
+// On an interactive terminal the rendering is styled: annotation lines dim
+// with the names in bold, DDL syntax-highlighted, lint severities colored,
+// and JSON artifacts colored jq-style. Piped output carries no escapes at
+// all, so redirecting to a file stays byte-clean.
+func TestWritePullSchema_StylesOutputOnInteractiveTerminals(t *testing.T) {
+	response := &apitypes.PullSchemaResponse{
+		Database:    "orders-db",
+		Type:        "vitess",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"commerce": {
+				Tables:    map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL)\n"},
+				Artifacts: map[string]string{"vschema.json": "{\"sharded\": true}\n"},
+				Lint: []*apitypes.LintViolationResponse{
+					{Table: "users", Severity: "warning", Message: "message"},
+					{Table: "users", Severity: "error", Message: "message"},
+				},
+			},
+		},
+	}
+
+	setColors(t, true)
+	styled := captureStdout(t, func() { WritePullSchema(response) })
+	assert.Contains(t, styled, ANSIDim+"-- Namespace ", "annotation lines dim")
+	assert.Contains(t, styled, ANSIBold+"`commerce`", "namespace name bold")
+	assert.Contains(t, styled, ANSIBold+"`vschema.json`", "artifact name bold")
+	assert.Contains(t, styled, ANSIYellow+"[warning]"+ANSIReset, "warning severity yellow")
+	assert.Contains(t, styled, ANSIRed+"[error]"+ANSIReset, "error severity red")
+	assert.Contains(t, styled, ANSIMagenta+"`users`"+ANSIReset, "DDL table name highlighted")
+	assert.Contains(t, styled, ANSICyan+"\"sharded\""+ANSIReset, "JSON key cyan")
+
+	setColors(t, false)
+	plain := captureStdout(t, func() { WritePullSchema(response) })
+	assert.NotContains(t, plain, "\033[", "piped output carries no ANSI escapes")
+	assert.Contains(t, plain, "{\n  \"sharded\": true\n}\n")
 }
