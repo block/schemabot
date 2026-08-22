@@ -203,12 +203,12 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
-	// Destructive changes to tables another pull request owns — shown on the
-	// plan comment for review, omitted on the locked apply comment: the
-	// disclosure coaches re-planning ("merge that PR ... then re-plan"), which
-	// is only actionable before the apply starts. By apply time the operator
-	// has already reviewed it, so repeating it there is noise.
-	if len(data.AttributedChanges) > 0 && !data.IsLocked {
+	// Destructive changes to tables another pull request owns — shown where the
+	// reader still decides whether the apply proceeds, omitted on the
+	// auto-applying locked comment: the disclosure coaches re-planning ("merge
+	// that PR ... then re-plan"), which is noise once the apply is already
+	// running.
+	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
@@ -290,6 +290,17 @@ func RenderPlanComment(data PlanCommentData) string {
 func writeApplyInstruction(sb *strings.Builder, command string) {
 	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// attributionStillActionable reports whether the comment's reader still
+// decides whether the apply proceeds. The plan comment offers the apply
+// command, and a locked comment downgraded to manual confirmation pauses for
+// apply-confirm — both readers can merge the owning pull request and re-plan
+// instead, so the attributed-changes disclosure informs a decision they still
+// hold. The auto-applying locked comment leaves no decision, so the
+// disclosure is noise there.
+func attributionStillActionable(data PlanCommentData) bool {
+	return !data.IsLocked || data.AutoConfirmDowngradeReason != ""
 }
 
 // writeAttributedChanges writes the section for destructive changes to tables

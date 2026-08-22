@@ -144,6 +144,37 @@ func TestRenderPlanComment_LockedApplyCommentOmitsAttributedChanges(t *testing.T
 	assert.Contains(t, planRendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 }
 
+// A locked comment downgraded to manual confirmation pauses for apply-confirm,
+// so the operator still holds the decision the attribution informs: the
+// disclosure renders alongside the confirmation it coaches.
+func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "drinks",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+		IsLocked:                   true,
+		LockOwner:                  "block/schemabot#7",
+		LockAcquired:               "2026-08-22 00:13:52 UTC",
+		AutoConfirmDowngradeReason: "Could not verify plan — confirm manually",
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "⚠️ **Automatic apply paused**")
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+	assert.Contains(t, rendered, "schemabot apply-confirm -e staging")
+}
+
 // The unsafe-blocked comment is where an operator is told how to override the
 // block, so it carries the attribution alongside the override it coaches.
 func TestRenderUnsafeChangesBlocked_CarriesAttributedChange(t *testing.T) {
