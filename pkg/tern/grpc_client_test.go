@@ -4405,10 +4405,16 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			expected:    state.Apply.Running,
 		},
 		{
-			name:        "remote retryable pause does not park a pending apply",
+			name:        "remote retryable pause normalizes a pre-claim pending snapshot to running",
 			storedState: state.Apply.Pending,
 			remoteState: state.Apply.FailedRetryable,
-			expected:    state.Apply.Pending,
+			expected:    state.Apply.Running,
+		},
+		{
+			name:        "remote retryable pause normalizes a pre-claim retryable snapshot to running",
+			storedState: state.Apply.FailedRetryable,
+			remoteState: state.Apply.FailedRetryable,
+			expected:    state.Apply.Running,
 		},
 		{
 			name:        "stale pending remote state does not reopen running apply",
