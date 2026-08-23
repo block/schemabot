@@ -19,8 +19,9 @@ import (
 // the PlanetScale deploy-request URL), resolved from engine resume metadata by
 // resolveDisplayByOperation (zero value when there is none). shardsByTable holds
 // the per-shard detail rows grouped by table (nil for unsharded engines); it is
-// attached to each table's progress for the compact per-shard summary.
-func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task) templates.ApplyStatusCommentData {
+// attached to each table's progress for the compact per-shard summary. tenant is
+// the deployment's tenant identity, carried into every pasteable command hint.
+func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:          apply.ApplyIdentifier,
 		Database:         apply.Database,
@@ -28,9 +29,14 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		State:            apply.State,
 		Engine:           apply.Engine,
 		ErrorMessage:     apply.ErrorMessage,
+		Attempt:          apply.Attempt,
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
+		Volume:           apply.GetOptions().Volume,
+		Tenant:           tenant,
+		Rollback:         apply.IsRollback(),
+		DeferCutover:     apply.GetOptions().DeferCutover,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -127,8 +133,9 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			ETASeconds:          int64(t.ETASeconds),
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
-			ReadyToComplete:     t.ReadyToComplete,
 			ErrorMessage:        t.ErrorMessage,
 			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})
@@ -174,13 +181,13 @@ func shardCommentTableKey(applyOperationID *int64, namespace, table string) stri
 // formatProgressComment renders the progress comment using the template system.
 // It is the no-operations fallback (load error, or the initial rollback comment),
 // so it carries no VSchema — the observer refreshes VSchema once operations load.
-func formatProgressComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable))
+func formatProgressComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task, tenant string) string {
+	return templates.RenderApplyStatusComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable, tenant))
 }
 
 // formatSummaryComment renders the final summary comment for a terminal apply
 // state. Like formatProgressComment it is the no-operations fallback and carries
 // no VSchema.
-func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable))
+func formatSummaryComment(apply *storage.Apply, tasks []*storage.Task, shardsByTable map[string][]*storage.Task, tenant string) string {
+	return templates.RenderApplySummaryComment(buildApplyCommentData(apply, tasks, operationDisplay{}, shardsByTable, tenant))
 }

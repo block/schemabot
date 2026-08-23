@@ -22,6 +22,7 @@ import (
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -33,7 +34,7 @@ import (
 // testServer holds the address and storage of a running SchemaBot HTTP server.
 type testServer struct {
 	Addr    string
-	Storage *mysqlstore.Storage
+	Storage storage.Storage
 	Service *schemabotapi.Service
 }
 
@@ -69,35 +70,22 @@ func startTestServer(t *testing.T, appDBName, appDSN string) testServer {
 
 func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration) testServer {
 	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, operatorInterval, false)
-}
-
-// startTestServerOperator starts a test server whose operator claims work at
-// the apply_operations level (operator_claim_operations enabled).
-func startTestServerOperator(t *testing.T, appDBName, appDSN string) testServer {
-	t.Helper()
-	return startTestServerWithOptions(t, appDBName, appDSN, 200*time.Millisecond, true)
-}
-
-func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operatorInterval time.Duration, operatorClaimOperations bool) testServer {
-	t.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	schemabotDB, err := sql.Open("mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
-	storage := mysqlstore.New(schemabotDB)
+	store := mysqlstore.New(schemabotDB)
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
 		Type:      "mysql",
 		TargetDSN: appDSN,
-	}, storage, logger)
+	}, store, logger)
 	require.NoError(t, err, "create local client")
 
 	serverConfig := &schemabotapi.ServerConfig{
-		OperatorClaimOperations: &operatorClaimOperations,
 		Databases: map[string]schemabotapi.DatabaseConfig{
 			appDBName: {
 				Type: "mysql",
@@ -107,7 +95,7 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 			},
 		},
 	}
-	svc := schemabotapi.New(storage, serverConfig, map[string]tern.Client{
+	svc := schemabotapi.New(store, serverConfig, map[string]tern.Client{
 		appDBName + "/staging": localClient,
 	}, logger)
 	startTestOperatorWithInterval(t, svc, operatorInterval)
@@ -131,7 +119,7 @@ func startTestServerWithOptions(t *testing.T, appDBName, appDSN string, operator
 		_ = schemabotDB.Close()
 	})
 
-	return testServer{Addr: addr, Storage: storage, Service: svc}
+	return testServer{Addr: addr, Storage: store, Service: svc}
 }
 
 func startTestOperator(t *testing.T, svc *schemabotapi.Service) {

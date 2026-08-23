@@ -29,11 +29,16 @@ type TableProgressData struct {
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	IsInstant           bool
-	ReadyToComplete     bool
+	// The engine's throttler is pausing this table's active phase (row copy
+	// or checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool
+	ThrottleReason string
+	IsInstant      bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
-	// per-table error explains what the user is seeing (e.g. a retrying task).
+	// per-table error explains what the user is seeing (e.g. a retrying or
+	// failed task).
 	ErrorMessage string
 
 	// Shards is the per-shard breakdown for a sharded table. Empty for unsharded
@@ -41,6 +46,18 @@ type TableProgressData struct {
 	// while the table is in flight (see renderShardSummary); detailed per-shard
 	// row counts/ETAs stay in the CLI, not the PR comment.
 	Shards []ShardProgressData
+}
+
+// TaskStatusReadyForCutover reports whether a table's task status marks it as
+// ready for the operator to cut over. A task parked at the cutover barrier has
+// finished its copy and verification phases — the remaining binlog catch-up
+// happens under cutover itself — so the barrier state is what makes the table
+// ready. Engines fold any internal readiness signal into the task status they
+// report, so this is the single predicate every render path uses to decide
+// readiness. Accepts raw engine statuses (Spirit "waitingOnSentinelTable",
+// Vitess "ready_to_complete") as well as canonical task states.
+func TaskStatusReadyForCutover(status string) bool {
+	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
 // ShardProgressData is the high-level status of one shard, for the compact
@@ -61,9 +78,21 @@ type ApplyStatusCommentData struct {
 	State        string // canonical lowercase apply state
 	Engine       string
 	ErrorMessage string
-	StartedAt    string // RFC3339 format
-	CompletedAt  string // RFC3339 format
-	Tables       []TableProgressData
+
+	// DerivedStatus, when set, replaces the raw-state **Status** line in the
+	// rendered body. Multi-deployment sections set it for deployments whose
+	// render-time presentation is derived from earlier siblings (queued,
+	// waiting, halted, paused): the raw operation state for all of those is
+	// pending, which alone cannot express them, so the body's status must come
+	// from the derived model to agree with its <summary> line.
+	DerivedStatus string
+
+	// Attempt is the apply's operator redispatch count so far; the retry the
+	// comment announces is Attempt+1 of storage.MaxRecoveryAttempts.
+	Attempt     int
+	StartedAt   string // RFC3339 format
+	CompletedAt string // RFC3339 format
+	Tables      []TableProgressData
 
 	// VSchemaChanges holds per-keyspace VSchema application state, surfaced from
 	// the engine's display metadata rather than as a per-table task. Empty when
@@ -81,6 +110,30 @@ type ApplyStatusCommentData struct {
 	// comment shows the time remaining before the change becomes permanent.
 	// Empty outside the revert window or for engines without one.
 	RevertExpiresAt string
+
+	// Volume is the apply's current volume level (1=slowest, 11=fastest) from
+	// its stored options. Zero means the engine default is in effect and the
+	// comment renders no volume.
+	Volume int
+
+	// Tenant is the deployment's tenant identity, appended as --tenant to every
+	// pasteable command hint so copied commands address this deployment in
+	// tenant mode. Empty on single-tenant deployments, leaving hints unchanged.
+	Tenant string
+
+	// Rollback reports whether this apply reverts a previously applied schema
+	// change (the apply's durable rollback option). It switches the headline and
+	// status vocabulary from "apply" to "rollback" so a completed rollback is
+	// announced as "Rollback Complete", never as a freshly applied schema change.
+	Rollback bool
+
+	// DeferCutover reports whether cutover waits on an explicit operator
+	// trigger (the apply's durable defer-cutover option). It selects the
+	// waiting-for-cutover footer: deferred applies get the pasteable
+	// `schemabot cutover` command, while non-deferred applies get a note that
+	// the drive triggers cutover automatically — surfacing the command there
+	// would tell the operator to act when no action is needed.
+	DeferCutover bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -108,8 +161,10 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// deploy request's own progress, which the comment does not otherwise surface.
 	writeDeployRequestLink(&sb, data)
 
-	// Cutover readiness summary
-	if data.State == state.Apply.WaitingForCutover || data.State == state.Apply.CuttingOver {
+	// Cutover readiness summary. Only while the apply is parked at the barrier —
+	// readiness answers "can I cut over yet?", a question that no longer exists
+	// once cutover is running, when the per-table rows carry the state.
+	if data.State == state.Apply.WaitingForCutover {
 		writeCutoverSummary(&sb, data.Tables)
 	}
 
@@ -120,7 +175,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 
 	// VSchema application status, surfaced from engine metadata rather than as a
 	// per-table task (a VSchema-only apply has no tables at all).
-	writeVSchemaStatus(&sb, data)
+	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	// Error message for apply states that need operator triage.
 	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
@@ -137,26 +192,36 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 }
 
 // writeApplyStatusHeader writes the headline for an in-place apply status
-// comment. The title is intentionally state-independent — always "Schema Change
-// Status — <env>" — so the headline stays stable as the apply moves through its
-// states (running → revert window → applied); the current state is conveyed by
-// the Status line and the per-table progress, not the headline. The single-,
-// multi-deployment, and sharded status comments all use this so their headline
-// vocabulary is identical. Terminal summary/notification comments use
-// writeApplyHeader, which keeps a state-specific title.
+// comment. The title is intentionally state-independent — "Schema Change
+// Status — <env>" (or "Rollback Status — <env>" for a rollback apply, which is
+// fixed for the apply's lifetime) — so the headline stays stable as the apply
+// moves through its states (running → revert window → applied); the current
+// state is conveyed by the Status line and the per-table progress, not the
+// headline. The single-, multi-deployment, and sharded status comments all use
+// this so their headline vocabulary is identical. Terminal summary/notification
+// comments use writeApplyHeader, which keeps a state-specific title.
 func writeApplyStatusHeader(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeEnvironmentTitle(sb, "Schema Change Status", data.Environment)
+	title := "Schema Change Status"
+	if data.Rollback {
+		title = "Rollback Status"
+	}
+	writeEnvironmentTitle(sb, title, data.Environment)
 }
 
 // writeApplyHeader writes the state-specific title for a terminal summary or
 // notification comment (the separate comment posted when an apply reaches a
 // terminal state), distinct from the stable in-place status headline.
 func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
+	if data.Rollback {
+		writeRollbackHeader(sb, data)
+		return
+	}
 	switch data.State {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
 		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
+		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
 	case state.Apply.Reverted:
@@ -165,6 +230,26 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 		writeEnvironmentTitle(sb, "🚫 Schema Change Cancelled", data.Environment)
 	default:
 		writeEnvironmentTitle(sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
+	}
+}
+
+// writeRollbackHeader writes the terminal title for a rollback apply. A
+// completed rollback is announced with rollback vocabulary and a rewind emoji —
+// never the green-check "Schema Change Applied" — so a PR reader cannot mistake
+// the revert for the schema change landing.
+func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
+	switch data.State {
+	case state.Apply.Completed:
+		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
+	case state.Apply.Failed:
+		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+		writeSupportChannelOffer(sb)
+	case state.Apply.Stopped:
+		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
+	case state.Apply.Cancelled:
+		writeEnvironmentTitle(sb, "🚫 Rollback Cancelled", data.Environment)
+	default:
+		writeEnvironmentTitle(sb, fmt.Sprintf("Rollback: %s", humanizeState(data.State)), data.Environment)
 	}
 }
 
@@ -195,7 +280,17 @@ func startedAtDisplay(startedAt, fallback string) string {
 }
 
 func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
+	// A sibling-derived status carries the whole story ("Halted — eu failed");
+	// the raw-state gloss and its running-state suffixes do not apply to the
+	// pending-derived presentations that set it.
+	if data.DerivedStatus != "" {
+		fmt.Fprintf(sb, "\n**Status**: %s\n", data.DerivedStatus)
+		return
+	}
 	detail := applyStatusDetail(data.State)
+	if data.Rollback && state.IsState(data.State, state.Apply.Completed) {
+		detail = "Rolled Back"
+	}
 	if detail == "" {
 		return
 	}
@@ -204,7 +299,17 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 			detail += " | " + countdown
 		}
 	}
+	// The volume level only matters while the engine is actively working
+	// (copying, draining, or verifying — volume stays adjustable through the
+	// post-copy phases); on other states (stopped, waiting for cutover,
+	// terminal) it carries no signal, so the status line stays quiet.
+	if data.Volume > 0 && state.IsRunningApplyState(data.State) {
+		detail += fmt.Sprintf(" | Volume: %d/%d", data.Volume, storage.MaxVolume)
+	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
+	if state.IsState(data.State, state.Apply.Failed) {
+		writeSupportChannelOffer(sb)
+	}
 }
 
 func applyStatusDetail(applyState string) string {
@@ -228,6 +333,12 @@ func applyStatusDetail(applyState string) string {
 		return "Starting"
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return "In Progress"
+	case state.Apply.CatchingUp:
+		return "Catching Up"
+	case state.Apply.Checksumming:
+		return "Checksumming"
+	case state.Apply.PostChecksum:
+		return "Applying Final Changes"
 	case state.Apply.FailedRetryable:
 		return "Retrying"
 	case state.Apply.WaitingForDeploy:
@@ -282,7 +393,7 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	if command == "cancel" {
 		prefix = cancelPrefix
 	}
-	writeFooterAction(sb, prefix, fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment))
+	writeFooterAction(sb, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -306,12 +417,12 @@ func revertWindowCountdown(revertExpiresAt string) string {
 }
 
 // writeCutoverSummary writes a readiness summary for cutover states,
-// showing how many tables are ready to complete vs still catching up.
+// showing how many tables are ready for cutover vs not yet ready.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := 0
 	total := len(tables)
 	for _, t := range tables {
-		if t.ReadyToComplete {
+		if TaskStatusReadyForCutover(t.Status) {
 			ready++
 		}
 	}
@@ -335,7 +446,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
 
@@ -350,6 +461,11 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			} else {
 				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			}
+		case state.Task.CatchingUp, state.Task.PostChecksum:
+			// Both binlog drains (before and after the verify) read as
+			// "catching up" in the compact summary; the per-table rows
+			// distinguish them.
+			catchingUp++
 		case state.Task.Checksumming:
 			checksumming++
 		case state.Task.Pending:
@@ -385,11 +501,18 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			label = fmt.Sprintf("%d running", running)
 		}
 		if runningEstimateExceeded {
-			label += " (Active)"
+			label += " (finalizing copy)"
 		} else if runningPct > 0 {
 			label += fmt.Sprintf(" (%d%%)", runningPct)
 		}
 		parts = append(parts, label)
+	}
+	if catchingUp > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d catching up", catchingUp))
+		} else {
+			parts = append(parts, "catching up")
+		}
 	}
 	if checksumming > 0 {
 		if multi {
@@ -452,19 +575,28 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 }
 
-// writeVSchemaStatus renders the VSchema application status and diff surfaced
-// from the engine's display metadata. It is shown as its own section because
-// VSchema application is not a per-table task. Renders nothing when the apply
-// carries no VSchema change.
-func writeVSchemaStatus(sb *strings.Builder, data ApplyStatusCommentData) {
-	if len(data.VSchemaChanges) == 0 {
+// writeVSchemaStatus renders the VSchema application status and, when
+// available, the diff. It is shown as its own section because VSchema
+// application is not a per-table task. Renders nothing when the apply carries
+// no VSchema change.
+func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
+	if len(changes) == 0 {
 		return
 	}
 	sb.WriteString("\n### VSchema\n\n")
-	for _, c := range data.VSchemaChanges {
+	// The diff budget is per comment, not per keyspace: split it across the
+	// entries that carry a diff so a multi-keyspace apply stays bounded.
+	diffCount := 0
+	for _, c := range changes {
+		if c.Diff != "" {
+			diffCount++
+		}
+	}
+	budget := vschemaDiffBudget(diffCount)
+	for _, c := range changes {
 		fmt.Fprintf(sb, "**`%s`**: %s\n\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
 		if c.Diff != "" {
-			fmt.Fprintf(sb, "```diff\n%s\n```\n\n", c.Diff)
+			writeVSchemaDiffFence(sb, c.Diff, budget)
 		}
 	}
 }
@@ -505,7 +637,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table)
+			renderTableProgress(sb, table, data.Attempt, data.ErrorMessage)
 		}
 	}
 }
@@ -566,8 +698,11 @@ func tableStatePriority(tableStatus string) int {
 }
 
 // renderTableProgress renders a single table's progress as markdown.
-// Mirrors the CLI's writeTableProgressWithState logic but outputs markdown instead of ANSI.
-func renderTableProgress(sb *strings.Builder, table TableProgressData) {
+// Mirrors the CLI's writeTableProgressWithState logic but outputs markdown
+// instead of ANSI. applyError is the apply-level error message the comment
+// renders as its own block, so a failed table's identical error is not
+// repeated below the row.
+func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int, applyError string) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -578,8 +713,19 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \u2705 Complete\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
+
+	case state.Task.CatchingUp:
+		// Row copy is complete; the engine is draining the changes that
+		// accumulated on the source while the copy ran. On a busy table this
+		// catch-up can run for hours, so name the phase instead of rendering a
+		// serene completed copy.
+		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Catching up on accumulated changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
+		writeDDLLine(sb, table.DDL)
+		if table.RowsCopied > 0 {
+			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
+		}
 
 	case state.Task.Checksumming:
 		// Row copy is complete; the engine is verifying the copied data against
@@ -587,22 +733,28 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		// show how far the verify has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)\n", table.TableName, ui.ProgressBarRowCopy(pct), pct)
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)%s\n", table.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
-			fmt.Fprintf(sb, "Rows verified: %s / %s\n",
+			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
 		} else {
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...\n", table.TableName, ui.ProgressBarRowCopy(100))
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data...%s\n", table.TableName, ui.ProgressBarRowCopy(100), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
+		}
+		writeThrottleTooltip(sb, table)
+
+	case state.Task.PostChecksum:
+		// The verify passed and the engine is draining the changes that
+		// accumulated on the source while it ran. Named separately from the
+		// pre-checksum catch-up so the row doesn't rewind to an earlier phase.
+		fmt.Fprintf(sb, "**`%s`**: %s ⏩ Data verified, applying final changes...\n", table.TableName, ui.ProgressBarRowCopy(100))
+		writeDDLLine(sb, table.DDL)
+		if table.RowsCopied > 0 {
+			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
 		}
 
 	case state.Task.WaitingForCutover:
-		bar := ui.ProgressBarWaitingCutover()
-		if table.ReadyToComplete {
-			fmt.Fprintf(sb, "**`%s`**: %s \u2705 Ready for cutover\n", table.TableName, bar)
-		} else {
-			fmt.Fprintf(sb, "**`%s`**: %s Waiting for cutover\n", table.TableName, bar)
-		}
+		fmt.Fprintf(sb, "**`%s`**: %s Waiting for cutover\n", table.TableName, ui.ProgressBarWaitingCutover())
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Recovering:
@@ -624,13 +776,28 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Failed:
-		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, bar)
+		// A progress bar asserts that row copy happened. When the engine failed
+		// before copying a single row (e.g. a preflight check rejected the
+		// change), a red 0% bar reads as a copy that started and stalled — render
+		// the failure without one. An instant DDL change has no row copy phase
+		// at all, so its failure label does not mention one.
+		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
+		case pct > 0:
+			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
+		case table.IsInstant:
+			fmt.Fprintf(sb, "**`%s`**: \u274c Failed\n", table.TableName)
+		default:
+			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
+		}
 		writeDDLLine(sb, table.DDL)
+		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
+			writeTableErrorLine(sb, table.ErrorMessage)
+		}
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
+			table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
 			writeTableErrorLine(sb, table.ErrorMessage)
@@ -641,8 +808,10 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData) {
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.RevertWindow:
+		// Deliberately no checkmark: the change is applied but not final while
+		// the revert window is open, and a checkmark reads as "done, walk away".
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(sb, "**`%s`**: %s \u2713 Complete (pending revert)\n", table.TableName, bar)
+		fmt.Fprintf(sb, "**`%s`**: %s Complete (revert window open)\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.Reverting:
@@ -674,7 +843,7 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	switch state.NormalizeTaskStatus(table.Status) {
-	case state.Task.Running, state.Task.Checksumming, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
 		// in flight — a breakdown adds signal
 	default:
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
@@ -776,9 +945,10 @@ func isCopyingShardStatus(status string) bool {
 
 // renderRunningTable renders a table that is actively copying rows.
 func renderRunningTable(sb *strings.Builder, table TableProgressData) {
+	defer writeThrottleTooltip(sb, table)
 	if table.RowsTotal > 0 {
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
-			fmt.Fprintf(sb, "**`%s`**: %s Active\n", table.TableName, ui.ProgressBarActivity())
+			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", table.TableName, ui.ProgressBarActivity(), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
 			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
@@ -790,20 +960,52 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 			// Row total is known but the copy hasn't reported progress yet
 			// (VReplication / Spirit ramp-up). A 0% bar reads as stuck, so show
 			// a starting indicator and the row total instead.
-			fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...%s\n", table.TableName, throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			writeRowsAndETA(sb, table)
 			return
 		}
 		bar := ui.ProgressBarRowCopy(pct)
-		fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", table.TableName, bar, pct)
+		fmt.Fprintf(sb, "**`%s`**: %s %d%%%s\n", table.TableName, bar, pct, throttledSuffix(table))
 		writeDDLLine(sb, table.DDL)
 		writeRowsAndETA(sb, table)
 	} else {
 		// No row data yet (initializing or instant DDL)
-		fmt.Fprintf(sb, "**`%s`**: Running...\n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: Running...%s\n", table.TableName, throttledSuffix(table))
 		writeDDLLine(sb, table.DDL)
 	}
+}
+
+// throttledSuffix annotates a paced-phase header when the engine's throttler
+// is holding the phase back, so a slow bar reads as deliberate backpressure —
+// slowed, not stopped — right where the eye checks progress, and never to be
+// confused with an operator stop. The drive clears the stored flag when the
+// throttle lifts, so the annotation disappears on the next refresh.
+func throttledSuffix(table TableProgressData) string {
+	if !table.Throttled {
+		return ""
+	}
+	return " (throttled)"
+}
+
+// writeThrottleTooltip explains the header's "(throttled)" annotation with the
+// engine's reason, using the same tooltip idiom as the estimate-exceeded note.
+// The reason is sanitized at the engine boundary before it is stored, so it is
+// safe to render in markdown. When the engine reports throttled without a
+// reason, the header annotation stands alone.
+func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
+	if !table.Throttled || table.ThrottleReason == "" {
+		return
+	}
+	// The raw reason names the engine signal; the tip says what the pause
+	// protects, and links the reference doc for remediation prose. A reason
+	// whose signal has no tip renders alone so a new engine signal degrades
+	// to raw text rather than a wrong explanation.
+	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
+		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		return
+	}
+	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -841,7 +1043,7 @@ func renderStoppedTable(sb *strings.Builder, table TableProgressData) {
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
-		fmt.Fprintf(sb, "Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
 			ui.FormatNumber(table.RowsTotal))
 	}
@@ -861,12 +1063,12 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 	}
 	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
 	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "Rows: %s / %s \u00b7 ETA: %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s \u00b7 ETA: %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal),
 			ui.FormatETA(table.ETASeconds))
 	} else {
-		fmt.Fprintf(sb, "Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal))
 	}
@@ -879,9 +1081,14 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	switch data.State {
 	case state.Apply.WaitingForDeploy:
-		writeFooterAction(sb, "To deploy:", fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.WaitingForCutover:
-		writeFooterAction(sb, "To proceed with cutover:", fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment))
+		if data.DeferCutover {
+			writeFooterAction(sb, "To proceed with cutover:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		} else {
+			sb.WriteString("\n---\n\n")
+			sb.WriteString("SchemaBot triggers cutover automatically — no action needed.\n")
+		}
 	case state.Apply.Recovering:
 		sb.WriteString("\n---\n\n")
 		if pct, ok := recoveringCopyPercent(data.Tables); ok {
@@ -892,7 +1099,8 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.CuttingOver:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
-	case state.Apply.Running, state.Apply.RunningDegraded:
+	case state.Apply.Running, state.Apply.RunningDegraded,
+		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
@@ -905,16 +1113,16 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
+		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeFooterAction(sb, "To skip revert and keep changes:", fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment))
-		fmt.Fprintf(sb, "\nTo revert:\n```\nschemabot revert %s -e %s\n```\n", data.ApplyID, data.Environment)
+		writeFooterAction(sb, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("Skip-revert was requested — closing the revert window and making this schema change permanent. This can no longer be reverted.\n")
@@ -971,12 +1179,23 @@ func writeSummaryCompleted(sb *strings.Builder, data ApplyStatusCommentData, tot
 	writeSummaryCompletedMetadata(sb, data)
 	// A VSchema update counts as a schema change alongside table changes, so the
 	// singular/plural wording reflects the total operation count.
-	msg := "Applied successfully — your schema changes are live!"
-	if totalTables+len(data.VSchemaChanges) == 1 {
-		msg = "Applied successfully — your schema change is live!"
-	}
-	writeSuccessBlock(sb, msg)
+	writeSuccessBlock(sb, completedOutcomeMessage(totalTables+len(data.VSchemaChanges) == 1, data.Rollback))
 	writeCompletedSummaryDetails(sb, data)
+}
+
+// completedOutcomeMessage is the completed summary's outcome line, shared by
+// every apply shape so the terminal vocabulary stays identical.
+func completedOutcomeMessage(singular, rollback bool) string {
+	if rollback {
+		if singular {
+			return "Rolled back successfully — the schema change has been reverted."
+		}
+		return "Rolled back successfully — the schema changes have been reverted."
+	}
+	if singular {
+		return "Applied successfully — your schema change is live!"
+	}
+	return "Applied successfully — your schema changes are live!"
 }
 
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
@@ -1000,7 +1219,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data)
-	writeFooterAction(sb, "To retry:", fmt.Sprintf("schemabot apply -e %s", data.Environment))
+	writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int) {
@@ -1012,7 +1231,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data)
-	writeFooterAction(sb, "Paused — to resume from where it stopped:", fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment))
+	writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 
 // writeSummaryCancelled renders the terminal summary for a cancelled schema
@@ -1039,15 +1258,30 @@ func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
 	if data.ApplyID != "" {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
-	if data.StartedAt != "" && data.CompletedAt != "" {
-		startTime, err1 := time.Parse(time.RFC3339, data.StartedAt)
-		endTime, err2 := time.Parse(time.RFC3339, data.CompletedAt)
-		if err1 == nil && err2 == nil {
-			parts = append(parts, fmt.Sprintf("**Duration**: %s", formatDuration(endTime.Sub(startTime))))
-		}
+	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
+		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
+}
+
+// durationDisplay formats the elapsed time between two RFC3339 timestamps for a
+// summary metadata line, or "" when either timestamp is missing or unparseable
+// — the duration is decoration, so a bad timestamp drops it rather than failing
+// the render.
+func durationDisplay(startedAt, completedAt string) string {
+	if startedAt == "" || completedAt == "" {
+		return ""
+	}
+	startTime, err1 := time.Parse(time.RFC3339, startedAt)
+	endTime, err2 := time.Parse(time.RFC3339, completedAt)
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	if endTime.Before(startTime) {
+		return ""
+	}
+	return formatDuration(endTime.Sub(startTime))
 }
 
 // formatDuration formats a time.Duration as a human-readable string.
@@ -1113,7 +1347,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) > 0 {
 		writeSummaryTableListWithOptions(sb, data, false)
 	}
-	writeVSchemaStatus(sb, data)
+	writeVSchemaStatus(sb, data.VSchemaChanges)
 	sb.WriteString("</details>\n")
 }
 
@@ -1371,6 +1605,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+		Volume:       int(resp.Volume),
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 

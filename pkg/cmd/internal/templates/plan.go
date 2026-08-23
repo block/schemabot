@@ -10,6 +10,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -419,17 +420,18 @@ func WriteOptions(deferCutover bool, skipRevert bool) {
 	}
 }
 
-// WriteLintViolations writes lint violations if any.
+// WriteLintViolations writes advisory lint findings, mirroring the unsafe
+// changes list shape: a count in the header and "table: message" items.
 func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 	if len(warnings) == 0 {
 		return
 	}
-	fmt.Println("⚠️  Lint Warnings:")
+	fmt.Printf("\U0001f4a1 Lint Warnings (%d):\n", len(warnings))
 	for _, w := range warnings {
 		if w.Table != "" {
-			fmt.Printf("  - [%s] %s\n", w.Table, w.Message)
+			fmt.Printf("  • %s: %s\n", w.Table, w.Message)
 		} else {
-			fmt.Printf("  - %s\n", w.Message)
+			fmt.Printf("  • %s\n", w.Message)
 		}
 	}
 	fmt.Println()
@@ -456,6 +458,23 @@ func WriteErrors(errors []string) {
 	fmt.Println()
 }
 
+// WriteIgnoredNamespaces disclosure: the plan was built from a deliberately
+// partial desired state, so a reader can distinguish "this namespace has no
+// changes" from "this namespace was withheld by config". Unmatched entries are
+// configured exclusions that removed nothing (typo, case mismatch, or stale
+// entry) — the namespaces they name are fully reconciled.
+func WriteIgnoredNamespaces(ignored, unmatched []string) {
+	if len(ignored) > 0 {
+		fmt.Printf("ℹ️  Namespaces excluded by ignore_namespaces: %s\n", strings.Join(ignored, ", "))
+	}
+	for _, entry := range unmatched {
+		fmt.Printf("⚠️  ignore_namespaces entry %q matched no namespace and excluded nothing\n", entry)
+	}
+	if len(ignored) > 0 || len(unmatched) > 0 {
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 
@@ -478,7 +497,7 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, sc
 	}
 	fmt.Println("🚨 To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  schemabot apply -s %s -e %s --allow-unsafe\n", schemaDir, environment)
+	fmt.Printf("  %s apply -s %s -e %s --allow-unsafe\n", cliname.Name(), schemaDir, environment)
 	fmt.Println()
 }
 
@@ -490,7 +509,7 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 	fmt.Println()
 	fmt.Println("🚨 Unsafe Changes (--allow-unsafe enabled)")
 	fmt.Println()
-	fmt.Println("The following changes will permanently delete data:")
+	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
@@ -498,20 +517,17 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 // writeUnsafeChangesList writes the list of unsafe changes, splitting multi-reason entries.
 func writeUnsafeChangesList(changes []UnsafeChange) {
 	for _, c := range changes {
-		reason := ui.CleanLintReason(c.Reason)
-		if reason != "" {
-			// Split multiple reasons (joined by "; " in the engine)
-			reasons := strings.Split(reason, "; ")
-			if len(reasons) > 1 {
-				fmt.Printf("  • %s:\n", c.Table)
-				for _, r := range reasons {
-					fmt.Printf("      - %s\n", r)
-				}
-			} else {
-				fmt.Printf("  • %s: %s\n", c.Table, reason)
-			}
-		} else {
+		reasons := ui.LintReasons(c.Reason)
+		switch len(reasons) {
+		case 0:
 			fmt.Printf("  • %s: %s\n", c.Table, c.ChangeType)
+		case 1:
+			fmt.Printf("  • %s: %s\n", c.Table, reasons[0])
+		default:
+			fmt.Printf("  • %s:\n", c.Table)
+			for _, r := range reasons {
+				fmt.Printf("      - %s\n", r)
+			}
 		}
 	}
 }

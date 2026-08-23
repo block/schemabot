@@ -10,8 +10,8 @@ import (
 type SchemaChangeReconciliationData struct {
 	RequestedBy string
 	Timestamp   string
-	// Tenant is the deployment's own tenant; when set, the pasteable stop and
-	// rollback hints carry it so the command addresses this deployment.
+	// Tenant is the deployment's own tenant; when set, the pasteable stop,
+	// plan, and rollback hints carry it so the command addresses this deployment.
 	Tenant string
 	Items  []SchemaChangeReconciliationItem
 }
@@ -39,6 +39,34 @@ func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 	return sb.String()
 }
 
+// NoManagedSchemaChangesChecksRefreshedData describes the outcome of a plan
+// command that found no managed schema changes and refreshed the PR's
+// SchemaBot check state instead of running a plan.
+type NoManagedSchemaChangesChecksRefreshedData struct {
+	RequestedBy string
+	Timestamp   string
+	HeadSHA     string
+	// GatedOnTenants marks the aggregate-leader case: the refreshed check
+	// gates on tenant deployments' own checks for the touched schema paths
+	// instead of passing unconditionally.
+	GatedOnTenants bool
+}
+
+// RenderNoManagedSchemaChangesChecksRefreshed reports that a plan command
+// found no managed schema changes and recreated the PR's SchemaBot check
+// state on the current head.
+func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChecksRefreshedData) string {
+	var sb strings.Builder
+	sb.WriteString("## ✅ No Managed Schema Changes\n\n")
+	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
+	if data.GatedOnTenants {
+		fmt.Fprintf(&sb, "\nThis PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `%s` and will pass once every tenant deployment's own check succeeds.\n", data.HeadSHA)
+		return sb.String()
+	}
+	fmt.Fprintf(&sb, "\nThis PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `%s`.\n", data.HeadSHA)
+	return sb.String()
+}
+
 // RenderSchemaChangeReconciliationRequired explains that the current PR no
 // longer contains a schema change whose apply has already started.
 func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationData) string {
@@ -54,7 +82,7 @@ func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationDat
 		writeCompletedReconciliation(&sb, data.Tenant, data.Items)
 	}
 
-	return sb.String()
+	return offerSupportChannel(sb.String())
 }
 
 func writeReconciliationMetadata(sb *strings.Builder, items []SchemaChangeReconciliationItem) {
@@ -121,7 +149,7 @@ func writeInProgressReconciliation(sb *strings.Builder, tenant string, items []S
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", stopCommand(tenant, items))
 	sb.WriteString("\n2. Then reconcile the final live schema:\n")
 	sb.WriteString("   - If the live schema change should remain, add the schema change back to the PR, then comment:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(tenant, items))
 	sb.WriteString("   - If the live schema change should not remain, roll it back:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
 	sb.WriteString("     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.\n")
@@ -135,23 +163,23 @@ func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []Sc
 	sb.WriteString("1. Keep the live schema change:\n")
 	sb.WriteString("   - add the schema change back to the PR\n")
 	sb.WriteString("   - comment:\n")
-	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(items))
+	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(tenant, items))
 	sb.WriteString("\n2. Undo the live schema change:\n")
 	sb.WriteString("   - comment:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
 	sb.WriteString("   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan\n")
 }
 
-func planCommand(items []SchemaChangeReconciliationItem) string {
+func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {
 	item, ok := singleCommandItem(items)
 	if !ok {
-		return "schemabot plan -e <environment> -d <database>"
+		return appendTenantFlag("schemabot plan -e <environment> -d <database>", tenant)
 	}
 	cmd := fmt.Sprintf("schemabot plan -e %s", item.Environment)
 	if item.Database != "" {
 		cmd += fmt.Sprintf(" -d %s", item.Database)
 	}
-	return cmd
+	return appendTenantFlag(cmd, tenant)
 }
 
 func stopCommand(tenant string, items []SchemaChangeReconciliationItem) string {

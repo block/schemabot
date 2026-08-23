@@ -1,8 +1,12 @@
 package auth_test
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,7 +20,21 @@ const (
 	trustedIPAddr = "192.0.2.10:443"
 	untrustedAddr = "203.0.113.5:443"
 	ingressSVID   = "spiffe://example.org/ns/ingress/sa/proxy"
+	gatewaySVID   = "spiffe://example.org/ns/service-ingress/sa/gateway"
+	callerSVID    = "spiffe://example.org/ns/reporting/sa/reporting"
 )
+
+// serviceCallerConfig returns a forward-auth config with both lanes enabled:
+// the identity-header proxy for humans and a caller-forwarding gateway for
+// read-only service callers.
+func serviceCallerConfig() auth.ForwardAuthConfig {
+	return auth.ForwardAuthConfig{
+		TrustedProxySPIFFE:   []string{ingressSVID},
+		WriteGroups:          []string{"ops"},
+		TrustedGatewaySPIFFE: []string{gatewaySVID},
+		ReadServiceSPIFFE:    []string{callerSVID},
+	}
+}
 
 // newForwardAuth builds a forward-auth authorizer around a handler that records
 // the authenticated user, and returns both so tests can assert the response and
@@ -71,6 +89,435 @@ func TestForwardAuth_UntrustedSourceDenied(t *testing.T) {
 	assert.Nil(t, captured.user)
 }
 
+// newForwardAuthWithLogs is newForwardAuth with a logger that records the
+// authorizer's output, so tests can assert on denial-log contents.
+func newForwardAuthWithLogs(t *testing.T, cfg auth.ForwardAuthConfig) (http.Handler, *bytes.Buffer) {
+	t.Helper()
+	var logs bytes.Buffer
+	authz, err := auth.NewForwardAuthAuthorizer(cfg, slog.New(slog.NewTextHandler(&logs, nil)))
+	require.NoError(t, err)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return authz.Middleware(inner), &logs
+}
+
+func TestForwardAuth_UntrustedProxyDenialLogsArrivingXFCCIdentities(t *testing.T) {
+	// An operator triaging an untrusted-proxy denial needs to see which URI
+	// identities were present in the XFCC header, so they can tell a missing
+	// trust anchor apart from a caller that forwarded no identity. The log
+	// carries the parsed URI values — never the raw header, so the logged
+	// content stays bounded and structured no matter what the caller sent.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs:  []string{trustedCIDR},
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = trustedIPAddr
+	req.Header.Set("X-Forwarded-Client-Cert",
+		`Hash=abc123;URI=spiffe://example.org/ns/gateway/sa/other-gateway,By=spiffe://example.org/ns/schemabot/sa/schemabot;URI="spiffe://example.org/ns/caller/sa/service"`)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "did not arrive through the trusted proxy")
+	assert.Contains(t, logged, "spiffe://example.org/ns/gateway/sa/other-gateway")
+	assert.Contains(t, logged, "spiffe://example.org/ns/caller/sa/service")
+	assert.Contains(t, logged, "xfcc_uri_count=2")
+	assert.NotContains(t, logged, "Hash=abc123")
+}
+
+func TestForwardAuth_UntrustedProxyDenialLogsZeroXFCCIdentities(t *testing.T) {
+	// A denial with no XFCC header logs a zero identity count, telling the
+	// operator no URI identity was forwarded at all — a routing or mesh
+	// problem, not a trust-anchor mismatch.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Contains(t, logs.String(), "xfcc_uri_count=0")
+}
+
+func TestForwardAuth_UntrustedProxyDenialClampsLoggedXFCCIdentities(t *testing.T) {
+	// A hostile caller can stuff arbitrarily many URI values into a synthetic
+	// XFCC header; the denial log clamps the listed identities while still
+	// reporting the true total, so log lines stay bounded without hiding the
+	// flood.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	elements := make([]string, 10)
+	for i := range elements {
+		elements[i] = fmt.Sprintf("URI=spiffe://example.org/ns/flood/sa/svc-%d", i)
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", strings.Join(elements, ","))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "xfcc_uri_count=10")
+	assert.Contains(t, logged, "spiffe://example.org/ns/flood/sa/svc-7")
+	assert.NotContains(t, logged, "spiffe://example.org/ns/flood/sa/svc-8")
+	assert.NotContains(t, logged, "spiffe://example.org/ns/flood/sa/svc-9")
+}
+
+func TestForwardAuth_UntrustedProxyDenialTruncatesOversizedXFCCIdentity(t *testing.T) {
+	// The count clamp alone would still let a single synthetic multi-hundred-KB
+	// URI value bloat every denial line; each logged value is also truncated to
+	// a fixed byte bound, marked so the operator can tell it was cut.
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	huge := "spiffe://example.org/ns/flood/sa/" + strings.Repeat("x", 4096)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", `URI="`+huge+`"`)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "xfcc_uri_count=1")
+	assert.Contains(t, logged, "spiffe://example.org/ns/flood/sa/x", "a recognizable prefix survives for triage")
+	assert.Contains(t, logged, "…", "the truncation is marked")
+	assert.NotContains(t, logged, huge, "the full oversized value is never logged")
+	assert.Less(t, len(logged), 2048, "the denial line stays bounded")
+}
+
+func TestNewForwardAuthAuthorizer_GatewayRequiresReadServiceCallers(t *testing.T) {
+	cfg := serviceCallerConfig()
+	cfg.ReadServiceSPIFFE = nil
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read_service_spiffe")
+}
+
+func TestNewForwardAuthAuthorizer_ReadServiceCallersRequireGateway(t *testing.T) {
+	cfg := serviceCallerConfig()
+	cfg.TrustedGatewaySPIFFE = nil
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trusted_gateway_spiffe")
+}
+
+func TestNewForwardAuthAuthorizer_RejectsGatewayLaneWithCIDROnlyTrust(t *testing.T) {
+	// Under CIDR-only proxy trust the gateway lane can never authenticate
+	// anyone — an in-CIDR gateway request is treated as the identity-header
+	// proxy and an out-of-CIDR one is refused by the CIDR gate — so the
+	// combination is a startup error, not a silently dead lane.
+	cfg := serviceCallerConfig()
+	cfg.TrustedProxySPIFFE = nil
+	cfg.TrustedProxyCIDRs = []string{trustedCIDR}
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SPIFFE-anchored proxy trust")
+}
+
+func TestNewForwardAuthAuthorizer_WhitespaceOnlyGatewayEntriesFailClosed(t *testing.T) {
+	// Entries that trim to empty do not count as configuration: a gateway list
+	// of blanks leaves the callers without a vouching gateway, which is the
+	// same fail-closed startup error as omitting the list.
+	cfg := serviceCallerConfig()
+	cfg.TrustedGatewaySPIFFE = []string{"   "}
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "trusted_gateway_spiffe")
+}
+
+func TestNewForwardAuthAuthorizer_RejectsProxyGatewayOverlap(t *testing.T) {
+	// A single peer cannot be both the identity-header proxy and a
+	// caller-forwarding gateway: the two lanes trust different headers, so an
+	// overlapping SPIFFE ID is an ambiguous configuration that must fail at
+	// startup rather than silently picking a lane.
+	cfg := serviceCallerConfig()
+	cfg.TrustedGatewaySPIFFE = []string{ingressSVID}
+	_, err := auth.NewForwardAuthAuthorizer(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both trusted_proxy_spiffe and trusted_gateway_spiffe")
+}
+
+func TestForwardAuth_GatewayServiceCallerReadAllowed(t *testing.T) {
+	// A service calling as itself arrives through a caller-forwarding gateway:
+	// the XFCC leaf is the gateway and the caller's verified SPIFFE ID rides in
+	// the caller header. A listed caller gets read access with the SPIFFE ID as
+	// its subject, and any user/groups headers on the request are ignored —
+	// this lane never grants group-derived privileges.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	req.Header.Set("X-Forwarded-User", "mallory")
+	req.Header.Set("X-Forwarded-Groups", "ops")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+	assert.Empty(t, captured.user.Groups)
+}
+
+func TestForwardAuth_GatewayServiceCallerCustomHeader(t *testing.T) {
+	// A deployment whose gateway forwards the caller identity under a
+	// different header name configures caller_spiffe_header; the default
+	// header is then ignored.
+	cfg := serviceCallerConfig()
+	cfg.CallerSPIFFEHeader = "X-Custom-Caller-Id"
+	handler, captured := newForwardAuth(t, cfg)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Custom-Caller-Id", callerSVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", "spiffe://example.org/ns/other/sa/other")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
+func TestForwardAuth_GatewayServiceCallerReadOnlyPOSTAllowed(t *testing.T) {
+	// Read-only POST endpoints (the explicit readPaths set) are part of the
+	// read tier, so a listed service caller can use them.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
+func TestForwardAuth_GatewayServiceCallerUnlistedDenied(t *testing.T) {
+	// A caller forwarded by a trusted gateway but absent from
+	// read_service_spiffe is denied: gateway trust vouches for who the caller
+	// is, not that the caller is allowed in.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", "spiffe://example.org/ns/other/sa/other")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_GatewayServiceCallerWriteDenied(t *testing.T) {
+	// Service callers are read-only by design: even a listed caller is denied
+	// write-tier endpoints with an explicit read-only message, so an operator
+	// triaging the denial sees a policy decision, not a trust failure.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "read-only")
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_GatewayMissingCallerIdentityDenied(t *testing.T) {
+	// A request from a trusted gateway with no forwarded caller identity is
+	// denied rather than falling back to any other lane: the gateway vouched
+	// for the transport but forwarded no caller, so there is nobody to
+	// authorize.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_GatewayBlankCallerIdentityDenied(t *testing.T) {
+	// A present-but-blank caller header is the same as no caller identity:
+	// there is nobody to authorize, so the request is denied.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", "   ")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_GatewayLaneGatedByTrustedCIDR(t *testing.T) {
+	// Configured trusted_proxy_cidrs gate the gateway lane like everything
+	// else: XFCC is a spoofable header, so a gateway SVID is honored only from
+	// inside the trusted networks. From inside, the lane works as usual.
+	cfg := serviceCallerConfig()
+	cfg.TrustedProxyCIDRs = []string{trustedCIDR}
+
+	t.Run("gateway SVID claimed from outside the CIDR is refused", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+		req.RemoteAddr = untrustedAddr
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+		req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusUnauthorized, rec.Code)
+		assert.Contains(t, rec.Body.String(), "trusted authenticating proxy",
+			"the forged claim falls through to the standard untrusted-proxy denial")
+		assert.Nil(t, captured.user)
+	})
+
+	t.Run("gateway caller from inside the CIDR is allowed", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-Client-Cert", "URI="+gatewaySVID)
+		req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured.user)
+		assert.Equal(t, callerSVID, captured.user.Subject)
+	})
+}
+
+func TestForwardAuth_GatewayMatchedFromMultiElementXFCCChain(t *testing.T) {
+	// An XFCC header carries one element per certificate in the chain. A
+	// gateway whose SVID rides in a later chain element — behind the mesh
+	// sidecar's own element — is still recognized: every URI in the chain is
+	// checked against the gateway list.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert",
+		`By=spiffe://example.org/ns/schemabot/sa/schemabot;URI=spiffe://example.org/ns/sidecar/sa/sidecar,Hash=abc123;URI="`+gatewaySVID+`"`)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
+func TestForwardAuth_MultipleConfiguredGatewaysHonored(t *testing.T) {
+	// A deployment can trust more than one caller-forwarding gateway (for
+	// example one per source mesh); a caller arriving through any listed
+	// gateway is honored.
+	secondGatewaySVID := "spiffe://example.org/ns/partner-ingress/sa/gateway"
+	cfg := serviceCallerConfig()
+	cfg.TrustedGatewaySPIFFE = append(cfg.TrustedGatewaySPIFFE, secondGatewaySVID)
+	handler, captured := newForwardAuth(t, cfg)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+secondGatewaySVID)
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, callerSVID, captured.user.Subject)
+}
+
+func TestForwardAuth_EscapedQuoteInXFCCValueDoesNotDropURIs(t *testing.T) {
+	// Envoy escapes embedded quotes inside quoted XFCC values as \" — a
+	// certificate Subject containing an escaped quote must not desync the
+	// header tokenizer, or a trusted SPIFFE ID later in the header would be
+	// dropped and the request wrongly denied.
+	handler, captured := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxySPIFFE: []string{ingressSVID},
+		WriteGroups:        []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert",
+		`Subject="CN=\"quoted, name\";OU=x";URI="`+ingressSVID+`"`)
+	req.Header.Set("X-Forwarded-User", "alice")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, "alice", captured.user.Subject)
+}
+
+func TestForwardAuth_ForgedCallerHeaderWithoutGatewayDenied(t *testing.T) {
+	// A caller header on a request that did not arrive through a listed
+	// gateway is spoofed input: the request falls through to the standard
+	// untrusted-proxy denial no matter what identity the header claims.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, captured.user)
+}
+
+func TestForwardAuth_TrustedProxyWinsOverCallerHeader(t *testing.T) {
+	// The identity-header proxy always wins: a request that provably arrived
+	// through it authenticates as the forwarded user, and a stray caller
+	// header is ignored rather than switching the request to the service lane.
+	handler, captured := newForwardAuth(t, serviceCallerConfig())
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	req.RemoteAddr = untrustedAddr
+	req.Header.Set("X-Forwarded-Client-Cert", "URI="+ingressSVID)
+	req.Header.Set("X-Forwarded-User", "alice")
+	req.Header.Set("X-Forwarded-Caller-Spiffe-Id", callerSVID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, captured.user)
+	assert.Equal(t, "alice", captured.user.Subject)
+}
+
 func TestForwardAuth_TrustedCIDRReadAllowedForAnyUser(t *testing.T) {
 	// With no read_groups configured, reads are open to any authenticated caller
 	// arriving through the trusted proxy.
@@ -123,6 +570,66 @@ func TestForwardAuth_WriteRequiresWriteGroup(t *testing.T) {
 		assert.Equal(t, "bob", captured.user.Subject)
 		assert.Equal(t, []string{"viewers", "owners"}, captured.user.Groups)
 	})
+}
+
+func TestForwardAuth_OperatorGroupsAdmittedToWriteTier(t *testing.T) {
+	// Per-database operator group members are admitted to write-tier endpoints
+	// by the middleware; the handler enforces their per-database scope once the
+	// target resolves. Callers in neither write nor operator groups stay denied.
+	cfg := auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+		OperatorGroups:    []string{"payments-team"},
+	}
+
+	t.Run("operator member is admitted", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-User", "bob")
+		req.Header.Set("X-Forwarded-Groups", "payments-team")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code)
+		require.NotNil(t, captured.user)
+		assert.Equal(t, "bob", captured.user.Subject)
+		assert.Equal(t, []string{"payments-team"}, captured.user.Groups,
+			"groups reach the handler so it can enforce the per-database scope")
+	})
+
+	t.Run("caller in neither lane is denied", func(t *testing.T) {
+		handler, captured := newForwardAuth(t, cfg)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", nil)
+		req.RemoteAddr = trustedIPAddr
+		req.Header.Set("X-Forwarded-User", "alice")
+		req.Header.Set("X-Forwarded-Groups", "readers")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code)
+		assert.Nil(t, captured.user)
+	})
+}
+
+func TestForwardAuth_OperatorGroupsGetReadTier(t *testing.T) {
+	// A caller who can mutate their database must be able to watch the result,
+	// so operator members clear restricted read groups too.
+	handler, _ := newForwardAuth(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		ReadGroups:        []string{"users"},
+		WriteGroups:       []string{"ops"},
+		OperatorGroups:    []string{"payments-team"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = trustedIPAddr
+	req.Header.Set("X-Forwarded-User", "bob")
+	req.Header.Set("X-Forwarded-Groups", "payments-team")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
 func TestForwardAuth_SPIFFEOnlyMode(t *testing.T) {
@@ -330,17 +837,87 @@ func TestForwardAuth_GroupsFromRepeatedAndDelimitedHeaders(t *testing.T) {
 }
 
 func TestForwardAuth_SkipsInfraPaths(t *testing.T) {
-	// Health/metrics/webhook paths bypass the authorizer entirely.
+	// Health/webhook paths bypass the authorizer entirely.
 	handler, _ := newForwardAuth(t, auth.ForwardAuthConfig{
 		TrustedProxyCIDRs: []string{trustedCIDR},
 		WriteGroups:       []string{"owners"},
 	})
 
-	for _, path := range []string{"/health", "/metrics", "/webhook"} {
+	for _, path := range []string{"/livez", "/health", "/webhook"} {
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
 		req.RemoteAddr = untrustedAddr // untrusted, but these paths skip auth
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		assert.Equalf(t, http.StatusOK, rec.Code, "path %s should bypass auth", path)
 	}
+
+	// /metrics is served on a dedicated listener outside the API handler, so it
+	// no longer bypasses the authorizer on the API port.
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	req.RemoteAddr = untrustedAddr
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code, "/metrics should not bypass auth")
+}
+
+// A deployment may trust loopback so operators can reach the API through a
+// port-forward when the proxy path is unavailable. Identity headers on that
+// path are typed by the local caller, not verified by the proxy, so an
+// admitted write from loopback must leave an audit line naming the claimed
+// subject and the path — break-glass usage an operator can alert on.
+func TestForwardAuth_LoopbackTrustedWriteLogsBreakGlass(t *testing.T) {
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{"127.0.0.0/8"},
+		WriteGroups:       []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
+	req.RemoteAddr = "127.0.0.1:52000"
+	req.Header.Set("X-Forwarded-User", "alice")
+	req.Header.Set("X-Forwarded-Groups", "ops")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	logged := logs.String()
+	assert.Contains(t, logged, "loopback source")
+	assert.Contains(t, logged, "subject=alice")
+	assert.Contains(t, logged, "path=/api/apply")
+}
+
+// A write arriving through the trusted proxy's own network path is the normal
+// case and produces no break-glass line.
+func TestForwardAuth_ProxiedWriteHasNoBreakGlassLog(t *testing.T) {
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{trustedCIDR},
+		WriteGroups:       []string{"ops"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", nil)
+	req.RemoteAddr = trustedIPAddr
+	req.Header.Set("X-Forwarded-User", "alice")
+	req.Header.Set("X-Forwarded-Groups", "ops")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, logs.String(), "loopback")
+}
+
+// Loopback reads are counted (the auth-decision metric carries the loopback
+// reason) but not logged — status polling over a port-forward must not flood
+// the log.
+func TestForwardAuth_LoopbackTrustedReadDoesNotLog(t *testing.T) {
+	handler, logs := newForwardAuthWithLogs(t, auth.ForwardAuthConfig{
+		TrustedProxyCIDRs: []string{"127.0.0.0/8"},
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status", nil)
+	req.RemoteAddr = "127.0.0.1:52000"
+	req.Header.Set("X-Forwarded-User", "alice")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, logs.String(), "loopback")
 }

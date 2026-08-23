@@ -343,7 +343,8 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, false)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "authorization comment")
@@ -366,7 +367,8 @@ func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testin
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock, false)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "unconfigured-database authorization comment")
@@ -385,8 +387,9 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
-	assert.True(t, blocked)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, false)
+	require.Error(t, err)
+	assert.False(t, blocked)
 
 	body := requireComment(t, comments, "authorization failure comment")
 	assert.Contains(t, body, "SchemaBot Authorization Check Failed")
@@ -394,6 +397,23 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	assert.Contains(t, body, "No schema change was started")
 	assert.Contains(t, body, "GitHub App can read organization members")
 	assert.NotContains(t, body, "is not authorized")
+}
+
+func TestEnforcePRCommandActorAuthorizationDurableAttemptSuppressesErrorComment(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, true)
+	require.Error(t, err)
+	assert.False(t, blocked)
+	assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
 }
 
 // TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning exercises the
@@ -581,6 +601,7 @@ func TestHandleRollbackConfirmCommandBlocksUnauthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "@mona is not authorized")
 	assert.Contains(t, body, "`schemabot rollback-confirm`")
 	assert.Empty(t, locks.released, "denied rollback-confirm must not release the lock")
+	assert.Empty(t, locks.releasedIfPending, "denied rollback-confirm must not release the pinned rollback lock")
 }
 
 // TestHandleRollbackConfirmCommandAllowsAuthorizedActor verifies that a
@@ -829,18 +850,24 @@ func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) (
 
 // actorAuthLockStore serves locks from a fixed set and records every lock
 // mutation so tests can assert which releases and acquisitions happened.
-// Setting releaseErr makes every Release call fail with that error, simulating
-// a storage outage during lock release.
+// Setting getErr makes every Get call fail with that error, simulating a
+// storage outage during the lock lookup; setting releaseErr does the same for
+// Release, simulating an outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
-	locks         []*storage.Lock
-	acquired      []*storage.Lock
-	released      []string
-	forceReleased []string
-	releaseErr    error
+	locks             []*storage.Lock
+	getErr            error
+	acquired          []*storage.Lock
+	released          []string
+	releasedIfPending []string
+	forceReleased     []string
+	releaseErr        error
 }
 
 func (s *actorAuthLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	for _, lock := range s.locks {
 		if lock.DatabaseName == database && lock.DatabaseType == dbType {
 			return lock, nil
@@ -874,6 +901,14 @@ func (s *actorAuthLockStore) Release(_ context.Context, database, _, _ string) e
 	}
 	s.released = append(s.released, database)
 	return nil
+}
+
+func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, pendingPlanID string) (bool, error) {
+	if s.releaseErr != nil {
+		return false, s.releaseErr
+	}
+	s.releasedIfPending = append(s.releasedIfPending, pendingPlanID)
+	return true, nil
 }
 
 func (s *actorAuthLockStore) ForceRelease(_ context.Context, database, _ string) error {
@@ -914,6 +949,104 @@ func actorAuthStorageTestHandler(cfg *api.ServerConfig, store storage.Storage, i
 
 // commentRecorder returns a mux handler that captures posted PR comment bodies
 // on the given channel and responds like the GitHub create-comment API.
+// A user-issued plan reads the resolved database's live schema, so an actor
+// who is neither an admin nor one of that database's operators is blocked
+// with a rejection that lists who can run the command.
+func TestPlanForResolvedDatabaseBlocksUnauthorizedActor(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.True(t, blocked)
+	body := requireComment(t, comments, "unauthorized plan comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+}
+
+// The database's configured operator users satisfy the plan gate: planning
+// requires the same access the database's mutating commands do.
+func TestPlanForResolvedDatabaseAllowsDatabaseOperator(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"mona"}
+		cfg.Databases["orders"] = db
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.False(t, blocked)
+	select {
+	case body := <-comments:
+		t.Fatalf("no comment should be posted for an authorized operator, got %q", body)
+	default:
+	}
+}
+
+// With PR command authorization disabled, plan keeps its ungated behavior.
+func TestPlanForResolvedDatabaseUngatedWhenAuthorizationDisabled(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	h := actorAuthTestHandler(actorAuthTestConfig(false), installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "orders", "")
+
+	assert.False(t, blocked)
+}
+
+// A database not configured on this deployment defers to the downstream
+// ownership handling, so fan-out deployments stay silent instead of posting
+// authorization rejections for databases they do not manage.
+func TestPlanForResolvedDatabaseSkipsGateForUnconfiguredDatabase(t *testing.T) {
+	client, _ := setupGitHubServer(t)
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked := h.planForResolvedDatabaseBlocked(t.Context(), "octocat/hello-world", 1, 12345, "mona", "someone-elses-db", "")
+
+	assert.False(t, blocked)
+}
+
+// The full plan command path authorizes the actor once discovery resolves
+// the database — even when the PR itself touches that database's schema,
+// planning it requires the database's configured principals.
+func TestHandleMultiEnvPlanBlocksUnauthorizedActorAfterDiscovery(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpoints(t, mux, "orders")
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthStorageTestHandler(cfg, &emptyStorage{}, installClient)
+
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, true, 0)
+
+	body := requireComment(t, comments, "unauthorized plan comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+}
+
 func commentRecorder(t *testing.T, comments chan<- string) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -966,9 +1099,10 @@ func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database 
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
-			"user": map[string]any{"login": "testuser"},
+			"state": "open",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"user":  map[string]any{"login": "testuser"},
 		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {

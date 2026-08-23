@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -17,13 +18,21 @@ import (
 // Each RPC delegates to the underlying Client implementation.
 type Server struct {
 	client Client
+	logger *slog.Logger
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
 
-// NewServer creates a gRPC server wrapping a Client.
-func NewServer(client Client) *Server {
-	return &Server{client: client}
+// NewServer creates a gRPC server wrapping a Client. The logger carries the
+// health-check causes the RPC sanitizes out of its response, so an embedder
+// that wires its own logger sees them with the rest of its structured output
+// and can attach its deployment identifiers to them. A nil logger falls back
+// to the default rather than dropping the only record of the cause.
+func NewServer(client Client, logger *slog.Logger) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Server{client: client, logger: logger}
 }
 
 // Register registers the server on the given grpc.Server.
@@ -33,9 +42,39 @@ func (s *Server) Register(srv *grpc.Server) {
 
 func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1.HealthResponse, error) {
 	if err := s.client.Health(ctx); err != nil {
+		// The caller only ever sees a sanitized Unavailable, so this log is the
+		// only record of why a deployment stopped reporting healthy — without it
+		// the control plane marks the deployment down with no attributable cause.
+		if callerAbandonedHealthCheck(ctx) {
+			s.logger.DebugContext(ctx, "tern health check abandoned by its caller", "error", err)
+		} else {
+			s.logger.WarnContext(ctx, "tern health check failed; reporting deployment unavailable to caller", "error", err)
+		}
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
 	return &ternv1.HealthResponse{Status: "ok"}, nil
+}
+
+// callerAbandonedHealthCheck reports whether a failed health check ended because
+// the caller hung up rather than because the deployment is unhealthy. A control
+// plane shutting down or dropping the connection teaches this side nothing, and
+// the caller already records it.
+//
+// The request context is the signal, not the returned error: gRPC cancels the
+// handler context when the client disconnects, so a real hangup always shows up
+// here, while an error merely wrapping context.Canceled can come from a
+// sub-context the check cancelled itself — a genuine failure that must stay at
+// warn.
+//
+// An expired deadline is deliberately excluded: it means the health check itself
+// outran the caller's budget, which is a genuine unhealthy signal, and this side
+// is the only one that knows what the check was waiting on.
+//
+// A hangup landing after the check already failed for a real cause files that
+// cause at debug. The signal is delayed rather than lost: the deployment is
+// still unhealthy on the caller's next poll, which warns then.
+func callerAbandonedHealthCheck(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 func (s *Server) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -102,6 +141,20 @@ func (s *Server) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*te
 	resp, err := s.client.Progress(ctx, req)
 	if err != nil {
 		if errors.Is(err, storage.ErrApplyNotFound) || errors.Is(err, storage.ErrTaskNotFound) {
+			return nil, status.Error(codes.NotFound, err.Error())
+		}
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return resp, nil
+}
+
+func (s *Server) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if err := requireApplyID(req.GetApplyId()); err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Logs(ctx, req)
+	if err != nil {
+		if errors.Is(err, storage.ErrApplyNotFound) {
 			return nil, status.Error(codes.NotFound, err.Error())
 		}
 		return nil, status.Error(codes.Internal, err.Error())

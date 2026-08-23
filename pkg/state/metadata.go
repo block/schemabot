@@ -44,6 +44,15 @@ var applyMetadata = map[string]ApplyStateInfo{
 	Apply.RunningDegraded: {
 		Label: "Running (degraded)",
 	},
+	Apply.CatchingUp: {
+		Label: "Catching up",
+	},
+	Apply.Checksumming: {
+		Label: "Checksumming",
+	},
+	Apply.PostChecksum: {
+		Label: "Applying final changes",
+	},
 	Apply.Paused: {
 		Label: "Paused",
 	},

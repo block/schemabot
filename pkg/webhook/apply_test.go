@@ -35,7 +35,7 @@ func TestFormatProgressComment(t *testing.T) {
 		},
 	}
 
-	body := formatProgressComment(apply, tasks, nil)
+	body := formatProgressComment(apply, tasks, nil, "")
 
 	// Template renders rich progress bars instead of a table
 	assert.Contains(t, body, "testdb")
@@ -59,7 +59,7 @@ func TestFormatProgressComment_NoTasks(t *testing.T) {
 		State:       state.Apply.Pending,
 	}
 
-	body := formatProgressComment(apply, nil, nil)
+	body := formatProgressComment(apply, nil, nil, "")
 
 	assert.Contains(t, body, "testdb")
 	assert.Contains(t, body, "Starting")
@@ -74,7 +74,7 @@ func TestFormatProgressComment_WithError(t *testing.T) {
 		ErrorMessage: "connection refused",
 	}
 
-	body := formatProgressComment(apply, nil, nil)
+	body := formatProgressComment(apply, nil, nil, "")
 
 	assert.Contains(t, body, "connection refused")
 	assert.Contains(t, body, "Failed")
@@ -89,6 +89,11 @@ func TestCommentObserverShouldDeferCutoverUsesPersistedApplyOption(t *testing.T)
 	assert.True(t, observer.shouldDeferCutover(apply))
 }
 
+// A defer-cutover apply parks its tasks at the cutover barrier with only the
+// task state to show for it — the driver persists no separate readiness flag.
+// Each parked table renders a "Waiting for cutover" row, and the readiness
+// summary counts every parked table as ready so the operator can see the
+// cutover is unblocked.
 func TestFormatProgressCommentCutoverState(t *testing.T) {
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-abc123",
@@ -98,16 +103,44 @@ func TestFormatProgressCommentCutoverState(t *testing.T) {
 	}
 
 	tasks := []*storage.Task{
-		{TableName: "users", State: state.Task.WaitingForCutover, ReadyToComplete: true},
-		{TableName: "orders", State: state.Task.WaitingForCutover, ReadyToComplete: true},
+		{TableName: "users", State: state.Task.WaitingForCutover},
+		{TableName: "orders", State: state.Task.WaitingForCutover},
 	}
 
-	body := formatProgressComment(apply, tasks, nil)
+	body := formatProgressComment(apply, tasks, nil, "")
 
 	assert.Contains(t, body, "Cutover")
 	assert.Contains(t, body, "testdb")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
+	assert.Contains(t, body, "**2/2** table(s) ready for cutover")
+	assert.NotContains(t, body, "waiting on")
+	assert.Contains(t, body, "Waiting for cutover")
+	assert.Contains(t, body, "📊 2 waiting for cutover", "the progress summary must agree with the per-table rows")
+}
+
+// While one table is still copying, the readiness summary counts only the
+// tables parked at the barrier so the operator can see what the cutover is
+// still waiting on.
+func TestFormatProgressCommentCutoverReadinessCountsOnlyParkedTables(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-abc123",
+		Database:        "testdb",
+		Environment:     "production",
+		State:           state.Apply.WaitingForCutover,
+	}
+
+	tasks := []*storage.Task{
+		{TableName: "users", State: state.Task.WaitingForCutover},
+		{TableName: "orders", State: state.Task.Running},
+	}
+
+	body := formatProgressComment(apply, tasks, nil, "")
+
+	assert.Contains(t, body, "**1/2** table(s) ready for cutover — waiting on 1")
+	assert.Contains(t, body, "Waiting for cutover")
+	assert.Contains(t, body, "1 waiting for cutover", "the progress summary must count the parked table")
+	assert.Contains(t, body, "1 running", "the progress summary must show the table the cutover is waiting on")
 }
 
 func TestFormatSummaryComment(t *testing.T) {
@@ -122,7 +155,7 @@ func TestFormatSummaryComment(t *testing.T) {
 		{TableName: "orders", State: state.Task.Completed},
 	}
 
-	body := formatSummaryComment(apply, tasks, nil)
+	body := formatSummaryComment(apply, tasks, nil, "")
 
 	assert.Contains(t, body, "Schema Change Applied")
 	assert.Contains(t, body, "`users`")
@@ -142,7 +175,7 @@ func TestFormatSummaryComment_Failed(t *testing.T) {
 		{TableName: "users", State: state.Task.Failed},
 	}
 
-	body := formatSummaryComment(apply, tasks, nil)
+	body := formatSummaryComment(apply, tasks, nil, "")
 
 	assert.Contains(t, body, "duplicate column")
 	assert.Contains(t, body, "Failed")
@@ -178,7 +211,7 @@ func TestBuildApplyCommentData(t *testing.T) {
 		},
 	}
 
-	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil)
+	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil, "")
 
 	assert.Equal(t, "apply-abc123", data.ApplyID)
 	assert.Equal(t, "testdb", data.Database)
@@ -200,7 +233,7 @@ func TestBuildApplyCommentData_DefaultNamespace(t *testing.T) {
 		{TableName: "users", State: state.Task.Running},
 	}
 
-	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil)
+	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil, "")
 
 	assert.Equal(t, "testdb", data.Tables[0].Namespace, "empty namespace should default to database name")
 }

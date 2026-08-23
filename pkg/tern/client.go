@@ -18,12 +18,38 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+// ErrApplyLeasePresumedLost is returned by a drive whose lease heartbeat
+// writes have been failing for the full storage.ApplyLeaseStaleAfter window.
+// The lease was never definitively reported lost — storage was unreachable —
+// but the row's heartbeat is now stale enough for a peer driver to reclaim
+// it, so the current owner must stop driving. Callers match it with errors.Is
+// to record the displacement once and release the claim without treating it
+// as an engine failure.
+var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
 // ErrNoTasksForApplyOperation so the same fail-closed handling (errors.Is)
 // terminalizes the stale claim rather than retrying it forever.
 var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
+
+// ErrPlanMissingForApplyOperation is returned when a task-less operation's
+// parent apply points at a plan row that is absent. The plan is what decides
+// whether an operation with no tasks is a legitimate VSchema-only drive, so
+// without it the operation can never be dispatched. Like
+// ErrApplyOperationRowMissing it names its own cause while wrapping
+// ErrNoTasksForApplyOperation, so the operator terminalizes the claim instead of
+// re-driving an operation that no retry can advance.
+var ErrPlanMissingForApplyOperation = fmt.Errorf("plan not found for apply operation: %w", ErrNoTasksForApplyOperation)
+
+// ErrApplyTasksNotLoaded is returned by a whole-apply drive that loaded zero
+// tasks for an apply that owns task rows. Such an apply is undriveable, not
+// done: completing it would report success for schema changes that never ran,
+// and the unreturned rows would keep blocking their database as active work.
+// The drive fails closed and the apply stays claimable, so the work stays
+// visibly stuck until the rows load or an operator intervenes.
+var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader did not return")
 
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
@@ -32,6 +58,16 @@ var (
 	// ErrPullSchemaInvalidRequest marks a malformed pull request.
 	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
 )
+
+// SchemaPuller is the optional engine capability that answers PullSchema for
+// database types without a built-in pull path. An engine supplied through
+// LocalConfig.EngineFactories advertises live-schema pull support by
+// implementing it; LocalClient delegates pull requests for its type to the
+// capability and fails closed with ErrPullSchemaUnsupportedType when the
+// engine does not provide it.
+type SchemaPuller interface {
+	PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+}
 
 // Client defines the interface for schema change operations.
 // Uses proto-generated types for type safety.
@@ -54,6 +90,9 @@ type Client interface {
 
 	// Progress returns detailed progress for an active schema change.
 	Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error)
+
+	// Logs returns a bounded recent window of durable apply logs.
+	Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error)
 
 	// Cutover triggers the cutover phase when defer_cutover was used.
 	Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error)
@@ -127,4 +166,18 @@ type Client interface {
 
 	// Close releases any resources held by the client.
 	Close() error
+}
+
+// ShutdownHalter is an optional capability for clients whose engines drive
+// schema changes inside this process. A halting client brings that in-process
+// work down so the process can exit without leaving a target held while it has
+// stopped renewing the apply's lease. Clients that delegate to a separate Tern
+// service do not implement it: that service owns its own engines and halts them
+// on its own shutdown.
+type ShutdownHalter interface {
+	// HaltForShutdown brings this client's in-flight schema-change work down,
+	// checkpointed so another driver can resume it, and returns once its engine
+	// no longer holds the target. It is not an operator stop: the applies it
+	// halts stay active for reclaim.
+	HaltForShutdown(ctx context.Context) error
 }

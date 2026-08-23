@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/block/spirit/pkg/statement"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
@@ -30,11 +30,11 @@ const (
 func changeTypeToString(ct ternv1.ChangeType) string {
 	switch ct {
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
@@ -104,6 +104,8 @@ func engineName(e ternv1.Engine) string {
 		return "Spirit"
 	case ternv1.Engine_ENGINE_PLANETSCALE:
 		return "PlanetScale"
+	case ternv1.Engine_ENGINE_POSTGRES:
+		return "PostgreSQL"
 	default:
 		return "Unknown"
 	}
@@ -183,6 +185,8 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
 			ProgressDetail:      t.ProgressDetail,
 			TaskID:              t.TaskId,
@@ -257,7 +261,8 @@ func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply,
 	released, err := storage.ReleaseLatched(ctx, s.storage, apply.ID, ops)
 	if err != nil {
 		s.logger.Warn("progress response will treat rollout as unreleased: failed to load release latch",
-			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		return false
 	}
 	return released
@@ -288,10 +293,8 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
 		s.logger.Warn("progress response will omit per-deployment operations",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		return nil, nil, false
 	}
 	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
@@ -323,7 +326,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if shouldServeProgressFromStorage(apply.State) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("failed to read apply progress from storage", append(apply.LogAttrs(), "error", err)...)
+			s.logger.Error("failed to read apply progress from storage",
+				append(apply.LogAttrs(),
+					"error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -337,7 +342,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	ops, opsErr := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if opsErr != nil {
 		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", opsErr)
+			append(apply.LogAttrs(),
+				"error", opsErr)...)
 	}
 
 	// A multi-operation apply has no single remote data-plane id — each
@@ -352,7 +358,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",
-				"apply_id", applyID, "state", apply.State, "error", err)
+				append(apply.LogAttrs(),
+					"error", err)...)
 		} else {
 			s.writeJSON(w, http.StatusOK, httpResp)
 			return
@@ -363,26 +370,32 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
 		s.logger.Error("active apply is missing stored deployment metadata",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, err.Error())
 		return
 	}
-	s.logger.Debug("progress by apply-id: resolving client", "apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment)
+	s.logger.Debug("progress by apply-id: resolving client", apply.LogAttrs()...)
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		s.logger.Error("no tern client for active apply — server is misconfigured",
-			"apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
 			fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
 		return
 	}
-	s.logger.Debug("progress by apply-id: got client", "apply_id", applyID, "is_remote", client.IsRemote())
+	s.logger.Debug("progress by apply-id: got client",
+		append(apply.LogAttrs(),
+			"is_remote", client.IsRemote())...)
 
 	if shouldServeRemoteProgressFromStorage(apply, client) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(apply))
 		if err != nil {
-			s.logger.Error("failed to read queued remote apply progress from storage", append(apply.LogAttrs(), "error", err)...)
+			s.logger.Error("failed to read queued remote apply progress from storage",
+				append(apply.LogAttrs(),
+					"error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -644,12 +657,13 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 // server. It intentionally exposes topology metadata only; connection
 // strings, opaque execution targets, and endpoint addresses stay server-side.
 func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
-	databaseType, err := parseDatabaseListTypeFilter(r)
+	databaseType, err := parseDatabaseListTypeFilter(r, s.config)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, err := databaseListResponse(s.config, databaseType)
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	resp, err := databaseListResponse(s.config, databaseType, name)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -658,23 +672,58 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
+// parseDatabaseListTypeFilter validates the optional ?type= filter against the
+// types actually present in server config — the one source of truth for the
+// type vocabulary — so typos are still caught while embedder-supplied engine
+// types filter the same way as the built-ins.
+func parseDatabaseListTypeFilter(r *http.Request, config *ServerConfig) (string, error) {
 	databaseType := r.URL.Query().Get("type")
-	switch databaseType {
-	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata:
-		return databaseType, nil
-	default:
-		return "", fmt.Errorf("type must be %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata)
+	if databaseType == "" {
+		return "", nil
 	}
+	configured := configuredDatabaseTypes(config)
+	if slices.Contains(configured, databaseType) {
+		return databaseType, nil
+	}
+	if len(configured) == 0 {
+		return "", fmt.Errorf("type %q matches no configured database type: no databases are configured on this server", databaseType)
+	}
+	return "", fmt.Errorf("type %q matches no configured database type (configured: %s)", databaseType, strings.Join(configured, ", "))
 }
 
-func databaseListResponse(config *ServerConfig, databaseType string) (*apitypes.DatabaseListResponse, error) {
+// configuredDatabaseTypes returns the distinct database types present in
+// server config, sorted for deterministic error messages.
+func configuredDatabaseTypes(config *ServerConfig) []string {
+	if config == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(config.Databases))
+	types := make([]string, 0, len(config.Databases))
+	for _, dbConfig := range config.Databases {
+		if !seen[dbConfig.Type] {
+			seen[dbConfig.Type] = true
+			types = append(types, dbConfig.Type)
+		}
+	}
+	sort.Strings(types)
+	return types
+}
+
+// databaseListResponse builds the sanitized database list, keeping only
+// databases matching the optional type and name filters. The name filter is a
+// case-insensitive substring match so one query covers a sharded family
+// (omnibus matches omnibus_001, omnibus_002, ...).
+func databaseListResponse(config *ServerConfig, databaseType, name string) (*apitypes.DatabaseListResponse, error) {
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
+	nameFilter := strings.ToLower(name)
 	databaseNames := make([]string, 0, len(config.Databases))
 	for database, dbConfig := range config.Databases {
 		if databaseType != "" && dbConfig.Type != databaseType {
+			continue
+		}
+		if nameFilter != "" && !strings.Contains(strings.ToLower(database), nameFilter) {
 			continue
 		}
 		databaseNames = append(databaseNames, database)
@@ -753,6 +802,21 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	last, err := parseStatusLast(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	stateFilter, err := parseStatusState(r, failuresOnly)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	activeOnly, err := parseStatusActiveOnly(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
@@ -761,6 +825,15 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
+	}
+	if stateFilter != "" {
+		filter.States = []string{stateFilter}
+	}
+	if activeOnly {
+		filter.ActiveOnly = true
+	}
+	if last > 0 {
+		filter.UpdatedSince = time.Now().Add(-last)
 	}
 	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
@@ -772,14 +845,25 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		applies = applies[:limit]
 	}
+	stateCounts, err := s.storage.Applies().CountRecentByState(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("count recent applies by state failed", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to count recent applies by state")
+		return
+	}
 
 	resp := &apitypes.StatusResponse{
 		Limit:        limit,
 		MaxLimit:     maxStatusLimit,
 		HasMore:      hasMore,
 		FailuresOnly: failuresOnly,
+		StateCounts:  stateCounts,
 		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
+	if last > 0 {
+		resp.Last = last.String()
+	}
+	resp.State = stateFilter
 	operationsByApply := map[int64][]*storage.ApplyOperation{}
 	if filter.Deployment != "" {
 		applyIDs := make([]int64, 0, len(applies))
@@ -925,6 +1009,36 @@ func parseStatusLimit(r *http.Request) (int, error) {
 	return limit, nil
 }
 
+// parseStatusLast parses the optional `last` query parameter bounding the status
+// list to applies whose latest activity — on the apply row or any of its
+// operations — falls within the window. Zero means unbounded.
+func parseStatusLast(r *http.Request) (time.Duration, error) {
+	raw := r.URL.Query().Get("last")
+	if raw == "" {
+		return 0, nil
+	}
+	last, err := time.ParseDuration(raw)
+	if err != nil || last <= 0 {
+		return 0, fmt.Errorf("last must be a positive duration such as 30m or 24h")
+	}
+	return last, nil
+}
+
+// parseStatusActiveOnly parses the optional `active` query parameter restricting
+// the status list to applies that have not reached a terminal state. Callers use
+// it to ask whether a target is busy without paging through settled history.
+func parseStatusActiveOnly(r *http.Request) (bool, error) {
+	raw := r.URL.Query().Get("active")
+	if raw == "" {
+		return false, nil
+	}
+	active, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("active must be a boolean")
+	}
+	return active, nil
+}
+
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {
 	raw := r.URL.Query().Get("failed")
 	if raw == "" {
@@ -935,6 +1049,26 @@ func parseStatusFailuresOnly(r *http.Request) (bool, error) {
 		return false, fmt.Errorf("failed must be a boolean")
 	}
 	return failed, nil
+}
+
+// parseStatusState parses the optional `state` query parameter restricting the
+// status list to one apply state. The value is normalized to canonical
+// lowercase and must name a known apply state, so a typo returns an error
+// instead of a silently empty list. It cannot be combined with `failed`, which
+// is its own state filter.
+func parseStatusState(r *http.Request, failuresOnly bool) (string, error) {
+	raw := r.URL.Query().Get("state")
+	if raw == "" {
+		return "", nil
+	}
+	if failuresOnly {
+		return "", fmt.Errorf("state cannot be combined with failed")
+	}
+	normalized := state.NormalizeState(raw)
+	if _, ok := state.LookupApply(normalized); !ok {
+		return "", fmt.Errorf("unknown state %q", raw)
+	}
+	return normalized, nil
 }
 
 // progressFromLocalStorage builds a ProgressResponse from local apply + task
@@ -965,7 +1099,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	if stale && apply.ExternalID != "" {
 		if err := s.syncTasksFromTern(ctx, apply, tasks); err != nil {
 			s.logger.Warn("task sync from Tern failed, serving stale data",
-				"apply_id", apply.ApplyIdentifier, "error", err)
+				append(apply.LogAttrs(),
+					"error", err)...)
 		} else {
 			// Re-read tasks after sync; keep original on failure.
 			if refreshed, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID); err == nil {
@@ -1015,6 +1150,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
+			Throttled:           task.Throttled,
+			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
 			TaskID:              task.TaskIdentifier,
 		}
@@ -1072,7 +1209,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		tp, ok := tableProgress[progressTableKey(task.Namespace, task.TableName)]
 		if !ok {
 			s.logger.Error("task has no matching table in Tern progress response",
-				"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName, "apply_id", apply.ApplyIdentifier)
+				append(apply.LogAttrs(),
+					"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName)...)
 			continue
 		}
 		task.State = state.NormalizeTaskStatus(tp.Status)
@@ -1081,6 +1219,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		task.ProgressPercent = int(tp.PercentComplete)
 		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+		task.Throttled = tp.Throttled
+		task.ThrottleReason = tp.ThrottleReason
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
 			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)
@@ -1089,7 +1229,8 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		synced++
 	}
 	s.logger.Info("synced stale task records from Tern",
-		"apply_id", apply.ApplyIdentifier, "synced", synced, "total", len(tasks))
+		append(apply.LogAttrs(),
+			"synced", synced, "total", len(tasks))...)
 	return nil
 }
 

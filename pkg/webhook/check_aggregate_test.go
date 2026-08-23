@@ -219,6 +219,78 @@ func TestAggregateSummary_WithParticipants(t *testing.T) {
 	assert.Contains(t, tenantSection, "`tenant-c`")
 }
 
+// When the blocking rows are tenant deployments' folded checks, the leader's
+// title says "tenant applies" — a bare "apply pending" reads as the leader's
+// own work when the pending applies actually belong to the tenants.
+func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
+	tenantPending := func(tenant string) *storage.Check {
+		return &storage.Check{
+			DatabaseType: aggregateSentinel,
+			DatabaseName: tenant,
+			Environment:  "production",
+			Status:       checkStatusCompleted,
+			Conclusion:   checkConclusionActionRequired,
+		}
+	}
+
+	t.Run("all pending rows are tenant folds", func(t *testing.T) {
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			tenantPending("tenant-b"),
+			tenantPending("tenant-c"),
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "3 tenant applies pending", title)
+	})
+
+	t.Run("single tenant fold pending", func(t *testing.T) {
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "1 tenant apply pending", title)
+	})
+
+	t.Run("own and tenant applies pending", func(t *testing.T) {
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
+			tenantPending("tenant-a"),
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "2 applies pending (1 tenant)", title)
+	})
+
+	// A participant whose Check Run could not be read blocks the aggregate,
+	// but it is a reporting gap, not a pending apply — the title must surface
+	// it separately instead of folding it into the tenant-apply count.
+	t.Run("unresolved participant is not counted as a pending apply", func(t *testing.T) {
+		unresolvedRow := tenantPending("tenant-b")
+		unresolvedRow.BlockingReason = participantUnresolvedBlockingReason
+		checks := []*storage.Check{
+			tenantPending("tenant-a"),
+			unresolvedRow,
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "1 apply pending, 1 participant has not reported", title)
+	})
+
+	t.Run("own applies and unresolved participants surface both counts", func(t *testing.T) {
+		unresolvedB := tenantPending("tenant-b")
+		unresolvedB.BlockingReason = participantUnresolvedBlockingReason
+		unresolvedC := tenantPending("tenant-c")
+		unresolvedC.BlockingReason = participantUnresolvedBlockingReason
+		checks := []*storage.Check{
+			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
+			tenantPending("tenant-a"),
+			unresolvedB,
+			unresolvedC,
+		}
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		assert.Equal(t, "2 applies pending, 2 participants have not reported", title)
+	})
+}
+
 // Participant gating is the key information, so the Tenant deployments section
 // must survive even when the leader has so many per-database checks that the
 // Database section truncates.
@@ -329,4 +401,55 @@ func TestFilterChecksByEnvironment(t *testing.T) {
 		result := filterChecksByEnvironment(checks, aggregateSentinel)
 		assert.Empty(t, result)
 	})
+}
+
+func TestNormalizeStaleContributions(t *testing.T) {
+	t.Run("rows for the current commit pass through unchanged", func(t *testing.T) {
+		checks := []*storage.Check{
+			{HeadSHA: "current", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			{HeadSHA: "current", DatabaseName: "users", Status: checkStatusInProgress},
+		}
+		contributions, staleCount := normalizeStaleContributions(checks, "current")
+		require.Len(t, contributions, 2)
+		assert.Zero(t, staleCount)
+		assert.Equal(t, checkConclusionSuccess, contributions[0].Conclusion)
+		assert.Equal(t, checkStatusInProgress, contributions[1].Status)
+	})
+
+	t.Run("rows for another commit become blocking in-progress placeholders", func(t *testing.T) {
+		checks := []*storage.Check{
+			{HeadSHA: "previous", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			{HeadSHA: "previous", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionFailure},
+		}
+		contributions, staleCount := normalizeStaleContributions(checks, "current")
+		require.Len(t, contributions, 2)
+		assert.Equal(t, 2, staleCount)
+		for _, c := range contributions {
+			assert.Equal(t, checkStatusInProgress, c.Status)
+			assert.Empty(t, c.Conclusion)
+		}
+		conclusion, status := computeAggregate(contributions)
+		assert.Empty(t, conclusion)
+		assert.Equal(t, checkStatusInProgress, status)
+	})
+
+	t.Run("normalization copies rows so stored state is untouched", func(t *testing.T) {
+		original := &storage.Check{HeadSHA: "previous", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess}
+		contributions, staleCount := normalizeStaleContributions([]*storage.Check{original}, "current")
+		require.Len(t, contributions, 1)
+		assert.Equal(t, 1, staleCount)
+		assert.Equal(t, checkStatusCompleted, original.Status)
+		assert.Equal(t, checkConclusionSuccess, original.Conclusion)
+	})
+}
+
+func TestAnyInProgressOnCommit(t *testing.T) {
+	checks := []*storage.Check{
+		{HeadSHA: "previous", DatabaseName: "orders", Status: checkStatusInProgress},
+		{HeadSHA: "current", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+	}
+	assert.False(t, anyInProgressOnCommit(checks, "current"), "an in-progress row from another commit is a placeholder, not current work")
+
+	checks = append(checks, &storage.Check{HeadSHA: "current", DatabaseName: "billing", Status: checkStatusInProgress})
+	assert.True(t, anyInProgressOnCommit(checks, "current"))
 }

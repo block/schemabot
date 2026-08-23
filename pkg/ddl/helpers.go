@@ -1,48 +1,44 @@
 package ddl
 
 import (
-	"fmt"
 	"strings"
-
-	"github.com/block/spirit/pkg/statement"
 )
 
 // SplitStatements splits SQL content into individual DDL statements.
-// Uses Spirit's statement package which wraps the TiDB parser for proper parsing.
-// All SQL content must be parseable by the TiDB parser.
+// It delegates to the package's default StatementParser (the TiDB/Spirit
+// implementation), so all SQL content must be parseable by that parser.
 func SplitStatements(content string) ([]string, error) {
-	content = strings.TrimSpace(content)
-	if content == "" {
-		return nil, nil
-	}
-	parsed, err := statement.NewWithOptions(content, statement.Options{
-		AllowMixedStatementTypes: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse SQL statements: %w", err)
-	}
-	var stmts []string
-	for _, s := range parsed {
-		stmt := strings.TrimSpace(s.Statement)
-		if stmt != "" {
-			stmts = append(stmts, stmt)
-		}
-	}
-	return stmts, nil
+	return defaultParser.Split(content)
 }
 
-// ClassifyStatement classifies a DDL statement using Spirit's parser.
-// Returns the typed StatementType and table name. Handles the Classify
-// boilerplate (nil check, empty results) so callers don't have to.
-func ClassifyStatement(stmt string) (statement.StatementType, string, error) {
-	results, err := statement.Classify(stmt)
-	if err != nil {
-		return statement.StatementUnknown, "", fmt.Errorf("classify statement %q: %w", stmt, err)
+// ClassifyStatement classifies a single DDL statement using the package's
+// default StatementParser. Returns the typed StatementType and table name.
+// Handles the Classify boilerplate (nil check, empty results) so callers
+// don't have to.
+//
+// The input must be exactly one statement: a compound string could hide a
+// destructive statement behind the classification of the first one, so
+// multi-statement input is rejected. Callers with multi-statement content
+// must split it with SplitStatements first.
+func ClassifyStatement(stmt string) (StatementType, string, error) {
+	return defaultParser.Classify(stmt)
+}
+
+// statementPreview returns the leading text of a statement for error messages,
+// truncated so multi-statement blobs do not flood logs. Truncation counts
+// runes, not bytes, so multi-byte identifiers are never split into invalid
+// UTF-8.
+func statementPreview(stmt string) string {
+	const maxPreview = 80
+	s := strings.TrimSpace(stmt)
+	count := 0
+	for i := range s {
+		if count == maxPreview {
+			return s[:i] + "..."
+		}
+		count++
 	}
-	if len(results) == 0 {
-		return statement.StatementUnknown, "", fmt.Errorf("no classification result for statement %q", stmt)
-	}
-	return results[0].Type, results[0].Table, nil
+	return s
 }
 
 // ClassifyStatementOp is like ClassifyStatement but returns the operation as a
@@ -53,38 +49,4 @@ func ClassifyStatementOp(stmt string) (string, string, error) {
 		return "", "", err
 	}
 	return StatementTypeToOp(t), table, nil
-}
-
-// StatementTypeToOp converts a Spirit StatementType to the lowercase operation
-// string used in storage and API layers ("create", "alter", "drop", "rename").
-func StatementTypeToOp(t statement.StatementType) string {
-	switch t {
-	case statement.StatementCreateTable:
-		return "create"
-	case statement.StatementAlterTable:
-		return "alter"
-	case statement.StatementDropTable:
-		return "drop"
-	case statement.StatementRenameTable:
-		return "rename"
-	default:
-		return "unknown"
-	}
-}
-
-// OpToStatementType converts a storage operation string back to a Spirit
-// StatementType. Used when reading from storage/proto boundaries.
-func OpToStatementType(op string) statement.StatementType {
-	switch strings.ToLower(op) {
-	case "create":
-		return statement.StatementCreateTable
-	case "alter":
-		return statement.StatementAlterTable
-	case "drop":
-		return statement.StatementDropTable
-	case "rename":
-		return statement.StatementRenameTable
-	default:
-		return statement.StatementUnknown
-	}
 }

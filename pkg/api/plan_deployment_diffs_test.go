@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -40,6 +41,16 @@ func twoDeploymentService(t *testing.T, eu, us *mockTernClient) *Service {
 		"eu/production": eu,
 		"us/production": us,
 	}, logger)
+}
+
+// productionTargets resolves the testapp/production deployment set the producer
+// tests exercise, so each PlanDeploymentDiffs call is given the same resolved
+// targets the rollup would pass in.
+func productionTargets(t *testing.T, svc *Service) []routing.ExecutionTarget {
+	t.Helper()
+	targets, err := svc.config.ResolveDatabaseTargets("testapp", "production")
+	require.NoError(t, err)
+	return targets
 }
 
 func planDiffReq(t *testing.T) PlanRequest {
@@ -91,7 +102,7 @@ func TestPlanDeploymentDiffs_PrimaryReusesReviewedPlan(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu")
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -115,7 +126,7 @@ func TestPlanDeploymentDiffs_DiffsAllDeploymentsWhenNoPrimary(t *testing.T) {
 	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "")
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -133,7 +144,7 @@ func TestPlanDeploymentDiffs_PerDeploymentErrorIsCaptured(t *testing.T) {
 	us := &mockTernClient{planDiffErr: errors.New("deployment unreachable")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "")
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
 	require.NoError(t, err, "a single deployment failure must not abort the rollup")
 	require.Len(t, results, 2)
 
@@ -195,7 +206,7 @@ func TestPlanDeploymentDiffs_PreservesShards(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu")
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -224,7 +235,7 @@ func TestPlanDeploymentDiffs_PrimaryDeploymentMismatchFailsClosed(t *testing.T) 
 	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
 	// targets[0] is "eu", but the reviewed plan was created against "us".
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "us")
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "us", productionTargets(t, svc))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "primary invariant violated")
 	assert.Nil(t, eu.planDiffReq, "must fail before diffing any deployment")
@@ -241,21 +252,17 @@ func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
 
 	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "")
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "", productionTargets(t, svc))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no origin deployment")
 }
 
-// A request-level failure (the database/environment resolves no deployments)
-// returns an error rather than a per-deployment result.
-func TestPlanDeploymentDiffs_UnresolvedTargetsError(t *testing.T) {
+// Called with no resolved targets the producer fails closed rather than
+// returning an empty result that a caller could mistake for agreement.
+func TestPlanDeploymentDiffs_NoTargetsError(t *testing.T) {
 	svc := twoDeploymentService(t, &mockTernClient{}, &mockTernClient{})
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), PlanRequest{
-		Database:    "testapp",
-		Environment: "staging", // not configured
-		Type:        storage.DatabaseTypeMySQL,
-	}, nil, "")
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "resolve deployment targets")
+	assert.Contains(t, err.Error(), "no deployment targets")
 }

@@ -12,6 +12,7 @@ SchemaBot is a declarative schema GitOps orchestrator for MySQL via Spirit and V
 make build                # Build binary → bin/schemabot
 make test                 # Run ALL tests (unit + integration + e2e)
 make test-unit            # Unit tests only (fast, no containers)
+make test-consumer-module # Consumer-module startup tests (fast, no containers)
 make test-integration     # Integration tests (testcontainers)
 make test-e2e             # E2E tests (docker-compose: local + gRPC)
 make test-e2e-local       # E2E local tests only
@@ -31,21 +32,23 @@ make lint                 # golangci-lint via Docker
 
 ## Test Architecture
 
-Three test layers, each with its own make target and CI job:
+Four test layers, each with its own make target:
 
 - **Unit** (`make test-unit`, `./...`) — No containers, no network. Fast. Tests individual functions and packages with `-race`.
+- **Consumer module** (`make test-consumer-module`, `e2e/consumermodule/`) — No containers, no network, no build tags. A nested Go module that embeds schemabot the way a host binary does, pinning newer dependency versions than this repo to prove the public startup surface tolerates version skew. Runs in the Unit Tests CI job. Module-boundary tests belong here.
 - **Integration** (`make test-integration`, `-tags=integration ./...`) — A mix of Docker containers (MySQL via testcontainers) and in-process server/gRPC components. Tests cross-package interactions without requiring a full deployment. Lives in `pkg/` and `integration/`.
 - **E2E** (`make test-e2e`, `-tags=e2e ./e2e/...`) — Full docker-compose stack. All components (SchemaBot server, MySQL instances) are real containers — nothing is in-process or mocked. Tests the CLI against a running system. Lives in `e2e/local/` and `e2e/grpc/`.
 
-Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2E tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all three layers are the only safe way to evolve SchemaBot.
+Integration tests are the workhorse — most test coverage lives here since they're cheaper to run than full e2e. E2E tests are more expensive (docker-compose setup/teardown) but essential for validating the CLI against a real running system. Robust automated tests across all layers are the only safe way to evolve SchemaBot.
 
-CI mirrors local dev exactly — each job runs the corresponding make target.
+CI mirrors local dev — every CI test job runs make targets, not bespoke commands. The Unit Tests job runs `make test-unit` followed by `make test-consumer-module`; the other jobs each run their single corresponding target. The Integration job is the exception: it splits the packages across two runners, leaves out the LocalScale packages that have their own job, and gives Go a timeout below the job's so a hung test panics with a goroutine dump naming the culprit. `make test-integration` runs everything in one pass on the make target's own timeout, so a CI-only timeout will not necessarily reproduce locally.
 
 ## Git
 
 - **Always verify the active branch before starting work.** The deployed code may be on a feature branch (e.g., a worktree), not `main`. Before implementing, check which branch has the code you're building on: `git log --oneline <branch> -- <relevant-file>`. Never branch from `main` for features that depend on unreleased work — branch from (or commit directly to) the active development branch.
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
 - **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. When a change affects flow, architecture, state transitions, or concurrency, include a small ASCII diagram if it makes the behavior easier to review; omit diagrams when they would add noise. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **UX changes show the rendered result, collapsed.** When a PR changes what users see (PR comments, check summaries, CLI output), embed the new rendering in the PR summary inside collapsed `<details>` blocks — one per scenario, using the TEMPLATES.md preview output where one exists — so reviewers see the actual UX without checking out the branch. Links to TEMPLATES.md anchors are not a substitute; the rendering belongs in the summary itself.
 - **Agent PR disclosures belong at the bottom.** When an agent writes or updates a PR summary/body, put the agent disclosure line after the summary content, not at the top.
 - **Do not create PRs automatically.** Wait for the user to explicitly ask before running `gh pr create`. Pushing a branch is fine; creating the PR is a separate decision.
 - **Create PRs in draft mode** (`gh pr create --draft`) by default. The author will mark it ready for review.
@@ -108,9 +111,17 @@ Before handing a PR to the user, review it the way an operator will experience i
 - **TOCTOU review.** For async flows, webhooks, reconciliation, and background watchers, ask what happens if the latest commit on the PR branch changes, another pod writes first, an apply starts or finishes concurrently, or a rollback changes the target schema. Use conditional storage updates, ownership identifiers, and final state reloads where stale workers could otherwise overwrite newer state.
 - **Started applies remain authoritative.** Once an apply has started, a later PR commit that removes the schema change must not make the aggregate check pass by cleanup alone. Example: commit A adds a column and starts an apply; commit B removes that column before the apply finishes. The stored state must continue to block merge until an operator reconciles the target environment.
 - **Logs must answer the triage question.** Error and warning logs on critical paths should include the identifiers an operator needs: repo, PR, head SHA when relevant, environment, database type, database, apply ID or identifier, check ID or Check Run ID, and the operation being attempted. For apply/operation/task logs, build these with the `LogAttrs()` helpers (see *Go Style → Logging*) rather than hand-listing identifiers.
-- **Metrics should be actionable.** Add counters for rare or dangerous branches that operators can investigate, such as ownership misses, stale cleanup blocking, or status-check update failures. If a metric spikes, the expected operator action should be obvious from the metric name, attributes, and nearby code comments or docs.
+- **Metrics are for what can go haywire; logs are for what is rare.** Add a new instrument only when its subject has enough volume for a rate, a trend, or a threshold to mean something and you would alert on it — retry storms, claim contention, throttling, error rates on a hot path. Log a rare dangerous branch well instead; when it should be countable, the answer is usually a new status or reason value on an existing hot-path counter rather than a counter of its own. Several existing counters predate this bar, so don't extend the pattern by copying a neighbor. When a metric does earn its place, the operator action it implies should be obvious from its name, attributes, and nearby code comments or docs. The reasoning, and which existing counters are the exception, is in [Adding New Metrics](pkg/metrics/README.md#adding-new-metrics).
 - **Readability is a review gate.** Extract named helpers for compound state predicates, separate error handling from state decisions, and keep comments focused on invariants and operator-facing behavior. Avoid clever SQL, dense boolean expressions, and control flow that requires reconstructing the state machine in your head.
 - **Tests must prove documented behavior.** If a PR summary or docs mention an edge case, add focused tests for it or explicitly call out why it cannot be tested in this layer. Prefer integration-style webhook/storage tests for check-run lifecycle behavior.
+
+### Control Operations
+
+Every operator control operation (stop, start, cutover, cancel, volume, revert, skip-revert — and any new ones) must provide, on every engine:
+
+- **A durable request path.** Record the request in storage (`apply_control_requests`) before acknowledging it, and have the driver consume it from storage. A pod restart, lease handover, or webhook redelivery must never lose an acknowledged command. In-memory flags are per-drive optimizations layered over the durable record, never the source of truth.
+- **Comment rotation when the effect lands.** When the operation takes effect on a still-active apply, the comment observer posts a fresh progress comment at the bottom of the PR timeline and freezes the superseded comment into a collapsed details block pointing at its successor — operators look at the bottom of the PR for the effect of the command they just issued, not at an older edited comment. The rotation signal must be durable and cross-pod safe (recorded on the tracked comment row, e.g. `posted_volume` / `posted_phase`), so a fresh observer on a later drive claim rotates at most once per recorded signal value. Rotation exists to surface an operator's command: when the same apply state is also reachable without one (e.g. skipping-revert via revert-window expiry), gate the rotation on the operator-origin signal — the durable control request — so routine applies transition in place. Operations that resolve directly to a terminal state (e.g. cancel) surface through the terminal summary comment instead, which already lands at the bottom of the PR — do not rotate on top of it.
+- **Engine-agnostic rotation signals.** Key rotation on apply state (`pkg/state`) or other engine-agnostic stored fields, not engine-specific metadata, so every engine gets the same PR UX.
 
 **Engine-agnostic interfaces:** The engine interface (`pkg/engine`), tern proto (`pkg/proto`), and API types (`pkg/apitypes`) must not contain engine-specific fields (e.g., PlanetScale branch names, Spirit checkpoint details). Use generic `Metadata map[string]string` fields for engine-specific data. Engine-specific types belong in the engine package (e.g., `pkg/engine/planetscale/`).
 
@@ -156,13 +167,13 @@ Before handing a PR to the user, review it the way an operator will experience i
 
 **Instant DDL terminology:** In MySQL, "instant DDL" has a specific meaning — `ALTER TABLE` operations that only modify metadata (e.g., adding a column with `ALGORITHM=INSTANT`). `CREATE TABLE` and `DROP TABLE` are **not** instant DDL even though they complete quickly. Don't describe them as instant in code or comments.
 
-### SQL Parsing: TiDB Parser Requirement
+### SQL Parsing: Real-Parser Requirement
 
-All SQL statements processed by SchemaBot **must be parseable by the TiDB parser** (via Spirit's `statement.New()` and `statement.ParseCreateTable()`). This is a hard requirement, not a best-effort behavior.
+All SQL statements processed by SchemaBot **must be parseable by the dialect's real parser**. For the MySQL family (MySQL/Vitess/Strata) that is the TiDB parser (via Spirit's `statement.New()` and `statement.ParseCreateTable()`); for PostgreSQL it is libpg_query (via the `pkg/ddl` `StatementParser` obtained from `ParserForDialect`). This is a hard requirement, not a best-effort behavior, and the same discipline applies to both grammars.
 
-- **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the TiDB parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
+- **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
-- Schema files are expected to contain valid MySQL DDL. If the TiDB parser cannot handle a valid MySQL construct, that is a bug to fix in the parser or Spirit, not something to work around with string splitting.
+- Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
 
 ## AWS Infrastructure
 
@@ -230,7 +241,8 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 ### Database Connections
 
 - Use `mysqlconn.Open()` from `github.com/block/schemabot/pkg/mysqlconn` for SchemaBot-managed MySQL connections. It centralizes DSN normalization, including required TLS settings for RDS targets. Use raw `sql.Open("mysql", ...)` only for local test/dev infrastructure (for example LocalScale) or engine-specific connection paths that intentionally manage their own TLS config (for example PlanetScale/Vitess mTLS).
-- After opening a database with `mysqlconn.Open()` or raw `sql.Open("mysql", ...)`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections).
+- Use `postgresconn.Open()` from `github.com/block/schemabot/pkg/postgresconn` for SchemaBot-managed PostgreSQL connections — it is the Postgres counterpart of `mysqlconn` (DSN normalization, required `sslmode` for RDS targets). Reserve `postgresconn.OpenReloadable()` for the single long-lived storage pool. Do not open Postgres connections with raw `sql.Open("pgx", ...)` outside local test/dev infrastructure.
+- After opening a database with `mysqlconn.Open()`, `postgresconn.Open()`, or raw `sql.Open(...)`, always call `db.PingContext(ctx)` to verify the connection works (Go's sql driver lazy-loads connections). An immediately error-checked `db.Conn(ctx)` right after open also satisfies this rule — for a freshly opened pool it is equivalent to a ping, since the empty pool forces a real dial and auth handshake. Outside that right-after-open window `db.Conn(ctx)` can hand back an already-pooled connection and verifies nothing, so it is not a general ping substitute.
 - Always backtick-quote SQL identifiers: `` USE `db` ``, `` SHOW CREATE TABLE `tbl` ``.
 - **Never manipulate DSN strings with `strings.Replace`.** Use `mysql.ParseDSN()` / `cfg.FormatDSN()` from `github.com/go-sql-driver/mysql` to parse, modify fields, and re-serialize. String manipulation is fragile and breaks on DSNs with passwords containing `/` or other special characters.
 
@@ -252,7 +264,7 @@ All SQL statements processed by SchemaBot **must be parseable by the TiDB parser
 
 ### Storage Schema (Self-Bootstrapping)
 
-SchemaBot's storage schema is self-bootstrapping via `EnsureSchema` (`pkg/api/ensure_schema.go`), which runs on every server startup before accepting traffic. It reads all embedded SQL files from `pkg/schema/mysql/`, diffs them against the live database using Spirit, and applies any DDL needed. This means adding a new table or column to `pkg/schema/mysql/` is all that's needed — the next deploy picks it up automatically. No manual schema changes or ordering concerns.
+SchemaBot's storage schema is self-bootstrapping via `EnsureSchema` (`pkg/api/ensure_schema.go`), which runs on every server startup before accepting traffic and routes to a per-dialect bootstrapper. On MySQL it reads all embedded SQL files from `pkg/schema/mysql/`, diffs them against the live database using Spirit, and applies any DDL needed — adding a new table or column to `pkg/schema/mysql/` is all that's needed; the next deploy picks it up automatically. On PostgreSQL (`pkg/api/ensure_schema_postgres.go`) it creates missing tables from `pkg/schema/postgres/` and verifies that existing tables contain every expected column, failing startup when one is missing; it does not alter existing tables, reject extra columns, or compare indexes. Apply column changes to already-bootstrapped PostgreSQL databases before deploying schema files that expect them. Keep the two dialect directories in lockstep; the schema parity tests in `pkg/schema` pin this.
 
 ### SQL Schema
 

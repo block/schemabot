@@ -21,11 +21,14 @@ func TestTierForRequest(t *testing.T) {
 		{http.MethodPost, "/api/rollback/plan", TierWrite},
 		{http.MethodPost, "/api/apply", TierWrite},
 		{http.MethodPost, "/api/cutover", TierWrite},
+		{http.MethodPost, "/api/webhooks/redrive", TierWrite},
+		{http.MethodPost, "/api/checks/scan", TierWrite},
+		{http.MethodPost, "/api/checks/synthesize", TierWrite},
 		{http.MethodPost, "/api/settings", TierWrite},
 		{http.MethodDelete, "/api/locks", TierWrite},
 	}
 	for _, c := range cases {
-		assert.Equalf(t, c.want, tierForRequest(c.method, c.path), "%s %s", c.method, c.path)
+		assert.Equalf(t, c.want, TierForRequest(c.method, c.path), "%s %s", c.method, c.path)
 	}
 }
 

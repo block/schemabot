@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	gh "github.com/google/go-github/v86/github"
@@ -21,6 +22,14 @@ import (
 // fakeClientFactory returns a pre-built InstallationClient for any installation ID.
 type fakeClientFactory struct {
 	client *ghclient.InstallationClient
+	// forInstallationErr, when set, makes ForInstallation fail after any
+	// configured synchronization hooks run.
+	forInstallationErr error
+	// forInstallationStarted is closed when ForInstallation is entered.
+	forInstallationStarted chan struct{}
+	// forInstallationRelease blocks ForInstallation until closed.
+	forInstallationRelease <-chan struct{}
+	forInstallationOnce    sync.Once
 	// repoInstallationID is returned by InstallationIDForRepo. Zero defaults to
 	// 12345 so repo-webhook dispatch tests resolve a non-zero installation id.
 	repoInstallationID int64
@@ -30,6 +39,15 @@ type fakeClientFactory struct {
 }
 
 func (f *fakeClientFactory) ForInstallation(_ int64) (*ghclient.InstallationClient, error) {
+	if f.forInstallationStarted != nil {
+		f.forInstallationOnce.Do(func() { close(f.forInstallationStarted) })
+	}
+	if f.forInstallationRelease != nil {
+		<-f.forInstallationRelease
+	}
+	if f.forInstallationErr != nil {
+		return nil, f.forInstallationErr
+	}
 	return f.client, nil
 }
 
@@ -61,9 +79,13 @@ func setupGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 // prWebhookPayloadOpts configures how buildPRWebhookRequest constructs the payload.
 type prWebhookPayloadOpts struct {
 	action    string // "opened", "synchronize", "reopened", "closed", etc.
+	merged    bool   // for "closed": whether the PR merged or was closed without merging
 	beforeSHA string
 	headSHA   string
 	headRef   string
+	// baseRefFrom is the branch the PR was retargeted away from. Setting it
+	// makes an "edited" delivery a retarget rather than a title or body edit.
+	baseRefFrom string
 }
 
 type checkRunWebhookPayloadOpts struct {
@@ -91,6 +113,7 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 		"action": opts.action,
 		"pull_request": map[string]any{
 			"number": 1,
+			"merged": opts.merged,
 			"head": map[string]any{
 				"sha": opts.headSHA,
 				"ref": opts.headRef,
@@ -108,6 +131,13 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 	}
 	if opts.beforeSHA != "" {
 		payload["before"] = opts.beforeSHA
+	}
+	if opts.baseRefFrom != "" {
+		payload["changes"] = map[string]any{
+			"base": map[string]any{
+				"ref": map[string]any{"from": opts.baseRefFrom},
+			},
+		}
 	}
 
 	body, err := json.Marshal(payload)

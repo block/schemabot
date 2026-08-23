@@ -72,12 +72,12 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 		return fmt.Errorf("rollback plan has errors")
 	}
 
-	// Check if there are any changes
-	tables := planResult.FlatTables()
-	if len(tables) == 0 {
+	// Check if there are any changes (DDL or VSchema)
+	if !planResult.HasChanges() {
 		fmt.Println("No changes. Schema is already at the original state.")
 		return nil
 	}
+	tables := planResult.FlatTables()
 
 	// Step 2: Show the rollback plan
 	fmt.Println()
@@ -92,12 +92,15 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 		fmt.Printf("  %s (%s):\n", tbl.TableName, tbl.ChangeType)
 		fmt.Printf("    %s\n", tbl.DDL)
 	}
-
-	// Show unsafe warning if any
-	if planResult.HasErrors() {
-		unsafeChanges := planResult.UnsafeChanges()
-		templates.WriteUnsafeWarningAllowed(unsafeChanges)
+	for _, sc := range planResult.Changes {
+		if sc.HasVSchemaChange() {
+			fmt.Printf("  %s: VSchema update\n", sc.Namespace)
+		}
 	}
+
+	// Disclose unsafe changes before the confirmation prompt. Rollback has no
+	// --allow-unsafe flag; the interactive confirmation is the acknowledgment.
+	templates.WriteUnsafeChangesWarning(planResult.UnsafeChanges())
 
 	// Show options if any flags are set
 	templates.WriteOptions(cmd.DeferCutover, false)

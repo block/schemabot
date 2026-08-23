@@ -7,8 +7,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -91,6 +89,12 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_PENDING
 	case state.Task.Running:
 		return ternv1.State_STATE_RUNNING
+	case state.Task.CatchingUp:
+		return ternv1.State_STATE_CATCHING_UP
+	case state.Task.Checksumming:
+		return ternv1.State_STATE_CHECKSUMMING
+	case state.Task.PostChecksum:
+		return ternv1.State_STATE_POST_CHECKSUM
 	case state.Task.WaitingForDeploy:
 		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
@@ -132,15 +136,19 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// changeTypeToProto converts a Spirit StatementType to the proto ChangeType enum.
-func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
+// changeTypeToProto converts a ddl.StatementType to the proto ChangeType enum.
+func changeTypeToProto(op ddl.StatementType) ternv1.ChangeType {
 	switch op {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
+	case ddl.StatementCreateIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
+	case ddl.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
+	case ddl.StatementDropIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}
@@ -166,11 +174,15 @@ func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
 	default:
 		return "unknown"
 	}
@@ -201,6 +213,12 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Pending
 	case ternv1.State_STATE_RUNNING:
 		return state.Apply.Running
+	case ternv1.State_STATE_CATCHING_UP:
+		return state.Apply.CatchingUp
+	case ternv1.State_STATE_CHECKSUMMING:
+		return state.Apply.Checksumming
+	case ternv1.State_STATE_POST_CHECKSUM:
+		return state.Apply.PostChecksum
 	case ternv1.State_STATE_WAITING_FOR_DEPLOY:
 		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:
@@ -403,13 +421,14 @@ func PSDisplayMetadata(resumeStateMetadata string) (map[string]string, error) {
 
 // PSDisplayMetadataStorageBlob converts a progress response's display
 // metadata — the map a data-plane progress poll returns (deploy_request_url, the
-// encoded VSchema status, instant/deferred flags) — back into the stored
-// psMetadataForStorage JSON that the PR comment's display projection
-// (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote (gRPC)
-// apply the engine runs in the data plane, so its resume metadata never lands on
-// the control-plane operation; mirroring these display fields is how the comment
-// surfaces the deploy-request link and VSchema status. Returns "" when there is
-// nothing worth storing, so callers leave the operation's metadata untouched.
+// encoded VSchema status, instant/deferred flags, the revert-window deadline) —
+// back into the stored psMetadataForStorage JSON that the PR comment's display
+// projection (resolveDisplayByOperation → PSDisplayMetadata) reads. For a remote
+// (gRPC) apply the engine runs in the data plane, so its resume metadata never
+// lands on the control-plane operation; mirroring these display fields is how
+// the comment surfaces the deploy-request link, VSchema status, and revert-window
+// countdown. Returns "" when there is nothing worth storing, so callers leave
+// the operation's metadata untouched.
 func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 	if len(md) == 0 {
 		return "", nil
@@ -419,6 +438,13 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		DeployRequestURL: md["deploy_request_url"],
 		IsInstant:        md["is_instant"] == "true",
 		DeferredDeploy:   md["deferred_deploy"] == "true",
+	}
+	if raw := md["revert_expires_at"]; raw != "" {
+		expires, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return "", fmt.Errorf("parse revert_expires_at %q from display metadata: %w", raw, err)
+		}
+		m.RevertExpiresAt = &expires
 	}
 	changes, err := apitypes.ParseVSchemaChanges(md)
 	if err != nil {
@@ -430,7 +456,7 @@ func PSDisplayMetadataStorageBlob(md map[string]string) (string, error) {
 		}
 		m.VSchemaDiffs = append(m.VSchemaDiffs, vschemaKeyspaceDiff{Namespace: ch.Namespace, Diff: ch.Diff})
 	}
-	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 {
+	if m.DeployRequestURL == "" && m.BranchName == "" && !m.IsInstant && !m.DeferredDeploy && len(m.VSchemaDiffs) == 0 && m.RevertExpiresAt == nil {
 		return "", nil
 	}
 	encoded, err := json.Marshal(m)

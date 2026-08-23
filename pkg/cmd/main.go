@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/commands"
 )
 
@@ -46,21 +49,33 @@ type CLI struct {
 	Locks      commands.LocksCmd      `cmd:"" help:"List all active database locks"`
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
 	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
+	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
 	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
 	Login      commands.LoginCmd      `cmd:"" help:"Log in via OIDC and cache a token for the active profile"`
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
+	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
+	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
 func main() {
+	// Render command hints — and kong's own usage text — with the tool name a
+	// wrapper passes via --cli-name, so wrapper-invoked runs print commands
+	// that work as pasted. Scanned from the raw args because kong's usage name
+	// must be fixed before kong parses; an absent flag keeps the default.
+	cliname.Set(cliname.FromArgs(os.Args[1:]))
+
 	var cli CLI
 	ctx := kong.Parse(&cli,
-		kong.Name("schemabot"),
+		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
-		kong.Vars{"version": fmt.Sprintf("%s (commit: %s)", version, commit)},
+		kong.Vars{
+			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
+			"cli_name": cliname.Name(),
+		},
 	)
 
 	cli.Version = version
@@ -88,7 +103,42 @@ func main() {
 	}
 	client.SetAuthToken(token)
 
+	// Cancel long-running commands on Ctrl+C / SIGTERM. The first signal
+	// cancels the context so in-flight requests stop and the command can print
+	// a clean summary; a second signal exits immediately, so a command that
+	// does not unwind promptly can always be force-stopped. Bind the context
+	// as the context.Context interface so command Run methods can declare a
+	// ctx parameter (kong binds concrete values by dynamic type, so an
+	// interface parameter needs BindTo).
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	// runDone signals the watcher that the command finished — kept separate
+	// from runCtx so the second select waits for a genuine second signal
+	// rather than the just-cancelled runCtx.
+	runDone := make(chan struct{})
+	go func() {
+		select {
+		case <-sigCh:
+			cancelRun()
+		case <-runDone:
+			return
+		}
+		select {
+		case <-sigCh:
+			os.Exit(130)
+		case <-runDone:
+		}
+	}()
+	ctx.BindTo(runCtx, (*context.Context)(nil))
+
 	err = ctx.Run(&cli.Globals)
+	// Release the watcher and stop intercepting signals now that the command
+	// is done; explicit rather than deferred, since the os.Exit below would
+	// skip a deferred call.
+	close(runDone)
+	signal.Stop(sigCh)
+	cancelRun()
 	if err != nil {
 		// ErrSilent means the error was already displayed - just exit with code 1
 		if !errors.Is(err, commands.ErrSilent) {

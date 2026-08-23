@@ -3,6 +3,7 @@ package commands
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,7 +27,7 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 	require.NoError(t, plan.checkConflicts(false))
 	require.NoError(t, plan.write())
@@ -61,7 +62,7 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 	require.NoError(t, plan.checkConflicts(false))
 	require.NoError(t, plan.write())
@@ -77,6 +78,58 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 	vschema, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "vschema.json"))
 	require.NoError(t, err)
 	assert.JSONEq(t, "{\"sharded\":true}", string(vschema))
+}
+
+// Re-onboarding over an existing schema root must not drop the
+// ignore_namespaces an operator configured: the rewritten schemabot.yaml
+// carries the entries forward and the plan verification excludes the same
+// namespaces a real plan would.
+func TestBuildOnboardWritePlanPreservesIgnoreNamespaces(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, []string{"local_fixtures", "fixtures_$ENV"})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\n", string(config))
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.ignoreNamespaces)
+}
+
+func TestPreservedIgnoreNamespaces(t *testing.T) {
+	t.Run("missing config is a fresh onboarding", func(t *testing.T) {
+		ignores, err := preservedIgnoreNamespaces(t.TempDir())
+		require.NoError(t, err)
+		assert.Nil(t, ignores)
+	})
+
+	t.Run("existing config's entries are preserved", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
+			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n"), 0o644))
+
+		ignores, err := preservedIgnoreNamespaces(root)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"local_fixtures"}, ignores)
+	})
+
+	t.Run("unreadable config is an error, not a silent drop", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
+			[]byte(": not yaml"), 0o644))
+
+		_, err := preservedIgnoreNamespaces(root)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "preserve ignore_namespaces")
+	})
 }
 
 func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
@@ -130,7 +183,7 @@ func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 
 	err = plan.checkConflicts(false)
@@ -149,7 +202,7 @@ func TestBuildOnboardWritePlanRejectsUnsafeResponsePaths(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"../users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	})
+	}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "table")
 }
@@ -204,7 +257,7 @@ func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			plan, err := buildOnboardWritePlan(tt.schemaRoot, tt.resp)
+			plan, err := buildOnboardWritePlan(tt.schemaRoot, tt.resp, nil)
 			require.Error(t, err)
 			assert.Nil(t, plan)
 			assert.Contains(t, err.Error(), tt.want)
@@ -231,24 +284,120 @@ func TestFileStatusForDryRunTreatsStatErrorsAsExisting(t *testing.T) {
 }
 
 func TestValidateOnboardPlanResult(t *testing.T) {
-	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{Environment: "production"}))
+	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{Environment: "production"}, "orders", "production"))
 	assert.NoError(t, validateOnboardPlanResult(&apitypes.PlanResponse{
 		Environment: "production",
 		LintResults: []*apitypes.LintViolationResponse{{Severity: "error", Message: "existing lint violation"}},
-	}))
+	}, "orders", "production"))
 
 	err := validateOnboardPlanResult(&apitypes.PlanResponse{
 		Environment: "production",
 		Changes: []*apitypes.SchemaChangeResponse{
-			{TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", ChangeType: "ALTER"}}},
+			{
+				Namespace: "orders",
+				TableChanges: []*apitypes.TableChangeResponse{{
+					TableName:  "users",
+					ChangeType: "ALTER",
+					DDL:        "ALTER TABLE `users`\n  ADD COLUMN `email` varchar(255)",
+				}},
+			},
+		},
+	}, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database orders environment production")
+	assert.Contains(t, err.Error(), "still produce schema changes")
+	assert.Contains(t, err.Error(), "orders/users (alter): ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+
+	err = validateOnboardPlanResult(&apitypes.PlanResponse{Errors: []string{"syntax error"}}, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database orders environment production")
+	assert.Contains(t, err.Error(), "plan returned errors")
+	assert.Contains(t, err.Error(), "syntax error")
+
+	err = validateOnboardPlanResult(nil, "orders", "production")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "database orders environment production")
+	assert.Contains(t, err.Error(), "plan response is empty")
+}
+
+func TestDescribeOnboardPlanChangesIncludesVSchemaAndClampsDDL(t *testing.T) {
+	longDDL := "ALTER TABLE `users` ADD COLUMN " + strings.Repeat("`c` varchar(255), ", 20)
+	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{
+				Namespace:    "orders",
+				TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", ChangeType: "ALTER", DDL: longDDL}},
+				Metadata:     map[string]string{"vschema": "{\"sharded\": true}"},
+			},
 		},
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "still produce schema changes")
+	require.Len(t, lines, 2)
+	assert.True(t, strings.HasPrefix(lines[0], "orders/users (alter): ALTER TABLE `users` ADD COLUMN"), lines[0])
+	assert.True(t, strings.HasSuffix(lines[0], "…"), lines[0])
+	assert.LessOrEqual(t, len([]rune(lines[0])), onboardVerifyDDLPreviewLimit+len("orders/users (alter): ")+len("…"))
+	assert.Equal(t, "orders: vschema change", lines[1])
+}
 
-	err = validateOnboardPlanResult(&apitypes.PlanResponse{Errors: []string{"syntax error"}})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "plan returned errors")
+// A leftover schema file for a table that no longer exists in the target is
+// the classic cause of a failed onboarding verification: the pull rewrites
+// every table in the namespace but never deletes strays, so the stale file
+// resurfaces as a spurious create. strayFiles must name exactly those files —
+// and ignore non-schema files — so the operator knows what to delete.
+func TestOnboardWritePlanStrayFiles(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	// Namespace directory absent (dry run before any write): nothing to scan.
+	strays, err := plan.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays)
+
+	require.NoError(t, plan.write())
+	strays, err = plan.strayFiles()
+	require.NoError(t, err)
+	assert.Empty(t, strays)
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "legacy_bak.sql"), []byte("CREATE TABLE `legacy_bak` (`id` bigint NOT NULL);\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{}"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "README.md"), []byte("docs"), 0o644))
+
+	// MySQL planning never reads vschema.json, so only the table file is stray.
+	strays, err = plan.strayFiles()
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		filepath.Join(root, "orders", "legacy_bak.sql"),
+	}, strays)
+}
+
+// For Vitess, vschema.json is a schema input: a leftover copy the pull did not
+// write proposes a VSchema the target doesn't have, so it must be flagged
+// alongside stray table files.
+func TestOnboardWritePlanStrayFilesFlagsVSchemaForVitess(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "vitess",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, nil)
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "orders", "vschema.json"), []byte("{\"sharded\": true}"), 0o644))
+
+	strays, err := plan.strayFiles()
+	require.NoError(t, err)
+	assert.Equal(t, []string{filepath.Join(root, "orders", "vschema.json")}, strays)
 }
 
 func validPullSchemaResponse() *apitypes.PullSchemaResponse {

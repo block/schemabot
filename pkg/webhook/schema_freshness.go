@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -72,4 +73,86 @@ func (h *Handler) assertSchemaStillCurrent(
 // underscore form expected by the metric's cardinality allowlist ("apply_confirm").
 func metricActionKey(action string) string {
 	return strings.ReplaceAll(action, "-", "_")
+}
+
+// assertBaseSchemaStillCurrent enforces the invariant that a PR must include
+// every base-branch change under its managed schema directory before it can
+// apply — a stale branch's plan would otherwise revert schema that already
+// landed. It compares Git tree object IDs at the PR merge base and the
+// current tip of the base branch (resolved from prInfo.BaseRef — the PR
+// object's base SHA is a creation-time snapshot that never observes later
+// base commits), so unrelated commits elsewhere in a monorepo never block an
+// apply.
+//
+// Returns rejected=true only for a verified stale branch. GitHub read
+// uncertainty stops the apply rather than silently bypassing the guard, and is
+// returned as an error, not a rejection: freshness could not be verified, so
+// the outcome is not the command's answer and a durable driver may re-drive
+// it.
+func (h *Handler) assertBaseSchemaStillCurrent(
+	ctx context.Context,
+	client *ghclient.InstallationClient,
+	repo string,
+	pr int,
+	installationID int64,
+	schema *ghclient.SchemaRequestResult,
+	prInfo *ghclient.PullRequestInfo,
+	environment string,
+	requestedBy string,
+	action string,
+) (rejected bool, err error) {
+	schemaPaths := []string{schema.SchemaPath}
+	if schema.SchemaLinkPath != "" {
+		schemaPaths = append(schemaPaths, schema.SchemaLinkPath)
+	}
+	changed, baseTipSHA, err := client.SchemaPathsChangedSinceMergeBase(ctx, repo, prInfo.BaseRef, prInfo.HeadSHA, schemaPaths)
+	if err != nil {
+		h.logger.Error("apply stopped: could not verify base schema freshness",
+			"repo", repo,
+			"pr", pr,
+			"environment", environment,
+			"database", schema.Database,
+			"database_type", schema.Type,
+			"schema_path", schema.SchemaPath,
+			"base_ref", prInfo.BaseRef,
+			"head_sha", prInfo.HeadSHA,
+			"action", action,
+			"requested_by", requestedBy,
+			"error", err,
+		)
+		metrics.RecordBaseSchemaFreshnessRejected(ctx, metricActionKey(action), environment, "verification_failed")
+		h.postComment(repo, pr, installationID, templates.RenderBaseSchemaFreshnessRejection(templates.BaseSchemaFreshnessRejectionData{
+			RequestedBy:       requestedBy,
+			Database:          schema.Database,
+			Environment:       environment,
+			SchemaPath:        schema.SchemaPath,
+			VerificationError: true,
+		}))
+		return false, fmt.Errorf("base schema freshness gate compare %s against %s tip for %s#%d: %w", schema.SchemaPath, prInfo.BaseRef, repo, pr, err)
+	}
+	if !changed {
+		return false, nil
+	}
+
+	h.logger.Warn("apply rejected: schema path changed on base branch after PR divergence",
+		"repo", repo,
+		"pr", pr,
+		"environment", environment,
+		"database", schema.Database,
+		"database_type", schema.Type,
+		"schema_path", schema.SchemaPath,
+		"base_ref", prInfo.BaseRef,
+		"base_tip_sha", baseTipSHA,
+		"head_sha", prInfo.HeadSHA,
+		"action", action,
+		"requested_by", requestedBy,
+	)
+	metrics.RecordBaseSchemaFreshnessRejected(ctx, metricActionKey(action), environment, "stale")
+	h.postComment(repo, pr, installationID, templates.RenderBaseSchemaFreshnessRejection(templates.BaseSchemaFreshnessRejectionData{
+		RequestedBy: requestedBy,
+		Database:    schema.Database,
+		Environment: environment,
+		SchemaPath:  schema.SchemaPath,
+	}))
+	return true, nil
 }

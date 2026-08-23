@@ -27,6 +27,8 @@ func TestChangeTypeRoundTrip(t *testing.T) {
 		ternv1.ChangeType_CHANGE_TYPE_CREATE,
 		ternv1.ChangeType_CHANGE_TYPE_ALTER,
 		ternv1.ChangeType_CHANGE_TYPE_DROP,
+		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
+		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
 		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
 		ternv1.ChangeType_CHANGE_TYPE_OTHER,
 	} {
@@ -201,6 +203,58 @@ func TestProtoChangesToNamespacesPreservesOriginalFiles(t *testing.T) {
 	nsData := namespaces["commerce"]
 	assert.Equal(t, "CREATE SCHEMA commerce;", nsData.OriginalFiles["schema.sql"])
 	assert.True(t, nsData.OriginalFilesCaptured)
+}
+
+// TestProtoChangesToNamespacesPersistsVSchemaMetadata verifies the gRPC
+// plan-persistence path stores the apply-time VSchema change-metadata — the
+// changed flag, the recorded deletions and mutations the unsafe gate reads,
+// and the rendered diff apply-time display shows — while dropping other
+// engine metadata, matching what the local persistence path stores for the
+// same change so apply-time consumers read either identically.
+func TestProtoChangesToNamespacesPersistsVSchemaMetadata(t *testing.T) {
+	deletions := `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`
+	mutations := `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "commerce",
+		Metadata: map[string]string{
+			"vschema_changed":   "true",
+			"vschema_deletions": deletions,
+			"vschema_mutations": mutations,
+			"vschema":           "rendered diff for display",
+			"branch":            "engine-internal detail",
+		},
+	}}, map[string]*ternv1.SchemaFiles{
+		"commerce": {Files: map[string]string{"vschema.json": `{"tables":{"users":{}}}`}},
+	})
+
+	require.NoError(t, err)
+	require.Contains(t, namespaces, "commerce")
+	nsData := namespaces["commerce"]
+	assert.Equal(t, map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: deletions,
+		storage.PlanMetadataVSchemaMutations: mutations,
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
+	}, nsData.Metadata)
+	assert.JSONEq(t, `{"tables":{"users":{}}}`, nsData.Artifacts["vschema.json"])
+}
+
+// TestProtoChangesToNamespacesNoMetadataWithoutVSchemaWork verifies a DDL-only
+// change persists no VSchema change-metadata, so the stored plan's
+// unsafe-VSchema gate has nothing to inspect for it.
+func TestProtoChangesToNamespacesNoMetadataWithoutVSchemaWork(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "commerce",
+		TableChanges: []*ternv1.TableChange{{
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}}, nil)
+
+	require.NoError(t, err)
+	require.Contains(t, namespaces, "commerce")
+	assert.Nil(t, namespaces["commerce"].Metadata)
 }
 
 func TestProtoChangesToNamespacesRejectsDuplicateNamespaces(t *testing.T) {

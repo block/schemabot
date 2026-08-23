@@ -25,6 +25,7 @@ import (
 	"github.com/block/spirit/pkg/utils"
 
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -91,6 +92,169 @@ func TestE2EApplyWithChanges(t *testing.T) {
 	}
 }
 
+// TestE2EApplyRejectedOnClosedPR verifies the closed-PR apply gate: an apply
+// command on a closed PR must be rejected with an explicit comment before any
+// plan, lock, or execution work happens. A closed PR's schema changes have no
+// path to the base branch, and its close-time lock cleanup has already run, so
+// an apply from it would push unmergeable schema and orphan the database lock.
+func TestE2EApplyRejectedOnClosedPR(t *testing.T) {
+	dbName := "webhook_apply_closed_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	closedState := "closed"
+	result.PRState.Store(&closedState)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "PR Is Closed")
+		assert.Contains(t, body, "open PRs")
+		assert.NotContains(t, body, "Applying automatically")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for closed-PR rejection comment")
+	}
+
+	// The rejected apply must not have acquired the database lock.
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+}
+
+// TestE2EApplyConfirmRejectedOnClosedPR verifies the closed-PR gate also
+// covers the manual confirmation path: apply-confirm on a closed PR is
+// rejected before any lock or freshness handling, so a confirmation comment
+// cannot execute a pending apply after the PR closes.
+func TestE2EApplyConfirmRejectedOnClosedPR(t *testing.T) {
+	dbName := "webhook_applyconfirm_closed_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	closedState := "closed"
+	result.PRState.Store(&closedState)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "PR Is Closed")
+		assert.Contains(t, body, "open PRs")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for closed-PR rejection comment")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+}
+
+// TestE2EApplyRejectedOnMergedPR verifies the closed-PR gate's merged flavor:
+// GitHub reports a merged PR as closed, so the gate still blocks the apply,
+// but the rejection copy must not tell the operator to reopen the PR (a
+// merged PR cannot be reopened) or claim its changes can never merge (they
+// did). The operator instead gets pointed at opening a new PR.
+func TestE2EApplyRejectedOnMergedPR(t *testing.T) {
+	dbName := "webhook_apply_merged_pr"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	closedState := "closed"
+	result.PRState.Store(&closedState)
+	result.PRMerged.Store(true)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "PR Is Merged")
+		assert.Contains(t, body, "open PRs")
+		assert.NotContains(t, body, "Reopen this PR")
+		assert.NotContains(t, body, "can never merge")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for merged-PR rejection comment")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock)
+}
+
 func TestE2EApplyNoChanges(t *testing.T) {
 	dbName := "webhook_apply_nochanges"
 	svc := setupE2EService(t, dbName)
@@ -142,6 +306,112 @@ func TestE2EApplyNoChanges(t *testing.T) {
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 	assert.Nil(t, lock, "expected no lock when there are no changes")
+}
+
+// TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck proves the safety property
+// documented on storeApplyPlanCheckRecord: when the apply command's no-changes
+// branch records its passing check, an in_progress row owned by a live apply
+// must survive untouched — the started apply remains authoritative for the
+// row's terminal outcome.
+//
+// The state is reachable: the active-apply gate only inspects applies while
+// this PR holds the lock, so a concurrent apply can claim the row between the
+// gate and the no-changes write. The test also pins the call-site choice —
+// swapping storeApplyPlanCheckRecord for the manual plan path would run
+// RecoverApplyOwnedCheckWithNoOpPlan, which releases same-head apply-owned
+// rows on exactly this write (completed/success/no-changes), and the ApplyID
+// assertion below would fail.
+func TestE2EApplyNoOpPreservesApplyOwnedInProgressCheck(t *testing.T) {
+	dbName := "webhook_noop_preserves_apply_owned"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	// Pre-create the table so the apply command's plan finds no changes.
+	seedTargetTable(t, dbName,
+		"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+
+	// A live apply owns the stored check row. The apply must be non-terminal so
+	// the pre-plan stale-check reconciliation leaves the row alone, and no lock
+	// is seeded so the command skips the active-apply gate and reaches the
+	// no-changes branch — the post-gate claim window this test materializes.
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-noop-preserve",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	// Same head SHA as the fake GitHub PR: the manual plan path's no-op
+	// recovery only releases same-head rows, so an old-SHA row would not
+	// discriminate the call-site swap this test guards against.
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "abc123",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The no-changes branch must be the path taken: a regular plan comment,
+	// not a blocked-apply comment.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No schema changes detected")
+		assert.NotContains(t, body, "Apply Blocked")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for no-op plan comment")
+	}
+
+	// The apply-owned in_progress row survived the no-changes check write
+	// untouched: still in_progress, still owned by the live apply, plan facts
+	// unchanged. The running apply's terminal update remains the only writer
+	// that may complete this row.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusInProgress, check.Status,
+		"no-op apply plan must not complete a check owned by a live apply")
+	assert.Equal(t, applyID, check.ApplyID,
+		"no-op apply plan must not release a live apply's ownership claim")
+	assert.Equal(t, "abc123", check.HeadSHA)
+	assert.True(t, check.HasChanges,
+		"no-op apply plan must not rewrite the plan facts on an apply-owned row")
+	assert.Empty(t, check.Conclusion)
 }
 
 func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
@@ -268,24 +538,8 @@ func TestE2EUnlock(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// For unlock, we still need PR info for the check run
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{
-				Ref: new("feature-branch"),
-				SHA: new("abc123"),
-			},
-			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
-			},
-			User: &gh.User{Login: new("testuser")},
-		})
-	})
-
 	comments := make(chan string, 10)
 	reactions := make(chan string, 10)
-	checkRuns := make(chan checkRunCapture, 10)
 
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -302,13 +556,6 @@ func TestE2EUnlock(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		reactions <- body.Content
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var body checkRunCapture
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		checkRuns <- body
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
@@ -344,15 +591,6 @@ func TestE2EUnlock(t *testing.T) {
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 	assert.Nil(t, lock, "expected lock to be released")
-
-	// Verify check run updated to neutral
-	select {
-	case cr := <-checkRuns:
-		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "neutral", cr.Conclusion)
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for check run")
-	}
 }
 
 func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
@@ -500,21 +738,6 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	// The current PR commit is still the same commit that owns the pending plan.
-	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.PullRequest{
-			Head: &gh.PullRequestBranch{
-				Ref: new("feature-branch"),
-				SHA: new("abc123"),
-			},
-			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
-			},
-			User: &gh.User{Login: new("testuser")},
-		})
-	})
-
 	comments := make(chan string, 10)
 	checkRuns := make(chan checkRunCapture, 10)
 
@@ -565,15 +788,14 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, lock)
 
-	// Unlock updates the command-specific "SchemaBot Apply" check to neutral,
-	// but must not make the aggregate safety gate pass.
+	// Unlock never writes Check Runs: check state must keep reflecting stored
+	// apply outcomes only. The "Lock Released" comment is the final action in
+	// the release flow, so an empty channel here proves no check-run write
+	// happened.
 	select {
 	case cr := <-checkRuns:
-		assert.Contains(t, cr.Name, "SchemaBot Apply")
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionNeutral, cr.Conclusion)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for unlock check run")
+		t.Fatalf("unlock unexpectedly wrote a check run: %+v", cr)
+	default:
 	}
 
 	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
@@ -1266,6 +1488,96 @@ func TestE2EApplyProductionAllowedWhenStagingSuccess(t *testing.T) {
 	})
 }
 
+// TestE2EApplyNoOpUnblocksPriorEnvironmentGate verifies that a no-op apply
+// repairs a stale prior-environment check: production is blocked while
+// staging's stored check says pending changes, a no-op `apply -e staging`
+// records the passing staging check, and production unblocks.
+func TestE2EApplyNoOpUnblocksPriorEnvironmentGate(t *testing.T) {
+	dbName := "webhook_noop_unblocks_prior_env"
+	svc := setupE2EService(t, dbName)
+	configureE2EServiceEnvironments(t, svc, dbName, "production")
+
+	// The target already has the table (reconciled out-of-band), but the
+	// stored staging check still says pending changes.
+	seedTargetTable(t, dbName,
+		"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	seedCheck(t, svc, dbName, "staging", "action_required")
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	// Production is blocked by the stale staging check.
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply Blocked")
+		assert.Contains(t, body, "Staging")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for blocked production comment")
+	}
+
+	// A staging apply finds no changes and records the passing staging check.
+	req = buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "No schema changes detected")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for no-op staging plan comment")
+	}
+
+	check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, "completed", check.Status)
+	assert.Equal(t, "success", check.Conclusion)
+	assert.False(t, check.HasChanges)
+
+	// Production unblocks. Its target is the same test database, so this
+	// apply is also a no-op plan comment rather than a locked apply.
+	req = buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production",
+		isPR:    true,
+	}, nil)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.NotContains(t, body, "Apply Blocked",
+			"production apply should not be blocked after the staging no-op apply recorded the passing check")
+		assert.Contains(t, body, "No schema changes detected")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for production comment")
+	}
+}
+
 // TestE2EApplyExecutesAutomatically verifies that `schemabot apply -e staging`
 // plans, acquires a lock, and executes the apply after safety rechecks.
 func TestE2EApplyExecutesAutomatically(t *testing.T) {
@@ -1392,6 +1704,445 @@ func TestE2EApplyAutoConfirmRejectsWhenHEADAdvanced(t *testing.T) {
 	for _, a := range applies {
 		assert.NotEqual(t, dbName, a.Database, "no apply for %s should have been started", dbName)
 	}
+}
+
+// A PR whose managed schema directory changed on the base branch after it
+// diverged is rejected before any plan is generated or lock acquired.
+// Unrelated base-branch commits are excluded by the directory tree comparison.
+// The fake models real GitHub semantics: the PR object's base SHA is a
+// creation-time snapshot equal to the merge base, so the gate only sees the
+// newer base commits by resolving the base ref to its current tip.
+func TestE2EApplyAutoConfirmRejectsStaleBaseSchema(t *testing.T) {
+	dbName := "webhook_auto_confirm_stale_base"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparison(t, mux, result)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.Contains(t, body, "`schema`")
+		assert.Contains(t, body, "Merge or rebase")
+		assert.NotContains(t, body, "Applying automatically")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for base-schema rejection")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after base-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale schema must not start an apply")
+	}
+}
+
+// A stale branch outranks the unsafe-change prompt. The base branch gained a
+// schema column after this PR diverged, and the live target already has it —
+// so a plan from the stale snapshot would emit a destructive DROP COLUMN that
+// only exists because the branch is missing the newer base schema. The apply
+// must answer with the base-schema freshness rejection, never coach the user
+// toward `--allow-unsafe`, and must not lock or start an apply.
+func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
+	dbName := "webhook_stale_base_unsafe"
+	svc := setupE2EService(t, dbName)
+
+	// The live target already carries the column the newer base commit added.
+	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	_, err = targetDB.ExecContext(t.Context(),
+		"CREATE TABLE `"+dbName+"`.`users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	// The stale PR snapshot omits the email column the base branch added.
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparison(t, mux, result)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.Contains(t, body, "Merge or rebase")
+		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
+		assert.NotContains(t, body, "Unsafe Change", "unsafe prompt must not outrank the freshness rejection")
+		assert.NotContains(t, body, "DROP COLUMN", "no stale-plan DDL may be rendered")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for base-schema rejection")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "freshness rejection must not leave a lock behind")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale schema must not start an apply")
+	}
+}
+
+// The final revalidation inside apply execution also outranks the unsafe
+// prompt. Here the base branch advances only while the confirm's re-plan is
+// running: the handler-level gate resolves the base ref to a tip whose schema
+// tree matches the merge base's, then the re-plan produces a destructive diff
+// (the target already has the column the stale snapshot omits) and the base
+// ref has moved to a newer tip by the time the final gate resolves it. The
+// user must get the freshness rejection — with the lock released — not an
+// `--allow-unsafe` prompt for revert DDL.
+func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testing.T) {
+	dbName := "webhook_confirm_final_stale_base"
+	svc := setupE2EService(t, dbName)
+
+	const pendingPlanID = "plan-pending-confirmation"
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: pendingPlanID,
+	}))
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(t.Context(), dbName, "mysql")
+	})
+
+	// The confirmation plan the user reviewed, rendered at the current HEAD so
+	// the cross-delivery plan check passes and execution reaches the re-plan.
+	planID, err := svc.Storage().Plans().Create(t.Context(), &storage.Plan{
+		PlanIdentifier: pendingPlanID,
+		Database:       dbName,
+		DatabaseType:   "mysql",
+		Deployment:     dbName,
+		Target:         dbName,
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+		HeadSHA:        "abc123",
+		CreatedAt:      time.Now(),
+	})
+	require.NoError(t, err)
+	require.NotZero(t, planID)
+
+	// The live target already carries the column the newer base commit added,
+	// so the re-plan from the stale snapshot emits a destructive DROP COLUMN.
+	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(targetDB)
+	_, err = targetDB.ExecContext(t.Context(),
+		"CREATE TABLE `"+dbName+"`.`users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+
+	// The base branch advances to a new tip commit while the re-plan runs:
+	// the handler-level gate resolves the ref to a tip whose schema tree
+	// still matches the merge base's, and the final gate — resolving the ref
+	// again — observes the newer tip whose schema tree differs. Each commit's
+	// tree is immutable; only the ref moves, so the gate detects the advance
+	// only if it re-resolves the ref rather than reusing an earlier tip.
+	var refReads atomic.Int32
+	tip := func() string {
+		if refReads.Add(1) > 1 {
+			return "base-tip-2"
+		}
+		return "base-tip-1"
+	}
+	result.BaseTip.Store(&tip)
+	for _, tipSHA := range []string{"base-tip-1", "base-tip-2"} {
+		mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+tipSHA+"...abc123", func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+				MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+			}))
+		})
+	}
+	for path, treeSHA := range map[string]string{
+		"def456":     "schema-tree-old",
+		"base-tip-1": "schema-tree-old",
+		"base-tip-2": "schema-tree-new",
+	} {
+		mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+path, func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+				{Path: new("schema"), Type: new("tree"), SHA: new(treeSHA)},
+			}}))
+		})
+	}
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
+		assert.NotContains(t, body, "Unsafe Change", "unsafe prompt must not outrank the freshness rejection")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for final-gate base-schema rejection")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "lock must be released after final-gate base-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale confirmation must not start an apply")
+	}
+}
+
+// A manual confirmation repeats the base-schema freshness gate and releases
+// only the apply-confirm lock when the branch is stale.
+func TestE2EApplyConfirmRejectsStaleBaseSchema(t *testing.T) {
+	dbName := "webhook_confirm_stale_base"
+	svc := setupE2EService(t, dbName)
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-pending-confirmation",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparison(t, mux, result)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+		assert.Contains(t, body, "Merge or rebase")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for apply-confirm base-schema rejection")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, 5*time.Second, 50*time.Millisecond, "apply-confirm lock must be released after base-schema rejection")
+
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, apply := range applies {
+		assert.NotEqual(t, dbName, apply.Database, "base-stale confirmation must not start an apply")
+	}
+}
+
+// apply-confirm validates lock intent before running freshness checks. A
+// rollback lock owned by the same PR must never be released by the apply path.
+func TestE2EApplyConfirmPreservesRollbackLock(t *testing.T) {
+	dbName := "webhook_confirm_rollback_lock"
+	svc := setupE2EService(t, dbName)
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: rollbackPendingPlanPrefix + "apply-original",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "This lock belongs to a rollback plan")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for rollback-lock rejection")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, rollbackPendingPlanPrefix+"apply-original", lock.PendingPlanID)
+}
+
+// A same-PR rollback can replace the pending apply intent while apply-confirm
+// is waiting on GitHub. Freshness rejection must conditionally release the
+// apply intent it observed, not delete the newer rollback lock by owner alone.
+func TestE2EApplyConfirmFreshnessRacePreservesReplacementRollbackLock(t *testing.T) {
+	dbName := "webhook_confirm_rollback_race"
+	svc := setupE2EService(t, dbName)
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-pending-confirmation",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}, schemabotConfig, dbName)
+	registerStaleBaseSchemaComparisonWithHook(t, mux, result, func() {
+		require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+			DatabaseName:  dbName,
+			DatabaseType:  "mysql",
+			Repository:    "octocat/hello-world",
+			PullRequest:   1,
+			Owner:         "octocat/hello-world#1",
+			PendingPlanID: rollbackPendingPlanPrefix + "replacement",
+		}))
+	})
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Apply rejected — base schema is newer")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for apply-confirm base-schema rejection")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, rollbackPendingPlanPrefix+"replacement", lock.PendingPlanID)
+}
+
+func registerStaleBaseSchemaComparison(t *testing.T, mux *http.ServeMux, result *planFlowResult) {
+	t.Helper()
+	registerStaleBaseSchemaComparisonWithHook(t, mux, result, nil)
+}
+
+// registerStaleBaseSchemaComparisonWithHook wires the fake GitHub endpoints
+// the base-schema freshness gate reads when the base branch gained schema
+// commits after the PR diverged. It mirrors real GitHub semantics: the PR
+// object's base SHA ("def456") is a creation-time snapshot equal to the merge
+// base, so only resolving the base ref reveals the advanced tip, whose schema
+// tree differs from the merge base's. The optional hook runs when the
+// merge-base comparison is fetched, mid-way through the gate's reads.
+func registerStaleBaseSchemaComparisonWithHook(t *testing.T, mux *http.ServeMux, result *planFlowResult, hook func()) {
+	t.Helper()
+	tip := func() string { return "base-tip-sha" }
+	result.BaseTip.Store(&tip)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/base-tip-sha...abc123", func(w http.ResponseWriter, _ *http.Request) {
+		if hook != nil {
+			hook()
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/def456", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-old")},
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/base-tip-sha", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: []*gh.TreeEntry{
+			{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-new")},
+		}}))
+	})
 }
 
 // TestE2EApplyConfirmRejectsWhenHEADAdvanced verifies that `apply-confirm`
@@ -1724,6 +2475,7 @@ func TestE2EApplyConfirmRejectsWhenPlanSHAStale(t *testing.T) {
 	// cross-delivery guard must still reject because the stored plan's
 	// HeadSHA ("abc123") doesn't match.
 	result.HeadSHAs = []string{"newsha456"}
+	registerFreshBaseComparison(t, mux, "newsha456")
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1993,6 +2745,7 @@ func TestE2EApplyConfirmRejectsWhenPlainPlanSupersedesApplyPlan(t *testing.T) {
 	// Current HEAD seen by every PR fetch in this delivery — matches the
 	// later plain plan, not the confirmation plan.
 	result.HeadSHAs = []string{"newsha456"}
+	registerFreshBaseComparison(t, mux, "newsha456")
 	h := newE2EHandler(t, svc, client)
 
 	confirmReq := buildWebhookRequest(t, webhookPayloadOpts{
@@ -2253,8 +3006,9 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	// Case 1: production blocked when sandbox is action_required
 	seedCheck(t, svc, dbName, "sandbox", "action_required")
 
-	blocked := h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "production", envs, 1)
+	blocked, err := h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+		dbName, "mysql", "production", envs, 1, false)
+	require.NoError(t, err)
 	assert.True(t, blocked, "production should be blocked when sandbox is action_required")
 
 	select {
@@ -2268,8 +3022,9 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	seedCheck(t, svc, dbName, "sandbox", "success")
 	seedCheck(t, svc, dbName, "staging", "action_required")
 
-	blocked = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "production", envs, 1)
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+		dbName, "mysql", "production", envs, 1, false)
+	require.NoError(t, err)
 	assert.True(t, blocked, "production should be blocked when staging is action_required")
 
 	select {
@@ -2282,20 +3037,23 @@ func TestE2EApplyThreeEnvEnforcement(t *testing.T) {
 	// Case 3: production allowed when both sandbox and staging are success
 	seedCheck(t, svc, dbName, "staging", "success")
 
-	blocked = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "production", envs, 1)
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+		dbName, "mysql", "production", envs, 1, false)
+	require.NoError(t, err)
 	assert.False(t, blocked, "production should not be blocked when all prior envs are success")
 
 	// Case 4: staging only requires sandbox (not production)
 	seedCheck(t, svc, dbName, "sandbox", "action_required")
 
-	blocked = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "staging", envs, 1)
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+		dbName, "mysql", "staging", envs, 1, false)
+	require.NoError(t, err)
 	assert.True(t, blocked, "staging should be blocked when sandbox is action_required")
 
 	// Case 5: sandbox (first env) is never blocked
-	blocked = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
-		dbName, "mysql", "sandbox", envs, 1)
+	blocked, err = h.checkPriorEnvironments(t.Context(), "octocat/hello-world", 1,
+		dbName, "mysql", "sandbox", envs, 1, false)
+	require.NoError(t, err)
 	assert.False(t, blocked, "sandbox (first env) should never be blocked")
 }
 

@@ -14,7 +14,7 @@
 - [Tern Layer (Orchestrator)](#tern-layer-orchestrator)
   - [Plan](#plan)
   - [Apply](#apply)
-  - [Apply vs Task](#apply-vs-task)
+  - [Apply vs Operation vs Task](#apply-vs-operation-vs-task)
   - [Progress Flow And Observers](#progress-flow-and-observers)
   - [Operator](#operator)
   - [Execution Modes](#execution-modes)
@@ -73,7 +73,7 @@ SchemaBot has three layers:
   - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
   - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
 - **Engine** ([`pkg/engine`](../pkg/engine/)): Stateless executor interface for schema change backends
-- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/)
+- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/)
 
 Supporting packages: [`pkg/ddl`](../pkg/ddl/) (schema diffing), [`pkg/lint`](../pkg/lint/) (safety linting and auto-fix), [`pkg/secrets`](../pkg/secrets/) (secret resolution), [`pkg/schema`](../pkg/schema/) (shared schema types and embedded storage SQL)
 
@@ -169,8 +169,9 @@ error. Uncertainty is never converted into a passing check. A check run belongs
 to one commit SHA, so stale work from an older commit can never satisfy branch
 protection for a newer PR head.
 
-**Environment ordering.** PR comment applies follow the server-owned promotion
-order (`environment_order`, default staging before production). Production
+**Environment ordering.** PR comment applies follow the database's effective
+promotion order (its `environment_order` override when set, otherwise the
+server-wide `environment_order`; default staging before production). Production
 applies are blocked until the prior environment's check state is `success`. When
 another SchemaBot deployment owns the prior environment, the gate reads that
 environment's aggregate check run from GitHub — check runs are the shared
@@ -208,10 +209,11 @@ Unsafe operations that produce error-severity violations:
 - `MODIFY COLUMN` (type change) — may truncate or lose data if the new type is narrower
 - `DROP INDEX` without first making it invisible — may cause query performance regression
 
-For MySQL/Spirit databases, an applied `DROP TABLE` is additionally quarantined
-instead of executed: the table is renamed into a `_pending_drops` database and
-stays recoverable until a background cleaner drops it after the retention
-period. See [Pending Drops](pending-drops.md).
+For MySQL/Spirit databases, an applied `DROP TABLE` can additionally be
+quarantined instead of executed: the table is renamed into a `_pending_drops`
+database and stays recoverable until a background cleaner drops it after the
+retention period. The quarantine is opt-in per deployment and off by default.
+See [Pending Drops](pending-drops.md).
 
 `HasErrors()` on the plan result checks if any lint warning has error severity. The CLI, webhook check runs, and PR comments all use this to gate applies and surface warnings to reviewers.
 
@@ -395,7 +397,9 @@ This plan has 2 DDL changes in one namespace. Applying it creates 2 tasks (one p
 
 ### Apply
 
-An **apply** executes a previously created plan. One apply can have multiple **tasks**.
+An **apply** executes a previously created plan. An apply fans out into one or
+more **operations** — the per-deployment units of work a driver claims — and
+each operation owns **tasks**, one per DDL statement.
 
 ```
 schemabot apply (after confirming plan)
@@ -404,28 +408,45 @@ CLI → API → Tern.Apply(PlanID)
                │
                ├─ looks up Plan from storage
                ├─ creates Apply record (links to Plan)
+               ├─ creates Operation records (one per deployment)
                ├─ creates Task records (one per DDL statement)
                └─ starts execution (mode depends on engine and flags)
 ```
 
-### Apply vs Task
+### Apply vs Operation vs Task
 
-| | Apply | Task |
-|---|---|---|
-| **What** | The overall schema change operation | One DDL statement within an apply |
-| **Granularity** | 1 per `schemabot apply` invocation | 1 per table being changed |
-| **Example** | "Apply plan-123 to staging" | "ALTER TABLE users ADD COLUMN email" |
-| **State** | pending → running → completed | pending → running → completed |
-| **Storage** | `applies` table | `tasks` table |
+| | Apply | Operation | Task |
+|---|---|---|---|
+| **What** | The overall schema change | The slice of an apply a driver claims and drives | One DDL statement within an operation |
+| **Granularity** | 1 per `schemabot apply` invocation | 1 per deployment (1 per shard/table on sharded targets) | 1 per table being changed |
+| **Example** | "Apply plan-123 to staging" | "Drive plan-123's work on region-a" | "ALTER TABLE users ADD COLUMN email" |
+| **State** | Derived from its operations' tasks | pending → running → completed | pending → running → completed |
+| **Storage** | `applies` table | `apply_operations` table | `tasks` table |
 
-Example: A plan with 3 DDL changes creates 1 apply and 3 tasks:
+The operation row is what a driver actually claims (`FindNextApplyOperation()`).
+It carries the state a drive needs that is scoped narrower than the whole apply:
+the Tern deployment and resolved target it runs against, the remote data plane's
+apply identifier for that slice, and the engine resume state used to recover
+after a restart. A multi-deployment parent apply has no single authoritative
+remote identifier — each operation does.
+
+Example: A plan with 3 DDL changes on a single-deployment target creates 1
+apply, 1 operation, and 3 tasks:
 
 ```
 Apply: apply-456 (state: running)
-  ├─ Task 1: ALTER TABLE users ADD COLUMN email     (state: completed)
-  ├─ Task 2: ALTER TABLE orders ADD INDEX idx_status (state: running)
-  └─ Task 3: CREATE TABLE audit_log                 (state: pending)
+  └─ Operation: region-a (claimed by a driver; holds the remote apply ID)
+       ├─ Task 1: ALTER TABLE users ADD COLUMN email      (state: completed)
+       ├─ Task 2: ALTER TABLE orders ADD INDEX idx_status (state: running)
+       └─ Task 3: CREATE TABLE audit_log                  (state: pending)
 ```
+
+Targets that fan out wider — multiple deployments, or sharded keyspaces where
+each shard's work is its own operation — create parallel operation rows under
+the same apply. Each is claimed by whichever driver gets there first (on the
+same pod or different ones) and drives independently; the apply's state is
+derived from all of them. See [Apply Lifecycle](apply-lifecycle.md) for the
+full record tree and how it behaves during recovery.
 
 ### Progress Flow And Observers
 
@@ -663,6 +684,8 @@ In a multi-pod deployment, every SchemaBot pod runs its own operator. Each opera
 
 The storage arrows represent operator coordination. The GitHub arrows represent optional observer notifications; CLI applies simply run without an observer.
 
+**An idle SchemaBot is never query-idle.** Polling is how drivers find work: every pod's drivers scan storage on each poll tick — claim queries with `FOR UPDATE SKIP LOCKED`, plus pending-stop and ordered-cutover precedence checks — whether or not any applies exist. The result is a steady baseline of query traffic against the storage database that scales with pods × drivers, even when no schema change is running. This is expected claim-loop traffic, not a leak or a stuck apply. To check whether a deployment is actually busy, look for non-terminal applies (`schemabot status`) rather than storage query volume. If the idle baseline ever matters, replica count and `drivers` are the knobs.
+
 A **claim** is an atomic storage operation: it selects one apply that needs work,
 refreshes its `updated_at` heartbeat, and rotates an apply lease token in the
 same transaction. The heartbeat timestamp decides when another driver may try to
@@ -710,6 +733,8 @@ Claims use `FOR UPDATE SKIP LOCKED` so multiple operator drivers can run concurr
 
 A running apply becomes claimable after its heartbeat has been stale for more than one minute and it is in a state that can be resumed from persisted metadata. Terminal applies are already done, and stopped applies are not auto-resumed; the user must call `schemabot start`.
 
+The staleness window covers unclean kills. When a process shuts down cleanly it brings its in-process engines down first — releasing each target's lock — and then hands its claims back explicitly, so the work is claimable on the next poll rather than after the window. Claims whose engine did not come down are the exception: they are left to go stale, because a driver handed a target this process still holds the lock on would only be refused.
+
 Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the operator. The wake path is only a latency optimization: it nudges one driver to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the operator is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
 
 ```
@@ -722,13 +747,13 @@ store pending apply + tasks
 best-effort operator wake
       |
       v
-driver calls FindNextApply()
+driver calls FindNextApplyOperation()
       |
       v
-claim row + refresh heartbeat
+claim operation row + parent apply lease
       |
       v
-TernClient.ResumeApply()
+TernClient.ResumeApplyOperation()
       |
       v
 dispatch through LocalClient or GRPCClient
@@ -760,7 +785,7 @@ Operations that support instant DDL include:
 - Modifying ENUM/SET column definitions
 - Adding or dropping a virtual generated column
 
-Note: some instant operations (e.g., dropping a column) are also flagged as unsafe since they cause data loss. Instant DDL is skipped when `--defer-cutover` or `--enable-revert` is set, since those require the full online DDL flow for cutover and revert control.
+Note: instant DDL completes immediately and leaves no revert window, so eligibility alone does not decide the path. An instant-eligible change deploys with a row copy instead when the change is unsafe in Spirit's vocabulary (e.g., dropping a column or partition — the row copy keeps a revert window open to undo the change) or when `--defer-cutover` is set (an instant deploy swaps the schema as soon as it runs, leaving the deferred cutover with nothing to hold).
 
 **Spirit (MySQL) — Sequential** (default):
 - Each task runs independently: instant DDL or copy rows → cutover → next task
@@ -795,7 +820,7 @@ Task 3 → engine.Apply(DDL 3)        → waits for cutover
 
 Each DDL becomes a separate Vitess migration with its own `migration_uuid`, visible in `SHOW VITESS_MIGRATIONS`. DDL tasks in SchemaBot map 1:1 with migration UUIDs — one task per DDL. DDLs run sequentially, but within a single DDL, all shards run in parallel. Per-shard progress is surfaced in the Progress API but not stored — only aggregated per-task progress is persisted.
 
-VSchema updates are tracked as VSchema task rows in the regular `tasks` table (one per changed keyspace), not a separate table. A deploy can be DDL-only, VSchema-only, or both.
+VSchema updates are never modelled as task rows — a task row represents table work, and a VSchema change touches no table. The changed keyspaces are read from the plan, and the work operation that carries a VSchema-only change has no tasks at all, so its drive owns its state directly instead of having it derived from tasks. A deploy can be DDL-only, VSchema-only, or both.
 
 | Flags | Behavior |
 |---|---|
@@ -936,3 +961,5 @@ The engine is a stateless executor. It diffs schemas, executes DDL, and reports 
 ## State Machine
 
 See [pkg/state/README.md](../pkg/state/README.md) for the full state machine documentation, including apply states, task states, and how engine states map to SchemaBot states.
+
+For an operator- and agent-facing guide to the apply lifecycle — the record tree, active vs terminal states, the retry budget for transient failures, and how to recover from a failed apply — see [Apply Lifecycle](apply-lifecycle.md).

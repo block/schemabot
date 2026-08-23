@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -47,16 +48,24 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 
 // completePendingRequestsForTerminalApply completes the pending control
 // requests that a terminal apply moots: a pending stop is settled (the apply
-// can no longer be stopped), and a pending revert or skip-revert can no longer
-// act because the revert window is gone. Sweeping all three keeps a request
-// issued moments before the apply settled — or one that lost to a contradictory
-// command — from lingering pending forever.
+// can no longer be stopped), a pending revert or skip-revert can no longer
+// act because the revert window is gone, and a pending volume adjustment has
+// no running copy left to retune. A pending cancel is mooted by every terminal
+// state except stopped — a stopped apply remains cancellable, so its pending
+// cancel stays deliverable for the next drive. Sweeping the mooted requests
+// keeps a request issued moments before the apply settled — or one that lost
+// to a contradictory command — from lingering pending forever.
 func completePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	for _, op := range []storage.ControlOperation{
+	ops := []storage.ControlOperation{
 		storage.ControlOperationStop,
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
-	} {
+		storage.ControlOperationVolume,
+	}
+	if !state.IsState(apply.State, state.Apply.Stopped) {
+		ops = append(ops, storage.ControlOperationCancel)
+	}
+	for _, op := range ops {
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}
@@ -68,10 +77,19 @@ func completePendingRequestsForTerminalApply(ctx context.Context, store storage.
 // operation terminally failed. A failed request is no longer pending, so the
 // operator-owned retry loop stops re-running the operation instead of spinning
 // on a permanent rejection.
-func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string) error {
+//
+// The stored message is rewritten for the operator before it is persisted, so a
+// rejection reads the same whether it arrived on the API's immediate attempt or
+// on this retry — the durable record must not spell the schema change
+// differently depending on which path reached the data plane. remoteIDs are the
+// remote identifiers the caller addressed; a remote caller passes the id it sent
+// the RPC to, and a local caller passes none because its identifiers are already
+// operator-facing.
+func failPendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation, errorMessage string, remoteIDs ...string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
+	errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
 	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, operation); err != nil {
 		return err
 	}
@@ -85,8 +103,8 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 	return nil
 }
 
-func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) error {
-	if !state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.Running) {
+func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, logger *slog.Logger) error {
+	if !state.IsState(apply.State, state.Apply.WaitingForCutover) && !state.IsRunningApplyState(apply.State) {
 		return nil
 	}
 	if store == nil {
@@ -100,6 +118,16 @@ func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.St
 	now := time.Now()
 	apply.State = state.Apply.CuttingOver
 	apply.UpdatedAt = now
+	// A multi-operation drive owns only its operation: the parent cutting_over
+	// write is the operator's projection to make — a direct write here fails
+	// closed under the operation-only lease and would block a cutover the
+	// engine is ready to accept. The in-memory transition still stands so this
+	// drive proceeds to dispatch the cutover.
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("pending cutover request accepted under operation lease; parent cutting_over state is the operator's projection",
+			"state", apply.State)
+		return nil
+	}
 	if err := applyStore.Update(ctx, apply); err != nil {
 		*apply = previous
 		return fmt.Errorf("mark apply %s cutting over for pending cutover request: %w", apply.ApplyIdentifier, err)
@@ -111,7 +139,7 @@ func applyReadyForCutoverRequest(ctx context.Context, store storage.Storage, app
 	if state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.CuttingOver) {
 		return true, nil
 	}
-	if !state.IsState(apply.State, state.Apply.Running) {
+	if !state.IsRunningApplyState(apply.State) {
 		return false, nil
 	}
 	if store == nil {
@@ -161,21 +189,27 @@ func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storag
 	return nil
 }
 
-func completePendingStopIfStoredApplyResolved(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
+// completePendingRequestIfStoredApplyResolved reloads the apply and, when its
+// stored state is terminal, completes the operation's pending control requests
+// and refreshes the caller's copy of the apply. It returns false without error
+// when the stored apply has not resolved yet — the caller decides whether that
+// means the request stays pending (a settle deferred to the apply-state
+// projection) or the consumption failed.
+func completePendingRequestIfStoredApplyResolved(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
 	if store == nil {
 		return false, fmt.Errorf("storage is not available")
 	}
 	storedApply, err := store.Applies().Get(ctx, apply.ID)
 	if err != nil {
-		return false, fmt.Errorf("load apply %s before completing pending stop: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("load apply %s before completing pending %s: %w", apply.ApplyIdentifier, operation, err)
 	}
 	if storedApply == nil {
-		return false, fmt.Errorf("load apply %s before completing pending stop: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+		return false, fmt.Errorf("load apply %s before completing pending %s: %w", apply.ApplyIdentifier, operation, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(storedApply.State) {
 		return false, nil
 	}
-	if err := completePendingControlRequests(ctx, store, storedApply, storage.ControlOperationStop); err != nil {
+	if err := completePendingControlRequests(ctx, store, storedApply, operation); err != nil {
 		return false, err
 	}
 	*apply = *storedApply
@@ -189,9 +223,18 @@ func controlRequestCaller(req *storage.ApplyControlRequest) string {
 	return req.RequestedBy
 }
 
-func callerApplyLogSuffix(caller string) string {
+// controlRequestRequester names the requester to record on a durable control
+// request. An empty caller means the command reached this plane without an
+// operator identity — an internal resume, or a plane that predates the caller
+// field — so the row names the path it arrived on rather than inventing a
+// person.
+func controlRequestRequester(caller string) string {
 	if caller == "" {
-		caller = "unknown"
+		return storage.ForwardingControlRequestCaller
 	}
-	return fmt.Sprintf(" (caller: %s)", caller)
+	return caller
+}
+
+func callerApplyLogSuffix(caller string) string {
+	return fmt.Sprintf(" (caller: %s)", storage.ApplyLogCaller(caller))
 }

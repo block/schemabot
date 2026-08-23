@@ -13,6 +13,10 @@ var (
 	// ErrLockNotOwned is returned when attempting to release a lock not owned by caller.
 	ErrLockNotOwned = errors.New("lock not owned by caller")
 
+	// ErrLockIntentChanged is returned when an apply's captured lock owner or
+	// pending plan no longer matches at durable apply creation time.
+	ErrLockIntentChanged = errors.New("lock intent changed")
+
 	// ErrCheckNotFound is returned when a check does not exist.
 	ErrCheckNotFound = errors.New("check not found")
 
@@ -29,8 +33,10 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
-	// ErrApplyNotReappliable is returned when a failed apply cannot be reapplied.
-	ErrApplyNotReappliable = errors.New("apply is not reappliable")
+	// ErrApplyNotActive is returned when a write requires the apply to still be
+	// active (non-terminal) and it is not — e.g. attaching a new operation to
+	// an apply no drive will pick up again.
+	ErrApplyNotActive = errors.New("apply is not active")
 
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
@@ -52,10 +58,23 @@ var (
 	// row does not exist for the given lookup key.
 	ErrApplyOperationNotFound = errors.New("apply operation not found")
 
+	// ErrRemoteApplyDeploymentIDConflict is returned when storing a remote
+	// apply id would correlate one deployment to more than one remote
+	// data-plane apply — either the deployment's operations already disagree
+	// with each other, or the id being stored disagrees with the one they
+	// share. Callers must fail closed rather than pick one.
+	ErrRemoteApplyDeploymentIDConflict = errors.New("deployment already correlates to a different remote apply")
+
 	// ErrApplyOperationExists is returned when an apply_operations row for
 	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")
 
 	// ErrEngineResumeStateNotFound is returned when no opaque engine resume state exists for an operation.
 	ErrEngineResumeStateNotFound = errors.New("engine resume state not found")
+
+	// ErrWebhookEventNotFound is returned when a durable webhook event does not exist.
+	ErrWebhookEventNotFound = errors.New("webhook event not found")
+
+	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
+	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
 )

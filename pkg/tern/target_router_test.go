@@ -80,9 +80,11 @@ type targetRouterRecordingClient struct {
 	planDiffReq        *ternv1.PlanRequest
 	applyReq           *ternv1.ApplyRequest
 	progressReq        *ternv1.ProgressRequest
+	logsReq            *ternv1.LogsRequest
 	resumeApply        *storage.Apply
 	targetDSN          string
 	targetMetadata     map[string]string
+	schemaOverrides    map[string]string
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
@@ -111,6 +113,10 @@ func (c *targetRouterRecordingClient) Apply(_ context.Context, req *ternv1.Apply
 func (c *targetRouterRecordingClient) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	c.progressReq = req
 	return &ternv1.ProgressResponse{ApplyId: req.ApplyId}, nil
+}
+func (c *targetRouterRecordingClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	c.logsReq = req
+	return &ternv1.LogsResponse{ApplyId: req.ApplyId}, nil
 }
 
 func (c *targetRouterRecordingClient) Cutover(context.Context, *ternv1.CutoverRequest) (*ternv1.CutoverResponse, error) {
@@ -235,6 +241,24 @@ func TestTargetRouterRoutesPlanDiffThroughStaticTarget(t *testing.T) {
 	assert.Equal(t, storage.DatabaseTypeMySQL, client.planDiffReq.Type)
 	assert.Equal(t, "dsid-orders-prod", client.planDiffReq.Target)
 	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
+}
+
+func TestTargetRouterRoutesLogsThroughExplicitTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err := router.Logs(t.Context(), nil)
+	require.EqualError(t, err, "logs request is required")
+
+	req := &ternv1.LogsRequest{ApplyId: "apply-remote", Database: "orders-logical", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod", Limit: 25}
+	resp, err := router.Logs(t.Context(), req)
+
+	require.NoError(t, err)
+	assert.Equal(t, "apply-remote", resp.ApplyId)
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	assert.Same(t, req, client.logsReq)
 }
 
 func TestTargetRouterApplyUsesTargetScopedPendingObserver(t *testing.T) {
@@ -391,6 +415,70 @@ func TestTargetRouterApplyRoutesByPlanTargetWhenRequestOmitsTarget(t *testing.T)
 	assert.Equal(t, "production", client.applyReq.Environment)
 }
 
+// A dispatched apply for a non-primary deployment references a plan created on
+// the primary deployment's Tern, so no local plan row exists. When the request
+// carries the plan's authoritative DDL changes and schema files, routing must
+// proceed on the request's own route fields so the deployment-local client can
+// materialize the plan, rather than rejecting the dispatch.
+func TestTargetRouterApplyRoutesMissingPlanWithMaterializationPayload(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	planStore := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{}}
+	router := newTargetRouterForTest(t, resolver, nil, planStore, created)
+
+	resp, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-7",
+		Database:    "orders",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace: "orders",
+			TableName: "customers",
+			Ddl:       "ALTER TABLE `customers` ADD COLUMN `region_code` CHAR(2) NULL",
+		}},
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"orders": {Files: map[string]string{"customers.sql": "CREATE TABLE `customers` (`id` BIGINT UNSIGNED)"}},
+		},
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	client := created["orders"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.applyReq)
+	assert.Equal(t, "plan-7", client.applyReq.PlanId)
+	assert.Equal(t, "orders", client.applyReq.Database)
+	assert.Equal(t, "dsid-orders-prod", client.applyReq.Target)
+	assert.Equal(t, "dsid-orders-prod", client.applyReq.Options["target"])
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.applyReq.Type)
+	assert.Equal(t, "production", client.applyReq.Environment)
+	assert.Len(t, client.applyReq.DdlChanges, 1, "the routed request must keep the DDL changes for materialization")
+	assert.Len(t, client.applyReq.SchemaFiles, 1, "the routed request must keep the schema files for materialization")
+}
+
+// A request for a plan that exists nowhere and carries nothing to materialize
+// it from — a stale apply, or a local-mode apply for a plan that was never
+// stored here — must fail closed rather than route on unverifiable fields.
+func TestTargetRouterApplyFailsClosedOnMissingPlanWithoutPayload(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	planStore := targetRouterPlanStore{byIdentifier: map[string]*storage.Plan{}}
+	router := newTargetRouterForTest(t, resolver, nil, planStore, created)
+
+	_, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      "plan-7",
+		Database:    "orders",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `plan "plan-7" not found for apply target routing`)
+	assert.Empty(t, created, "no client should be created when the plan is missing and there is nothing to materialize")
+}
+
 // The plan is authoritative: a request that supplies a Target contradicting the
 // stored plan target must fail closed rather than silently override the
 // plan-time route.
@@ -502,6 +590,33 @@ func TestTargetRouterCloseClosesCachedClients(t *testing.T) {
 	assert.True(t, created["orders"].closed)
 }
 
+// A resolved target's schema overrides must reach the LocalClient config so
+// the data-plane seam can map the canonical namespace to the physical schema.
+func TestTargetRouterPropagatesSchemaOverridesToLocalConfig(t *testing.T) {
+	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
+		"eu-bikeshare-qa": {
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			DSN:             "root@tcp(localhost:3306)/",
+			SchemaOverrides: map[string]string{"bikeshare": "bikeshare_eu_qa"},
+		},
+	}})
+	require.NoError(t, err)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	_, err = router.Plan(t.Context(), &ternv1.PlanRequest{
+		Database:    "bikeshare",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "development",
+		Target:      "eu-bikeshare-qa",
+	})
+
+	require.NoError(t, err)
+	client := created["bikeshare"]
+	require.NotNil(t, client)
+	assert.Equal(t, map[string]string{"bikeshare": "bikeshare_eu_qa"}, client.schemaOverrides)
+}
+
 func newStaticResolver(t *testing.T) *inventory.StaticResolver {
 	t.Helper()
 	resolver, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{
@@ -525,7 +640,7 @@ func newTargetRouterForTest(t *testing.T, resolver inventory.Resolver, applyStor
 		Storage:  targetRouterStorage{applies: applyStore, plans: planStore},
 		Logger:   slog.Default(),
 		LocalClientFactory: func(cfg LocalConfig, _ storage.Storage, _ *slog.Logger) (Client, error) {
-			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata}
+			client := &targetRouterRecordingClient{targetDSN: cfg.TargetDSN, targetMetadata: cfg.Metadata, schemaOverrides: cfg.SchemaOverrides}
 			key := cfg.Database
 			if existing := created[key]; existing != nil {
 				key = fmt.Sprintf("%s#%d", cfg.Database, len(created)+1)

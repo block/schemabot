@@ -23,7 +23,7 @@ func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚠️ **Lint Warnings**:", "the plan comment surfaces lint for review")
+	assert.Contains(t, plan, "💡 **Lint Warnings**:", "the plan comment surfaces lint for review")
 	assert.Contains(t, plan, "Column added without DEFAULT value")
 
 	data.IsLocked = true
@@ -175,4 +175,61 @@ func TestRenderPlanComment_UnsafeShardChangeShowsShard(t *testing.T) {
 	assert.Contains(t, out, "**Issues**: **1** unsafe change detected")
 	assert.Contains(t, out, "`mutes` (shard `40-80`)", "the unsafe change names the shard it applies to")
 	assert.Contains(t, out, "DROP COLUMN `x`", "the drop is shown in that shard's combined ALTER")
+}
+
+// Plan errors can carry raw engine text with internal endpoints and newlines.
+// Each rendered error bullet must redact endpoints and stay on one Markdown
+// line so an error cannot escape its list item.
+func TestRenderPlanComment_ErrorsSanitized(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{"dial tcp db-primary.internal:3306: refused\nsecond line"},
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "- dial tcp [endpoint redacted]: refused second line\n",
+		"the error bullet stays on one line")
+}
+
+// An error entry that sanitizes to nothing renders no bullet, and a plan whose
+// errors all sanitize to nothing renders no Errors section at all.
+func TestRenderPlanComment_EmptyErrorsRenderNothing(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{" \n\t ", "real failure"},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "- real failure\n")
+	assert.NotContains(t, out, "- \n", "a whitespace-only error renders no bullet")
+
+	data.Errors = []string{" \n\t "}
+	out = RenderPlanComment(data)
+	assert.NotContains(t, out, "**Errors**:", "an all-empty errors list renders no section")
+}
+
+// HTML in an error is escaped after sanitization, so a message quoting markup
+// (e.g. a parse error echoing a <details> tag) renders as text instead of
+// folding the rest of the comment into an unlabeled collapse.
+func TestRenderPlanComment_ErrorsEscapeHTML(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		Errors: []string{"read <nil> & retry"},
+	})
+
+	assert.Contains(t, out, "- read &lt;nil&gt; &amp; retry\n",
+		"HTML metacharacters are escaped after sanitization")
+	assert.NotContains(t, out, "<nil>")
 }

@@ -21,7 +21,17 @@ type SchemaRequestResult struct {
 	Repository   string
 	PullRequest  int
 	SchemaPath   string
-	HeadSHA      string // Commit SHA used to fetch schema files
+	// SchemaLinkPath is the logical environment path when SchemaPath was
+	// resolved through a symlink. Base-freshness checks compare both the link
+	// object and its target so retargeting the environment cannot go unnoticed.
+	SchemaLinkPath string
+	HeadSHA        string // Commit SHA used to fetch schema files
+	// IgnoredNamespaces lists the namespaces that were actually removed from
+	// SchemaFiles by the config's ignore_namespaces, resolved for the
+	// environment and sorted. Surfaces the exclusion on the PR (plan comment)
+	// and travels with the plan request so the data plane can refuse engine
+	// shapes that cannot honor it.
+	IgnoredNamespaces []string
 }
 
 // EnvironmentValidator verifies that a discovered database can be used with
@@ -46,6 +56,14 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	if err != nil {
 		return nil, err
 	}
+	return ic.CreateSchemaRequestForConfig(ctx, repo, pr, environment, config, configDir, validateEnvironment)
+}
+
+// CreateSchemaRequestForConfig fetches schema files and builds a plan request
+// for a config the caller has already discovered and selected — for example
+// after filtering a multi-config discovery result down to the one config this
+// deployment manages.
+func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, repo string, pr int, environment string, config *SchemabotConfig, configDir string, validateEnvironment EnvironmentValidator) (*SchemaRequestResult, error) {
 	if validateEnvironment != nil {
 		if err := validateEnvironment(config.Database, environment); err != nil {
 			return nil, err
@@ -57,7 +75,7 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	if err != nil {
 		return nil, fmt.Errorf("fetch PR info: %w", err)
 	}
-	schemaRoot, err := ic.resolveSchemaRootForEnvironment(ctx, repo, prInfo.HeadSHA, configDir, environment)
+	schemaRoot, schemaLinkPath, err := ic.resolveSchemaRootForEnvironment(ctx, repo, prInfo.HeadSHA, configDir, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -69,60 +87,79 @@ func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, rep
 	}
 
 	// Group files by keyspace/namespace
-	schemaFiles, err := groupFilesByNamespace(files, schemaRoot, environment)
+	schemaFiles, ignoredNamespaces, err := groupFilesByNamespace(files, schemaRoot, environment, config.IgnoreNamespaces)
 	if err != nil {
 		return nil, err
 	}
+	if len(ignoredNamespaces) > 0 {
+		ic.logger.Info("excluding ignored namespaces from schema request",
+			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
+			"schema_root", schemaRoot, "ignored_namespaces", ignoredNamespaces)
+	}
+	// A configured entry that removed nothing is a typo, a case mismatch, or a
+	// stale entry for a deleted directory — the namespace it names is being
+	// fully reconciled, so surface it rather than letting the config imply an
+	// exclusion that is not happening.
+	if unmatched := schema.UnmatchedIgnoreEntries(config.IgnoreNamespaces, environment, ignoredNamespaces); len(unmatched) > 0 {
+		ic.logger.Warn("ignore_namespaces entries matched no namespace and excluded nothing",
+			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
+			"schema_root", schemaRoot, "unmatched_entries", unmatched)
+	}
 	if len(schemaFiles) == 0 {
+		if len(ignoredNamespaces) > 0 {
+			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)
+		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}
 
 	return &SchemaRequestResult{
-		Database:    config.Database,
-		Type:        string(config.GetType()),
-		SchemaFiles: schemaFiles,
-		Repository:  repo,
-		PullRequest: pr,
-		SchemaPath:  schemaRoot,
-		HeadSHA:     prInfo.HeadSHA,
+		Database:          config.Database,
+		Type:              string(config.GetType()),
+		SchemaFiles:       schemaFiles,
+		Repository:        repo,
+		PullRequest:       pr,
+		SchemaPath:        schemaRoot,
+		SchemaLinkPath:    schemaLinkPath,
+		HeadSHA:           prInfo.HeadSHA,
+		IgnoredNamespaces: ignoredNamespaces,
 	}, nil
 }
 
-func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (string, error) {
+func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {
 	if environment == "" {
-		return configDir, nil
+		return configDir, "", nil
 	}
 	if err := validateEnvironmentPathSegment(environment); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	candidate := path.Join(configDir, environment)
 	content, directoryContent, err := ic.fetchRepositoryContents(ctx, repo, candidate, ref)
 	if err != nil {
 		if IsNotFoundError(err) {
-			return configDir, nil
+			return configDir, "", nil
 		}
-		return "", fmt.Errorf("resolve schema root for environment %s at %s: %w", environment, candidate, err)
+		return "", "", fmt.Errorf("resolve schema root for environment %s at %s: %w", environment, candidate, err)
 	}
 	if directoryContent != nil {
-		return candidate, nil
+		return candidate, "", nil
 	}
 	if content == nil || content.GetType() != "symlink" {
-		return "", fmt.Errorf("environment schema root %s in repo %s ref %s is not a directory or symlink", candidate, repo, ref)
+		return "", "", fmt.Errorf("environment schema root %s in repo %s ref %s is not a directory or symlink", candidate, repo, ref)
 	}
 
 	resolved, err := resolveSchemaRootSymlinkTarget(configDir, candidate, content.GetTarget())
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	resolvedContent, resolvedDirectoryContent, err := ic.fetchRepositoryContents(ctx, repo, resolved, ref)
 	if err != nil {
-		return "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
+		return "", "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
 	}
 	if resolvedContent != nil || resolvedDirectoryContent == nil {
-		return "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
+		return "", "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
 	}
-	return resolved, nil
+	return resolved, candidate, nil
 }
 
 func validateEnvironmentPathSegment(environment string) error {
@@ -170,7 +207,9 @@ func schemaPathWithinDirectory(directory, candidate string) bool {
 // Files in namespace subdirectories (schema/namespace/table.sql) use the
 // subdirectory name as the namespace. Flat files (schema/table.sql) use the
 // schema directory name as the namespace (the MySQL database name).
-func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (map[string]*ternv1.SchemaFiles, error) {
+// Namespaces listed in ignoreNamespaces are excluded from the result; the
+// second return value lists the namespace keys actually removed, sorted.
+func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string, ignoreNamespaces []string) (map[string]*ternv1.SchemaFiles, []string, error) {
 	// Build relativePath → content map for the shared helper.
 	// file.Path is the full path (e.g., "schema/payments/transactions.sql"),
 	// so trimming schemaPath+"/" gives the relative path ("payments/transactions.sql"
@@ -180,14 +219,14 @@ func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (
 	for _, file := range files {
 		relPath, ok := strings.CutPrefix(file.Path, prefix)
 		if !ok {
-			return nil, fmt.Errorf("file path %q does not start with schema path %q", file.Path, prefix)
+			return nil, nil, fmt.Errorf("file path %q does not start with schema path %q", file.Path, prefix)
 		}
 		rawFiles[relPath] = file.Content
 	}
 
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment)
+	grouped, removed, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment, ignoreNamespaces)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Convert schema.SchemaFiles → ternv1.SchemaFiles
@@ -195,5 +234,5 @@ func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (
 	for ns, nsFiles := range grouped {
 		result[ns] = &ternv1.SchemaFiles{Files: nsFiles.Files}
 	}
-	return result, nil
+	return result, removed, nil
 }

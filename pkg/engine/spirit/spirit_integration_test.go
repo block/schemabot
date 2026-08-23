@@ -10,12 +10,15 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	spiritmigration "github.com/block/spirit/pkg/migration"
+	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -26,7 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 
-	_ "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/go-sql-driver/mysql"
 )
 
 // Shared test infrastructure
@@ -35,10 +38,47 @@ var (
 	sharedContainer testcontainers.Container
 )
 
+// copyProgressPollDeadline bounds the wait for a table copy to get underway.
+// Tests that act on a schema change mid-copy need the copy observably in
+// flight, so one that never starts is a failed test rather than one that waits
+// indefinitely.
+const copyProgressPollDeadline = 30 * time.Second
+
+// waitForCopyProgress blocks until the schema change reports at least
+// wantRowsCopied rows copied, returning how many had been copied. It fails
+// rather than returning early: an operation that lands before the copy is
+// underway exercises none of the mid-copy behavior its caller asserts on.
+func waitForCopyProgress(t *testing.T, eng *Engine, wantRowsCopied int64) int64 {
+	t.Helper()
+
+	deadline := time.Now().Add(copyProgressPollDeadline)
+	for time.Now().Before(deadline) {
+		progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+		require.NoError(t, err, "Progress()")
+		require.NotEqual(t, engine.StateFailed, progress.State,
+			"the schema change failed before its copy could be observed: %s", progress.ErrorMessage)
+		require.NotEqual(t, engine.StateCompleted, progress.State,
+			"the copy finished before it could be acted on; seed more rows so it stays in flight")
+
+		if len(progress.Tables) > 0 && progress.Tables[0].RowsCopied >= wantRowsCopied {
+			return progress.Tables[0].RowsCopied
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	t.Fatalf("copy did not reach %d rows within %s", wantRowsCopied, copyProgressPollDeadline)
+	return 0
+}
+
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	// Start shared MySQL container
+	// Start shared MySQL container. The MySQL entrypoint runs a throwaway
+	// init server that also logs "ready for connections" and binds nothing
+	// on TCP, so log- and port-based waits can be satisfied before the
+	// final server accepts clients. Gate readiness on a real query through
+	// the mapped port instead — the same handshake the tests themselves
+	// perform.
 	req := testcontainers.ContainerRequest{
 		Image:        "mysql:8.0",
 		ExposedPorts: []string{"3306/tcp"},
@@ -46,10 +86,9 @@ func TestMain(m *testing.M) {
 			"MYSQL_ROOT_PASSWORD": "testpassword",
 			"MYSQL_DATABASE":      "testdb",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
+		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
+			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
+		}).WithStartupTimeout(30 * time.Second),
 	}
 
 	var err error
@@ -71,25 +110,6 @@ func TestMain(m *testing.M) {
 		log.Fatalf("get container port: %v", err)
 	}
 	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true&multiStatements=true", host, port)
-
-	// Wait for MySQL to be ready
-	var db *sql.DB
-	for range 30 {
-		db, err = sql.Open("mysql", sharedDSN)
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if err = db.PingContext(ctx); err == nil {
-			_ = db.Close()
-			break
-		}
-		_ = db.Close()
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("connect to mysql: %v", err)
-	}
 
 	code := m.Run()
 
@@ -279,6 +299,305 @@ func TestEngine_Plan_DropTable(t *testing.T) {
 	assert.True(t, result.HasErrors(), "Spirit unsafe drop lint should remain the blocking gate")
 	_, err = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `legacy_users`")
 	require.NoError(t, err, "drop table")
+}
+
+// A desired schema that swaps a table's primary key diffs to a DROP PRIMARY KEY,
+// one that introduces a referential constraint diffs to an ADD FOREIGN KEY, and
+// one that reorders an ENUM's values diffs to a MODIFY COLUMN — all statements
+// Spirit deterministically refuses at apply time. The plan carries the
+// execution-mode verdict on those changes — mode "blocked" with the engine's
+// reason — so the operator learns at plan time that the apply will fail, while
+// an ordinary change in the same plan stays on the engine's default path.
+//
+// The ENUM case is the one the engine can only judge against the table's current
+// column types, so it also proves the plan supplies the engine with the current
+// definition, not just the statement.
+func TestEngine_Plan_ExecutionVerdictBlocked(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		for _, table := range []string{"orders", "accounts", "notes", "shipments"} {
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			assert.NoError(t, err, "drop table %s", table)
+		}
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE accounts (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create accounts table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE notes (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create notes table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL AUTO_INCREMENT,
+		note_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create orders table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE shipments (
+		id INT NOT NULL AUTO_INCREMENT,
+		status ENUM('new','shipped','done') NOT NULL DEFAULT 'new',
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create shipments table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"accounts.sql": `CREATE TABLE accounts (
+				id INT NOT NULL AUTO_INCREMENT,
+				tenant_id INT NOT NULL,
+				PRIMARY KEY (id, tenant_id)
+			)`,
+			"notes.sql": `CREATE TABLE notes (
+				id INT NOT NULL AUTO_INCREMENT,
+				body TEXT,
+				PRIMARY KEY (id)
+			)`,
+			"orders.sql": `CREATE TABLE orders (
+				id INT NOT NULL AUTO_INCREMENT,
+				note_id INT NOT NULL,
+				PRIMARY KEY (id),
+				CONSTRAINT fk_orders_note FOREIGN KEY (note_id) REFERENCES notes (id)
+			)`,
+			"shipments.sql": `CREATE TABLE shipments (
+				id INT NOT NULL AUTO_INCREMENT,
+				status ENUM('shipped','new','done') NOT NULL DEFAULT 'new',
+				PRIMARY KEY (id)
+			)`,
+		}),
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+		},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges, "expected changes, got NoChanges")
+
+	verdicts := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		t.Logf("table %s: ddl=%s mode=%q reason=%q", tc.Table, tc.DDL, tc.ExecutionMode, tc.ModeReason)
+		verdicts[tc.Table] = tc
+	}
+
+	accounts, ok := verdicts["accounts"]
+	require.True(t, ok, "plan carries the accounts change")
+	assert.Contains(t, accounts.DDL, "DROP PRIMARY KEY")
+	assert.Equal(t, "blocked", accounts.ExecutionMode, "the refused statement carries the blocked verdict")
+	assert.Equal(t, "dropping primary key is not supported", accounts.ModeReason)
+
+	notes, ok := verdicts["notes"]
+	require.True(t, ok, "plan carries the notes change")
+	assert.Empty(t, notes.ExecutionMode, "an ordinary ADD COLUMN stays on the engine's default path")
+	assert.Empty(t, notes.ModeReason)
+
+	orders, ok := verdicts["orders"]
+	require.True(t, ok, "plan carries the orders change")
+	assert.Contains(t, orders.DDL, "FOREIGN KEY")
+	assert.Contains(t, orders.DDL, "fk_orders_note")
+	assert.Equal(t, "blocked", orders.ExecutionMode, "adding a foreign key carries the blocked verdict")
+	assert.Equal(t, "adding foreign key constraints is not supported", orders.ModeReason)
+
+	shipments, ok := verdicts["shipments"]
+	require.True(t, ok, "plan carries the shipments change")
+	assert.Contains(t, shipments.DDL, "MODIFY COLUMN")
+	assert.Contains(t, shipments.DDL, "status")
+	assert.Equal(t, "blocked", shipments.ExecutionMode, "reordering ENUM values carries the blocked verdict")
+	assert.Contains(t, shipments.ModeReason, `unsafe ENUM value reorder on column "status"`)
+}
+
+// The execution-mode verdict asks the engine which statements it refuses, so
+// this test proves the answer against the engine itself: every statement shape
+// the verdict classifies as blocked is handed to a real Spirit schema change,
+// which must refuse it with the very reason the verdict recorded. The engine
+// attempts MySQL's native DDL before its refusal checks run, so a shape the
+// native DDL can complete is not a refusal at all — an engine upgrade that
+// relaxes one of these checks, or moves it behind the native DDL, fails this
+// test rather than letting the plan claim an apply will fail when it succeeds.
+func TestEngine_SpiritRefusesVerdictBlockedStatements(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		for _, table := range []string{"verdict_orders", "verdict_refs"} {
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			assert.NoError(t, err, "drop table %s", table)
+		}
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE verdict_refs (
+		id INT NOT NULL AUTO_INCREMENT,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_refs table")
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE verdict_orders (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		ref_id INT NOT NULL,
+		status ENUM('new','shipped','done') NOT NULL DEFAULT 'new',
+		perms SET('read','write','execute') DEFAULT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_orders table")
+
+	// The engine's ENUM/SET refusals compare the statement against the table's
+	// current column types, which the plan and the apply-time routing both read
+	// from the target.
+	var tableName, currentCreateTable string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `verdict_orders`").Scan(&tableName, &currentCreateTable),
+		"show create table verdict_orders")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	tests := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "drop primary key",
+			stmt: "ALTER TABLE `verdict_orders` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+		},
+		{
+			name: "add foreign key",
+			stmt: "ALTER TABLE `verdict_orders` ADD CONSTRAINT `fk_verdict_ref` FOREIGN KEY (`ref_id`) REFERENCES `verdict_refs` (`id`)",
+		},
+		{
+			name: "explicit algorithm clause",
+			stmt: "ALTER TABLE `verdict_orders` ADD COLUMN `note` VARCHAR(64), ALGORITHM=INPLACE",
+		},
+		{
+			name: "explicit lock clause",
+			stmt: "ALTER TABLE `verdict_orders` ADD COLUMN `note` VARCHAR(64), LOCK=NONE",
+		},
+		{
+			name: "enum value reorder",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `status` ENUM('shipped','new','done') NOT NULL DEFAULT 'new'",
+		},
+		{
+			name: "enum value inserted in the middle",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `status` ENUM('new','pending','shipped','done') NOT NULL DEFAULT 'new'",
+		},
+		{
+			name: "set member reorder",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `perms` SET('write','read','execute')",
+		},
+		{
+			name: "enum to numeric conversion",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `status` INT NOT NULL DEFAULT 0",
+		},
+		{
+			name: "set to enum conversion",
+			stmt: "ALTER TABLE `verdict_orders` MODIFY COLUMN `perms` ENUM('read','write','execute')",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, discardLogger())
+			require.NoError(t, err, "StatementRefusal")
+			require.True(t, refused, "the verdict must classify this statement as blocked")
+			require.NotEmpty(t, reason)
+
+			runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
+				Host:      host,
+				Username:  username,
+				Password:  &password,
+				Database:  database,
+				Statement: tt.stmt,
+			})
+			require.NoError(t, err, "NewRunner")
+			defer utils.CloseAndLog(runner)
+
+			runCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			runErr := runner.Run(runCtx)
+			require.Error(t, runErr, "the engine must refuse a statement the verdict marked blocked")
+			assert.Contains(t, runErr.Error(), reason,
+				"the engine's refusal must carry the reason the verdict recorded")
+		})
+	}
+}
+
+// Statements the engine's own preflight checks refuse, but that MySQL's native
+// DDL — which the engine attempts first — can complete. The verdict must stay
+// silent on these: routing them to direct execution, or reporting that the apply
+// will fail, would both be wrong for a schema change the engine applies cleanly.
+func TestEngine_VerdictSilentOnNativeDDLStatements(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `verdict_fastpath`")
+		assert.NoError(t, err, "drop table verdict_fastpath")
+	})
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE verdict_fastpath (
+		id INT NOT NULL AUTO_INCREMENT,
+		email VARCHAR(255) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create verdict_fastpath table")
+
+	var tableName, currentCreateTable string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `verdict_fastpath`").Scan(&tableName, &currentCreateTable),
+		"show create table verdict_fastpath")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	tests := []struct {
+		name string
+		stmt string
+	}{
+		{
+			name: "drop and re-add the same column",
+			stmt: "ALTER TABLE `verdict_fastpath` DROP COLUMN `email`, ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+		{
+			name: "rename a column onto a freed name",
+			stmt: "ALTER TABLE `verdict_fastpath` RENAME COLUMN `email` TO `contact_email`, ADD COLUMN `email` VARCHAR(255) NOT NULL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, currentCreateTable, discardLogger())
+			require.NoError(t, err, "StatementRefusal")
+			assert.False(t, refused, "the verdict must not claim a refusal the native DDL path completes")
+			assert.Empty(t, reason)
+
+			runner, err := spiritmigration.NewRunner(&spiritmigration.Migration{
+				Host:      host,
+				Username:  username,
+				Password:  &password,
+				Database:  database,
+				Statement: tt.stmt,
+			})
+			require.NoError(t, err, "NewRunner")
+			defer utils.CloseAndLog(runner)
+
+			runCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			require.NoError(t, runner.Run(runCtx), "the engine must apply a statement the verdict left silent")
+
+			// Restore the starting shape so the next case sees the same table.
+			_, err = db.ExecContext(t.Context(), "DROP TABLE `verdict_fastpath`")
+			require.NoError(t, err, "drop verdict_fastpath")
+			_, err = db.ExecContext(t.Context(), `CREATE TABLE verdict_fastpath (
+				id INT NOT NULL AUTO_INCREMENT,
+				email VARCHAR(255) NOT NULL,
+				PRIMARY KEY (id)
+			)`)
+			require.NoError(t, err, "recreate verdict_fastpath")
+		})
+	}
 }
 
 func TestEngine_Plan_NoChanges(t *testing.T) {
@@ -552,23 +871,24 @@ func TestNew_Defaults(t *testing.T) {
 
 	assert.NotNil(t, eng.logger, "expected logger to be set")
 	assert.NotNil(t, eng.linter, "expected linter to be set")
-	assert.Equal(t, DefaultTargetChunkTime, eng.targetChunkTime)
 	assert.Equal(t, DefaultThreads, eng.threads)
 	assert.Equal(t, DefaultLockWaitTimeout, eng.lockWaitTimeout)
+	// Pin the literal value so a change to the constant itself is caught here,
+	// not just propagation from Config into the engine.
+	assert.Equal(t, 10*time.Second, eng.lockWaitTimeout)
 }
 
 func TestNew_CustomConfig(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	eng := New(Config{
 		Logger:          logger,
-		TargetChunkTime: DefaultTargetChunkTime * 2,
 		Threads:         8,
 		LockWaitTimeout: DefaultLockWaitTimeout * 2,
 	})
 
 	assert.Equal(t, logger, eng.logger, "expected custom logger")
-	assert.Equal(t, DefaultTargetChunkTime*2, eng.targetChunkTime)
 	assert.Equal(t, 8, eng.threads)
+	assert.Equal(t, DefaultLockWaitTimeout*2, eng.lockWaitTimeout, "expected custom lock wait timeout to override the default")
 }
 
 func TestSetSchemaChangeCompleted(t *testing.T) {
@@ -989,7 +1309,7 @@ func TestEngine_ExecuteMigration_AddColumn(t *testing.T) {
 	eng.mu.Unlock()
 
 	// Execute the schema change synchronously for testing
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	// Check that schema change completed
 	eng.mu.Lock()
@@ -1054,7 +1374,7 @@ func TestEngine_ExecuteMigration_ModifyColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1110,7 +1430,7 @@ func TestEngine_ExecuteMigration_DropColumn(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1167,7 +1487,7 @@ func TestEngine_ExecuteMigration_AddIndex(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1216,7 +1536,7 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1258,7 +1578,7 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false)
+		eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false, directPolicy{})
 	}()
 
 	deadline := time.NewTimer(30 * time.Second)
@@ -1335,7 +1655,7 @@ func TestEngine_ExecuteMigration_MultipleStatements(t *testing.T) {
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1421,7 +1741,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false)
+		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false, directPolicy{})
 
 		eng.mu.Lock()
 		createState := eng.runningSchemaChange.state
@@ -1446,7 +1766,7 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 		}
 		eng.mu.Unlock()
 
-		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{dropDDL}, false)
+		eng.executeSchemaChange(t.Context(), host, username, password, database, []string{dropDDL}, false, directPolicy{})
 
 		eng.mu.Lock()
 		dropState := eng.runningSchemaChange.state
@@ -1473,6 +1793,63 @@ func TestEngine_ExecuteMigration_SingleStatementReleasesConnections(t *testing.T
 	assert.LessOrEqual(t, settled, baseline+5,
 		"server connections grew far beyond baseline after %d single-statement applies (baseline=%d, settled=%d)",
 		iterations*2, baseline, settled)
+}
+
+// TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs runs a CREATE
+// TABLE through Spirit's single-statement path with the engine's log callback
+// registered. Spirit's INFO log lines for the run are routed through the
+// callback — the same path that feeds operator-visible apply logs — so
+// single-statement applies (CREATE/DROP/RENAME) are traceable in the apply
+// log stream just like ALTERs.
+func TestEngine_ExecuteSchemaChange_SingleStatementRoutesSpiritLogs(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	var mu sync.Mutex
+	var captured []string
+	capturedTables := make(map[string]bool)
+	eng.SetLogCallback(func(level slog.Level, table, msg string) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, msg)
+		capturedTables[table] = true
+	})
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	createDDL := "CREATE TABLE `log_routed` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{
+		database: database,
+		tables:   []string{"log_routed"},
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	}
+	eng.mu.Unlock()
+
+	eng.executeSchemaChange(t.Context(), host, username, password, database, []string{createDDL}, false, directPolicy{})
+
+	eng.mu.Lock()
+	finalState := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	require.Equal(t, engine.StateCompleted, finalState, "CREATE TABLE did not complete")
+	require.True(t, tableExists(t, db, "log_routed"), "expected log_routed to exist after CREATE")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Contains(t, captured, "Starting spirit migration",
+		"Spirit's run-start log line was not routed through the engine log callback")
+	assert.Contains(t, captured, "apply complete",
+		"Spirit's completion log line was not routed through the engine log callback")
+	// Every routed line must carry the table so operators can attribute
+	// interleaved log lines during multi-table applies.
+	assert.Equal(t, map[string]bool{"log_routed": true}, capturedTables,
+		"every routed Spirit log line should carry the table being changed")
 }
 
 // TestEngine_Apply_StartsGoroutine tests that Apply starts a schema change goroutine
@@ -1624,9 +2001,8 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{
-		Logger:          logger,
-		TargetChunkTime: 100 * time.Millisecond, // Small chunks for more progress updates (Spirit minimum is 100ms)
-		Threads:         1,                      // Start slow
+		Logger:  logger,
+		Threads: 1, // Start slow
 	})
 
 	ctx := t.Context()
@@ -1743,8 +2119,15 @@ func TestEngine_Volume_PreservesProgress(t *testing.T) {
 		tableProgress := progressResult.Tables[0]
 		t.Logf("Progress after volume change: state=%v, rows_copied=%d/%d",
 			progressResult.State, tableProgress.RowsCopied, tableProgress.RowsTotal)
-		if tableProgress.RowsTotal == 0 {
-			t.Logf("Progress after volume change is still in runner setup: state=%v", progressResult.State)
+		// During the resume window the new runner can publish a table row with a
+		// known RowsTotal while RowsCopied is momentarily 0, before the checkpoint
+		// is re-applied. Skip those samples and wait for the first checkpoint-backed
+		// one. A genuine restart from the beginning is still caught: it re-copies
+		// from 0 and its first non-zero sample lands far below minExpected, and if it
+		// never republishes progress the timeout guard below fails the test.
+		if tableProgress.RowsTotal == 0 || tableProgress.RowsCopied == 0 {
+			t.Logf("Progress after volume change is still in runner setup: state=%v, rows_copied=%d/%d",
+				progressResult.State, tableProgress.RowsCopied, tableProgress.RowsTotal)
 			continue
 		}
 
@@ -1806,7 +2189,7 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 		"DROP TABLE `stop_pending_drop`",
 	}
 
-	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(ctx, host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	finalState := eng.runningSchemaChange.state
@@ -1849,9 +2232,8 @@ func TestEngine_Stop_DuringAlterWithPendingDrop(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	eng := New(Config{
-		Logger:          logger,
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         1,
+		Logger:  logger,
+		Threads: 1,
 	})
 
 	ctx := t.Context()
@@ -1875,22 +2257,7 @@ func TestEngine_Stop_DuringAlterWithPendingDrop(t *testing.T) {
 
 	// Wait until the ALTER copy is observably in-flight before stopping, so the
 	// stop lands mid-ALTER (the DROP phase has not yet started).
-	deadline := time.Now().Add(30 * time.Second)
-	copying := false
-	for time.Now().Before(deadline) {
-		progress, perr := eng.Progress(ctx, &engine.ProgressRequest{})
-		require.NoError(t, perr, "Progress()")
-		require.NotEqual(t, engine.StateFailed, progress.State, "apply failed before stop: %s", progress.ErrorMessage)
-		if progress.State == engine.StateCompleted {
-			t.Skip("schema change completed before it could be stopped mid-flight")
-		}
-		if len(progress.Tables) > 0 && progress.Tables[0].RowsCopied > 0 {
-			copying = true
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	require.True(t, copying, "ALTER copy did not become observably in-flight within deadline")
+	waitForCopyProgress(t, eng, 1)
 
 	stopResult, err := eng.Stop(ctx, &engine.ControlRequest{Database: "testdb"})
 	require.NoError(t, err, "Stop()")
@@ -2013,4 +2380,107 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// Stateless control operations (cutover and deferred-cutover sentinel lookup
+// without an in-memory schema change) must address the schema the DSN connects
+// to, not the request's logical database name: under per-deployment schema
+// overrides the DSN carries the physical schema while the request carries the
+// canonical name. Addressing the request database instead would silently no-op
+// the sentinel drop (the cutover reports success while the sentinel survives)
+// and report the deferred-cutover signal as absent.
+func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
+	ctx := t.Context()
+	db, err := sql.Open("mysql", sharedDSN)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const (
+		canonical      = "ctl_ovr_bikeshare"
+		physicalSchema = "ctl_ovr_bikeshare_region2_env1"
+	)
+
+	_, err = db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+physicalSchema+"`")
+	require.NoError(t, err, "create physical schema")
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("mysql", sharedDSN)
+		require.NoError(t, cleanupErr, "open database for stateless control cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+physicalSchema+"`")
+		assert.NoError(t, cleanupErr, "drop physical schema")
+	})
+	_, err = db.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS `"+physicalSchema+"`.`_spirit_sentinel` (`id` int NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB")
+	require.NoError(t, err, "create sentinel table in physical schema")
+
+	// The DSN names the physical schema; the request carries the canonical
+	// database name, which exists as no schema on this cluster.
+	cfg, err := drivermysql.ParseDSN(sharedDSN)
+	require.NoError(t, err, "parse shared DSN")
+	cfg.DBName = physicalSchema
+	creds := &engine.Credentials{DSN: cfg.FormatDSN()}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	eng := New(Config{Logger: logger})
+
+	exists, err := eng.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
+		Database:    canonical,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "deferred cutover signal lookup")
+	assert.True(t, exists, "sentinel in the DSN's physical schema is found despite the canonical request database")
+
+	result, err := eng.Cutover(ctx, &engine.ControlRequest{
+		Database:    canonical,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "stateless cutover")
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted, "stateless cutover is accepted")
+
+	var count int
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
+		physicalSchema,
+	).Scan(&count), "count sentinel tables")
+	assert.Zero(t, count, "cutover drops the sentinel in the DSN's physical schema, not the canonical name")
+
+	exists, err = eng.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
+		Database:    canonical,
+		Credentials: creds,
+	})
+	require.NoError(t, err, "deferred cutover signal lookup after cutover")
+	assert.False(t, exists, "signal is reported absent after the sentinel drop")
+}
+
+// TestNewSpiritMigrationRunSettings verifies the Spirit run settings applied to
+// every schema change this engine starts: the fleet defaults resolve when the
+// engine is built without overrides, and metadata overrides carry through.
+func TestNewSpiritMigrationRunSettings(t *testing.T) {
+	dsn, _ := setupTestMySQL(t)
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+
+	eng := New(Config{})
+	m := eng.newSpiritMigration(host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
+	assert.Equal(t, DefaultCheckpointMaxAge, m.CheckpointMaxAge)
+	assert.Equal(t, DefaultChecksumYieldTimeout, m.ChecksumYieldTimeout)
+	assert.True(t, m.EnableExperimentalAutoscaling, "autoscaling defaults to enabled")
+	assert.True(t, m.InterpolateParams)
+	assert.Zero(t, m.WriteThreads, "write threads auto-size for the target")
+	assert.Equal(t, maxCommitLatency, m.MaxCommitLatency,
+		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
+
+	settings, err := SettingsFromMetadata(map[string]string{
+		MetadataEnableExperimentalAutoscaling: "false",
+		MetadataCheckpointMaxAge:              "24h",
+		MetadataChecksumYieldTimeout:          "6h",
+	})
+	require.NoError(t, err, "SettingsFromMetadata")
+	eng = New(Config{Settings: settings})
+	m = eng.newSpiritMigration(host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
+	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
+	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
+	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
 }

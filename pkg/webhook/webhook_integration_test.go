@@ -68,14 +68,20 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -147,47 +153,129 @@ func TestMain(m *testing.M) {
 // setupE2EService creates a real api.Service with a LocalClient for the given database.
 func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	t.Helper()
+	return setupE2EServiceWithStorage(t, appDBName, nil)
+}
+
+// setupE2EServiceWithStorage is setupE2EService with a storage decorator hook.
+// A non-nil wrapStorage wraps the service's storage so a test can observe every
+// storage write the handler and observers perform (e.g. record stored check
+// state transitions).
+func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
+	t.Helper()
+	return setupE2EServiceOpts(t, appDBName, e2eServiceOpts{wrapStorage: wrapStorage})
+}
+
+// e2eServiceOpts customizes setupE2EServiceOpts beyond the defaults.
+type e2eServiceOpts struct {
+	// wrapStorage wraps the service's storage so a test can observe every
+	// storage write the handler and observers perform.
+	wrapStorage func(storage.Storage) storage.Storage
+	// engineMetadata is forwarded to the LocalClient, enabling per-database
+	// engine policies (e.g. direct execution) for the test's plans and
+	// applies.
+	engineMetadata map[string]string
+	// skipOperator leaves the operator claim loop stopped so a test can
+	// observe the initial durable state of queued work (e.g. a pending
+	// apply_operations row) without racing an operator claim.
+	skipOperator bool
+	// databaseType and targetDSN let integration scenarios exercise another
+	// built-in engine while retaining the same API, storage, and operator path.
+	// For MySQL, a non-empty targetDSN overrides the default database-scoped
+	// DSN — e.g. a namespace-free DSN for scenarios where the namespace
+	// selects the database.
+	databaseType string
+	targetDSN    string
+	// preserveDurableState skips the stale-data cleanup so a second service
+	// instance can adopt durable work queued by a previous instance — the
+	// restart fixtures' crash/recovery seam. Only the first instance of a
+	// test may clean; a recovering instance must see the queued rows.
+	preserveDurableState bool
+}
+
+// namespaceFreeTargetDSN returns the shared MySQL target's DSN with no
+// database selected — the shape where each namespace's directory name selects
+// the database it is planned against.
+func namespaceFreeTargetDSN(t *testing.T) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	return cfg.FormatDSN()
+}
+
+// setupE2EServiceOpts creates a real api.Service with a LocalClient for the
+// given database, customized by opts.
+func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *api.Service {
+	t.Helper()
 	ctx := t.Context()
+	databaseType := opts.databaseType
+	if databaseType == "" {
+		databaseType = storage.DatabaseTypeMySQL
+	}
+	appDSN := opts.targetDSN
 
-	// Create the app database on the target
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-	require.NoError(t, err)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
-	require.NoError(t, err)
-	_ = targetDB.Close()
+	if databaseType == storage.DatabaseTypeMySQL {
+		// Create the app database on the target.
+		targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		require.NoError(t, err)
+		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
+		require.NoError(t, err)
+		_ = targetDB.Close()
 
-	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-		if err == nil {
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
-			_ = db.Close()
+		t.Cleanup(func() {
+			db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+			if err == nil {
+				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
+				_ = db.Close()
+			}
+		})
+
+		if appDSN == "" {
+			cfg, err := mysql.ParseDSN(e2eTargetDSN)
+			require.NoError(t, err)
+			cfg.DBName = appDBName
+			appDSN = cfg.FormatDSN()
 		}
-	})
-
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+appDBName, 1)
+	}
+	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
-	st := mysqlstore.New(schemabotDB)
+	st := storage.Storage(mysqlstore.New(schemabotDB))
+	if opts.wrapStorage != nil {
+		st = opts.wrapStorage(st)
+	}
 
-	// Clean up any stale data from previous test runs (shared storage DB)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	// Delete child apply_operations rows before their parent applies rows so the
-	// operator claim loop cannot re-claim orphan operations whose parent lookup
-	// returns nil.
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
+	if !opts.preserveDurableState {
+		// Clean up any stale data from previous test runs (shared storage DB).
+		// A failed delete must stop the test here: leftover rows surface later
+		// as misleading assertion failures. Child apply_operations rows are
+		// deleted before their parent applies rows so the operator claim loop
+		// cannot re-claim orphan operations whose parent lookup returns nil.
+		for _, cleanup := range []struct {
+			query string
+			args  []any
+		}{
+			{"DELETE FROM checks WHERE database_name = ?", []any{appDBName}},
+			{"DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1", nil},
+			{"DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE FROM plans WHERE database_name = ?", []any{appDBName}},
+		} {
+			_, err := schemabotDB.ExecContext(ctx, cleanup.query, cleanup.args...)
+			require.NoError(t, err, "stale-data cleanup: %s", cleanup.query)
+		}
+	}
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
-		Type:      "mysql",
+		Type:      databaseType,
 		TargetDSN: appDSN,
+		Metadata:  opts.engineMetadata,
 	}, st, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = localClient.Close() })
@@ -196,7 +284,7 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 		Drivers: 1,
 		Databases: map[string]api.DatabaseConfig{
 			appDBName: {
-				Type: "mysql",
+				Type: databaseType,
 				Environments: map[string]api.EnvironmentConfig{
 					"staging": {DSN: appDSN},
 				},
@@ -210,7 +298,10 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 	require.NoError(t, svc.SetOperatorPollInterval(100*time.Millisecond))
 	// Webhook E2E helpers use the real service lifecycle. Local applies are
 	// durably queued by ExecuteApply, then dispatched by operator drivers.
-	svc.StartOperator(ctx)
+	// Tests that assert on pre-claim durable state opt out via skipOperator.
+	if !opts.skipOperator {
+		svc.StartOperator(ctx)
+	}
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc
@@ -264,7 +355,7 @@ func seedCheck(t *testing.T, svc *api.Service, dbName, env, conclusion string) {
 func newE2EHandler(t *testing.T, svc *api.Service, client *gh.Client) *Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
+	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	factory := &fakeClientFactory{client: installClient}
 	return NewHandler(svc, factory, nil, logger)
 }
@@ -286,6 +377,33 @@ type planFlowResult struct {
 	HeadSHAs    []string
 	headSHACall atomic.Int64
 
+	// PRState overrides the lifecycle state served by /pulls/1. Empty (the
+	// default) serves "open"; tests exercising the closed-PR command gate set
+	// "closed" before issuing the webhook request.
+	PRState atomic.Pointer[string]
+
+	// baseFiles is what the default branch holds, as repository path to blob
+	// SHA. It starts as the schema directory carrying the config at a blob of
+	// its own, so resolving a PR's schema file at the default branch tip walks
+	// the same directory levels a real repository has, and none of the PR's own
+	// files are found there. Tests add to it through baseHolds to model a
+	// changed-file list that carries a file the PR does not propose.
+	baseFiles atomic.Pointer[map[string]string]
+
+	// headTreeEntries is the repository at head, as the fixture described it.
+	headTreeEntries []*gh.TreeEntry
+
+	// BaseRef overrides the base branch served by /pulls/1. Nil (the default)
+	// serves "main". Tests that model a PR being retargeted install the new ref,
+	// optionally partway through a flow so the base a plan was computed against
+	// differs from the base it would be published on.
+	BaseRef atomic.Pointer[string]
+
+	// PRMerged marks the PR served by /pulls/1 as merged. GitHub reports a
+	// merged PR with state "closed" and merged true, so tests exercising the
+	// merged-PR rejection copy set this together with PRState "closed".
+	PRMerged atomic.Bool
+
 	// CheckStatusNodes optionally overrides the default passing-checks REST
 	// responses installed by setupFakeGitHubForPlan. Tests that need to drive
 	// different check-gate responses across consecutive calls (e.g. PASS at the
@@ -293,6 +411,44 @@ type planFlowResult struct {
 	// before issuing the webhook request. Nil preserves the default
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
+
+	// FailFirstPRRead makes the first /pulls/1 request answer with a 403 and
+	// serves every later one. Auto-plan reads the PR to snapshot its base
+	// branch before discovery, so this models a failure to establish which
+	// base a plan would be computed against, while leaving the reads that post
+	// the resulting check run working. The status has to be one the client
+	// treats as a semantic answer rather than an availability failure: a 5xx
+	// is retried, and the retry would serve the request and hide the failure
+	// the test is asking for.
+	FailFirstPRRead atomic.Bool
+
+	// FailPRReadsAfterFirstFetch makes /pulls/1 serve only its first request and
+	// answer every later one with a 403. Auto-plan snapshots the PR once at the
+	// top of discovery and re-reads it uncached before publishing, so this models
+	// SchemaBot losing access to the PR in between — the publish-time
+	// re-verification cannot be answered and the plan must not be published. The
+	// status is the non-retryable kind on purpose: the client already retries an
+	// availability failure, so what reaches that re-verification is a failure
+	// retrying does not fix.
+	FailPRReadsAfterFirstFetch atomic.Bool
+
+	prReadRequests atomic.Int64
+
+	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
+	// request and answer every later one with a 503. Config discovery fetches
+	// the changed files exactly once, so this simulates GitHub becoming
+	// unavailable between a successful discovery and the dispatched command's
+	// own re-fetch. False (the default) always serves the files.
+	FailPRFilesAfterFirstFetch atomic.Bool
+	prFilesRequests            atomic.Int64
+
+	// BaseTip overrides the commit SHA that /git/ref/heads/main resolves to.
+	// Nil (the default) serves "def456" — the same commit /pulls/1 reports as
+	// the PR base, so the base branch appears unmoved and the base-schema
+	// freshness gate lets applies proceed. Tests that simulate the base
+	// branch advancing after the PR diverged install a provider returning
+	// the moved tip and register comparison fixtures for it.
+	BaseTip atomic.Pointer[func() string]
 }
 
 func (p *planFlowResult) nextHeadSHA() string {
@@ -306,14 +462,6 @@ func (p *planFlowResult) nextHeadSHA() string {
 	return p.HeadSHAs[idx]
 }
 
-type checkRunCapture struct {
-	Name       string                   `json:"name"`
-	HeadSHA    string                   `json:"head_sha"`
-	Status     string                   `json:"status"`
-	Conclusion string                   `json:"conclusion"`
-	Output     *ghclient.CheckRunOutput `json:"output"`
-}
-
 // registerPassingChecks adds mock REST endpoints for PR check statuses that
 // return no checks. This prevents enforcePassingChecks from blocking apply
 // commands in e2e tests.
@@ -321,14 +469,101 @@ func registerPassingChecks(mux *http.ServeMux) {
 	registerCheckStatusRESTHandlers(mux, nil)
 }
 
-func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode) {
+// fakeCheckRunStore records every Check Run a fake GitHub server accepts so
+// the commit check-runs list can serve the same runs the real API would: each
+// run's latest state, attributed to the trusted "schemabot" App. The
+// aggregate fold resolves its reuse/rewind decision from that list, so a
+// harness whose handler can fold the same head more than once must list the
+// runs its own create and update calls produced.
+type fakeCheckRunStore struct {
+	mu   sync.Mutex
+	next int64
+	runs []*fakeCheckRunRecord
+}
+
+type fakeCheckRunRecord struct {
+	id         int64
+	name       string
+	headSHA    string
+	status     string
+	conclusion string
+}
+
+// create records a created Check Run and returns its assigned ID.
+func (s *fakeCheckRunStore) create(body checkRunCapture) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	s.runs = append(s.runs, &fakeCheckRunRecord{
+		id:         s.next,
+		name:       body.Name,
+		headSHA:    body.HeadSHA,
+		status:     body.Status,
+		conclusion: body.Conclusion,
+	})
+	return s.next
+}
+
+// update records an update to an existing run. Update payloads carry no head
+// SHA, so an update to an ID the store never saw created (for example a
+// seeded stored CheckRunID) is recorded without one and stays invisible to
+// every commit's list — like a run that lives on some other commit.
+func (s *fakeCheckRunStore) update(id int64, body checkRunCapture) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range s.runs {
+		if run.id != id {
+			continue
+		}
+		run.status = body.Status
+		run.conclusion = body.Conclusion
+		return
+	}
+	s.runs = append(s.runs, &fakeCheckRunRecord{
+		id:         id,
+		name:       body.Name,
+		status:     body.Status,
+		conclusion: body.Conclusion,
+	})
+}
+
+// serveList writes GitHub's list-check-runs response for the recorded runs on
+// headSHA whose name matches checkName, each attributed to the trusted
+// "schemabot" App.
+func (s *fakeCheckRunStore) serveList(w http.ResponseWriter, headSHA, checkName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]map[string]any, 0, len(s.runs))
+	for _, run := range s.runs {
+		if run.headSHA != headSHA || run.name != checkName {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id":         run.id,
+			"name":       run.name,
+			"status":     run.status,
+			"conclusion": run.conclusion,
+			"app":        map[string]any{"slug": "schemabot"},
+		})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(out), "check_runs": out})
+}
+
+func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() []checkStatusNode, checkRuns *fakeCheckRunStore) {
 	prefix := "/repos/octocat/hello-world/commits/"
 	mux.HandleFunc("GET "+prefix, func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, prefix)
+		reqPath := strings.TrimPrefix(r.URL.Path, prefix)
 		switch {
-		case strings.HasSuffix(path, "/status"):
+		case strings.HasSuffix(reqPath, "/status"):
 			writeCommitStatusResponse(w, nodes())
-		case strings.HasSuffix(path, "/check-runs"):
+		case strings.HasSuffix(reqPath, "/check-runs"):
+			// A name-filtered list is the aggregate fold resolving the newest
+			// run for its check name; the unfiltered list is the apply gate
+			// reading the PR's checks.
+			if name := r.URL.Query().Get("check_name"); name != "" && checkRuns != nil {
+				checkRuns.serveList(w, strings.TrimSuffix(reqPath, "/check-runs"), name)
+				return
+			}
 			writeCheckRunsResponse(w, nodes())
 		default:
 			http.NotFound(w, r)
@@ -337,10 +572,186 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 }
 
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
-// schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
+// schemaSQL maps filename -> content. Plain filenames are placed under
+// schema/{namespace}/; filenames containing a "/" are placed under schema/
+// as-is, so a test can lay out multiple namespace subdirectories.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
+}
+
+// baseHolds adds the given repository paths to what the default branch already
+// carries: each at the blob head has for it when head has it too — a file the
+// PR's changed-file list carries but that merging it would not change — and at
+// a blob of its own otherwise, which is what a file the PR deletes looks like.
+func (r *planFlowResult) baseHolds(paths ...string) {
+	held := make(map[string]string, len(paths))
+	if existing := r.baseFiles.Load(); existing != nil {
+		maps.Copy(held, *existing)
+	}
+	for _, path := range paths {
+		held[path] = "basesha~" + path
+		for _, entry := range r.headTreeEntries {
+			if entry.GetPath() == path {
+				held[path] = entry.GetSHA()
+			}
+		}
+	}
+	r.baseFiles.Store(&held)
+}
+
+// baseTreeEntries is the repository as the default branch holds it.
+func (r *planFlowResult) baseTreeEntries() []*gh.TreeEntry {
+	held := r.baseFiles.Load()
+	if held == nil {
+		return nil
+	}
+	entries := make([]*gh.TreeEntry, 0, len(*held))
+	for path, blobSHA := range *held {
+		entries = append(entries, &gh.TreeEntry{Path: new(path), Type: new("blob"), SHA: new(blobSHA)})
+	}
+	slices.SortFunc(entries, func(a, b *gh.TreeEntry) int { return strings.Compare(a.GetPath(), b.GetPath()) })
+	return entries
+}
+
+// Synthesized tree identifiers for directories below a root level, one prefix
+// per branch so the head and the default branch resolve through distinct nodes.
+// Directory separators are encoded so an identifier stays one URL path segment,
+// as a real tree SHA is.
+const (
+	headSubtreeSHAPrefix = "subtree~"
+	baseSubtreeSHAPrefix = "basetree~"
+)
+
+// repositoryTreeFixture describes a repository to the tree endpoints at the two
+// commits a plan flow reads: the PR head, and the default branch tip that
+// discovery scopes the PR's changed files against. Both are given as the flat
+// path lists a recursive tree read returns.
+type repositoryTreeFixture struct {
+	headSHA     string
+	headEntries []*gh.TreeEntry
+	// baseEntries is what the default branch holds. Nil means it holds none of
+	// the head's files, so every changed file is the PR's own proposal.
+	baseEntries func() []*gh.TreeEntry
+	// defaultTip is the commit the default branch resolves to. Nil serves the
+	// PR's base commit, so the base branch appears unmoved.
+	defaultTip func() string
+}
+
+func (f repositoryTreeFixture) base() []*gh.TreeEntry {
+	if f.baseEntries == nil {
+		return nil
+	}
+	return f.baseEntries()
+}
+
+func (f repositoryTreeFixture) tip() string {
+	if f.defaultTip == nil {
+		return "def456"
+	}
+	return f.defaultTip()
+}
+
+// shallowTreeLevel serves one directory level. treeSHA is either a commit (a
+// root level) or a synthesized subtree identifier, and which commit it belongs
+// to decides which entry list the level is built from. A commit the fixture
+// does not name as the default branch tip is a head commit, so a test that
+// advances the PR head needs no fixture of its own.
+func (f repositoryTreeFixture) shallowTreeLevel(treeSHA string) []*gh.TreeEntry {
+	if encoded, isBase := strings.CutPrefix(treeSHA, baseSubtreeSHAPrefix); isBase {
+		return treeLevelFrom(f.base(), strings.ReplaceAll(encoded, "~", "/"), baseSubtreeSHAPrefix)
+	}
+	if encoded, isHead := strings.CutPrefix(treeSHA, headSubtreeSHAPrefix); isHead {
+		return treeLevelFrom(f.headEntries, strings.ReplaceAll(encoded, "~", "/"), headSubtreeSHAPrefix)
+	}
+	if treeSHA == f.tip() {
+		return treeLevelFrom(f.base(), "", baseSubtreeSHAPrefix)
+	}
+	return treeLevelFrom(f.headEntries, "", headSubtreeSHAPrefix)
+}
+
+// registerRepositoryTrees serves the repository reads a plan flow makes: the
+// default branch and its tip, and the git trees at head and at that tip. A
+// shallow read walks one directory level at a time; a recursive read wants the
+// whole tree flat. Both hit the same path, so serve what was asked for: the
+// recursive form is what config discovery reads, and the level form is what the
+// path resolvers walk.
+func registerRepositoryTrees(t *testing.T, mux *http.ServeMux, fixture repositoryTreeFixture) {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Repository{DefaultBranch: new("main")}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		tip := fixture.tip()
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
+		}))
+	})
+
+	serveTree := func(w http.ResponseWriter, r *http.Request, sha string) {
+		entries := fixture.headEntries
+		if r.URL.Query().Get("recursive") == "" {
+			entries = fixture.shallowTreeLevel(sha)
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       &sha,
+			Entries:   entries,
+			Truncated: new(false),
+		}))
+	}
+	// Go 1.22 ServeMux gives precedence to the more specific exact path, so the
+	// head commit keeps its own route and every other SHA falls through to the
+	// prefix — a test that advances the head needs no fixture per commit.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+fixture.headSHA, func(w http.ResponseWriter, r *http.Request) {
+		serveTree(w, r, fixture.headSHA)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
+		serveTree(w, r, r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):])
+	})
+}
+
+// treeLevelFrom returns the entries directly under dir, minting subtree
+// identifiers for deeper directories with subtreePrefix.
+func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.TreeEntry {
+	pathPrefix := ""
+	if dir != "" {
+		pathPrefix = dir + "/"
+	}
+	var level []*gh.TreeEntry
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		rest, under := strings.CutPrefix(entry.GetPath(), pathPrefix)
+		if !under || rest == "" {
+			continue
+		}
+		segment, deeper, isDir := strings.Cut(rest, "/")
+		if seen[segment] {
+			continue
+		}
+		seen[segment] = true
+		if isDir && deeper != "" {
+			level = append(level, &gh.TreeEntry{
+				Path: new(segment),
+				Type: new("tree"),
+				SHA:  new(subtreePrefix + strings.ReplaceAll(pathPrefix+segment, "/", "~")),
+			})
+			continue
+		}
+		level = append(level, &gh.TreeEntry{Path: new(segment), Type: new("blob"), SHA: new(entry.GetSHA())})
+	}
+	return level
+}
+
+// schemaFixturePath resolves a schemaSQL key to its repository path: plain
+// filenames live under the namespace subdirectory, keys with a "/" already
+// name their namespace subdirectory.
+func schemaFixturePath(ns, name string) string {
+	if strings.Contains(name, "/") {
+		return "schema/" + name
+	}
+	return "schema/" + ns + "/" + name
 }
 
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
@@ -355,22 +766,52 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// PR info — head SHA can shift across calls via result.HeadSHAs (default
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		read := result.prReadRequests.Add(1)
+		if result.FailFirstPRRead.Load() && read == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
+		if result.FailPRReadsAfterFirstFetch.Load() && read > 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
 		sha := result.nextHeadSHA()
+		prState := "open"
+		if override := result.PRState.Load(); override != nil {
+			prState = *override
+		}
+		merged := result.PRMerged.Load()
+		baseRef := "main"
+		if override := result.BaseRef.Load(); override != nil {
+			baseRef = *override
+		}
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			State:  &prState,
+			Merged: &merged,
 			Head: &gh.PullRequestBranch{
 				Ref: new("feature-branch"),
 				SHA: &sha,
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
+				Ref: &baseRef,
 				SHA: new("def456"),
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
 
+	registerFreshBaseComparison(t, mux, "abc123")
+
 	// PR changed files — report schema files changed (in namespace subdir)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
+		if result.FailPRFilesAfterFirstFetch.Load() && result.prFilesRequests.Add(1) > 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		if prFiles != nil {
 			_ = json.NewEncoder(w).Encode(prFiles)
 			return
@@ -378,7 +819,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
-				Filename: new("schema/" + ns + "/" + name),
+				Filename: new(schemaFixturePath(ns, name)),
 				Status:   new("added"),
 			})
 		}
@@ -408,34 +849,38 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		blobIndex++
 		blobContents[sha] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/" + ns + "/" + name),
+			Path: new(schemaFixturePath(ns, name)),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(sha),
 			Size: new(len(content)),
 		})
 	}
+	result.headTreeEntries = treeEntries
 
-	// Git tree (recursive). The exact-SHA handler preserves the historical
-	// "abc123" behavior for tests that only exercise one head; the prefix
-	// fallback serves the same tree for any other SHA so tests that simulate
-	// HEAD advancing (e.g. the cross-delivery freshness checks) don't need a
-	// custom fixture per SHA. Go 1.22 ServeMux gives precedence to the more
-	// specific exact path, so existing tests are unaffected.
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       new("abc123"),
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
-		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       &sha,
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
+	// The default branch already has the schema directory and the config in it,
+	// at a blob of its own. Resolving one of the PR's schema files at the default
+	// branch tip then descends the directory levels a real repository has instead
+	// of stopping at an empty root, and still finds none of the PR's own files
+	// there — so every changed file remains the PR's own proposal.
+	if schemabotConfig != "" {
+		result.baseFiles.Store(&map[string]string{"schema/schemabot.yaml": "baseconfigsha001"})
+	}
+
+	// The repository at both commits a plan flow reads. By default the default
+	// branch tip is the PR's own base commit, so the base branch appears
+	// unmoved — the schema tree cannot differ from itself, and the base-schema
+	// freshness gate lets applies proceed.
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA:     "abc123",
+		headEntries: treeEntries,
+		baseEntries: result.baseTreeEntries,
+		defaultTip: func() string {
+			if provider := result.BaseTip.Load(); provider != nil {
+				return (*provider)()
+			}
+			return "def456"
+		},
 	})
 
 	// Blob content
@@ -487,24 +932,32 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
 
-	// Capture check run creates (incrementing IDs so aggregate can distinguish create vs update)
-	var checkRunIDCounter atomic.Int64
+	// Capture check run creates and updates. Every write is also recorded in
+	// checkRunState (with incrementing IDs) so the commit's check-runs list
+	// serves the runs this server actually accepted — the aggregate fold
+	// resolves its reuse/rewind decision from that list.
+	checkRunState := &fakeCheckRunStore{}
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
-		id := checkRunIDCounter.Add(1)
+		id := checkRunState.create(body)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
-	// Capture check run updates (PATCH)
 	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
 		var body checkRunCapture
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.checkRuns <- body
+		id, err := strconv.ParseInt(path.Base(r.URL.Path), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid check run id", http.StatusBadRequest)
+			return
+		}
+		checkRunState.update(id, body)
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id})
 	})
 
 	// PR check statuses for enforcePassingChecks. Defaults to all passing
@@ -516,16 +969,29 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 			return (*provider)()
 		}
 		return nil
-	})
+	}, checkRunState)
 
 	return result
+}
+
+// registerFreshBaseComparison serves the merge-base comparison for a head
+// whose merge base is the unmoved base tip "def456", so the base-schema
+// freshness gate sees no base-branch schema change for that head. Tests that
+// serve a head other than the default "abc123" register their head here.
+func registerFreshBaseComparison(t *testing.T, mux *http.ServeMux, headSHA string) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/def456..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
+			MergeBaseCommit: &gh.RepositoryCommit{SHA: new("def456")},
+		}))
+	})
 }
 
 func registerCompareFiles(t *testing.T, mux *http.ServeMux, baseSHA, headSHA string, files []*gh.CommitFile) {
 	t.Helper()
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/"+baseSHA+"..."+headSHA, func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Files: files}))
+		require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{Status: new("ahead"), Files: files}))
 	})
 }
 

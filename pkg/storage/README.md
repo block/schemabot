@@ -1,6 +1,6 @@
 # storage
 
-Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/).
+Package `storage` defines the persistence interfaces for SchemaBot. All state — locks, plans, applies, tasks, logs, control requests, settings — flows through these interfaces. The MySQL implementation lives in [`storage/mysqlstore`](./mysqlstore/) and the PostgreSQL implementation in [`storage/postgresstore`](./postgresstore/). The cross-dialect behavioral parity suite that every implementation must pass lives in [`storage/storagetest`](./storagetest/).
 
 ## Interface Hierarchy
 
@@ -16,6 +16,7 @@ type Storage interface {
     ControlRequests() ControlRequestStore
     Checks()          CheckStore
     Settings()        SettingsStore
+    WebhookEvents()   WebhookEventStore
     Ping(ctx)         error
     Close()           error
 }
@@ -31,6 +32,7 @@ type Storage interface {
 | `ControlRequestStore` | Durable user control intent that can be recovered by drivers |
 | `CheckStore` | GitHub status check state |
 | `SettingsStore` | Admin-level key-value settings |
+| `WebhookEventStore` | Durable webhook inbox rows, dedup + lease-based claim/retry |
 
 ## Lock Coordination
 
@@ -53,8 +55,20 @@ See [`pkg/state`](../state/) for the full state hierarchy (apply states, task st
 The apply store supports crash recovery through heartbeat-based leasing:
 
 - **Heartbeat**: Drivers call `Heartbeat(applyID)` every 10 seconds to signal they're alive
-- **FindNextApply**: Claims one apply with a stale heartbeat (>1 minute since last update) by selecting it and refreshing its heartbeat in one transaction
-- If a driver crashes, its apply becomes claimable after the heartbeat times out
+- **Discovery**: the operation ladder (`FindNextApplyOperation`) scans for claimable work, including operation rows whose heartbeat went stale (>1 minute since last update)
+- **ClaimApplyByID**: after leasing an operation row, the driver leases its parent apply by ID — the claim predicate covers pending applies with child rows, stale active states, retryable applies within budget, and pending start control requests, and rotates the lease and heartbeat in one transaction
+- If a driver crashes, its work becomes claimable after the heartbeat times out
+
+## Webhook Inbox Retention
+
+`webhook_events` stores the full JSON payload of every accepted delivery, so it
+grows without bound if never pruned. Terminal rows (`completed`, `failed`) are
+kept for dedup and forensics but only need to outlive GitHub's redelivery
+window (GitHub retains deliveries for 30 days). The intended retention policy
+is a periodic sweep that deletes terminal rows older than ~30 days, keyed on
+`idx_received_at`; it will land with the reconciliation/observability work
+rather than in the initial inbox. Until then the table is append-mostly and
+growth is bounded by webhook volume, not by retries.
 
 ## Key Types
 
@@ -65,6 +79,6 @@ The apply store supports crash recovery through heartbeat-based leasing:
 - **ApplyLog**: Level, event type, source (schemabot/spirit), message, state transitions
 - **ApplyControlRequest**: Durable control operation intent and processing status
 
-## MySQL Implementation
+## Implementations
 
-The `storage/mysqlstore` package implements all interfaces using a `*sql.DB` connection. Each store is a thin wrapper with SQL queries. Plans store their DDL and schema data as JSON in a `plan_data` column. The schema tables themselves are defined in [`pkg/schema`](../schema/) and applied on startup via `api.EnsureSchema()`.
+The [`storage/mysqlstore`](./mysqlstore/) and [`storage/postgresstore`](./postgresstore/) packages implement all interfaces using a `*sql.DB` connection. Both are thin public constructors over the shared dialect-parameterized core in `storage/internal/sqlstore`; each store is a thin wrapper with SQL queries. Plans store their DDL and schema data as JSON in a `plan_data` column. The schema tables themselves are defined in [`pkg/schema`](../schema/) and applied on startup via `api.EnsureSchema()`.

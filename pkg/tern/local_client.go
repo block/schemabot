@@ -92,6 +92,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -108,7 +109,9 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -118,22 +121,16 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const vSchemaArtifactName = "vschema.json"
-
-func namespaceHasVSchemaArtifact(nsData *storage.NamespacePlanData) bool {
-	if nsData == nil {
-		return false
-	}
-	return nsData.Artifacts[vSchemaArtifactName] != ""
-}
-
 // LocalConfig holds configuration for the local Tern client.
 type LocalConfig struct {
-	// Database is the name of this database.
+	// Database is the identifier this database is registered under — a routing
+	// and display key. For PlanetScale targets the API addresses the "database"
+	// metadata key when set; without it this identifier doubles as the
+	// PlanetScale database name.
 	Database string
 
-	// Type is the database type. "mysql" and "vitess" have built-in engines; any
-	// other value requires a matching EngineFactories entry.
+	// Type is the database type. "mysql", "vitess", and "postgres" have built-in
+	// engines; any other value requires a matching EngineFactories entry.
 	Type string
 
 	// TargetDSN is the connection string to the target database for schema changes.
@@ -142,11 +139,30 @@ type LocalConfig struct {
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
-	// Keys used by PlanetScale: organization, token_name, token_value,
-	// tls_name, revert_window_duration, main_branch.
+	// Keys used by PlanetScale: organization, database (the PlanetScale
+	// database name when it differs from the registered identifier),
+	// token_name, token_value, tls_name, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
-	// quarantine so DROP TABLE executes directly).
+	// quarantine so DROP TABLE executes directly); direct_execution ("true"
+	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
+	// with its required companion direct_execution_max_table_rows (positive
+	// estimated-row-count bound above which direct execution is blocked) and
+	// optional direct_execution_lock_acquisition_timeout_seconds (positive bound on
+	// each direct statement's lock acquisition; engine default when absent);
+	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
+	// (enable_experimental_autoscaling, checkpoint_max_age,
+	// checksum_yield_timeout).
 	Metadata map[string]string
+
+	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
+	// physical schema name on this target, for targets whose physical schema
+	// names embed environment or region. When non-empty it is a strict
+	// allowlist consulted wherever a namespace is turned into a connection
+	// schema: a requested namespace without a mapping fails rather than
+	// falling back to the canonical name. Empty preserves the default
+	// behavior where the requested namespace is the physical schema. MySQL
+	// only, and requires a namespace-free TargetDSN.
+	SchemaOverrides map[string]string
 
 	// WakeOperator notifies the owner loop after durable work is recorded — a
 	// queued apply from a dispatch, or an external control request. The callback
@@ -175,6 +191,7 @@ type LocalClient struct {
 	storage           storage.Storage
 	spiritEngine      engine.Engine
 	planetscaleEngine engine.Engine
+	postgresEngine    engine.Engine
 	customEngine      engine.Engine
 	psClientFunc      func(tokenName, tokenValue string) (psclient.PSClient, error)
 	logger            *slog.Logger
@@ -215,13 +232,41 @@ var _ Client = (*LocalClient)(nil)
 // NewLocalClient creates a new local Tern client that calls the Spirit engine directly.
 // The storage parameter should be SchemaBot's storage instance for plan/task management.
 func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) (*LocalClient, error) {
+	// Schema overrides select a MySQL connection schema, so they only make
+	// sense for MySQL and only with a namespace-free target DSN (a DSN that
+	// already names a database would silently win over the mapping). Enforce
+	// the full mapping contract here as well as at inventory-config load so a
+	// custom resolver cannot hand an invalid combination straight to the
+	// client, and clone the map so the client's view cannot be mutated later.
+	if len(cfg.SchemaOverrides) > 0 {
+		if err := inventory.ValidateSchemaOverrides(cfg.Type, cfg.SchemaOverrides); err != nil {
+			return nil, fmt.Errorf("local client for database %q: %w", cfg.Database, err)
+		}
+		hasDatabase, err := mysqlDSNHasDatabase(cfg.TargetDSN)
+		if err != nil {
+			return nil, fmt.Errorf("inspect MySQL target DSN for schema overrides: %w", err)
+		}
+		if hasDatabase {
+			return nil, fmt.Errorf("schema overrides require a namespace-free target DSN; the DSN already names a database")
+		}
+		cfg.SchemaOverrides = maps.Clone(cfg.SchemaOverrides)
+	}
+
 	// For Vitess databases, create a PlanetScale engine with a client factory
 	// that points at the API base URL from metadata (e.g., "http://localscale:8080").
 	// TargetDSN is the vtgate MySQL DSN for SHOW VITESS_MIGRATIONS.
 	var psEngine engine.Engine
 	var psClientFunc func(tokenName, tokenValue string) (psclient.PSClient, error)
 	if cfg.Type == storage.DatabaseTypeVitess {
+		// api_url is optional in a database's configuration and names a private or
+		// emulated endpoint when it is set. Absent, the database is a real
+		// PlanetScale one, so fall back to the public endpoint the way the
+		// inventory-resolved path does — the client needs a base URL to address
+		// the API directly, and leaving it empty would refuse every apply.
 		apiURL := cfg.Metadata["api_url"]
+		if apiURL == "" {
+			apiURL = inventory.DefaultPlanetScaleAPIURL
+		}
 		psClientFunc = func(tokenName, tokenValue string) (psclient.PSClient, error) {
 			return psclient.NewPSClientWithBaseURL(tokenName, tokenValue, apiURL)
 		}
@@ -232,7 +277,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	// factory. This is the embedder extension point for engines this build does
 	// not include.
 	var customEngine engine.Engine
-	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess {
+	if cfg.Type != storage.DatabaseTypeMySQL && cfg.Type != storage.DatabaseTypeVitess && cfg.Type != storage.DatabaseTypePostgres {
 		factory, ok := cfg.EngineFactories[cfg.Type]
 		if !ok {
 			return nil, fmt.Errorf("no engine registered for database type %q", cfg.Type)
@@ -250,16 +295,21 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		customEngine = eng
 	}
 
+	spiritSettings, err := spirit.SettingsFromMetadata(cfg.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("parse Spirit settings for database %q: %w", cfg.Database, err)
+	}
+
 	return &LocalClient{
 		config:  cfg,
 		storage: stor,
 		spiritEngine: spirit.New(spirit.Config{
-			Logger: logger,
-			// Pending drops quarantine is on by default; deployments opt out
-			// via the pending_drops metadata key.
-			DisablePendingDrops: cfg.Metadata["pending_drops"] == "false",
+			Logger:              logger,
+			DisablePendingDrops: pendingDropsDisabled(cfg.Metadata),
+			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
+		postgresEngine:    postgres.New(),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -318,10 +368,14 @@ func (c *LocalClient) protoEngine() ternv1.Engine {
 	}
 	// Fall back to the type default when there is no engine or its name has no
 	// proto representation.
-	if c.config.Type == storage.DatabaseTypeVitess {
+	switch c.config.Type {
+	case storage.DatabaseTypeVitess:
 		return ternv1.Engine_ENGINE_PLANETSCALE
+	case storage.DatabaseTypePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES
+	default:
+		return ternv1.Engine_ENGINE_SPIRIT
 	}
-	return ternv1.Engine_ENGINE_SPIRIT
 }
 
 func localPlanTarget(req *ternv1.PlanRequest, database string) string {
@@ -340,6 +394,8 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 		return ternv1.Engine_ENGINE_SPIRIT, nil
 	case storage.EngineStrata:
 		return ternv1.Engine_ENGINE_STRATA, nil
+	case storage.EnginePostgres:
+		return ternv1.Engine_ENGINE_POSTGRES, nil
 	default:
 		return 0, fmt.Errorf("unknown engine: %s", name)
 	}
@@ -348,6 +404,28 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
 	// LocalClient doesn't own storage, so nothing to close
+	return nil
+}
+
+// HaltForShutdown brings this client's engine down when the engine runs its
+// schema-change work in this process, so the process can exit without leaving
+// the target held by work no lease is being renewed for.
+func (c *LocalClient) HaltForShutdown(ctx context.Context) error {
+	eng := c.getEngine()
+	if eng == nil {
+		c.logger.Debug("no engine to halt for shutdown",
+			"database", c.config.Database, "database_type", c.config.Type)
+		return nil
+	}
+	supported, err := engine.HaltEngineForShutdown(ctx, eng)
+	if !supported {
+		c.logger.Debug("engine drives its schema changes outside this process; nothing to halt for shutdown",
+			"database", c.config.Database, "database_type", c.config.Type, "engine", eng.Name())
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("halt engine %s for database %s (%s) on shutdown: %w", eng.Name(), c.config.Database, c.config.Type, err)
+	}
 	return nil
 }
 
@@ -371,6 +449,8 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	// The data-plane model is a namespace-free DSN with the schema injected per
 	// operation (below); existing static/local configs still carry the database
 	// in the DSN, and those keep working until they migrate to namespace-free.
+	// (A DSN-with-database target cannot carry schema overrides; NewLocalClient
+	// rejects that combination.)
 	if hasDatabase {
 		return c.credentials(), nil
 	}
@@ -379,7 +459,11 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	if namespace == "" {
 		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
-	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, namespace)
+	physical, err := c.physicalMySQLNamespace(namespace)
+	if err != nil {
+		return nil, err
+	}
+	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, physical)
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +471,27 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 		DSN:      dsn,
 		Metadata: c.config.Metadata,
 	}, nil
+}
+
+// physicalMySQLNamespace resolves the physical schema name for a requested
+// (canonical) namespace. Without configured overrides the requested namespace
+// is the physical schema. With overrides the map is a strict allowlist: an
+// unmapped namespace fails rather than falling back to the canonical name, so
+// a request misrouted to this target cannot land in the wrong physical schema.
+func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
+	if len(c.config.SchemaOverrides) == 0 {
+		return namespace, nil
+	}
+	physical, ok := c.config.SchemaOverrides[namespace]
+	if !ok {
+		return "", fmt.Errorf("target does not authorize MySQL namespace %q; configured schema overrides map only %v", namespace, slices.Sorted(maps.Keys(c.config.SchemaOverrides)))
+	}
+	c.logger.Debug("resolved schema override for namespace",
+		"database", c.config.Database,
+		"namespace", namespace,
+		"physical_schema", physical,
+	)
+	return physical, nil
 }
 
 func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
@@ -435,6 +540,28 @@ func mysqlDSNHasDatabase(dsn string) (bool, error) {
 	return database != "", nil
 }
 
+// singleTaskNamespace returns the single non-empty namespace shared by the
+// tasks, or "" when no task carries one (a DSN-with-database target). Tasks
+// that drive one Spirit execution must agree on the namespace — it selects the
+// connection schema, so with mixed namespaces the schema addressed would
+// silently depend on task order. Fail loudly instead.
+func singleTaskNamespace(tasks []*storage.Task) (string, error) {
+	namespace := ""
+	for _, task := range tasks {
+		if task == nil || task.Namespace == "" {
+			continue
+		}
+		if namespace == "" {
+			namespace = task.Namespace
+			continue
+		}
+		if task.Namespace != namespace {
+			return "", fmt.Errorf("tasks span multiple namespaces (%q, %q)", namespace, task.Namespace)
+		}
+	}
+	return namespace, nil
+}
+
 func mysqlDSNDatabase(dsn string) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
@@ -443,7 +570,7 @@ func mysqlDSNDatabase(dsn string) (string, error) {
 	return cfg.DBName, nil
 }
 
-func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply) (bool, bool, error) {
+func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (bool, bool, error) {
 	if apply == nil {
 		return false, false, fmt.Errorf("apply is required for deferred cutover signal lookup")
 	}
@@ -452,9 +579,28 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 	if !ok {
 		return false, false, nil
 	}
+	// Resolve credentials through the task namespace so the lookup addresses
+	// the schema the apply actually runs against. The engine's sentinel query
+	// is schema-qualified (DSN database first, request database as fallback),
+	// so without injecting the mapped task namespace it would address the
+	// canonical database name and miss a sentinel that lives in a different
+	// physical schema.
+	//
+	// A deferred-cutover apply's tasks share exactly one namespace (grouped
+	// applies enforce this at credential resolution). Guard that invariant
+	// here: with mixed namespaces the lookup would silently depend on task
+	// order, so fail loudly instead.
+	namespace, err := singleTaskNamespace(tasks)
+	if err != nil {
+		return false, true, fmt.Errorf("deferred cutover signal lookup for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
+	}
+	creds, err := c.credentialsForMySQLNamespace(namespace)
+	if err != nil {
+		return false, true, fmt.Errorf("resolve credentials for deferred cutover signal lookup for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
+	}
 	exists, err := checker.DeferredCutoverSignalExists(ctx, &engine.DeferredCutoverSignalRequest{
 		Database:    apply.Database,
-		Credentials: c.credentials(),
+		Credentials: creds,
 	})
 	if err != nil {
 		return false, true, fmt.Errorf("check deferred cutover signal for apply %s database %s: %w", apply.ApplyIdentifier, apply.Database, err)
@@ -490,17 +636,48 @@ func (c *LocalClient) Health(ctx context.Context) error {
 }
 
 // PullSchema fetches the live schema and returns declarative schema files.
+// MySQL and Vitess use the built-in pull paths; any other database type is
+// delegated to the configured engine's SchemaPuller capability.
 func (c *LocalClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL && c.config.Type != storage.DatabaseTypeVitess {
-		return nil, fmt.Errorf("pull schema for database %s type %s: only %s and %s are supported: %w", c.config.Database, c.config.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, ErrPullSchemaUnsupportedType)
-	}
 	if req.Type != "" && req.Type != c.config.Type {
 		return nil, fmt.Errorf("pull schema for database %s: request type %q does not match client type %q: %w", c.config.Database, req.Type, c.config.Type, ErrPullSchemaInvalidRequest)
+	}
+	if c.config.Type != storage.DatabaseTypeMySQL && c.config.Type != storage.DatabaseTypeVitess {
+		return c.pullSchemaFromEngine(ctx, req)
 	}
 	if req.GetNamespace() == "" {
 		return c.pullAllNamespaces(ctx, req)
 	}
 	return c.pullSchemaNamespace(ctx, req, req.GetNamespace())
+}
+
+// pullSchemaFromEngine delegates a pull for a database type without a
+// built-in pull path to the configured engine's SchemaPuller capability. An
+// engine that does not implement the capability fails closed with
+// ErrPullSchemaUnsupportedType, which the gRPC server surfaces as
+// codes.Unimplemented. A nil response from an engine that does implement the
+// capability is a broken engine contract, not a missing capability: it is
+// deliberately surfaced as an internal error rather than the unsupported
+// sentinel, so an engine defect stays loud instead of reading as an expected
+// unsupported-type condition.
+func (c *LocalClient) pullSchemaFromEngine(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	puller, ok := c.getEngine().(SchemaPuller)
+	if !ok {
+		return nil, fmt.Errorf("pull schema for database %s type %s: engine does not support schema pull: %w", c.config.Database, c.config.Type, ErrPullSchemaUnsupportedType)
+	}
+	c.logger.Info("LocalClient.PullSchema: delegating to engine schema pull",
+		"database", c.config.Database,
+		"type", c.config.Type,
+		"namespace", req.GetNamespace(),
+	)
+	resp, err := puller.PullSchema(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("engine pull schema for database %s type %s: %w", c.config.Database, c.config.Type, err)
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("engine pull schema for database %s type %s returned a nil response", c.config.Database, c.config.Type)
+	}
+	return resp, nil
 }
 
 func (c *LocalClient) pullAllNamespaces(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -537,6 +714,16 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 		return []string{database}, nil
 	}
 
+	// A target with schema overrides serves exactly the mapped canonical
+	// namespaces. Return those keys rather than scanning the cluster, which
+	// would surface physical names (and unrelated databases) the requested
+	// canonical namespace model must not leak.
+	if len(c.config.SchemaOverrides) > 0 {
+		namespaces := slices.Sorted(maps.Keys(c.config.SchemaOverrides))
+		c.logger.Info("LocalClient.PullSchema: using schema-override namespaces", "database", c.config.Database, "namespace_count", len(namespaces))
+		return namespaces, nil
+	}
+
 	attrs := []any{"database", c.config.Database}
 	attrs = append(attrs, dsnLogAttrs(c.config.TargetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: discovering live namespaces", attrs...)
@@ -555,13 +742,14 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 	}
 	defer utils.CloseAndLog(rows)
 
+	dialect := schema.DialectForDatabaseType(c.config.Type)
 	var namespaces []string
 	for rows.Next() {
 		var namespace string
 		if err := rows.Scan(&namespace); err != nil {
 			return nil, fmt.Errorf("scan namespace for schema pull: %w", err)
 		}
-		if schema.IsReservedPullNamespace(namespace) {
+		if schema.IsReservedPullNamespaceForDialect(dialect, namespace) {
 			c.logger.Debug("LocalClient.PullSchema: skipping reserved namespace", "database", c.config.Database, "namespace", namespace)
 			continue
 		}
@@ -579,16 +767,21 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		return c.pullVitessSchemaNamespace(ctx, req, namespace)
 	}
 
+	// The physical schema is what MySQL is addressed by (connection schema and
+	// information_schema predicates); the requested canonical namespace stays
+	// the response key so callers never see physical names.
+	physical := namespace
 	targetDSN := c.config.TargetDSN
 	if c.config.Type == storage.DatabaseTypeMySQL {
-		creds, err := c.credentialsForMySQLPullNamespace(namespace)
+		creds, resolvedPhysical, err := c.credentialsForMySQLPullNamespace(namespace)
 		if err != nil {
-			return nil, fmt.Errorf("resolve database %s namespace %s credentials for schema pull: %w", c.config.Database, namespace, err)
+			return nil, fmt.Errorf("resolve database %s namespace %s target for schema pull: %w", c.config.Database, namespace, err)
 		}
+		physical = resolvedPhysical
 		targetDSN = creds.DSN
 	}
 
-	attrs := []any{"database", c.config.Database, "namespace", namespace}
+	attrs := []any{"database", c.config.Database, "namespace", namespace, "physical_schema", physical}
 	attrs = append(attrs, dsnLogAttrs(targetDSN)...)
 	c.logger.Info("LocalClient.PullSchema: loading live schema", attrs...)
 
@@ -616,7 +809,7 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		}
 		pulledTables[tbl.Name] = content
 	}
-	catalog, err := c.pullNamespaceCatalog(ctx, db, namespace, pulledTables, req.GetCatalogDetail())
+	catalog, err := c.pullNamespaceCatalog(ctx, db, namespace, physical, pulledTables, req.GetCatalogDetail())
 	if err != nil {
 		return nil, err
 	}
@@ -643,90 +836,92 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 }
 
 func (c *LocalClient) discoverVitessPullKeyspaces(ctx context.Context) ([]string, error) {
-	client, org, branch, err := c.planetScalePullClient()
+	pt, err := c.planetScalePullClient()
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "branch", branch)
-	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	c.logger.Info("LocalClient.PullSchema: discovering Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch)
+	keyspaces, err := pt.client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", c.config.Database, branch, err)
+		return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s: %w", pt.database, pt.branch, err)
 	}
+	dialect := schema.DialectForDatabaseType(c.config.Type)
 	namespaces := make([]string, 0, len(keyspaces))
 	for _, keyspace := range keyspaces {
 		if keyspace == nil {
-			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "branch", branch)
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch)
 			continue
 		}
 		if keyspace.Name == "" {
-			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", c.config.Database, branch)
+			return nil, fmt.Errorf("list Vitess keyspaces for database %s branch %s returned a keyspace with no name", pt.database, pt.branch)
 		}
-		if schema.IsReservedPullNamespace(keyspace.Name) {
-			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "branch", branch, "namespace", keyspace.Name)
+		if schema.IsReservedPullNamespaceForDialect(dialect, keyspace.Name) {
+			c.logger.Debug("LocalClient.PullSchema: skipping reserved Vitess keyspace", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", keyspace.Name)
 			continue
 		}
 		namespaces = append(namespaces, keyspace.Name)
 	}
 	sort.Strings(namespaces)
-	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "branch", branch, "namespace_count", len(namespaces))
+	c.logger.Info("LocalClient.PullSchema: discovered Vitess keyspaces", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace_count", len(namespaces))
 	return namespaces, nil
 }
 
 func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1.PullSchemaRequest, namespace string) (*ternv1.PullSchemaResponse, error) {
-	client, org, branch, err := c.planetScalePullClient()
+	pt, err := c.planetScalePullClient()
 	if err != nil {
 		return nil, err
 	}
 
-	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
-	schemaResult, err := client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	c.logger.Info("LocalClient.PullSchema: loading live Vitess schema", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", namespace)
+	schemaResult, err := pt.client.GetBranchSchema(ctx, &ps.BranchSchemaRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 		Keyspace:     namespace,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 	}
 
 	pulledTables := make(map[string]string, len(schemaResult))
 	for _, tbl := range schemaResult {
 		if tbl == nil {
-			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "branch", branch, "namespace", namespace)
+			c.logger.Warn("LocalClient.PullSchema: skipping nil Vitess table schema", "database", c.config.Database, "planetscale_database", pt.database, "branch", pt.branch, "namespace", namespace)
 			continue
 		}
 		if tbl.Name == "" {
-			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", c.config.Database, branch, namespace)
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s returned a table with no name", pt.database, pt.branch, namespace)
 		}
 		content, err := pulledSchemaFileContent(c.config.Database, tbl.Name, tbl.Raw)
 		if err != nil {
-			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+			return nil, fmt.Errorf("fetch Vitess schema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 		}
 		pulledTables[tbl.Name] = content
 	}
 
 	artifacts := map[string]string{}
-	vschema, err := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-		Organization: org,
-		Database:     c.config.Database,
-		Branch:       branch,
+	vschema, err := pt.client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
+		Organization: pt.org,
+		Database:     pt.database,
+		Branch:       pt.branch,
 		Keyspace:     namespace,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", c.config.Database, branch, namespace, err)
+		return nil, fmt.Errorf("fetch Vitess VSchema for database %s branch %s keyspace %s: %w", pt.database, pt.branch, namespace, err)
 	}
 	if vschema != nil && strings.TrimSpace(vschema.Raw) != "" {
-		artifacts[vSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
+		artifacts[storage.VSchemaArtifactName] = strings.TrimRight(vschema.Raw, "\n") + "\n"
 	}
 
 	c.logger.Info("LocalClient.PullSchema: loaded live Vitess schema",
 		"database", c.config.Database,
-		"branch", branch,
+		"planetscale_database", pt.database,
+		"branch", pt.branch,
 		"namespace", namespace,
 		"table_count", len(pulledTables),
 		"artifact_count", len(artifacts),
@@ -761,13 +956,33 @@ func (c *LocalClient) pullVitessSchemaNamespace(ctx context.Context, req *ternv1
 	}, nil
 }
 
-func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string, error) {
+// planetScalePullTarget carries the PlanetScale client and the identifiers a
+// pull resolves once per call: the organization, the PlanetScale database
+// name, and the branch to read from.
+type planetScalePullTarget struct {
+	client   psclient.PSClient
+	org      string
+	database string
+	branch   string
+}
+
+func (c *LocalClient) planetScalePullClient() (*planetScalePullTarget, error) {
 	if c.psClientFunc == nil {
-		return nil, "", "", fmt.Errorf("PlanetScale client is not configured for database %s: %w", c.config.Database, ErrPullSchemaUnsupportedType)
+		// A vitess database supports pull; a missing PlanetScale client is a
+		// configuration defect, surfaced as an internal error rather than the
+		// unsupported-type sentinel so it cannot read as "pull not supported".
+		return nil, fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
 	}
 	org := c.config.Metadata["organization"]
 	if org == "" {
-		return nil, "", "", fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+		return nil, fmt.Errorf("PlanetScale organization metadata is required for database %s", c.config.Database)
+	}
+	// The SchemaBot database identifier is a routing and display key; the
+	// PlanetScale database name in target metadata is what the API addresses.
+	// Without the metadata the identifier doubles as the PlanetScale name.
+	database := c.config.Metadata["database"]
+	if database == "" {
+		database = c.config.Database
 	}
 	branch := c.config.Metadata["main_branch"]
 	if branch == "" {
@@ -775,9 +990,9 @@ func (c *LocalClient) planetScalePullClient() (psclient.PSClient, string, string
 	}
 	client, err := c.psClientFunc(c.config.Metadata["token_name"], c.config.Metadata["token_value"])
 	if err != nil {
-		return nil, "", "", fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
+		return nil, fmt.Errorf("create PlanetScale client for database %s: %w", c.config.Database, err)
 	}
-	return client, org, branch, nil
+	return &planetScalePullTarget{client: client, org: org, database: database, branch: branch}, nil
 }
 
 type pulledCatalog struct {
@@ -785,13 +1000,15 @@ type pulledCatalog struct {
 	tables    map[string]*ternv1.TableCatalog
 }
 
-func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
+func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, namespace, physical string, pulledTables map[string]string, catalogDetail ternv1.PullCatalogDetail) (*pulledCatalog, error) {
 	// BASIC pulls only canonical DDL and artifacts (the pre-catalog pull shape):
 	// no namespace or table catalog. The full structured catalog is built only
 	// at DETAILED detail.
 	if catalogDetail != ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED {
 		return &pulledCatalog{}, nil
 	}
+	// The catalog is named by the requested canonical namespace; the live rows
+	// are read from the physical schema (they differ under schema overrides).
 	catalog := &pulledCatalog{
 		namespace: &ternv1.NamespaceCatalog{
 			Name:       namespace,
@@ -803,39 +1020,39 @@ func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, name
 	if len(pulledTables) == 0 {
 		return catalog, nil
 	}
-	if err := c.loadTableCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadTableCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadColumnCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadColumnCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadIndexCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadIndexCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadForeignKeyCatalog(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadForeignKeyCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadTableEstimates(ctx, db, namespace, pulledTables, catalog.tables); err != nil {
+	if err := c.loadTableEstimates(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
 	return catalog, nil
 }
 
-func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, table_type, table_comment
 		FROM information_schema.tables
 		WHERE table_schema = ?
-		ORDER BY table_name`, namespace)
+		ORDER BY table_name`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
 	for rows.Next() {
 		var tableName, tableType, tableComment string
 		if err := rows.Scan(&tableName, &tableType, &tableComment); err != nil {
-			return fmt.Errorf("scan table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			catalog[tableName] = &ternv1.TableCatalog{
@@ -846,7 +1063,7 @@ func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespac
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate table catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
@@ -855,14 +1072,14 @@ func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, namespac
 // estimates from information_schema.tables. These are approximations (NULL for
 // views, stale until statistics are refreshed) and are only loaded at DETAILED
 // catalog detail.
-func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, table_rows, data_length, index_length
 		FROM information_schema.tables
 		WHERE table_schema = ?
-		ORDER BY table_name`, namespace)
+		ORDER BY table_name`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -870,7 +1087,7 @@ func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namesp
 		var tableName string
 		var tableRows, dataLength, indexLength sql.NullInt64
 		if err := rows.Scan(&tableName, &tableRows, &dataLength, &indexLength); err != nil {
-			return fmt.Errorf("scan table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
@@ -879,19 +1096,19 @@ func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, namesp
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate table estimates for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
 
-func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, column_name, column_type, is_nullable, column_default, column_comment, extra
 		FROM information_schema.columns
 		WHERE table_schema = ?
-		ORDER BY table_name, ordinal_position`, namespace)
+		ORDER BY table_name, ordinal_position`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load column catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -899,7 +1116,7 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 		var tableName, columnName, columnType, nullable, comment, extra string
 		var defaultValue sql.NullString
 		if err := rows.Scan(&tableName, &columnName, &columnType, &nullable, &defaultValue, &comment, &extra); err != nil {
-			return fmt.Errorf("scan column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan column catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
@@ -923,19 +1140,19 @@ func (c *LocalClient) loadColumnCatalog(ctx context.Context, db *sql.DB, namespa
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate column catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate column catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
 
-func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, index_name, non_unique, column_name, expression
 		FROM information_schema.statistics
 		WHERE table_schema = ?
-		ORDER BY table_name, index_name, seq_in_index`, namespace)
+		ORDER BY table_name, index_name, seq_in_index`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load index catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -945,7 +1162,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 		var columnName, expression sql.NullString
 		var nonUnique int32
 		if err := rows.Scan(&tableName, &indexName, &nonUnique, &columnName, &expression); err != nil {
-			return fmt.Errorf("scan index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan index catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			indexedValue := ""
@@ -955,7 +1172,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 			case expression.Valid:
 				indexedValue = expression.String
 			default:
-				c.logger.Warn("LocalClient.PullSchema: skipping index part without column or expression", "database", c.config.Database, "namespace", namespace, "table", tableName, "index", indexName)
+				c.logger.Warn("LocalClient.PullSchema: skipping index part without column or expression", "database", c.config.Database, "physical_schema", physicalSchema, "table", tableName, "index", indexName)
 				continue
 			}
 			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
@@ -976,7 +1193,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate index catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate index catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
@@ -986,7 +1203,7 @@ func (c *LocalClient) loadIndexCatalog(ctx context.Context, db *sql.DB, namespac
 // per-constraint ON UPDATE / ON DELETE rules). referential_constraints
 // contains only foreign-key constraints, so the join naturally restricts to
 // them; primary-key and unique constraints are already represented as indexes.
-func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, namespace string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
+func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT kcu.table_name, kcu.constraint_name, kcu.column_name,
 		       kcu.referenced_table_name, kcu.referenced_column_name,
@@ -996,9 +1213,9 @@ func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, nam
 		  ON rc.constraint_schema = kcu.constraint_schema
 		 AND rc.constraint_name = kcu.constraint_name
 		WHERE kcu.table_schema = ?
-		ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`, namespace)
+		ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`, physicalSchema)
 	if err != nil {
-		return fmt.Errorf("load foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("load foreign key catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -1007,7 +1224,7 @@ func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, nam
 		var tableName, constraintName string
 		var columnName, referencedTable, referencedColumn, updateRule, deleteRule sql.NullString
 		if err := rows.Scan(&tableName, &constraintName, &columnName, &referencedTable, &referencedColumn, &updateRule, &deleteRule); err != nil {
-			return fmt.Errorf("scan foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+			return fmt.Errorf("scan foreign key catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; !ok {
 			continue
@@ -1031,7 +1248,7 @@ func (c *LocalClient) loadForeignKeyCatalog(ctx context.Context, db *sql.DB, nam
 		fk.ReferencedColumns = append(fk.ReferencedColumns, referencedColumn.String)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate foreign key catalog for database %s namespace %s: %w", c.config.Database, namespace, err)
+		return fmt.Errorf("iterate foreign key catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
@@ -1063,31 +1280,38 @@ func (c *LocalClient) pullResponseDatabase(req *ternv1.PullSchemaRequest) string
 	return c.config.Database
 }
 
-func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engine.Credentials, error) {
+// credentialsForMySQLPullNamespace resolves the connection credentials and the
+// physical schema a pull for the requested canonical namespace reads, so the
+// pull path resolves the schema-override mapping exactly once.
+func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engine.Credentials, string, error) {
 	if c.config.Type != storage.DatabaseTypeMySQL {
-		return c.credentials(), nil
+		return c.credentials(), namespace, nil
 	}
 	database, err := mysqlDSNDatabase(c.config.TargetDSN)
 	if err != nil {
-		return nil, fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
+		return nil, "", fmt.Errorf("inspect MySQL target DSN for namespace injection: %w", err)
 	}
 	if database != "" {
 		if database != namespace {
-			return nil, fmt.Errorf("target DSN database %q does not match requested namespace %q", database, namespace)
+			return nil, "", fmt.Errorf("target DSN database %q does not match requested namespace %q", database, namespace)
 		}
-		return c.credentials(), nil
+		return c.credentials(), namespace, nil
 	}
 	if namespace == "" {
-		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
+		return nil, "", fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
-	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, namespace)
+	physical, err := c.physicalMySQLNamespace(namespace)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	dsn, err := mysqlDSNWithDatabase(c.config.TargetDSN, physical)
+	if err != nil {
+		return nil, "", err
 	}
 	return &engine.Credentials{
 		DSN:      dsn,
 		Metadata: c.config.Metadata,
-	}, nil
+	}, physical, nil
 }
 
 func pulledSchemaFileContent(database string, tableName string, tableDDL string) (string, error) {
@@ -1142,85 +1366,10 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Store the plan in SchemaBot's storage
 	ddlChanges := make([]storage.TableChange, len(result.FlatTableChanges()))
 	for i, t := range result.FlatTableChanges() {
-		ddlChanges[i] = storage.TableChange{
-			Table:        t.Table,
-			DDL:          t.DDL,
-			Operation:    ddl.StatementTypeToOp(t.Operation),
-			IsUnsafe:     t.IsUnsafe,
-			UnsafeReason: t.UnsafeReason,
-		}
+		ddlChanges[i] = storageTableChangeFromEngine(t, "")
 	}
 
-	// Build per-namespace plan data from the engine's changes.
-	// For Vitess, each namespace is a keyspace. For Spirit, there's one namespace.
-	namespaces := make(map[string]*storage.NamespacePlanData)
-	seenTable := make(map[string]map[string]bool)
-	var allShardPlans []storage.ShardPlan
-	for _, sc := range result.Changes {
-		ns := c.planNamespace(sc.Namespace)
-		nsData := namespaces[ns]
-		if nsData == nil {
-			nsData = &storage.NamespacePlanData{}
-			namespaces[ns] = nsData
-			seenTable[ns] = make(map[string]bool)
-		}
-		// A plan is keyed by (namespace, shard), so a sharded engine emits one
-		// SchemaChange per shard and the same table repeats across a keyspace's
-		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
-		for _, tc := range sc.TableChanges {
-			if seenTable[ns][tc.Table] {
-				continue
-			}
-			seenTable[ns][tc.Table] = true
-			nsData.Tables = append(nsData.Tables, storage.TableChange{
-				Table:        tc.Table,
-				DDL:          tc.DDL,
-				Operation:    ddl.StatementTypeToOp(tc.Operation),
-				IsUnsafe:     tc.IsUnsafe,
-				UnsafeReason: tc.UnsafeReason,
-			})
-		}
-		// Record each changing shard's own changes so apply-create can rebuild
-		// per-shard operation groups with per-shard DDL (a keyspace whose shards
-		// diverge is persisted per shard, not collapsed; a shard is changing iff
-		// it has changes). A SchemaChange with an empty shard targets the whole
-		// namespace (non-sharded engines) and contributes no shard rows.
-		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
-			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
-			for _, tc := range sc.TableChanges {
-				sp.Changes = append(sp.Changes, storage.TableChange{
-					Namespace:    ns,
-					Table:        tc.Table,
-					DDL:          tc.DDL,
-					Operation:    ddl.StatementTypeToOp(tc.Operation),
-					IsUnsafe:     tc.IsUnsafe,
-					UnsafeReason: tc.UnsafeReason,
-				})
-			}
-			nsData.Shards = append(nsData.Shards, sp)
-			allShardPlans = append(allShardPlans, sp)
-		}
-		if len(sc.OriginalFiles) > 0 {
-			nsData.OriginalFiles = sc.OriginalFiles
-		}
-		if sc.OriginalFilesCaptured {
-			nsData.OriginalFilesCaptured = true
-			if nsData.OriginalFiles == nil {
-				nsData.OriginalFiles = map[string]string{}
-			}
-		}
-		// Only store VSchema artifacts when the Plan detected a change.
-		if sc.Metadata["vschema_changed"] == "true" {
-			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
-				if vs, ok := nsFiles.Files[vSchemaArtifactName]; ok && vs != "" {
-					if nsData.Artifacts == nil {
-						nsData.Artifacts = map[string]string{}
-					}
-					nsData.Artifacts[vSchemaArtifactName] = vs
-				}
-			}
-		}
-	}
+	namespaces, allShardPlans := c.namespacesFromEngineChanges(result.Changes, schemaFiles)
 	if len(namespaces) == 0 {
 		namespaces[c.config.Database] = &storage.NamespacePlanData{
 			Tables: ddlChanges,
@@ -1230,7 +1379,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	// Don't store empty plans — no DDL changes, no VSchema changes.
 	hasVSchemaChanges := false
 	for _, ns := range namespaces {
-		if namespaceHasVSchemaArtifact(ns) {
+		if ns.ChangesVSchema() {
 			hasVSchemaChanges = true
 			break
 		}
@@ -1318,6 +1467,28 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 	}
 
 	changes, violations, protoShards := c.planResultToProtoChanges(result)
+	// Log the resulting change set so a diverged deployment is triageable from
+	// this side's logs alone: change count plus one line per table change, with
+	// DDL length instead of the DDL body.
+	changeCount := 0
+	for _, ch := range changes {
+		changeCount += len(ch.TableChanges)
+	}
+	c.logger.Info("LocalClient.PlanDiff: plan diff response",
+		"database", c.config.Database,
+		"change_count", changeCount,
+	)
+	for _, ch := range changes {
+		for _, tc := range ch.TableChanges {
+			c.logger.Info("LocalClient.PlanDiff: table change",
+				"database", c.config.Database,
+				"namespace", tc.Namespace,
+				"table", tc.TableName,
+				"change_type", tc.ChangeType.String(),
+				"ddl_len", len(tc.Ddl),
+			)
+		}
+	}
 	return &ternv1.PlanDiffResponse{
 		Engine:         c.protoEngine(),
 		Changes:        changes,
@@ -1343,41 +1514,40 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 		if protoSC == nil {
 			protoSC = &ternv1.SchemaChange{
 				Namespace:             ns,
-				Metadata:              sc.Metadata,
+				Metadata:              maps.Clone(sc.Metadata),
 				OriginalFiles:         sc.OriginalFiles,
 				OriginalFilesCaptured: sc.OriginalFilesCaptured,
 			}
 			protoByNS[ns] = protoSC
 			protoTableSeen[ns] = make(map[string]bool)
 			changes = append(changes, protoSC)
+		} else {
+			// A sharded namespace's changes collapse into one wire change, so
+			// merge metadata key by key (first write wins): the namespace's
+			// VSchema annotation must survive no matter which shard's change
+			// carries it.
+			for key, value := range sc.Metadata {
+				if protoSC.Metadata == nil {
+					protoSC.Metadata = map[string]string{}
+				}
+				if _, ok := protoSC.Metadata[key]; !ok {
+					protoSC.Metadata[key] = value
+				}
+			}
 		}
 		for _, t := range sc.TableChanges {
 			if protoTableSeen[ns][t.Table] {
 				continue
 			}
 			protoTableSeen[ns][t.Table] = true
-			protoSC.TableChanges = append(protoSC.TableChanges, &ternv1.TableChange{
-				TableName:    t.Table,
-				ChangeType:   changeTypeToProto(t.Operation),
-				Ddl:          t.DDL,
-				IsUnsafe:     t.IsUnsafe,
-				UnsafeReason: t.UnsafeReason,
-				Namespace:    ns,
-			})
+			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
 		// (non-sharded engines) and contributes no shard rows.
 		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
 			protoSP := &ternv1.ShardPlan{Shard: shardName, Namespace: ns}
 			for _, t := range sc.TableChanges {
-				protoSP.Changes = append(protoSP.Changes, &ternv1.TableChange{
-					Namespace:    ns,
-					TableName:    t.Table,
-					Ddl:          t.DDL,
-					ChangeType:   changeTypeToProto(t.Operation),
-					IsUnsafe:     t.IsUnsafe,
-					UnsafeReason: t.UnsafeReason,
-				})
+				protoSP.Changes = append(protoSP.Changes, protoTableChangeFromEngine(t, ns))
 			}
 			shards = append(shards, protoSP)
 		}
@@ -1410,6 +1580,19 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		return nil, err
 	}
 	if hasDatabase {
+		// A database-scoped target DSN diffs the whole database as one unit:
+		// the engine loads every live table while the desired state is only
+		// the files the caller sent. A namespace withheld via
+		// ignore_namespaces leaves its live tables with no declaring file, so
+		// the declarative diff would plan them as drops — the inverse of
+		// "ignore". No reliable live-table→namespace mapping exists on this
+		// shape, so refuse rather than emit a plan that proposes dropping the
+		// namespace the config says to leave alone.
+		if len(req.GetIgnoredNamespaces()) > 0 {
+			return nil, fmt.Errorf(
+				"ignore_namespaces is not supported for MySQL targets whose DSN names a database: the whole database is diffed as one unit, so ignored namespaces %v would have their live tables planned as DROP TABLE; use a namespace-free target DSN or remove ignore_namespaces",
+				req.GetIgnoredNamespaces())
+		}
 		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
 	}
 	if len(schemaFiles) == 0 {
@@ -1518,16 +1701,132 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if op == "unknown" || op == "vschema_update" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
-		out = append(out, storage.TableChange{
-			Namespace:    namespace,
-			Table:        table,
-			DDL:          ddl,
-			Operation:    op,
-			IsUnsafe:     ch.IsUnsafe,
-			UnsafeReason: ch.UnsafeReason,
-		})
+		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, op))
 	}
 	return out, nil
+}
+
+// vschemaOnlyDispatchNamespaces returns, deduplicated in dispatch order, the
+// namespaces of a VSchema-only dispatch — one where every ddl_change carries
+// CHANGE_TYPE_VSCHEMA — or nil when the dispatch carries any table DDL or no
+// changes at all. This is the shape the control plane's task-less VSchema
+// dispatch sends; a mixed set is a work dispatch and returns nil so the caller
+// treats it as one.
+func vschemaOnlyDispatchNamespaces(changes []*ternv1.TableChange) []string {
+	if len(changes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(changes))
+	namespaces := make([]string, 0, len(changes))
+	for _, ch := range changes {
+		if ch == nil || ch.ChangeType != ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
+			return nil
+		}
+		namespace := strings.TrimSpace(ch.Namespace)
+		if namespace == "" {
+			return nil
+		}
+		if _, ok := seen[namespace]; ok {
+			continue
+		}
+		seen[namespace] = struct{}{}
+		namespaces = append(namespaces, namespace)
+	}
+	return namespaces
+}
+
+// finalizerDispatchScope validates a group_finalizer dispatch's namespace set
+// against the stored plan and resolves the operation scope the finalizer is
+// created with. A single-namespace dispatch (a sharded plan's per-namespace
+// finalizer) is namespace-scoped; a multi-namespace dispatch (a VSchema-only
+// plan) is deployment-scoped (empty namespace) and applies every dispatched
+// namespace's VSchema in one engine apply — the engine treats the deployment
+// as the unit of change, so splitting the namespaces across operations would
+// have each drive validating keyspaces whose VSchema it never applied. Every
+// dispatched namespace must hold a VSchema artifact in the stored plan —
+// otherwise the drive would have nothing to apply and the operation would fail
+// only after it was created.
+//
+// A single-namespace dispatch is shape-ambiguous on its own: a sharded plan's
+// per-namespace finalizer and a deployment-scoped finalizer over a plan whose
+// only VSchema change is one namespace arrive identically. The dispatch's
+// generation manifest names the dispatcher's actual operation keys, so when
+// one is present it resolves the shape; without one the dispatch keeps the
+// namespace-scoped reading.
+func finalizerDispatchScope(plan *storage.Plan, namespaces []string, generationManifest []string) (string, error) {
+	if len(namespaces) == 0 {
+		return "", fmt.Errorf("group_finalizer dispatch names no namespaces")
+	}
+	for _, namespace := range namespaces {
+		if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
+			return "", fmt.Errorf("group_finalizer dispatch for namespace %q: %w", namespace, err)
+		}
+	}
+	if len(namespaces) == 1 && !manifestNamesDeploymentScopedFinalizer(generationManifest, namespaces[0]) {
+		return namespaces[0], nil
+	}
+	// A deployment-scoped finalizer's drive applies every VSchema-changed
+	// namespace in the stored plan, so a deployment-scoped dispatch must cover
+	// exactly that set — a partial dispatch would silently apply namespaces the
+	// dispatcher never named.
+	planNamespaces := plan.VSchemaNamespaces()
+	dispatched := append([]string(nil), namespaces...)
+	sort.Strings(dispatched)
+	if !slices.Equal(dispatched, planNamespaces) {
+		return "", fmt.Errorf("group_finalizer dispatch names namespaces %v but plan %s changes VSchema in %v; a deployment-scoped dispatch must cover the plan's full VSchema set",
+			namespaces, plan.PlanIdentifier, planNamespaces)
+	}
+	return "", nil
+}
+
+// manifestNamesDeploymentScopedFinalizer reports whether a single-namespace
+// finalizer dispatch resolves to the deployment-scoped shape: its generation
+// manifest names the deployment-scoped finalizer key and not the namespace's
+// own finalizer key. The manifest is the dispatcher's declared operation-key
+// set, so the operation created here must carry a key from that set — the
+// manifest is the completion authority for the apply, and a key outside it is
+// refused at creation. An empty manifest (a dispatch without generation
+// tracking) resolves nothing and keeps the namespace-scoped reading.
+func manifestNamesDeploymentScopedFinalizer(generationManifest []string, namespace string) bool {
+	if len(generationManifest) == 0 {
+		return false
+	}
+	if slices.Contains(generationManifest, namespace+finalizerOperationKeySuffix) {
+		return false
+	}
+	return slices.Contains(generationManifest, finalizerDeploymentScopedKey)
+}
+
+// shardScopedDispatchOperationKey builds the operation key for a shard-scoped
+// dispatch's single operation. The control plane's per-shard fan-out dispatches
+// one (namespace, shard, table)'s changes per operation, so every change in the
+// dispatch must agree on namespace and table; a mixed set is a malformed
+// dispatch and fails closed rather than stamping a key that matches only some
+// of the dispatch's tasks. Components must not contain the key's "/" delimiter:
+// readers split the key back into exactly three parts, so a delimiter inside a
+// component would produce a key they no longer recognize as shard-scoped work.
+func shardScopedDispatchOperationKey(changes []storage.TableChange, shard string) (string, error) {
+	if len(changes) == 0 {
+		return "", fmt.Errorf("shard-scoped dispatch has no ddl changes to key its operation from")
+	}
+	namespace, table := changes[0].Namespace, changes[0].Table
+	for _, ch := range changes[1:] {
+		if ch.Namespace != namespace || ch.Table != table {
+			return "", fmt.Errorf("shard-scoped dispatch mixes tables %s.%s and %s.%s; a dispatch must carry one table's changes for one shard",
+				namespace, table, ch.Namespace, ch.Table)
+		}
+	}
+	for _, component := range []struct{ name, value string }{
+		{"namespace", namespace},
+		{"shard", shard},
+		{"table", table},
+	} {
+		if strings.Contains(component.value, "/") {
+			return "", fmt.Errorf("shard-scoped dispatch %s %q contains the shard operation key delimiter; refusing to stamp a key readers would misparse",
+				component.name, component.value)
+		}
+	}
+	return storage.ShardOperationKey(namespace, shard, table), nil
 }
 
 // planForApplyRequest resolves the plan for an apply. It prefers a plan row in
@@ -1546,7 +1845,7 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if plan != nil {
 		return plan, nil
 	}
-	if len(req.DdlChanges) == 0 && len(req.SchemaFiles) == 0 {
+	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
 	return c.materializeApplyRequestPlan(ctx, req)
@@ -1613,6 +1912,79 @@ func (c *LocalClient) materializeApplyRequestPlan(ctx context.Context, req *tern
 	return plan, nil
 }
 
+// namespacesFromEngineChanges builds per-namespace plan data from the engine's
+// plan changes. For Vitess, each namespace is a keyspace; for Spirit, there is
+// one namespace.
+func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, []storage.ShardPlan) {
+	namespaces := make(map[string]*storage.NamespacePlanData)
+	seenTable := make(map[string]map[string]bool)
+	var allShardPlans []storage.ShardPlan
+	for _, sc := range changes {
+		ns := c.planNamespace(sc.Namespace)
+		nsData := namespaces[ns]
+		if nsData == nil {
+			nsData = &storage.NamespacePlanData{}
+			namespaces[ns] = nsData
+			seenTable[ns] = make(map[string]bool)
+		}
+		// A plan is keyed by (namespace, shard), so a sharded engine emits one
+		// SchemaChange per shard and the same table repeats across a keyspace's
+		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
+		for _, tc := range sc.TableChanges {
+			if seenTable[ns][tc.Table] {
+				continue
+			}
+			seenTable[ns][tc.Table] = true
+			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
+		}
+		// Record each changing shard's own changes so apply-create can rebuild
+		// per-shard operation groups with per-shard DDL (a keyspace whose shards
+		// diverge is persisted per shard, not collapsed; a shard is changing iff
+		// it has changes). A SchemaChange with an empty shard targets the whole
+		// namespace (non-sharded engines) and contributes no shard rows.
+		if shardName := strings.TrimSpace(sc.Shard.Name); shardName != "" {
+			sp := storage.ShardPlan{Shard: shardName, Namespace: ns}
+			for _, tc := range sc.TableChanges {
+				sp.Changes = append(sp.Changes, storageTableChangeFromEngine(tc, ns))
+			}
+			nsData.Shards = append(nsData.Shards, sp)
+			allShardPlans = append(allShardPlans, sp)
+		}
+		if len(sc.OriginalFiles) > 0 {
+			nsData.OriginalFiles = sc.OriginalFiles
+		}
+		if sc.OriginalFilesCaptured {
+			nsData.OriginalFilesCaptured = true
+			if nsData.OriginalFiles == nil {
+				nsData.OriginalFiles = map[string]string{}
+			}
+		}
+		// A sharded keyspace's SchemaChanges share one nsData, so merge the
+		// gate-facing VSchema metadata key by key: a sibling shard's change
+		// carrying less of it (or none) must not clear a deletion or mutation
+		// record another shard already persisted.
+		for key, value := range storage.VSchemaPlanMetadata(sc.Metadata) {
+			if nsData.Metadata == nil {
+				nsData.Metadata = map[string]string{}
+			}
+			if _, ok := nsData.Metadata[key]; !ok {
+				nsData.Metadata[key] = value
+			}
+		}
+		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+			if nsFiles, ok := schemaFiles[ns]; ok && nsFiles != nil {
+				if vs, ok := nsFiles.Files[storage.VSchemaArtifactName]; ok && vs != "" {
+					if nsData.Artifacts == nil {
+						nsData.Artifacts = map[string]string{}
+					}
+					nsData.Artifacts[storage.VSchemaArtifactName] = vs
+				}
+			}
+		}
+	}
+	return namespaces, allShardPlans
+}
+
 // namespacesFromApplyRequest rebuilds per-namespace plan data from a dispatch
 // request so a deployment that did not plan locally applies exactly what the
 // primary deployment planned. Table changes are grouped by namespace (resolved
@@ -1640,8 +2012,20 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			continue
 		}
 		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
-			ensure(ch.Namespace)
+			nsData := ensure(ch.Namespace)
 			vschemaChangedNamespaces[c.planNamespace(ch.Namespace)] = true
+			// The dispatch carries the namespace's persisted VSchema
+			// change-metadata on its VSchema change; merge it key by key
+			// (first write wins) so the materialized plan runs the same
+			// apply-time safety gates as a locally stored one.
+			for key, value := range storage.VSchemaPlanMetadata(ch.Metadata) {
+				if nsData.Metadata == nil {
+					nsData.Metadata = map[string]string{}
+				}
+				if _, ok := nsData.Metadata[key]; !ok {
+					nsData.Metadata[key] = value
+				}
+			}
 			continue
 		}
 		op, err := materializedTableChangeOperation(ch)
@@ -1649,30 +2033,23 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			return nil, err
 		}
 		nsData := ensure(ch.Namespace)
-		nsData.Tables = append(nsData.Tables, storage.TableChange{
-			Namespace:    ch.Namespace,
-			Table:        ch.TableName,
-			DDL:          ch.Ddl,
-			Operation:    op,
-			IsUnsafe:     ch.IsUnsafe,
-			UnsafeReason: ch.UnsafeReason,
-		})
+		nsData.Tables = append(nsData.Tables, StorageTableChangeFromProto(ch, ch.Namespace, ch.TableName, ch.Ddl, op))
 	}
 
 	for ns := range vschemaChangedNamespaces {
 		nsFiles := schemaFiles[ns]
 		vs := ""
 		if nsFiles != nil {
-			vs = nsFiles.Files[vSchemaArtifactName]
+			vs = nsFiles.Files[storage.VSchemaArtifactName]
 		}
 		if vs == "" {
-			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, vSchemaArtifactName)
+			return nil, fmt.Errorf("apply request indicates a vschema change for namespace %q but carries no %s artifact", ns, storage.VSchemaArtifactName)
 		}
 		nsData := namespaces[ns]
 		if nsData.Artifacts == nil {
 			nsData.Artifacts = map[string]string{}
 		}
-		nsData.Artifacts[vSchemaArtifactName] = vs
+		nsData.Artifacts[storage.VSchemaArtifactName] = vs
 	}
 
 	return namespaces, nil
@@ -1709,6 +2086,26 @@ func rejectUnsafeDDLChangesWithoutOptIn(planIdentifier string, changes []storage
 	return nil
 }
 
+// rejectUnsafeVSchemaChangesWithoutOptIn is the VSchema counterpart of
+// rejectUnsafeDDLChangesWithoutOptIn: it re-checks the stored plan's recorded
+// VSchema deletions and mutations at apply admission, so a dispatched
+// VSchema-only operation — whose scope carries no table DDL for the DDL gate
+// to inspect — still requires the same explicit opt-in the queueing gate
+// enforced. The gate reads the whole plan rather than the dispatch scope: the
+// VSchema change is namespace-level, and admission must never accept work the
+// plan discloses as unsafe.
+func rejectUnsafeVSchemaChangesWithoutOptIn(plan *storage.Plan, applyOpts storage.ApplyOptions) error {
+	if applyOpts.AllowUnsafe {
+		return nil
+	}
+	changes := plan.UnsafeVSchemaChanges()
+	if len(changes) == 0 {
+		return nil
+	}
+	change := changes[0]
+	return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
+}
+
 // existingIdempotentApply returns the apply previously created for
 // req.IdempotencyKey, or nil when the key is empty or unseen. The match is
 // returned regardless of the existing apply's state: the key encodes the
@@ -1740,6 +2137,340 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 	return existing, nil
 }
 
+// newTaskIdentifier returns a fresh opaque task identifier (`task-<16 hex>`).
+func newTaskIdentifier() string {
+	return "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+}
+
+// dispatchScope is the execution shape derived from a dispatch request: the
+// DDL changes this dispatch drives, the single target shard of a shard-scoped
+// dispatch, and whether the dispatch is a task-less VSchema finalizer.
+type dispatchScope struct {
+	ddlChanges         []storage.TableChange
+	shard              string
+	finalizer          bool
+	finalizerNamespace string
+}
+
+// deriveDispatchScope determines a dispatch request's scope. A sharded
+// engine's work is dispatched one apply_operation per shard, so a request that
+// carries target shards is scoped to that single shard: it drives the
+// operation's own DDL changes (req.DdlChanges) and tags its tasks with the
+// shard, so the engine receives exactly one target shard. More than one target
+// shard is a malformed dispatch (the per-shard fan-out emits one shard per
+// operation) and fails closed.
+//
+// A dispatch with no target shards whose changes are all VSchema-typed is a
+// VSchema apply: it targets VSchema documents and deliberately carries no
+// shard (the VSchema is namespace-level). Whether the stored plan also
+// carries table DDL (a group_finalizer alongside sibling shard work) or is
+// VSchema-only (the plan's entire change), falling back to the plan's flat
+// DDL here would be wrong: sibling table DDL would resurrect as shard-less
+// work tasks a sharded engine rejects, and a VSchema-only plan would yield
+// a work operation with no tasks — a shape with nothing to drive. The scope
+// is the task-less group_finalizer instead — the dispatch's one namespace, or
+// the whole deployment when the dispatch names every VSchema-changed
+// namespace of a VSchema-only plan — so the drive applies the VSchema
+// change(s) from the plan.
+//
+// Every other no-target-shard dispatch (a whole-deployment or non-sharded
+// apply) uses the stored plan unchanged.
+func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatchScope, error) {
+	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges()}
+	if len(req.TargetShards) > 0 {
+		shard, err := dispatchTargetShard(req.TargetShards)
+		if err != nil {
+			return dispatchScope{}, err
+		}
+		scoped, err := scopedDispatchDDLChanges(req.DdlChanges)
+		if err != nil {
+			return dispatchScope{}, err
+		}
+		scope.shard = shard
+		scope.ddlChanges = scoped
+		return scope, nil
+	}
+	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		namespace, err := finalizerDispatchScope(plan, namespaces, req.GenerationOperationKeys)
+		if err != nil {
+			return dispatchScope{}, err
+		}
+		scope.finalizer = true
+		scope.finalizerNamespace = namespace
+		scope.ddlChanges = nil
+	}
+	return scope, nil
+}
+
+// operationIdentityForDispatch returns the operation key and kind the dispatch
+// scope stores on its apply_operations row.
+//
+// A shard-scoped dispatch tags its tasks with the target shard, so its
+// operation row must carry the matching shard operation key: the task loaders
+// treat a shard-tagged row as a drive task only when its operation's key
+// matches (the convention the control plane's sharded fan-out stamps).
+// Without the key, the operator's claim would load no drive tasks for the
+// apply and the dispatched work would never run.
+//
+// A group_finalizer dispatch creates a task-less finalizer operation: the
+// finalizer key names the scope the drive reconstructs the VSchema change(s)
+// from — one namespace, or the whole deployment for a VSchema-only plan — and
+// the kind routes the claim to the finalizer drive instead of failing closed
+// on the empty task set.
+func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationKind string, err error) {
+	if scope.shard != "" {
+		operationKey, err = shardScopedDispatchOperationKey(scope.ddlChanges, scope.shard)
+		if err != nil {
+			return "", "", err
+		}
+		return operationKey, "", nil
+	}
+	if scope.finalizer {
+		operationKey = finalizerDeploymentScopedKey
+		if scope.finalizerNamespace != "" {
+			operationKey = scope.finalizerNamespace + finalizerOperationKeySuffix
+		}
+		return operationKey, storage.ApplyOperationKindGroupFinalizer, nil
+	}
+	return "", "", nil
+}
+
+// buildDispatchTasks constructs the task rows for a dispatch scope's DDL
+// changes, each tagged with the dispatch's shard.
+func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, engineName string, optionsJSON []byte, now time.Time) []*storage.Task {
+	tasks := make([]*storage.Task, len(scope.ddlChanges))
+	for i, ddlChange := range scope.ddlChanges {
+		tasks[i] = &storage.Task{
+			TaskIdentifier: newTaskIdentifier(),
+			PlanID:         plan.ID,
+			Database:       plan.Database,
+			DatabaseType:   plan.DatabaseType,
+			Engine:         engineName,
+			Repository:     plan.Repository,
+			PullRequest:    plan.PullRequest,
+			Environment:    environment,
+			State:          state.Task.Pending,
+			Options:        optionsJSON,
+			TableName:      ddlChange.Table,
+			Namespace:      ddlChange.Namespace,
+			Shard:          scope.shard,
+			DDL:            ddlChange.DDL,
+			DDLAction:      ddlChange.Operation,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+	}
+	return tasks
+}
+
+// dispatchApplyResponse is the accepted-dispatch response shape: the apply's
+// identifier, the operation row the dispatch resolved to, and the derived
+// operation key echoed so the caller can verify the response addresses its
+// own operation.
+func dispatchApplyResponse(apply *storage.Apply, operationID int64, operationKey string) *ternv1.ApplyResponse {
+	return &ternv1.ApplyResponse{
+		Accepted:         true,
+		ApplyId:          apply.ApplyIdentifier,
+		ApplyOperationId: strconv.FormatInt(operationID, 10),
+		OperationKey:     operationKey,
+	}
+}
+
+// findApplyOperationByKey returns the apply's operation row for this
+// deployment and operation key, or nil when the apply has no such operation.
+func (c *LocalClient) findApplyOperationByKey(ctx context.Context, apply *storage.Apply, operationKey string) (*storage.ApplyOperation, error) {
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return nil, fmt.Errorf("apply operation store is not configured")
+	}
+	op, err := store.GetByApplyDeploymentAndOperationKey(ctx, apply.ID, c.config.Database, operationKey)
+	if err != nil {
+		return nil, fmt.Errorf("get apply_operation (deployment=%s, operation_key=%s) for apply %s: %w", c.config.Database, operationKey, apply.ApplyIdentifier, err)
+	}
+	return op, nil
+}
+
+// dispatchIntoExistingApply resolves a dispatch whose idempotency key already
+// maps to an apply. The dispatch is identified within the apply by the
+// operation key derived from its shape: a matching operation row means this
+// exact dispatch was seen before and is replayed, and a missing row means the
+// dispatch is a sibling operation of the same keyed generation, which is
+// attached to the apply. dedupOutcome labels the replay metric with the path
+// that resolved the key (first lookup, conflict race, or create race).
+func (c *LocalClient) dispatchIntoExistingApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, dedupOutcome string) (*ternv1.ApplyResponse, error) {
+	operationKey, operationKind, err := operationIdentityForDispatch(scope)
+	if err != nil {
+		return nil, fmt.Errorf("derive operation identity for dispatch into apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	existing, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		c.logger.Info("Apply: returning existing apply for idempotency key",
+			append(apply.LogAttrs(),
+				"idempotency_key", req.IdempotencyKey,
+				"operation_key", operationKey,
+				"dedup_outcome", dedupOutcome)...)
+		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, dedupOutcome)
+		return dispatchApplyResponse(apply, existing.ID, operationKey), nil
+	}
+	return c.attachDispatchOperation(ctx, req, apply, plan, scope, operationKey, operationKind)
+}
+
+// validateDispatchAgainstManifest is the fail-closed gate for a dispatch's
+// operation key against a generation manifest. A key outside the manifest
+// means the two planes disagree about the generation — the dispatcher declared
+// one operation set and is now sending another — and accepting it would attach
+// an operation the completion gate never waits for. Empty manifests (an apply
+// created without one, or a dispatch that carries none) validate everything: a
+// dispatcher that never declared a generation keeps the attached-rows-only
+// completion semantics. A dispatch whose carried manifest disagrees with the
+// stored one is logged for triage but judged against the stored manifest,
+// which is immutable for the generation.
+func (c *LocalClient) validateDispatchAgainstManifest(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
+	if len(req.GenerationOperationKeys) > 0 && len(apply.ExpectedOperationKeys) > 0 &&
+		!slices.Equal(normalizedManifest(req.GenerationOperationKeys), apply.ExpectedOperationKeys) {
+		c.logger.Warn("Apply: dispatch carries a generation manifest that disagrees with the stored one; validating against the stored manifest",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"stored_manifest", apply.ExpectedOperationKeys,
+				"dispatch_manifest", req.GenerationOperationKeys)...)
+	}
+	if apply.AllowsOperationKey(operationKey) {
+		return nil
+	}
+	c.logger.Warn("Apply: refusing operation outside the apply's generation manifest; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"stored_manifest", apply.ExpectedOperationKeys)...)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "manifest_refused")
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("operation %s is not in apply %s's generation manifest %v; refusing to attach an operation its completion gate never waits for", operationKey, apply.ApplyIdentifier, apply.ExpectedOperationKeys),
+	}
+}
+
+// normalizedManifest returns the canonical stored form of a dispatched
+// generation manifest: sorted with duplicates removed, so equality checks and
+// the stored column are independent of dispatch ordering.
+func normalizedManifest(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	normalized := slices.Clone(keys)
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
+}
+
+// refuseAttachToTerminalApply is the fail-closed rejection for an attach
+// against an apply that is (or just became) terminal: its target reservation
+// is released and no drive will pick new work up, so accepting the operation
+// would strand it. The deployment's remaining operations cannot dispatch until
+// an operator reconciles the apply.
+func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string) *ternv1.ApplyResponse {
+	c.logger.Warn("Apply: refusing to attach operation to terminal keyed apply; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey)...)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "terminal_refused")
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("apply %s for this idempotency key is terminal (%s); operation %s cannot attach", apply.ApplyIdentifier, apply.State, operationKey),
+	}
+}
+
+// attachDispatchOperation adds a sibling dispatch's operation and its tasks to
+// the deployment's existing keyed apply. The attach runs the same conflict and
+// unsafe-DDL gates a fresh apply runs, so attaching never admits work a create
+// would have refused, and it fails closed on a terminal apply.
+func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, plan *storage.Plan, scope dispatchScope, operationKey, operationKind string) (*ternv1.ApplyResponse, error) {
+	if state.IsTerminalApplyState(apply.State) {
+		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+	}
+	if refusal := c.validateDispatchAgainstManifest(ctx, req, apply, operationKey); refusal != nil {
+		return refusal, nil
+	}
+
+	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+
+	eng := c.getEngine()
+	if eng == nil {
+		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+
+	applyOpts := storage.ApplyOptionsFromMap(req.Options)
+	applyOpts.Target = plan.Target
+	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+	if err := rejectUnsafeVSchemaChangesWithoutOptIn(plan, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+	optionsJSON := storage.MarshalApplyOptions(applyOpts)
+
+	now := time.Now()
+	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
+	operation := &storage.ApplyOperation{
+		Deployment:    c.config.Database,
+		OperationKey:  operationKey,
+		OperationKind: operationKind,
+		Target:        plan.Target,
+		State:         state.ApplyOperation.Pending,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	switch {
+	case errors.Is(err, storage.ErrApplyOperationExists):
+		// A concurrent same-operation attach won the insert; the winner's row
+		// is this dispatch's replay target.
+		winner, lookupErr := c.findApplyOperationByKey(ctx, apply, operationKey)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("resolve attach race for operation %s of apply %s: %w", operationKey, apply.ApplyIdentifier, lookupErr)
+		}
+		if winner == nil {
+			return nil, fmt.Errorf("operation %s of apply %s exists per the unique index but was not found on re-read", operationKey, apply.ApplyIdentifier)
+		}
+		c.logger.Info("Apply: concurrent attach won the operation insert; replaying the winner's row",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey)...)
+		metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
+		return dispatchApplyResponse(apply, winner.ID, operationKey), nil
+	case errors.Is(err, storage.ErrApplyNotActive):
+		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
+	case err != nil:
+		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
+	}
+
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attached")
+	c.logger.Info("Apply: attached operation to keyed apply",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"task_count", len(tasks),
+			"plan_id", plan.PlanIdentifier)...)
+	c.wakeOperatorForQueuedApply(apply)
+
+	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
 // Apply executes a previously generated plan.
 // In local mode, Apply has additional conflict checking and polls for completion.
 //
@@ -1754,25 +2485,30 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		return nil, fmt.Errorf("environment is required")
 	}
 
-	// Idempotent re-dispatch: if this request's generation already created an
-	// apply, return that apply's id instead of starting a duplicate. This runs
-	// before plan resolution and the active-task conflict check so a re-dispatch
-	// of our own in-flight apply is recovered rather than rejected as "already
-	// in progress".
+	// Idempotent re-dispatch: if this request's idempotency key already maps to
+	// an apply, resolve the dispatch against that apply instead of starting a
+	// duplicate — replaying the dispatch's own operation, or attaching it as a
+	// sibling operation of the same keyed generation. This runs before the
+	// active-task conflict check so a re-dispatch of our own in-flight apply is
+	// recovered rather than rejected as "already in progress".
 	if existing, err := c.existingIdempotentApply(ctx, req); err != nil {
 		return nil, err
 	} else if existing != nil {
-		c.logger.Info("Apply: returning existing apply for idempotency key",
-			"apply_id", existing.ApplyIdentifier,
-			"idempotency_key", req.IdempotencyKey,
-			"state", existing.State,
-		)
-		metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "hit")
-		applyOperationID, err := c.applyResponseOperationID(ctx, existing)
+		plan, err := c.planForApplyRequest(ctx, req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("resolve plan %s for idempotent re-dispatch: %w", req.PlanId, err)
 		}
-		return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
+		if plan == nil {
+			return &ternv1.ApplyResponse{
+				Accepted:     false,
+				ErrorMessage: "plan not found",
+			}, nil
+		}
+		scope, err := deriveDispatchScope(plan, req)
+		if err != nil {
+			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+		}
+		return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "hit")
 	}
 
 	// Look up the plan, materializing it from the dispatch request when this
@@ -1788,38 +2524,20 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			ErrorMessage: "plan not found",
 		}, nil
 	}
-	// Determine the dispatch's shard scope. A sharded engine's work is dispatched
-	// one apply_operation per shard, so a request that carries target shards is
-	// scoped to that single shard: it drives the operation's own DDL changes
-	// (req.DdlChanges) and tags its tasks with the shard, so the engine receives
-	// exactly one target shard. A whole-deployment or non-sharded apply carries no
-	// target shard and uses the stored plan unchanged — keeping that path
-	// byte-for-byte as before. More than one target shard is a malformed dispatch
-	// (the per-shard fan-out emits one shard per operation) and fails closed.
-	ddlChanges := plan.FlatDDLChanges()
-	dispatchShard := ""
-	if len(req.TargetShards) > 0 {
-		shard, err := dispatchTargetShard(req.TargetShards)
-		if err != nil {
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
-		}
-		scoped, err := scopedDispatchDDLChanges(req.DdlChanges)
-		if err != nil {
-			return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
-		}
-		dispatchShard = shard
-		ddlChanges = scoped
+	scope, err := deriveDispatchScope(plan, req)
+	if err != nil {
+		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
 	}
 	c.logger.Info("Apply: retrieved plan",
 		"plan_id", req.PlanId,
 		"plan_identifier", plan.PlanIdentifier,
-		"ddl_change_count", len(ddlChanges),
+		"ddl_change_count", len(scope.ddlChanges),
 		"target_shards", req.TargetShards,
 		"database", plan.Database,
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if err := c.checkActiveTaskConflict(ctx, plan, dispatchShard); err != nil {
+	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
@@ -1827,16 +2545,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			return nil, errors.Join(err, lookupErr)
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
-				"apply_id", existing.ApplyIdentifier,
-				"idempotency_key", req.IdempotencyKey,
-				"state", existing.State,
-			)
-			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "conflict_race")
-			applyOperationID, err := c.applyResponseOperationID(ctx, existing)
-			if err != nil {
-				return nil, err
-			}
-			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
+				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
+			return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "conflict_race")
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -1868,7 +2578,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// target string the request carried.
 	applyOpts := storage.ApplyOptionsFromMap(options)
 	applyOpts.Target = plan.Target
-	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, ddlChanges, applyOpts); err != nil {
+	if err := rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, applyOpts); err != nil {
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+	if err := rejectUnsafeVSchemaChangesWithoutOptIn(plan, applyOpts); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -1880,31 +2596,36 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// surfaces its VSchema status/diff from engine resume metadata, and a sharded
 	// apply runs VSchema as a task-less group_finalizer derived from the plan.
 
-	// Build the Apply record (1 Apply -> N Tasks).
+	// Build the Apply record (1 Apply -> N Tasks). The dispatch's generation
+	// manifest is stored on the apply at creation: sibling dispatches of the
+	// same keyed generation attach one at a time, and the manifest is what the
+	// state projection holds the apply's success verdict on until every
+	// declared operation has attached and finished.
 	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 	apply := &storage.Apply{
-		ApplyIdentifier: applyIdentifier,
-		PlanID:          plan.ID,
-		Database:        plan.Database,
-		DatabaseType:    plan.DatabaseType,
-		Deployment:      c.config.Database,
-		Repository:      plan.Repository,
-		PullRequest:     plan.PullRequest,
-		Environment:     req.Environment,
-		Caller:          caller,
-		Engine:          eng.Name(),
-		State:           state.Apply.Pending,
-		Options:         optionsJSON,
-		IdempotencyKey:  req.IdempotencyKey,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		ApplyIdentifier:       applyIdentifier,
+		PlanID:                plan.ID,
+		Database:              plan.Database,
+		DatabaseType:          plan.DatabaseType,
+		Deployment:            c.config.Database,
+		Repository:            plan.Repository,
+		PullRequest:           plan.PullRequest,
+		Environment:           req.Environment,
+		Caller:                caller,
+		Engine:                eng.Name(),
+		State:                 state.Apply.Pending,
+		Options:               optionsJSON,
+		IdempotencyKey:        req.IdempotencyKey,
+		ExpectedOperationKeys: normalizedManifest(req.GenerationOperationKeys),
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	c.logger.Info("Apply: creating tasks",
 		"plan_id", plan.PlanIdentifier,
-		"ddl_change_count", len(ddlChanges),
+		"ddl_change_count", len(scope.ddlChanges),
 	)
-	for i, ddlChange := range ddlChanges {
+	for i, ddlChange := range scope.ddlChanges {
 		c.logger.Debug("Apply: DDLChange",
 			"index", i,
 			"table", ddlChange.Table,
@@ -1912,28 +2633,29 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		)
 	}
 
-	tasks := make([]*storage.Task, len(ddlChanges))
-	for i, ddlChange := range ddlChanges {
-		taskIdentifier := "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-		tasks[i] = &storage.Task{
-			TaskIdentifier: taskIdentifier,
-			PlanID:         plan.ID,
-			Database:       plan.Database,
-			DatabaseType:   plan.DatabaseType,
-			Engine:         eng.Name(),
-			Repository:     plan.Repository,
-			PullRequest:    plan.PullRequest,
-			Environment:    req.Environment,
-			State:          state.Task.Pending,
-			Options:        optionsJSON,
-			TableName:      ddlChange.Table,
-			Namespace:      ddlChange.Namespace,
-			Shard:          dispatchShard,
-			DDL:            ddlChange.DDL,
-			DDLAction:      ddlChange.Operation,
-			CreatedAt:      now,
-			UpdatedAt:      now,
-		}
+	tasks := buildDispatchTasks(plan, scope, req.Environment, eng.Name(), optionsJSON, now)
+
+	operationKey, operationKind, err := operationIdentityForDispatch(scope)
+	if err != nil {
+		return nil, fmt.Errorf("apply for plan %s: %w", req.PlanId, err)
+	}
+
+	// A dispatch that declares a generation manifest must name its own
+	// operation in it: the manifest is the completion authority for the apply
+	// this dispatch creates, and an apply whose first operation is outside its
+	// own manifest could never complete. Refuse the malformed dispatch instead
+	// of creating an apply that is wedged from birth.
+	if !apply.AllowsOperationKey(operationKey) {
+		c.logger.Error("Apply: dispatch's generation manifest does not name its own operation; refusing the malformed dispatch",
+			append(apply.LogAttrs(),
+				"plan_id", plan.PlanIdentifier,
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"manifest", apply.ExpectedOperationKeys)...)
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: fmt.Sprintf("dispatch generation manifest %v does not include its own operation key %q; refusing the malformed dispatch", apply.ExpectedOperationKeys, operationKey),
+		}, nil
 	}
 
 	// Dual-write one apply_operations row alongside the applies row in the
@@ -1947,11 +2669,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// apply path), so the store applies its safe defaults (rolling cutover,
 	// halt on failure).
 	operations := []*storage.ApplyOperation{{
-		Deployment: apply.Deployment,
-		Target:     plan.Target,
-		State:      state.ApplyOperation.Pending,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		Deployment:    apply.Deployment,
+		OperationKey:  operationKey,
+		OperationKind: operationKind,
+		Target:        plan.Target,
+		State:         state.ApplyOperation.Pending,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}}
 
 	applyID, err := c.storage.Applies().CreateWithTasksAndOperations(ctx, apply, tasks, operations)
@@ -1963,16 +2687,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			return nil, fmt.Errorf("create apply %s with tasks and operations (idempotency re-lookup also failed): %w", applyIdentifier, errors.Join(err, lookupErr))
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved a create race",
-				"apply_id", existing.ApplyIdentifier,
-				"idempotency_key", req.IdempotencyKey,
-				"state", existing.State,
-			)
-			metrics.RecordRemoteApplyDedup(ctx, req.Database, req.Environment, "create_race")
-			applyOperationID, err := c.applyResponseOperationID(ctx, existing)
-			if err != nil {
-				return nil, err
-			}
-			return &ternv1.ApplyResponse{Accepted: true, ApplyId: existing.ApplyIdentifier, ApplyOperationId: applyOperationID}, nil
+				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
+			return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "create_race")
 		}
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
 	}
@@ -2015,32 +2731,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier)...)
 	c.wakeOperatorForQueuedApply(apply)
 
-	return &ternv1.ApplyResponse{
-		Accepted:         true,
-		ApplyId:          apply.ApplyIdentifier,
-		ApplyOperationId: strconv.FormatInt(operations[0].ID, 10),
-	}, nil
-}
-
-func (c *LocalClient) applyResponseOperationID(ctx context.Context, apply *storage.Apply) (string, error) {
-	if apply == nil {
-		return "", fmt.Errorf("apply is required")
-	}
-	store := c.storage.ApplyOperations()
-	if store == nil {
-		return "", fmt.Errorf("apply operation store is not configured")
-	}
-	ops, err := store.ListByApply(ctx, apply.ID)
-	if err != nil {
-		return "", fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	if len(ops) != 1 {
-		c.logger.Debug("ApplyResponse omits apply_operation_id because apply has no single child operation",
-			"apply_id", apply.ApplyIdentifier,
-			"operation_count", len(ops))
-		return "", nil
-	}
-	return strconv.FormatInt(ops[0].ID, 10), nil
+	return dispatchApplyResponse(apply, operations[0].ID, operationKey), nil
 }
 
 // getEngine returns the appropriate engine based on database type.
@@ -2050,6 +2741,8 @@ func (c *LocalClient) getEngine() engine.Engine {
 		return c.spiritEngine
 	case storage.DatabaseTypeVitess:
 		return c.planetscaleEngine
+	case storage.DatabaseTypePostgres:
+		return c.postgresEngine
 	default:
 		// A registered engine for a non-built-in type (nil if none registered).
 		return c.customEngine
@@ -2095,9 +2788,15 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		}
 		c.logger.Info("Progress: serving task-less apply from operations",
 			"apply_id", req.ApplyId, "operation_count", len(ops), "state", apply.State)
+		settled, err := c.settledControlRequests(ctx, apply)
+		if err != nil {
+			c.logger.Error("progress: serving a task-less apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+				append(apply.LogAttrs(), "error", err)...)
+		}
 		return &ternv1.ProgressResponse{
-			State:  storageStateToProto(apply.State),
-			Engine: c.protoEngine(),
+			State:                  storageStateToProto(apply.State),
+			Engine:                 c.protoEngine(),
+			SettledControlRequests: settled,
 		}, nil
 	}
 
@@ -2116,6 +2815,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	for _, t := range tasks {
 		switch {
 		case t.State == state.Task.Running ||
+			t.State == state.Task.CatchingUp ||
+			t.State == state.Task.Checksumming ||
+			t.State == state.Task.PostChecksum ||
 			t.State == state.Task.WaitingForCutover ||
 			t.State == state.Task.Recovering ||
 			t.State == state.Task.CuttingOver ||
@@ -2199,13 +2901,14 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 
 	for _, t := range currentApplyTasks {
 		tp := &ternv1.TableProgress{
-			TableName:  t.TableName,
-			Ddl:        t.DDL,
-			Namespace:  t.Namespace,
-			Status:     t.State,
-			TaskId:     t.TaskIdentifier,
-			IsInstant:  t.IsInstant || vitessApplyIsInstant,
-			ChangeType: ddlActionToProtoChangeType(t.DDLAction),
+			TableName:    t.TableName,
+			Ddl:          t.DDL,
+			Namespace:    t.Namespace,
+			Status:       t.State,
+			TaskId:       t.TaskIdentifier,
+			IsInstant:    t.IsInstant || vitessApplyIsInstant,
+			ChangeType:   ddlActionToProtoChangeType(t.DDLAction),
+			ErrorMessage: t.ErrorMessage,
 		}
 
 		// Table figures come from the stored task row the drive maintains.
@@ -2214,6 +2917,13 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsTotal = t.RowsTotal
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
+		tp.Throttled = t.Throttled
+		tp.ThrottleReason = t.ThrottleReason
+		// For Spirit the stored figure is the runner-wide remaining-copy
+		// estimate stamped on every still-copying table (see
+		// buildSpiritTableProgress), so in a multi-table apply each table
+		// reports the whole run's ETA rather than its own.
+		tp.EtaSeconds = int64(t.ETASeconds)
 		// Clamp to 100% only for successfully completed tasks — Vitess row
 		// counts can lag slightly due to concurrent inserts during copy.
 		if state.IsState(t.State, state.Task.Completed) && t.RowsTotal > 0 {
@@ -2310,6 +3020,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// The apply record's engine is the source of truth (set at apply creation time).
 	if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && apply != nil {
 		resp.ApplyId = apply.ApplyIdentifier
+		settled, err := c.settledControlRequests(ctx, apply)
+		if err != nil {
+			c.logger.Error("progress: serving an apply without its settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
+				append(apply.LogAttrs(), "error", err)...)
+		}
+		resp.SettledControlRequests = settled
 		if eng, err := engineNameToProto(apply.Engine); err != nil {
 			return nil, fmt.Errorf("invalid engine on apply %s: %w", apply.ApplyIdentifier, err)
 		} else {
@@ -2333,6 +3049,44 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		}
 	}
 
+	return resp, nil
+}
+
+const maxLogsLimit = 1000
+
+func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("logs request is required")
+	}
+	if req.ApplyId == "" {
+		return nil, fmt.Errorf("apply_id is required")
+	}
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > maxLogsLimit {
+		limit = maxLogsLimit
+	}
+	apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
+	if err != nil {
+		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("get apply %s for logs: %w", req.ApplyId, storage.ErrApplyNotFound)
+	}
+	logs, err := c.storage.ApplyLogs().GetRecentByApply(ctx, apply.ID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get recent logs for apply %s: %w", req.ApplyId, err)
+	}
+	resp := &ternv1.LogsResponse{ApplyId: req.ApplyId, Logs: make([]*ternv1.ApplyLog, 0, len(logs))}
+	for _, log := range logs {
+		entry := &ternv1.ApplyLog{Id: log.ID, Level: log.Level, EventType: log.EventType, Source: log.Source, Message: log.Message, OldState: log.OldState, NewState: log.NewState, MetadataJson: log.Metadata, CreatedAt: log.CreatedAt.UTC().Format(time.RFC3339Nano)}
+		if log.TaskID != nil {
+			entry.TaskId = log.TaskID
+		}
+		resp.Logs = append(resp.Logs, entry)
+	}
 	return resp, nil
 }
 
@@ -2366,6 +3120,42 @@ func (c *LocalClient) loadStoredShardsByTable(ctx context.Context, apply *storag
 		}
 	}
 	return byTable
+}
+
+// settledControlRequests projects the apply's terminal control requests onto the
+// progress response. A control RPC is accepted when the request is queued, not
+// when it takes effect, so this is how the plane that accepted one learns
+// whether the operation actually landed — without it, a rejection recorded here
+// never leaves this plane.
+//
+// Callers on the progress path degrade rather than propagate: the field is
+// advisory, and the same settled rows are reported on every poll until the
+// operator retries the operation, so a failed load costs one tick of notice and
+// self-heals. Failing the RPC instead would throw away the state and task
+// progress the caller drives the apply from, over a field it only displays.
+func (c *LocalClient) settledControlRequests(ctx context.Context, apply *storage.Apply) ([]*ternv1.SettledControlRequest, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available for apply %s", apply.ApplyIdentifier)
+	}
+	requests, err := controlStore.ListSettled(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load settled control requests for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	settled := make([]*ternv1.SettledControlRequest, 0, len(requests))
+	for _, req := range requests {
+		entry := &ternv1.SettledControlRequest{
+			Operation:    string(req.Operation),
+			Status:       string(req.Status),
+			ErrorMessage: req.ErrorMessage,
+			RequestedBy:  req.RequestedBy,
+		}
+		if req.CompletedAt != nil {
+			entry.SettledAt = req.CompletedAt.UTC().Format(time.RFC3339)
+		}
+		settled = append(settled, entry)
+	}
+	return settled, nil
 }
 
 // loadStoredDisplayMetadata reads a Vitess apply's deploy display fields
@@ -2528,21 +3318,35 @@ func activeTaskProgressRank(taskState string) (int, bool) {
 		return 1, true
 	case state.Task.Running:
 		return 2, true
+	case state.Task.CatchingUp:
+		// Row copy is done; the engine is applying the changeset accumulated
+		// from the binlog during the copy. Ranks after Running and before
+		// Checksumming — the verify that follows this first drain — so a
+		// later poll never regresses the table to a plain copy.
+		return 3, true
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data. Ranks after
-		// Running and before WaitingForCutover — the phase the table moves through
-		// next — so a later poll never regresses a checksumming table to Running.
-		return 3, true
-	case state.Task.WaitingForCutover:
+		// CatchingUp and before PostChecksum — the second drain that follows
+		// the verify — so a later poll never regresses a checksumming table
+		// to an earlier phase.
 		return 4, true
-	case state.Task.CuttingOver:
+	case state.Task.PostChecksum:
+		// The verify passed and the engine is applying the changes that
+		// accumulated while it ran. Ranks after Checksumming so a stale
+		// checksum poll never rewinds the table into a verify that already
+		// finished, and before WaitingForCutover — the phase the table moves
+		// through next.
 		return 5, true
-	case state.Task.RevertWindow:
+	case state.Task.WaitingForCutover:
 		return 6, true
+	case state.Task.CuttingOver:
+		return 7, true
+	case state.Task.RevertWindow:
+		return 8, true
 	case state.Task.Reverting:
 		// Undoing the change after the revert window; ranks after RevertWindow so
 		// a reverting table never regresses to the resumable-window phase.
-		return 7, true
+		return 9, true
 	default:
 		return 0, false
 	}
@@ -2570,4 +3374,16 @@ func dsnLogAttrs(dsn string) []any {
 		"target_addr", cfg.Addr,
 		"target_db", cfg.DBName,
 	}
+}
+
+// pendingDropsDisabled reports whether this client drops tables outright rather
+// than quarantining them in the pending drops database.
+//
+// The quarantine is opt-in: a deployment turns it on with the pending_drops
+// metadata key, and anything else, including an absent key, drops the table
+// outright. Quarantining is only safe for a deployment that also reaps its own
+// targets, because a quarantine no cleaner reaches grows on the target server
+// forever, so an embedder that never states the intent must not inherit it.
+func pendingDropsDisabled(metadata map[string]string) bool {
+	return metadata["pending_drops"] != "true"
 }

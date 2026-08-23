@@ -91,7 +91,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build"
         run: go build -v ./...
@@ -100,13 +100,19 @@ jobs:
           go vet ./...
           go vet -tags=integration ./...
           go vet -tags=e2e ./e2e/...
+      # Compile (without running) the consumer module's test binary so the
+      # saved cache covers its dependency delta — the module resolves newer
+      # versions than the root go.sum, which the cache key also hashes.
+      - name: "Warm consumer-module cache"
+        working-directory: e2e/consumermodule
+        run: go test -race -run '^$' ./...
       - name: "Save Go cache"
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
 
   unit:
     name: "Unit Tests"
@@ -127,17 +133,38 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-unit
+      - name: "Consumer-module startup test"
+        run: make test-consumer-module
 
   integration:
-    name: "Integration Tests"
+    name: "Integration Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Shard names are the answer to "which shard ran my test?", so they
+          # name the packages they select rather than describing the split.
+          #
+          # The cross-package suite under ./integration is the longest single
+          # shard and cannot be shortened by package parallelism, so it gets its
+          # own runner rather than setting the wall time for everything else.
+          - shard: ./integration
+            match: "-E"
+          # Every other integration-tagged package: tests that live beside the
+          # code they cover, spread across ./pkg, ./cmd and ./e2e. Selected as
+          # the exact inverse of the grep above, so every package lands in
+          # exactly one shard and a newly added package is picked up here
+          # without touching this file.
+          - shard: per-package
+            match: "-vE"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -151,14 +178,66 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so transient registry outages
+      # surface here as a named, retryable, fail-fast step instead of as many
+      # parallel testcontainer "context deadline exceeded" test failures.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            mysql:8.4 \
+            postgres:16 \
+            localstack/localstack:3.0 \
+            testcontainers/ryuk:0.13.0
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
         # MySQL, starving operator claim loops and causing spurious pending-apply
-        # timeouts. Two lanes keeps wall time within the job budget.
-        run: go test -tags=integration -timeout=10m -count=1 -p=2 $(go list -tags=integration ./... | grep -v /localscale)
+        # timeouts. Two packages at a time keeps wall time within the job budget.
+        #
+        # Go's own timeout sits below the job's so a hung test panics with a
+        # goroutine dump naming the culprit, instead of the runner cancelling the
+        # job and leaving a bare "cancelled" that reads like a plain failure. It
+        # is per test binary and starts when that binary does, so the dump is
+        # guaranteed only where a binary's own deadline lands inside the job's:
+        # one starting late in a long shard can still be cancelled without one.
+        env:
+          MATCH: ${{ matrix.match }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          # Anchored at the module root so only the top-level cross-package
+          # suite takes that shard. A future nested package named `integration`
+          # belongs beside the code it covers, in the per-package shard.
+          selector='^github\.com/block/schemabot/integration(/|$)'
+          all=$(go list -tags=integration ./...)
+          set +e
+          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$MATCH" "$selector")
+          selector_status=$?
+          set -e
+          # grep exits 1 when a shard matches nothing and 2 when the selector
+          # itself is unusable. Under `set -e` either would abort here with a
+          # bare exit status, so both are absorbed and reported apart: a broken
+          # selector says so rather than being described as an empty shard.
+          if [ "$selector_status" -gt 1 ]; then
+            echo "::error::shard '$SHARD' selector $selector is unusable (grep exited $selector_status)"
+            exit 1
+          fi
+          # An empty shard would hand `go test` no packages and silently test the
+          # working directory instead, reporting success for work never run.
+          if [ -z "$pkgs" ]; then
+            echo "::error::shard '$SHARD' selected no packages"
+            exit 1
+          fi
+          # Print the selection so a reader can confirm which shard owns a given
+          # test from the log itself, rather than inferring it from the shard
+          # name and this file's grep expressions.
+          echo "::group::shard '$SHARD' runs $(echo "$pkgs" | wc -l | tr -d ' ') packages"
+          echo "$pkgs" | sed 's|^github.com/block/schemabot|.|'
+          echo "::endgroup::"
+          go test -tags=integration -timeout=8m -count=1 -p=2 $pkgs
 
   localscale-matrix:
     name: "LocalScale Matrix"
@@ -229,8 +308,16 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the image
+      # build or the testcontainer-based tests below.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            testcontainers/ryuk:0.13.0 \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Build LocalScale image"
         run: |
           CGO_ENABLED=0 GOOS=linux go build -o bin/localscale-linux ./cmd/localscale
@@ -259,14 +346,98 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
-        run: make test-e2e-mysql test-e2e-grpc
-      - name: "Container logs on failure"
+        run: make test-e2e-mysql
+      - name: "Capture container logs on failure"
         if: failure()
         run: |
-          docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+          mkdir -p e2e-logs
+          # test-e2e-mysql (test-e2e-local) leaves its stack up, so capture it here.
+          docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/mysql-containers.log 2>&1 || true
+          if [ -s e2e-logs/mysql-containers.log ]; then
+            echo "=== tail of MySQL container logs (full logs in the uploaded e2e-mysql-logs artifact) ==="
+            tail -n 200 e2e-logs/mysql-containers.log || true
+          else
+            echo "no container logs captured (stack failed before containers started; see the job log above)"
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-mysql-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  e2e-grpc:
+    name: "E2E gRPC Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev
+      - name: "Test"
+        run: make test-e2e-grpc
+      - name: "Capture container logs on failure"
+        if: failure()
+        run: |
+          # test-e2e-grpc tears its own stack down, so it captures
+          # e2e-logs/grpc-containers.log itself before teardown (test
+          # failures and health-wait timeouts). If the target failed before
+          # those handlers ran (e.g. a compose build failure), the stack may
+          # still be up — capture whatever exists so the artifact is never
+          # empty for a diagnosable failure.
+          mkdir -p e2e-logs
+          if [ ! -f e2e-logs/grpc-containers.log ]; then
+            docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps > e2e-logs/grpc-containers.log 2>&1 || true
+          fi
+          if [ -s e2e-logs/grpc-containers.log ]; then
+            echo "=== tail of gRPC container logs (full logs in the uploaded e2e-grpc-logs artifact) ==="
+            tail -n 200 e2e-logs/grpc-containers.log || true
+          else
+            echo "no container logs captured (stack failed before containers started; see the job log above)"
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-grpc-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   e2e-grpc-multideploy:
     name: "E2E gRPC Multi-Deployment Tests (${{ matrix.shard }})"
@@ -295,14 +466,45 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
         run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
-      - name: "Container logs on failure"
+      - name: "Show captured container logs on failure"
         if: failure()
         run: |
-          docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --tail=300 2>/dev/null || true
+          # test-e2e-grpc-multideploy tears its own stack down, so it captures
+          # grpc-multideploy-containers.log itself before teardown (test
+          # failures and health-wait timeouts). If the target failed before
+          # those handlers ran (e.g. a compose build failure), the stack may
+          # still be up — capture whatever exists so the artifact is never
+          # empty for a diagnosable failure.
+          mkdir -p e2e-logs
+          if [ ! -f e2e-logs/grpc-multideploy-containers.log ]; then
+            docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps > e2e-logs/grpc-multideploy-containers.log 2>&1 || true
+          fi
+          if [ -s e2e-logs/grpc-multideploy-containers.log ]; then
+            echo "=== tail of container logs (full logs in the uploaded e2e-grpc-md-logs-shard-${{ matrix.shard }} artifact) ==="
+            tail -n 200 e2e-logs/grpc-multideploy-containers.log || true
+          else
+            echo "no container logs captured (stack failed before containers started; see the job log above)"
+          fi
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-grpc-md-logs-shard-${{ matrix.shard }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   e2e-vitess-matrix:
     name: "E2E Vitess Matrix"
@@ -373,16 +575,36 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # Pre-pull external images with retries so a transient registry outage
+      # fails fast in a named, retryable step instead of failing the compose
+      # image builds or container startup mid-job.
+      - name: "Pre-pull external images"
+        run: |
+          scripts/ci/prepull-images.sh \
+            mysql:8.0 \
+            --dockerfile deploy/local/Dockerfile.dev \
+            --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
         run: |
           echo "Vitess e2e shard ${{ matrix.shard }}: ${{ matrix.run_filter }}"
           make test-e2e-local RUN="${{ matrix.run_filter }}" E2E_TEST_TIMEOUT=8m E2E_TEST_FLAGS=-v
-      - name: "Container logs on failure"
+      - name: "Capture container logs on failure"
         if: failure()
         run: |
-          docker compose -f deploy/e2e/docker-compose.yml logs --tail=300 schemabot localscale 2>/dev/null || true
+          mkdir -p e2e-logs
+          docker compose -f deploy/e2e/docker-compose.yml logs --no-color --timestamps > e2e-logs/containers.log 2>&1 || true
+          echo "=== tail of container logs (full logs in the uploaded e2e-vitess-logs-shard-${{ matrix.shard }} artifact) ==="
+          tail -n 200 e2e-logs/containers.log || true
+      - name: "Upload container logs on failure"
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact@v4.6.2
+        with:
+          name: e2e-vitess-logs-shard-${{ matrix.shard }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
   e2e-k8s:
     name: "E2E K8s Tests"
     needs: changes
@@ -402,7 +624,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
@@ -452,7 +674,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
@@ -486,7 +708,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Most of the budget is vtcombo coming up: it initializes a sidecar database
+    # per shard of every keyspace the stack declares before the suite can start.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -500,7 +724,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # The runner ships a preinstalled MySQL whose AppArmor profile confines
       # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's
@@ -530,14 +754,24 @@ jobs:
       - name: "Pod logs on failure"
         if: failure()
         run: |
+          # The operator's per-tick debug lines and the suite's progress polling
+          # fill a short tail on their own, so a deeper window is what keeps the
+          # drive that dispatched the work — the part worth reading — in the dump.
           echo "=== Control Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=control-plane-vitess --tail=3000 2>/dev/null || true
           echo "=== Data Plane ==="
-          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=200 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-vitess -l app.kubernetes.io/instance=data-plane-vitess --tail=1000 2>/dev/null || true
           echo "=== Etre ==="
           kubectl logs -n schemabot-e2e-vitess -l app=etre --tail=100 2>/dev/null || true
           echo "=== LocalScale ==="
           kubectl logs -n schemabot-e2e-vitess -l app=localscale --tail=200 2>/dev/null || true
+          # A restarted LocalScale serves the whole suite connection-refused, and
+          # the surviving container's logs show none of it — the reason the first
+          # one exited is only in the previous container and the pod's state.
+          echo "=== LocalScale (previous container) ==="
+          kubectl logs -n schemabot-e2e-vitess -l app=localscale --previous --tail=200 2>/dev/null || true
+          echo "=== LocalScale pod state ==="
+          kubectl describe pod -n schemabot-e2e-vitess -l app=localscale 2>/dev/null || true
           echo "=== Seed jobs ==="
           kubectl logs -n schemabot-e2e-vitess -l job-name=etre-seed --tail=50 2>/dev/null || true
           echo "=== All pods ==="
@@ -551,7 +785,7 @@ jobs:
   # skipped or failed upstream is treated as failure.
   e2e-rollup:
     name: "E2E Tests"
-    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc-multideploy, e2e-vitess]
+    needs: [changes, e2e-vitess-matrix, e2e-mysql, e2e-grpc, e2e-grpc-multideploy, e2e-vitess]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -564,6 +798,7 @@ jobs:
           VITESS_MODE: ${{ needs.e2e-vitess-matrix.outputs.mode }}
           VITESS_SHARD_COUNT: ${{ needs.e2e-vitess-matrix.outputs.shard_count }}
           E2E_MYSQL_RESULT: ${{ needs.e2e-mysql.result }}
+          E2E_GRPC_RESULT: ${{ needs.e2e-grpc.result }}
           E2E_MULTIDEPLOY_RESULT: ${{ needs.e2e-grpc-multideploy.result }}
           E2E_VITESS_RESULT: ${{ needs.e2e-vitess.result }}
         run: |
@@ -593,6 +828,10 @@ jobs:
           fi
           if [ "$E2E_MYSQL_RESULT" != "success" ]; then
             echo "::error::e2e-mysql result=$E2E_MYSQL_RESULT"
+            exit 1
+          fi
+          if [ "$E2E_GRPC_RESULT" != "success" ]; then
+            echo "::error::e2e-grpc result=$E2E_GRPC_RESULT"
             exit 1
           fi
           if [ "$E2E_MULTIDEPLOY_RESULT" != "success" ]; then
@@ -645,6 +884,34 @@ jobs:
           fi
           if [ "$LOCALSCALE_RESULT" != "success" ]; then
             echo "::error::localscale result=$LOCALSCALE_RESULT"
+            exit 1
+          fi
+
+  integration-rollup:
+    name: "Integration Tests"
+    needs: [changes, integration]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_CODE: ${{ needs.changes.outputs.code }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::changes job failed"
+            exit 1
+          fi
+          if [ "$CHANGES_CODE" != "true" ]; then
+            echo "Docs-only PR; integration intentionally skipped."
+            exit 0
+          fi
+          # A matrix result is success only when every shard succeeded, so this
+          # cannot pass on a partial run.
+          if [ "$INTEGRATION_RESULT" != "success" ]; then
+            echo "::error::integration result=$INTEGRATION_RESULT"
             exit 1
           fi
 

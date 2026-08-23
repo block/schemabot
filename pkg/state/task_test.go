@@ -14,11 +14,11 @@ func TestNormalizeTaskStatus_SpiritStates(t *testing.T) {
 	}{
 		{spiritstatus.Initial.String(), Task.Running},
 		{spiritstatus.CopyRows.String(), Task.Running},
-		{spiritstatus.ApplyChangeset.String(), Task.Running},
+		{spiritstatus.ApplyChangeset.String(), Task.CatchingUp},
 		{spiritstatus.RestoreSecondaryIndexes.String(), Task.Running},
 		{spiritstatus.AnalyzeTable.String(), Task.Running},
 		{spiritstatus.Checksum.String(), Task.Checksumming},
-		{spiritstatus.PostChecksum.String(), Task.Running},
+		{spiritstatus.PostChecksum.String(), Task.PostChecksum},
 		{spiritstatus.ErrCleanup.String(), Task.Running},
 		{spiritstatus.WaitingOnSentinelTable.String(), Task.WaitingForCutover},
 		{spiritstatus.CutOver.String(), Task.CuttingOver},
@@ -53,7 +53,7 @@ func TestNormalizeTaskStatus_VitessStates(t *testing.T) {
 
 func TestNormalizeTaskStatus_PassThrough(t *testing.T) {
 	for _, s := range []string{
-		Task.Pending, Task.Running, Task.Completed, Task.Stopped, Task.Failed,
+		Task.Pending, Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering, Task.CuttingOver, Task.Cancelled,
 	} {

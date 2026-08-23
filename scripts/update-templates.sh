@@ -16,9 +16,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-# Strip ANSI escape codes from CLI output for markdown rendering.
+# Strip terminal escape codes from CLI output for markdown rendering: SGR
+# color codes and OSC sequences (hyperlinks), the two families the CLI emits.
 strip_ansi() {
-    sed $'s/\033\\[[0-9;]*m//g'
+    sed -E $'s/\033\\[[0-9;]*m//g; s/\033\\][^\033\007]*(\033\\\\|\007)//g'
 }
 
 # Shared awk function to wrap "--- SECTION NAME ---" lines into collapsible blocks
@@ -161,19 +162,11 @@ render_markdown_section() {
 # === Paired sections (PR + CLI) ===
 render_paired_section "Plan & Status"  "comment_plan_all"       "cli_plan_all"
 render_markdown_section "Aggregate Check — Details summary" "aggregate_check_summary"
+render_markdown_section "Aggregate Check — Blocked: PR File Cap Exceeded" "aggregate_check_file_cap_blocked"
 render_paired_section "Locking"        "comment_locking_all"    "cli_locking_all"
 render_paired_section "Apply Flow"     "comment_apply_flow_all" "cli_apply_all"
 
 # === PR-only sections ===
-{
-    echo ""
-    echo "## Apply Gates"
-    echo ""
-    echo "### PR Comments"
-    echo ""
-    "$BINARY" preview "comment_apply_all" 2>&1 | wrap_sections
-} >> "$SNAPSHOT"
-
 {
     echo ""
     echo "## Multi-Deployment Apply"

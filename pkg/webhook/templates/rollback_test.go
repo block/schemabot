@@ -147,15 +147,7 @@ func TestRenderRollbackPlanComment_WithLintViolations(t *testing.T) {
 
 	rendered := RenderRollbackPlanComment(data)
 	assert.Contains(t, rendered, "Lint Warnings")
-	assert.Contains(t, rendered, "[users] Dropping index may impact queries")
-}
-
-func TestRenderRollbackNoCompletedApply(t *testing.T) {
-	rendered := RenderRollbackNoCompletedApply("testapp", "staging")
-	assert.Contains(t, rendered, "## ℹ️ No Completed Schema Change to Rollback")
-	assert.Contains(t, rendered, "`testapp`")
-	assert.Contains(t, rendered, "`staging`")
-	assert.Contains(t, rendered, "no completed schema change")
+	assert.Contains(t, rendered, "- `users`: Dropping index may impact queries")
 }
 
 func TestRenderRollbackConfirmNoLock(t *testing.T) {
@@ -253,11 +245,13 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 		assert.Contains(t, rendered, "`schemabot unlock --tenant acme`")
 	})
 
-	t.Run("non-PR lock renders bare owner", func(t *testing.T) {
+	t.Run("non-PR lock renders the owner without its hostname", func(t *testing.T) {
 		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "")
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
-		assert.Contains(t, rendered, "`cli:alice@laptop`")
+		assert.Contains(t, rendered, "`cli:alice`")
+		assert.NotContains(t, rendered, "laptop",
+			"the lock owner's machine is internal detail and stays out of PR markdown")
 		assert.Contains(t, rendered, "ask the lock owner to release it")
 		assert.NotContains(t, rendered, "github.com",
 			"bare-owner variant should not include any github.com link")
@@ -342,4 +336,37 @@ func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 		assert.False(t, strings.HasPrefix(body, " ") || strings.HasPrefix(body, "\n"),
 			"%s body should not start with whitespace", name)
 	}
+}
+
+// The rollback-rejection reason can carry raw engine error text with internal
+// endpoints and newlines; the rendered comment must redact endpoints and keep
+// the reason on one line.
+func TestRenderRollbackNotAcceptedSanitizesError(t *testing.T) {
+	rendered := RenderRollbackNotAccepted("testapp", "staging",
+		"dial tcp db-primary.internal:3306: refused\nsecond line")
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "The rollback was not accepted: dial tcp [endpoint redacted]: refused second line")
+}
+
+// A rejection reason that sanitizes to nothing renders the short form instead
+// of a dangling "not accepted: " suffix, and HTML in the reason is escaped so
+// it cannot inject markup into the comment.
+func TestRenderRollbackNotAcceptedEmptyAndHTMLError(t *testing.T) {
+	rendered := RenderRollbackNotAccepted("testapp", "staging", " \n\t ")
+	assert.Contains(t, rendered, "The rollback was not accepted.")
+	assert.NotContains(t, rendered, "not accepted: ")
+
+	rendered = RenderRollbackNotAccepted("testapp", "staging", "boom <details> & more")
+	assert.Contains(t, rendered, "The rollback was not accepted: boom &lt;details&gt; &amp; more")
+}
+
+// The rollback-not-allowed reason renders inside a code span; endpoints in the
+// reason are redacted like every other rendered error.
+func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
+	rendered := RenderRollbackRejected(RollbackRejectedData{
+		ApplyID: "apply-abc123",
+		Reason:  "dial tcp db-primary.internal:3306: connection refused",
+	})
+	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, rendered, "**Reason**: `dial tcp [endpoint redacted]: connection refused`")
 }

@@ -22,6 +22,8 @@ import (
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/vschema"
 )
 
 // verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
@@ -257,18 +259,28 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			Keyspace:     ks,
 		})
 		if fetchErr != nil {
-			return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			var psErr *ps.Error
+			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
+				return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+			}
+			// Keyspace has no VSchema on this branch yet — either it has
+			// never had one, or the API has not converged after a recent
+			// write. Treat as empty so the desired VSchema appears as a
+			// change; validation callers absorb convergence lag through
+			// the VSchema staleness retry.
+			e.logger.Warn("VSchema not found for keyspace, treating as empty",
+				"keyspace", ks, "branch", branch)
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
 		}
-		vschemaChanged = VSchemaChanged(currentVSchemaRaw, content)
+		vschemaChanged = vschema.Changed(currentVSchemaRaw, content)
 		if vschemaChanged {
 			e.logger.Info("diffKeyspace: VSchema mismatch detected",
 				"keyspace", ks,
 				"branch", branch,
-				"current_normalized", normalizeVSchemaJSON(currentVSchemaRaw),
-				"desired_normalized", normalizeVSchemaJSON(content),
+				"current_normalized", vschema.Normalize(currentVSchemaRaw),
+				"desired_normalized", vschema.Normalize(content),
 			)
 		}
 	}
@@ -500,15 +512,162 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 	}
 }
 
-func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoCutover, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
+	// AutoCutover stays off so SchemaBot is the sole cutover actor: the deploy
+	// request parks at pending_cutover and the driver completes it via Cutover
+	// (or an operator does, when cutover is deferred). Letting PlanetScale cut
+	// over on its own would race the driver's cutover call and move the schema
+	// without SchemaBot's involvement or caller attribution.
+	//
+	// The client sends this setting explicitly rather than through the SDK's
+	// request struct, whose omitempty tag drops a false — see
+	// psclient.CreateDeployRequest. Saying it out loud is the whole point: it is
+	// the only chance to say it, since the API offers no way to change
+	// auto_cutover once the deploy request exists.
 	return client.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
 		Organization:     org,
 		Database:         database,
 		Branch:           branchName,
 		IntoBranch:       intoBranch,
-		AutoCutover:      autoCutover,
+		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
+}
+
+// deployRequestCreatedEvent states, on the operator's timeline, the cutover
+// ownership SchemaBot asked this deploy request to be created with.
+//
+// The apply's log surface carries lifecycle events, not the engine's own log
+// lines, so a decision left in an engine logger is invisible to the operator
+// reading the schema change. This one is settled at creation and can never be
+// changed afterwards, and it is the fact an operator needs first when a schema
+// change swaps without them: either SchemaBot held the cutover, and the swap
+// was its call to make, or the deploy request was not created holding it.
+//
+// It reports the request rather than the outcome, because that is all it has:
+// the created deploy request echoes back no cutover setting, so what the
+// backend recorded is not knowable here. verifyCutoverHeld reads it back and is
+// what turns this into a confirmed fact before a deferred cutover is deployed.
+func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.ApplyEvent {
+	return engine.ApplyEvent{
+		Message: fmt.Sprintf("Deploy request #%d created, requesting SchemaBot hold the cutover, validating...", dr.Number),
+		Metadata: map[string]string{
+			"deploy_request_id":      fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url":     dr.HtmlURL,
+			"branch":                 branchName,
+			"requested_auto_cutover": "false",
+		},
+		NewState: state.Apply.ValidatingDeployRequest,
+	}
+}
+
+// verifyCutoverHeld checks that the backend is holding the cutover of a deploy
+// request whose cutover the operator deferred.
+//
+// auto_cutover is settled when the deploy request is created and no later call
+// can change it, so the create request is the only thing standing between a
+// deferred cutover and a schema that swaps seconds after the deploy goes ready.
+// A create request that did not arrive as sent leaves no trace on any surface
+// the operator reads: the deploy request looks ordinary right up to the moment
+// it cuts itself over. Reading the setting back is the only way to know the
+// deferral took.
+//
+// Fails closed, including when the setting cannot be read — the deploy has not
+// started, so refusing costs a re-run, while proceeding costs the decision the
+// operator kept for themselves.
+//
+// A read that does not answer is read again before it is treated as a refusal.
+// Auto-cutover on is an answer and stops the deploy immediately; anything else —
+// a request that did not arrive, a response carrying no deployment, a body that
+// did not decode — leaves the question open, and none of those can be told apart
+// from a moment's lag from here. Seconds of re-reading is cheap next to failing
+// an apply that would have been fine, and a gate that refuses at random is one
+// operators learn to re-run past, which is how a gate stops being one.
+func (e *Engine) verifyCutoverHeld(ctx context.Context, client psclient.PSClient, org, database string, number uint64) error {
+	const maxAttempts = 3
+	const pollInterval = 2 * time.Second
+
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and reading the cutover setting was interrupted: %w", number, ctx.Err())
+			case <-time.After(pollInterval):
+			}
+		}
+
+		autoCutover, err := client.DeployRequestAutoCutover(ctx, org, database, number)
+		if err != nil {
+			lastErr = err
+			e.logger.Warn("could not read the deploy request's cutover setting, reading again before refusing the deploy",
+				"database", database, "deploy_request", number, "attempt", attempt+1, "error", err)
+			continue
+		}
+		if autoCutover {
+			return fmt.Errorf("deploy request #%d was not deployed: its cutover was deferred, but the deploy request holds auto-cutover on and would swap the schema on its own once the deploy finishes. Auto-cutover cannot be changed after a deploy request is created, so re-run the schema change to get a deploy request that holds the cutover", number)
+		}
+		e.logger.Info("the deploy request holds the cutover for the operator",
+			"database", database, "deploy_request", number, "attempts", attempt+1)
+		return nil
+	}
+	return fmt.Errorf("deploy request #%d was not deployed because its cutover was deferred and SchemaBot could not confirm the cutover is held: %w", number, lastErr)
+}
+
+// useInstantDDL decides whether to run an eligible schema change as instant DDL.
+//
+// Instant DDL rewrites metadata only: the deploy executes and the schema is
+// swapped in a single step, with nothing in between. That makes it the right
+// way to run an eligible change — except in two cases where the in-between is
+// the point:
+//
+//   - A deferred cutover is a decision the operator kept for themselves, and
+//     instant DDL takes it: there is no pending_cutover to park at, so the
+//     schema swaps the moment the deploy runs and the operator is told
+//     afterwards. The row-copy path parks at the gate.
+//   - An unsafe change — one that destroys existing data, in Spirit's unsafe
+//     vocabulary (DROP TABLE, DROP COLUMN, DROP PARTITION, ...) — must keep a
+//     revert window: the row-copy path retains the old data and can revert
+//     after cutover, while instant DDL destroys the data the moment the
+//     deploy runs with no way back.
+//
+// Both cases trade the speed of an eligible change for the safety net that
+// the change requires.
+func useInstantDDL(dr *ps.DeployRequest, deferCutover, unsafe bool) bool {
+	if dr.Deployment == nil || !dr.Deployment.InstantDDLEligible {
+		return false
+	}
+	return !deferCutover && !unsafe
+}
+
+// changesContainUnsafe reports whether any DDL statement in the requested
+// changes is unsafe (destroys existing data, per ddl.UnsafeStatement), and
+// names the operation. The verdict is unconditional — it does not honor
+// allow-unsafe: the plan gate proves the operator intended the change, while
+// the revert window is what recovers an intended change that turns out to be
+// wrong, so passing the first must never remove the second. Classification
+// failures fail closed: a statement that cannot be classified is treated as
+// unsafe, so the deploy takes the row-copy path and keeps its revert window —
+// the cost is time, never data.
+func (e *Engine) changesContainUnsafe(changes []engine.SchemaChange, database string) (bool, string) {
+	for _, sc := range changes {
+		for _, tc := range sc.TableChanges {
+			unsafe, reason, err := ddl.UnsafeStatement(tc.DDL)
+			if err != nil {
+				e.logger.Warn("could not classify statement for the instant DDL decision, taking the row-copy path to keep a revert window",
+					"database", database,
+					"namespace", sc.Namespace,
+					"ddl", tc.DDL,
+					"error", err,
+				)
+				return true, "a statement could not be classified"
+			}
+			if unsafe {
+				return true, reason
+			}
+		}
+	}
+	return false, ""
 }
 
 func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64) (*ps.DeployRequest, error) {
@@ -517,6 +676,73 @@ func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient,
 		Database:     database,
 		Number:       number,
 	})
+}
+
+// deployDeployRequest starts a deploy request's schema change, absorbing the
+// rejections that clear on their own. PlanetScale keeps rejecting the deploy
+// while the deploy request's pre-deploy safety validation is still running —
+// a not-ready condition, not a failure — so that rejection polls on its own
+// bounded budget (deployValidationWait) instead of counting toward the
+// transient-error retry bound, which validation routinely outlives. Transient
+// API errors retry with backoff up to maxRetries. Any other rejection fails
+// immediately.
+func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool) (*ps.DeployRequest, error) {
+	var validationDeadline time.Time
+	validationWaitLogged := false
+	transientAttempts := 0
+	for {
+		dr, err := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+			Organization: org,
+			Database:     database,
+			Number:       number,
+			InstantDDL:   instantDDL,
+		})
+		if err == nil {
+			return dr, nil
+		}
+		if strings.Contains(err.Error(), "approved") {
+			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", number)
+		}
+		switch {
+		case isDeployStillValidatingError(err):
+			// The budget starts at the first validating rejection, not at the
+			// first deploy attempt, so transient retries never eat into it.
+			if validationDeadline.IsZero() {
+				validationDeadline = time.Now().Add(deployValidationWait)
+			}
+			if time.Now().After(validationDeadline) {
+				return nil, fmt.Errorf("deploy deploy request #%d: PlanetScale was still validating the deploy request after waiting %s: %w", number, deployValidationWait, err)
+			}
+			if !validationWaitLogged {
+				e.logger.Info("deploy rejected because the deploy request is still validating; deploy will be retried until validation completes",
+					"database", database, "deploy_request", number, "poll_interval", deployValidationPollInterval, "wait_bound", deployValidationWait)
+				validationWaitLogged = true
+			} else {
+				e.logger.Debug("deploy request still validating; retrying deploy",
+					"database", database, "deploy_request", number)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled waiting for deploy request #%d to finish validating: %w", number, ctx.Err())
+			case <-time.After(deployValidationPollInterval):
+			}
+		case isRetryablePSError(err):
+			transientAttempts++
+			if transientAttempts >= maxRetries {
+				return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err)
+			}
+			delay := retryDelay(transientAttempts, err)
+			e.logger.Warn("retrying deploy request",
+				"database", database, "deploy_request", number, "attempt", transientAttempts+1, "delay", delay.Round(time.Millisecond), "error", err)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("context cancelled retrying deploy request #%d: %w", number, ctx.Err())
+			case <-time.After(delay):
+			}
+		default:
+			return nil, fmt.Errorf("deploy deploy request #%d: %w", number, err)
+		}
+	}
 }
 
 // waitForDeployRequestPending polls a deploy request until PlanetScale finishes

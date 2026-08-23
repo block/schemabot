@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -534,6 +535,147 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 	})
 }
 
+// A deferred cutover is only as good as the setting the backend actually holds.
+// The setting is settled when the deploy request is created and no later call can
+// change it, so SchemaBot reads it back before deploying a deferred change and
+// refuses when it reads auto-cutover on or cannot read it at all. That read is
+// only meaningful if the deploy request reports the setting, so LocalScale has to
+// report it the way the PlanetScale API does: nested under the deployment.
+func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		cleanupActiveDeployRequests(t, cleanupCtx)
+	})
+
+	tests := []struct {
+		name        string
+		autoCutover bool
+	}{
+		{name: "cutover held for the operator", autoCutover: false},
+		{name: "cutover left automatic", autoCutover: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+
+			branchName := createBranchWithDDL(t, ctx, "cutover-setting",
+				map[string][]string{
+					"testapp_sharded": {"ALTER TABLE users ADD COLUMN cutover_setting_col VARCHAR(50) NULL"},
+				},
+				nil,
+			)
+
+			dr, err := testClient.CreateDeployRequest(ctx, &ps.CreateDeployRequestRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Branch:       branchName,
+				IntoBranch:   "main",
+				AutoCutover:  tt.autoCutover,
+			})
+			require.NoError(t, err, "CreateDeployRequest")
+			t.Cleanup(func() {
+				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				defer cancel()
+				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
+					Organization: testOrg,
+					Database:     testDB,
+					Number:       dr.Number,
+				})
+			})
+
+			autoCutover, err := testClient.DeployRequestAutoCutover(ctx, testOrg, testDB, dr.Number)
+			require.NoError(t, err, "DeployRequestAutoCutover")
+			assert.Equal(t, tt.autoCutover, autoCutover,
+				"deploy request should report the cutover setting it was created with")
+		})
+	}
+}
+
+// An instant-eligible change whose cutover the operator deferred is deployed
+// with a row copy so it has a gate to park at, and it stays eligible the whole
+// time. Progress therefore reads what the deployment ran as rather than what it
+// was eligible for, and that only works if the deploy request reports the two
+// separately — otherwise a change still copying rows and waiting for the
+// operator renders as already swapped.
+func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+		defer cancel()
+		cleanupActiveDeployRequests(t, cleanupCtx)
+	})
+
+	tests := []struct {
+		name       string
+		instantDDL bool
+		column     string
+	}{
+		// Each subtest deploys to the shared main branch, so each adds its
+		// own column — an earlier subtest's completed deploy is visible to
+		// the branches later subtests create.
+		{name: "deployed instantly", instantDDL: true, column: "instant_report_col_instant"},
+		{name: "eligible but deployed with a row copy", instantDDL: false, column: "instant_report_col_copy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+
+			branchName := createBranch(t, ctx, "instant-report")
+			applyBranchSchemaHTTP(t, ctx, branchName, map[string][]string{
+				"testapp_sharded": {fmt.Sprintf("ALTER TABLE users ADD COLUMN %s VARCHAR(50) NULL", tt.column)},
+			})
+
+			dr := createDeploy(t, ctx, branchName, true)
+			require.Equal(t, drState.Ready, dr.DeploymentState)
+			require.NotNil(t, dr.Deployment)
+			require.True(t, dr.Deployment.InstantDDLEligible, "ADD COLUMN NULL should be instant-eligible")
+			// Leak safety for the failure path only: a subtest that fails before
+			// it settles would otherwise leave this deploy active, and only one
+			// deploy can be active per database, so the next subtest could not
+			// create its own and would fail for a reason that hides the first
+			// failure. On the passing path the deploy is already complete and
+			// this cancel is refused — hence the discarded result.
+			t.Cleanup(func() {
+				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				defer cancel()
+				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
+					Organization: testOrg,
+					Database:     testDB,
+					Number:       dr.Number,
+				})
+			})
+
+			_, err := testClient.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Number:       dr.Number,
+				InstantDDL:   tt.instantDDL,
+			})
+			require.NoError(t, err, "DeployDeployRequest")
+
+			read, err := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+				Organization: testOrg,
+				Database:     testDB,
+				Number:       dr.Number,
+			})
+			require.NoError(t, err, "GetDeployRequest")
+			require.NotNil(t, read.Deployment)
+			assert.Equal(t, tt.instantDDL, read.Deployment.InstantDDL,
+				"deploy request should report whether it was deployed instantly")
+			assert.True(t, read.Deployment.InstantDDLEligible,
+				"eligibility should stay reported independently of how the deploy ran")
+
+			// Only one deploy can be active per database — settle this deploy
+			// request so it cannot block the next subtest's deploy.
+			settleDeploy(t, ctx, dr.Number)
+		})
+	}
+}
+
 // TestDeployRequestPendingToNoChanges verifies that CreateDeployRequest returns "pending"
 // and transitions to "no_changes" when branch matches main.
 func TestDeployRequestPendingToNoChanges(t *testing.T) {
@@ -818,14 +960,7 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	require.Equal(t, drState.Ready, dr.DeploymentState)
 
 	deploy(t, ctx, dr.Number, false)
-	dr = waitForDeployState(t, ctx, dr.Number, drState.CompletePendingRevert, drState.Complete)
-	if dr.DeploymentState == drState.CompletePendingRevert {
-		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: dr.Number,
-		})
-		require.NoError(t, err, "SkipRevert")
-		waitForDeployState(t, ctx, dr.Number, drState.Complete)
-	}
+	settleDeploy(t, ctx, dr.Number)
 
 	// Refresh schema for reuse
 	err := testClient.RefreshSchema(ctx, testOrg, testDB, branchName)
@@ -840,14 +975,7 @@ func TestRefreshSchemaAndApply(t *testing.T) {
 	require.Equal(t, drState.Ready, dr2.DeploymentState)
 
 	deploy(t, ctx, dr2.Number, false)
-	dr2 = waitForDeployState(t, ctx, dr2.Number, drState.CompletePendingRevert, drState.Complete)
-	if dr2.DeploymentState == drState.CompletePendingRevert {
-		_, err = testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
-			Organization: testOrg, Database: testDB, Number: dr2.Number,
-		})
-		require.NoError(t, err, "SkipRevert")
-		waitForDeployState(t, ctx, dr2.Number, drState.Complete)
-	}
+	settleDeploy(t, ctx, dr2.Number)
 
 	// Verify both columns exist on main
 	verifyColumnExists(t, "users", "reuse_col_1")

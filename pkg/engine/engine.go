@@ -12,10 +12,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -77,6 +77,39 @@ type Drainer interface {
 	Drain()
 }
 
+// ShutdownHalter is an optional capability for engines whose schema-change work
+// runs inside this process. Such an engine holds resources on the target — for
+// Spirit, an advisory lock on the table it is copying — for exactly as long as
+// its in-process work lives, and that work outlives the drive that started it.
+// Without a way to bring it down, a shutting-down process stops renewing the
+// apply's lease while still holding the target, and peer drivers reclaim work
+// they cannot execute.
+//
+// An engine whose work runs elsewhere (a remote online-DDL service) must not
+// implement this: its schema change is unaffected by this process going away,
+// and the lease handover alone is the correct behavior.
+type ShutdownHalter interface {
+	// HaltForShutdown brings this instance's in-flight schema change down now,
+	// checkpointed so another driver can resume it, and returns once the engine
+	// no longer holds the target's resources. It is not an operator stop: it
+	// records no operator intent and leaves the apply active for reclaim.
+	// It returns an error if the work has not come down by the time ctx expires,
+	// so a caller can report that the target may still be held.
+	HaltForShutdown(ctx context.Context) error
+}
+
+// HaltEngineForShutdown brings eng's in-process schema-change work down when it
+// has any, and reports whether the engine implements the capability at all. An
+// engine that does not is one whose work is unaffected by this process exiting,
+// so there is nothing to halt and nothing to wait for.
+func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err error) {
+	halter, ok := eng.(ShutdownHalter)
+	if !ok {
+		return false, nil
+	}
+	return true, halter.HaltForShutdown(ctx)
+}
+
 // DeferredCutoverSignalChecker is an optional capability for engines that can
 // persist deferred-cutover intent in the target data plane. SchemaBot uses this
 // during restart recovery to decide whether it must reattach to a deferred
@@ -109,6 +142,16 @@ type ExternallyAuthoritativeProgress interface {
 	// ProgressIsExternallyAuthoritative reports whether this engine's Progress
 	// result is correct regardless of which instance answers.
 	ProgressIsExternallyAuthoritative() bool
+}
+
+// ProgressIsExternallyAuthoritative reports whether eng declares its Progress
+// result authoritative regardless of which instance answers. Engines that do
+// not implement ExternallyAuthoritativeProgress are treated as instance-local —
+// this fails closed: a new engine's progress is never trusted as backend truth
+// unless it explicitly declares it.
+func ProgressIsExternallyAuthoritative(eng Engine) bool {
+	auth, ok := eng.(ExternallyAuthoritativeProgress)
+	return ok && auth.ProgressIsExternallyAuthoritative()
 }
 
 // DeferredCutoverSignalRequest identifies the target database whose deferred
@@ -149,6 +192,12 @@ type PlanResult struct {
 	// Lint results from schema analysis. Violations with Severity "error" block
 	// apply unless overridden with --allow-unsafe.
 	LintViolations []LintViolation
+
+	// ExistingCopies is unfinished work earlier schema changes left on the
+	// target that applying this plan will continue or destroy, one entry per
+	// namespace that holds any. Empty when the target holds none, which is the
+	// ordinary case.
+	ExistingCopies []*ExistingCopy
 }
 
 // HasErrors returns true if any lint warning has error severity.
@@ -244,13 +293,131 @@ type LintViolation struct {
 // TableChange describes a change to a single table within a SchemaChange namespace.
 type TableChange struct {
 	Table     string // Table name
-	Operation statement.StatementType
+	Operation ddl.StatementType
 	DDL       string // The DDL statement
 
 	// Unsafe change tracking
 	IsUnsafe     bool   // True if this is a destructive/unsafe change
 	UnsafeReason string // Human-readable reason (e.g., "DROP COLUMN removes data")
+
+	// Execution-mode verdict: how the engine will run this statement at apply
+	// time. Empty means the engine's default path. "blocked" means the engine
+	// deterministically refuses the statement — the apply will fail, and the
+	// plan surfaces that up front. "direct" means the database's direct
+	// execution policy routes the refused statement to native DDL on the
+	// target instead. Distinct from IsUnsafe, which flags a change the engine
+	// *can* run but the operator must acknowledge.
+	ExecutionMode string
+	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
 }
+
+// Execution-mode verdicts recorded on a planned table change. The verdict
+// answers "how will this statement actually run?" so operators learn about
+// engine limitations at plan time instead of at apply time.
+const (
+	// ExecutionModeBlocked marks a statement the engine deterministically
+	// refuses. An apply containing it will fail, and retrying cannot succeed
+	// until the statement changes.
+	ExecutionModeBlocked = "blocked"
+
+	// ExecutionModeDirect marks a statement the engine refuses but that the
+	// database's direct execution policy routes to native DDL on the target
+	// instead: it runs synchronously, it blocks writes to the table while it
+	// runs, and it is not revertible.
+	ExecutionModeDirect = "direct"
+)
+
+// CopyDisposition is what applying a plan will do with work an earlier schema
+// change already did on the target and left behind — for engines that copy a
+// table, the partly filled copy and the checkpoint describing it.
+type CopyDisposition string
+
+const (
+	// CopyNone means the target holds no unfinished work for any table in the
+	// plan. This is the ordinary case and is not surfaced.
+	CopyNone CopyDisposition = "none"
+
+	// CopyAdopt means applying continues the existing work rather than
+	// repeating it. Nothing is destroyed, so it is disclosed and proceeds.
+	CopyAdopt CopyDisposition = "adopt"
+
+	// CopyDiscard means applying destroys the existing work and starts the
+	// affected tables over. The cost is everything the earlier schema change
+	// had done, which can be days of copying.
+	CopyDiscard CopyDisposition = "discard"
+)
+
+// Discard reasons, kept distinct because they call for different operator
+// advice: a plan that drifted from the copy's own batch can be restored, an
+// expired checkpoint cannot, and a partial copy is not the operator's doing at
+// all.
+const (
+	// DiscardStatementDiffers means the existing work was done for a different
+	// set of statements than this plan will run, so the engine will not
+	// continue it.
+	DiscardStatementDiffers = "statement_differs"
+
+	// DiscardCheckpointExpired means the statements match but the engine's
+	// record of the existing work is too old to resume from.
+	DiscardCheckpointExpired = "checkpoint_expired"
+
+	// DiscardCopyIncomplete means the existing work covers only some of the
+	// tables this plan changes. An engine that continues work continues all of
+	// it or none, so the tables that did get copied are destroyed along with the
+	// ones that never started.
+	DiscardCopyIncomplete = "copy_incomplete"
+)
+
+// ExistingCopy is unfinished work an earlier schema change left on the target
+// that applying this plan will either continue or destroy. It never carries
+// CopyNone: a plan that destroys nothing reports no ExistingCopy at all.
+type ExistingCopy struct {
+	// Namespace names the target the work sits on, as the engine that read it
+	// addresses that target. An engine planning each namespace separately
+	// reports one ExistingCopy per namespace that holds any. Where several
+	// namespaces share one target — schema subdirectories dividing a single
+	// connection-scoped database only logically — the engine reads that target
+	// once and this names the database it read, not the subdirectory the change
+	// came from. Either way it names something an operator can go and look at,
+	// which is what a disclosure has to do; it is not a key to group or route
+	// on.
+	Namespace string
+	// Disposition is what applying will do with the existing work.
+	Disposition CopyDisposition
+	// Reason names why a discard cannot be avoided by applying as planned.
+	// Empty for an adopt.
+	Reason string
+	// Tables are the tables in this plan that already hold unfinished work.
+	Tables []string
+	// Age is how long ago the engine last recorded progress on it. Zero when
+	// the engine has no record to resume from, which is itself a discard.
+	Age time.Duration
+}
+
+// Engine metadata keys carrying the direct execution policy from config
+// surfaces (server config, embedder assemblers) to an engine via request
+// credentials. Exported so producers and consumers share one spelling and
+// cannot drift on the key strings.
+const (
+	// MetadataDirectExecution enables direct execution ("true") for ALTER
+	// statements the engine deterministically refuses. Absent or "false"
+	// leaves refused statements blocked.
+	MetadataDirectExecution = "direct_execution"
+
+	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
+	// target table's row count. Required (a positive integer) when direct
+	// execution is enabled, so a native table rebuild can never run
+	// unbounded: above the bound — or when the size cannot be determined —
+	// the statement stays blocked.
+	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
+
+	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
+	// seconds, how long each direct statement waits to acquire its locks
+	// before failing with a retryable busy-table error instead of queueing
+	// on the table's lock indefinitely. Optional; engines apply their
+	// default when the key is absent.
+	MetadataDirectExecutionLockAcquisitionTimeoutSeconds = "direct_execution_lock_acquisition_timeout_seconds"
+)
 
 // ApplyRequest contains the input for starting a schema change.
 // On first apply, set the resume context to group related DDL.
@@ -264,6 +431,13 @@ type ApplyRequest struct {
 	Options      map[string]string  // Options like "defer_cutover", "skip_revert"
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
+
+	// Logger is an optional schema-change-scoped logger, already bound with
+	// the caller's triage identity (apply id, repo, PR, environment). Engines
+	// use it for every log line about this schema change so engine lines stay
+	// filterable by the same identity as the drive logs. Nil falls back to
+	// the engine's configured logger.
+	Logger *slog.Logger
 
 	// OnStateChange is called by the engine to persist ResumeState at key milestones
 	// during Apply (e.g., after branch creation, after deploy request creation).
@@ -334,6 +508,12 @@ type ProgressResult struct {
 	Tables       []TableProgress
 	ResumeState  *ResumeState // Updated resume state (engines may update MigrationContext/Metadata during polling)
 
+	// ResumedFromCheckpoint reports that this run reattached to a durable
+	// checkpoint left by an earlier run rather than starting the copy from
+	// scratch, so preserved progress can be told apart from a fresh restart.
+	// False for engines without checkpoint resume.
+	ResumedFromCheckpoint bool
+
 	// Metadata carries engine-specific display fields for the progress response
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the
 	// engine surface structured status to the renderer without core decoding the
@@ -379,12 +559,21 @@ type TableProgress struct {
 	// Populated while the table is checksumming (verifying copied data), 0 otherwise.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	Shards              []ShardProgress // Per-shard breakdown (for Vitess)
-	IsInstant           bool            // True if using instant DDL
-	ProgressDetail      string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
-	DDL                 string          // The DDL statement being applied
-	StartedAt           *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
-	CompletedAt         *time.Time      // When execution completed (from engine)
+	// Throttled reports that the engine's throttler is currently pausing the
+	// phase this table's work is in (the row copy or the checksum verify), so
+	// stalled row counts read as a deliberate pause rather than a hang. False
+	// in phases nothing paces, and cleared when the pause lifts.
+	Throttled bool
+	// ThrottleReason names the signal pausing the work, for display only
+	// (e.g. "replica-lag 5s >= 2s"). Empty when Throttled is false or the
+	// engine cannot explain the pause.
+	ThrottleReason string
+	Shards         []ShardProgress // Per-shard breakdown (for Vitess)
+	IsInstant      bool            // True if using instant DDL
+	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
+	DDL            string          // The DDL statement being applied
+	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
+	CompletedAt    *time.Time      // When execution completed (from engine)
 }
 
 // ShardProgress tracks progress for a single shard.

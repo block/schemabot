@@ -2,10 +2,11 @@ package templates
 
 import (
 	"fmt"
+	"html"
+	"slices"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
-
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -29,6 +30,42 @@ type UnsafeChangeData struct {
 	Shards []string
 }
 
+// BlockedChangeData is a planned change the engine deterministically refuses:
+// an apply will fail on it, so the plan comment discloses it up front.
+type BlockedChangeData struct {
+	Table  string
+	Reason string
+	// Shards names the shards this blocked change applies to, for a sharded
+	// plan where only some shards carry it. Empty for a non-sharded change.
+	Shards []string
+}
+
+// DirectChangeData is a planned change the database's direct execution policy
+// routes to native MySQL DDL instead of the schema-change engine. The plan
+// comment discloses its semantics — blocking, not revertible — so the
+// operator consents to them when confirming the apply.
+type DirectChangeData struct {
+	Table  string
+	Reason string
+	// Shards names the shards this direct change applies to, for a sharded
+	// plan where only some shards carry it. Empty for a non-sharded change.
+	Shards []string
+}
+
+// AttributedChangeData is a table carrying a planned destructive change that
+// stored task history attributes to a pull request other than the one being
+// planned. Repository and PullRequest name the owner when the lookup resolved
+// an open one; Unresolved marks a table whose ownership could not be
+// established, which is annotated the same way — the lookup fails toward
+// ownership rather than presenting a change SchemaBot cannot vouch for as one
+// this pull request proposes.
+type AttributedChangeData struct {
+	Table       string
+	Repository  string
+	PullRequest int
+	Unresolved  bool
+}
+
 // PlanCommentData contains all data needed to render a plan comment.
 type PlanCommentData struct {
 	Database     string
@@ -42,14 +79,37 @@ type PlanCommentData struct {
 	IsMySQL      bool
 	ApplyID      string
 
+	// AgentHint is the deployment's configured guidance for AI agents reading
+	// the plan. Empty on deployments that configure none, which render an
+	// unchanged comment.
+	AgentHint string
+
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
 	Errors         []string
+
+	// IgnoredNamespaces lists the namespaces whose schema files were excluded
+	// from this plan by the repository's ignore_namespaces config — only entries
+	// that actually removed a namespace, resolved and sorted. Disclosed on the
+	// comment so a reviewer can tell "this namespace has no changes" apart from
+	// "this namespace was withheld by config", which is what makes a PR that
+	// introduces an ignore_namespaces entry visible in review.
+	IgnoredNamespaces []string
 
 	// Unsafe change tracking
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
 	UnsafeChanges    []UnsafeChangeData
+
+	// Changes the engine refuses; the apply will fail on them.
+	BlockedChanges []BlockedChangeData
+
+	// Changes the direct execution policy routes to native MySQL DDL.
+	DirectChanges []DirectChangeData
+
+	// Tables carrying a destructive change that another pull request owns, or
+	// whose ownership could not be established.
+	AttributedChanges []AttributedChangeData
 
 	// Options
 	DeferCutover bool
@@ -137,7 +197,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	writePlanAttribution(&sb, data)
 
 	if data.IsLocked && data.LockOwner != "" {
-		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", data.LockOwner)
+		fmt.Fprintf(&sb, "\n🔒 **Lock acquired by** `%s`", caller.Short(data.LockOwner))
 		if data.LockAcquired != "" {
 			fmt.Fprintf(&sb, " at %s", data.LockAcquired)
 		}
@@ -155,14 +215,44 @@ func RenderPlanComment(data PlanCommentData) string {
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
-	// No changes — short-circuit with a single clean message
+	// No changes — short-circuit with a single clean message. The
+	// ignore_namespaces disclosure still renders: a no-changes result is
+	// exactly where a reviewer needs to tell a withheld namespace apart from a
+	// genuinely unchanged one.
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
-		return sb.String()
+		if len(data.IgnoredNamespaces) > 0 {
+			sb.WriteString("\n")
+			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
+		}
+		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data)
+
+	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
+	// these cannot be acknowledged away: the apply will fail on them. Shown on
+	// the locked apply comment too, so the operator sees the guaranteed
+	// failure before confirming.
+	if len(data.BlockedChanges) > 0 {
+		writeBlockedChanges(&sb, data.BlockedChanges)
+	}
+
+	// Destructive changes to tables another pull request owns. Shown on the
+	// locked apply comment too, for the same reason as the direct-execution
+	// disclosure: it must sit on the comment the confirmation acts on.
+	if len(data.AttributedChanges) > 0 {
+		writeAttributedChanges(&sb, data.AttributedChanges)
+	}
+
+	// Direct-execution changes — statements the policy routes to native DDL.
+	// Shown on the locked apply comment too: confirming the apply is the
+	// operator's consent to their blocking, non-revertible semantics, so the
+	// disclosure must sit on the comment the confirmation acts on.
+	if len(data.DirectChanges) > 0 {
+		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
+	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
@@ -191,7 +281,8 @@ func RenderPlanComment(data PlanCommentData) string {
 	// Footer
 	sb.WriteString("\n---\n\n")
 
-	if data.IsLocked {
+	switch {
+	case data.IsLocked:
 		applyConfirmCmd := fmt.Sprintf("schemabot apply-confirm -e %s", data.Environment)
 		if data.Tenant != "" {
 			applyConfirmCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
@@ -218,21 +309,50 @@ func RenderPlanComment(data PlanCommentData) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
-	} else {
+	default:
 		applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyHint(&sb, applyCmd)
+		writeApplyInstruction(&sb, applyCmd)
 	}
 
-	return sb.String()
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
-// writeApplyHint writes the 💡 apply hint with the given command.
-func writeApplyHint(sb *strings.Builder, command string) {
-	sb.WriteString("💡 **To apply** all schema changes from this PR, comment:\n")
+// writeApplyInstruction writes the ▶️ apply instruction with the given command.
+func writeApplyInstruction(sb *strings.Builder, command string) {
+	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// writeAttributedChanges writes the section for destructive changes to tables
+// that stored task history attributes to another pull request. SchemaBot plans
+// a full diff of the pull request's schema files against the live database, so
+// what an unmerged pull request already applied reads as something this pull
+// request wants gone. Reconciling the database to the declared schema is the
+// operator's call to make; what the comment owes them is the attribution they
+// cannot see from the DDL alone.
+//
+// Attribution is table-grained: stored task history records the table a task
+// changed and nothing finer, so the notice names the table and the pull request
+// that last changed it, never the specific column or index.
+func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
+	n := len(changes)
+	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	for _, d := range changes {
+		if d.Unresolved {
+			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
+			continue
+		}
+		// The owner named is the most recent open pull request that changed the
+		// table, which is not necessarily the last one to change it: a later
+		// change from a pull request that has since closed leaves no open claim
+		// and is passed over.
+		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
+			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+	}
+	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
 
 // writePlanMetadata writes the metadata line for plan comments.
@@ -322,6 +442,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if totalChanges == 0 {
 		writeNoChangesDetected(sb, data)
 		sb.WriteString("\n")
+		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
 		return
 	}
 
@@ -347,6 +468,79 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	} else {
 		// Fallback for unrecognized statement types
 		fmt.Fprintf(sb, "📋 **Plan**: %d DDL %s\n\n", totalStatements, pluralize("statement", totalStatements))
+	}
+
+	// Disclosed directly under the plan summary so the exclusion reads as
+	// part of the plan result: what was counted, then what was withheld.
+	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
+}
+
+// writeIgnoredNamespaces renders the ignore_namespaces disclosure line. No-op
+// when nothing was excluded, so plans from repos without the config render
+// unchanged.
+func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
+	if len(ignored) == 0 {
+		return
+	}
+	quoted := make([]string, len(ignored))
+	for i, ns := range ignored {
+		quoted[i] = fmt.Sprintf("`%s`", ns)
+	}
+	fmt.Fprintf(sb, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+}
+
+// multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
+// namespaces, so callers can decide whether the disclosure (and its spacing)
+// renders at all.
+func multiEnvHasIgnoredNamespaces(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if plan, ok := data.Plans[env]; ok && plan != nil && len(plan.IgnoredNamespaces) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// writeMultiEnvIgnoredNamespaces renders the ignore_namespaces disclosure for
+// the all-environments-clean path, where no per-environment sections exist to
+// carry it. When every environment excluded the same namespaces it renders the
+// single shared line; otherwise one line per environment, since entries can
+// resolve differently per environment.
+func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	anyIgnored := false
+	identical := true
+	var first []string
+	for i, env := range data.Environments {
+		var ignored []string
+		if plan, ok := data.Plans[env]; ok && plan != nil {
+			ignored = plan.IgnoredNamespaces
+		}
+		if len(ignored) > 0 {
+			anyIgnored = true
+		}
+		if i == 0 {
+			first = ignored
+		} else if !slices.Equal(ignored, first) {
+			identical = false
+		}
+	}
+	if !anyIgnored {
+		return
+	}
+	if identical {
+		writeIgnoredNamespaces(sb, first)
+		return
+	}
+	for _, env := range data.Environments {
+		plan, ok := data.Plans[env]
+		if !ok || plan == nil || len(plan.IgnoredNamespaces) == 0 {
+			continue
+		}
+		quoted := make([]string, len(plan.IgnoredNamespaces))
+		for i, ns := range plan.IgnoredNamespaces {
+			quoted[i] = fmt.Sprintf("`%s`", ns)
+		}
+		fmt.Fprintf(sb, "ℹ️ **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
 	}
 }
 
@@ -408,11 +602,11 @@ func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops i
 				continue
 			}
 			switch stmtType {
-			case statement.StatementCreateTable:
+			case ddl.StatementCreateTable:
 				creates++
-			case statement.StatementAlterTable:
+			case ddl.StatementAlterTable:
 				alters++
-			case statement.StatementDropTable:
+			case ddl.StatementDropTable:
 				drops++
 			}
 		}
@@ -424,6 +618,17 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 	// Skip the schema/keyspace heading when there's only one and it matches
 	// the database name — it's redundant with the metadata line.
 	singleKeyspace := len(data.Changes) == 1 && data.IsMySQL && data.Changes[0].Keyspace == data.Database
+
+	// The VSchema diff budget is per comment, not per keyspace: split it
+	// across the keyspaces that will render a diff so a multi-keyspace plan
+	// stays bounded.
+	diffCount := 0
+	for _, ks := range data.Changes {
+		if ks.VSchemaChanged && !data.IsMySQL && ks.VSchemaDiff != "" {
+			diffCount++
+		}
+	}
+	diffBudget := vschemaDiffBudget(diffCount)
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
@@ -443,9 +648,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		if hasVSchemaChanges {
 			sb.WriteString("#### VSchema\n")
 			if ks.VSchemaDiff != "" {
-				sb.WriteString("```diff\n")
-				sb.WriteString(ks.VSchemaDiff)
-				sb.WriteString("\n```\n\n")
+				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
 			} else {
 				sb.WriteString("_(diff not available)_\n\n")
 			}
@@ -616,23 +819,118 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 	return strings.Join(names, ", ")
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+// writeBlockedChanges writes the section for statements the engine refuses,
+// naming each table and the engine's reason verbatim. There is no opt-in flag
+// that lets these through — the guidance is to rewrite the change, not retry.
+func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
+	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	for _, c := range changes {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
+		if c.Reason != "" {
+			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+		} else {
+			fmt.Fprintf(sb, "- %s\n", table)
+		}
+	}
+	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
+}
+
+// directConsentCopy returns the header noun and consent footer for the
+// direct-execution disclosure, keyed by database type. The footer is the
+// sentence the operator consents to by confirming the apply, and what a
+// direct statement does to the table while it runs is engine-specific — an
+// engine that adopts direct execution adds its own copy here rather than
+// inheriting another engine's semantics.
+func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer string) {
+	// Strata is sharded MySQL: a direct statement there is the same native
+	// MySQL DDL, executed per shard.
+	databaseType = strings.TrimSpace(databaseType)
+	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
+		return "native MySQL DDL",
+			"These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+	}
+	// Deliberately conservative fallback for an engine that emits direct
+	// verdicts without registering its own copy above: disclose the broadest
+	// impact rather than understate what the operator is consenting to.
+	return "native DDL",
+		"These statements run synchronously outside the schema-change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+}
+
+// writeDirectChanges writes the section for statements the direct execution
+// policy routes to native DDL, naming each table and the planner's reason
+// (which carries the row estimate). The fixed footer discloses the semantics
+// the operator consents to by confirming the apply.
+func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
+	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
+	n := len(changes)
+	fmt.Fprintf(sb, "⚙️ **Direct execution**: **%d** %s will run as %s\n", n, pluralize("change", n), headerNoun)
+	for _, c := range changes {
+		table := "`" + c.Table + "`"
+		if len(c.Shards) > 0 {
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+		}
+		if c.Reason != "" {
+			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+		} else {
+			fmt.Fprintf(sb, "- %s\n", table)
+		}
+	}
+	sb.WriteString("\n" + footer + "\n\n")
+}
+
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
-		reason := ui.CleanLintReason(c.Reason)
-		if reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, reason)
-		} else {
-			fmt.Fprintf(sb, "- %s\n", table)
-		}
+		writeUnsafeChangeItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, isMySQL)
+}
+
+// writeUnsafeChangeItem writes one table's unsafe findings as a list item:
+// a single "- table: reason" line for one finding, or a nested list when the
+// engine joined several, so each finding reads on its own line.
+func writeUnsafeChangeItem(sb *strings.Builder, table, reason string) {
+	reasons := ui.LintReasons(reason)
+	for i, r := range reasons {
+		reasons[i] = ui.CodeQuoteIdentifiers(r)
+	}
+	switch len(reasons) {
+	case 0:
+		fmt.Fprintf(sb, "- %s\n", table)
+	case 1:
+		fmt.Fprintf(sb, "- %s: %s\n", table, reasons[0])
+	default:
+		fmt.Fprintf(sb, "- %s:\n", table)
+		for _, r := range reasons {
+			fmt.Fprintf(sb, "  - %s\n", r)
+		}
+	}
+}
+
+// countUnsafeFindings sums the individual lint findings across changes, so
+// headers count what the list below actually shows: a table whose reason
+// carries several joined violations contributes each of them. A change with
+// no parseable reason still counts once.
+func countUnsafeFindings(changes []UnsafeChangeData) int {
+	n := 0
+	for _, c := range changes {
+		if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+			n += len(reasons)
+		} else {
+			n++
+		}
+	}
+	return n
 }
 
 func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
@@ -706,22 +1004,92 @@ func unsafeDropIndexUsageTargets(changes []UnsafeChangeData) (actionTarget, invi
 	return "", "", "", false
 }
 
+// lintWarningsFoldThreshold is the warning count above which the lint section
+// collapses into a details block grouped by table. Short lists stay inline so
+// a single advisory finding never needs a click; long lists stop dominating
+// the plan comment while the count stays visible in the header.
+const lintWarningsFoldThreshold = 5
+
+// writeLintViolations writes advisory lint findings. Lint warnings never block
+// an apply, so they render with a lighter marker than the unsafe-change Issues
+// section but share its visual language: a bold count in the header, backticked
+// table prefixes, and identifiers as inline code.
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
-	sb.WriteString("\u26a0\ufe0f **Lint Warnings**:\n")
-	for _, w := range warnings {
-		warningText := w.Message
-		if w.Table != "" {
-			warningText = fmt.Sprintf("[%s] %s", w.Table, w.Message)
+	n := len(warnings)
+
+	if n <= lintWarningsFoldThreshold {
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: **%d** advisory %s\n", n, pluralize("finding", n))
+		for _, w := range warnings {
+			message := ui.CodeQuoteIdentifiers(w.Message)
+			if w.Table != "" {
+				fmt.Fprintf(sb, "- `%s`: %s\n", w.Table, message)
+			} else {
+				fmt.Fprintf(sb, "- %s\n", message)
+			}
 		}
-		fmt.Fprintf(sb, "- %s\n", warningText)
+		sb.WriteString("\n")
+		return
 	}
-	sb.WriteString("\n")
+
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// header bolds with <b> tags instead of asterisks.
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: <b>%d</b> advisory %s</summary>\n\n", n, pluralize("finding", n))
+	for _, group := range groupLintWarningsByTable(warnings) {
+		if group.table != "" {
+			fmt.Fprintf(sb, "**`%s`**\n", group.table)
+		}
+		for _, message := range group.messages {
+			fmt.Fprintf(sb, "- %s\n", ui.CodeQuoteIdentifiers(message))
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("</details>\n\n")
+}
+
+type lintWarningGroup struct {
+	table    string
+	messages []string
+}
+
+// groupLintWarningsByTable groups warnings by table in first-appearance order,
+// preserving message order within each table. Warnings without a table come
+// out as a leading group with an empty table name.
+func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
+	index := make(map[string]int)
+	var groups []lintWarningGroup
+	for _, w := range warnings {
+		i, ok := index[w.Table]
+		if !ok {
+			i = len(groups)
+			index[w.Table] = i
+			groups = append(groups, lintWarningGroup{table: w.Table})
+		}
+		groups[i].messages = append(groups[i].messages, w.Message)
+	}
+	// Untabled warnings read as general notes; surface them first rather
+	// than wherever they happened to appear in the linter output.
+	for i, g := range groups {
+		if g.table == "" && i > 0 {
+			groups = append([]lintWarningGroup{g}, append(groups[:i:i], groups[i+1:]...)...)
+			break
+		}
+	}
+	return groups
 }
 
 func writeErrors(sb *strings.Builder, errors []string) {
-	sb.WriteString("**Errors**:\n")
+	var msgs []string
 	for _, errMsg := range errors {
-		fmt.Fprintf(sb, "- %s\n", errMsg)
+		if msg := SanitizeInlineError(errMsg); msg != "" {
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) == 0 {
+		return
+	}
+	sb.WriteString("**Errors**:\n")
+	for _, msg := range msgs {
+		fmt.Fprintf(sb, "- %s\n", html.EscapeString(msg))
 	}
 	sb.WriteString("\n")
 }
@@ -744,6 +1112,11 @@ type MultiEnvPlanCommentData struct {
 	IsMySQL      bool
 	RequestedBy  string
 	Tenant       string
+
+	// AgentHint is the deployment's configured guidance for AI agents reading
+	// the plan. Empty on deployments that configure none, which render an
+	// unchanged comment.
+	AgentHint string
 
 	// Environments in display order (staging first, production second, etc.)
 	Environments []string
@@ -786,10 +1159,17 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 
 	// If no environments have changes and no errors, show simple message — unless
 	// a deployment drifted, which must still surface even when the reviewed
-	// primary plans are clean no-ops.
+	// primary plans are clean no-ops. The ignore_namespaces disclosure still
+	// renders underneath it: an all-clean result is exactly where a reviewer
+	// needs to see that a namespace was withheld rather than genuinely
+	// unchanged.
 	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
-		return sb.String()
+		if multiEnvHasIgnoredNamespaces(data) {
+			sb.WriteString("\n")
+			writeMultiEnvIgnoredNamespaces(&sb, data)
+		}
+		return appendAgentHint(sb.String(), data.AgentHint)
 	}
 
 	// Check if all environments have identical plans (for deduplication)
@@ -822,7 +1202,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	sb.WriteString("---\n\n")
 	writeMultiEnvFooter(&sb, data)
 
-	return sb.String()
+	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
 func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool) {
@@ -861,6 +1241,9 @@ func singleEnvironmentPlan(data MultiEnvPlanCommentData) (PlanCommentData, bool)
 	}
 	if merged.Tenant == "" {
 		merged.Tenant = data.Tenant
+	}
+	if merged.AgentHint == "" {
+		merged.AgentHint = data.AgentHint
 	}
 	return merged, true
 }
@@ -909,8 +1292,12 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
+	// The ignore_namespaces disclosure renders under each environment's
+	// summary (writePlanSummary) or no-changes message, because entries can
+	// resolve differently per environment.
 	if totalChanges == 0 {
 		sb.WriteString("✅ **No schema changes detected**\n\n")
+		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
 		return
 	}
 
@@ -921,6 +1308,25 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeKeyspaceChanges(sb, *plan)
 	} else {
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements)
+	}
+
+	// Blocked changes — statements the engine refuses; the apply will fail on
+	// them, so each environment's section discloses its own.
+	if len(plan.BlockedChanges) > 0 {
+		writeBlockedChanges(sb, plan.BlockedChanges)
+	}
+
+	// Destructive changes to tables another pull request owns — resolved per
+	// environment, since the task history that attributes them is per
+	// environment.
+	if len(plan.AttributedChanges) > 0 {
+		writeAttributedChanges(sb, plan.AttributedChanges)
+	}
+
+	// Direct-execution changes — each environment's section discloses its own,
+	// since the policy is configured per environment.
+	if len(plan.DirectChanges) > 0 {
+		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
 	// Unsafe changes warning
@@ -969,17 +1375,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		}
 	}
 
-	// Apply instructions for environments with changes
+	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
-		sb.WriteString("💡 **To apply** these changes, start with the first environment:\n")
+		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
 		for i := 1; i < len(envsWithChanges); i++ {
 			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
 			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[i], data.Tenant))
 		}
 	case len(envsWithChanges) == 1:
-		sb.WriteString("💡 **To apply** these changes, comment:\n")
+		sb.WriteString("▶️ **To apply** these changes, comment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot apply", envsWithChanges[0], data.Tenant))
 	case len(envsWithErrors) == 0:
 		sb.WriteString("No changes to apply.\n")
@@ -1064,8 +1470,13 @@ func driftIdentical(a, b *DeploymentDriftData) bool {
 	return true
 }
 
-// plansIdentical checks if two plans have the same DDL statements.
+// plansIdentical checks if two plans have the same DDL statements. Plans that
+// excluded different namespaces are never identical: deduplicating them into
+// one section would show one environment's exclusion disclosure for both.
 func plansIdentical(a, b *PlanCommentData) bool {
+	if !slices.Equal(a.IgnoredNamespaces, b.IgnoredNamespaces) {
+		return false
+	}
 	if len(a.Changes) != len(b.Changes) {
 		return false
 	}

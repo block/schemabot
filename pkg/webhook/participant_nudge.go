@@ -30,7 +30,7 @@ const defaultParticipantNudgeRefoldDelay = 45 * time.Second
 //
 // Returns false when the comment is not a nudge — not a led repo, or not a
 // trusted sibling's bot — so the caller keeps its normal bot handling.
-func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr int, installationID int64, authorLogin string) bool {
+func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr int, installationID int64, deliveryID, authorLogin string) bool {
 	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
 		return false
 	}
@@ -46,11 +46,11 @@ func (h *Handler) participantCommentNudge(ctx context.Context, repo string, pr i
 		Status:     "success",
 	})
 
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		h.refoldAggregateForPR(repo, pr, installationID, "participant comment")
 	})
 	time.AfterFunc(h.nudgeRefoldDelay(), func() {
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.refoldAggregateForPR(repo, pr, installationID, "participant comment delayed pass")
 		})
 	})
@@ -114,13 +114,15 @@ func (h *Handler) participantRefoldBudgetRemaining(repo string, pr int) bool {
 	return h.participantRefoldAttempts[participantRefoldKey(repo, pr)] < maxParticipantRefoldAttempts
 }
 
-// scheduleParticipantRefold arms a delayed aggregate re-fold because at least
-// one expected participant resolved as retriable (not reported yet, or a
-// failed Checks API read). Participants publish their Check Runs moments after
-// the leader's first fold, and a participant with no schema work never
-// comments, so without this the leader's aggregate would stay blocked on a
-// participant that already reported green. Attempts are bounded per PR so a
-// participant that is genuinely down cannot keep a timer chain alive forever.
+// scheduleParticipantRefold arms a delayed aggregate re-fold because the fold
+// left retriable work behind: an expected participant resolved as retriable
+// (not reported yet, or a failed Checks API read), or an aggregate publish
+// failed (a GitHub Check Run write or the storage write recording it).
+// Participants publish their Check Runs moments after the leader's first fold,
+// and a participant with no schema work never comments, so without this the
+// leader's aggregate would stay blocked on a participant that already reported
+// green. Attempts are bounded per PR so a participant that is genuinely down
+// (or a persistently failing write) cannot keep a timer chain alive forever.
 func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr int, installationID int64) {
 	key := participantRefoldKey(repo, pr)
 
@@ -128,7 +130,7 @@ func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr
 	attempts := h.participantRefoldAttempts[key]
 	if attempts >= maxParticipantRefoldAttempts {
 		h.participantRefoldMu.Unlock()
-		h.logger.Warn("expected participants still unresolved after scheduled re-folds; aggregate stays blocked until a participant comment, new commit, or manual plan re-folds it",
+		h.logger.Warn("aggregate re-fold budget exhausted; the aggregate keeps its last published state until a participant comment, new commit, or manual plan re-folds it",
 			"repo", repo, "pr", pr, "refold_attempts", attempts)
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "participant_refold",
@@ -153,7 +155,7 @@ func (h *Handler) scheduleParticipantRefold(ctx context.Context, repo string, pr
 	})
 
 	time.AfterFunc(delay, func() {
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, "", func() {
 			h.refoldAggregateForPR(repo, pr, installationID, "unresolved participant delayed re-fold")
 		})
 	})

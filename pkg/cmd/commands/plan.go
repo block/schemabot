@@ -13,8 +13,10 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -46,7 +48,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		errMsg := "no endpoint configured (run 'schemabot configure' to set up a profile)"
+		errMsg := fmt.Sprintf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 		if cmd.JSON {
 			return client.ExitWithJSON("invalid_request", errMsg)
 		}
@@ -78,11 +80,12 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	// Collect results for all environments
 	allResults := make(map[string]*apitypes.PlanResponse)
+	ignoredByEnv := make(map[string][]string)
 	for _, env := range environments {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces)
 			return planErr
 		})
 		if err != nil {
@@ -99,6 +102,20 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	if cmd.JSON {
 		return writeJSON(allResults)
+	}
+
+	// Disclose config-driven exclusions once per distinct resolution — the
+	// lists only differ between environments when entries use $ENV.
+	disclosed := make(map[string]bool)
+	for _, env := range environments {
+		ignored := ignoredByEnv[env]
+		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
+		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
+		if disclosed[key] {
+			continue
+		}
+		disclosed[key] = true
+		templates.WriteIgnoredNamespaces(ignored, unmatched)
 	}
 
 	// Human-readable output for all environments
@@ -210,10 +227,10 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Collect VSchema changes from metadata
 	var vschemaChanges []templates.VSchemaChange
 	for _, sc := range result.Changes {
-		if diff, ok := sc.Metadata["vschema"]; ok && diff != "" {
+		if sc.HasVSchemaChange() {
 			vschemaChanges = append(vschemaChanges, templates.VSchemaChange{
 				Keyspace: sc.Namespace,
-				Diff:     diff,
+				Diff:     sc.Metadata[apitypes.VSchemaDiffMetadataKey],
 			})
 		}
 	}
@@ -285,7 +302,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}
 
-	// Show non-unsafe lint violations with ⚠️
+	// Show advisory (non-error) lint violations
 	lintViolations := result.LintNonErrors()
 	if len(lintViolations) > 0 {
 		templates.WriteLintViolations(lintViolations)
@@ -302,18 +319,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 
 // hasResultChanges returns true if the result has schema changes (DDL or VSchema).
 func hasResultChanges(result *apitypes.PlanResponse) bool {
-	if result == nil {
-		return false
-	}
-	if len(result.FlatTables()) > 0 {
-		return true
-	}
-	for _, sc := range result.Changes {
-		if sc.Metadata["vschema"] != "" {
-			return true
-		}
-	}
-	return false
+	return result != nil && result.HasChanges()
 }
 
 // sortEnvironments sorts environments with staging first, production second, then alphabetically.
@@ -339,7 +345,7 @@ func sortEnvironments(envs []string) {
 }
 
 // planFingerprint creates a string fingerprint of a plan result for deduplication.
-// Plans with identical DDL statements are considered the same.
+// Plans with identical DDL statements and VSchema updates are considered the same.
 func planFingerprint(result *apitypes.PlanResponse) string {
 	// Check for errors first
 	if len(result.Errors) > 0 {
@@ -347,22 +353,28 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		return "errors:" + string(data)
 	}
 
-	// Get DDL statements
-	tables := result.FlatTables()
-	if len(tables) == 0 {
+	var ddls []string
+	for _, tbl := range result.FlatTables() {
+		ddls = append(ddls, tbl.DDL)
+	}
+	var vschemas []string
+	for _, sc := range result.Changes {
+		if sc.HasVSchemaChange() {
+			vschemas = append(vschemas, sc.Namespace+":"+sc.Metadata[apitypes.VSchemaDiffMetadataKey])
+		}
+	}
+	if len(ddls) == 0 && len(vschemas) == 0 {
 		return "no-changes"
 	}
 
-	// Build fingerprint from DDL statements
-	var ddls []string
-	for _, tbl := range tables {
-		ddls = append(ddls, tbl.DDL)
-	}
-
-	// Sort DDLs to make fingerprint order-independent
+	// Sort to make the fingerprint order-independent
 	sort.Strings(ddls)
+	sort.Strings(vschemas)
 
-	data, _ := json.Marshal(ddls)
+	data, _ := json.Marshal(struct {
+		DDLs     []string `json:"ddls"`
+		VSchemas []string `json:"vschemas"`
+	}{ddls, vschemas})
 	return string(data)
 }
 

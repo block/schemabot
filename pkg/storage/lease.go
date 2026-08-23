@@ -1,6 +1,11 @@
 package storage
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+)
 
 type applyLeaseContextKey struct{}
 
@@ -60,4 +65,25 @@ func WithOperationLease(ctx context.Context, lease OperationLease) context.Conte
 func OperationLeaseFromContext(ctx context.Context) (OperationLease, bool) {
 	lease, ok := ctx.Value(operationLeaseContextKey{}).(OperationLease)
 	return lease, ok
+}
+
+// LeaseOwnerProcess returns the "<host>/<pid>" prefix that identifies this
+// process in lease owner strings. Every lease owner is composed as
+// "<host>/<pid>/<claimer>", so the prefix identifies the process that acquired
+// a lease. A restarted process has a new pid and therefore a new identity —
+// a lease written before a crash is never attributed to the restarted process.
+func LeaseOwnerProcess() string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "unknown-host"
+	}
+	return fmt.Sprintf("%s/%d", hostname, os.Getpid())
+}
+
+// LeaseOwnedByThisProcess reports whether the lease owner string was written by
+// this process. Callers use this to tell their own in-memory engine reports
+// apart from work last leased to another process, whose state this process's
+// memory cannot speak for.
+func LeaseOwnedByThisProcess(owner string) bool {
+	return strings.HasPrefix(owner, LeaseOwnerProcess()+"/")
 }

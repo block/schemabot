@@ -9,11 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // fakePlanStore lets a test script the plan Get/Create behavior the plan
@@ -84,7 +84,7 @@ func alterUsersEmailPlan() *engine.PlanResult {
 			Namespace: "testapp",
 			TableChanges: []engine.TableChange{{
 				Table:     "users",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 			}},
 		}},
@@ -198,7 +198,7 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 		{TableName: "VSchema: shop", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "shop"},
 	}
 	schemaFiles := schema.SchemaFiles{
-		"shop": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+		"shop": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 	}
 
 	got, err := c.namespacesFromApplyRequest(changes, schemaFiles)
@@ -213,7 +213,7 @@ func TestNamespacesFromApplyRequest(t *testing.T) {
 	assert.Equal(t, "alter", shop.Tables[0].Operation)
 	assert.True(t, shop.Tables[0].IsUnsafe)
 	assert.Equal(t, "DROP COLUMN removes data", shop.Tables[0].UnsafeReason)
-	assert.Equal(t, `{"sharded":true}`, shop.Artifacts[vSchemaArtifactName])
+	assert.Equal(t, `{"sharded":true}`, shop.Artifacts[storage.VSchemaArtifactName])
 
 	fallback := got["testapp"]
 	require.Len(t, fallback.Tables, 1)
@@ -230,14 +230,14 @@ func TestNamespacesFromApplyRequest_DDLOnlyOmitsVSchemaArtifact(t *testing.T) {
 		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "shop"},
 	}
 	schemaFiles := schema.SchemaFiles{
-		"shop": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+		"shop": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 	}
 
 	got, err := c.namespacesFromApplyRequest(changes, schemaFiles)
 	require.NoError(t, err)
 
 	require.Contains(t, got, "shop")
-	assert.Empty(t, got["shop"].Artifacts[vSchemaArtifactName], "DDL-only request must not materialize a vschema artifact")
+	assert.Empty(t, got["shop"].Artifacts[storage.VSchemaArtifactName], "DDL-only request must not materialize a vschema artifact")
 }
 
 // A vschema change with no vschema.json artifact in the schema files fails

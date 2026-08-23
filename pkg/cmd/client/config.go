@@ -11,6 +11,8 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 	"gopkg.in/yaml.v3"
+
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // Config represents the global SchemaBot CLI configuration.
@@ -330,12 +332,12 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return token, nil
 	}
 	if profile.RefreshToken == "" || profile.OIDC == nil {
-		return token, fmt.Errorf("token for profile %q is expired or about to expire and cannot be refreshed; run `schemabot login`", profileName)
+		return token, fmt.Errorf("token for profile %q is expired or about to expire and cannot be refreshed; run `%s login`", profileName, cliname.Name())
 	}
 
 	result, err := RefreshToken(ctx, LoginConfig{Issuer: profile.OIDC.Issuer, ClientID: profile.OIDC.ClientID}, profile.RefreshToken)
 	if err != nil {
-		return token, fmt.Errorf("could not refresh the token for profile %q (run `schemabot login`): %w", profileName, err)
+		return token, fmt.Errorf("could not refresh the token for profile %q (run `%s login`): %w", profileName, cliname.Name(), err)
 	}
 
 	profile.Token = result.IDToken

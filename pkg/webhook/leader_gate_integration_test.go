@@ -11,6 +11,7 @@
 package webhook
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -432,11 +433,22 @@ func TestE2ELeaderRefoldSkippedForOwnAggregateCheck(t *testing.T) {
 	}
 }
 
-// mockLeaderEmptyTree serves an empty git tree for headSHA so config discovery
-// resolves no schemabot.yaml — the leader manages none of the PR's files.
-func mockLeaderEmptyTree(mux *http.ServeMux, headSHA string) {
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+headSHA, func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new(headSHA), Entries: []*gh.TreeEntry{}, Truncated: new(false)})
+// mockLeaderRepositoryWithoutConfig serves the repository at headSHA and at the
+// default branch tip. The head carries the participant's changed schema file
+// and no schemabot.yaml anywhere, so config discovery resolves nothing — the
+// leader manages none of the PR's files — while the changed file still reads as
+// one this PR proposes.
+func mockLeaderRepositoryWithoutConfig(t *testing.T, mux *http.ServeMux, headSHA string) {
+	t.Helper()
+
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA: headSHA,
+		headEntries: []*gh.TreeEntry{{
+			Path: new(tenantBSchemaDir + "/users.sql"),
+			Mode: new("100644"),
+			Type: new("blob"),
+			SHA:  new("blobsha_tenant_b_users"),
+		}},
 	})
 }
 
@@ -459,7 +471,7 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	// The participant has posted no Check Run at all on the head commit.
 	mockParticipantCheckRuns(mux, nil)
 	checkRuns := captureLeaderCheckRuns(mux)
@@ -473,7 +485,7 @@ func TestE2ELeaderNonSchemaPRTouchingParticipantPathBlocks(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "aggregate folds expected participants")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
 	for _, env := range []string{"staging", "production"} {
 		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
@@ -502,7 +514,7 @@ func TestE2ELeaderRefoldsWhenParticipantReportsAfterFirstFold(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 
 	// The first fold reads one participant check per environment and sees
 	// nothing — the participant has not published yet. Every later read finds
@@ -609,7 +621,7 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 			{Filename: new("README.md"), Status: new("modified")},
 		})
 	})
-	mockLeaderEmptyTree(mux, headSHA)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
 	checkRuns := captureLeaderCheckRuns(mux)
 
 	h := newLeaderHandler(t, svc, client)
@@ -621,7 +633,7 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "no schema files in PR")
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
 	assert.NotContains(t, rr.Body.String(), "aggregate folds expected participants")
 
 	for _, env := range []string{"staging", "production"} {
@@ -705,5 +717,75 @@ func TestE2ELeaderRefoldSkipsClosedPR(t *testing.T) {
 	case cr := <-checkRuns:
 		t.Fatalf("a re-fold must not publish an aggregate on a closed PR: %+v", cr)
 	default:
+	}
+}
+
+// A PR that changes an expected participant's schema, where the participant's
+// own schemabot.yaml is discoverable in the repo tree, is still the
+// participant's work: the leader registers no database for the repo, so the
+// discovered config belongs to the participant deployment. The leader routes
+// through the fail-closed aggregate fold — blocking until the participant
+// reports — rather than planning the participant's database itself, which
+// would turn routine fan-out into a failing aggregate and an error comment.
+func TestE2ELeaderParticipantSchemaWithDiscoverableConfigFoldsInsteadOfPlanning(t *testing.T) {
+	svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
+	// The participant's schema root carries a discoverable schemabot.yaml for a
+	// database only tenant-b's deployment registers.
+	var configFetches atomic.Int64
+	mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+tenantBSchemaDir+"/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		configFetches.Add(1)
+		content := base64.StdEncoding.EncodeToString([]byte("database: tenant-b-db\ntype: mysql\n"))
+		_ = json.NewEncoder(w).Encode(gh.RepositoryContent{
+			Type:     new("file"),
+			Encoding: new("base64"),
+			Content:  &content,
+			Name:     new("schemabot.yaml"),
+			Path:     new(tenantBSchemaDir + "/schemabot.yaml"),
+		})
+	})
+	// The participant has posted no Check Run on the head commit yet.
+	mockParticipantCheckRuns(mux, nil)
+	checkRuns := captureLeaderCheckRuns(mux)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	h := newLeaderHandler(t, svc, client)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: headSHA,
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	for _, env := range []string{"staging", "production"} {
+		cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", env))
+		assert.Equal(t, headSHA, cr.HeadSHA)
+		assert.Equal(t, checkStatusInProgress, cr.Status,
+			"aggregate for %s must block on the unreported participant, not fail on a database the leader cannot plan", env)
+		assert.Empty(t, cr.Conclusion)
+	}
+
+	// The silence must come from the leader dropping the discovered config,
+	// not from discovery never running at all.
+	require.Positive(t, configFetches.Load(), "the participant's schemabot.yaml was never fetched, so config discovery did not run")
+
+	select {
+	case body := <-comments:
+		t.Fatalf("leader posted a comment for participant-owned schema: %s", body)
+	case <-time.After(500 * time.Millisecond):
 	}
 }

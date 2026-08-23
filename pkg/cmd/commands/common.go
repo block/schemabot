@@ -18,7 +18,9 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -27,6 +29,10 @@ type Globals struct {
 	Endpoint string `help:"SchemaBot API endpoint (overrides profile)"`
 	Profile  string `help:"Configuration profile"`
 	Token    string `help:"Bearer token for authenticating to an auth-enabled server (or set SCHEMABOT_TOKEN)"`
+	// CLIName is declared so kong accepts the flag at any position; main.go
+	// consumes the value from the raw args before parsing, since it feeds
+	// kong's own usage text.
+	CLIName string `name:"cli-name" hidden:"" help:"Tool name rendered in command hints (for CLI wrappers)"`
 
 	// Build info (set by main.go from ldflags)
 	Version string `kong:"-"`
@@ -65,9 +71,12 @@ var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
 type CLIConfig struct {
-	Database  string `yaml:"database"`
-	Type      string `yaml:"type"`
-	SchemaDir string `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	Database string `yaml:"database"`
+	Type     string `yaml:"type"`
+	// IgnoreNamespaces lists namespace subdirectories of the schema root that
+	// SchemaBot must not reconcile against the live database.
+	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
+	SchemaDir        string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -82,7 +91,7 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			absDir, _ := filepath.Abs(dir)
-			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  schemabot plan -s ./path/to/schema\n  schemabot apply -s ./path/to/schema -e staging", absDir)
+			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  %s plan -s ./path/to/schema\n  %s apply -s ./path/to/schema -e staging", absDir, cliname.Name(), cliname.Name())
 		}
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
@@ -96,6 +105,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 
 	if cfg.Database == "" {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
+	}
+	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml
 	cfg.SchemaDir = dir
@@ -113,7 +125,7 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 		return "", fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		return "", fmt.Errorf("no endpoint configured (run 'schemabot configure' to set up a profile)")
+		return "", fmt.Errorf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 	}
 	return ep, nil
 }
@@ -219,6 +231,85 @@ func withLoading(message string, show bool, fn func() error) error {
 	close(done)
 	wg.Wait()
 	return err
+}
+
+// startLiveProgress renders a spinner with a caller-updated status line on
+// stderr, for chunked operations that report progress between requests.
+// update replaces the status text; stop clears the line. Both are no-ops when
+// show is false, so JSON output stays clean. When stderr is not a terminal
+// (a scripted run, a log pipe), each new status prints as its own plain line
+// instead — a long sweep must stay observable in a log file, not go silent.
+func startLiveProgress(show bool) (update func(string), stop func()) {
+	if !show {
+		return func(string) {}, func() {}
+	}
+	if !loadingSpinnerTerminal() {
+		var mu sync.Mutex
+		last := ""
+		broken := false
+		update = func(text string) {
+			mu.Lock()
+			defer mu.Unlock()
+			// The spinner variant repaints the same text every frame; the plain
+			// variant prints only on change so logs record each step once.
+			if broken || text == last {
+				return
+			}
+			last = text
+			if _, err := fmt.Fprintln(loadingSpinnerWriter, text); err != nil {
+				// Progress is advisory; a stderr that stopped accepting writes
+				// stops further updates, matching the spinner goroutine's exit.
+				broken = true
+			}
+		}
+		return update, func() {}
+	}
+
+	var mu sync.Mutex
+	message := ""
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		frame := 0
+		ticker := time.NewTicker(loadingSpinnerInterval)
+		defer ticker.Stop()
+		for {
+			mu.Lock()
+			current := message
+			mu.Unlock()
+			if current != "" {
+				if _, err := fmt.Fprintf(loadingSpinnerWriter, "\r\033[2K%s%s %s%s", templates.ANSIDim, loadingSpinnerFrames[frame%len(loadingSpinnerFrames)], current, templates.ANSIReset); err != nil {
+					return
+				}
+			}
+			frame++
+			select {
+			case <-done:
+				if _, err := fmt.Fprint(loadingSpinnerWriter, "\r\033[2K"); err != nil {
+					return
+				}
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+
+	update = func(text string) {
+		mu.Lock()
+		message = text
+		mu.Unlock()
+	}
+	// stop is idempotent: callers commonly invoke it explicitly on the success
+	// path and again via defer, and a plain close(done) would panic the second
+	// time.
+	var stopOnce sync.Once
+	stop = func() {
+		stopOnce.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
+	return update, stop
 }
 
 // requireControlScope validates the explicit fields that scope a control operation.
@@ -400,9 +491,9 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
+		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
 	} else {
-		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
 	}
 }
 

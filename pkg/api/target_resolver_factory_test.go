@@ -2,6 +2,7 @@ package api
 
 import (
 	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,6 +98,14 @@ func TestBuildEtreResolverRejectsUnknownCredentialType(t *testing.T) {
 // The awssm backend validates its required fields with config-path context at
 // startup, before any AWS work, so a misconfiguration fails fast.
 func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
+	// Building the resolver loads the AWS shared config, which honors the
+	// ambient AWS_* environment (a developer's exported AWS_PROFILE can make
+	// the load fail on an unresolvable profile). Pin the test to an empty,
+	// hermetic AWS environment so it only exercises SchemaBot's validation.
+	t.Setenv("AWS_PROFILE", "")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "aws-credentials"))
+
 	base := EtreCredentialsConfig{
 		Type:       "awssm",
 		Region:     "us-east-1",
@@ -250,14 +259,15 @@ func TestBuildEtreResolverRejectsUnsupportedEngine(t *testing.T) {
 	assert.Contains(t, err.Error(), "not supported")
 }
 
-// The Vitess organization attribute is surfaced to the resolver so the assembler
-// can read it, even when not listed in attribute_fields.
-func TestResolverAttributeFieldsIncludesOrganization(t *testing.T) {
-	defaultOrg := EtreConfig{DatabaseType: storage.DatabaseTypeVitess}
-	assert.Equal(t, []string{"organization"}, resolverAttributeFields(defaultOrg))
+// The Vitess organization and database-name attributes are surfaced to the
+// resolver so the assembler can read them, even when not listed in
+// attribute_fields.
+func TestResolverAttributeFieldsIncludesOrganizationAndDatabase(t *testing.T) {
+	defaults := EtreConfig{DatabaseType: storage.DatabaseTypeVitess}
+	assert.Equal(t, []string{"organization", "name"}, resolverAttributeFields(defaults))
 
-	customOrg := EtreConfig{DatabaseType: storage.DatabaseTypeVitess, Vitess: EtreVitessConfig{OrganizationAttribute: "ps_org"}}
-	assert.Equal(t, []string{"ps_org"}, resolverAttributeFields(customOrg))
+	custom := EtreConfig{DatabaseType: storage.DatabaseTypeVitess, Vitess: EtreVitessConfig{OrganizationAttribute: "ps_org", DatabaseAttribute: "ps_database"}}
+	assert.Equal(t, []string{"ps_org", "ps_database"}, resolverAttributeFields(custom))
 }
 
 // The Etre resolver's lazily-validated fields are checked at startup so a

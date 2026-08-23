@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -143,6 +144,79 @@ func TestIsRetryable(t *testing.T) {
 
 }
 
+func TestIsNotReady(t *testing.T) {
+	t.Run("plain error is not a not-ready condition", func(t *testing.T) {
+		assert.False(t, IsNotReady(fmt.Errorf("connection refused")))
+	})
+
+	t.Run("NotReadyError is a not-ready condition", func(t *testing.T) {
+		err := NewNotReadyError("deploy request has not staged its changes yet")
+		assert.True(t, IsNotReady(err))
+	})
+
+	t.Run("wrapped NotReadyError is a not-ready condition", func(t *testing.T) {
+		err := fmt.Errorf("cutover deploy request #7: %w", NewNotReadyError("not staged"))
+		assert.True(t, IsNotReady(err))
+	})
+
+	t.Run("NotReadyError stays retryable", func(t *testing.T) {
+		assert.True(t, IsRetryable(NewNotReadyError("not staged")))
+	})
+
+	t.Run("nil is not a not-ready condition", func(t *testing.T) {
+		assert.False(t, IsNotReady(nil))
+	})
+}
+
+func TestIsUnsupportedOperation(t *testing.T) {
+	t.Run("plain error is not an unsupported-operation decline", func(t *testing.T) {
+		assert.False(t, IsUnsupportedOperation(fmt.Errorf("connection refused")))
+	})
+
+	t.Run("UnsupportedOperationError is an unsupported-operation decline", func(t *testing.T) {
+		assert.True(t, IsUnsupportedOperation(NewUnsupportedOperationError("stop is not supported")))
+	})
+
+	t.Run("wrapped UnsupportedOperationError is an unsupported-operation decline", func(t *testing.T) {
+		err := fmt.Errorf("stop local engine for task t-1: %w", NewUnsupportedOperationError("stop is not supported"))
+		assert.True(t, IsUnsupportedOperation(err))
+	})
+
+	t.Run("UnsupportedOperationError stays retryable", func(t *testing.T) {
+		// The schema change itself is healthy — only the control operation is
+		// undeliverable — so the generic failure path must not record it as a
+		// permanent failure. Paths that can receive the decline resolve the
+		// control request terminally via IsUnsupportedOperation instead.
+		assert.True(t, IsRetryable(NewUnsupportedOperationError("stop is not supported")))
+	})
+
+	t.Run("nil is not an unsupported-operation decline", func(t *testing.T) {
+		assert.False(t, IsUnsupportedOperation(nil))
+	})
+
+	t.Run("zero-args decline message with a literal percent renders verbatim", func(t *testing.T) {
+		// Exercise the runtime contract directly: with no args the message is
+		// used as-is, never interpreted as a format string. The indirect call
+		// reflects a caller vet's printf checker cannot see.
+		construct := NewUnsupportedOperationError
+		err := construct("volume is capped at 100% for this engine")
+		assert.Equal(t, "volume is capped at 100% for this engine", err.Error())
+	})
+
+	t.Run("extractor returns the typed decline from a wrapped error", func(t *testing.T) {
+		wrapped := fmt.Errorf("stop local engine for task t-1: %w", NewUnsupportedOperationError("stop is not supported"))
+		unsupported, ok := AsUnsupportedOperation(wrapped)
+		assert.True(t, ok)
+		assert.Equal(t, "stop is not supported", unsupported.Error())
+	})
+
+	t.Run("extractor reports absence for a plain error", func(t *testing.T) {
+		unsupported, ok := AsUnsupportedOperation(fmt.Errorf("connection refused"))
+		assert.False(t, ok)
+		assert.Nil(t, unsupported)
+	})
+}
+
 func TestIsTransientTransportError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -163,4 +237,57 @@ func TestIsTransientTransportError(t *testing.T) {
 			assert.Equal(t, tt.want, IsTransientTransportError(tt.err))
 		})
 	}
+}
+
+// remoteWorkEngine models an engine whose schema change runs outside this
+// process: it declares no shutdown-halt capability because nothing it started
+// is affected by this process exiting.
+type remoteWorkEngine struct{ Engine }
+
+// haltableEngine models an engine that runs its schema change in this process.
+type haltableEngine struct {
+	Engine
+	haltErr error
+	halts   int
+}
+
+func (e *haltableEngine) HaltForShutdown(context.Context) error {
+	e.halts++
+	return e.haltErr
+}
+
+// Halting an engine on shutdown exists to release resources this process holds
+// on a target. An engine whose work runs elsewhere holds none, so shutdown must
+// report there is nothing to halt rather than treating the missing capability as
+// an error and blocking the process from exiting.
+func TestHaltEngineForShutdownSkipsEnginesWithNoInProcessWork(t *testing.T) {
+	supported, err := HaltEngineForShutdown(t.Context(), &remoteWorkEngine{})
+
+	require.NoError(t, err)
+	assert.False(t, supported, "an engine whose work runs elsewhere declares nothing to halt")
+}
+
+// An engine that runs its work in this process is halted, and a halt that does
+// not complete is reported to the caller rather than swallowed: the target may
+// still be held while the process stops renewing the apply's lease.
+func TestHaltEngineForShutdownReportsTheHaltResult(t *testing.T) {
+	t.Run("halted", func(t *testing.T) {
+		eng := &haltableEngine{}
+
+		supported, err := HaltEngineForShutdown(t.Context(), eng)
+
+		require.NoError(t, err)
+		assert.True(t, supported)
+		assert.Equal(t, 1, eng.halts)
+	})
+
+	t.Run("halt failed", func(t *testing.T) {
+		eng := &haltableEngine{haltErr: fmt.Errorf("runner still copying")}
+
+		supported, err := HaltEngineForShutdown(t.Context(), eng)
+
+		require.Error(t, err)
+		assert.True(t, supported)
+		assert.Contains(t, err.Error(), "runner still copying")
+	})
 }

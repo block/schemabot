@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -36,6 +37,12 @@ func VSchemaStatusLabel(status string) string {
 		return "Applying..."
 	case "applied":
 		return "Applied"
+	case "failed":
+		return "Failed"
+	case "cancelled":
+		return "Cancelled"
+	case "stopped":
+		return "Stopped"
 	case "":
 		return "Pending"
 	default:
@@ -201,7 +208,7 @@ func PluralizeLabel(singular, plural string, count int) string {
 // Used by both CLI (watch TUI) and PR comment rendering for consistent ordering.
 func TableStatePriority(taskState string) int {
 	switch taskState {
-	case state.Task.Running, state.Task.Checksumming, state.Task.CuttingOver:
+	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.CuttingOver:
 		return 0 // active — top
 	case state.Task.WaitingForCutover, state.Task.Recovering, state.Task.FailedRetryable:
 		return 1
@@ -216,15 +223,19 @@ func TableStatePriority(taskState string) int {
 	}
 }
 
-// CleanLintReason strips severity prefixes like "[ERROR] linter_name:" from
-// Spirit's raw lint violation strings for cleaner display. Handles multiple
-// violations joined by "; " by cleaning each segment individually.
-func CleanLintReason(reason string) string {
-	segments := strings.Split(reason, "; ")
-	for i, seg := range segments {
-		segments[i] = cleanSingleLintReason(seg)
+// LintReasons splits an engine-reported unsafe reason into its individual
+// lint violations. Engines join a table's violations with "; ", so renderers
+// use this to give each violation its own line instead of one run-on string.
+// Each returned message has its severity prefix stripped; empty segments are
+// dropped.
+func LintReasons(reason string) []string {
+	var reasons []string
+	for seg := range strings.SplitSeq(reason, "; ") {
+		if cleaned := cleanSingleLintReason(seg); cleaned != "" {
+			reasons = append(reasons, cleaned)
+		}
 	}
-	return strings.Join(segments, "; ")
+	return reasons
 }
 
 func cleanSingleLintReason(reason string) string {
@@ -238,4 +249,22 @@ func cleanSingleLintReason(reason string) string {
 		}
 	}
 	return reason
+}
+
+// Lint and safety messages quote SQL identifiers and types with single or
+// double quotes ('idx_category', "varchar"). The token pattern is restricted
+// to identifier and type characters so prose in quotes ("should not be
+// dropped") is left alone.
+var (
+	singleQuotedIdentifier = regexp.MustCompile(`'([A-Za-z0-9_$.()]+)'`)
+	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.()]+)"`)
+)
+
+// CodeQuoteIdentifiers rewrites quoted SQL identifiers and types in a
+// human-authored message to markdown inline code, so index, column, and type
+// names read as code on markdown surfaces. Best-effort display formatting:
+// tokens that don't look like identifiers keep their original quotes.
+func CodeQuoteIdentifiers(message string) string {
+	message = singleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	return doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
 }

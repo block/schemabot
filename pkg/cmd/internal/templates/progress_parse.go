@@ -30,6 +30,9 @@ type ProgressData struct {
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
+	// Volume is the apply's current volume level (1=slowest, 11=fastest).
+	// Zero means the operator never set one, so the display stays quiet.
+	Volume int
 	// Released is true when an operator has released a paused rollout open, so a
 	// deployment that failed under on_failure=pause no longer holds later
 	// deployments. Apply-level: it applies to every operation of the apply.
@@ -67,9 +70,14 @@ type TableProgress struct {
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	IsInstant           bool
-	ProgressDetail      string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
-	Shards              []ShardProgress
+	// The engine's throttler is pausing this table's active phase (row copy
+	// or checksum verify). ThrottleReason names the signal for display and is
+	// empty when Throttled is false.
+	Throttled      bool
+	ThrottleReason string
+	IsInstant      bool
+	ProgressDetail string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
+	Shards         []ShardProgress
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -137,18 +145,20 @@ const (
 // ParseProgressResponse converts a typed ProgressResponse to ProgressData for rendering.
 func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	data := ProgressData{
-		ApplyID:      result.ApplyID,
-		Database:     result.Database,
-		Environment:  result.Environment,
-		Caller:       result.Caller,
-		State:        state.NormalizeState(result.State),
-		Engine:       result.Engine,
-		ErrorMessage: result.ErrorMessage,
-		StartedAt:    result.StartedAt,
-		CompletedAt:  result.CompletedAt,
-		Options:      result.Options,
-		Metadata:     result.Metadata,
-		Released:     result.Released,
+		ApplyID:        result.ApplyID,
+		Database:       result.Database,
+		Environment:    result.Environment,
+		Caller:         result.Caller,
+		PullRequestURL: result.PullRequest,
+		State:          state.NormalizeState(result.State),
+		Engine:         result.Engine,
+		ErrorMessage:   result.ErrorMessage,
+		StartedAt:      result.StartedAt,
+		CompletedAt:    result.CompletedAt,
+		Options:        result.Options,
+		Metadata:       result.Metadata,
+		Volume:         int(result.Volume),
+		Released:       result.Released,
 	}
 
 	for _, op := range result.Operations {
@@ -181,6 +191,8 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
 			ChecksumRowsTotal:   tbl.ChecksumRowsTotal,
+			Throttled:           tbl.Throttled,
+			ThrottleReason:      tbl.ThrottleReason,
 			IsInstant:           tbl.IsInstant,
 			ProgressDetail:      tbl.ProgressDetail,
 		}

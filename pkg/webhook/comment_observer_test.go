@@ -35,17 +35,32 @@ func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID i
 	return nil, storage.ErrEngineResumeStateNotFound
 }
 
-// stubStorage exposes only the ApplyOperations accessor the comment dispatch
-// needs; every other store would panic, keeping the test honest about the path
-// it covers.
+// stubStorage exposes only the accessors the comment dispatch needs; every
+// other store would panic, keeping the test honest about the path it covers.
 type stubStorage struct {
 	storage.Storage
-	ops storage.ApplyOperationStore
+	ops     storage.ApplyOperationStore
+	settled []*storage.ApplyControlRequest
 }
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
 func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
+
+func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
+	return stubControlRequestStore{settled: s.settled}
+}
+
+// stubControlRequestStore supplies the settled-control-request read the comment
+// dispatch path makes, from whatever the test seeded.
+type stubControlRequestStore struct {
+	storage.ControlRequestStore
+	settled []*storage.ApplyControlRequest
+}
+
+func (s stubControlRequestStore) ListSettled(context.Context, int64) ([]*storage.ApplyControlRequest, error) {
+	return s.settled, nil
+}
 
 // stubTaskStore supplies the per-shard read the comment dispatch path makes; the
 // routing tests have no shard rows, so it returns none.

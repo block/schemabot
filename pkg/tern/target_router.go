@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -139,12 +140,19 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	if req == nil {
 		return nil, fmt.Errorf("apply request is required")
 	}
-	// An apply executes a previously created plan, so the plan is authoritative
-	// for routing: it carries the execution target, namespace, type, and
-	// environment chosen at plan time. Derive the route from the plan and reject
-	// a request that contradicts it. Never treat req.Database as the target — the
-	// opaque execution target and the schema namespace are distinct, and that is
-	// the whole point of this router.
+	// An apply executes a previously created plan, so a locally stored plan is
+	// authoritative for routing: it carries the execution target, namespace,
+	// type, and environment chosen at plan time. Derive the route from the plan
+	// and reject a request that contradicts it. Never treat req.Database as the
+	// target — the opaque execution target and the schema namespace are
+	// distinct, and that is the whole point of this router.
+	//
+	// A non-primary deployment of a multi-deployment environment never planned
+	// locally — the plan row lives on the primary deployment's Tern — so no
+	// local plan exists here. The dispatch request carries the plan's
+	// authoritative DDL changes and schema files, so routing proceeds on the
+	// request's own route fields and the deployment-local client materializes
+	// (and re-verifies against the live schema) the plan before applying.
 	target := req.Target
 	if target == "" && req.Options != nil {
 		target = req.Options["target"]
@@ -158,20 +166,30 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 		if err != nil {
 			return nil, fmt.Errorf("load plan %q for apply target routing: %w", req.PlanId, err)
 		}
-		if plan == nil {
-			return nil, fmt.Errorf("plan %q not found for apply target routing", req.PlanId)
-		}
-		if target, err = planAuthoritativeField("target", req.PlanId, target, plan.Target); err != nil {
-			return nil, err
-		}
-		if namespace, err = planAuthoritativeField("database", req.PlanId, namespace, plan.Database); err != nil {
-			return nil, err
-		}
-		if databaseType, err = planAuthoritativeField("type", req.PlanId, databaseType, plan.DatabaseType); err != nil {
-			return nil, err
-		}
-		if environment, err = planAuthoritativeField("environment", req.PlanId, environment, plan.Environment); err != nil {
-			return nil, err
+		switch {
+		case plan != nil:
+			if target, err = planAuthoritativeField("target", req.PlanId, target, plan.Target); err != nil {
+				return nil, err
+			}
+			if namespace, err = planAuthoritativeField("database", req.PlanId, namespace, plan.Database); err != nil {
+				return nil, err
+			}
+			if databaseType, err = planAuthoritativeField("type", req.PlanId, databaseType, plan.DatabaseType); err != nil {
+				return nil, err
+			}
+			if environment, err = planAuthoritativeField("environment", req.PlanId, environment, plan.Environment); err != nil {
+				return nil, err
+			}
+		case applyRequestCarriesPlanPayload(req):
+			r.logger.Info("apply target routing: no local plan; routing dispatch by request fields so the deployment-local client can materialize the plan",
+				"plan_id", req.PlanId,
+				"database", namespace,
+				"database_type", databaseType,
+				"environment", environment,
+				"target", target,
+			)
+		default:
+			return nil, fmt.Errorf("plan %q not found for apply target routing and the request carries no DDL changes or schema files to materialize it", req.PlanId)
 		}
 	}
 	if target == "" {
@@ -195,6 +213,14 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	}
 	routedReq.Options["target"] = resolved.Target
 	return client.Apply(ctx, routedReq)
+}
+
+// applyRequestCarriesPlanPayload reports whether a dispatched apply request
+// carries the plan's authoritative content — DDL changes or schema files —
+// which lets a deployment that never planned locally materialize the plan
+// before applying.
+func applyRequestCarriesPlanPayload(req *ternv1.ApplyRequest) bool {
+	return len(req.DdlChanges) > 0 || len(req.SchemaFiles) > 0
 }
 
 // planAuthoritativeField resolves one routing field where the stored plan is
@@ -244,6 +270,17 @@ func routeStoredApply[T any, PT applyScopedRequest[T], Resp any](
 // Progress returns progress for a stored apply by routing through its target.
 func (r *TargetRouter) Progress(ctx context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	return routeStoredApply(ctx, r, req, "progress", Client.Progress)
+}
+
+func (r *TargetRouter) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("logs request is required")
+	}
+	client, _, err := r.clientForTarget(ctx, req.Target, req.Type, req.Environment, req.Database)
+	if err != nil {
+		return nil, fmt.Errorf("route logs for target %q: %w", req.Target, err)
+	}
+	return client.Logs(ctx, req)
 }
 
 // Cutover triggers cutover for a stored apply by routing through its target.
@@ -408,6 +445,41 @@ func (r *TargetRouter) Close() error {
 	return nil
 }
 
+// HaltForShutdown halts every resolved client that drives its schema changes in
+// this process. A router serves targets resolved per request, so its cached
+// clients are the only handle a shutting-down process has on the engines it
+// started; halting them here is what keeps a dynamically-routed target from
+// staying held after this process stops renewing its applies' leases.
+//
+// Every client is attempted even after one fails, so one target that will not
+// come down does not leave the rest held, and the failures are reported
+// together.
+func (r *TargetRouter) HaltForShutdown(ctx context.Context) error {
+	r.mu.Lock()
+	clients := make([]Client, 0, len(r.clientsByTarget))
+	for _, client := range r.clientsByTarget {
+		clients = append(clients, client)
+	}
+	r.mu.Unlock()
+
+	var errs []error
+	for _, client := range clients {
+		halter, ok := client.(ShutdownHalter)
+		if !ok {
+			r.logger.Debug("routed client drives its schema changes outside this process; nothing to halt for shutdown",
+				"endpoint", client.Endpoint())
+			continue
+		}
+		if err := halter.HaltForShutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("halt routed clients for shutdown: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
 func (r *TargetRouter) clientForApplyIdentifier(ctx context.Context, applyIdentifier, requestEnvironment, operation string) (Client, *storage.Apply, error) {
 	if applyIdentifier == "" {
 		return nil, nil, fmt.Errorf("apply id is required for %s", operation)
@@ -486,10 +558,11 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 	}
 
 	client, err := r.factory(LocalConfig{
-		Database:  namespace,
-		Type:      resolved.DatabaseType,
-		TargetDSN: resolved.DSN,
-		Metadata:  maps.Clone(resolved.Metadata),
+		Database:        namespace,
+		Type:            resolved.DatabaseType,
+		TargetDSN:       resolved.DSN,
+		Metadata:        maps.Clone(resolved.Metadata),
+		SchemaOverrides: maps.Clone(resolved.SchemaOverrides),
 	}, r.storage, r.logger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("create local client for target %q database %q: %w", target, namespace, err)

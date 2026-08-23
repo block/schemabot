@@ -56,19 +56,12 @@ func buildMergeGroupWebhookRequest(t *testing.T, action, headSHA string, secret 
 	return req
 }
 
-type createdCheckRun struct {
-	Name       string `json:"name"`
-	HeadSHA    string `json:"head_sha"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-}
-
-func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig) (*Handler, chan createdCheckRun) {
+func mergeGroupTestHandler(t *testing.T, allowedEnvironments []string, repos map[string]api.RepoConfig) (*Handler, chan checkRunCapture) {
 	t.Helper()
 	client, mux := setupGitHubServer(t)
-	created := make(chan createdCheckRun, 10)
+	created := make(chan checkRunCapture, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var c createdCheckRun
+		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c
 		w.WriteHeader(http.StatusCreated)
@@ -107,7 +100,7 @@ func TestWebhookMergeGroupPostsPassingChecks(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "merge_group checks posted")
 
-	got := map[string]createdCheckRun{}
+	got := map[string]checkRunCapture{}
 	for range []int{0, 1} {
 		select {
 		case c := <-created:
@@ -184,7 +177,7 @@ func TestWebhookMergeGroupUpdatesExistingCheck(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 7})
 	})
 	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
-		var c createdCheckRun
+		var c checkRunCapture
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&c))
 		created <- c.Name
 		w.WriteHeader(http.StatusCreated)

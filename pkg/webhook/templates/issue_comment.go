@@ -2,8 +2,11 @@ package templates
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
@@ -11,9 +14,9 @@ import (
 // the tenant flag in optional form because this message also renders on
 // untenanted deployments.
 func RenderRollbackMissingArguments() string {
-	return "## Missing Arguments\n\n" +
+	return offerSupportChannel("## Missing Arguments\n\n" +
 		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
-		"Rollback requires both an apply ID and the `-e` flag to select the target environment."
+		"Rollback requires both an apply ID and the `-e` flag to select the target environment.")
 }
 
 // RenderRollbackMissingEnv renders the message posted when `schemabot rollback`
@@ -22,9 +25,9 @@ func RenderRollbackMissingArguments() string {
 // usage line keeps the tenant flag in optional form because this message also
 // renders on untenanted deployments.
 func RenderRollbackMissingEnv() string {
-	return "## Missing Environment\n\n" +
+	return offerSupportChannel("## Missing Environment\n\n" +
 		"Usage: `schemabot rollback <apply-id> -e <environment> [-t <tenant>]`\n\n" +
-		"The `-e` flag is required to select the target environment."
+		"The `-e` flag is required to select the target environment.")
 }
 
 // RenderUnsupportedAutoConfirm renders the message posted when the `-y` /
@@ -86,11 +89,27 @@ type CutoverCommandAcceptedData struct {
 }
 
 // RenderControlMissingApplyID renders the message posted when an apply-scoped
-// control command is invoked without the required apply ID.
-func RenderControlMissingApplyID(action string) string {
-	return fmt.Sprintf("## Missing Apply ID\n\n"+
-		"Usage: `schemabot %s <apply-id> -e <environment>`\n\n"+
-		"Use `schemabot status -e <environment>` to find the apply ID.", action)
+// control command is invoked without the required apply ID. The usage line
+// carries every flag the command requires, so a volume command also shows its
+// mandatory `-v` level.
+func RenderControlMissingApplyID(command string) string {
+	usage := fmt.Sprintf("schemabot %s <apply-id> -e <environment>", command)
+	if command == action.Volume {
+		usage += fmt.Sprintf(" -v <%d-%d>", storage.MinVolume, storage.MaxVolume)
+	}
+	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
+		"Usage: `%s`\n\n"+
+		"Use `schemabot status -e <environment>` to find the apply ID.", usage))
+}
+
+// RenderVolumeInvalidLevel renders the message posted when a volume command
+// is missing the `-v` flag, carries a non-numeric value, or names a level
+// outside the supported range.
+func RenderVolumeInvalidLevel() string {
+	return offerSupportChannel(fmt.Sprintf("## Missing or Invalid Volume Level\n\n"+
+		"Usage: `schemabot volume <apply-id> -e <environment> -v <level>`\n\n"+
+		"The `-v` flag is required and must be a number between %d (slowest) and %d (fastest).",
+		storage.MinVolume, storage.MaxVolume))
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
@@ -237,6 +256,224 @@ func PreviewCommentStartCommandAlreadyRequested() string {
 		StartedCount: 1,
 		SkippedCount: 0,
 	})
+}
+
+// VolumeCommandAcceptedData contains data for a PR comment volume acknowledgement.
+type VolumeCommandAcceptedData struct {
+	ApplyID     string
+	Environment string
+	RequestedBy string
+	// Volume is the queued target level (1=slowest, 11=fastest).
+	Volume int32
+}
+
+// RenderVolumeCommandAccepted renders the acknowledgement posted when a PR
+// comment volume command queues a durable volume adjustment. The wording says
+// "shortly" rather than implying an immediate change: the new level takes
+// effect at the next progress check, so it is not yet in effect when this
+// posts.
+func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
+	body := "## Volume Request Accepted\n\n" +
+		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
+		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
+	if data.RequestedBy != "" {
+		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
+	}
+	body += fmt.Sprintf("\nVolume change to %d requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.\n", data.Volume)
+	return body
+}
+
+// PreviewCommentVolumeCommandAccepted renders a sample volume command
+// acknowledgement comment.
+func PreviewCommentVolumeCommandAccepted() string {
+	return RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
+		ApplyID:     "apply-a1b2c3d4e5f67890",
+		Environment: "staging",
+		RequestedBy: "alice",
+		Volume:      8,
+	})
+}
+
+// PreviewCommentVolumeInvalidLevel renders the usage comment posted when a
+// volume command carries a missing or invalid level.
+func PreviewCommentVolumeInvalidLevel() string {
+	return RenderVolumeInvalidLevel()
+}
+
+// PreviewCommentVolumeMissingApplyID renders the usage comment posted when a
+// volume command is missing the required apply ID.
+func PreviewCommentVolumeMissingApplyID() string {
+	return RenderControlMissingApplyID(action.Volume)
+}
+
+// VolumeSupersededProgressData contains data for freezing a progress comment
+// that a volume change has superseded.
+type VolumeSupersededProgressData struct {
+	// Volume is the new level (1=slowest, 11=fastest) that took effect.
+	Volume int
+	// Repo is the "owner/name" repository, used to link the successor comment.
+	Repo string
+	// PR is the pull request number, used to link the successor comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the fresh progress comment now
+	// tracking the schema change.
+	NewCommentID int64
+	// PreviousBody is the superseded comment's last rendered body, preserved
+	// inside the folded details block.
+	PreviousBody string
+}
+
+// volumeSupersededPrefix opens every frozen body written when a volume change
+// superseded a progress comment; IsSupersededProgressComment keys on it so a
+// freeze retry can tell an already-frozen comment from a live one.
+const volumeSupersededPrefix = "⏩ Volume changed to"
+
+// supersededFoldMarker is the successor-link text renderSupersededFold embeds
+// in the headline of every frozen body. IsSupersededProgressComment requires
+// it alongside a flavor prefix, so a live comment that merely opens with the
+// same words as a prefix is never misread as already frozen.
+const supersededFoldMarker = " [a new progress comment](https://github.com/"
+
+// SupersededProgressData contains the data every superseded-comment fold
+// shares: where the successor comment lives and the superseded comment's last
+// rendered body. Rotation flavors with no flavor-specific data render directly
+// from it; flavors that carry extra data (volume) keep their own struct.
+type SupersededProgressData struct {
+	// Repo is the "owner/name" repository, used to link the successor comment.
+	Repo string
+	// PR is the pull request number, used to link the successor comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the fresh comment that now
+	// tracks the schema change.
+	NewCommentID int64
+	// PreviousBody is the superseded comment's last rendered body, preserved
+	// inside the folded details block.
+	PreviousBody string
+}
+
+// renderSupersededFold renders the frozen body written over a superseded
+// comment: a headline pointing at the successor comment, with the superseded
+// comment's last rendered body preserved inside a collapsed details block.
+// Every rotation flavor shares this shape and differs only in its headline
+// (which must start with that flavor's superseded prefix) and fold label.
+func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
+	return fmt.Sprintf(
+		"%s"+supersededFoldMarker+"%s/pull/%d#issuecomment-%d).\n\n"+
+			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
+		headline, repo, pr, newCommentID, foldLabel, previousBody)
+}
+
+// RenderVolumeSupersededProgressComment renders the frozen body written over a
+// progress comment once a volume change rotates in a fresh one. The old
+// comment's final progress stays on the PR as a record, collapsed into a
+// details block, with a pointer to the comment where progress continues.
+func RenderVolumeSupersededProgressComment(data VolumeSupersededProgressData) string {
+	headline := fmt.Sprintf("%s **%d/%d** — progress continues in", volumeSupersededPrefix, data.Volume, storage.MaxVolume)
+	return renderSupersededFold(headline, "Progress before the volume change",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// resumeSupersededPrefix opens every frozen body written when a resume
+// superseded a progress comment; IsSupersededProgressComment keys on it so a
+// freeze retry can tell an already-frozen comment from a live one.
+const resumeSupersededPrefix = "▶️ Schema change resumed"
+
+// RenderResumeSupersededProgressComment renders the frozen body written over a
+// progress comment once a resumed apply rotates in a fresh one. The old
+// comment's final pre-stop progress stays on the PR as a record, collapsed
+// into a details block, with a pointer to the comment where progress
+// continues.
+func RenderResumeSupersededProgressComment(data SupersededProgressData) string {
+	return renderSupersededFold(resumeSupersededPrefix+" — progress continues in", "Progress before the stop",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// revertSupersededPrefix opens every frozen body written when a revert
+// superseded a progress comment; IsSupersededProgressComment keys on it so a
+// freeze retry can tell an already-frozen comment from a live one.
+const revertSupersededPrefix = "Schema change reverting"
+
+// RenderRevertSupersededProgressComment renders the frozen body written over a
+// progress comment once a user revert rotates in a fresh one. The old
+// comment's final pre-revert progress stays on the PR as a record, collapsed
+// into a details block, with a pointer to the comment where the revert is
+// tracked.
+func RenderRevertSupersededProgressComment(data SupersededProgressData) string {
+	return renderSupersededFold(revertSupersededPrefix+" — the revert is tracked in", "Progress before the revert",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// skipRevertSupersededPrefix opens every frozen body written when a
+// skip-revert superseded a progress comment; IsSupersededProgressComment keys
+// on it so a freeze retry can tell an already-frozen comment from a live one.
+const skipRevertSupersededPrefix = "Revert skipped"
+
+// RenderSkipRevertSupersededProgressComment renders the frozen body written
+// over a progress comment once a user skip-revert rotates in a fresh one. The
+// old comment's final revert-window rendering stays on the PR as a record,
+// collapsed into a details block, with a pointer to the comment where the
+// finalization is tracked.
+func RenderSkipRevertSupersededProgressComment(data SupersededProgressData) string {
+	return renderSupersededFold(skipRevertSupersededPrefix+" — the schema change is finalizing in", "Progress before the revert was skipped",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// cutoverSupersededPrefix opens every frozen body written when a completed
+// cutover superseded the cutover prompt comment; IsSupersededProgressComment
+// keys on it so a freeze retry can tell an already-frozen comment from a live
+// one.
+const cutoverSupersededPrefix = "Cutover complete"
+
+// RenderCutoverSupersededComment renders the frozen body written over the
+// cutover prompt comment once the operator's cutover has completed and the
+// apply continues (e.g. into its revert window). The prompt stays on the PR as
+// a record, collapsed into a details block, with a pointer to the comment
+// where progress is tracked.
+func RenderCutoverSupersededComment(data SupersededProgressData) string {
+	return renderSupersededFold(cutoverSupersededPrefix+" — progress continues in", "Cutover prompt",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// genericSupersededPrefix opens every frozen body written when the superseding
+// rotation is no longer known; IsSupersededProgressComment keys on it so a
+// freeze retry can tell an already-frozen comment from a live one.
+const genericSupersededPrefix = "⏭️ Progress comment superseded"
+
+// RenderSupersededProgressComment renders the frozen body written over a
+// progress comment when a fresh one has replaced it but the rotation that did
+// so is no longer known. The old comment's final progress stays on the PR as
+// a record, collapsed into a details block, with a pointer to the comment
+// where progress continues.
+func RenderSupersededProgressComment(data SupersededProgressData) string {
+	return renderSupersededFold(genericSupersededPrefix+" — progress continues in", "Earlier progress",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
+// IsSupersededProgressComment reports whether a comment body is already a
+// frozen superseded rendering — any rotation flavor — so a freeze retry does
+// not wrap a frozen body in a second fold. A frozen body opens with a flavor
+// prefix and carries the successor link on that same headline; both are
+// required, so a live body that merely opens with the same words as a prefix
+// (e.g. an edited comment starting "Cutover complete") is never mistaken for
+// a frozen one and skipped by a freeze retry.
+func IsSupersededProgressComment(body string) bool {
+	headline, _, _ := strings.Cut(body, "\n")
+	if !strings.Contains(headline, supersededFoldMarker) {
+		return false
+	}
+	for _, prefix := range []string{
+		volumeSupersededPrefix,
+		resumeSupersededPrefix,
+		revertSupersededPrefix,
+		skipRevertSupersededPrefix,
+		cutoverSupersededPrefix,
+		genericSupersededPrefix,
+	} {
+		if strings.HasPrefix(headline, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // RenderCutoverCommandAccepted renders the acknowledgement posted when a PR

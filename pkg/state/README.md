@@ -25,7 +25,7 @@ the stored task rows.
 | ValidatingBranch | `validating_branch` | Branch schema validation in progress after DDL apply (PlanetScale only) |
 | ValidatingDeployRequest | `validating_deploy_request` | PlanetScale is validating the deploy request diff (PlanetScale only) |
 | WaitingForDeploy | `waiting_for_deploy` | Deploy request ready, waiting for user to trigger deploy (PlanetScale only). Without `--defer-deploy`, auto-advances immediately. |
-| WaitingForCutover | `waiting_for_cutover` | All tasks ready, waiting for manual cutover (atomic mode only — in sequential mode each task cuts over independently) |
+| WaitingForCutover | `waiting_for_cutover` | All tasks ready for cutover (atomic mode only — in sequential mode each task cuts over independently). With `--defer-cutover` the apply holds for an operator; otherwise the drive triggers cutover automatically |
 | Recovering | `recovering` | Restart recovery is reattaching to engine state. Control actions that require a later phase are blocked until the engine proves that phase is safe again. |
 | CuttingOver | `cutting_over` | Cutover in progress (atomic mode only) |
 | Completed | `completed` | All tasks finished successfully |
@@ -74,7 +74,7 @@ stateDiagram-v2
 ```
 
 - `waiting_for_deploy`: PlanetScale only. The deploy request is created and ready, but not yet executed. With `--defer-deploy`, the user reviews the deploy request diff on PlanetScale and triggers via `schemabot cutover`. Without `--defer-deploy`, the system auto-advances through this state. For instant DDL, the deploy completes immediately after triggering. `--defer-deploy` and `--defer-cutover` compose: the first pauses before deploy, the second pauses before cutover.
-- `waiting_for_cutover`/`cutting_over`: Only with `--defer-cutover` or atomic mode (Spirit). Note: `--defer-cutover` is a no-op for instant DDL (no cutover exists).
+- `waiting_for_cutover`/`cutting_over`: With `--defer-cutover` or atomic mode (Spirit). PlanetScale applies pass through both even without `--defer-cutover`: the deploy request is created with the backend's auto-cutover disabled, so it parks at pending cutover and the drive — the sole cutover actor — triggers cutover automatically. Note: an instant-eligible change deploys with a row copy instead of instant DDL when `--defer-cutover` is set (an instant deploy swaps the schema immediately, leaving no cutover to hold) or when the change is unsafe (the row copy keeps a revert window open to undo the change).
 - `running_degraded`: Projected (not engine-reported) apply state for a multi-deployment rollout that is still in flight after a deployment failed under `on_failure: continue`. It is non-terminal and active — recovery can reclaim a stale degraded parent, and the one-active-apply overlap invariant keeps the whole target set reserved while it holds. It is unreachable for single-operation applies (one failed operation is already terminal, so the apply settles straight to `failed`); it only appears once an apply owns more than one operation. The `continue` policy governs rollout continuation, not the pass/fail verdict, so the apply still settles to `failed` once every sibling reaches a terminal state.
 - `resuming`: A stopped apply that has been claimed to process a queued start. Storage moves the apply to `resuming` at claim time — before the data-plane start is attempted — and holds it there until the data plane reports leaving the stopped state. This keeps `/api/status` and `/api/progress/apply/{id}` consistent for remote (gRPC) engines, where live progress can still report `stopped` for a short window after the start is accepted; both endpoints serve `resuming` from storage instead of one showing `running`. It is non-terminal and active, so the one-active-apply overlap invariant keeps the target reserved and recovery can reclaim a stale resuming apply. It advances to `running` once the data plane leaves stopped; remote-engine resumes fall back to `stopped` if the data plane stays stopped past the start grace window.
 - `recovering`: Temporary restart recovery. Current MySQL/Spirit deferred-cutover recovery enters this state only after durable storage had already reached `waiting_for_cutover`. That stored cutover-ready state is authoritative: recovery must not move durable storage backward to `running` if Spirit reports row-copy progress after reattaching. Row-copy counters can still be displayed while storage remains `recovering`. Recovery exits to `waiting_for_cutover` only after cutover readiness is proven again, or to `completed` when live-schema reconciliation proves the data plane already reached the desired schema. Control operations that require a later phase are blocked while recovery is active.
@@ -196,6 +196,7 @@ stateDiagram-v2
     queued --> ready
     ready --> running
     ready --> cancelled
+    queued --> ready_to_complete
     running --> complete
     running --> ready_to_complete
     running --> failed
@@ -209,9 +210,9 @@ stateDiagram-v2
 Each shard executes the same DDL independently via vreplication (or instant DDL). Key behavior:
 
 - **All shards copy independently.** Each shard has its own `rows_copied`, `table_rows`, `progress` (0-100), and `eta_seconds`. Shards progress at different rates.
-- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. SchemaBot normalizes `running + ready_to_complete` to `waiting_for_cutover`.
+- **`ready_to_complete` is a flag, not a state.** A migration stays in `running` state with `ready_to_complete=1` when its row copy is done and vreplication lag is within threshold. Immediate operations (CREATE/DROP TABLE) set the flag while still `queued`, since there is nothing to copy. SchemaBot normalizes any non-terminal status with `ready_to_complete=1` to `waiting_for_cutover`; terminal statuses (`complete`/`failed`/`cancelled`) always win over a stale flag.
 - **Cutover is per-shard.** Each shard attempts cutover independently with its own `cutover_attempts` counter. PlanetScale's deploy request layer coordinates when to trigger cutover across all shards, but the actual table swap happens per-shard.
-- **`postpone_completion` defers cutover.** PlanetScale uses `postpone_completion=1` so shards stay in `running` (with `ready_to_complete=1`) until an explicit `CompleteMigration` operation is performed. PlanetScale's deploy request triggers this automatically when all shards are ready. With `--defer-cutover`, SchemaBot holds here until the user runs `schemabot cutover`.
+- **`postpone_completion` defers cutover.** PlanetScale uses `postpone_completion=1` so shards stay in `running` (with `ready_to_complete=1`) until an explicit `CompleteMigration` operation is performed. SchemaBot creates deploy requests with the deploy-request layer's auto-cutover disabled, so the drive — the sole cutover actor — triggers completion once all shards are ready. With `--defer-cutover`, the drive holds here until the user runs `schemabot cutover`.
 - **Cutover retries with backoff.** When cutover fails (e.g., MDL lock timeout), `cutover_attempts` increments and vreplication restarts. Vitess uses exponential backoff between attempts. `force_cutover` bypasses backoff and kills competing locks.
 - **Instant DDL skips vreplication.** With `--prefer-instant-ddl`, Vitess attempts `ALGORITHM=INSTANT` for eligible ALTER TABLE operations (e.g., adding a nullable column). The ALTER executes as a metadata-only change — no row copy, no cutover. Not all ALTERs support instant; unsupported ones fall back to vreplication. CREATE TABLE and DROP TABLE also execute without vreplication (they're inherently fast), but they are not "instant DDL" in the MySQL sense.
 - **Revert depends on the operation type.** CREATE TABLE can be reverted (Vitess renames the table away, preserving data). DROP TABLE can be reverted (Vitess renames instead of dropping, so the table can be renamed back). ALTER TABLE via VReplication can be reverted near-instantly — Vitess resumes VReplication from the cut-over GTID position, catching up only the changelog since completion. Instant DDL ALTERs cannot be reverted (no shadow table exists). Revert window is controlled by artifact retention (default 24h in Vitess, 30min in PlanetScale's deploy request layer).
@@ -223,12 +224,13 @@ Each shard executes the same DDL independently via vreplication (or instant DDL)
 
 | Vitess migration state | `ready_to_complete` | SchemaBot normalized state |
 |---|---|---|
-| `queued` / `ready` | - | `pending` |
+| `requested` / `queued` / `ready` | `0` | `pending` |
+| `requested` / `queued` / `ready` | `1` | `waiting_for_cutover` (immediate operations) |
 | `running` | `0` | `running` (copying rows) |
 | `running` | `1` | `waiting_for_cutover` |
 | `complete` | - | `completed` |
-| `failed` | - | `failed` |
-| `cancelled` | - | `cancelled` |
+| `failed` | - | `failed` (a stale `ready_to_complete=1` is ignored) |
+| `cancelled` | - | `cancelled` (a stale `ready_to_complete=1` is ignored) |
 
 ### PlanetScale deploy request states
 

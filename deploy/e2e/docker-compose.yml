@@ -31,10 +31,20 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      # A cold start initializes the data directory (temporary server, init
+      # SQL, restart) before the server accepts connections; on a contended
+      # runner that can exceed the retry budget alone. Probe failures during
+      # the start period don't count toward retries, while a success still
+      # marks the container healthy immediately.
+      start_period: 60s
 
-  # Staging MySQL instance
+  # Staging MySQL instance. Runs with GTIDs enabled so applies exercise
+  # Spirit's GTID-based change source end-to-end.
   mysql-staging:
     image: mysql:8.0
+    command:
+      - --gtid_mode=ON
+      - --enforce_gtid_consistency=ON
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_INITDB_SKIP_TZINFO: "1"
@@ -49,10 +59,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      # A cold start initializes the data directory (temporary server, init
+      # SQL, restart) before the server accepts connections; on a contended
+      # runner that can exceed the retry budget alone. Probe failures during
+      # the start period don't count toward retries, while a success still
+      # marks the container healthy immediately.
+      start_period: 60s
 
-  # Production MySQL instance
+  # Production MySQL instance. GTIDs enabled for the same reason as staging.
   mysql-production:
     image: mysql:8.0
+    command:
+      - --gtid_mode=ON
+      - --enforce_gtid_consistency=ON
     environment:
       MYSQL_ROOT_PASSWORD: testpassword
       MYSQL_INITDB_SKIP_TZINFO: "1"
@@ -67,6 +86,12 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      # A cold start initializes the data directory (temporary server, init
+      # SQL, restart) before the server accepts connections; on a contended
+      # runner that can exceed the retry budget alone. Probe failures during
+      # the start period don't count toward retries, while a success still
+      # marks the container healthy immediately.
+      start_period: 60s
 
   # LocalScale: fake PlanetScale API with managed Vitess (vtcombo) inside.
   # Uses e2e config with faster delays (50ms instead of 1s).

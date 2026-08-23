@@ -33,6 +33,15 @@ func grpcSchemabotURL(t *testing.T) string {
 	return url
 }
 
+// grpcSchemabotMetricsURL is the base URL of the dedicated metrics listener,
+// which serves /metrics on its own port separate from the API.
+func grpcSchemabotMetricsURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("E2E_SCHEMABOT_METRICS_URL")
+	require.NotEmpty(t, url, "E2E_SCHEMABOT_METRICS_URL environment variable not set")
+	return url
+}
+
 func grpcSchemabotMySQLDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("E2E_SCHEMABOT_MYSQL_DSN")
@@ -69,8 +78,11 @@ func grpcPost(t *testing.T, path string, body any) *http.Response {
 		require.NoError(t, err, "marshal request body")
 		bodyReader = bytes.NewReader(data)
 	}
+	// The caller reads resp.Body after this helper returns, and the transport
+	// surfaces a cancelled request context as a body read error once the body
+	// outgrows its buffer — so the context must outlive the helper.
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bodyReader)
 	require.NoError(t, err, "create request")
 	req.Header.Set("Content-Type", "application/json")
@@ -83,8 +95,11 @@ func grpcPost(t *testing.T, path string, body any) *http.Response {
 func grpcGet(t *testing.T, path string) *http.Response {
 	t.Helper()
 	baseURL := grpcSchemabotURL(t)
+	// The caller reads resp.Body after this helper returns, and the transport
+	// surfaces a cancelled request context as a body read error once the body
+	// outgrows its buffer — so the context must outlive the helper.
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	require.NoError(t, err, "create request")
 	resp, err := http.DefaultClient.Do(req)
@@ -281,7 +296,12 @@ func grpcApplyLogs(t *testing.T, applyID string, limit int) []grpcApplyLogEntry 
 // exposition text.
 func grpcMetrics(t *testing.T) string {
 	t.Helper()
-	resp := grpcGet(t, "/metrics")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, grpcSchemabotMetricsURL(t)+"/metrics", nil)
+	require.NoError(t, err, "create request")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err, "GET /metrics")
 	require.Equalf(t, http.StatusOK, resp.StatusCode, "GET /metrics status")
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
@@ -464,39 +484,10 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 	})
 }
 
-// grpcSeedRows inserts test data using efficient SQL cross-joins.
+// grpcSeedRows inserts test data into the Tern MySQL for the given environment.
 func grpcSeedRows(t *testing.T, env, tableName, columns, valueTemplate string, rowCount int) {
 	t.Helper()
-	dsn := grpcTernMySQLDSN(t, env)
-	db, err := sql.Open("mysql", dsn)
-	require.NoErrorf(t, err, "open tern mysql (%s)", env)
-	defer utils.CloseAndLog(db)
-
-	seqGen := `(SELECT @row := @row + 1 as seq FROM
-		(SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a`
-
-	if rowCount >= 100 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b`
-	}
-	if rowCount >= 1000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c`
-	}
-	if rowCount >= 10000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d`
-	}
-	if rowCount >= 100000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e`
-	}
-	if rowCount > 100000 {
-		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) f`
-	}
-	seqGen += `, (SELECT @row := 0) r) nums`
-
-	query := fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM %s LIMIT %d`,
-		tableName, columns, valueTemplate, seqGen, rowCount)
-
-	_, err = db.ExecContext(t.Context(), query)
-	require.NoErrorf(t, err, "seed %s on %s", tableName, env)
+	testutil.SeedRows(t, grpcTernMySQLDSN(t, env), tableName, columns, valueTemplate, rowCount)
 }
 
 // grpcColumnExists checks if a column exists in a table on the Tern MySQL.

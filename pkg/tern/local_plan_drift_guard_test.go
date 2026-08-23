@@ -8,10 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // alterUsersEmailShardPlan is the recomputed plan for a sharded engine: the same
@@ -23,7 +23,7 @@ func alterUsersEmailShardPlan(shard string) *engine.PlanResult {
 			Shard:     engine.Shard{Name: shard},
 			TableChanges: []engine.TableChange{{
 				Table:     "users",
-				Operation: statement.StatementAlterTable,
+				Operation: ddl.StatementAlterTable,
 				DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 			}},
 		}},
@@ -55,7 +55,7 @@ func TestDriftGuard_CanonicalizationTolerant(t *testing.T) {
 		Namespace: "testapp",
 		TableChanges: []engine.TableChange{{
 			Table:     "users",
-			Operation: statement.StatementAlterTable,
+			Operation: ddl.StatementAlterTable,
 			DDL:       "ALTER TABLE users ADD COLUMN email varchar(255)",
 		}},
 	}}}
@@ -217,7 +217,7 @@ func TestDriftGuard_VSchemaParityMatches(t *testing.T) {
 			{TableName: "VSchema: testapp", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "testapp"},
 		},
 		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"testapp": {Files: map[string]string{vSchemaArtifactName: `{"sharded":true}`}},
+			"testapp": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
 		},
 	})
 

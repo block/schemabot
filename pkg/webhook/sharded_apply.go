@@ -1,10 +1,13 @@
 package webhook
 
 import (
+	"context"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -28,11 +31,16 @@ func parseShardOperationKey(key string) (namespace, shard, table string, ok bool
 	return parts[0], parts[1], parts[2], true
 }
 
-// isFinalizerOperationKey reports whether the key is a "namespace/group_finalizer"
-// finalizer operation key.
-func isFinalizerOperationKey(key string) bool {
+// parseFinalizerOperationKey splits a "namespace/group_finalizer" finalizer
+// operation key into its namespace. ok is false for any other shape, including
+// the bare "group_finalizer" key a vschema-only plan produces — that shape has
+// no shard work alongside it, so it never reaches the sharded layout.
+func parseFinalizerOperationKey(key string) (namespace string, ok bool) {
 	ns, ok := strings.CutSuffix(key, "/"+finalizerKeySegment)
-	return ok && ns != "" && !strings.Contains(ns, "/")
+	if !ok || ns == "" || strings.Contains(ns, "/") {
+		return "", false
+	}
+	return ns, true
 }
 
 // isShardedApply reports whether the apply's operations are the per-shard
@@ -49,7 +57,7 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 	hasShard := false
 	for _, op := range ops {
 		ns, _, _, isShard := parseShardOperationKey(op.OperationKey)
-		if !isShard && !isFinalizerOperationKey(op.OperationKey) {
+		if _, isFinalizer := parseFinalizerOperationKey(op.OperationKey); !isShard && !isFinalizer {
 			return false
 		}
 		if deployment == "" {
@@ -74,14 +82,20 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 // cell carrying its DDL; per-shard status is derived through pkg/presentation
 // with the shard name as the operation identity, so the ordering labels
 // ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
-// (VSchema) operations are not shard work and are omitted from the shard view;
-// their outcome is still reflected in the aggregate headline state.
-func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task) templates.ShardedApplyData {
+// (VSchema) operations are not shard work: each one becomes a VSchema change —
+// its keyspace from the operation key, its display status from the operation
+// state, and its diff from the stored plan's per-namespace diffs
+// (vschemaDiffs, see resolveShardedVSchemaDiffs) — rendered in the comment's
+// VSchema section. A failed
+// finalizer's error also stands in for the apply-level failure cause when the
+// apply row carries none, since a finalizer failure is operation-scoped and
+// leaves no failed shard row to name it.
+func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, vschemaDiffs map[string]string, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
-	// Tasks arrive in created_at DESC order with no id tiebreaker. Sort each
-	// operation's tasks by id so the joined DDL (and the change signature derived
-	// from it) is deterministic. In practice a (shard, table) operation has a
-	// single task — multiple statements for one table are combined into one ALTER
+	// Sort each operation's tasks by id so the joined DDL (and the change
+	// signature derived from it) is deterministic without depending on the
+	// loader's ordering. In practice a (shard, table) operation has a single
+	// task — multiple statements for one table are combined into one ALTER
 	// upstream — but this keeps the rendering stable regardless.
 	for _, ts := range tasksByOp {
 		sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
@@ -93,9 +107,25 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	// one table change (a divergent shard) collapses to one status row.
 	var shardOrder []string
 	opsByShard := make(map[string][]*storage.ApplyOperation)
+	var vschemaChanges []apitypes.VSchemaChange
+	finalizerError := ""
 	for _, op := range ops {
 		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
 		if !ok {
+			// isShardedApply admits only shard work and finalizer keys, so a
+			// non-shard key here is a finalizer: one keyspace's VSchema change.
+			finalizerNS, isFinalizer := parseFinalizerOperationKey(op.OperationKey)
+			if !isFinalizer {
+				continue
+			}
+			vschemaChanges = append(vschemaChanges, apitypes.VSchemaChange{
+				Namespace: finalizerNS,
+				Status:    vschemaStatusForOperationState(apply.State, op.State),
+				Diff:      vschemaDiffs[finalizerNS],
+			})
+			if finalizerError == "" && isFinalizerFailureState(op.State) && op.ErrorMessage != "" {
+				finalizerError = op.ErrorMessage
+			}
 			continue
 		}
 		if keyspace == "" {
@@ -119,15 +149,27 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		opsByShard[shard] = append(opsByShard[shard], op)
 	}
 
+	// A finalizer failure is operation-scoped and does not write the parent
+	// apply's error, so when the apply row carries no cause of its own the
+	// failed finalizer's error is the one to surface.
+	errorMessage := apply.ErrorMessage
+	if errorMessage == "" {
+		errorMessage = finalizerError
+	}
+
 	data := templates.ShardedApplyData{
-		State:       apply.State,
-		Environment: apply.Environment,
-		Database:    apply.Database,
-		Keyspace:    keyspace,
-		ApplyID:     apply.ApplyIdentifier,
-		RequestedBy: actorFromCaller(apply.Caller),
-		Shards:      shardStatuses(shardOrder, opsByShard, released, tasksByOp),
-		Cells:       cells,
+		State:          apply.State,
+		Environment:    apply.Environment,
+		Database:       apply.Database,
+		Keyspace:       keyspace,
+		ApplyID:        apply.ApplyIdentifier,
+		RequestedBy:    actorFromCaller(apply.Caller),
+		ErrorMessage:   errorMessage,
+		Shards:         shardStatuses(shardOrder, opsByShard, released, tasksByOp),
+		Cells:          cells,
+		VSchemaChanges: vschemaChanges,
+		Tenant:         tenant,
+		Rollback:       apply.IsRollback(),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -136,6 +178,100 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		data.CompletedAt = apply.CompletedAt.Format(time.RFC3339)
 	}
 	return data
+}
+
+// resolveShardedVSchemaDiffs loads the stored plan's per-namespace rendered
+// VSchema diffs for a sharded apply's comment: the diff the engine annotated
+// at plan time and plan persistence kept (PlanMetadataVSchemaDiff), so the
+// comment shows the change the operator approved rather than a re-diff
+// against live state. Returns nil without touching storage unless the apply
+// renders the sharded layout and carries a finalizer operation — only the
+// sharded layout consumes these diffs, and only finalizer rows render VSchema
+// entries, so any other shape would pay a stored-plan read on every comment
+// edit just to discard the result. Best-effort: a plan load failure, a
+// missing plan row, or a stored plan without diffs (recorded before diffs
+// were persisted) contributes nothing rather than blocking the comment.
+func resolveShardedVSchemaDiffs(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+	if !isShardedApply(ops) {
+		return nil
+	}
+	hasFinalizer := false
+	for _, op := range ops {
+		if _, ok := parseFinalizerOperationKey(op.OperationKey); ok {
+			hasFinalizer = true
+			break
+		}
+	}
+	if !hasFinalizer {
+		return nil
+	}
+
+	plan, err := stor.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		slog.Warn("comment will omit VSchema diffs: failed to load stored plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if plan == nil {
+		slog.Warn("comment will omit VSchema diffs: stored plan row not found",
+			apply.LogAttrs()...)
+		return nil
+	}
+
+	var diffs map[string]string
+	for namespace, nsData := range plan.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
+			if diffs == nil {
+				diffs = make(map[string]string)
+			}
+			diffs[namespace] = d
+		}
+	}
+	return diffs
+}
+
+// vschemaStatusForOperationState projects a finalizer operation's state onto
+// the VSchema display status vocabulary the single-deployment comment uses, so
+// both comment shapes describe VSchema application identically: applied when
+// the finalizer completed, applying while it runs, failed on a failure
+// (terminal or auto-retrying), and pending (empty) before it starts. A
+// finalizer whose rollout ended without running it reads as cancelled rather
+// than pending, so the terminal summary never promises VSchema work that no
+// claim arm will run. That covers both routes to a dead row: the operation
+// itself holds cancelled or reverted (written by the cancel path or mirrored
+// from the settled parent by the stranded-operation reaper), and the row
+// still pending under a parent whose verdict is already final — a halted
+// rollout terminalizes the apply immediately, while the reaper only settles
+// the stranded row minutes later, well after the summary posted. Stopped —
+// on the operation or the parent — stays its own status: a stopped apply is
+// resumable, so its finalizer may yet run, but "pending" would overpromise.
+func vschemaStatusForOperationState(applyState, opState string) string {
+	switch {
+	case state.IsState(opState, state.ApplyOperation.Completed):
+		return "applied"
+	case state.IsState(opState, state.ApplyOperation.Running):
+		return "applying"
+	case isFinalizerFailureState(opState):
+		return "failed"
+	case state.IsState(opState, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted):
+		return "cancelled"
+	case state.IsState(opState, state.ApplyOperation.Stopped) || state.IsState(applyState, state.Apply.Stopped):
+		return "stopped"
+	case state.IsTerminalApplyState(applyState):
+		return "cancelled"
+	default:
+		return ""
+	}
+}
+
+// isFinalizerFailureState reports whether a finalizer operation's state carries
+// an operator-facing error — a terminal failure or an automatic retry after
+// one, mirroring the shard-failure vocabulary.
+func isFinalizerFailureState(opState string) bool {
+	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // shardStatuses derives one status per shard. Each shard's operations are

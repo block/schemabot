@@ -25,9 +25,10 @@ CREATE TABLE `tasks` (
   `eta_seconds` int DEFAULT NULL,
   `checksum_rows_checked` bigint DEFAULT '0',
   `checksum_rows_total` bigint DEFAULT '0',
+  `throttled` tinyint(1) NOT NULL DEFAULT '0',
+  `throttle_reason` varchar(255) NOT NULL DEFAULT '',
   `cutover_attempts` int NOT NULL DEFAULT '0',
   `is_instant` tinyint(1) DEFAULT '0',
-  `ready_to_complete` tinyint(1) DEFAULT '0',
   `engine_migration_id` varchar(255) DEFAULT NULL,
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
@@ -37,7 +38,7 @@ CREATE TABLE `tasks` (
   UNIQUE KEY `idx_task_identifier` (`task_identifier`),
   KEY `idx_apply_id` (`apply_id`),
   KEY `idx_apply_operation_id` (`apply_operation_id`),
-  KEY `idx_database` (`database_name`),
+  KEY `idx_database` (`database_name`,`database_type`,`environment`,`table_name`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
   KEY `idx_state` (`state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
