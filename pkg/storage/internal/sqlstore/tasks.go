@@ -615,9 +615,10 @@ func (s *taskStore) List(ctx context.Context, filter storage.TaskFilter) ([]*sto
 // edge of that window would refresh the parent's heartbeat the moment it is
 // claimed, so a parent still quiet this long past the window cannot have a
 // just-admitted retry in flight, and the reap can never race one at the
-// boundary. Dead failed_retryable rows keep indefinitely, so the extra wait
-// costs nothing.
-const strandedRetryableQuiescence = retryableRecoveryFreshnessDays*24*time.Hour + time.Hour
+// boundary. The buffer only needs to cover the gap between a claim selecting
+// the parent and its heartbeat write landing; all timestamps compared are
+// database-side, so there is no clock skew to absorb.
+const strandedRetryableQuiescence = retryableRecoveryFreshnessDays*24*time.Hour + 5*time.Minute
 
 // strandedTaskReaperLockName is the advisory lock that elects one retryable-task
 // reaper per pass. Instance-wide for the same reason as the stranded-operation
