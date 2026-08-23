@@ -4714,6 +4714,94 @@ func TestGRPCClient_SyncStoredTasksFollowsDataPlaneRetryOfRetryableTask(t *testi
 	}
 }
 
+func TestGRPCClient_ResumeApplyRejectsStartDuringDataPlaneRetryablePause(t *testing.T) {
+	// An operator start against an apply whose data plane is mid-retry has
+	// nothing to start: the data plane resumes on its own. The drive settles
+	// the durable start request as rejected — leaving it pending would repeat
+	// the same check on every later claim — never sends a remote Start, and
+	// then holds through the pause like any other in-flight snapshot instead
+	// of terminalizing the stored apply from the paused wire state.
+	server := &capturingTernServer{
+		remoteApplyID:  "remote-start-during-pause",
+		progressStates: []ternv1.State{ternv1.State_STATE_FAILED, ternv1.State_STATE_RUNNING},
+		progressTableSets: [][]*ternv1.TableProgress{
+			{{
+				Namespace:    "default",
+				TableName:    "users",
+				Status:       state.Task.FailedRetryable,
+				ErrorMessage: "temporary engine failure",
+			}},
+			{{
+				Namespace:       "default",
+				TableName:       "users",
+				Status:          state.Task.Running,
+				PercentComplete: 50,
+			}},
+		},
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-start-during-pause",
+		ExternalID:      "remote-start-during-pause",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	logs := &mockApplyLogStore{}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApply(ctx, apply))
+
+	assert.Equal(t, state.Apply.Completed, apply.State,
+		"the drive must hold through the pause and follow the data plane to completion")
+	assert.False(t, server.startCalled, "a paused remote is not startable; no remote Start may be sent")
+	pendingStart, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart, "the start request must settle during the pause instead of repeating on every claim")
+	startReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
+	assert.Contains(t, startReq.ErrorMessage, "already retrying automatically")
+	for _, update := range applyStore.updates {
+		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
+			"a retryable pause must never persist a failed or failed_retryable apply row while the drive polls, got %s", update.State)
+	}
+}
+
 func TestGRPCClient_RemoteRetryablePauseKeepsDrivePollingToCompletion(t *testing.T) {
 	// A remote task failure the data plane will retry parks the remote apply in
 	// failed_retryable, which the wire reports as STATE_FAILED. The drive must

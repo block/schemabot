@@ -2565,14 +2565,32 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			if remoteApplyPausedForDataPlaneRetry(resp.State, resp.Tables) {
 				// The data plane is retrying the apply on its own; it is
 				// neither stopped (startable) nor settled (reconcilable).
-				// Exit without adopting any state — the start request stays
-				// pending and a later claim re-checks once the data plane
-				// settles or resumes.
-				message := "Remote apply is paused for a data-plane retry; operator will not request remote start and will re-check on a later claim"
-				logger.Warn("remote gRPC stopped-state check found a data-plane retryable pause; operator will not request remote start",
-					apply.MutableLogAttrs()...)
-				c.logApplyWarning(ctx, apply, message)
-				return fmt.Errorf("check stopped gRPC apply %s before start: remote apply is paused for a data-plane retry", apply.ApplyIdentifier)
+				if startRequested {
+					// Settle the start request durably instead of leaving it
+					// pending: repeating this check every claim would write a
+					// warning per cycle, and the answer will not change — the
+					// data plane resumes without a start.
+					message := "The schema change is already retrying automatically; there is nothing to start"
+					logger.Info("remote gRPC stopped-state check found a data-plane retryable pause; rejecting the start request as unneeded",
+						apply.MutableLogAttrs()...)
+					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
+						return failErr
+					}
+				}
+				if state.IsState(apply.State, state.Apply.Stopped) {
+					// A stored stop with a remote that is self-retrying is
+					// contradictory; exit without adopting any state and let a
+					// later claim re-check once the data plane settles.
+					message := "Remote apply is paused for a data-plane retry while the stored apply reads stopped; operator will re-check on a later claim"
+					logger.Warn("remote gRPC stopped-state check found a data-plane retryable pause on a stopped stored apply; operator will re-check on a later claim",
+						apply.MutableLogAttrs()...)
+					c.logApplyWarning(ctx, apply, message)
+					return fmt.Errorf("check stopped gRPC apply %s before start: remote apply is paused for a data-plane retry", apply.ApplyIdentifier)
+				}
+				// The stored apply is active: hold the drive and poll through
+				// the pause like any other in-flight snapshot.
+				return c.pollForCompletion(ctx, apply, false, scope,
+					shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
 			}
 			apply.State = remoteState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
