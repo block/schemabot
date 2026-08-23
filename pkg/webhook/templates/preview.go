@@ -224,6 +224,7 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 				Tables:    []string{"orders"},
 				Reason:    "statement_differs",
 				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
 		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
