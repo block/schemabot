@@ -1214,3 +1214,189 @@ func (c *stopCommandTernClient) SetPendingObserver(tern.ProgressObserver) {}
 func (c *stopCommandTernClient) SetObserver(int64, tern.ProgressObserver) {}
 
 func (c *stopCommandTernClient) Close() error { return nil }
+
+// postCancelCommandWithoutApplyID issues the command the way an operator reaches
+// for it after `schemabot apply`, which takes no apply ID either.
+func postCancelCommandWithoutApplyID(t *testing.T, h *Handler, user string) {
+	t.Helper()
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot cancel -e staging",
+		userLogin: user,
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+}
+
+// captureCommentsAndReactions routes the PR's comment and reaction posts into
+// channels a control-command test can read.
+func captureCommentsAndReactions(t *testing.T, mux *http.ServeMux) (chan string, chan string) {
+	t.Helper()
+	comments := make(chan string, 10)
+	reactions := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Content string `json:"content"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		reactions <- body.Content
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	return comments, reactions
+}
+
+// `schemabot apply` takes no apply ID, so operators reach for `schemabot cancel
+// -e <env>` the same way. On a PR carrying a single schema change in that
+// environment there is only one apply the command can be about, so it acts on
+// that one instead of sending the operator to `schemabot status` to copy back an
+// identifier SchemaBot already has.
+func TestE2ECancelCommandWithoutApplyIDActsOnThePRsOnlySchemaChange(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_1e55c0de"
+	database := "cancel_inferred_only_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+
+	client, mux := setupGitHubServer(t)
+	comments, reactions := captureCommentsAndReactions(t, mux)
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postCancelCommandWithoutApplyID(t, h, "alice")
+
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Cancel Request Accepted")
+	// The reply names the apply it acted on, so an operator who never typed an
+	// identifier still knows which schema change they just cancelled.
+	assert.Contains(t, comment, "`"+applyIdentifier+"`")
+
+	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq, "the PR's only schema change was not cancelled")
+	assert.Equal(t, "github:alice@octocat/hello-world#1", controlReq.RequestedBy)
+	assertReactionEventually(t, reactions)
+}
+
+// With more than one schema change in the environment the command is genuinely
+// ambiguous, and guessing would cancel work the operator did not name. The reply
+// lists the candidates so they reissue the command against the one they mean,
+// and nothing is cancelled in the meantime.
+func TestE2ECancelCommandWithoutApplyIDListsCandidatesWhenThePRHasSeveral(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	firstIdentifier, secondIdentifier := "apply_a3b1c0de", "apply_b7d2e0fa"
+	firstDatabase, secondDatabase := "cancel_ambiguous_db_a", "cancel_ambiguous_db_b"
+	cleanup := func() {
+		cleanupStopCommandTestRows(t, schemabotDB, firstIdentifier, firstDatabase)
+		cleanupStopCommandTestRows(t, schemabotDB, secondIdentifier, secondDatabase)
+	}
+	cleanup()
+	t.Cleanup(func() {
+		cleanup()
+		utils.CloseAndLog(schemabotDB)
+	})
+	firstApplyID := createStopCommandApply(t, store, firstIdentifier, firstDatabase)
+	secondApplyID := createStopCommandApply(t, store, secondIdentifier, secondDatabase)
+
+	client, mux := setupGitHubServer(t)
+	comments, _ := captureCommentsAndReactions(t, mux)
+
+	service := apiServiceForStopCommandTest(t, store, firstDatabase)
+	service.RegisterTernClient(firstDatabase, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postCancelCommandWithoutApplyID(t, h, "alice")
+
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Which Schema Change?")
+	assert.Contains(t, comment, "`"+firstIdentifier+"`")
+	assert.Contains(t, comment, "`"+secondIdentifier+"`")
+	assert.Contains(t, comment, "`schemabot cancel <apply-id> -e staging`")
+
+	for _, applyID := range []int64{firstApplyID, secondApplyID} {
+		controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCancel)
+		require.NoError(t, err)
+		assert.Nil(t, controlReq, "an ambiguous cancel must not settle on one of the candidates")
+	}
+}
+
+// An unscoped control command on an aggregate repo fans out to deployments that
+// each store their own slice of the PR's applies, so "exactly one here" is not a
+// statement about the PR. The reply stays the usage line rather than a candidate
+// table this deployment cannot see the whole of.
+func TestE2ECancelCommandWithoutApplyIDDoesNotListCandidatesOnAnAggregateFanOut(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier, database := "apply_c9f4a1bb", "cancel_fanout_db"
+	cleanup := func() { cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database) }
+	cleanup()
+	t.Cleanup(func() {
+		cleanup()
+		utils.CloseAndLog(schemabotDB)
+	})
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+
+	client, mux := setupGitHubServer(t)
+	comments, _ := captureCommentsAndReactions(t, mux)
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.Config().Repos = map[string]api.RepoConfig{
+		"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader}},
+	}
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{remote: true})
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	postCancelCommandWithoutApplyID(t, h, "alice")
+
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "Missing Apply ID")
+	assert.NotContains(t, comment, "Which Schema Change?")
+	assert.NotContains(t, comment, applyIdentifier,
+		"a deployment holding one slice of the PR must not present its slice as the PR's candidates")
+
+	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a fan-out cancel with no apply id must not settle on this deployment's apply")
+}

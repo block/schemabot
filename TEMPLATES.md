@@ -4262,6 +4262,23 @@ Use `schemabot status -e <environment>` to find the apply ID.
 </details>
 
 <details>
+<summary><a name="control-command-ambiguous-apply-id"></a><strong>Control Command Ambiguous Apply ID</strong></summary>
+
+
+## Which Schema Change?
+
+This PR has more than one schema change in `staging`, so `schemabot cancel` needs to be told which one.
+
+| Apply | Database | State |
+|---|---|---|
+| `apply_a1b2c3d4` | `orders` | running |
+| `apply_e5f6a7b8` | `customers` | stopped |
+
+Usage: `schemabot cancel <apply-id> -e staging`
+
+</details>
+
+<details>
 <summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
 
 

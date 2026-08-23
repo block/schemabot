@@ -88,18 +88,55 @@ type CutoverCommandAcceptedData struct {
 	Status      string
 }
 
-// RenderControlMissingApplyID renders the message posted when an apply-scoped
-// control command is invoked without the required apply ID. The usage line
-// carries every flag the command requires, so a volume command also shows its
-// mandatory `-v` level.
-func RenderControlMissingApplyID(command string) string {
-	usage := fmt.Sprintf("schemabot %s <apply-id> -e <environment>", command)
+// controlCommandUsage renders a control command's usage line, carrying every
+// flag the command requires — a volume command also shows its mandatory `-v`
+// level.
+func controlCommandUsage(command, environment string) string {
+	if environment == "" {
+		environment = "<environment>"
+	}
+	usage := fmt.Sprintf("schemabot %s <apply-id> -e %s", command, environment)
 	if command == action.Volume {
 		usage += fmt.Sprintf(" -v <%d-%d>", storage.MinVolume, storage.MaxVolume)
 	}
+	return usage
+}
+
+// RenderControlMissingApplyID renders the message posted when an apply-scoped
+// control command names no apply ID and the PR holds nothing the command could
+// have meant.
+func RenderControlMissingApplyID(command string) string {
 	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `%s`\n\n"+
-		"Use `schemabot status -e <environment>` to find the apply ID.", usage))
+		"Use `schemabot status -e <environment>` to find the apply ID.", controlCommandUsage(command, "")))
+}
+
+// ControlApplyCandidate is one schema change an apply-scoped control command
+// could have meant.
+type ControlApplyCandidate struct {
+	ApplyID  string
+	Database string
+	State    string
+}
+
+// RenderControlAmbiguousApplyID renders the reply to an apply-scoped control
+// command that named no apply ID on a PR carrying several the command could
+// have meant.
+//
+// The operator's next step is to reissue the command with one of these
+// identifiers, and they are all right here — so unlike the missing-ID reply
+// this carries no support-channel link. Sending someone to a support channel to
+// read back a list already in front of them is noise.
+func RenderControlAmbiguousApplyID(command, environment string, candidates []ControlApplyCandidate) string {
+	var body strings.Builder
+	fmt.Fprintf(&body, "## Which Schema Change?\n\n"+
+		"This PR has more than one schema change in `%s`, so `schemabot %s` needs to be told which one.\n\n"+
+		"| Apply | Database | State |\n|---|---|---|\n", environment, command)
+	for _, c := range candidates {
+		fmt.Fprintf(&body, "| `%s` | `%s` | %s |\n", c.ApplyID, c.Database, c.State)
+	}
+	fmt.Fprintf(&body, "\nUsage: `%s`\n", controlCommandUsage(command, environment))
+	return body.String()
 }
 
 // RenderVolumeInvalidLevel renders the message posted when a volume command
@@ -304,6 +341,15 @@ func PreviewCommentVolumeInvalidLevel() string {
 // volume command is missing the required apply ID.
 func PreviewCommentVolumeMissingApplyID() string {
 	return RenderControlMissingApplyID(action.Volume)
+}
+
+// PreviewCommentControlAmbiguousApplyID renders the reply posted when a control
+// command names no apply ID on a PR carrying several it could have meant.
+func PreviewCommentControlAmbiguousApplyID() string {
+	return RenderControlAmbiguousApplyID(action.Cancel, "staging", []ControlApplyCandidate{
+		{ApplyID: "apply_a1b2c3d4", Database: "orders", State: "running"},
+		{ApplyID: "apply_e5f6a7b8", Database: "customers", State: "stopped"},
+	})
 }
 
 // VolumeSupersededProgressData contains data for freezing a progress comment
