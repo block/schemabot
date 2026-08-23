@@ -6,13 +6,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// Plan and apply identifiers are opaque strings: nothing may parse structure
-// out of them, so their only guarantees are a recognizable prefix and enough
-// randomness that concurrent planners and applies on any pod can never
-// collide. Creation time lives in the stored row's created_at column, never
-// in the identifier. Identifiers are minted once — at plan time and at apply
-// creation — and copied verbatim everywhere else, so stored rows minted under
-// earlier formats stay resolvable by exact match forever.
+// Plan, apply, and task identifiers are opaque strings: nothing may parse
+// structure out of them, so their only guarantees are a recognizable prefix
+// and enough randomness that concurrent mints on any pod are vanishingly
+// unlikely to collide. Creation time lives in the stored row's created_at
+// column, never in the identifier. Identifiers are minted once — at plan,
+// apply, or task creation — and copied verbatim everywhere else, so stored
+// rows minted under earlier formats stay resolvable by exact match forever.
 
 // NewPlanID mints a stored plan's identifier.
 func NewPlanID() string {
