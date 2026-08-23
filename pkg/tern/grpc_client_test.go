@@ -4665,6 +4665,16 @@ func TestGRPCClient_SyncStoredTasksFollowsDataPlaneRetryOfRetryableTask(t *testi
 			wantStoredState: state.Task.Completed,
 		},
 		{
+			name:            "unrecognized remote status keeps the stored pause",
+			remoteTaskState: "someNewEngineState",
+			wantStoredState: state.Task.FailedRetryable,
+		},
+		{
+			name:            "empty remote status keeps the stored pause",
+			remoteTaskState: "",
+			wantStoredState: state.Task.FailedRetryable,
+		},
+		{
 			name:            "failed remote task fails the stored task",
 			remoteTaskState: state.Task.Failed,
 			wantStoredState: state.Task.Failed,

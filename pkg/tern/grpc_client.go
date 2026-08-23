@@ -2576,7 +2576,10 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			}
 			apply.State = remoteState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
-			if remoteProgressIsTerminal(resp.State, resp.Tables) && !state.IsState(remoteState, state.Apply.Stopped) {
+			// The pause guard above already returned for a retryable pause, so
+			// a terminal proto state here is a settled verdict — no table
+			// refinement left to apply.
+			if isTerminalProtoState(resp.State) && !state.IsState(remoteState, state.Apply.Stopped) {
 				now := time.Now()
 				if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 					apply.StartedAt = &now
@@ -3715,11 +3718,15 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 		switch {
 		case state.IsState(remoteTaskState, state.Task.Stopped):
 			storedTask.State = remoteTaskState
-		case state.IsState(storedTask.State, state.Task.FailedRetryable) && remoteTaskResumedFromRetryablePause(remoteTaskState):
+		case state.IsState(storedTask.State, state.Task.FailedRetryable) &&
+			state.RecognizedTaskStatus(remoteTask.Status) &&
+			remoteTaskResumedFromRetryablePause(remoteTaskState):
 			// The data plane owns recovery of its retryable failures: the
 			// stored pause must follow the remote's new attempt instead of
 			// pinning "Retrying" on the operator surfaces while the data
-			// plane is actively copying.
+			// plane is actively copying. Un-pinning needs positive evidence:
+			// an unrecognized remote status normalizes to running as a
+			// fail-open default, which is no proof the row left its pause.
 			storedTask.State = remoteTaskState
 		default:
 			storedTask.State = taskStateWithNoBackwardProgress(storedTask.State, remoteTaskState)

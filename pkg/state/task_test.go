@@ -78,6 +78,18 @@ func TestNormalizeTaskStatus_UnknownDefaultsToRunning(t *testing.T) {
 	assert.Equal(t, Task.Running, NormalizeTaskStatus("something_unknown"))
 }
 
+func TestRecognizedTaskStatus(t *testing.T) {
+	for _, s := range []string{
+		Task.Running, Task.FailedRetryable, "copyRows", "complete",
+		"STATE_FAILED_RETRYABLE", "STATE_running",
+	} {
+		assert.True(t, RecognizedTaskStatus(s), "RecognizedTaskStatus(%q)", s)
+	}
+	for _, s := range []string{"something_unknown", "someNewEngineState", ""} {
+		assert.False(t, RecognizedTaskStatus(s), "RecognizedTaskStatus(%q)", s)
+	}
+}
+
 func TestIsInFlightTaskState(t *testing.T) {
 	inFlight := []string{
 		Task.Running,
