@@ -188,6 +188,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy())
 	case PreviewCommentApplyRetrying:
 		fmt.Print(webhooktemplates.PreviewCommentApplyRetrying())
+	case PreviewCommentApplyRemoteRetryablePause:
+		fmt.Print(webhooktemplates.PreviewCommentApplyRemoteRetryablePause())
 	case PreviewCommentApplyStopped:
 		fmt.Print(webhooktemplates.PreviewCommentApplyStopped())
 	case PreviewCommentApplyWaitingCutover:

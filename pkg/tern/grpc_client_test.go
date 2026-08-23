@@ -577,6 +577,7 @@ type capturingTernServer struct {
 	progressSettled   []*ternv1.SettledControlRequest
 	progressErr       error
 	startErr          error
+	stopErr           error
 	cancelErr         error
 	cutoverErr        error
 	cutoverAccepted   bool
@@ -652,7 +653,11 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 	s.stopApplyID = req.ApplyId
 	s.stopCaller = req.Caller
 	s.stopCalls++
+	err := s.stopErr
 	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
@@ -4682,6 +4687,16 @@ func TestGRPCClient_SyncStoredTasksFollowsDataPlaneRetryOfRetryableTask(t *testi
 			wantStoredState: state.Task.Completed,
 		},
 		{
+			name:            "unrecognized remote status keeps the stored pause",
+			remoteTaskState: "someNewEngineState",
+			wantStoredState: state.Task.FailedRetryable,
+		},
+		{
+			name:            "empty remote status keeps the stored pause",
+			remoteTaskState: "",
+			wantStoredState: state.Task.FailedRetryable,
+		},
+		{
 			name:            "failed remote task fails the stored task",
 			remoteTaskState: state.Task.Failed,
 			wantStoredState: state.Task.Failed,
@@ -4718,6 +4733,94 @@ func TestGRPCClient_SyncStoredTasksFollowsDataPlaneRetryOfRetryableTask(t *testi
 
 			assert.Equal(t, tc.wantStoredState, storedTask.State)
 		})
+	}
+}
+
+func TestGRPCClient_ResumeApplyRejectsStartDuringDataPlaneRetryablePause(t *testing.T) {
+	// An operator start against an apply whose data plane is mid-retry has
+	// nothing to start: the data plane resumes on its own. The drive settles
+	// the durable start request as rejected — leaving it pending would repeat
+	// the same check on every later claim — never sends a remote Start, and
+	// then holds through the pause like any other in-flight snapshot instead
+	// of terminalizing the stored apply from the paused wire state.
+	server := &capturingTernServer{
+		remoteApplyID:  "remote-start-during-pause",
+		progressStates: []ternv1.State{ternv1.State_STATE_FAILED, ternv1.State_STATE_RUNNING},
+		progressTableSets: [][]*ternv1.TableProgress{
+			{{
+				Namespace:    "default",
+				TableName:    "users",
+				Status:       state.Task.FailedRetryable,
+				ErrorMessage: "temporary engine failure",
+			}},
+			{{
+				Namespace:       "default",
+				TableName:       "users",
+				Status:          state.Task.Running,
+				PercentComplete: 50,
+			}},
+		},
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-start-during-pause",
+		ExternalID:      "remote-start-during-pause",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	logs := &mockApplyLogStore{}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApply(ctx, apply))
+
+	assert.Equal(t, state.Apply.Completed, apply.State,
+		"the drive must hold through the pause and follow the data plane to completion")
+	assert.False(t, server.startCalled, "a paused remote is not startable; no remote Start may be sent")
+	pendingStart, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart, "the start request must settle during the pause instead of repeating on every claim")
+	startReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
+	assert.Contains(t, startReq.ErrorMessage, "already retrying automatically")
+	for _, update := range applyStore.updates {
+		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
+			"a retryable pause must never persist a failed or failed_retryable apply row while the drive polls, got %s", update.State)
 	}
 }
 
@@ -5016,6 +5119,241 @@ func TestGRPCClient_ProcessPendingCancelKeepsRequestPendingDuringRetryablePause(
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.NotNil(t, cancelReq, "the durable cancel request must stay pending for retry against the live remote")
+}
+
+func TestGRPCClient_ProcessPendingStopSyncDoesNotTerminalizeDuringRetryablePause(t *testing.T) {
+	// A stop accepted by the data plane while the remote apply is paused for a
+	// data-plane retry syncs against a STATE_FAILED snapshot whose tables still
+	// report failed_retryable. That snapshot is a pause, not a verdict: the
+	// sync must keep the durable stop pending for the remote to consume, mirror
+	// the pause onto the task row, and never persist a failed or
+	// failed_retryable apply row while the drive holds the lease.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "temporary engine failure",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:    "default",
+			TableName:    "users",
+			Status:       state.Task.FailedRetryable,
+			ErrorMessage: "temporary engine failure",
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-paused",
+		ExternalID:      "remote-grpc-stop-paused",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.False(t, handled, "a paused remote is not settled: the drive must keep polling for the stop to land")
+	assert.False(t, state.IsTerminalApplyState(apply.State),
+		"the in-memory apply must not be terminalized from a paused remote snapshot, got %s", apply.State)
+	for _, update := range applyStore.updates {
+		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
+			"a retryable pause must never persist a failed or failed_retryable apply row while the drive holds the lease, got %s", update.State)
+	}
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "the task row must mirror the data-plane pause")
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the durable stop request must stay pending for the remote to consume")
+}
+
+func TestGRPCClient_ProcessPendingCancelSyncDoesNotTerminalizeDuringRetryablePause(t *testing.T) {
+	// A cancel accepted by the data plane while the remote apply is paused for
+	// a data-plane retry syncs against a STATE_FAILED snapshot whose tables
+	// still report failed_retryable. Completing the cancel from that snapshot
+	// would tell the operator the change is settled while the data plane keeps
+	// driving it: the sync must keep the durable request pending and must not
+	// terminalize the stored apply.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "temporary engine failure",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.FailedRetryable,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-sync-paused",
+		ExternalID:      "remote-grpc-cancel-sync-paused",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.False(t, handled, "a paused remote is not settled: the drive must keep polling for the cancel to land")
+	assert.Equal(t, 1, server.cancelCalls, "the cancel must still be relayed to the data plane")
+	assert.False(t, state.IsTerminalApplyState(apply.State),
+		"the in-memory apply must not be terminalized from a paused remote snapshot, got %s", apply.State)
+	for _, update := range applyStore.updates {
+		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
+			"a retryable pause must never persist a failed or failed_retryable apply row while the drive holds the lease, got %s", update.State)
+	}
+	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, cancelReq, "the durable cancel request must stay pending for the remote to consume")
+}
+
+func TestGRPCClient_StopErrorReconcileKeepsRequestPendingDuringRetryablePause(t *testing.T) {
+	// A stop the data plane rejects as already-terminal while the remote apply
+	// is really paused for a data-plane retry must not be reconciled to a
+	// terminal state: the remote will keep driving, so the terminal-progress
+	// fallback must see the pause as nonterminal and leave the durable stop
+	// pending for retry against the live remote.
+	server := &capturingTernServer{
+		stopErr:          status.Error(codes.Internal, "apply remote-grpc-stop-paused is already terminal (state: failed)"),
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "temporary engine failure",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.FailedRetryable,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-paused",
+		ExternalID:      "remote-grpc-stop-paused",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	_, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.Error(t, err, "a stop rejection during a retryable pause has no terminal progress to reconcile from")
+	assert.False(t, state.IsTerminalApplyState(applyStore.apply.State),
+		"the stored apply must not be terminalized from a paused remote snapshot, got %s", applyStore.apply.State)
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, stopReq, "the durable stop request must stay pending for retry against the live remote")
+}
+
+func TestGRPCClient_CutoverPreflightDoesNotTerminalizeDuringRetryablePause(t *testing.T) {
+	// A cutover preflight that polls a remote paused for a data-plane retry
+	// sees STATE_FAILED with a failed_retryable table. That snapshot is a
+	// pause, not a verdict: the preflight must not reconcile the apply to a
+	// terminal state and must not send Cutover — it returns a retryable error
+	// so the operator retries once the data plane's own recovery brings the
+	// copy back to the barrier.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_FAILED,
+		progressStateSet: true,
+		progressError:    "temporary engine failure",
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.FailedRetryable,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cutover-paused",
+		ExternalID:      "remote-grpc-cutover-paused",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks:   &mockTaskStore{},
+		logs:    &mockApplyLogStore{},
+	}
+
+	poll, err := client.triggerRemoteOperationCutover(t.Context(), apply, wholeApplyTaskScope(), apply.ExternalID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not parked at the cutover barrier",
+		"a paused remote must surface as not-ready so the operator retries the cutover")
+	assert.False(t, poll)
+	assert.Empty(t, server.cutoverApplyID, "Cutover must never be sent to a remote that is not parked at the barrier")
+	assert.False(t, state.IsTerminalApplyState(apply.State),
+		"the in-memory apply must not be terminalized from a paused remote snapshot, got %s", apply.State)
+	for _, update := range applyStore.updates {
+		assert.False(t, state.IsState(update.State, state.Apply.Failed, state.Apply.FailedRetryable),
+			"a retryable pause must never persist a failed or failed_retryable apply row from a cutover preflight, got %s", update.State)
+	}
 }
 
 func TestGRPCClient_StampRemoteApplyErrorOnFailedTasks(t *testing.T) {
