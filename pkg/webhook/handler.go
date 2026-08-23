@@ -431,7 +431,11 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 // is deterministic per deployment config — no configured clients, an unknown
 // repo in multi-App mode — so the same request reproduces the failure until
 // an operator fixes the config. Command cores classifying durability treat it
-// as terminal rather than re-driving.
+// as terminal rather than re-driving. The determinism rests on two facts:
+// the handler's client set is fixed at construction, and the ServerConfig it
+// resolves against has no reload path. If either ever becomes hot-reloadable,
+// a delivery arriving mid-reload could fail transiently, and this terminal
+// classification must be revisited.
 var errGitHubAppResolution = errors.New("GitHub App resolution failed")
 
 // factoryForRepo returns the GitHub App client factory that owns the given
