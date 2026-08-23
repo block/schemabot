@@ -10,7 +10,12 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// The stranded-operation reaper settles apply_operations rows that nothing will
+// The reaper is the operator's cleanup component: it settles rows that nothing
+// will ever act on again, so dead rows cannot masquerade as live work. Each
+// kind of dead row is its own independent sweep within a shared per-tick pass;
+// new cleanup responsibilities belong here as additional sweeps.
+//
+// The stranded-operation sweep settles apply_operations rows that nothing will
 // ever claim.
 //
 // An operation row is claimed and driven while its parent apply is active. When
@@ -57,15 +62,15 @@ import (
 // guarded and idempotent, so concurrent reapers would be correct; they would just
 // each pay the full scan to settle rows the first one already handled.
 //
-// The same pass also reaps dead retryable tasks: failed_retryable task rows
-// under a settled parent apply. A failed_retryable task promises a retry that
+// The retryable-task sweep reaps dead retryable tasks: failed_retryable task
+// rows under a settled parent apply. A failed_retryable task promises a retry that
 // only the parent's recovery path can dispatch, so once the parent settles the
 // promise is dead — and the row poisons every reader that treats
 // failed_retryable as "a retry is coming", most critically the control plane's
 // remote-progress snapshot, which copies the row verbatim and reads it as a
 // permanent retryable pause. Which rows qualify and how each write is guarded is
 // the storage layer's contract — see storage.TaskStore.ReapStrandedRetryable.
-// The pass shape is the same as above, with its own election lock and a longer
+// The sweep shape is the same as above, with its own election lock and a longer
 // parent-quiescence window sized past the retryable-recovery freshness window.
 
 // StrandedReaperInterval is how often the reaper runs a pass. Override with
@@ -105,10 +110,10 @@ func (s *Service) strandedReaperLoop(ctx context.Context, stop <-chan struct{}, 
 	for {
 		select {
 		case <-stop:
-			s.logger.Debug("operator: stranded-operation reaper stopping")
+			s.logger.Debug("operator: reaper stopping")
 			return
 		case <-ctx.Done():
-			s.logger.Debug("operator: stranded-operation reaper stopping", "error", ctx.Err())
+			s.logger.Debug("operator: reaper stopping", "error", ctx.Err())
 			return
 		case <-ticker.C:
 			s.runStrandedReaperPass(ctx)

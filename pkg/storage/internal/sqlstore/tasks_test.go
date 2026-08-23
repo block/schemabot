@@ -1154,7 +1154,7 @@ func TestTaskStore_ReapStrandedRetryable_SkipsParentThatLeftTheSettledSet(t *tes
 }
 
 // Only one instance reaps tasks per pass, and its election is independent of
-// the stranded-operation reaper's: the two sweeps hold different locks, so one
+// the stranded-operation sweep's: the two sweeps hold different locks, so one
 // instance settling operations never parks another instance's task reap.
 func TestTaskStore_ReapStrandedRetryable_ElectsOneReaperPerPass(t *testing.T) {
 	clearTables(t)
