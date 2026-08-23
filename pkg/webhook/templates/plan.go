@@ -64,6 +64,11 @@ type AttributedChangeData struct {
 	Repository  string
 	PullRequest int
 	Unresolved  bool
+	// OutsideUnsafeGate marks a destructive change the --allow-unsafe opt-in
+	// never gated — one visible only on individual shards — so consent for it
+	// was never solicited and the disclosure must not be dropped as already
+	// consented to.
+	OutsideUnsafeGate bool
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -292,15 +297,26 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
-// attributionStillActionable reports whether the comment's reader still
-// decides whether the apply proceeds. The plan comment offers the apply
-// command, and a locked comment downgraded to manual confirmation pauses for
-// apply-confirm — both readers can merge the owning pull request and re-plan
-// instead, so the attributed-changes disclosure informs a decision they still
-// hold. The auto-applying locked comment leaves no decision, so the
-// disclosure is noise there.
+// attributionStillActionable reports whether the attributed-changes
+// disclosure still informs a choice this comment's reader holds. The plan
+// comment offers the apply command, and a locked comment downgraded to manual
+// confirmation pauses for apply-confirm — both readers can still merge the
+// owning pull request and re-plan instead of applying. Once the locked
+// comment is applying automatically, that re-plan alternative is gone and the
+// operator consented to the destruction through --allow-unsafe, so the
+// disclosure is omitted — unless an attributed table never passed through the
+// unsafe opt-in gate, where no consent was ever solicited and this comment is
+// the operator's notice.
 func attributionStillActionable(data PlanCommentData) bool {
-	return !data.IsLocked || data.AutoConfirmDowngradeReason != ""
+	if !data.IsLocked || data.AutoConfirmDowngradeReason != "" {
+		return true
+	}
+	for _, change := range data.AttributedChanges {
+		if change.OutsideUnsafeGate {
+			return true
+		}
+	}
+	return false
 }
 
 // writeAttributedChanges writes the section for destructive changes to tables
