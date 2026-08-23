@@ -64,6 +64,11 @@ type AttributedChangeData struct {
 	Repository  string
 	PullRequest int
 	Unresolved  bool
+	// OutsideUnsafeGate marks a destructive change the --allow-unsafe opt-in
+	// never gated — one visible only on individual shards — so consent for it
+	// was never solicited and the disclosure must not be dropped as already
+	// consented to.
+	OutsideUnsafeGate bool
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -239,10 +244,12 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
-	// Destructive changes to tables another pull request owns. Shown on the
-	// locked apply comment too, for the same reason as the direct-execution
-	// disclosure: it must sit on the comment the confirmation acts on.
-	if len(data.AttributedChanges) > 0 {
+	// Destructive changes to tables another pull request owns — shown where the
+	// reader still decides whether the apply proceeds, omitted on the
+	// auto-applying locked comment: the disclosure coaches re-planning ("merge
+	// that PR ... then re-plan"), which is noise once the apply is already
+	// running.
+	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
@@ -324,6 +331,28 @@ func RenderPlanComment(data PlanCommentData) string {
 func writeApplyInstruction(sb *strings.Builder, command string) {
 	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// attributionStillActionable reports whether the attributed-changes
+// disclosure still informs a choice this comment's reader holds. The plan
+// comment offers the apply command, and a locked comment downgraded to manual
+// confirmation pauses for apply-confirm — both readers can still merge the
+// owning pull request and re-plan instead of applying. Once the locked
+// comment is applying automatically, that re-plan alternative is gone and the
+// operator consented to the destruction through --allow-unsafe, so the
+// disclosure is omitted — unless an attributed table never passed through the
+// unsafe opt-in gate, where no consent was ever solicited and this comment is
+// the operator's notice.
+func attributionStillActionable(data PlanCommentData) bool {
+	if !data.IsLocked || data.AutoConfirmDowngradeReason != "" {
+		return true
+	}
+	for _, change := range data.AttributedChanges {
+		if change.OutsideUnsafeGate {
+			return true
+		}
+	}
+	return false
 }
 
 // writeAttributedChanges writes the section for destructive changes to tables
