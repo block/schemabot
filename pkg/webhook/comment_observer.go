@@ -806,11 +806,11 @@ func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Ap
 		return false
 	}
 	if !held {
-		// Another observer holds a fresh authority (or no tracked progress
-		// comment row exists yet to claim) — that observer's edits carry the
-		// PR, so this one skips. Expected on every peer pod polling the same
-		// apply, hence Info.
-		o.logger.Info("observer: progress-comment authority held by another observer; skipping GitHub side effect",
+		// The claim was not won: either another observer holds a fresh
+		// authority (its edits carry the PR), or no tracked progress comment
+		// row exists yet to claim (nothing to edit either way). Expected on
+		// every peer pod polling the same apply, hence Info.
+		o.logger.Info("observer: progress-comment authority not won (held by another observer, or no tracked comment row yet); skipping GitHub side effect",
 			append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner)...)
 		return false
 	}

@@ -260,7 +260,7 @@ func TestConcurrentObserversShareOneProgressCommentAuthority(t *testing.T) {
 
 	var loggedSkip bool
 	for _, entry := range loserLogger.infos {
-		if entry.msg != "observer: progress-comment authority held by another observer; skipping GitHub side effect" {
+		if entry.msg != "observer: progress-comment authority not won (held by another observer, or no tracked comment row yet); skipping GitHub side effect" {
 			continue
 		}
 		loggedSkip = true
