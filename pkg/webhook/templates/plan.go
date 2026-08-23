@@ -124,6 +124,37 @@ type PlanCommentData struct {
 	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
 
 	RecoveredApplyOwnedCheckState bool
+
+	// DeploymentDrift is the review-time rollup of how every configured
+	// deployment compares to the reviewed primary plan. Nil for a single-target
+	// database (nothing to compare) or when drift was not evaluated.
+	DeploymentDrift *DeploymentDriftData
+}
+
+// DeploymentDriftData renders the review-time drift rollup in the PR preview: a
+// uniform "same plan everywhere" line when every deployment matches, or a
+// per-deployment breakdown when some deployment diverged from — or could not be
+// confirmed against — the reviewed plan.
+type DeploymentDriftData struct {
+	// Deployments is every configured deployment in rollout order, primary first.
+	Deployments []DeploymentDriftEntry
+	// Clean is true only when every deployment matches the reviewed plan.
+	Clean bool
+	// Computed is false when the rollup itself could not be evaluated; the check
+	// still fails closed, and the preview says the deployments are unverified.
+	Computed bool
+}
+
+// DeploymentDriftEntry is one deployment's classification against the reviewed
+// primary plan.
+type DeploymentDriftEntry struct {
+	Deployment string
+	Primary    bool
+	// Class is "match", "diverged", or "errored".
+	Class string
+	// Detail is a short human explanation for a diverged or errored deployment;
+	// empty for a match.
+	Detail string
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -174,6 +205,11 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 
 	sb.WriteString("\n")
+
+	// Review-time deployment drift is shown before the change list — and before
+	// the no-changes short-circuit — because a non-primary deployment can drift
+	// even when the reviewed primary plan is a clean no-op.
+	writeDeploymentDrift(&sb, data.DeploymentDrift)
 
 	// Count changes
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
@@ -727,6 +763,62 @@ func planShardList(shards []string) string {
 	return "shards " + strings.Join(quoted, ", ")
 }
 
+// writeDeploymentDrift renders the review-time drift rollup: a single uniform
+// line when every deployment matches the reviewed plan, or a per-deployment
+// breakdown naming which deployments diverged or could not be verified. It is a
+// no-op for a nil rollup (single-target database or drift not evaluated).
+func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
+	if drift == nil {
+		return
+	}
+
+	if !drift.Computed {
+		sb.WriteString("⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
+		return
+	}
+
+	if drift.Clean {
+		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
+			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
+		return
+	}
+
+	sb.WriteString("⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	for _, d := range drift.Deployments {
+		name := "`" + d.Deployment + "`"
+		if d.Primary {
+			name += " (primary)"
+		}
+		switch d.Class {
+		case "match":
+			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
+		case "diverged":
+			fmt.Fprintf(sb, "- %s ⚠️ diverged%s\n", name, driftDetailSuffix(d.Detail))
+		default:
+			fmt.Fprintf(sb, "- %s ❌ could not verify%s\n", name, driftDetailSuffix(d.Detail))
+		}
+	}
+	sb.WriteString("\n")
+}
+
+// driftDetailSuffix renders a deployment's drift detail as a trailing clause, or
+// an empty string when there is no detail.
+func driftDetailSuffix(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return " — " + detail
+}
+
+// joinDeploymentNames lists deployment names for the uniform drift line.
+func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
+	names := make([]string, len(deployments))
+	for i, d := range deployments {
+		names[i] = d.Deployment
+	}
+	return strings.Join(names, ", ")
+}
+
 // writeBlockedChanges writes the section for statements the engine refuses,
 // naming each table and the engine's reason verbatim. There is no opt-in flag
 // that lets these through — the guidance is to rewrite the change, not retry.
@@ -1065,11 +1157,13 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	}
 	hasErrors := len(data.Errors) > 0
 
-	// If no environments have changes and no errors, show simple message. The
-	// ignore_namespaces disclosure still renders underneath it: an all-clean
-	// result is exactly where a reviewer needs to see that a namespace was
-	// withheld rather than genuinely unchanged.
-	if envsWithChanges == 0 && !hasErrors {
+	// If no environments have changes and no errors, show simple message — unless
+	// a deployment drifted, which must still surface even when the reviewed
+	// primary plans are clean no-ops. The ignore_namespaces disclosure still
+	// renders underneath it: an all-clean result is exactly where a reviewer
+	// needs to see that a namespace was withheld rather than genuinely
+	// unchanged.
+	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
 		if multiEnvHasIgnoredNamespaces(data) {
 			sb.WriteString("\n")
@@ -1190,6 +1284,11 @@ func titleDatabaseType(databaseType string) string {
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
+	// Deployment drift is shown before the change list and before the no-changes
+	// short-circuit: a non-primary deployment can drift even when this
+	// environment's reviewed primary plan is a clean no-op.
+	writeDeploymentDrift(sb, plan.DeploymentDrift)
+
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
@@ -1336,6 +1435,41 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 	return firstPlan != nil
 }
 
+// AnyEnvHasDriftToShow reports whether any environment has drift that must be
+// surfaced even when no environment plans changes: a deployment that diverged or
+// could not be verified. A clean uniform rollup is not "drift to show" — with no
+// changes anywhere the simple no-changes message is clearer.
+func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		plan, ok := data.Plans[env]
+		if !ok || plan == nil || plan.DeploymentDrift == nil {
+			continue
+		}
+		d := plan.DeploymentDrift
+		if !d.Computed || !d.Clean {
+			return true
+		}
+	}
+	return false
+}
+
+// driftIdentical reports whether two plans' deployment-drift rollups render the
+// same, so environments are only deduplicated when their drift is identical too.
+func driftIdentical(a, b *DeploymentDriftData) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Computed != b.Computed || a.Clean != b.Clean || len(a.Deployments) != len(b.Deployments) {
+		return false
+	}
+	for i := range a.Deployments {
+		if a.Deployments[i] != b.Deployments[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // plansIdentical checks if two plans have the same DDL statements. Plans that
 // excluded different namespaces are never identical: deduplicating them into
 // one section would show one environment's exclusion disclosure for both.
@@ -1363,7 +1497,7 @@ func plansIdentical(a, b *PlanCommentData) bool {
 			return false
 		}
 	}
-	return true
+	return driftIdentical(a.DeploymentDrift, b.DeploymentDrift)
 }
 
 // capitalizeEnvNames joins environment names with " & " and capitalizes each.
