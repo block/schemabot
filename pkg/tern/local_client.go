@@ -103,7 +103,6 @@ import (
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -1628,7 +1627,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	}
 	sort.Strings(namespaces)
 
-	result := &engine.PlanResult{PlanID: fmt.Sprintf("plan-%d", time.Now().UnixNano()), NoChanges: true}
+	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true}
 	for _, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
@@ -2137,11 +2136,6 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 	return existing, nil
 }
 
-// newTaskIdentifier returns a fresh opaque task identifier (`task-<16 hex>`).
-func newTaskIdentifier() string {
-	return "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-}
-
 // dispatchScope is the execution shape derived from a dispatch request: the
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
 // dispatch, and whether the dispatch is a task-less VSchema finalizer.
@@ -2241,7 +2235,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 	tasks := make([]*storage.Task, len(scope.ddlChanges))
 	for i, ddlChange := range scope.ddlChanges {
 		tasks[i] = &storage.Task{
-			TaskIdentifier: newTaskIdentifier(),
+			TaskIdentifier: engine.NewTaskID(),
 			PlanID:         plan.ID,
 			Database:       plan.Database,
 			DatabaseType:   plan.DatabaseType,
@@ -2601,7 +2595,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// same keyed generation attach one at a time, and the manifest is what the
 	// state projection holds the apply's success verdict on until every
 	// declared operation has attached and finished.
-	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	applyIdentifier := engine.NewApplyID()
 	apply := &storage.Apply{
 		ApplyIdentifier:       applyIdentifier,
 		PlanID:                plan.ID,
