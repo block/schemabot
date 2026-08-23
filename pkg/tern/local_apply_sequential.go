@@ -446,15 +446,64 @@ func heartbeatScopeName(operationScoped bool) string {
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 
+const (
+	// defaultTaskPollInterval is the cadence of the sequential drive's engine
+	// progress polls.
+	defaultTaskPollInterval = 500 * time.Millisecond
+
+	// maxConsecutiveProgressPollErrors bounds how many consecutive progress
+	// poll failures the sequential drive tolerates before settling the task,
+	// matching the grouped poll. An apply that cannot reach a terminal state
+	// holds the database's active-apply slot and blocks every later apply.
+	maxConsecutiveProgressPollErrors = 10
+
+	// lostEngineWorkPendingPolls is how many consecutive progress polls may
+	// report no active schema change (a state that maps to pending) for a task
+	// whose stored state says the work is already in flight, before the drive
+	// stops trusting the engine and verifies the target schema directly. An
+	// engine that just restarted, or that drained a previous operation, can
+	// serve a stale snapshot that omits the in-flight work for a short window
+	// before it catches up; that window self-heals, so a small budget of polls
+	// absorbs it. A run of pending reports outlasting the budget means the
+	// engine has lost (or never had) the work, and polling it further can
+	// never terminalize the task.
+	lostEngineWorkPendingPolls = 10
+
+	// defaultTaskStallWarnInterval is how long a polled task may sit in the
+	// same stored state with unchanged progress fields before the drive warns
+	// that the task looks stalled. The warning repeats once per interval, not
+	// per poll, so a genuinely stuck task stays visible without flooding logs.
+	defaultTaskStallWarnInterval = 5 * time.Minute
+)
+
+// taskPollInterval returns the sequential drive's progress poll cadence.
+func (c *LocalClient) taskPollInterval() time.Duration {
+	if c.taskPollIntervalOverride > 0 {
+		return c.taskPollIntervalOverride
+	}
+	return defaultTaskPollInterval
+}
+
+// taskStallWarnInterval returns how long a polled task may show no state or
+// progress movement before the drive warns.
+func (c *LocalClient) taskStallWarnInterval() time.Duration {
+	if c.taskStallWarnIntervalOverride > 0 {
+		return c.taskStallWarnIntervalOverride
+	}
+	return defaultTaskStallWarnInterval
+}
+
 // pollTaskToCompletion polls a single task to completion (sequential mode).
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 
 	var consecutiveErrors int
 	var resumeEventLogged bool
+	var pendingWhileInFlight int
+	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 
 	for {
 		select {
@@ -523,7 +572,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				consecutiveErrors++
 				logger.Warn("progress check failed",
 					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors)
-				if consecutiveErrors >= 10 {
+				if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 					if c.shouldRetryEngineError(err) {
 						c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
 						return taskFailed
@@ -533,10 +582,6 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				}
 				continue
 			}
-			consecutiveErrors = 0
-			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
-
-			now := time.Now()
 			prevState := task.State
 			engineTaskState := taskStateFromProgressResult(result)
 			// A sequential task drives a single DDL, so the first table's
@@ -549,6 +594,40 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					engineTaskState = phase
 				}
 			}
+
+			if engineReportsLostWork(prevState, engineTaskState) {
+				pendingWhileInFlight++
+				if pendingWhileInFlight >= lostEngineWorkPendingPolls {
+					action, settleErr := c.settleLostEngineWork(ctx, apply, task, result.State)
+					if settleErr == nil {
+						return action
+					}
+					// Neither the engine nor the target has answered what
+					// happened to the work, so count the failed verification
+					// against the same bounded error budget as a failed poll —
+					// this must never become an unbounded loop.
+					consecutiveErrors++
+					c.logger.Warn("engine reports no active schema change for an in-flight task and target verification failed; the drive re-verifies at the next poll",
+						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "error", settleErr)...)
+					if consecutiveErrors >= maxConsecutiveProgressPollErrors {
+						c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and target verification failed after %d consecutive errors; see server logs", consecutiveErrors))
+						return taskFailed
+					}
+					continue
+				}
+				// A short run of pending reports is a stale engine snapshot
+				// (e.g. right after an engine restart) that self-heals once the
+				// engine catches up with its own in-flight work.
+				c.logger.Debug("engine reported no active schema change for an in-flight task; tolerating a stale engine snapshot",
+					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_pending_reports", pendingWhileInFlight)...)
+			} else {
+				pendingWhileInFlight = 0
+			}
+
+			consecutiveErrors = 0
+			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
+
+			now := time.Now()
 			task.State = taskStateWithNoBackwardProgress(prevState, engineTaskState)
 			task.UpdatedAt = now
 			retryableFailure := state.IsState(task.State, state.Task.FailedRetryable)
@@ -600,6 +679,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				return taskContinue
 			}
 
+			if stalledFor, warn := watchdog.observe(now, taskProgressSnapshotOf(task)); warn {
+				c.logger.Warn("task state and progress fields are unchanged past the stall-warning interval; the drive continues polling the engine",
+					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "stalled_for", stalledFor.Round(time.Second), "engine_state", result.State)...)
+			}
+
 			c.transitionTaskState(ctx, task, 0, task.State, "")
 
 			// Notify observer with full apply + tasks context
@@ -627,6 +711,115 @@ func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task,
 	task.ErrorMessage = errMsg
 	task.CompletedAt = nil
 	c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
+}
+
+// engineReportsLostWork reports whether a successful progress poll came back
+// with no active schema change (a state that maps to pending) for a task whose
+// stored state says the work is already in flight. An engine never reports
+// pending for work it is actively driving, so this shape means the engine's
+// view and durable storage have diverged: briefly and legitimately while a
+// restarted engine reloads its snapshot, or permanently when the engine has
+// lost (or never had) the work — in which case polling can never terminalize
+// the task. Only genuinely in-flight stored states count: resting states such
+// as stopped or failed_retryable have no active engine work by design, so a
+// pending report for them is expected, not divergence.
+func engineReportsLostWork(storedTaskState, engineTaskState string) bool {
+	if !state.IsState(engineTaskState, state.Task.Pending) {
+		return false
+	}
+	return state.IsInFlightTaskState(storedTaskState)
+}
+
+// settleLostEngineWork resolves a task the engine has stopped reporting on by
+// verifying the target schema directly. The engine says no schema change is
+// active while durable storage says this task's change is in flight, and that
+// divergence outlasted the tolerated staleness window — so engine progress can
+// never terminalize the task and the target itself is the only remaining
+// authority. A target that already has the desired schema means the work
+// finished and only its outcome was lost: the task completes. A target that
+// still needs the change means the work is genuinely gone: the task is marked
+// retryable so a fresh claim re-drives it — never permanently failed, because
+// nothing about the target is known to be broken. A verification error is
+// returned for the caller's consecutive-error budget to count.
+func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.Apply, task *storage.Task, engineState engine.State) (taskAction, error) {
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return taskContinue, fmt.Errorf("load plan for apply %s to verify target schema for task %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, err)
+	}
+	if plan == nil {
+		return taskContinue, fmt.Errorf("plan not found for apply %s while verifying target schema for task %s", apply.ApplyIdentifier, task.TaskIdentifier)
+	}
+	_, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
+	if err != nil {
+		return taskContinue, fmt.Errorf("verify target schema for task %s table %s: %w", task.TaskIdentifier, task.TableName, err)
+	}
+	if !needsChange {
+		now := time.Now()
+		task.ProgressPercent = 100
+		task.CompletedAt = &now
+		c.logger.Info("engine reports no active schema change and the target already has the desired schema; completing the task",
+			append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+		c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Completed,
+			fmt.Sprintf("Task %s completed: engine no longer reports the schema change and the target has the desired schema", task.TaskIdentifier))
+		return taskContinue, nil
+	}
+	c.logger.Warn("engine reports no active schema change but the target still needs it; marking the task retryable for a fresh claim to re-drive",
+		append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+	c.markTaskRetryable(ctx, task,
+		fmt.Sprintf("engine reports no active schema change for table %s but the target still needs the change; a fresh claim will re-drive it", task.TableName))
+	return taskFailed, nil
+}
+
+// taskProgressSnapshot captures the fields whose movement shows a polled task
+// is advancing: the stored state plus the progress counters the engine
+// refreshes while it works.
+type taskProgressSnapshot struct {
+	state               string
+	rowsCopied          int64
+	progressPercent     int
+	checksumRowsChecked int64
+}
+
+func taskProgressSnapshotOf(task *storage.Task) taskProgressSnapshot {
+	return taskProgressSnapshot{
+		state:               task.State,
+		rowsCopied:          task.RowsCopied,
+		progressPercent:     task.ProgressPercent,
+		checksumRowsChecked: task.ChecksumRowsChecked,
+	}
+}
+
+// taskStallWatchdog tracks whether a polled task's state and progress fields
+// are moving, so the drive can surface a task that is nominally being polled
+// but has shown no movement for a full interval. It only observes and warns —
+// it never changes task state.
+type taskStallWatchdog struct {
+	interval time.Duration
+	last     taskProgressSnapshot
+	since    time.Time
+	lastWarn time.Time
+}
+
+// observe records this poll's snapshot and reports whether the task has now
+// been motionless for a full interval since movement stopped, rate-limited to
+// one warning per interval. The caller logs when warn is true; movement resets
+// both the stall clock and the warning latch.
+func (w *taskStallWatchdog) observe(now time.Time, snap taskProgressSnapshot) (stalledFor time.Duration, warn bool) {
+	if w.since.IsZero() || snap != w.last {
+		w.last = snap
+		w.since = now
+		w.lastWarn = time.Time{}
+		return 0, false
+	}
+	stalledFor = now.Sub(w.since)
+	if stalledFor < w.interval {
+		return 0, false
+	}
+	if !w.lastWarn.IsZero() && now.Sub(w.lastWarn) < w.interval {
+		return 0, false
+	}
+	w.lastWarn = now
+	return stalledFor, true
 }
 
 // shouldRetryEngineError decides whether an engine error pauses the apply as

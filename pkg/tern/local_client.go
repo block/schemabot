@@ -199,6 +199,17 @@ type LocalClient struct {
 	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
 	heartbeatInterval time.Duration
 
+	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
+	// as the sequential drive's progress poll cadence. Tests may lower it to
+	// drive many polls quickly.
+	taskPollIntervalOverride time.Duration
+
+	// taskStallWarnIntervalOverride, when positive, replaces
+	// defaultTaskStallWarnInterval as the interval after which a polled task
+	// with no state or progress movement is warned about. Tests may lower it
+	// to observe the warning.
+	taskStallWarnIntervalOverride time.Duration
+
 	// cancelApply cancels the background goroutine running executeApplySequential
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
