@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -268,6 +269,63 @@ func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 	}
 }
 
+// multiDeploySpendRecoveryBudget spends the recovery budget on the apply this
+// test just dispatched to a deployment's remote Tern. The engine classifies
+// the induced duplicate-row failure retryable, so the remote operator would
+// re-run the whole engine attempt until the budget is spent while the control
+// plane correctly keeps the operation open through each pause — a bounded
+// sequence of engine runs and recovery waits far longer than a test deadline
+// should cover. With the budget spent up front, the first retryable failure
+// goes through the real expiry pass immediately, settling the operation to the
+// same terminal state exhaustion would reach, with the engine error intact.
+//
+// Each test starts from multiDeployEnsureNoActiveChange, which clears every
+// deployment's Tern storage, so the apply this test dispatched is the only
+// applies row on the deployment's Tern.
+func multiDeploySpendRecoveryBudget(t *testing.T, deployment string) {
+	t.Helper()
+	db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, deployment))
+	require.NoErrorf(t, err, "open tern storage db (%s)", deployment)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern storage db (%s)", deployment)
+
+	// The control plane dispatches to the remote asynchronously after accepting
+	// the apply, so poll for the remote row to exist before spending its budget.
+	var applyIdentifier string
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			rows, err := db.QueryContext(t.Context(), "SELECT apply_identifier FROM `applies`")
+			require.NoErrorf(t, err, "read dispatched applies on %s", deployment)
+			defer utils.CloseAndLog(rows)
+			var identifiers []string
+			for rows.Next() {
+				var identifier string
+				require.NoError(t, rows.Scan(&identifier))
+				identifiers = append(identifiers, identifier)
+			}
+			require.NoError(t, rows.Err())
+			if len(identifiers) == 0 {
+				return false
+			}
+			require.Lenf(t, identifiers, 1,
+				"expected exactly the apply this test dispatched on %s", deployment)
+			applyIdentifier = identifiers[0]
+			return true
+		},
+		func() string {
+			return fmt.Sprintf("timeout waiting for the apply to be dispatched to %s", deployment)
+		})
+
+	result, err := db.ExecContext(t.Context(),
+		"UPDATE `applies` SET attempt = ? WHERE apply_identifier = ?",
+		storage.MaxRecoveryAttempts, applyIdentifier)
+	require.NoErrorf(t, err, "spend the recovery budget on %s apply %s", deployment, applyIdentifier)
+	spent, err := result.RowsAffected()
+	require.NoError(t, err, "read spent recovery budget rows")
+	require.EqualValuesf(t, 1, spent,
+		"expected to spend the recovery budget on %s apply %s", deployment, applyIdentifier)
+}
+
 // multiDeployEnsureNoActiveChange clears any active schema change for the
 // fan-out (database, env). It mirrors grpcEnsureNoActiveChange but clears Tern
 // storage on every deployment instance, since the fan-out keeps a separate Tern
@@ -454,6 +512,11 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
+	// The duplicate-row failure is retryable, so the earlier deployment would
+	// otherwise pause and re-run its engine attempt until the recovery budget
+	// is spent before settling failed.
+	multiDeploySpendRecoveryBudget(t, first)
+
 	// Wait for the earlier deployment to fail, asserting throughout that the
 	// later deployment never reaches completed — the halt policy must keep it
 	// from cutting over once a sibling has failed.
@@ -638,6 +701,11 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// The duplicate-row failure is retryable, so the earlier deployment would
+	// otherwise pause and re-run its engine attempt until the recovery budget
+	// is spent before settling failed.
+	multiDeploySpendRecoveryBudget(t, first)
 
 	// Wait until both deployments are terminal: the earlier failed, the later
 	// completed. Under continue, the later sibling must not be blocked by the
