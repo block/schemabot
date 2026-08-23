@@ -83,44 +83,29 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
-func TestCleanLintReason(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		expect string
-	}{
-		{
-			name:   "strips ERROR prefix and linter name",
-			input:  "[ERROR] invisible_index_before_drop: Index 'idx_status' should be made invisible",
-			expect: "Index 'idx_status' should be made invisible",
-		},
-		{
-			name:   "strips WARNING prefix and linter name",
-			input:  "[WARNING] unsafe: DROP COLUMN removes data",
-			expect: "DROP COLUMN removes data",
-		},
-		{
-			name:   "no prefix passes through",
-			input:  "DROP TABLE removes all data",
-			expect: "DROP TABLE removes all data",
-		},
-		{
-			name:   "multiple reasons joined by semicolon",
-			input:  "[ERROR] unsafe: DROP COLUMN removes data; [ERROR] invisible_index_before_drop: Index should be invisible first",
-			expect: "DROP COLUMN removes data; Index should be invisible first",
-		},
-		{
-			name:   "empty string",
-			input:  "",
-			expect: "",
-		},
-	}
+func TestLintReasons(t *testing.T) {
+	t.Run("splits engine-joined violations into cleaned messages", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{"DROP COLUMN removes data", "Index should be invisible first"},
+			LintReasons("[ERROR] unsafe: DROP COLUMN removes data; [ERROR] invisible_index_before_drop: Index should be invisible first"))
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expect, CleanLintReason(tt.input))
-		})
-	}
+	t.Run("strips severity prefix and linter name", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{"Index 'idx_status' should be made invisible"},
+			LintReasons("[ERROR] invisible_index_before_drop: Index 'idx_status' should be made invisible"))
+		assert.Equal(t,
+			[]string{"DROP COLUMN removes data"},
+			LintReasons("[WARNING] unsafe: DROP COLUMN removes data"))
+	})
+
+	t.Run("single violation yields one message", func(t *testing.T) {
+		assert.Equal(t, []string{"DROP TABLE removes all data"}, LintReasons("DROP TABLE removes all data"))
+	})
+
+	t.Run("empty reason yields nothing", func(t *testing.T) {
+		assert.Empty(t, LintReasons(""))
+	})
 }
 
 func TestCodeQuoteIdentifiers(t *testing.T) {

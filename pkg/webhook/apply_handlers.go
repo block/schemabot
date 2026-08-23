@@ -349,9 +349,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
 
-	// Build plan comment data with lock info. The attributed-change disclosure sits
-	// on this comment for the same reason as the direct-execution one: it must
-	// be on the comment the confirmation acts on.
+	// Build plan comment data with lock info. Attributed changes are annotated
+	// here so that a downgrade to manual confirmation below discloses them on
+	// the comment apply-confirm acts on; the template omits them when the
+	// apply proceeds automatically and the unsafe opt-in already solicited
+	// consent for every attributed table, where the re-plan choice the
+	// disclosure coaches is no longer open.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true

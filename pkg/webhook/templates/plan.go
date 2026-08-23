@@ -64,6 +64,11 @@ type AttributedChangeData struct {
 	Repository  string
 	PullRequest int
 	Unresolved  bool
+	// OutsideUnsafeGate marks a destructive change the --allow-unsafe opt-in
+	// never gated — one visible only on individual shards — so consent for it
+	// was never solicited and the disclosure must not be dropped as already
+	// consented to.
+	OutsideUnsafeGate bool
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -124,6 +129,37 @@ type PlanCommentData struct {
 	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
 
 	RecoveredApplyOwnedCheckState bool
+
+	// DeploymentDrift is the review-time rollup of how every configured
+	// deployment compares to the reviewed primary plan. Nil for a single-target
+	// database (nothing to compare) or when drift was not evaluated.
+	DeploymentDrift *DeploymentDriftData
+}
+
+// DeploymentDriftData renders the review-time drift rollup in the PR preview: a
+// uniform "same plan everywhere" line when every deployment matches, or a
+// per-deployment breakdown when some deployment diverged from — or could not be
+// confirmed against — the reviewed plan.
+type DeploymentDriftData struct {
+	// Deployments is every configured deployment in rollout order, primary first.
+	Deployments []DeploymentDriftEntry
+	// Clean is true only when every deployment matches the reviewed plan.
+	Clean bool
+	// Computed is false when the rollup itself could not be evaluated; the check
+	// still fails closed, and the preview says the deployments are unverified.
+	Computed bool
+}
+
+// DeploymentDriftEntry is one deployment's classification against the reviewed
+// primary plan.
+type DeploymentDriftEntry struct {
+	Deployment string
+	Primary    bool
+	// Class is "match", "diverged", or "errored".
+	Class string
+	// Detail is a short human explanation for a diverged or errored deployment;
+	// empty for a match.
+	Detail string
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -175,6 +211,11 @@ func RenderPlanComment(data PlanCommentData) string {
 
 	sb.WriteString("\n")
 
+	// Review-time deployment drift is shown before the change list — and before
+	// the no-changes short-circuit — because a non-primary deployment can drift
+	// even when the reviewed primary plan is a clean no-op.
+	writeDeploymentDrift(&sb, data.DeploymentDrift)
+
 	// Count changes
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
@@ -203,10 +244,12 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeBlockedChanges(&sb, data.BlockedChanges)
 	}
 
-	// Destructive changes to tables another pull request owns. Shown on the
-	// locked apply comment too, for the same reason as the direct-execution
-	// disclosure: it must sit on the comment the confirmation acts on.
-	if len(data.AttributedChanges) > 0 {
+	// Destructive changes to tables another pull request owns — shown where the
+	// reader still decides whether the apply proceeds, omitted on the
+	// auto-applying locked comment: the disclosure coaches re-planning ("merge
+	// that PR ... then re-plan"), which is noise once the apply is already
+	// running.
+	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
@@ -288,6 +331,28 @@ func RenderPlanComment(data PlanCommentData) string {
 func writeApplyInstruction(sb *strings.Builder, command string) {
 	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// attributionStillActionable reports whether the attributed-changes
+// disclosure still informs a choice this comment's reader holds. The plan
+// comment offers the apply command, and a locked comment downgraded to manual
+// confirmation pauses for apply-confirm — both readers can still merge the
+// owning pull request and re-plan instead of applying. Once the locked
+// comment is applying automatically, that re-plan alternative is gone and the
+// operator consented to the destruction through --allow-unsafe, so the
+// disclosure is omitted — unless an attributed table never passed through the
+// unsafe opt-in gate, where no consent was ever solicited and this comment is
+// the operator's notice.
+func attributionStillActionable(data PlanCommentData) bool {
+	if !data.IsLocked || data.AutoConfirmDowngradeReason != "" {
+		return true
+	}
+	for _, change := range data.AttributedChanges {
+		if change.OutsideUnsafeGate {
+			return true
+		}
+	}
+	return false
 }
 
 // writeAttributedChanges writes the section for destructive changes to tables
@@ -727,6 +792,62 @@ func planShardList(shards []string) string {
 	return "shards " + strings.Join(quoted, ", ")
 }
 
+// writeDeploymentDrift renders the review-time drift rollup: a single uniform
+// line when every deployment matches the reviewed plan, or a per-deployment
+// breakdown naming which deployments diverged or could not be verified. It is a
+// no-op for a nil rollup (single-target database or drift not evaluated).
+func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
+	if drift == nil {
+		return
+	}
+
+	if !drift.Computed {
+		sb.WriteString("⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
+		return
+	}
+
+	if drift.Clean {
+		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
+			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
+		return
+	}
+
+	sb.WriteString("⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	for _, d := range drift.Deployments {
+		name := "`" + d.Deployment + "`"
+		if d.Primary {
+			name += " (primary)"
+		}
+		switch d.Class {
+		case "match":
+			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
+		case "diverged":
+			fmt.Fprintf(sb, "- %s ⚠️ diverged%s\n", name, driftDetailSuffix(d.Detail))
+		default:
+			fmt.Fprintf(sb, "- %s ❌ could not verify%s\n", name, driftDetailSuffix(d.Detail))
+		}
+	}
+	sb.WriteString("\n")
+}
+
+// driftDetailSuffix renders a deployment's drift detail as a trailing clause, or
+// an empty string when there is no detail.
+func driftDetailSuffix(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return " — " + detail
+}
+
+// joinDeploymentNames lists deployment names for the uniform drift line.
+func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
+	names := make([]string, len(deployments))
+	for i, d := range deployments {
+		names[i] = d.Deployment
+	}
+	return strings.Join(names, ", ")
+}
+
 // writeBlockedChanges writes the section for statements the engine refuses,
 // naming each table and the engine's reason verbatim. There is no opt-in flag
 // that lets these through — the guidance is to rewrite the change, not retry.
@@ -791,22 +912,54 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 }
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
-	n := len(changes)
+	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
-		reason := ui.CodeQuoteIdentifiers(ui.CleanLintReason(c.Reason))
-		if reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, reason)
-		} else {
-			fmt.Fprintf(sb, "- %s\n", table)
-		}
+		writeUnsafeChangeItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, isMySQL)
+}
+
+// writeUnsafeChangeItem writes one table's unsafe findings as a list item:
+// a single "- table: reason" line for one finding, or a nested list when the
+// engine joined several, so each finding reads on its own line.
+func writeUnsafeChangeItem(sb *strings.Builder, table, reason string) {
+	reasons := ui.LintReasons(reason)
+	for i, r := range reasons {
+		reasons[i] = ui.CodeQuoteIdentifiers(r)
+	}
+	switch len(reasons) {
+	case 0:
+		fmt.Fprintf(sb, "- %s\n", table)
+	case 1:
+		fmt.Fprintf(sb, "- %s: %s\n", table, reasons[0])
+	default:
+		fmt.Fprintf(sb, "- %s:\n", table)
+		for _, r := range reasons {
+			fmt.Fprintf(sb, "  - %s\n", r)
+		}
+	}
+}
+
+// countUnsafeFindings sums the individual lint findings across changes, so
+// headers count what the list below actually shows: a table whose reason
+// carries several joined violations contributes each of them. A change with
+// no parseable reason still counts once.
+func countUnsafeFindings(changes []UnsafeChangeData) int {
+	n := 0
+	for _, c := range changes {
+		if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+			n += len(reasons)
+		} else {
+			n++
+		}
+	}
+	return n
 }
 
 func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
@@ -1033,11 +1186,13 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	}
 	hasErrors := len(data.Errors) > 0
 
-	// If no environments have changes and no errors, show simple message. The
-	// ignore_namespaces disclosure still renders underneath it: an all-clean
-	// result is exactly where a reviewer needs to see that a namespace was
-	// withheld rather than genuinely unchanged.
-	if envsWithChanges == 0 && !hasErrors {
+	// If no environments have changes and no errors, show simple message — unless
+	// a deployment drifted, which must still surface even when the reviewed
+	// primary plans are clean no-ops. The ignore_namespaces disclosure still
+	// renders underneath it: an all-clean result is exactly where a reviewer
+	// needs to see that a namespace was withheld rather than genuinely
+	// unchanged.
+	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
 		if multiEnvHasIgnoredNamespaces(data) {
 			sb.WriteString("\n")
@@ -1158,6 +1313,11 @@ func titleDatabaseType(databaseType string) string {
 
 // writeEnvironmentPlanSection writes the plan body for a single environment within a multi-env comment.
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
+	// Deployment drift is shown before the change list and before the no-changes
+	// short-circuit: a non-primary deployment can drift even when this
+	// environment's reviewed primary plan is a clean no-op.
+	writeDeploymentDrift(sb, plan.DeploymentDrift)
+
 	totalStatements, keyspacesWithVSchema := countChanges(plan.Changes)
 	totalChanges := totalStatements + keyspacesWithVSchema
 
@@ -1304,6 +1464,41 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 	return firstPlan != nil
 }
 
+// AnyEnvHasDriftToShow reports whether any environment has drift that must be
+// surfaced even when no environment plans changes: a deployment that diverged or
+// could not be verified. A clean uniform rollup is not "drift to show" — with no
+// changes anywhere the simple no-changes message is clearer.
+func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		plan, ok := data.Plans[env]
+		if !ok || plan == nil || plan.DeploymentDrift == nil {
+			continue
+		}
+		d := plan.DeploymentDrift
+		if !d.Computed || !d.Clean {
+			return true
+		}
+	}
+	return false
+}
+
+// driftIdentical reports whether two plans' deployment-drift rollups render the
+// same, so environments are only deduplicated when their drift is identical too.
+func driftIdentical(a, b *DeploymentDriftData) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.Computed != b.Computed || a.Clean != b.Clean || len(a.Deployments) != len(b.Deployments) {
+		return false
+	}
+	for i := range a.Deployments {
+		if a.Deployments[i] != b.Deployments[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // plansIdentical checks if two plans have the same DDL statements. Plans that
 // excluded different namespaces are never identical: deduplicating them into
 // one section would show one environment's exclusion disclosure for both.
@@ -1331,7 +1526,7 @@ func plansIdentical(a, b *PlanCommentData) bool {
 			return false
 		}
 	}
-	return true
+	return driftIdentical(a.DeploymentDrift, b.DeploymentDrift)
 }
 
 // capitalizeEnvNames joins environment names with " & " and capitalizes each.
