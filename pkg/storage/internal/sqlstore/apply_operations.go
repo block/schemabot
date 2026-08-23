@@ -1604,19 +1604,22 @@ const strandedParentQuiescence = 10 * time.Minute
 const strandedReaperLockName = "schemabot_stranded_reaper"
 
 // strandedParentGate renders the EXISTS admitting only parents whose outcome can
-// no longer change, correlated on the given apply_id column. Both the sweep's
-// SELECT and the guarded per-row UPDATE assert it, so the write re-verifies the
-// parent it was chosen for rather than trusting a read that may be seconds old.
+// no longer change, correlated on the given apply_id column. Both a reaper
+// sweep's SELECT and its guarded per-row UPDATE assert it, so the write
+// re-verifies the parent it was chosen for rather than trusting a read that may
+// be seconds old.
 //
 // Two conditions, each for its own reason:
-//   - settled state: the rollout has a verdict, so a pending child describes
-//     work that will never run.
-//   - quiescent: the apply's own paths — stop reconciliation, terminal
-//     derivation — may still be writing sibling rows just after it terminalized.
-func (s *applyOperationStore) strandedParentGate(correlation string) (string, []any) {
+//   - settled state: the rollout has a verdict, so a child row describing
+//     future work (a pending operation, a promised task retry) is dead.
+//   - quiescent for the given window: the apply's own paths — stop
+//     reconciliation, terminal derivation — may still be writing child rows
+//     just after it terminalized. Each reaper picks the window matching what
+//     could still race it.
+func strandedParentGate(d Dialect, correlation string, quiescence time.Duration) (string, []any) {
 	parentStates := settledApplyStates()
-	quiescentBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64(strandedParentQuiescence.Microseconds())), IntervalMicrosecond)
+	quiescentBefore := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(quiescence.Microseconds())), IntervalMicrosecond)
 
 	args := stringArgs(parentStates)
 	return fmt.Sprintf(`EXISTS (
@@ -1683,7 +1686,7 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 		return nil, fmt.Errorf("reap stranded apply_operations: limit must be positive, got %d", limit)
 	}
 
-	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 
 	selectArgs := []any{state.ApplyOperation.Pending}
 	selectArgs = append(selectArgs, parentGateArgs...)
@@ -1709,7 +1712,11 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 		return nil, nil
 	}
 
-	parents, err := s.loadStrandedParents(ctx, stranded)
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, op := range stranded {
+		applyIDs = append(applyIDs, op.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded apply_operations")
 	if err != nil {
 		return nil, err
 	}
@@ -1740,31 +1747,32 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 	return reaped, nil
 }
 
-// loadStrandedParents returns the settled parent applies of the reaped rows,
-// keyed by apply id.
-func (s *applyOperationStore) loadStrandedParents(ctx context.Context, stranded []*storage.ApplyOperation) (map[int64]*storage.Apply, error) {
-	applyIDs := make([]any, 0, len(stranded))
-	seen := make(map[int64]bool, len(stranded))
-	for _, op := range stranded {
-		if seen[op.ApplyID] {
+// loadSettledParents returns the settled parent applies of the rows a reaper
+// sweep selected, keyed by apply id. subject names the reaped row kind for
+// error context.
+func loadSettledParents(ctx context.Context, db *rebindDB, applyIDs []int64, subject string) (map[int64]*storage.Apply, error) {
+	args := make([]any, 0, len(applyIDs))
+	seen := make(map[int64]bool, len(applyIDs))
+	for _, applyID := range applyIDs {
+		if seen[applyID] {
 			continue
 		}
-		seen[op.ApplyID] = true
-		applyIDs = append(applyIDs, op.ApplyID)
+		seen[applyID] = true
+		args = append(args, applyID)
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE id IN (`+placeholders(len(applyIDs))+`)
-	`, applyIDs...)
+		WHERE id IN (`+placeholders(len(args))+`)
+	`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query settled parents of %d stranded apply_operations: %w", len(stranded), err)
+		return nil, fmt.Errorf("query settled parents of %d %s: %w", len(applyIDs), subject, err)
 	}
 	applies, err := scanApplies(rows)
 	utils.CloseAndLog(rows)
 	if err != nil {
-		return nil, fmt.Errorf("scan settled parents of %d stranded apply_operations: %w", len(stranded), err)
+		return nil, fmt.Errorf("scan settled parents of %d %s: %w", len(applyIDs), subject, err)
 	}
 
 	parents := make(map[int64]*storage.Apply, len(applies))
@@ -1790,7 +1798,7 @@ func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *sto
 		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())"
 		args = []any{parent.State, nullString(parent.ErrorMessage)}
 	}
-	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 	args = append(args, op.ID, state.ApplyOperation.Pending)
 	args = append(args, parentGateArgs...)
 

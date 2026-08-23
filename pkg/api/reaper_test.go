@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -54,10 +55,26 @@ func reapedDeployments(t *testing.T, reader *sdkmetric.ManualReader) []string {
 	return deployments
 }
 
+// reapingTaskStore serves the reaper pass a canned retryable-task reap result.
+type reapingTaskStore struct {
+	storage.TaskStore
+	reaped  []*storage.ReapedTask
+	reapErr error
+}
+
+func (s *reapingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
+	return s.reaped, s.reapErr
+}
+
 func strandedReaperService(reaped []*storage.ReapedOperation, reapErr error) *Service {
+	return strandedReaperServiceWithTasks(reaped, reapErr, nil, nil)
+}
+
+func strandedReaperServiceWithTasks(reaped []*storage.ReapedOperation, reapErr error, reapedTasks []*storage.ReapedTask, taskReapErr error) *Service {
 	svc := newTestService()
 	svc.storage = &mockStorageWithApplyStores{
 		operations: &staticApplyOperationStore{reaped: reaped, reapErr: reapErr},
+		tasks:      &reapingTaskStore{reaped: reapedTasks, reapErr: taskReapErr},
 	}
 	return svc
 }
@@ -115,4 +132,82 @@ func TestRunStrandedReaperPassRecordsNothingWhenAnotherInstanceIsReaping(t *test
 	svc.runStrandedReaperPass(t.Context())
 
 	assert.Empty(t, reapedDeployments(t, reader), "an unelected pass settles nothing")
+}
+
+// claimFailureReasons returns the reason attribute of every operator
+// claim-failure data point the reader has collected.
+func claimFailureReasons(t *testing.T, reader *sdkmetric.ManualReader) []string {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	var reasons []string
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.operator.claim_failures_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				reason, hasReason := dp.Attributes.Value(attribute.Key("reason"))
+				require.True(t, hasReason, "a claim failure must say why")
+				reasons = append(reasons, reason.AsString())
+			}
+		}
+	}
+	return reasons
+}
+
+// The two reaps in one pass are independent maintenance sweeps: a storage
+// failure in each is recorded under its own claim-failure reason, and the
+// operation reap failing first does not stop the task reap from running.
+func TestRunStrandedReaperPassRecordsEachReapFailureUnderItsOwnReason(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc := strandedReaperServiceWithTasks(
+		nil, errors.New("operations table unavailable"),
+		nil, errors.New("tasks table unavailable"))
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.ElementsMatch(t, []string{"stranded_reaper_error", "stranded_task_reaper_error"},
+		claimFailureReasons(t, reader),
+		"both reaps run and each failure is attributable to its own sweep")
+}
+
+// Losing the task-reaper election is the expected outcome on every instance but
+// one, so a busy task reap records no failure.
+func TestRunStrandedReaperPassTaskReapBusyIsNotAFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc := strandedReaperServiceWithTasks(nil, nil, nil, storage.ErrStrandedTaskReaperBusy)
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.Empty(t, claimFailureReasons(t, reader), "an unelected task reap is not a failure")
+}
+
+// A task reap pass that settled rows before failing reports the settlements —
+// the writes are committed whatever the pass does next — and still records the
+// failure. The settled rows carry both the task and its parent so the log line
+// can name the apply an operator will be triaging.
+func TestRunStrandedReaperPassReportsTaskSettlementsThatLandedBeforeAFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc := strandedReaperServiceWithTasks(nil, nil, []*storage.ReapedTask{{
+		Task: &storage.Task{
+			TaskIdentifier: "task-stranded",
+			TableName:      "users",
+			State:          state.Task.Failed,
+			ErrorMessage:   "connection reset during copy",
+		},
+		Parent: &storage.Apply{
+			ApplyIdentifier: "apply-stranded",
+			Database:        "payments",
+			Environment:     "staging",
+			State:           state.Apply.Failed,
+		},
+	}}, errors.New("tasks table unavailable"))
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.Equal(t, []string{"stranded_task_reaper_error"}, claimFailureReasons(t, reader),
+		"the failure is still recorded after the committed settlements are reported")
 }

@@ -56,6 +56,17 @@ import (
 // The election is an efficiency gate, not a safety one. Every write is already
 // guarded and idempotent, so concurrent reapers would be correct; they would just
 // each pay the full scan to settle rows the first one already handled.
+//
+// The same pass also reaps dead retryable tasks: failed_retryable task rows
+// under a settled parent apply. A failed_retryable task promises a retry that
+// only the parent's recovery path can dispatch, so once the parent settles the
+// promise is dead — and the row poisons every reader that treats
+// failed_retryable as "a retry is coming", most critically the control plane's
+// remote-progress snapshot, which copies the row verbatim and reads it as a
+// permanent retryable pause. Which rows qualify and how each write is guarded is
+// the storage layer's contract — see storage.TaskStore.ReapStrandedRetryable.
+// The pass shape is the same as above, with its own election lock and a longer
+// parent-quiescence window sized past the retryable-recovery freshness window.
 
 // StrandedReaperInterval is how often the reaper runs a pass. Override with
 // SetStrandedReaperInterval.
@@ -105,10 +116,19 @@ func (s *Service) strandedReaperLoop(ctx context.Context, stop <-chan struct{}, 
 	}
 }
 
-// runStrandedReaperPass runs one pass. It is best-effort maintenance: a storage
-// error is logged and recorded, and the next pass retries. Losing the election is
-// the expected outcome on every instance but one, so it is not an error.
+// runStrandedReaperPass runs one pass over both kinds of dead rows. It is
+// best-effort maintenance: a storage error is logged and recorded, and the next
+// pass retries. Losing the election is the expected outcome on every instance
+// but one, so it is not an error. The two reaps are independent — a failure in
+// one must not starve the other.
 func (s *Service) runStrandedReaperPass(ctx context.Context) {
+	s.reapStrandedOperations(ctx)
+	s.reapStrandedRetryableTasks(ctx)
+}
+
+// reapStrandedOperations settles pending operation rows under settled parent
+// applies, mirroring the parent's outcome onto them.
+func (s *Service) reapStrandedOperations(ctx context.Context) {
 	reaped, err := s.storage.ApplyOperations().ReapStranded(ctx, strandedReaperBatch)
 
 	// Report what landed before handling the error. A failed pass still returns
@@ -138,6 +158,45 @@ func (s *Service) runStrandedReaperPass(ctx context.Context) {
 		s.logger.Error("operator: failed to reap stranded apply operations",
 			"reaped_before_failure", len(reaped), "error", err)
 		metrics.RecordOperatorClaimFailure(ctx, "stranded_reaper_error")
+		return
+	}
+}
+
+// reapStrandedRetryableTasks hardens failed_retryable task rows under settled
+// parent applies to failed, retiring retry promises nothing will ever dispatch.
+// Settlements are logged, not counted: the rows are the rare residue of a
+// partial failure write, so a rate would read zero for weeks — a log-based
+// monitor can count the line below if that day arrives.
+func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
+	reaped, err := s.storage.Tasks().ReapStrandedRetryable(ctx, strandedReaperBatch)
+
+	// Report what landed before handling the error. A failed pass still returns
+	// the rows it settled before failing, and those writes are committed — an
+	// operator asking who changed a settled apply's task rows must find them.
+	for _, settled := range reaped {
+		parent, task := settled.Parent, settled.Task
+		s.logger.Info("operator: reaped a stranded retryable task to failed; its settled parent apply will never dispatch the retry",
+			append(parent.LogAttrs(),
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_error", task.ErrorMessage)...)
+	}
+
+	if errors.Is(err, storage.ErrStrandedTaskReaperBusy) {
+		s.logger.Debug("operator: another instance is reaping stranded retryable tasks; skipping this pass")
+		return
+	}
+	if ctx.Err() != nil {
+		// A pass interrupted by shutdown is a routine deploy, not a fault, and
+		// must not tick the claim-failure counter operators alert on.
+		s.logger.Debug("operator: stranded retryable-task reaper pass interrupted by shutdown",
+			"reaped_before_shutdown", len(reaped), "error", err)
+		return
+	}
+	if err != nil {
+		s.logger.Error("operator: failed to reap stranded retryable tasks",
+			"reaped_before_failure", len(reaped), "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, "stranded_task_reaper_error")
 		return
 	}
 }
