@@ -135,6 +135,10 @@ type controlCaptureEngine struct {
 	progressReq *engine.ProgressRequest
 	stopErr     error
 	cancelErr   error
+	// progressResult is returned from Progress when set; a zero ProgressResult
+	// is returned otherwise.
+	progressResult *engine.ProgressResult
+	progressErr    error
 	// onStop runs when Stop is invoked, before it returns. Used to observe
 	// storage state at the moment of the engine stop (e.g. to assert the engine
 	// is stopped before tasks are marked stopped/cancelled).
@@ -174,7 +178,27 @@ func (e *controlCaptureEngine) Cancel(_ context.Context, req *engine.ControlRequ
 
 func (e *controlCaptureEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	e.progressReq = req
+	if e.progressErr != nil {
+		return nil, e.progressErr
+	}
+	if e.progressResult != nil {
+		return e.progressResult, nil
+	}
 	return &engine.ProgressResult{}, nil
+}
+
+// controlValidatingCaptureEngine mimics an engine that addresses remote work:
+// its control operations cannot proceed without persisted resume state, so its
+// validator gate rejects a control request that carries none.
+type controlValidatingCaptureEngine struct {
+	controlCaptureEngine
+}
+
+func (e *controlValidatingCaptureEngine) ValidateControlResumeState(_ engine.ControlOperation, resumeState *engine.ResumeState) error {
+	if resumeState == nil || resumeState.Metadata == "" {
+		return errors.New("no active schema change")
+	}
+	return nil
 }
 
 func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng *controlCaptureEngine) *LocalClient {
@@ -538,6 +562,10 @@ func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
 // resume state recorded for the apply. If that state is missing, the owner
 // returns an error before invoking the engine so the storage invariant
 // violation is visible.
+// An engine that addresses remote work (a deploy request) cannot deliver a
+// control operation without persisted resume state. Its validator gate must
+// reject the operation before the engine is invoked when no resume state was
+// ever persisted for the task's apply operation.
 func TestLocalClient_CutoverRequiresEngineResumeState(t *testing.T) {
 	operationID := int64(99)
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-control"}
@@ -548,12 +576,12 @@ func TestLocalClient_CutoverRequiresEngineResumeState(t *testing.T) {
 		TaskIdentifier:   "task-vitess-control",
 		State:            state.Task.WaitingForCutover,
 	}
-	eng := &controlCaptureEngine{}
+	eng := &controlValidatingCaptureEngine{}
 	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
 
 	_, err := client.cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: apply.ApplyIdentifier}, "")
 
-	require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound)
+	require.ErrorContains(t, err, "no active schema change")
 	assert.Nil(t, eng.cutoverReq, "cutover should not call the engine without resume state")
 }
 
@@ -817,6 +845,199 @@ func TestLocalClient_CancelFailedRetryableCancelsDeployRequest(t *testing.T) {
 	assert.Equal(t, state.Task.FailedRetryable, stateAtEngineCancel, "deploy request must be cancelled before the task is marked cancelled")
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
+}
+
+// newCustomTypeControlTestClient builds a client for a database type without a
+// built-in engine (registered through an engine factory in production), wired
+// to the given capture engine and optional persisted resume state.
+func newCustomTypeControlTestClient(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine) *LocalClient {
+	return &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeStrata,
+		},
+		storage: &controlTestStorage{
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: tasks},
+			applyLogs:       &controlTestApplyLogStore{},
+			applyOperations: &controlTestApplyOperationStore{data: resumeState},
+			controlRequests: &testControlRequestStore{},
+		},
+		customEngine: eng,
+		logger:       slog.Default(),
+	}
+}
+
+// A database type without a built-in engine can address remote work through
+// persisted resume state, exactly like Vitess does. The control request built
+// for its cancel must carry the stored resume state so the engine can reach
+// the work it is asked to terminate.
+func TestLocalClient_CancelCarriesStoredResumeStateForCustomEngineType(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-custom-cancel",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-custom-cancel",
+		State:            state.Task.Running,
+	}
+	resumeState := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-custom-cancel",
+		Metadata:         `{"change_id":"321"}`,
+	}
+	eng := &controlValidatingCaptureEngine{}
+	client := newCustomTypeControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, eng.cancelReq, "cancel must reach the engine for a task with live engine work")
+	require.NotNil(t, eng.cancelReq.ResumeState, "the cancel request must carry the stored resume state")
+	assert.Equal(t, "ctx-custom-cancel", eng.cancelReq.ResumeState.MigrationContext)
+	assert.JSONEq(t, `{"change_id":"321"}`, eng.cancelReq.ResumeState.Metadata)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+}
+
+// A cancel that reaches an engine with no live work for the task has nothing
+// left to stop: the engine cancel error must not surface, and the durable
+// cancel completes by terminalizing the task and apply. Surfacing the error
+// would abort the drive and re-run the same failing cancel on every claim.
+func TestLocalClient_CancelCompletesWhenEngineHasNoLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-cancel-no-live-work",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-cancel-no-live-work",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{
+		cancelErr:      engine.NewPermanentError("no active schema change to cancel"),
+		progressResult: &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.CancelledCount)
+	require.NotNil(t, eng.cancelReq, "cancel must attempt the engine before deciding it has no live work")
+	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the cancel")
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	assert.NotNil(t, apply.CompletedAt)
+}
+
+// A cancel the engine refuses while it still has live work must surface: the
+// destructive direction for cancel is leaving the work running past a recorded
+// cancel, so storage must stay active until the engine work is actually down.
+func TestLocalClient_CancelSurfacesErrorWhenEngineHasLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-cancel-live-work",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-cancel-live-work",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	cancelErr := errors.New("cancel refused")
+	eng := &controlCaptureEngine{
+		cancelErr:      cancelErr,
+		progressResult: &engine.ProgressResult{State: engine.StateRunning},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, cancelErr)
+	require.NotNil(t, eng.progressReq, "the live-work probe must run before the cancel error surfaces")
+	assert.Equal(t, state.Task.Running, task.State, "a refused cancel over live work must not terminalize the task")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// When the live-work probe itself fails, the engine's state is unknown:
+// completing the cancel could record running work as cancelled. The original
+// cancel error surfaces so the drive retries with engine state intact.
+func TestLocalClient_CancelSurfacesErrorWhenLiveWorkProbeFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-cancel-probe-error",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-cancel-probe-error",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	cancelErr := errors.New("cancel refused")
+	eng := &controlCaptureEngine{
+		cancelErr:   cancelErr,
+		progressErr: errors.New("progress unavailable"),
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, cancelErr, "the original cancel error must surface, not the probe error")
+	assert.Equal(t, state.Task.Running, task.State, "an uncertain probe must never terminalize the task")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// The live-work predicate reads the engine's own report: only an affirmative
+// nothing-is-running answer clears the probe, and every uncertain or active
+// shape counts as live work so a cancel never completes over running work.
+func TestEngineProgressShowsLiveWork(t *testing.T) {
+	assert.True(t, engineProgressShowsLiveWork(nil), "a missing probe result is uncertainty, which counts as live work")
+
+	noLiveWork := []engine.State{engine.StatePending, engine.StateStopped, engine.StateCancelled, engine.StateFailed}
+	for _, s := range noLiveWork {
+		assert.False(t, engineProgressShowsLiveWork(&engine.ProgressResult{State: s}), "state %s tracks no live work", s)
+	}
+	liveWork := []engine.State{
+		engine.StateRunning,
+		engine.StateWaitingForDeploy,
+		engine.StateWaitingForCutover,
+		engine.StateCuttingOver,
+		engine.StateRevertWindow,
+		engine.StateReverting,
+		engine.StateCompleted,
+		engine.StateReverted,
+		engine.State(""),
+	}
+	for _, s := range liveWork {
+		assert.True(t, engineProgressShowsLiveWork(&engine.ProgressResult{State: s}), "state %q must keep the cancel error surfacing", s)
+	}
 }
 
 // A task in the revert window has already cut over: the new schema is live.

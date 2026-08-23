@@ -163,9 +163,9 @@ func firstTaskWithLiveEngineWork(tasks []*storage.Task) *storage.Task {
 }
 
 // readEngineProgressForTask reads the engine's authoritative view of the change
-// the task addresses. It mirrors buildControlRequest's addressing: Vitess
-// targets are addressed through the persisted engine resume state (the deploy
-// request identifier lives there), other targets by credentials alone.
+// the task addresses. Vitess targets are addressed through the persisted engine
+// resume state (the deploy request identifier lives there), other targets by
+// credentials alone.
 func (c *LocalClient) readEngineProgressForTask(ctx context.Context, eng engine.Engine, task *storage.Task) (*engine.ProgressResult, error) {
 	creds, err := c.credentialsForTask(task)
 	if err != nil {
