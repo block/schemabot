@@ -1580,6 +1580,23 @@ func PreviewCommentApplyRetrying() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentApplyRemoteRetryablePause renders a sample comment for an
+// active apply whose data plane is retrying a failed table on its own. The
+// stored apply stays active through the pause, so the Retrying status is
+// derived from the task rows, and no attempt count is shown — the data plane's
+// attempt number does not cross the wire.
+func PreviewCommentApplyRemoteRetryablePause() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
+}
+
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.
 func PreviewCommentApplyStopped() string {
 	tables := sampleApplyTables()[:2]

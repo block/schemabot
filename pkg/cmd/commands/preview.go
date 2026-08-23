@@ -95,6 +95,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyFailed,
 		templates.PreviewCommentApplyFailedBeforeRowCopy,
 		templates.PreviewCommentApplyRetrying,
+		templates.PreviewCommentApplyRemoteRetryablePause,
 		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
@@ -279,6 +280,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
   comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
   comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
+  comment_apply_remote_retryable_pause Multi-table: active apply paused by a data-plane retry (no attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
   comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)

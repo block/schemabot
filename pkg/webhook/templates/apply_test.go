@@ -1187,6 +1187,44 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.NotContains(t, result, "schemabot apply -e staging")
 }
 
+// A remote data plane retries its failures on its own: the stored apply stays
+// active through the pause, so only the task rows carry it. The comment must
+// still read as Retrying — status line, table detail, and retry footer — but
+// without an attempt count, because the data plane's attempt number does not
+// cross the wire and the stored redispatch count is not it.
+func TestRenderApplyStatusComment_RemoteRetryablePauseDerivesRetryingFromTasks(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Running,
+		Engine:      "Spirit",
+		ApplyID:     "apply-abc123",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
+			{
+				TableName:       "users",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:          state.Task.FailedRetryable,
+				PercentComplete: 35,
+				ErrorMessage:    "failed to execute chunklet insert: Error 1041 (HY000): Out of memory",
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**Status**: Retrying")
+	assert.NotContains(t, result, "**Status**: In Progress")
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically\n")
+	assert.NotContains(t, result, "(attempt")
+	assert.Contains(t, result, "> ⚠️ Last error: failed to execute chunklet insert: Error 1041 (HY000): Out of memory")
+	assert.Contains(t, result, "1 retrying")
+	assert.Contains(t, result, "SchemaBot retries automatically and marks it failed if retries are exhausted")
+	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
+	assert.NotContains(t, result, "To stop this schema change:")
+}
+
 // A retryable apply that has already been redispatched shows how much of the
 // operator retry budget the next attempt consumes, so a watcher can tell a
 // transient blip (attempt 2/10) from an apply that is about to exhaust its

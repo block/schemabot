@@ -147,6 +147,7 @@ const (
 	PreviewCommentApplyFailed                  PreviewType = "comment_apply_failed"                    // Apply failed (1 done, 1 failed, 1 cancelled)
 	PreviewCommentApplyFailedBeforeRowCopy     PreviewType = "comment_apply_failed_before_row_copy"    // Apply failed before row copy (preflight rejection, per-table error)
 	PreviewCommentApplyRetrying                PreviewType = "comment_apply_retrying"                  // Apply interrupted, retrying automatically (attempt counter)
+	PreviewCommentApplyRemoteRetryablePause    PreviewType = "comment_apply_remote_retryable_pause"    // Active apply paused by a data-plane retry (Retrying derived from task rows, no attempt counter)
 	PreviewCommentApplyStopped                 PreviewType = "comment_apply_stopped"                   // Apply stopped (1 done, 1 stopped)
 	PreviewCommentApplyWaitingCutover          PreviewType = "comment_apply_waiting_cutover"           // Waiting for cutover (deferred, operator triggers)
 	PreviewCommentApplyWaitingCutoverAutomatic PreviewType = "comment_apply_waiting_cutover_automatic" // Waiting for cutover (non-deferred, drive triggers)
