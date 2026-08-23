@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +21,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const k8sNamespace = "schemabot-e2e"
+// k8sNamespace is the namespace holding the stack under test. The runner
+// script derives a per-run namespace so concurrent suites on one cluster
+// deploy isolated stacks, and hands it to the tests here; the fixed default
+// covers running the tests by hand against a manually deployed stack.
+var k8sNamespace = func() string {
+	if ns := os.Getenv("E2E_K8S_NAMESPACE"); ns != "" {
+		return ns
+	}
+	return "schemabot-e2e"
+}()
 
 func runKubectl(t *testing.T, args ...string) string {
 	t.Helper()
@@ -185,19 +196,79 @@ func freeLocalPort(t *testing.T) int {
 	return addr.Port
 }
 
+var (
+	controlPlaneEndpointMu     sync.Mutex
+	cachedControlPlaneEndpoint string
+)
+
+// controlPlaneEndpoint returns a health-checked HTTP endpoint for the base
+// stack's control plane. It starts from the suite-wide E2E_SCHEMABOT_URL
+// port-forward and lazily replaces it with a fresh forward to
+// svc/control-plane-schemabot when the current endpoint stops answering
+// /health — a test that crashes the control-plane pod kills whichever forward
+// was serving the endpoint, and every later test must self-heal rather than
+// inherit the dead forward. The etre/vitess resolver suites deploy
+// differently-named control-plane services, so their tests read
+// testutil.Endpoint directly instead of using this helper.
+func controlPlaneEndpoint(t *testing.T) string {
+	t.Helper()
+	controlPlaneEndpointMu.Lock()
+	defer controlPlaneEndpointMu.Unlock()
+
+	if cachedControlPlaneEndpoint == "" {
+		cachedControlPlaneEndpoint = testutil.Endpoint(t)
+	}
+	if controlPlaneHealthy(t, cachedControlPlaneEndpoint) {
+		return cachedControlPlaneEndpoint
+	}
+
+	t.Logf("control-plane endpoint %s is not answering /health; starting a fresh port-forward", cachedControlPlaneEndpoint)
+	cachedControlPlaneEndpoint = startControlPlanePortForward(t)
+	return cachedControlPlaneEndpoint
+}
+
+// controlPlaneHealthy reports whether the endpoint answers /health with 200.
+// A single failed probe is treated as an unhealthy endpoint: the caller
+// replaces the forward, which is safe to do even on a transient failure.
+func controlPlaneHealthy(t *testing.T, endpoint string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/health", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Logf("control-plane health probe for %s failed: %v", endpoint, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("control-plane health probe for %s returned status %d", endpoint, resp.StatusCode)
+		return false
+	}
+	return true
+}
+
+// startControlPlanePortForward forwards a free local port to the base stack's
+// control-plane service and waits for it to answer /health. The forward is
+// deliberately not tied to the calling test's lifecycle: controlPlaneEndpoint
+// caches it as the shared suite endpoint, so killing it when the creating test
+// finishes would strand every later test. The kubectl process exits on its own
+// when its pinned pod goes away (another control-plane crash, or the suite
+// teardown deleting the namespace) — controlPlaneEndpoint then detects the
+// dead endpoint and forwards again.
 func startControlPlanePortForward(t *testing.T) string {
 	t.Helper()
 	port := freeLocalPort(t)
-	ctx, cancel := context.WithCancel(context.WithoutCancel(t.Context()))
-	cmd := exec.CommandContext(ctx, "kubectl", "port-forward", "-n", k8sNamespace, "svc/control-plane-schemabot", fmt.Sprintf("%d:8080", port))
+	// WithoutCancel detaches the process from the creating test's lifetime —
+	// the forward must keep serving after that test finishes.
+	cmd := exec.CommandContext(context.WithoutCancel(t.Context()), "kubectl", "port-forward", "-n", k8sNamespace, "svc/control-plane-schemabot", fmt.Sprintf("%d:8080", port))
 	require.NoError(t, cmd.Start())
-	t.Cleanup(func() {
-		cancel()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_ = cmd.Wait()
-	})
+	// Reap the kubectl process whenever it exits so a dead forward does not
+	// linger as a zombie for the rest of the test binary. Its exit error is
+	// expected (the pinned pod went away) and outlives the creating test, so
+	// there is no test to report it to.
+	go func() { _ = cmd.Wait() }()
 
 	endpoint := fmt.Sprintf("http://localhost:%d", port)
 	waitForHTTPStatus(t, endpoint+"/health", http.StatusOK, testutil.PollDeadline)
