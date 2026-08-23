@@ -81,14 +81,14 @@ func TestPlanChangeSummary(t *testing.T) {
 		{
 			name:    "single change",
 			summary: &apitypes.PlanSummaryResponse{ChangeCounts: map[string]int{"alter": 1}},
-			want:    "1 change: 1 alter",
+			want:    "1 alter",
 		},
 		{
 			name: "mixed operations in lifecycle order",
 			summary: &apitypes.PlanSummaryResponse{
 				ChangeCounts: map[string]int{"drop": 1, "create": 1, "alter": 2, "create_index": 1},
 			},
-			want: "5 changes: 1 create, 2 alter, 1 drop, 1 create_index",
+			want: "1 create, 2 alter, 1 drop, 1 create_index",
 		},
 		{
 			name: "unsafe and blocked flagged",
@@ -97,7 +97,7 @@ func TestPlanChangeSummary(t *testing.T) {
 				UnsafeCount:  1,
 				BlockedCount: 2,
 			},
-			want: "3 changes: 3 alter · ⚠️ 1 unsafe · ⛔ 2 blocked",
+			want: "3 alter · ⚠️ 1 unsafe · ⛔ 2 blocked",
 		},
 		{
 			name:    "vschema-only plan is not a no-change plan",

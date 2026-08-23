@@ -149,17 +149,16 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 		return "no changes"
 	}
 
+	// The per-operation breakdown carries the total implicitly, so no "N
+	// changes" head repeats it — the summary competes for row width with
+	// every other column.
 	var parts []string
 	if total > 0 {
-		head := fmt.Sprintf("%d change", total)
-		if total != 1 {
-			head += "s"
-		}
 		var ops []string
 		for _, op := range orderedChangeOperations(p.ChangeCounts) {
 			ops = append(ops, fmt.Sprintf("%d %s", p.ChangeCounts[op], op))
 		}
-		parts = append(parts, head+": "+strings.Join(ops, ", "))
+		parts = append(parts, strings.Join(ops, ", "))
 	}
 	if p.VSchemaChangeCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))

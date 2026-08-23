@@ -21,7 +21,7 @@ func previewPlansListOutput() {
 				// the PR, falling back to the full URL off a terminal.
 				Source:    ui.Link("acme/shop#412", "https://github.com/acme/shop/pull/412"),
 				CreatedAt: previewTime.Add(-10 * time.Minute),
-				Changes:   "3 changes: 1 create, 2 alter · ⚠️ 1 unsafe",
+				Changes:   "1 create, 2 alter · ⚠️ 1 unsafe",
 			},
 			{
 				PlanID:      "plan-1700000000000000002",
@@ -29,7 +29,7 @@ func previewPlansListOutput() {
 				Environment: "production",
 				Source:      ui.Link("acme/shop#410", "https://github.com/acme/shop/pull/410"),
 				CreatedAt:   previewTime.Add(-2 * time.Hour),
-				Changes:     "1 change: 1 alter",
+				Changes:     "1 alter",
 			},
 			{
 				PlanID:      "plan-1700000000000000001",

@@ -23,7 +23,7 @@ type PlanSummaryData struct {
 	Source    string
 	CreatedAt time.Time
 	// Changes is the rendered change summary, such as
-	// "3 changes: 1 create, 2 alter · 1 unsafe".
+	// "1 create, 2 alter · 1 unsafe".
 	Changes string
 }
 

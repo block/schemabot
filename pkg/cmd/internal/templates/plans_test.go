@@ -27,7 +27,7 @@ func TestWritePlansListColumnOrder(t *testing.T) {
 					Environment: "staging",
 					Source:      "https://github.com/acme/shop/pull/412",
 					CreatedAt:   time.Now().Add(-10 * time.Minute),
-					Changes:     "3 changes: 1 create, 2 alter · ⚠️ 1 unsafe",
+					Changes:     "1 create, 2 alter · ⚠️ 1 unsafe",
 				},
 				{
 					PlanID:      "plan-1700000000000000001",
@@ -35,7 +35,7 @@ func TestWritePlansListColumnOrder(t *testing.T) {
 					Environment: "production",
 					Source:      "ad-hoc",
 					CreatedAt:   time.Now().Add(-2 * time.Hour),
-					Changes:     "1 change: 1 alter",
+					Changes:     "1 alter",
 				},
 			},
 		})
@@ -85,7 +85,7 @@ func TestWritePlansListAlignsChangeSummaries(t *testing.T) {
 					Environment: "staging",
 					Source:      "https://github.com/acme/shop/pull/412",
 					CreatedAt:   created,
-					Changes:     "3 changes: 3 alter · ⚠️ 1 unsafe",
+					Changes:     "3 alter · ⚠️ 1 unsafe",
 				},
 				{
 					PlanID:      "plan-1700000000000000001",
@@ -93,7 +93,7 @@ func TestWritePlansListAlignsChangeSummaries(t *testing.T) {
 					Environment: "staging",
 					Source:      "ad-hoc",
 					CreatedAt:   created,
-					Changes:     "1 change: 1 alter",
+					Changes:     "1 alter",
 				},
 			},
 		})
