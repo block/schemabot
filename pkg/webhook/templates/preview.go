@@ -217,6 +217,71 @@ func PreviewCommentPlanNoChanges() string {
 	})
 }
 
+// PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
+// rollup confirmed the reviewed plan on every deployment (uniform clean line).
+func PreviewCommentPlanDriftClean() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "production",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match"},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
+// rollup found deployments that no longer match the reviewed plan: a
+// per-deployment breakdown naming the matching, diverged, and errored targets.
+func PreviewCommentPlanDriftDetected() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "production",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the reviewed plan"},
+				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
+// drift rollup could not be computed, so the plan check fails closed.
+func PreviewCommentPlanDriftUnverified() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:        "testapp",
+		SchemaName:      "testapp",
+		Environment:     "production",
+		HeadSHA:         previewHeadSHA,
+		Repository:      previewRepository,
+		RequestedBy:     previewRequestedBy,
+		IsMySQL:         true,
+		Changes:         samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{Computed: false},
+	})
+}
+
 // PreviewCommentNoManagedSchemaChanges renders the safe empty-diff comment when
 // SchemaBot has no apply-owned state for the PR.
 func PreviewCommentNoManagedSchemaChanges() string {
@@ -1513,6 +1578,23 @@ func PreviewCommentApplyRetrying() string {
 	data := sampleApplyData(state.Apply.FailedRetryable, tables)
 	data.Attempt = 1
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyRemoteRetryablePause renders a sample comment for an
+// active apply whose data plane is retrying a failed table on its own. The
+// stored apply stays active through the pause, so the Retrying status is
+// derived from the task rows, and no attempt count is shown — the data plane's
+// attempt number does not cross the wire.
+func PreviewCommentApplyRemoteRetryablePause() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.

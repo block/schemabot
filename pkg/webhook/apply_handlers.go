@@ -37,6 +37,11 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 //     terminal only when handleSchemaRequestError recognizes it as a
 //     user-facing rejection; an unexpected failure there (for example a
 //     transient GitHub config read) stays retryable.
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure inside the bootstrap): the
+//     delivery must not be re-driven, but the command never ran and no PR
+//     comment could be posted, so the error is recorded on the delivery as
+//     its only triage trail rather than marking it completed.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -57,6 +62,19 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
+		// A GitHub App resolution failure inside the bootstrap is deterministic
+		// per deployment config, so a re-drive reproduces it; recovery is an
+		// operator fixing the App mapping and the user re-issuing the command.
+		// The command never ran and no PR comment could be posted, so the
+		// error is returned (with retry=false) to record the failure on the
+		// delivery instead of marking it completed. Other bootstrap failures
+		// (an installation token fetch, for example) are transient and stay
+		// retryable.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("apply blocked: cannot resolve GitHub App client for repo",
+				"repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
+			return false, fmt.Errorf("apply command bootstrap %s#%d: %w", repo, pr, err)
+		}
 		h.logger.Error("apply: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return true, fmt.Errorf("apply command bootstrap %s#%d: %w", repo, pr, err)
 	}
@@ -349,9 +367,12 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return true, fmt.Errorf("apply command acquire lock %s#%d: %w", repo, pr, err)
 	}
 
-	// Build plan comment data with lock info. The attributed-change disclosure sits
-	// on this comment for the same reason as the direct-execution one: it must
-	// be on the comment the confirmation acts on.
+	// Build plan comment data with lock info. Attributed changes are annotated
+	// here so that a downgrade to manual confirmation below discloses them on
+	// the comment apply-confirm acts on; the template omits them when the
+	// apply proceeds automatically and the unsafe opt-in already solicited
+	// consent for every attributed table, where the re-plan choice the
+	// disclosure coaches is no longer open.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
@@ -456,6 +477,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     only when handleSchemaRequestError recognizes it as a user-facing
 //     rejection; an unexpected failure there (for example a transient GitHub
 //     config read) stays retryable.
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure inside the bootstrap): the
+//     delivery must not be re-driven, but the command never ran and no PR
+//     comment could be posted, so the error is recorded on the delivery as
+//     its only triage trail rather than marking it completed.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -479,6 +505,19 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
+		// A GitHub App resolution failure inside the bootstrap is deterministic
+		// per deployment config, so a re-drive reproduces it; recovery is an
+		// operator fixing the App mapping and the user re-issuing the command.
+		// The command never ran and no PR comment could be posted, so the
+		// error is returned (with retry=false) to record the failure on the
+		// delivery instead of marking it completed. Other bootstrap failures
+		// (an installation token fetch, for example) are transient and stay
+		// retryable.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("apply-confirm blocked: cannot resolve GitHub App client for repo",
+				"repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
+			return false, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
+		}
 		h.logger.Error("apply-confirm: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return true, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
 	}
@@ -712,6 +751,12 @@ func isUnlockRejection(err error) bool {
 //     locks found, an authorization block on the merits, an active apply
 //     still protecting the lock, or a command that predates every lock it
 //     matched).
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure during database inference or
+//     the authorization client): the delivery must not be re-driven, but no
+//     PR comment could be posted without a client, so the error is recorded
+//     on the delivery as its only triage trail rather than marking it
+//     completed.
 //
 // issuedAt bounds the release targets: a lock acquired after issuedAt is
 // never released. On the durable path issuedAt is the delivery's received-at,
@@ -758,6 +803,15 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			if isUnlockRejection(err) {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
 				return false, nil
+			}
+			// A GitHub App resolution failure is deterministic per deployment
+			// config, so a re-drive reproduces it; recovery is an operator
+			// fixing the App mapping and the user re-issuing the command. No
+			// PR comment could be posted without a client, so the error is
+			// returned (with retry=false) to record the failure on the
+			// delivery instead of marking it completed.
+			if errors.Is(err, errGitHubAppResolution) {
+				return false, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 			}
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
@@ -827,12 +881,18 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// admin/operator for each affected database before any lock is released.
 	// Locks are not environment-scoped, so authorization is enforced per
 	// database without an environment.
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, locks[0].DatabaseName, "", action.Unlock)
-	if blocked {
+	client, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, locks[0].DatabaseName, "", action.Unlock)
+	if err != nil {
 		// The gate has already logged the client-creation failure and posted
-		// the authorization-unavailable comment; it fails closed for this
-		// delivery, but a fresh client may succeed on a later attempt.
-		return true, fmt.Errorf("unlock command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
+		// its best-effort authorization-unavailable comment; it fails closed
+		// for this delivery. A GitHub App resolution failure is deterministic
+		// per deployment config, so a re-drive reproduces it and the error is
+		// recorded on the delivery instead; any other cause (an installation
+		// token fetch, for example) may clear on a later attempt.
+		if errors.Is(err, errGitHubAppResolution) {
+			return false, fmt.Errorf("unlock command actor authorization client %s#%d: %w", repo, pr, err)
+		}
+		return true, fmt.Errorf("unlock command actor authorization client %s#%d: %w", repo, pr, err)
 	}
 	for _, lock := range locks {
 		blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock, result.SuppressRetryComments)

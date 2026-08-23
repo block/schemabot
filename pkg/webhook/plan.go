@@ -134,10 +134,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
+	commentData.DeploymentDrift = driftPreview
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
@@ -195,8 +196,12 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 			"repo", repo, "pr", pr, "database", databaseName)
 		return false
 	}
-	authzClient, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, databaseName, environment, action.Plan)
-	if blocked {
+	authzClient, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, databaseName, environment, action.Plan)
+	if err != nil {
+		// The plan handler is not a durable core, so there is no driver to
+		// classify the cause; the gate has already logged the failure and
+		// posted the authorization-unavailable comment, and the plan is
+		// blocked (fail closed).
 		return true
 	}
 	if authzClient == nil {
@@ -412,7 +417,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -436,6 +441,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
+		commentData.DeploymentDrift = driftPreview
 		multiEnvData.Plans[env] = &commentData
 	}
 
@@ -480,8 +486,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"environments", len(driftBlockUnstored))
 	}
 
-	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)
-	// Check runs are still created above so PR status shows green
+	// Auto-plan: skip the comment only when there is genuinely nothing to show —
+	// no changes, no errors, and no deployment drift. A drifted or unverifiable
+	// deployment fails the check closed even when every primary plan is a clean
+	// no-op, so the comment must still post to explain why the check is red;
+	// skipping it would leave a red check with no visible reason on the PR.
 	if isAutoPlan {
 		hasErrors := len(multiEnvData.Errors) > 0
 		anyChanges := false
@@ -491,11 +500,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				break
 			}
 		}
-		if !anyChanges && !hasErrors {
+		if !anyChanges && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) {
 			// The no-changes outcome supersedes older plan comments just as a
 			// new plan comment would: a prior head's comment still advertises
 			// pending DDL and an apply prompt that no longer match the branch.
-			h.logger.Info("auto-plan: no changes detected; skipping comment and minimizing plan comments from prior heads",
+			h.logger.Info("auto-plan: no changes, errors, or drift detected; skipping comment and minimizing plan comments from prior heads",
 				"repo", repo, "pr", pr, "database", multiEnvData.Database,
 				"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
 			h.minimizeStalePlanComments(ctx, client, repo, pr,

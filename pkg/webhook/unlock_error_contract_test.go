@@ -69,6 +69,62 @@ func serveConfiglessRepo(t *testing.T, mux *http.ServeMux) {
 	})
 }
 
+// A GitHub App resolution failure is deterministic per deployment config —
+// the same repo resolves to the same missing App on every attempt — so the
+// core must report it as terminal rather than re-driving a delivery that can
+// only fail until an operator fixes the config. No PR comment could be posted
+// without a client, so the core also returns the error: the delivery is
+// recorded as failed (its only triage trail) rather than completed.
+func TestUnlockCommandCoreAppResolutionFailureIsTerminal(t *testing.T) {
+	t.Run("database inference cannot resolve an App", func(t *testing.T) {
+		h := &Handler{
+			ghClients: ghclient.NewClientSet(nil),
+			logger:    testLogger(),
+		}
+
+		retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser",
+			CommandResult{Action: action.Unlock, Force: true})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errGitHubAppResolution)
+		assert.False(t, retry, "a deterministic GitHub App resolution failure must not be re-driven; recovery is fixing the deployment config")
+	})
+
+	t.Run("authorization client cannot resolve an App", func(t *testing.T) {
+		lockStore := &unlockTestLockStore{locks: []*storage.Lock{prOwnedOrdersLock()}}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := actorAuthClientSetTestHandler(t, st, ghclient.NewSingleClientSet("unrelated-app", &fakeClientFactory{}))
+
+		retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser",
+			CommandResult{Action: action.Unlock})
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errGitHubAppResolution)
+		assert.False(t, retry, "a deterministic GitHub App resolution failure must not be re-driven; recovery is fixing the deployment config")
+		assert.Zero(t, lockStore.releaseCalls, "no lock may be released when the authorization gate cannot run")
+	})
+}
+
+// The authorization client is created per delivery, so a transient
+// client-creation failure (an installation token fetch, for example) may
+// clear on a later attempt: the core must report it as retryable with a
+// non-nil error while still releasing nothing.
+func TestUnlockCommandCoreAuthorizationClientTransientFailureIsRetryable(t *testing.T) {
+	lockStore := &unlockTestLockStore{locks: []*storage.Lock{prOwnedOrdersLock()}}
+	st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+	h := actorAuthClientSetTestHandler(t, st, ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{
+		forInstallationErr: errors.New("installation token unavailable"),
+	}))
+
+	retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser",
+		CommandResult{Action: action.Unlock})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, errGitHubAppResolution)
+	assert.True(t, retry, "a transient authorization client-creation failure must stay retryable for a durable driver")
+	assert.Zero(t, lockStore.releaseCalls, "no lock may be released when the authorization gate cannot run")
+}
+
 // Transient infrastructure failures — a GitHub read during database inference,
 // a storage lock lookup, the active-apply verification, or a lock release —
 // are failures the same delivery could clear on a later attempt, so the core

@@ -43,6 +43,7 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 	if len(tables) == 0 {
 		return
 	}
+	gated := unsafeGateTables(planResp)
 	for _, table := range tables {
 		ref := storage.TableRef{
 			Database:     data.Database,
@@ -52,9 +53,23 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 		}
 		change, annotate := h.classifyDestructiveChange(ctx, client, ref, repo, pr, table)
 		if annotate {
+			_, consentSolicited := gated[table]
+			change.OutsideUnsafeGate = !consentSolicited
 			data.AttributedChanges = append(data.AttributedChanges, change)
 		}
 	}
+}
+
+// unsafeGateTables returns the tables the --allow-unsafe opt-in gate reads:
+// the namespace-level unsafe changes. A destructive change confined to
+// individual shards is not among them, so applying never solicits consent
+// for it — the attribution disclosure is then the operator's only notice.
+func unsafeGateTables(planResp *apitypes.PlanResponse) map[string]struct{} {
+	gated := map[string]struct{}{}
+	for _, unsafe := range planResp.UnsafeChanges() {
+		gated[unsafe.Table] = struct{}{}
+	}
+	return gated
 }
 
 // classifyDestructiveChange decides whether one table's destructive change must
@@ -64,7 +79,7 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclient.InstallationClient, ref storage.TableRef, repo string, pr int, table string) (change templates.AttributedChangeData, annotate bool) {
 	owners, err := h.service.Storage().Tasks().FindTableOwners(ctx, ref)
 	if err != nil {
-		h.logger.Error("planned destructive change will be annotated as unresolved: table-ownership lookup failed",
+		h.logger.Error("planned destructive change's ownership is unresolved: table-ownership lookup failed",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table, "error", err)
 		metrics.RecordPlanChangeOwnership(ctx, repo, ref.Database, ref.Environment, "storage_error")
@@ -81,7 +96,7 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 		checked++
 		info, err := client.FetchPullRequest(ctx, owner.Repository, owner.PullRequest)
 		if err != nil {
-			h.logger.Error("planned destructive change will be annotated as unresolved: owning pull request's state could not be read",
+			h.logger.Error("planned destructive change's ownership is unresolved: owning pull request's state could not be read",
 				"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 				"environment", ref.Environment, "table", table,
 				"owner_repo", owner.Repository, "owner_pr", owner.PullRequest, "error", err)
@@ -95,7 +110,7 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 				"owner_merged", info.Merged)
 			continue
 		}
-		h.logger.Warn("planned destructive change will be annotated: an open pull request last changed this table",
+		h.logger.Warn("planned destructive change is attributed to another open pull request: it last changed this table",
 			"repo", repo, "pr", pr, "database", ref.Database, "database_type", ref.DatabaseType,
 			"environment", ref.Environment, "table", table,
 			"owner_repo", owner.Repository, "owner_pr", owner.PullRequest)

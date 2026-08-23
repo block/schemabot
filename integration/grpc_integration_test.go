@@ -626,10 +626,43 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	applyID, ok := applyResp["apply_id"].(string)
 	require.True(t, ok && applyID != "", "apply response missing apply_id: %v", applyResp)
 
-	// Step 3: Wait for the apply to fail on the duplicate rows. The engine
-	// classifies this failure retryable, so the remote re-runs it until the
-	// recovery budget is spent; the deadline covers that whole bounded sequence,
-	// not a single engine run.
+	// The engine classifies the duplicate-row failure retryable, so the remote
+	// operator would re-run the whole engine attempt until the recovery budget
+	// is spent, and the control plane correctly keeps polling through those
+	// pauses — a bounded sequence of full engine runs far longer than a test
+	// deadline should cover. Spend the budget on the remote apply row up front
+	// so the first retryable failure goes through the real expiry pass
+	// immediately, settling the remote apply and its tasks to the same terminal
+	// states exhaustion would reach, with the engine error intact.
+	ternDB, err := sql.Open("mysql", ternStorageDSN)
+	require.NoError(t, err, "open tern storage db")
+	t.Cleanup(func() { utils.CloseAndLog(ternDB) })
+	require.NoError(t, ternDB.PingContext(ctx), "ping tern storage db")
+	var remoteApplyID string
+	testutil.Poll(t, 10*time.Second, 50*time.Millisecond,
+		func() bool {
+			stored, getErr := schemabotStorage.Applies().GetByApplyIdentifier(ctx, applyID)
+			require.NoError(t, getErr, "get apply by identifier")
+			if stored == nil {
+				return false
+			}
+			remoteApplyID = stored.ExternalID
+			return remoteApplyID != ""
+		},
+		func() string { return "apply never recorded a remote apply id" },
+	)
+	spendResult, err := ternDB.ExecContext(ctx,
+		"UPDATE applies SET attempt = ? WHERE apply_identifier = ?",
+		storage.MaxRecoveryAttempts, remoteApplyID)
+	require.NoError(t, err, "spend the remote apply's recovery budget")
+	spent, err := spendResult.RowsAffected()
+	require.NoError(t, err, "read spent recovery budget rows")
+	require.EqualValues(t, 1, spent, "expected to spend the recovery budget on remote apply %s", remoteApplyID)
+
+	// Step 3: Wait for the apply to fail on the duplicate rows. With the
+	// recovery budget spent, the first retryable failure expires to permanent
+	// failed instead of entering the recovery loop, so the deadline covers a
+	// single engine run plus the expiry pass.
 	waitForState(t, "http://"+schemabotAddr, applyID, "failed", 30*time.Second)
 
 	// Step 4: Wait for the local apply record to be updated by pollForCompletion.
