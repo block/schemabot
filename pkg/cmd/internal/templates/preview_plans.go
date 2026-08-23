@@ -13,6 +13,15 @@ func previewPlansListOutput() {
 		HasMore:  true,
 		Plans: []PlanSummaryData{
 			{
+				PlanID:       "plan-1700000000000000004",
+				Database:     "billing-db",
+				Environment:  "production",
+				Source:       ui.Link("acme/billing#77", "https://github.com/acme/billing/pull/77"),
+				CreatedAt:    previewTime.Add(-5 * time.Minute),
+				Changes:      "1 alter · ⛔",
+				BlockedCount: 1,
+			},
+			{
 				PlanID:      "plan-1700000000000000003",
 				Database:    "orders-db",
 				Environment: "staging",
