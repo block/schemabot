@@ -97,7 +97,7 @@ func TestPlanChangeSummary(t *testing.T) {
 				UnsafeCount:  1,
 				BlockedCount: 2,
 			},
-			want: "3 alter · ⚠️ 1 unsafe · ⛔ 2 blocked",
+			want: "3 alter · ⚠️ · ⛔ 2",
 		},
 		{
 			name:    "vschema-only plan is not a no-change plan",

@@ -23,8 +23,13 @@ type PlanSummaryData struct {
 	Source    string
 	CreatedAt time.Time
 	// Changes is the rendered change summary, such as
-	// "1 create, 2 alter · 1 unsafe".
+	// "1 create, 2 alter · ⚠️".
 	Changes string
+	// UnsafeCount and BlockedCount say which safety markers the change
+	// summary carries, so the table can print a legend naming exactly the
+	// markers on display and nothing when the listing is clean.
+	UnsafeCount  int
+	BlockedCount int
 }
 
 // PlansListData drives WritePlansList.
@@ -87,10 +92,32 @@ func WritePlansList(data PlansListData) {
 			maxCreated, ui.FormatTimeAgo(p.CreatedAt),
 			p.Source)
 	}
+	if legend := changesLegend(data.Plans); legend != "" {
+		fmt.Printf("\n  %s%s%s\n", ANSIDim, legend, ANSIReset)
+	}
 	if data.HasMore {
 		fmt.Printf("\n  %sShowing %d plans; more available — raise --limit (max %d) or narrow with filters%s\n",
 			ANSIDim, len(data.Plans), data.MaxLimit, ANSIReset)
 	}
+}
+
+// changesLegend names the safety markers appearing in the listed plans'
+// change summaries, so a marker is never a symbol the operator has to guess
+// at. A listing without markers prints no legend at all.
+func changesLegend(plans []PlanSummaryData) string {
+	var hasUnsafe, hasBlocked bool
+	for _, p := range plans {
+		hasUnsafe = hasUnsafe || p.UnsafeCount > 0
+		hasBlocked = hasBlocked || p.BlockedCount > 0
+	}
+	var parts []string
+	if hasUnsafe {
+		parts = append(parts, "⚠️ unsafe change")
+	}
+	if hasBlocked {
+		parts = append(parts, "⛔ blocked change")
+	}
+	return strings.Join(parts, " · ")
 }
 
 func plansWindowSuffix(data PlansListData) string {

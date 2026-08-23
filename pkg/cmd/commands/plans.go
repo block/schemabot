@@ -71,12 +71,14 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 	rows := make([]templates.PlanSummaryData, 0, len(result.Plans))
 	for _, p := range result.Plans {
 		rows = append(rows, templates.PlanSummaryData{
-			PlanID:      p.PlanID,
-			Database:    p.Database,
-			Environment: p.Environment,
-			Source:      planSource(p),
-			CreatedAt:   p.CreatedAt,
-			Changes:     planChangeSummary(p),
+			PlanID:       p.PlanID,
+			Database:     p.Database,
+			Environment:  p.Environment,
+			Source:       planSource(p),
+			CreatedAt:    p.CreatedAt,
+			Changes:      planChangeSummary(p),
+			UnsafeCount:  p.UnsafeCount,
+			BlockedCount: p.BlockedCount,
 		})
 	}
 	templates.WritePlansList(templates.PlansListData{
@@ -138,8 +140,8 @@ func planSource(p *apitypes.PlanSummaryResponse) string {
 	return "ad-hoc"
 }
 
-// planChangeSummary renders a stored plan's change counts as one line, such as
-// "3 changes: 1 create, 2 alter · 1 unsafe".
+// planChangeSummary renders a stored plan's change counts as one line, such
+// as "1 create, 2 alter · ⚠️".
 func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 	total := 0
 	for _, count := range p.ChangeCounts {
@@ -164,12 +166,22 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))
 	}
 	if p.UnsafeCount > 0 {
-		parts = append(parts, fmt.Sprintf("⚠️ %d unsafe", p.UnsafeCount))
+		parts = append(parts, markerWithCount("⚠️", p.UnsafeCount))
 	}
 	if p.BlockedCount > 0 {
-		parts = append(parts, fmt.Sprintf("⛔ %d blocked", p.BlockedCount))
+		parts = append(parts, markerWithCount("⛔", p.BlockedCount))
 	}
 	return strings.Join(parts, " · ")
+}
+
+// markerWithCount renders a safety marker, carrying its count only when more
+// than one change is flagged: the single-violation case reads from the marker
+// alone, and the legend under the table names what each marker flags.
+func markerWithCount(marker string, count int) string {
+	if count == 1 {
+		return marker
+	}
+	return fmt.Sprintf("%s %d", marker, count)
 }
 
 // orderedChangeOperations returns the plan's change operations with the

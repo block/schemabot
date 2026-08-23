@@ -27,7 +27,8 @@ func TestWritePlansListColumnOrder(t *testing.T) {
 					Environment: "staging",
 					Source:      "https://github.com/acme/shop/pull/412",
 					CreatedAt:   time.Now().Add(-10 * time.Minute),
-					Changes:     "1 create, 2 alter · ⚠️ 1 unsafe",
+					Changes:     "1 create, 2 alter · ⚠️",
+					UnsafeCount: 1,
 				},
 				{
 					PlanID:      "plan-1700000000000000001",
@@ -67,6 +68,43 @@ func setNow(t *testing.T, now time.Time) {
 	t.Cleanup(func() { ui.NowFunc = prev })
 }
 
+// A safety marker in a change summary is explained by a legend under the
+// table naming exactly the markers on display; a listing without markers
+// prints no legend at all.
+func TestWritePlansListLegendNamesOnlyPresentMarkers(t *testing.T) {
+	now := time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC)
+	setNow(t, now)
+	plan := func(changes string, unsafe, blocked int) PlanSummaryData {
+		return PlanSummaryData{
+			PlanID:       "plan-1700000000000000001",
+			Database:     "orders-db",
+			Environment:  "staging",
+			Source:       "ad-hoc",
+			CreatedAt:    now.Add(-10 * time.Minute),
+			Changes:      changes,
+			UnsafeCount:  unsafe,
+			BlockedCount: blocked,
+		}
+	}
+
+	unsafeOnly := captureStdout(t, func() {
+		WritePlansList(PlansListData{Limit: 20, MaxLimit: 200, Plans: []PlanSummaryData{plan("1 drop · ⚠️", 1, 0)}})
+	})
+	assert.Contains(t, unsafeOnly, "⚠️ unsafe change")
+	assert.NotContains(t, unsafeOnly, "⛔ blocked change")
+
+	both := captureStdout(t, func() {
+		WritePlansList(PlansListData{Limit: 20, MaxLimit: 200, Plans: []PlanSummaryData{plan("1 drop · ⚠️ · ⛔ 2", 1, 2)}})
+	})
+	assert.Contains(t, both, "⚠️ unsafe change · ⛔ blocked change")
+
+	clean := captureStdout(t, func() {
+		WritePlansList(PlansListData{Limit: 20, MaxLimit: 200, Plans: []PlanSummaryData{plan("1 alter", 0, 0)}})
+	})
+	assert.NotContains(t, clean, "unsafe change")
+	assert.NotContains(t, clean, "blocked change")
+}
+
 // The change summary can carry multi-byte unsafe/blocked markers, so the
 // columns after it must align by visible width across rows with and without
 // them.
@@ -85,7 +123,8 @@ func TestWritePlansListAlignsChangeSummaries(t *testing.T) {
 					Environment: "staging",
 					Source:      "https://github.com/acme/shop/pull/412",
 					CreatedAt:   created,
-					Changes:     "3 alter · ⚠️ 1 unsafe",
+					Changes:     "3 alter · ⚠️",
+					UnsafeCount: 1,
 				},
 				{
 					PlanID:      "plan-1700000000000000001",
