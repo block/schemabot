@@ -125,4 +125,26 @@ func TestVisibleWidth(t *testing.T) {
 	t.Run("SGR color codes are zero width", func(t *testing.T) {
 		assert.Equal(t, 7, VisibleWidth("\x1b[32mRunning\x1b[0m"))
 	})
+
+	t.Run("a default-emoji-presentation symbol occupies two cells", func(t *testing.T) {
+		assert.Equal(t, 2, VisibleWidth("⛔"))
+	})
+
+	t.Run("an emoji variation sequence occupies two cells", func(t *testing.T) {
+		assert.Equal(t, 2, VisibleWidth("⚠️"))
+	})
+
+	t.Run("a text-presentation symbol occupies one cell", func(t *testing.T) {
+		assert.Equal(t, 1, VisibleWidth("⚠"))
+	})
+
+	t.Run("wide runes count double inside surrounding text", func(t *testing.T) {
+		assert.Equal(t, 12, VisibleWidth("1 alter · ⛔"))
+		assert.Equal(t, 22, VisibleWidth("1 create, 2 alter · ⚠️"))
+	})
+
+	t.Run("a variation selector without a narrow base adds nothing", func(t *testing.T) {
+		assert.Equal(t, 2, VisibleWidth("⛔️"))
+		assert.Equal(t, 0, VisibleWidth("️"))
+	})
 }

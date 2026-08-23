@@ -81,8 +81,9 @@ func WritePlansList(data PlansListData) {
 		"SOURCE",
 		ANSIReset)
 	for _, p := range data.Plans {
-		// The change summary can carry multi-byte runes (its unsafe/blocked
-		// markers), so it is padded by visible width rather than %-*s's bytes.
+		// The change summary can carry emoji markers whose byte, rune, and
+		// terminal-cell counts all differ, so it is padded by visible width
+		// rather than %-*s's byte count.
 		paddedChanges := p.Changes + strings.Repeat(" ", maxChanges-ui.VisibleWidth(p.Changes))
 		fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 			maxID, p.PlanID,
