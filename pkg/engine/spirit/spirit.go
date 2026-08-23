@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,6 +83,10 @@ type Engine struct {
 	// Running schema change state
 	mu                  sync.Mutex
 	runningSchemaChange *runningSchemaChange
+	// drainedOutcome retains the terminal result of the last schema change
+	// Drain released, so a progress poll that lands after the drain still
+	// observes the outcome. Apply releases it when it accepts new work.
+	drainedOutcome *drainedOutcome
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -288,9 +293,15 @@ func (e *Engine) DebugLogs() bool {
 	return e.debugLogs.Load()
 }
 
-// Drain waits for any in-flight migration goroutine to complete and clears the
-// running migration state. This ensures DB connections from a previous run are
-// fully released before new operations begin.
+// Drain waits for any in-flight schema change goroutine to complete and clears
+// the running schema change state. This ensures DB connections from a previous
+// run are fully released before new operations begin.
+//
+// A schema change that ran to completion or failed is retained as a drained
+// outcome so a progress poll that lands after the drain still observes the
+// result instead of concluding no schema change ever ran. Draining an engine
+// with nothing running changes nothing: an already-retained outcome stays
+// retained.
 func (e *Engine) Drain() {
 	e.mu.Lock()
 	rm := e.runningSchemaChange
@@ -303,8 +314,69 @@ func (e *Engine) Drain() {
 	rm.wg.Wait()
 
 	e.mu.Lock()
+	if e.runningSchemaChange != rm {
+		// The engine started tracking a different schema change while this
+		// drain waited; that change's own flow owns the tracked state now.
+		e.mu.Unlock()
+		e.schemaChangeLogger(rm).Debug("drained schema change is no longer tracked; leaving the newer tracked state in place",
+			"database", rm.database, "tables", rm.tables)
+		return
+	}
+	if retainsDrainedOutcome(rm.state) {
+		e.drainedOutcome = newDrainedOutcome(rm)
+	}
 	e.runningSchemaChange = nil
 	e.mu.Unlock()
+}
+
+// drainedOutcome is the retained result of a schema change that reached a
+// terminal outcome before Drain released its tracked state. Progress serves it
+// so a poll that lands after the drain reports the real result — the drain
+// must never make a finished change look like one that never started. It lives
+// under Engine.mu next to the tracked state it stands in for.
+type drainedOutcome struct {
+	state        engine.State
+	message      string
+	errorMessage string // Failure details when state is StateFailed
+	tables       []engine.TableProgress
+}
+
+// retainsDrainedOutcome reports whether a drained schema change's final state
+// must stay observable to progress polls after the tracked state is released:
+// the change ran to completion or failed. Stopped changes stay resumable
+// through their stored checkpoint and cancelled changes resolve through the
+// cancel call itself, so neither is retained.
+func retainsDrainedOutcome(s engine.State) bool {
+	return s == engine.StateCompleted || s == engine.StateFailed
+}
+
+// newDrainedOutcome snapshots the terminal result of a drained schema change.
+// The runners are closed by the time the snapshot is served, so each table
+// carries its identity, DDL, and final state rather than live copy counters.
+// The caller must hold e.mu.
+func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
+	tables := make([]engine.TableProgress, 0, len(rm.tables)+len(rm.directStatements))
+	for i, tableName := range rm.tables {
+		tp := engine.TableProgress{
+			Namespace: rm.tableNamespace[tableName],
+			Table:     tableName,
+			State:     string(rm.state),
+		}
+		if i < len(rm.ddls) {
+			tp.DDL = rm.ddls[i]
+		}
+		if rm.state == engine.StateCompleted {
+			tp.Progress = 100
+		}
+		tables = append(tables, tp)
+	}
+	tables = append(tables, directStatementTableProgress(rm)...)
+	return &drainedOutcome{
+		state:        rm.state,
+		message:      fmt.Sprintf("Schema change %s", rm.state),
+		errorMessage: rm.errorMessage,
+		tables:       tables,
+	}
 }
 
 // HaltForShutdown brings this instance's in-flight schema change down so the
@@ -672,6 +744,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		threads:        e.threads,
 	}
 	e.runningSchemaChange = rm
+	// Accepting new work releases the previous change's drained outcome, so
+	// one schema change's result never bleeds into the next one's progress.
+	e.drainedOutcome = nil
 	e.mu.Unlock()
 
 	// Start schema change in background with cancellable context.
@@ -703,6 +778,18 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	defer e.mu.Unlock()
 
 	if e.runningSchemaChange == nil {
+		// A retained drained outcome is still this engine's answer for the
+		// last schema change it ran; only a truly idle engine reports pending.
+		if d := e.drainedOutcome; d != nil {
+			return &engine.ProgressResult{
+				State:        d.state,
+				Message:      d.message,
+				ErrorMessage: d.errorMessage,
+				Retryable:    d.state == engine.StateFailed,
+				Tables:       slices.Clone(d.tables),
+				ResumeState:  req.ResumeState,
+			}, nil
+		}
 		return &engine.ProgressResult{
 			State:   engine.StatePending,
 			Message: "No active schema change",
@@ -759,28 +846,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Direct-routed statements run outside the Spirit runner, so they report
-	// their own explicit lifecycle entries: no row counts or ETA, just the
-	// per-statement state transitions the executor recorded.
-	for _, ds := range rm.directStatements {
-		tp := engine.TableProgress{
-			Namespace:      rm.tableNamespace[ds.table],
-			Table:          ds.table,
-			DDL:            ds.ddl,
-			State:          ds.state,
-			ProgressDetail: "direct execution (native MySQL DDL)",
-		}
-		started := ds.startedAt
-		tp.StartedAt = &started
-		if ds.completedAt != nil {
-			completed := *ds.completedAt
-			tp.CompletedAt = &completed
-		}
-		if ds.state == directStateCompleted {
-			tp.Progress = 100
-		}
-		tableProgress = append(tableProgress, tp)
-	}
+	tableProgress = append(tableProgress, directStatementTableProgress(rm)...)
 
 	state := progressState(rm, spiritState)
 
@@ -799,6 +865,35 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		ResumeState:           req.ResumeState,
 		ResumedFromCheckpoint: spiritProgress.Resume,
 	}, nil
+}
+
+// directStatementTableProgress renders the schema change's direct-routed
+// statements as table progress entries. Direct statements run outside the
+// Spirit runner, so they report their own explicit lifecycle entries: no row
+// counts or ETA, just the per-statement state transitions the executor
+// recorded. The caller must hold e.mu.
+func directStatementTableProgress(rm *runningSchemaChange) []engine.TableProgress {
+	entries := make([]engine.TableProgress, 0, len(rm.directStatements))
+	for _, ds := range rm.directStatements {
+		tp := engine.TableProgress{
+			Namespace:      rm.tableNamespace[ds.table],
+			Table:          ds.table,
+			DDL:            ds.ddl,
+			State:          ds.state,
+			ProgressDetail: "direct execution (native MySQL DDL)",
+		}
+		started := ds.startedAt
+		tp.StartedAt = &started
+		if ds.completedAt != nil {
+			completed := *ds.completedAt
+			tp.CompletedAt = &completed
+		}
+		if ds.state == directStateCompleted {
+			tp.Progress = 100
+		}
+		entries = append(entries, tp)
+	}
+	return entries
 }
 
 // buildSpiritTableProgress maps Spirit's per-table progress into engine
