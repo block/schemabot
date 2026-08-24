@@ -108,6 +108,12 @@ const (
 	State_STATE_CATCHING_UP   State = 19
 	State_STATE_CHECKSUMMING  State = 20
 	State_STATE_POST_CHECKSUM State = 21
+	// The apply failed but is parked for the serving plane's own retry: a later
+	// recovery attempt will claim it, so this is a pause, not a verdict. Clients
+	// must keep polling and must not treat it as terminal. Distinct from
+	// STATE_FAILED, which means the failure settled (retries exhausted or the
+	// failure is not retryable).
+	State_STATE_FAILED_RETRYABLE State = 22
 )
 
 // Enum value maps for State.
@@ -135,6 +141,7 @@ var (
 		19: "STATE_CATCHING_UP",
 		20: "STATE_CHECKSUMMING",
 		21: "STATE_POST_CHECKSUM",
+		22: "STATE_FAILED_RETRYABLE",
 	}
 	State_value = map[string]int32{
 		"STATE_NO_ACTIVE_CHANGE":          0,
@@ -159,6 +166,7 @@ var (
 		"STATE_CATCHING_UP":               19,
 		"STATE_CHECKSUMMING":              20,
 		"STATE_POST_CHECKSUM":             21,
+		"STATE_FAILED_RETRYABLE":          22,
 	}
 )
 
@@ -4040,7 +4048,7 @@ const file_tern_proto_rawDesc = "" +
 	"\rENGINE_SPIRIT\x10\x00\x12\x16\n" +
 	"\x12ENGINE_PLANETSCALE\x10\x01\x12\x11\n" +
 	"\rENGINE_STRATA\x10\x02\x12\x13\n" +
-	"\x0fENGINE_POSTGRES\x10\x03*\xb1\x04\n" +
+	"\x0fENGINE_POSTGRES\x10\x03*\xcd\x04\n" +
 	"\x05State\x12\x1a\n" +
 	"\x16STATE_NO_ACTIVE_CHANGE\x10\x00\x12\x11\n" +
 	"\rSTATE_PENDING\x10\x01\x12\x11\n" +
@@ -4064,7 +4072,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x0fSTATE_REVERTING\x10\x12\x12\x15\n" +
 	"\x11STATE_CATCHING_UP\x10\x13\x12\x16\n" +
 	"\x12STATE_CHECKSUMMING\x10\x14\x12\x17\n" +
-	"\x13STATE_POST_CHECKSUM\x10\x15*\xbb\x01\n" +
+	"\x13STATE_POST_CHECKSUM\x10\x15\x12\x1a\n" +
+	"\x16STATE_FAILED_RETRYABLE\x10\x16*\xbb\x01\n" +
 	"\n" +
 	"ChangeType\x12\x15\n" +
 	"\x11CHANGE_TYPE_OTHER\x10\x00\x12\x16\n" +

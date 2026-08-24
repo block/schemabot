@@ -276,6 +276,12 @@ enum State {
   STATE_CATCHING_UP = 19;
   STATE_CHECKSUMMING = 20;
   STATE_POST_CHECKSUM = 21;
+  // The apply failed but is parked for the serving plane's own retry: a later
+  // recovery attempt will claim it, so this is a pause, not a verdict. Clients
+  // must keep polling and must not treat it as terminal. Distinct from
+  // STATE_FAILED, which means the failure settled (retries exhausted or the
+  // failure is not retryable).
+  STATE_FAILED_RETRYABLE = 22;
 }
 
 // ChangeType represents the type of schema change.
