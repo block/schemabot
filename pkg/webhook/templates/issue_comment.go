@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -332,7 +333,7 @@ const volumeSupersededPrefix = "⏩ Volume changed to"
 // in the headline of every frozen body. IsSupersededProgressComment requires
 // it alongside a flavor prefix, so a live comment that merely opens with the
 // same words as a prefix is never misread as already frozen.
-const supersededFoldMarker = " [a new progress comment](https://github.com/"
+const supersededFoldMarker = " [a new progress comment]("
 
 // SupersededProgressData contains the data every superseded-comment fold
 // shares: where the successor comment lives and the superseded comment's last
@@ -358,9 +359,9 @@ type SupersededProgressData struct {
 // (which must start with that flavor's superseded prefix) and fold label.
 func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
 	return fmt.Sprintf(
-		"%s"+supersededFoldMarker+"%s/pull/%d#issuecomment-%d).\n\n"+
+		"%s"+supersededFoldMarker+"%s#issuecomment-%d).\n\n"+
 			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
-		headline, repo, pr, newCommentID, foldLabel, previousBody)
+		headline, caller.PullRequestURL(repo, pr), newCommentID, foldLabel, previousBody)
 }
 
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
