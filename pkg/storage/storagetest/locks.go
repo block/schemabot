@@ -100,8 +100,11 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, "plan-2", stored.PendingPlanID)
 
 		// A re-acquire whose pending plan already matches the stored value
-		// succeeds. Implementations whose UPDATE reports changed rows rather
-		// than matched rows must not misread the no-op write as lost ownership.
+		// succeeds as a read-side no-op: the store sees the match and skips
+		// the write. (The write-side race — a concurrent same-owner caller
+		// storing the same plan between this caller's read and its write —
+		// depends on the dialect's rows-affected semantics and lives in each
+		// implementation's own integration tests.)
 		require.NoError(t, store.Locks().Acquire(ctx, refresh))
 
 		stored, err = store.Locks().Get(ctx, "refresh_db", storage.DatabaseTypeMySQL)
