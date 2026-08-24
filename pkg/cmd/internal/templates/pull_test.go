@@ -111,6 +111,64 @@ func TestWritePullSchema_LintAuditRendersAsComments(t *testing.T) {
 	assert.NotContains(t, unaudited, "-- Lint")
 }
 
+// A pull that asked for a detailed catalog surfaces the part of it the DDL
+// cannot carry — the engine's row-count and size estimates — as a comment
+// above each table's CREATE statement, so the output stays executable SQL.
+// A view has no rows or storage of its own and gets no estimate line.
+func TestWritePullSchema_DetailedCatalogRendersTableEstimates(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "staging",
+			TableCount:  2,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {
+					Tables: map[string]string{
+						"users":        "CREATE TABLE `users` (`id` bigint NOT NULL)\n",
+						"active_users": "CREATE VIEW `active_users` AS select 1\n",
+					},
+					NamespaceCatalog: &apitypes.NamespaceCatalog{Name: "orders", Engine: "mysql", TableCount: 2},
+					TableCatalog: map[string]*apitypes.TableCatalog{
+						"users":        {Name: "users", Kind: "table", EstimatedRowCount: 18402551, DataSizeBytes: 4294967296},
+						"active_users": {Name: "active_users", Kind: "view"},
+					},
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "-- Table `users` — rows ~18,402,551, size ~4.0 GiB (engine estimates)\nCREATE TABLE `users`",
+		"the estimate line sits directly above the table's DDL")
+	assert.NotContains(t, out, "-- Table `active_users`", "a view carries no row or size estimate")
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(line, "rows ~") {
+			assert.True(t, strings.HasPrefix(line, "--"), "an estimate line must be a SQL comment: %q", line)
+		}
+	}
+}
+
+// A basic pull carries no catalog, so the schema renders without estimate
+// lines rather than with zeroed ones.
+func TestWritePullSchema_BasicPullRendersNoEstimates(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "staging",
+			TableCount:  1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL)\n"}},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "CREATE TABLE `users`")
+	assert.NotContains(t, out, "rows ~")
+}
+
 // A multi-namespace pull renders each namespace in name order and surfaces
 // the namespace count in the summary box.
 func TestWritePullSchema_MultipleNamespacesRenderInOrder(t *testing.T) {

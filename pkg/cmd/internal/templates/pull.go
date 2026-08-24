@@ -17,7 +17,8 @@ import (
 // (statements terminated with ";", annotations as "--" comments) so a
 // DDL-only pull can be redirected into a .sql file as-is. Artifact bodies
 // (e.g. a VSchema) print raw under their comment header so they can be
-// copy-pasted straight out of the terminal.
+// copy-pasted straight out of the terminal. A pull that asked for a detailed
+// catalog also gets each table's engine estimates above its DDL.
 func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	rows := []BoxRow{
 		{Label: "Database", Value: resp.Database},
@@ -39,6 +40,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 
 		for _, table := range sortedKeys(ns.Tables) {
 			fmt.Println()
+			writeTableEstimates(table, ns.TableCatalog[table])
 			stmt := terminateStatement(ns.Tables[table])
 			if ui.Colors {
 				stmt = FormatSQL(stmt)
@@ -55,6 +57,28 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 			fmt.Println(body)
 		}
 	}
+}
+
+// tableKindView is the catalog kind an engine reports for a view rather than
+// a stored table.
+const tableKindView = "view"
+
+// writeTableEstimates renders the one part of a detailed table catalog the
+// pulled DDL cannot carry: the engine's row-count and size estimates. The
+// rest of the catalog — columns, indexes, foreign keys, the table comment —
+// is already in the CREATE statement this line sits above, so repeating it
+// would pad the output without adding a fact. A basic pull carries no
+// catalog and prints nothing here.
+func writeTableEstimates(table string, catalog *apitypes.TableCatalog) {
+	// A view has no rows or storage of its own, so its zeroed estimates would
+	// read as a fact about the data rather than an absence of one.
+	if catalog == nil || catalog.Kind == tableKindView {
+		return
+	}
+	fmt.Println(annotation(fmt.Sprintf("-- Table %s — rows ~%s, size ~%s (engine estimates)",
+		emphasis("`"+table+"`"),
+		ui.FormatNumber(catalog.EstimatedRowCount),
+		ui.FormatBytes(catalog.DataSizeBytes))))
 }
 
 // annotation renders a "--" comment line dimmed on interactive terminals, so

@@ -40,11 +40,35 @@ func previewPullVitessSchemaOutput() {
 	})
 }
 
+// previewPullSchemaDetailedOutput shows what a detailed catalog adds to the
+// pulled schema: each table's engine row-count and size estimates, which the
+// DDL cannot carry. The view in the namespace shows the same pull without
+// estimates, since a view has no rows or storage of its own.
+func previewPullSchemaDetailedOutput() {
+	resp := pullSchemaPreviewResponse()
+	ns := resp.Namespaces["orders"]
+	ns.Tables["order_summary"] = "CREATE ALGORITHM=UNDEFINED SQL SECURITY INVOKER VIEW `order_summary` AS " +
+		"select `orders`.`customer_ref` AS `customer_ref`,count(0) AS `order_count` " +
+		"from `orders` group by `orders`.`customer_ref`\n"
+	ns.NamespaceCatalog = &apitypes.NamespaceCatalog{Name: "orders", Engine: "mysql", TableCount: 3}
+	ns.TableCatalog = map[string]*apitypes.TableCatalog{
+		"orders":        {Name: "orders", Kind: "table", EstimatedRowCount: 18_402_551, DataSizeBytes: 4_294_967_296},
+		"order_lines":   {Name: "order_lines", Kind: "table", EstimatedRowCount: 96_233_104, DataSizeBytes: 21_474_836_480},
+		"order_summary": {Name: "order_summary", Kind: "view"},
+	}
+	resp.TableCount = 3
+	WritePullSchema(resp)
+}
+
 // previewPullSchemaOutput shows a pulled live schema with a lint audit: the
 // summary box, per-namespace DDL as executable SQL, and lint findings as
 // comments.
 func previewPullSchemaOutput() {
-	WritePullSchema(&apitypes.PullSchemaResponse{
+	WritePullSchema(pullSchemaPreviewResponse())
+}
+
+func pullSchemaPreviewResponse() *apitypes.PullSchemaResponse {
+	return &apitypes.PullSchemaResponse{
 		Database:    "orders-db",
 		Type:        "mysql",
 		Environment: "staging",
@@ -77,5 +101,5 @@ func previewPullSchemaOutput() {
 				},
 			},
 		},
-	})
+	}
 }
