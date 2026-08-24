@@ -67,6 +67,14 @@ var rollbackCompletedBlock = checkBlockReason{
 	message:        "Schema changes were rolled back in this environment; apply the PR schema changes again, or reconcile the PR and live schema before this check can pass.",
 }
 
+// applyCancelledBlock is used after a forward apply is cancelled before it
+// changes the target environment. The check remains blocked until a plan
+// confirms whether the PR still requests the schema change.
+var applyCancelledBlock = checkBlockReason{
+	blockingReason: "apply_cancelled",
+	message:        "The apply was cancelled before completion; re-plan and re-apply if the schema change is still wanted, or remove it and re-run `schemabot plan` to converge this check.",
+}
+
 // githubConfigDiscoveryUnavailableBlock is used when GitHub is unavailable
 // while SchemaBot is discovering which managed schema changes exist. The
 // aggregate check must fail closed until SchemaBot can read PR metadata and

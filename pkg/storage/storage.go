@@ -147,13 +147,13 @@ type CheckStore interface {
 	// the stored state first.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
-	// MarkActionRequiredForApply marks stored check state action_required after
-	// a rollback only if no apply newer than the rollback exists for the same
-	// PR/environment/database. Rows owned by the rollback, by an older apply, or
-	// unowned all qualify: a rollback that never claimed the row must still be
-	// able to block the stale successful check left over from the apply it
-	// reverted. Returns false when any apply newer than the rollback exists for
-	// the target, whether or not it has claimed the row.
+	// MarkActionRequiredForApply marks stored check state action_required for a
+	// terminal apply only if no newer apply exists for the same target. The row
+	// may be owned by this apply, an older apply, or no apply: completed rollbacks
+	// must block stale success even when their claim never landed, and safely
+	// cancelled forward applies must be able to release retained ownership.
+	// Returns false when any newer apply exists for the target, whether or not it
+	// has claimed the row.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
