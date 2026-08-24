@@ -92,6 +92,17 @@ func TestHasAutoConfirmFlag(t *testing.T) {
 	assert.True(t, p.HasAutoConfirmFlag("schemabot apply -e staging --yes"))
 	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging"))
 	assert.False(t, p.HasAutoConfirmFlag(""))
+
+	// A flag is a token on the command, not a substring of one: an
+	// environment ending in `-y` is a legal environment name.
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging-y"))
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e prod --yes-really"))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging\n\nlast time I had to pass --yes locally"))
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging\n\n```\nschemabot apply -e staging -y\n```\n"))
+	assert.False(t, p.HasAutoConfirmFlag("we could pass --yes here"))
 }
 
 func TestHasDatabaseFlag(t *testing.T) {

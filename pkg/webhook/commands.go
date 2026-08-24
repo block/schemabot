@@ -139,7 +139,7 @@ func NewCommandParser() *CommandParser {
 		deferCutoverRegex:    regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:     regexp.MustCompile(`(?i)--allow-unsafe\b`),
 		forceRegex:           regexp.MustCompile(`(?i)--force\b`),
-		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
+		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:^|\s)(?:--yes|-y)(?:\s|$)`),
 		volumeFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
 	}
 }
@@ -351,7 +351,7 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	return result
 }
 
-// HasAutoConfirmFlag reports whether the body contains the `-y` / `--yes`
+// HasAutoConfirmFlag reports whether the command carries the `-y` / `--yes`
 // flag. No comment command takes it: a comment has no prompt to skip, and the
 // gates that stop an apply — direct-execution changes, a discarded copy — stop
 // it because the operator has to see what they are consenting to, which a flag
@@ -359,8 +359,17 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 // flag and ignore it, which would read as consent that was never recorded.
 // This is distinct from the CLI's own `-y` (`--auto-approve`), which skips an
 // interactive terminal prompt that genuinely exists.
+//
+// The answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from rather than the whole comment: a
+// reader who mentions the flag in prose, or pastes a CLI example in a fence, is
+// describing it, not passing it.
 func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
-	return p.autoConfirmRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.autoConfirmRegex.MatchString(directive)
 }
 
 // HasDatabaseFlag reports whether the body contains a `-d <database>` flag,
