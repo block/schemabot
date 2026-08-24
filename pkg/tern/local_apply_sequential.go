@@ -457,17 +457,22 @@ const (
 	// holds the database's active-apply slot and blocks every later apply.
 	maxConsecutiveProgressPollErrors = 10
 
-	// lostEngineWorkPendingPolls is how many consecutive progress polls may
-	// report no active schema change (a state that maps to pending) for a task
-	// whose stored state says the work is already in flight, before the drive
-	// stops trusting the engine and verifies the target schema directly. An
-	// engine that just restarted, or that drained a previous operation, can
-	// serve a stale snapshot that omits the in-flight work for a short window
-	// before it catches up; that window self-heals, so a small budget of polls
-	// absorbs it. A run of pending reports outlasting the budget means the
-	// engine has lost (or never had) the work, and polling it further can
-	// never terminalize the task.
-	lostEngineWorkPendingPolls = 10
+	// defaultLostEngineWorkPendingBudget is how long an engine may keep
+	// reporting no active schema change for a task whose stored state says the
+	// work is already in flight, before the drive stops trusting the engine and
+	// verifies the target schema directly.
+	//
+	// The budget is a duration rather than a count of polls because what it has
+	// to outlast is wall-clock engine behaviour, not a number of round trips: an
+	// engine that just restarted serves a stale snapshot until it catches up,
+	// and an engine whose remote work is still being set up or validated
+	// reports pending for real, healthy work it has not begun executing. Both
+	// resolve on their own schedule, and a poll-count budget silently shrinks to
+	// nothing whenever the poll cadence is shortened. The budget is generous for
+	// that reason: distrusting the engine too early bounces a healthy apply to
+	// retryable and re-drives it, which on an engine that provisions remote
+	// resources per attempt is worse than waiting.
+	defaultLostEngineWorkPendingBudget = 2 * time.Minute
 
 	// defaultTaskStallWarnInterval is how long a polled task may sit in the
 	// same stored state with unchanged progress fields before the drive warns
@@ -493,6 +498,15 @@ func (c *LocalClient) taskStallWarnInterval() time.Duration {
 	return defaultTaskStallWarnInterval
 }
 
+// lostEngineWorkPendingBudget returns how long the drive keeps trusting an
+// engine that reports no active schema change for an in-flight task.
+func (c *LocalClient) lostEngineWorkPendingBudget() time.Duration {
+	if c.lostEngineWorkPendingBudgetOverride > 0 {
+		return c.lostEngineWorkPendingBudgetOverride
+	}
+	return defaultLostEngineWorkPendingBudget
+}
+
 // pollTaskToCompletion polls a single task to completion (sequential mode).
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
@@ -502,7 +516,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 	var consecutiveErrors int
 	var resumeEventLogged bool
-	var pendingWhileInFlight int
+	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget()}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 
 	for {
@@ -595,9 +609,10 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				}
 			}
 
+			now := time.Now()
 			if engineReportsLostWork(prevState, engineTaskState) {
-				pendingWhileInFlight++
-				if pendingWhileInFlight >= lostEngineWorkPendingPolls {
+				pendingFor, exhausted := lostWork.observePending(now)
+				if exhausted {
 					action, settleErr := c.settleLostEngineWork(ctx, apply, task, result.State)
 					if settleErr == nil {
 						return action
@@ -615,19 +630,18 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					}
 					continue
 				}
-				// A short run of pending reports is a stale engine snapshot
-				// (e.g. right after an engine restart) that self-heals once the
-				// engine catches up with its own in-flight work.
-				c.logger.Debug("engine reported no active schema change for an in-flight task; tolerating a stale engine snapshot",
-					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_pending_reports", pendingWhileInFlight)...)
+				// Inside the budget the engine is still trusted: it may be
+				// serving a stale snapshot after a restart, or reporting
+				// pending for real work it has not begun executing yet.
+				c.logger.Debug("engine reports no active schema change for an in-flight task; still inside the trust budget",
+					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "pending_for", pendingFor.Round(time.Second))...)
 			} else {
-				pendingWhileInFlight = 0
+				lostWork.reset()
 			}
 
 			consecutiveErrors = 0
 			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
 
-			now := time.Now()
 			task.State = taskStateWithNoBackwardProgress(prevState, engineTaskState)
 			task.UpdatedAt = now
 			retryableFailure := state.IsState(task.State, state.Task.FailedRetryable)
@@ -715,19 +729,54 @@ func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task,
 
 // engineReportsLostWork reports whether a successful progress poll came back
 // with no active schema change (a state that maps to pending) for a task whose
-// stored state says the work is already in flight. An engine never reports
-// pending for work it is actively driving, so this shape means the engine's
-// view and durable storage have diverged: briefly and legitimately while a
-// restarted engine reloads its snapshot, or permanently when the engine has
-// lost (or never had) the work — in which case polling can never terminalize
-// the task. Only genuinely in-flight stored states count: resting states such
-// as stopped or failed_retryable have no active engine work by design, so a
-// pending report for them is expected, not divergence.
+// stored state says the work is already in flight.
+//
+// This shape means the engine's view and durable storage disagree, but it does
+// not by itself mean the work is gone. Pending is an overloaded report: an
+// engine serves it while a restarted instance reloads its snapshot, while
+// remote work it has genuinely created is still being provisioned or validated,
+// and also when it has truly lost (or never had) the work. Only the last case
+// can never terminalize the task, and nothing in a single poll tells the three
+// apart — so the caller treats this as the start of a timed trust budget rather
+// than as evidence.
+//
+// Only genuinely in-flight stored states count: resting states such as stopped
+// or failed_retryable have no active engine work by design, so a pending report
+// for them is expected, not disagreement.
 func engineReportsLostWork(storedTaskState, engineTaskState string) bool {
 	if !state.IsState(engineTaskState, state.Task.Pending) {
 		return false
 	}
 	return state.IsInFlightTaskState(storedTaskState)
+}
+
+// lostEngineWorkTracker measures how long an engine has been reporting no
+// active schema change for a task storage says is in flight, and reports when
+// that has outlasted the budget. It is a clock, not a poll counter, so a
+// shorter poll cadence cannot shrink how long the engine is trusted for.
+type lostEngineWorkTracker struct {
+	budget time.Duration
+	since  time.Time
+}
+
+// observePending records a poll that reported no active schema change and
+// returns how long the run has lasted, plus whether the trust budget is spent.
+// The first observation of a run starts the clock and is never exhausted, so an
+// engine always gets at least the full budget before the drive stops trusting
+// it.
+func (t *lostEngineWorkTracker) observePending(now time.Time) (pendingFor time.Duration, exhausted bool) {
+	if t.since.IsZero() {
+		t.since = now
+		return 0, false
+	}
+	pendingFor = now.Sub(t.since)
+	return pendingFor, pendingFor >= t.budget
+}
+
+// reset clears the run, so a single healthy report buys the engine a fresh
+// budget.
+func (t *lostEngineWorkTracker) reset() {
+	t.since = time.Time{}
 }
 
 // settleLostEngineWork resolves a task the engine has stopped reporting on by
@@ -742,6 +791,19 @@ func engineReportsLostWork(storedTaskState, engineTaskState string) bool {
 // nothing about the target is known to be broken. A verification error is
 // returned for the caller's consecutive-error budget to count.
 func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.Apply, task *storage.Task, engineState engine.State) (taskAction, error) {
+	// A revert-phase task can never be settled by reading the target. The
+	// forward change has already cut over, so the live schema matches the
+	// reviewed target by definition and a match says nothing about whether the
+	// revert this task was driving ever finished. Completing on it would report
+	// the apply as a successful schema change while the revert it was undoing is
+	// gone. Retryable is the only answer a schema read supports here.
+	if taskInRevertPhase(task) {
+		c.logger.Warn("engine reports no active schema change for a revert-phase task; marking it retryable because the target schema cannot settle a revert",
+			append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+		c.markTaskRetryable(ctx, task,
+			fmt.Sprintf("engine reports no active schema change while table %s was in its revert phase; a fresh claim will re-drive it", task.TableName))
+		return taskFailed, nil
+	}
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
 		return taskContinue, fmt.Errorf("load plan for apply %s to verify target schema for task %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, err)

@@ -210,6 +210,12 @@ type LocalClient struct {
 	// to observe the warning.
 	taskStallWarnIntervalOverride time.Duration
 
+	// lostEngineWorkPendingBudgetOverride, when positive, replaces
+	// defaultLostEngineWorkPendingBudget as how long the sequential drive keeps
+	// trusting an engine reporting no active schema change for an in-flight
+	// task. Tests may lower it to reach the verification path quickly.
+	lostEngineWorkPendingBudgetOverride time.Duration
+
 	// cancelApply cancels the background goroutine running executeApplySequential
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.

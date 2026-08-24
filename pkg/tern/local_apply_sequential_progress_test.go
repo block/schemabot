@@ -265,13 +265,22 @@ func TestEngineReportsLostWork(t *testing.T) {
 // lostWorkPollFixture builds a running sequential task, its apply, and a
 // LocalClient polling the given engine with a fast poll interval, so lost-work
 // scenarios can drive many polls without waiting out the real poll cadence.
-// The re-plan's target plan row is served by a scripted plan store.
-func lostWorkPollFixture(eng engine.Engine) (*LocalClient, *storage.Apply, *storage.Task, *stateRecordingTaskStore) {
+// trustBudget sets how long the drive keeps trusting an engine reporting no
+// active schema change: a tiny budget reaches target verification, and a large
+// one proves a short pending run is tolerated. The re-plan's target plan row is
+// served by a scripted plan store.
+func lostWorkPollFixture(eng engine.Engine, trustBudget time.Duration) (*LocalClient, *storage.Apply, *storage.Task, *stateRecordingTaskStore) {
+	return lostWorkPollFixtureInState(eng, trustBudget, state.Task.Running)
+}
+
+// lostWorkPollFixtureInState is lostWorkPollFixture with the task's stored
+// state chosen by the caller, for the states whose settlement rules differ.
+func lostWorkPollFixtureInState(eng engine.Engine, trustBudget time.Duration, taskState string) (*LocalClient, *storage.Apply, *storage.Task, *stateRecordingTaskStore) {
 	task := &storage.Task{
 		ID: 1, ApplyID: 1, PlanID: 7, TaskIdentifier: "task-1",
 		Database: "appdb", DatabaseType: storage.DatabaseTypeStrata,
 		Namespace: "appdb_sharded", TableName: "orders", Shard: "-40",
-		Environment: "staging", State: state.Task.Running,
+		Environment: "staging", State: taskState,
 	}
 	apply := &storage.Apply{
 		ID: 1, PlanID: 7, ApplyIdentifier: "apply-1", Database: "appdb",
@@ -289,11 +298,20 @@ func lostWorkPollFixture(eng engine.Engine) (*LocalClient, *storage.Apply, *stor
 			logs:            &mockApplyLogStore{},
 			plans:           &scriptedPlanStore{plan: &storage.Plan{ID: 7, SchemaFiles: schema.SchemaFiles{}}},
 		},
-		logger:                   slog.Default(),
-		taskPollIntervalOverride: time.Millisecond,
+		logger:                              slog.Default(),
+		taskPollIntervalOverride:            time.Millisecond,
+		lostEngineWorkPendingBudgetOverride: trustBudget,
 	}
 	return client, apply, task, taskStore
 }
+
+// lostWorkTrustBudgetReached is a trust budget small enough that a few fast
+// polls exhaust it, so a test reaches the target-verification path.
+const lostWorkTrustBudgetReached = 5 * time.Millisecond
+
+// lostWorkTrustBudgetAmple is a trust budget no test can exhaust, so a short
+// run of pending reports is provably tolerated rather than tolerated by luck.
+const lostWorkTrustBudgetAmple = time.Hour
 
 // An engine can complete a schema change and then lose all record of it — after
 // that, every progress poll reports no active schema change while durable
@@ -312,7 +330,7 @@ func TestPollTaskToCompletion_LostEngineWorkTargetConverged(t *testing.T) {
 		// already has the desired schema.
 		planResult: &engine.PlanResult{NoChanges: true},
 	}
-	client, apply, task, _ := lostWorkPollFixture(eng)
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 
@@ -321,7 +339,7 @@ func TestPollTaskToCompletion_LostEngineWorkTargetConverged(t *testing.T) {
 	assert.Equal(t, 100, task.ProgressPercent)
 	require.NotNil(t, task.CompletedAt)
 	assert.GreaterOrEqual(t, eng.planCalls, 1, "the drive verifies the target schema before completing")
-	assert.GreaterOrEqual(t, eng.calls, lostEngineWorkPendingPolls, "the drive tolerates the full staleness window before verifying")
+	assert.GreaterOrEqual(t, eng.calls, 3, "a single pending report never settles the task; the engine is polled again first")
 }
 
 // An engine that never had (or irrecoverably lost) the work reports no active
@@ -345,7 +363,7 @@ func TestPollTaskToCompletion_LostEngineWorkTargetNotConverged(t *testing.T) {
 			}},
 		}}},
 	}
-	client, apply, task, _ := lostWorkPollFixture(eng)
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 
@@ -372,7 +390,7 @@ func TestPollTaskToCompletion_StaleEngineSnapshotSelfHeals(t *testing.T) {
 		phaseSequenceEngine: phaseSequenceEngine{results: results},
 		planResult:          &engine.PlanResult{NoChanges: true},
 	}
-	client, apply, task, taskStore := lostWorkPollFixture(eng)
+	client, apply, task, taskStore := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 
@@ -381,6 +399,59 @@ func TestPollTaskToCompletion_StaleEngineSnapshotSelfHeals(t *testing.T) {
 	assert.Equal(t, 0, eng.planCalls, "a self-healing stale snapshot never triggers target verification")
 	assert.NotContains(t, taskStore.states, state.Task.FailedRetryable)
 	assert.NotContains(t, taskStore.states, state.Task.Failed)
+}
+
+// Once a schema change has cut over, the live schema matches the reviewed
+// target whether or not the revert that was undoing it ever ran — so a task in
+// its revert phase can never be settled by reading the target. An engine that
+// loses a revert must leave the task retryable for a fresh claim to re-drive;
+// completing it would report the apply as a successful schema change while the
+// change it was reverting is still in place.
+func TestPollTaskToCompletion_LostEngineWorkNeverCompletesARevertPhaseTask(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// A converged target is exactly what a post-cutover re-plan reports, and
+		// it must not be read as the revert having finished.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetReached, state.Task.Reverting)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "a lost revert is retryable, never a completed schema change")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Contains(t, task.ErrorMessage, "revert phase")
+	assert.Equal(t, 0, eng.planCalls, "the target schema is never consulted for a revert-phase task")
+}
+
+// The lost-work trust budget is a clock, not a poll counter: a shorter poll
+// cadence must not shorten how long an engine is trusted, and the first pending
+// report of a run only starts the clock.
+func TestLostEngineWorkTrackerSpendsABudgetOfTimeNotPolls(t *testing.T) {
+	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	tracker := lostEngineWorkTracker{budget: time.Minute}
+
+	pendingFor, exhausted := tracker.observePending(base)
+	assert.Zero(t, pendingFor)
+	assert.False(t, exhausted, "the first pending report only starts the clock")
+
+	// Many polls inside the budget never exhaust it, however fast they arrive.
+	for i := 1; i <= 100; i++ {
+		_, exhausted = tracker.observePending(base.Add(time.Duration(i) * time.Millisecond))
+		require.False(t, exhausted, "a fast poll cadence must not shorten the budget")
+	}
+
+	pendingFor, exhausted = tracker.observePending(base.Add(time.Minute))
+	assert.True(t, exhausted, "a full budget of pending reports stops trusting the engine")
+	assert.Equal(t, time.Minute, pendingFor)
+
+	// One healthy report buys a fresh budget.
+	tracker.reset()
+	_, exhausted = tracker.observePending(base.Add(2 * time.Minute))
+	assert.False(t, exhausted, "movement resets the budget")
 }
 
 // recordingLogHandler collects slog records so a test can assert on the
