@@ -33,11 +33,13 @@ func TestLocks(t *testing.T, h Harness) {
 		// apply-confirms for the same PR share the lock key and both succeed.
 		require.NoError(t, store.Locks().Acquire(ctx, lock))
 
-		// A different owner must be rejected while the lock is held.
+		// A different owner must be rejected while the lock is held — even
+		// from another repository, since the lock key is (database, type)
+		// and nothing else.
 		other := &storage.Lock{
 			DatabaseName: "acquire_db",
 			DatabaseType: storage.DatabaseTypeMySQL,
-			Repository:   "org/repo",
+			Repository:   "org/other-repo",
 			PullRequest:  456,
 			Owner:        "owner-b",
 		}
