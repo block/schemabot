@@ -288,10 +288,10 @@ schemabot apply -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying
-- `orders` in `testapp`: the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
-Applying copies the tables above again from zero rows, so it runs as long as a first copy would; the 3h 12m already spent is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
+Applying copies the tables above again from zero rows, so it runs as long as a first copy would; the work already done is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
 
 📋 **Plan**: **1** table to alter
 
@@ -321,8 +321,8 @@ schemabot apply -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying
-- `orders` in `testapp`: the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
 📋 **Plan**: **1** table to alter
 

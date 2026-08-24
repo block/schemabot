@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // ExistingCopyData is an unfinished copy of one or more tables sitting on the
@@ -18,7 +19,12 @@ type ExistingCopyData struct {
 	// Reason is the engine's identifier for why the copy cannot be resumed.
 	// Empty for an adopted copy, which needs no explanation.
 	Reason string
-	// Age is how long ago the copy last made progress, already humanized.
+	// Age is how long ago the copy last made progress, already humanized. It
+	// dates the copy's last checkpoint, not how long it has been copying: a copy
+	// still running checkpoints continuously, so its age stays small however
+	// many hours of work it holds. It is rendered as staleness for that reason,
+	// and never as the cost of discarding.
+	//
 	// Empty for a copy with no recorded progress to date it by.
 	Age string
 	// Statement is the schema change the copy was started for. Empty when the
@@ -33,8 +39,11 @@ type ExistingCopyData struct {
 // throws away. The work already done on the target is lost and every table in
 // the copy is read again from the start, which on a large table is hours.
 //
-// How long the copy has been running is what makes an operator stop, so it
-// leads the section rather than sitting in a parenthetical below the headline.
+// What is lost is named as the work itself, never as a duration. The only
+// duration a copy carries is how long ago it last checkpointed, which is
+// staleness rather than elapsed copying — a live copy checkpoints continuously,
+// so hours of work show up as seconds of age. Each entry reports it as the
+// staleness it is, and the headline carries none.
 //
 // alreadyApplying selects between the two things this section can be, and the
 // difference is whether the reader has a move.
@@ -54,71 +63,58 @@ type ExistingCopyData struct {
 // Both keep the same verb so the two read as one disclosure rather than two.
 func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
-	headlineAge := soleCopyAge(copies)
 	marker, subject := "⚠️", "Applying"
 	if alreadyApplying {
 		marker, subject = "ℹ️", "This apply"
 	}
-	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target",
+	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target\n",
 		marker, subject, n, copyNoun(n))
-	if headlineAge != "" {
-		fmt.Fprintf(sb, ", %s of copying", headlineAge)
-	}
-	sb.WriteString("\n")
-	writeExistingCopyEntries(sb, copies, headlineAge == "")
+	writeExistingCopyEntries(sb, copies)
 	if alreadyApplying {
 		sb.WriteString("\n")
 		return
 	}
-	lost := "the work already done"
-	if headlineAge != "" {
-		lost = "the " + headlineAge + " already spent"
-	}
 	fmt.Fprintf(sb, "\nApplying copies the tables above again from zero rows, so it runs as long as a first copy would; "+
-		"%s is lost and cannot be recovered. "+
-		"To continue the existing copy instead, apply the same schema change that started it.\n\n", lost)
-}
-
-// soleCopyAge is the age to put in the headline: the copy's own, when exactly
-// one copy is being reported and its age is known. Empty otherwise — several
-// copies have several ages and no one of them describes what applying costs, so
-// each keeps its age on its own entry.
-func soleCopyAge(copies []ExistingCopyData) string {
-	if len(copies) != 1 {
-		return ""
-	}
-	return copies[0].Age
+		"the work already done is lost and cannot be recovered. "+
+		"To continue the existing %s instead, apply the same schema %s that started %s.\n\n",
+		copyNoun(n), ui.PluralizeLabel("change", "changes", n), ui.PluralizeLabel("it", "them", n))
 }
 
 // writeAdoptedCopies writes the section for unfinished copies the apply
 // resumes. It reassures rather than warns: nothing is destroyed and the copy
 // picks up where it stopped, which is why an operator seeing a long-running
 // apply reappear should not expect it to restart.
-func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData) {
+//
+// alreadyApplying moves the closing line from what applying would do to what
+// the apply already under way is doing, matching the discard section on the
+// same comment: the two sections can render together, and one describing a
+// decision while the other describes an event reads as two comments spliced.
+func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
+	subject := "Applying picks"
+	if alreadyApplying {
+		subject = "This apply picks"
+	}
 	fmt.Fprintf(sb, "♻️ **Resuming work in progress**: **%d** unfinished %s on the target will be continued\n",
 		n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies, true)
-	sb.WriteString("\nApplying picks up where the existing copy stopped rather than starting over.\n\n")
+	writeExistingCopyEntries(sb, copies)
+	fmt.Fprintf(sb, "\n%s up where the existing %s stopped rather than starting over.\n\n", subject, copyNoun(n))
 }
 
-// copyNoun is the irregular plural the shared pluralize helper cannot form.
+// copyNoun is the count-appropriate noun for a row copy.
 func copyNoun(count int) string {
-	if count == 1 {
-		return "copy"
-	}
-	return "copies"
+	return ui.PluralizeLabel("copy", "copies", count)
 }
 
-// writeExistingCopyEntries writes one entry per copy. withAge is false when the
-// section headline already carries the age, so the entry does not repeat it.
-func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, withAge bool) {
+// writeExistingCopyEntries writes one entry per copy: the tables it covers,
+// where they live, how stale it is, and why it cannot be resumed.
+func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
 		if c.Namespace != "" {
 			line += " in " + markdownInlineCode(c.Namespace)
 		}
-		if withAge && c.Age != "" {
+		if c.Age != "" {
 			line += fmt.Sprintf(" (last progress %s ago)", c.Age)
 		}
 		if reason := existingCopyReason(c); reason != "" {

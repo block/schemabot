@@ -9,10 +9,10 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// A copy the apply will throw away is disclosed as a warning that leads with
-// what applying costs — how long the copy has been running — then names the
-// tables, the namespace, why it cannot be resumed, and the remedy. This is the
-// rendering that reaches an operator who still has the decision.
+// A copy the apply will throw away is disclosed as a warning that names the
+// tables, the namespace, how stale the copy is, why it cannot be resumed, and
+// the remedy. This is the rendering that reaches an operator who still has the
+// decision.
 func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
@@ -32,14 +32,16 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
-	assert.Contains(t, plan, "- `orders` in `testapp`: the schema change differs from the one that started it, "+
+	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, plan, "- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, "+
 		"which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`",
 		"a cause that is a comparison names the side the operator cannot see from the plan above")
-	assert.NotContains(t, plan, "(last progress 3h 12m ago)",
-		"the headline already carries the age, so the entry does not repeat it")
-	assert.Contains(t, plan, "it runs as long as a first copy would; the 3h 12m already spent is lost and cannot be recovered",
-		"what confirming costs is the whole copy over again, not just the hours already lost")
+	assert.NotContains(t, plan, "3h 12m of copying",
+		"the copy's age dates its last checkpoint, so it can never be read as elapsed copying")
+	assert.NotContains(t, plan, "3h 12m already spent",
+		"a live copy checkpoints continuously, so its age understates what discarding costs")
+	assert.Contains(t, plan, "it runs as long as a first copy would; the work already done is lost and cannot be recovered",
+		"what confirming costs is the whole copy over again, named as work rather than as a duration")
 	assert.Contains(t, plan, "apply the same schema change that started it")
 
 	// A locked apply that stopped for confirmation is the same situation: the
@@ -72,8 +74,8 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 
 	assert.Contains(t, out, "**Applying automatically**",
 		"the fixture is the automatic path, which is what makes the section a record")
-	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target, 3h 12m of copying")
-	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it")
+	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, out, "- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it")
 	assert.NotContains(t, out, "⚠️ **This apply destroys work in progress**",
 		"a reader with no move to make is being informed, not warned")
 	assert.NotContains(t, out, "**Applying destroys work in progress**",
@@ -107,7 +109,7 @@ func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *test
 		},
 	})
 
-	assert.Contains(t, out, "- `orders`, `line items` in `app db`: `futurereason value`\n",
+	assert.Contains(t, out, "- `orders`, `line items` in `app db` (last progress 3h 12m ago): `futurereason value`\n",
 		"identifiers and an untranslated reason render as one entry on one line")
 	assert.NotContains(t, out, "ord`ers", "a backtick in an identifier cannot end the code span early")
 	assert.NotContains(t, out, "future`reason", "a backtick in a reason cannot end the code span early")
@@ -181,12 +183,45 @@ func TestRenderPlanComment_AdoptedCopyReadsAsContinuation(t *testing.T) {
 
 	assert.Contains(t, out, "♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued")
 	assert.Contains(t, out, "- `orders`, `products` in `testapp` (last progress 3h 12m ago)")
-	assert.Contains(t, out, "picks up where the existing copy stopped")
+	assert.Contains(t, out, "Applying picks up where the existing copy stopped")
 	assert.NotContains(t, out, "destroys work in progress", "an adopted copy is not a discard warning")
 }
 
+// Both sections can land on one comment, and an apply already under way is not
+// a decision anyone is being offered. Each then describes what the apply is
+// doing rather than what applying would do, so the two read as one disclosure
+// instead of a warning spliced onto a hypothetical. The plural follows the
+// count: several resumed copies stopped, not one.
+func TestRenderPlanComment_AdoptedCopyReadsAsAnEventOnceApplying(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
+		LockOwner: "block/schemabot#42",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+		DiscardedCopies: []ExistingCopyData{
+			{Namespace: "orders_a", Tables: []string{"orders"}, Reason: engine.DiscardCheckpointExpired, Age: "9d 4h"},
+		},
+		AdoptedCopies: []ExistingCopyData{
+			{Namespace: "orders_b", Tables: []string{"orders"}, Age: "45s"},
+			{Namespace: "orders_c", Tables: []string{"products"}, Age: "2m 30s"},
+		},
+	})
+
+	assert.Contains(t, out, "**Applying automatically**",
+		"the fixture is the automatic path, which is what makes both sections a record")
+	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**")
+	assert.Contains(t, out, "♻️ **Resuming work in progress**: **2** unfinished copies on the target will be continued")
+	assert.Contains(t, out, "This apply picks up where the existing copies stopped rather than starting over.")
+	assert.NotContains(t, out, "Applying picks up",
+		"the hypothetical subject belongs to a comment where applying is still a choice")
+}
+
 // An expired checkpoint is a different cause from a changed statement, and the
-// remedy differs, so the section names which one applies.
+// remedy differs, so the section names which one applies. Its age is what
+// expired it, so the entry reads as the staleness the cause describes rather
+// than as time spent copying.
 func TestRenderPlanComment_DiscardedCopyNamesExpiryCause(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
@@ -196,8 +231,10 @@ func TestRenderPlanComment_DiscardedCopyNamesExpiryCause(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target, 9d 4h of copying")
-	assert.Contains(t, out, "- `orders` in `testapp`: it is too old to resume")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, out, "- `orders` in `testapp` (last progress 9d 4h ago): it is too old to resume")
+	assert.NotContains(t, out, "9d 4h of copying",
+		"an expired checkpoint is stale by construction; naming it as copying time contradicts the cause below it")
 }
 
 // A copy covering only part of the schema change is discarded for a cause the
@@ -212,13 +249,14 @@ func TestRenderPlanComment_DiscardedCopyNamesPartialCoverage(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "- `orders` in `testapp`: it covers only some of the tables this schema change alters")
+	assert.Contains(t, out, "- `orders` in `testapp` (last progress 3h 12m ago): it covers only some of the tables this schema change alters")
 }
 
-// Several discarded copies have several ages, and no one of them describes what
-// applying costs, so each keeps its own age on its own entry rather than one
-// standing in for the rest in the headline.
-func TestRenderPlanComment_SeveralDiscardedCopiesKeepTheirOwnAges(t *testing.T) {
+// Several discarded copies were started by several schema changes, so the
+// section counts them as copies and its remedy speaks of changes and of them —
+// telling an operator to re-apply "the schema change that started it" when two
+// statements started two copies names nothing they can act on.
+func TestRenderPlanComment_SeveralDiscardedCopiesReadAsPlural(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
 		Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"}}},
@@ -228,11 +266,14 @@ func TestRenderPlanComment_SeveralDiscardedCopiesKeepTheirOwnAges(t *testing.T) 
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **2** unfinished copies on the target\n",
-		"no single age speaks for both copies, so the headline carries none")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **2** unfinished copies on the target\n")
 	assert.Contains(t, out, "- `orders` in `orders_a` (last progress 3h 12m ago): the schema change differs from the one that started it")
 	assert.Contains(t, out, "- `orders` in `orders_b` (last progress 9d 4h ago): it is too old to resume")
 	assert.Contains(t, out, "the work already done is lost and cannot be recovered")
+	assert.Contains(t, out, "To continue the existing copies instead, apply the same schema changes that started them.",
+		"two copies were started by two schema changes, so the remedy names both in the plural")
+	assert.NotContains(t, out, "the same schema change that started it",
+		"the singular remedy points at one statement an operator cannot identify from two copies")
 }
 
 // A copy with no recorded progress to date it by still names the tables it
@@ -247,11 +288,71 @@ func TestRenderPlanComment_DiscardedCopyWithoutAge(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n",
-		"an unknown age is omitted rather than rendered as a bare zero in the headline")
-	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it",
+		"an unknown age is omitted rather than rendered as a bare zero, which would read as a copy that just started")
 	assert.Contains(t, out, "the work already done is lost and cannot be recovered")
 	assert.NotContains(t, out, "last progress")
+}
+
+// A copy sits on one environment's target, so two environments planning the
+// same DDL are not the same disclosure. Every environment SchemaBot serves in
+// production posts through the multi-environment comment, and it is the comment
+// an apply is confirmed from, so an environment whose target holds discardable
+// work must show that in its own section rather than being folded under a
+// combined header that speaks for a target it was never read from.
+func TestRenderMultiEnvPlanComment_IdenticalDDLStillDisclosesOneEnvironmentsCopy(t *testing.T) {
+	alterOrders := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+	}}
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging": {Environment: "staging", IsMySQL: true, Changes: alterOrders},
+			"production": {
+				Environment: "production", IsMySQL: true, Changes: alterOrders,
+				DiscardedCopies: []ExistingCopyData{
+					{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "9h 40m"},
+				},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "### Staging\n", "the environment holding no copy keeps its own section")
+	assert.Contains(t, out, "### Production\n", "the environment holding the copy keeps its own section")
+	assert.NotContains(t, out, "### Staging & Production",
+		"one section cannot speak for two targets when only one of them holds discardable work")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target")
+	assert.Contains(t, out, "- `orders` in `testapp` (last progress 9h 40m ago): the schema change differs from the one that started it")
+}
+
+// The two dispositions are opposite promises, so an environment that resumes
+// its copy and one that destroys its copy can never share a section — the
+// surviving promise would be shown over work that is about to be destroyed.
+func TestRenderMultiEnvPlanComment_AdoptAndDiscardNeverShareASection(t *testing.T) {
+	alterOrders := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+	}}
+	copyOnOrders := ExistingCopyData{Namespace: "testapp", Tables: []string{"orders"}, Age: "45s"}
+	discarded := copyOnOrders
+	discarded.Reason = engine.DiscardCheckpointExpired
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging":    {Environment: "staging", IsMySQL: true, Changes: alterOrders, AdoptedCopies: []ExistingCopyData{copyOnOrders}},
+			"production": {Environment: "production", IsMySQL: true, Changes: alterOrders, DiscardedCopies: []ExistingCopyData{discarded}},
+		},
+	})
+
+	assert.NotContains(t, out, "### Staging & Production")
+	assert.Contains(t, out, "♻️ **Resuming work in progress**")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**")
 }
 
 // A plan against a clean target renders exactly as it always has: no copy

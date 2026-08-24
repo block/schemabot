@@ -288,7 +288,7 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
 	}
 	if len(data.AdoptedCopies) > 0 {
-		writeAdoptedCopies(&sb, data.AdoptedCopies)
+		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
 	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
@@ -1394,7 +1394,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
 	}
 	if len(plan.AdoptedCopies) > 0 {
-		writeAdoptedCopies(sb, plan.AdoptedCopies)
+		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
 	}
 
 	// Unsafe changes warning
@@ -1521,51 +1521,24 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	return false
 }
 
-// driftIdentical reports whether two plans' deployment-drift rollups render the
-// same, so environments are only deduplicated when their drift is identical too.
-func driftIdentical(a, b *DeploymentDriftData) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.Computed != b.Computed || a.Clean != b.Clean || len(a.Deployments) != len(b.Deployments) {
-		return false
-	}
-	for i := range a.Deployments {
-		if a.Deployments[i] != b.Deployments[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// plansIdentical checks if two plans have the same DDL statements. Plans that
-// excluded different namespaces are never identical: deduplicating them into
-// one section would show one environment's exclusion disclosure for both.
+// plansIdentical reports whether two environments' plan sections are the same
+// section, so one may stand in for both under a combined header.
+//
+// It answers that by rendering both and comparing the bytes, because every
+// disclosure in a section is a promise about one environment's target and
+// standing in for the other means making that promise for a target it was never
+// read from. Identical DDL does not make those promises identical: execution
+// policy, the task history that attributes a change, and unfinished copies on
+// the target are all resolved per environment, so a section can differ on any of
+// them while the statements match. Comparing what the section says is the only
+// comparison that stays right as sections gain disclosures — a field-by-field
+// version silently drops each one added after it was written, and drops it from
+// the comment operators apply from.
 func plansIdentical(a, b *PlanCommentData) bool {
-	if !slices.Equal(a.IgnoredNamespaces, b.IgnoredNamespaces) {
-		return false
-	}
-	if len(a.Changes) != len(b.Changes) {
-		return false
-	}
-	for i, aChange := range a.Changes {
-		bChange := b.Changes[i]
-		if aChange.Keyspace != bChange.Keyspace {
-			return false
-		}
-		if len(aChange.Statements) != len(bChange.Statements) {
-			return false
-		}
-		for j, stmt := range aChange.Statements {
-			if stmt != bChange.Statements[j] {
-				return false
-			}
-		}
-		if aChange.VSchemaChanged != bChange.VSchemaChanged || aChange.VSchemaDiff != bChange.VSchemaDiff {
-			return false
-		}
-	}
-	return driftIdentical(a.DeploymentDrift, b.DeploymentDrift)
+	var renderedA, renderedB strings.Builder
+	writeEnvironmentPlanSection(&renderedA, a)
+	writeEnvironmentPlanSection(&renderedB, b)
+	return renderedA.String() == renderedB.String()
 }
 
 // capitalizeEnvNames joins environment names with " & " and capitalizes each.
