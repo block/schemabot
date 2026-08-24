@@ -49,6 +49,33 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "users_c")
 }
 
+// A keyed apply runs many operations on one deployment, distinguished only by
+// operation key. Each section must render its own operation's key and external
+// operation ID — never a sibling's — so an operator can correlate every section
+// with its stored apply_operation. The external apply ID is shared across the
+// deployment, so an operation that has not dispatched yet still shows it.
+func TestWriteProgressKeyedApplySectionsCarryOwnOperationIdentity(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-keyed",
+			Environment: "staging",
+			State:       state.Apply.Running,
+			Operations: []ProgressOperation{
+				{Deployment: "cake", OperationKey: "commerce/-80/users", ExternalID: "remote-apply-shared", ExternalOperationID: "remote-op-1", Target: "commerce-db", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "cake", OperationKey: "commerce/80-/users", ExternalOperationID: "remote-op-2", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+		})
+	})
+
+	assertLess(t, output, "✅ cake · commerce/-80/users — completed (commerce-db)", "External operation ID: remote-op-1")
+	assertLess(t, output, "External operation ID: remote-op-1", "🔄 cake · commerce/80-/users — running table copy")
+	assertLess(t, output, "🔄 cake · commerce/80-/users — running table copy", "External operation ID: remote-op-2")
+	assert.Equal(t, 2, strings.Count(output, "External apply ID: remote-apply-shared"),
+		"both sections must show the deployment's shared external apply ID, including the operation that has not recorded one itself")
+	assert.Equal(t, 2, strings.Count(output, "(commerce-db)"),
+		"the second operation's section must inherit the deployment target from its sibling")
+}
+
 // Under on_failure continue a failed deployment with a still-running sibling
 // holds the rollout running_degraded: the aggregate shows "running (degraded)"
 // rather than a premature "failed", surfaces the first failure, and offers no
