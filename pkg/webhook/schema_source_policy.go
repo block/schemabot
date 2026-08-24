@@ -18,18 +18,26 @@ import (
 // none of the changed schema is expected to do nothing while the deployment that
 // does own it handles the command. Posting "config not authorized" or "database
 // not configured" from every non-owning deployment would be exactly the noise
-// fan-out removes. Scoped to the not-owned error classes only — real failures
-// still surface. A -t-scoped command (tenant != "") always reports, since it
-// named a specific deployment.
+// fan-out removes. A participant also defers repository-discovery outcomes
+// that its deployment-local schema directory hints cannot resolve: the leader
+// owns the fleet-authoritative reply. Real failures still surface. A -t-scoped
+// command (tenant != "") always reports, since it named a specific deployment.
 func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) bool {
 	if tenant != "" {
 		return false
 	}
 	config, ok := h.serverConfig()
-	if !ok || config.AggregateRoleForRepo(repo) == "" {
+	if !ok {
 		return false
 	}
-	return isSchemaUnownedByDeploymentError(err)
+	role := config.AggregateRoleForRepo(repo)
+	if role == "" {
+		return false
+	}
+	if isSchemaUnownedByDeploymentError(err) {
+		return true
+	}
+	return role == api.AggregateRoleParticipant && isParticipantDiscoveryDeferError(err)
 }
 
 // isSchemaUnownedByDeploymentError reports whether err means the command
@@ -46,6 +54,43 @@ func isSchemaUnownedByDeploymentError(err error) bool {
 	}
 	var notConfigured *api.DatabaseNotConfiguredError
 	return errors.As(err, &notConfigured)
+}
+
+// isParticipantDiscoveryDeferError reports discovery outcomes that are not
+// fleet-authoritative on an aggregate participant. A participant's configured
+// schema directory hints cover only its own databases, so failing to find a
+// requested database or failing to enumerate a truncated repository cannot
+// establish that the fleet has no matching schema. The aggregate leader must
+// answer from its broader view while the participant stays silent. A raw
+// ErrGitTreeTruncated is not enough: schema loading can return the same error
+// after this deployment established ownership, and that real failure must
+// still surface.
+func isParticipantDiscoveryDeferError(err error) bool {
+	var notFound *ghclient.DatabaseNotFoundError
+	if errors.As(err, &notFound) {
+		return true
+	}
+	var incompleteOwnership *incompleteSchemaOwnershipDiscoveryError
+	return errors.As(err, &incompleteOwnership)
+}
+
+type incompleteSchemaOwnershipDiscoveryError struct {
+	err error
+}
+
+func (e *incompleteSchemaOwnershipDiscoveryError) Error() string {
+	return fmt.Sprintf("incomplete schema ownership discovery: %v", e.err)
+}
+
+func (e *incompleteSchemaOwnershipDiscoveryError) Unwrap() error {
+	return e.err
+}
+
+func markIncompleteSchemaOwnershipDiscovery(err error) error {
+	if errors.Is(err, ghclient.ErrGitTreeTruncated) {
+		return &incompleteSchemaOwnershipDiscoveryError{err: err}
+	}
+	return fmt.Errorf("resolve schema ownership: %w", err)
 }
 
 // silentOnUnscopedFanOut reports whether a "nothing to do on this deployment"
@@ -206,12 +251,12 @@ func (h *Handler) createUnscopedSchemaRequestFromPR(ctx context.Context, client 
 func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, source string) (*ghclient.SchemabotConfig, string, error) {
 	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
-		return nil, "", err
+		return nil, "", markIncompleteSchemaOwnershipDiscovery(err)
 	}
 	if len(configs) == 0 {
 		config, configDir, _, err := client.FindConfigInRepo(ctx, repo, pr)
 		if err != nil {
-			return nil, "", err
+			return nil, "", markIncompleteSchemaOwnershipDiscovery(err)
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, source) {
 			return nil, "", h.unownedDiscoveredConfigError(repo, config, configDir)

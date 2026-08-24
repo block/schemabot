@@ -2,12 +2,14 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -69,6 +71,33 @@ func TestSkipUnownedUnscopedCommand(t *testing.T) {
 	require.Error(t, envNotConfigured)
 	assert.False(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", envNotConfigured),
 		"an unconfigured environment for an owned database must still surface")
+
+	// Repository discovery on a participant is limited to that deployment's
+	// schema directory hints. A miss or a truncated-tree result from that local
+	// view defers to the leader, which owns the fleet-authoritative response.
+	databaseNotFound := &ghclient.DatabaseNotFoundError{DatabaseName: "orders"}
+	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", databaseNotFound),
+		"a participant defers a database discovery miss to the leader")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", databaseNotFound),
+		"the leader reports a fleet-authoritative database discovery miss")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "tenant-b", databaseNotFound),
+		"a -t-scoped database discovery miss still surfaces")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/plain-repo", "", databaseNotFound),
+		"a database discovery miss on a non-aggregate repo still surfaces")
+
+	rawTruncatedTree := fmt.Errorf("load owned schema: %w", ghclient.ErrGitTreeTruncated)
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", rawTruncatedTree),
+		"a participant must surface truncation after ownership is established")
+
+	truncatedTree := markIncompleteSchemaOwnershipDiscovery(fmt.Errorf("discover configs: %w", ghclient.ErrGitTreeTruncated))
+	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", truncatedTree),
+		"a participant defers incomplete repository discovery to the leader")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", truncatedTree),
+		"the leader surfaces incomplete repository discovery")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "tenant-b", truncatedTree),
+		"a -t-scoped incomplete repository discovery error still surfaces")
+	assert.False(t, h.skipUnownedUnscopedCommand("octocat/plain-repo", "", truncatedTree),
+		"incomplete repository discovery on a non-aggregate repo still surfaces")
 }
 
 // On an aggregate repo an unscoped command fans out to every deployment, so a

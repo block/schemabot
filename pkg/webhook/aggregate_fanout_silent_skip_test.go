@@ -62,12 +62,53 @@ func newFanOutSkipHandler(t *testing.T, cfg *api.ServerConfig) (*Handler, *http.
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
+	installClient.SetConfigDirHints(cfg)
 	h := &Handler{
 		service:   api.New(&emptyStorage{}, cfg, nil, testLogger()),
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:    testLogger(),
 	}
 	return h, mux, comments
+}
+
+// serveTruncatedRepoWithChangedSchemaFile registers a PR whose changed schema
+// file has no reachable config and whose recursive repository tree is
+// truncated. A participant cannot resolve ownership from this local view.
+func serveTruncatedRepoWithChangedSchemaFile(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "schema/users.sql",
+			"status":   "modified",
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": true,
+			"tree":      []any{},
+		}))
+	})
+}
+
+func serveCompleteRootConfigTree(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": false,
+			"tree": []map[string]string{{
+				"path": "schemabot.yaml",
+				"type": "blob",
+				"sha":  "config-sha",
+			}},
+		}))
+	})
 }
 
 // serveSchemaConfigForDatabase registers the GitHub content routes config
@@ -211,6 +252,37 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 
 		body := requireComment(t, comments, "database-not-configured plan error")
 		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+	})
+}
+
+// A database-scoped plan still fans out when it does not name a tenant. If a
+// participant's exhaustive local discovery cannot find that database, only
+// the leader may publish Database Not Found as the fleet-authoritative answer.
+func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
+	barePlan := func(h *Handler) {
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, true, 0)
+	}
+
+	t.Run("participant stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+		serveSchemaConfigForDatabase(t, mux, "inventory")
+		serveCompleteRootConfigTree(t, mux)
+
+		barePlan(h)
+
+		assert.Empty(t, comments, "a participant database discovery miss must defer silently to the leader")
+	})
+
+	t.Run("leader reports database not found", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "inventory")
+		serveCompleteRootConfigTree(t, mux)
+
+		barePlan(h)
+
+		body := requireComment(t, comments, "database-not-found leader plan error")
+		assert.Contains(t, body, "Database Not Found")
+		assert.Contains(t, body, "orders")
 	})
 }
 

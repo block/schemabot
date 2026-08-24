@@ -108,6 +108,21 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 	})
 }
 
+// An aggregate participant cannot make a fleet-wide ownership decision when
+// its local schema directory hints cannot recover config discovery from a
+// truncated repository. It defers silently to the leader instead of retrying
+// a permanent condition and eventually posting Apply Failed.
+func TestApplyCommandCoreParticipantTruncatedDiscoveryDefersToLeader(t *testing.T) {
+	h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+	serveTruncatedRepoWithChangedSchemaFile(t, mux)
+
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "production", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+	require.NoError(t, err)
+	assert.False(t, retry, "participant discovery uncertainty is a terminal silent defer, not retryable work")
+	assert.Empty(t, comments, "the participant must not post Apply Failed for incomplete fleet discovery")
+}
+
 // A GitHub read failure during config discovery (here, fetching the changed
 // schemabot.yaml returns a server error) is a transient infrastructure failure:
 // the same delivery could succeed once GitHub recovers, so the core must report
