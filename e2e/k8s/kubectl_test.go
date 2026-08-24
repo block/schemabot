@@ -199,7 +199,36 @@ func freeLocalPort(t *testing.T) int {
 var (
 	controlPlaneEndpointMu     sync.Mutex
 	cachedControlPlaneEndpoint string
+	cachedControlPlaneForward  *exec.Cmd
 )
+
+// TestMain owns the suite's shared control-plane port-forward. The forward
+// deliberately outlives the test that started it, so no test cleanup can end
+// it; without an owner here, a run against a stack that is not torn down
+// afterwards (a manual `go test ./e2e/k8s/...`) would leave stray kubectl
+// processes behind for every forward the suite had to replace.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	controlPlaneEndpointMu.Lock()
+	stopControlPlaneForwardLocked()
+	controlPlaneEndpointMu.Unlock()
+	os.Exit(code)
+}
+
+// stopControlPlaneForwardLocked ends the cached forward, if this suite started
+// one. Callers must hold controlPlaneEndpointMu.
+func stopControlPlaneForwardLocked() {
+	if cachedControlPlaneForward == nil {
+		return
+	}
+	if cachedControlPlaneForward.Process != nil {
+		// The reaping goroutine's Wait collects it; killing an already-exited
+		// process is the expected case when its pod went away on its own.
+		_ = cachedControlPlaneForward.Process.Kill()
+	}
+	cachedControlPlaneForward = nil
+	cachedControlPlaneEndpoint = ""
+}
 
 // controlPlaneEndpoint returns a health-checked HTTP endpoint for the base
 // stack's control plane. It starts from the suite-wide E2E_SCHEMABOT_URL
@@ -223,7 +252,8 @@ func controlPlaneEndpoint(t *testing.T) string {
 	}
 
 	t.Logf("control-plane endpoint %s is not answering /health; starting a fresh port-forward", cachedControlPlaneEndpoint)
-	cachedControlPlaneEndpoint = startControlPlanePortForward(t)
+	stopControlPlaneForwardLocked()
+	cachedControlPlaneEndpoint, cachedControlPlaneForward = startControlPlanePortForward(t)
 	return cachedControlPlaneEndpoint
 }
 
@@ -250,14 +280,16 @@ func controlPlaneHealthy(t *testing.T, endpoint string) bool {
 }
 
 // startControlPlanePortForward forwards a free local port to the base stack's
-// control-plane service and waits for it to answer /health. The forward is
-// deliberately not tied to the calling test's lifecycle: controlPlaneEndpoint
-// caches it as the shared suite endpoint, so killing it when the creating test
-// finishes would strand every later test. The kubectl process exits on its own
-// when its pinned pod goes away (another control-plane crash, or the suite
-// teardown deleting the namespace) — controlPlaneEndpoint then detects the
-// dead endpoint and forwards again.
-func startControlPlanePortForward(t *testing.T) string {
+// control-plane service, waits for it to answer /health, and returns the
+// endpoint alongside the process serving it. The forward is deliberately not
+// tied to the calling test's lifecycle: controlPlaneEndpoint caches it as the
+// shared suite endpoint, so killing it when the creating test finishes would
+// strand every later test. It is instead owned by the suite, and ended in
+// TestMain. The kubectl process can also exit on its own when its pinned pod
+// goes away (another control-plane crash, or the suite teardown deleting the
+// namespace) — controlPlaneEndpoint then detects the dead endpoint and
+// forwards again.
+func startControlPlanePortForward(t *testing.T) (string, *exec.Cmd) {
 	t.Helper()
 	port := freeLocalPort(t)
 	// WithoutCancel detaches the process from the creating test's lifetime —
@@ -266,13 +298,13 @@ func startControlPlanePortForward(t *testing.T) string {
 	require.NoError(t, cmd.Start())
 	// Reap the kubectl process whenever it exits so a dead forward does not
 	// linger as a zombie for the rest of the test binary. Its exit error is
-	// expected (the pinned pod went away) and outlives the creating test, so
-	// there is no test to report it to.
+	// expected (the pinned pod went away, or TestMain killed it) and outlives
+	// the creating test, so there is no test to report it to.
 	go func() { _ = cmd.Wait() }()
 
 	endpoint := fmt.Sprintf("http://localhost:%d", port)
 	waitForHTTPStatus(t, endpoint+"/health", http.StatusOK, testutil.PollDeadline)
-	return endpoint
+	return endpoint, cmd
 }
 
 func startDataPlanePodGRPCPortForward(t *testing.T, pod string) string {
