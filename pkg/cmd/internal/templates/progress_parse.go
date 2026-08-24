@@ -42,6 +42,7 @@ type ProgressData struct {
 // ProgressOperation represents progress for one deployment operation.
 type ProgressOperation struct {
 	Deployment          string
+	OperationKey        string
 	ExternalID          string
 	ExternalOperationID string
 	Target              string
@@ -164,6 +165,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
+			OperationKey:        op.OperationKey,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
 			Target:              op.Target,

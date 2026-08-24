@@ -906,7 +906,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: no active schema change", apply.ApplyIdentifier, remoteID)
 	}
-	remoteState := ProtoStateToStorage(progress.State)
+	remoteState := remoteProgressApplyState(progress.State, progress.Tables)
 	if remoteState == "" {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
@@ -917,7 +917,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	}
 	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
-	if isTerminalProtoState(progress.State) {
+	if remoteProgressIsTerminal(progress.State, progress.Tables) {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
@@ -1021,7 +1021,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: no active schema change", apply.ApplyIdentifier, remoteID)
 	}
-	remoteState := ProtoStateToStorage(progress.State)
+	remoteState := remoteProgressApplyState(progress.State, progress.Tables)
 	if remoteState == "" {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
@@ -1029,7 +1029,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
 	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
-	if isTerminalProtoState(progress.State) {
+	if remoteProgressIsTerminal(progress.State, progress.Tables) {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
@@ -1089,7 +1089,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 				"error", err)...)
 		return false, nil
 	}
-	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !remoteProgressIsTerminal(progress.State, progress.Tables) {
 		logger.WarnContext(ctx, "remote gRPC stop error found nonterminal progress; durable stop request remains pending for operator retry",
 			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
@@ -1157,7 +1157,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 				"error", err)...)
 		return false, nil
 	}
-	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !remoteProgressIsTerminal(progress.State, progress.Tables) {
 		logger.WarnContext(ctx, "remote gRPC cancel error found nonterminal progress; durable cancel request remains pending for operator retry",
 			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
@@ -2401,13 +2401,15 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		message := fmt.Sprintf("remote apply %s returned no active schema change during cutover preflight", remoteID)
 		return false, c.failMissingRemoteApply(ctx, apply, message, nil, scope)
 	}
-	remoteState := ProtoStateToStorage(resp.State)
+	remoteState := remoteProgressApplyState(resp.State, resp.Tables)
 	if remoteState == "" {
 		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): unmapped remote state %s", scope.applyOperationID, apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 	}
 	// Remote already terminal: reconcile from this poll and stop. Do not re-send
-	// Cutover.
-	if isTerminalProtoState(resp.State) {
+	// Cutover. A retryable pause is not terminal: it falls through to the
+	// not-parked branch below and the operator retries once the data plane's
+	// own recovery brings the copy back to the barrier.
+	if remoteProgressIsTerminal(resp.State, resp.Tables) {
 		now := time.Now()
 		apply.State = remoteState
 		apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
@@ -2560,8 +2562,41 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				c.logApplyWarning(ctx, apply, message)
 				return fmt.Errorf("check stopped gRPC apply %s before start: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 			}
+			if remoteApplyPausedForDataPlaneRetry(resp.State, resp.Tables) {
+				// The data plane is retrying the apply on its own; it is
+				// neither stopped (startable) nor settled (reconcilable).
+				if startRequested {
+					// Settle the start request durably instead of leaving it
+					// pending: repeating this check every claim would write a
+					// warning per cycle, and the answer will not change — the
+					// data plane resumes without a start.
+					message := "The schema change is already retrying automatically; there is nothing to start"
+					logger.Info("remote gRPC stopped-state check found a data-plane retryable pause; rejecting the start request as unneeded",
+						apply.MutableLogAttrs()...)
+					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
+						return failErr
+					}
+				}
+				if state.IsState(apply.State, state.Apply.Stopped) {
+					// A stored stop with a remote that is self-retrying is
+					// contradictory; exit without adopting any state and let a
+					// later claim re-check once the data plane settles.
+					message := "Remote apply is paused for a data-plane retry while the stored apply reads stopped; operator will re-check on a later claim"
+					logger.Warn("remote gRPC stopped-state check found a data-plane retryable pause on a stopped stored apply; operator will re-check on a later claim",
+						apply.MutableLogAttrs()...)
+					c.logApplyWarning(ctx, apply, message)
+					return fmt.Errorf("check stopped gRPC apply %s before start: remote apply is paused for a data-plane retry", apply.ApplyIdentifier)
+				}
+				// The stored apply is active: hold the drive and poll through
+				// the pause like any other in-flight snapshot.
+				return c.pollForCompletion(ctx, apply, false, scope,
+					shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
+			}
 			apply.State = remoteState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
+			// The pause guard above already returned for a retryable pause, so
+			// a terminal proto state here is a settled verdict — no table
+			// refinement left to apply.
 			if isTerminalProtoState(resp.State) && !state.IsState(remoteState, state.Apply.Stopped) {
 				now := time.Now()
 				if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
@@ -3612,6 +3647,76 @@ func remoteProgressErrorMessage(applyState, remoteErrorMessage, existingErrorMes
 	return ""
 }
 
+// remoteApplyPausedForDataPlaneRetry reports whether a remote progress
+// snapshot is a retryable pause rather than a final verdict: the data plane's
+// own recovery will claim another attempt, so the control plane must keep
+// polling instead of terminalizing — a terminal verdict here would orphan a
+// live remote apply that can still cut over. A current data plane says so
+// directly with STATE_FAILED_RETRYABLE. A data plane from before that wire
+// state reports the pause as STATE_FAILED and reveals the retryable truth only
+// on the per-table status strings, so a STATE_FAILED snapshot with a table
+// still in failed_retryable is also a pause.
+func remoteApplyPausedForDataPlaneRetry(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) bool {
+	if protoState == ternv1.State_STATE_FAILED_RETRYABLE {
+		return true
+	}
+	if protoState != ternv1.State_STATE_FAILED {
+		return false
+	}
+	for _, remoteTask := range remoteTasks {
+		if remoteTask == nil {
+			continue
+		}
+		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status), state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteProgressIsTerminal reports whether a remote progress snapshot settles
+// the apply. It refines isTerminalProtoState with the pause check: a snapshot
+// that is really a retryable pause is not terminal. A STATE_FAILED snapshot
+// with no retryable table (for example a dispatch-level failure that never
+// created tasks, or exhausted retries) stays terminal — the guard only holds
+// the drive open when the snapshot proves the data plane will retry.
+func remoteProgressIsTerminal(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) bool {
+	return isTerminalProtoState(protoState) && !remoteApplyPausedForDataPlaneRetry(protoState, remoteTasks)
+}
+
+// remoteProgressApplyState maps a remote progress snapshot to the stored apply
+// state it represents: a snapshot that is a retryable pause maps to
+// failed_retryable, not failed, even when an older data plane reported the
+// pause as STATE_FAILED. Like ProtoStateToStorage it returns "" for an
+// unmapped state.
+func remoteProgressApplyState(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) string {
+	mapped := ProtoStateToStorage(protoState)
+	if mapped == "" {
+		return ""
+	}
+	if remoteApplyPausedForDataPlaneRetry(protoState, remoteTasks) {
+		return state.Apply.FailedRetryable
+	}
+	return mapped
+}
+
+// remoteTaskResumedFromRetryablePause reports whether a remote task status
+// shows the data plane actively driving the task again after a retryable
+// pause. A stored failed_retryable task normally pins its state so a stale
+// engine poll cannot hide an operator-written pause, but the remote Progress
+// response reads the data plane's durable rows: an actively driving status
+// after a pause means a recovery attempt really re-claimed the task, and the
+// mirror must follow it. Pending does not count — the data plane parks
+// requeued tasks there before a recovery claims them — and terminal statuses
+// flow through taskStateWithNoBackwardProgress, which already admits them.
+func remoteTaskResumedFromRetryablePause(remoteTaskState string) bool {
+	return !state.IsTerminalTaskState(remoteTaskState) &&
+		!state.IsState(remoteTaskState,
+			state.Task.FailedRetryable,
+			state.Task.Stopped,
+			state.Task.Pending)
+}
+
 // syncStoredTasksFromRemoteTasks mirrors the per-task table progress fields
 // returned by remote Tern. It only copies the remote task snapshot; terminal
 // remote applies are persisted only after those copied task states are resolved.
@@ -3633,9 +3738,20 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 		}
 		oldTaskState := storedTask.State
 		remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
-		if state.IsState(remoteTaskState, state.Task.Stopped) {
+		switch {
+		case state.IsState(remoteTaskState, state.Task.Stopped):
 			storedTask.State = remoteTaskState
-		} else {
+		case state.IsState(storedTask.State, state.Task.FailedRetryable) &&
+			state.RecognizedTaskStatus(remoteTask.Status) &&
+			remoteTaskResumedFromRetryablePause(remoteTaskState):
+			// The data plane owns recovery of its retryable failures: the
+			// stored pause must follow the remote's new attempt instead of
+			// pinning "Retrying" on the operator surfaces while the data
+			// plane is actively copying. Un-pinning needs positive evidence:
+			// an unrecognized remote status normalizes to running as a
+			// fail-open default, which is no proof the row left its pause.
+			storedTask.State = remoteTaskState
+		default:
 			storedTask.State = taskStateWithNoBackwardProgress(storedTask.State, remoteTaskState)
 		}
 		if !state.IsState(storedTask.State, remoteTaskState) {
@@ -3777,7 +3893,7 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			pct = 100
 		}
 		shardTask := &storage.Task{
-			TaskIdentifier:   newTaskIdentifier(),
+			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          storedTask.ApplyID,
 			ApplyOperationID: storedTask.ApplyOperationID,
 			PlanID:           storedTask.PlanID,
@@ -3916,6 +4032,23 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, all
 	if state.IsTerminalApplyState(remoteApplyState) {
 		return remoteApplyState
 	}
+	// A remote retryable pause parks the apply between data-plane recovery
+	// attempts. The stored apply must not adopt it while a live drive holds
+	// the row: failed_retryable is immediately claimable (no stale-lease
+	// requirement), so persisting it mid-drive would invite a second driver
+	// onto the same apply. The task rows carry the pause for operator
+	// surfaces; the drive keeps polling until the data plane settles.
+	if state.IsState(remoteApplyState, state.Apply.FailedRetryable) {
+		// The in-memory apply can still carry its pre-claim snapshot: the
+		// claim moves the row to running but hands the driver the pre-claim
+		// state. Echoing a parked snapshot back would persist an immediately
+		// claimable state onto a leased row, so normalize it to the running
+		// state the claim already wrote.
+		if state.IsState(storedApplyState, state.Apply.FailedRetryable, state.Apply.Pending) {
+			return state.Apply.Running
+		}
+		return storedApplyState
+	}
 	if allowStoppedStoredApply && state.IsState(storedApplyState, state.Apply.Stopped) {
 		return remoteApplyState
 	}
@@ -3991,6 +4124,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 	consecutiveProgressErrors := 0
 	loggedStoppedAfterStart := false
+	loggedRetryablePause := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
 	lastHeartbeatSuccess := time.Now()
@@ -4090,7 +4224,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// must return a concrete state; unknown states are unsafe to reconcile.
 			now := time.Now()
 			oldApplyState := apply.State
-			newState := ProtoStateToStorage(resp.State)
+			newState := remoteProgressApplyState(resp.State, resp.Tables)
 			if newState == "" {
 				message := fmt.Sprintf("Remote progress returned unmapped apply state %s; operator will retry without changing stored state", remoteApplyStateDescription(resp.State))
 				logger.Warn("remote gRPC progress returned unmapped apply state; operator will retry without changing stored state",
@@ -4104,6 +4238,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				apply.StartedAt = &now
 			}
 			remoteApplyState := newState
+			if state.IsState(remoteApplyState, state.Apply.FailedRetryable) {
+				if !loggedRetryablePause {
+					logger.Info("remote gRPC apply paused for data-plane retry; drive keeps polling and will not terminalize",
+						append(apply.MutableLogAttrs(), "remote_error", resp.ErrorMessage)...)
+					loggedRetryablePause = true
+				}
+			} else {
+				loggedRetryablePause = false
+			}
 			if allowStoppedAfterStart && state.IsState(remoteApplyState, state.Apply.Stopped) {
 				if terminalTaskState, ok := terminalApplyStateFromRemoteTaskProgress(resp.Tables); ok {
 					remoteApplyState = terminalTaskState
@@ -4149,8 +4292,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
-			terminal := isTerminalProtoState(resp.State)
-			if terminal {
+			if remoteProgressIsTerminal(resp.State, resp.Tables) {
 				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 			}
 			storedTasks, err := c.loadApplyTasks(ctx, apply, scope)

@@ -1352,7 +1352,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 	}
 	for _, sh := range tp.Shards {
 		shardTask := &storage.Task{
-			TaskIdentifier:   newTaskIdentifier(),
+			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          table.ApplyID,
 			ApplyOperationID: table.ApplyOperationID,
 			PlanID:           table.PlanID,

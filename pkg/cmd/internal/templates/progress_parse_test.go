@@ -19,6 +19,7 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 		Operations: []*apitypes.ProgressOperationResponse{
 			{
 				Deployment:          "deploy-a",
+				OperationKey:        "commerce/-80/users",
 				ExternalID:          "remote-apply-a",
 				ExternalOperationID: "remote-operation-a",
 				Target:              "target-a",
@@ -47,6 +48,7 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 
 	require.Len(t, data.Operations, 1)
 	assert.Equal(t, "deploy-a", data.Operations[0].Deployment)
+	assert.Equal(t, "commerce/-80/users", data.Operations[0].OperationKey)
 	assert.Equal(t, "remote-apply-a", data.Operations[0].ExternalID)
 	assert.Equal(t, "remote-operation-a", data.Operations[0].ExternalOperationID)
 	assert.Equal(t, "target-a", data.Operations[0].Target)

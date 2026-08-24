@@ -453,7 +453,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 	if !plan.HasChanges() {
 		return &engine.PlanResult{
-			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			PlanID:    engine.NewPlanID(),
 			NoChanges: true,
 		}, nil
 	}
@@ -578,7 +578,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	return &engine.PlanResult{
-		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		PlanID:         engine.NewPlanID(),
 		Changes:        schemaChanges,
 		LintViolations: lintViolations,
 		// Applying this plan can meet a copy an earlier schema change left on

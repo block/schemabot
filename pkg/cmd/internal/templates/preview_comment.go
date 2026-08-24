@@ -44,6 +44,11 @@ func previewCommentAllOutput() {
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"PLAN COMMENT (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
+		{"PLAN COMMENT (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
+		{"PLAN COMMENT (EXISTING COPY DISCARDED, APPLYING)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscardedApplying())
+		}},
+		{"PLAN COMMENT (EXISTING COPY ADOPTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyAdopted()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"PLAN COMMENT (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
@@ -84,6 +89,7 @@ func previewCommentAllOutput() {
 		{"APPLY ESTIMATE EXCEEDED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyEstimateExceeded()) }},
 		{"APPLY COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCompleted()) }},
 		{"APPLY RETRYING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRetrying()) }},
+		{"APPLY RETRYING (REMOTE DATA-PLANE PAUSE)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRemoteRetryablePause()) }},
 		{"APPLY FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"APPLY FAILED (BEFORE ROW COPY)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy()) }},
 		{"APPLY STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyStopped()) }},
@@ -140,6 +146,11 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},
+		{"MYSQL PLAN (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
+		{"MYSQL PLAN (EXISTING COPY DISCARDED, APPLYING)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscardedApplying())
+		}},
+		{"MYSQL PLAN (EXISTING COPY ADOPTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyAdopted()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"MYSQL PLAN (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
@@ -260,6 +271,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"VITESS: DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessDDLWithVSchema()) }},
 		{"VITESS: MULTI-KEYSPACE VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentApplyVitessMultiKeyspaceVSchema()) }},
 		{"MIDDLE TABLE RETRYING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRetrying()) }},
+		{"MIDDLE TABLE RETRYING (REMOTE DATA-PLANE PAUSE)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyRemoteRetryablePause()) }},
 		{"FIRST TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFirstFailed()) }},
 		{"MIDDLE TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailed()) }},
 		{"FAILED BEFORE ROW COPY (PREFLIGHT)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy()) }},

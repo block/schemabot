@@ -288,6 +288,13 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 		return
 	}
 	detail := applyStatusDetail(data.State)
+	if state.IsRunningApplyState(data.State) && hasRetryingTable(data.Tables) {
+		// A remote data plane retries its failures on its own: the stored
+		// apply stays active through the pause, so the retry is only visible
+		// on the task rows. Surface it as the status so the operator sees the
+		// same Retrying view a locally parked apply gets.
+		detail = "Retrying"
+	}
 	if data.Rollback && state.IsState(data.State, state.Apply.Completed) {
 		detail = "Rolled Back"
 	}
@@ -637,7 +644,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table, data.Attempt, data.ErrorMessage)
+			renderTableProgress(sb, table, data.State, data.Attempt, data.ErrorMessage)
 		}
 	}
 }
@@ -655,6 +662,19 @@ type namespaceTableGroup struct {
 // render without a header, so a comment never shows a meaningless
 // "Schema `default`" / "Keyspace `default`" header or splits the same logical
 // no-namespace tables into separate groups.
+// hasRetryingTable reports whether any table sits in a retryable pause. An
+// active apply with a retrying table means a data plane is recovering the
+// failure on its own; the pause never reaches the stored apply state, so
+// status and footer rendering derive it from the task rows.
+func hasRetryingTable(tables []TableProgressData) bool {
+	for _, table := range tables {
+		if state.IsState(state.NormalizeTaskStatus(table.Status), state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
+}
+
 func groupTablesByNamespace(tables []TableProgressData) []namespaceTableGroup {
 	var groups []namespaceTableGroup
 	index := make(map[string]int)
@@ -702,7 +722,7 @@ func tableStatePriority(tableStatus string) int {
 // instead of ANSI. applyError is the apply-level error message the comment
 // renders as its own block, so a failed table's identical error is not
 // repeated below the row.
-func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int, applyError string) {
+func renderTableProgress(sb *strings.Builder, table TableProgressData, applyState string, applyAttempt int, applyError string) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -796,8 +816,16 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
-			table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
+		if state.IsState(applyState, state.Apply.FailedRetryable) {
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
+				table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
+		} else {
+			// The apply is paused by a data plane that retries on its own; its
+			// attempt count does not cross the wire, so announce the retry
+			// without inventing a number.
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n",
+				table.TableName, bar)
+		}
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
 			writeTableErrorLine(sb, table.ErrorMessage)
@@ -1101,6 +1129,15 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running, state.Apply.RunningDegraded,
 		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
+		if hasRetryingTable(data.Tables) {
+			// The apply is active but a data plane is retrying a failed table
+			// on its own; give the operator the same retry guidance a locally
+			// parked apply gets.
+			writeStopOrCancelFooterAction(sb, data,
+				"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
+				"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
+			return
+		}
 		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,

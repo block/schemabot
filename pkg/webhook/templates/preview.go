@@ -162,6 +162,105 @@ func PreviewCommentPlanDirect() string {
 	})
 }
 
+// PreviewCommentPlanCopyDiscarded renders a sample plan comment for a plan
+// whose apply will throw away an unfinished copy already on the target, showing
+// what the operator would lose by applying while that decision is still theirs.
+func PreviewCommentPlanCopyDiscarded() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on the
+// comment of an apply that is already running. Nothing is being asked of the
+// reader and the copy is already gone, so the section is a record of what the
+// apply threw away rather than a warning with a remedy.
+func PreviewCommentPlanCopyDiscardedApplying() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyAdopted renders a sample plan comment for a plan whose
+// apply will resume an unfinished copy already on the target rather than
+// starting it over.
+func PreviewCommentPlanCopyAdopted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		AdoptedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "3h 12m",
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
 // plan containing statements the engine refuses.
 func PreviewCommentApplyBlockedRejected() string {
@@ -1578,6 +1677,23 @@ func PreviewCommentApplyRetrying() string {
 	data := sampleApplyData(state.Apply.FailedRetryable, tables)
 	data.Attempt = 1
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyRemoteRetryablePause renders a sample comment for an
+// active apply whose data plane is retrying a failed table on its own. The
+// stored apply stays active through the pause, so the Retrying status is
+// derived from the task rows, and no attempt count is shown — the data plane's
+// attempt number does not cross the wire.
+func PreviewCommentApplyRemoteRetryablePause() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.

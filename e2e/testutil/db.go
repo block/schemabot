@@ -17,6 +17,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// OpenMySQL opens and verifies a MySQL handle for direct test-side access to a
+// plane's storage or target database. The handle is closed when the test ends.
+func OpenMySQL(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	require.NoError(t, err, "open mysql")
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()), "ping mysql")
+	return db
+}
+
 // CreateTestTable creates a table on the given DSN and returns a cleanup function
 // that drops it. The cleanup function opens a new connection so it works even
 // after the test context is cancelled.

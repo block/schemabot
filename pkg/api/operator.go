@@ -88,9 +88,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		})
 	}
 
-	// The stranded-operation reaper is maintenance, not claim work, so it runs on
-	// its own slow cadence outside the driver pool. It shares the driver
-	// lifecycle: one goroutine per process, stopped by StopOperator.
+	// The reaper is maintenance, not claim work, so it runs on its own slow
+	// cadence outside the driver pool. It shares the driver lifecycle: one
+	// goroutine per process, stopped by StopOperator.
 	s.recoveryWg.Go(func() {
 		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
 	})
