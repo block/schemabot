@@ -457,21 +457,27 @@ const (
 	// holds the database's active-apply slot and blocks every later apply.
 	maxConsecutiveProgressPollErrors = 10
 
-	// defaultLostEngineWorkPendingBudget is how long an engine may keep
-	// reporting no active schema change for a task whose stored state says the
-	// work is already in flight, before the drive stops trusting the engine and
-	// verifies the target schema directly.
+	// defaultLostEngineWorkPendingBudget is how long an engine that provisions
+	// resources after accepting work may keep reporting no active schema change
+	// for a task whose stored state says the work is already in flight, before
+	// the drive stops trusting the engine and verifies the target schema
+	// directly. An engine declaring engine.SynchronousWorkRegistration needs no
+	// budget at all, because a pending report is conclusive the first time it
+	// arrives.
 	//
-	// The budget is a duration rather than a count of polls because what it has
-	// to outlast is wall-clock engine behaviour, not a number of round trips: an
-	// engine that just restarted serves a stale snapshot until it catches up,
-	// and an engine whose remote work is still being set up or validated
-	// reports pending for real, healthy work it has not begun executing. Both
-	// resolve on their own schedule, and a poll-count budget silently shrinks to
-	// nothing whenever the poll cadence is shortened. The budget is generous for
-	// that reason: distrusting the engine too early bounces a healthy apply to
-	// retryable and re-drives it, which on an engine that provisions remote
-	// resources per attempt is worse than waiting.
+	// The budget covers what a pending report cannot distinguish on its own: an
+	// engine still cutting a branch or validating a deploy request is reporting
+	// real, healthy work it has not begun executing, and an engine that just
+	// restarted serves a stale snapshot until it catches up. Both resolve on
+	// their own schedule, so it is a duration rather than a count of polls —
+	// what it has to outlast is wall-clock engine behaviour, not a number of
+	// round trips, and a poll-count budget silently shrinks to nothing whenever
+	// the poll cadence is shortened. It is generous because distrusting a
+	// provisioning engine too early bounces a healthy apply to retryable and
+	// re-drives it, which on an engine that provisions per attempt is worse
+	// than waiting, and it stays inside defaultTaskStallWarnInterval so the
+	// drive resolves the ambiguity before an operator is told the task looks
+	// stalled.
 	defaultLostEngineWorkPendingBudget = 2 * time.Minute
 
 	// defaultTaskStallWarnInterval is how long a polled task may sit in the
@@ -498,11 +504,19 @@ func (c *LocalClient) taskStallWarnInterval() time.Duration {
 	return defaultTaskStallWarnInterval
 }
 
-// lostEngineWorkPendingBudget returns how long the drive keeps trusting an
-// engine that reports no active schema change for an in-flight task.
-func (c *LocalClient) lostEngineWorkPendingBudget() time.Duration {
+// lostEngineWorkPendingBudget returns how long the drive keeps trusting eng
+// when it reports no active schema change for an in-flight task. An engine that
+// registers accepted work synchronously gets no budget: it has no
+// pending-but-healthy phase to wait out, so the first such report is already
+// conclusive. Every other engine gets the full budget, which is the safe
+// default — an engine that has not declared itself is assumed to provision
+// after accepting work.
+func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Duration {
 	if c.lostEngineWorkPendingBudgetOverride > 0 {
 		return c.lostEngineWorkPendingBudgetOverride
+	}
+	if engine.RegistersWorkSynchronously(eng) {
+		return 0
 	}
 	return defaultLostEngineWorkPendingBudget
 }
@@ -516,7 +530,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 	var consecutiveErrors int
 	var resumeEventLogged bool
-	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget()}
+	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 
 	for {
@@ -766,13 +780,14 @@ type lostEngineWorkTracker struct {
 
 // observePending records a poll that reported no active schema change and
 // returns how long the run has lasted, plus whether the trust budget is spent.
-// The first observation of a run starts the clock and is never exhausted, so an
-// engine always gets at least the full budget before the drive stops trusting
-// it.
+// The first observation of a run starts the clock and, for an engine with a
+// budget, is never exhausted — such an engine always gets at least its full
+// budget before the drive stops trusting it. An engine with no budget has
+// nothing to wait out, so its first report exhausts immediately.
 func (t *lostEngineWorkTracker) observePending(now time.Time) (pendingFor time.Duration, exhausted bool) {
 	if t.since.IsZero() {
 		t.since = now
-		return 0, false
+		return 0, t.budget <= 0
 	}
 	pendingFor = now.Sub(t.since)
 	return pendingFor, pendingFor >= t.budget

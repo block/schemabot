@@ -318,3 +318,16 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		})
 	}
 }
+
+// Spirit runs the schema change in a goroutine of this process and publishes
+// the tracked state before Apply returns, so it declares its work registration
+// synchronous. A driver reads that declaration to decide whether a pending
+// progress report about work it believes is in flight is conclusive.
+func TestRegistersWorkSynchronously(t *testing.T) {
+	eng := New(Config{})
+
+	assert.True(t, eng.RegistersWorkSynchronously(),
+		"Spirit publishes the tracked schema change before Apply returns")
+	assert.True(t, engine.RegistersWorkSynchronously(eng),
+		"the package helper resolves Spirit's declaration")
+}

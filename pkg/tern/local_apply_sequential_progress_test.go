@@ -656,3 +656,57 @@ func TestPollTaskToCompletion_PermanentErrorFailsFast(t *testing.T) {
 	assert.Equal(t, taskFailed, action)
 	assert.Equal(t, state.Task.Failed, task.State, "a permanent progress error fails the task without exhausting the retry budget")
 }
+
+// syncRegistrationEngine declares its work registration synchronous, the way an
+// in-process engine that publishes tracked state before Apply returns does.
+type syncRegistrationEngine struct {
+	lostWorkEngine
+}
+
+func (e *syncRegistrationEngine) RegistersWorkSynchronously() bool { return true }
+
+// An engine that registers accepted work before Apply returns has no phase in
+// which it reports pending for healthy work it has not begun. For such an
+// engine the first pending report about an in-flight task is already proof the
+// work is gone, so the drive verifies the target immediately instead of
+// spending a trust budget it does not need.
+func TestPollTaskToCompletion_SynchronousEngineNeedsNoTrustBudget(t *testing.T) {
+	eng := &syncRegistrationEngine{
+		lostWorkEngine: lostWorkEngine{
+			phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+				{State: engine.StateRunning},
+				{State: engine.StatePending},
+			}},
+			planResult: &engine.PlanResult{NoChanges: true},
+		},
+	}
+	// No budget override: the engine's own declaration decides the budget.
+	client, apply, task, _ := lostWorkPollFixture(eng, 0)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, 1, eng.planCalls, "the target is verified once, on the first pending report")
+	assert.Equal(t, 2, eng.calls, "no poll is spent waiting out a phase this engine does not have")
+}
+
+// The trust budget is a property of the engine, not a global constant: an
+// engine that provisions after accepting work needs time before a pending
+// report means anything, while one that registers synchronously needs none. A
+// test override outranks both so a test can reach the verification path
+// quickly.
+func TestLostEngineWorkPendingBudgetFollowsTheEngine(t *testing.T) {
+	provisioning := &phaseSequenceEngine{}
+	synchronous := &syncRegistrationEngine{}
+
+	client := &LocalClient{}
+	assert.Equal(t, defaultLostEngineWorkPendingBudget, client.lostEngineWorkPendingBudget(provisioning),
+		"an engine that has not declared itself is assumed to provision after accepting work")
+	assert.Zero(t, client.lostEngineWorkPendingBudget(synchronous),
+		"a synchronous engine has no pending-but-healthy phase to wait out")
+
+	overridden := &LocalClient{lostEngineWorkPendingBudgetOverride: lostWorkTrustBudgetReached}
+	assert.Equal(t, lostWorkTrustBudgetReached, overridden.lostEngineWorkPendingBudget(provisioning))
+	assert.Equal(t, lostWorkTrustBudgetReached, overridden.lostEngineWorkPendingBudget(synchronous))
+}
