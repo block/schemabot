@@ -33,11 +33,6 @@ import (
 func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testing.T) {
 	cleanupState(t)
 
-	// Earlier tests replace the control-plane pod, which kills the suite-level
-	// port-forward behind testutil.Endpoint. Forward the control-plane service
-	// fresh so this test reaches whichever pod is serving now.
-	endpoint := startControlPlanePortForward(t)
-
 	// Dial a data-plane pod and open the direct database handles before the
 	// apply starts: every second between the copy being observed running and
 	// the first kill is time for a fast copy to complete, and a completed
@@ -59,7 +54,7 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	// poll tick, so the table is seeded well past the suite's usual row count:
 	// the copy must still be running when the first kill lands, or the apply
 	// completes with no pause to observe.
-	fixture := startIndexAddApplyAtEndpoint(t, endpoint, "k8s_retry_pause", false, nil, 2000000)
+	fixture := startIndexAddApplyWithOptions(t, "k8s_retry_pause", false, nil, 2000000)
 	waitForPodApplyState(t, podClient, fixture.DataPlaneApplyID, ternv1.State_STATE_RUNNING, testutil.PollDeadline)
 
 	// Kill the data plane's target connections on every poll tick until the

@@ -1867,6 +1867,40 @@ func TestApplyStore_Update(t *testing.T) {
 	require.NotNil(t, updated.StartedAt)
 }
 
+// The recovery budget (attempt) is owned by the insert at create time and the
+// claim transition's atomic increment. A driver's in-memory apply goes stale
+// the moment the stored budget is adjusted out-of-band mid-drive — an operator
+// spending or granting attempts — so the driver persisting its mutable state
+// must leave the stored budget in place rather than resetting it to the value
+// it loaded at claim time.
+func TestApplyStore_UpdatePreservesStoredRecoveryBudget(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_update_keeps_budget", 303, state.Apply.Running, "staging")
+
+	// Spend the stored budget underneath the drive, after its in-memory copy
+	// was loaded.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ? WHERE id = ?
+	`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	apply.State = state.Apply.FailedRetryable
+	apply.ErrorMessage = "transient engine failure"
+	require.NoError(t, store.Applies().Update(ctx, apply))
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.FailedRetryable, persisted.State, "the drive's own state write lands")
+	assert.Equal(t, "transient engine failure", persisted.ErrorMessage)
+	assert.Equal(t, maxRecoveryAttempts, persisted.Attempt,
+		"the stored recovery budget survives a drive persisting a stale in-memory copy")
+}
+
 func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3220,11 +3254,13 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_expired", 501, state.Apply.FailedRetryable, "staging")
-	apply.Attempt = maxRecoveryAttempts
-	require.NoError(t, store.Applies().Update(ctx, apply))
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ? WHERE id = ?
+	`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
 
 	now := time.Now()
-	_, err := store.Tasks().Create(ctx, &storage.Task{
+	_, err = store.Tasks().Create(ctx, &storage.Task{
 		TaskIdentifier: "task_retryable_expired",
 		ApplyID:        apply.ID,
 		PlanID:         apply.PlanID,
@@ -3327,8 +3363,10 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 
 	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retryable_ops_expired", 510, state.Apply.FailedRetryable, "staging")
-	apply.Attempt = maxRecoveryAttempts
-	require.NoError(t, store.Applies().Update(ctx, apply))
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET attempt = ? WHERE id = ?
+	`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
 
 	failedOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,

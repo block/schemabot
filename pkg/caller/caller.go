@@ -159,3 +159,18 @@ func Short(caller string) string {
 	}
 	return caller
 }
+
+// PullRequestURL renders the canonical github.com URL for a pull request.
+// Every surface that links a repo/PR pair — API responses, PR comment
+// markdown, CLI tables — builds the address here so the rendering never
+// drifts between them.
+func PullRequestURL(repo string, pr int) string {
+	return "https://github.com/" + repo + "/pull/" + strconv.Itoa(pr)
+}
+
+// PullRequestMarkdownLink renders a pull request as a "repo#N" markdown link
+// to its canonical github.com URL, the form PR comments use to name another
+// pull request.
+func PullRequestMarkdownLink(repo string, pr int) string {
+	return "[" + repo + "#" + strconv.Itoa(pr) + "](" + PullRequestURL(repo, pr) + ")"
+}

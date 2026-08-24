@@ -28,6 +28,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/engine/planetscale"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -252,6 +253,32 @@ type Server struct {
 	engines    map[string]tern.EngineFactory
 }
 
+// registerPlanetScaleMTLS registers the configured planetscale.mtls
+// certificates with the Go MySQL driver, making every MySQL connection the
+// Vitess engine opens (branch hosts and vtgates) present the client identity.
+// Unreadable or unparseable certificate material is a hard error so the
+// caller fails startup rather than running without the identity the
+// endpoints require.
+func registerPlanetScaleMTLS(cfg *api.ServerConfig, logger *slog.Logger) error {
+	mtls := cfg.PlanetScale.MTLS
+	if mtls == nil {
+		logger.Debug("planetscale.mtls not configured; Vitess engine MySQL connections use no TLS")
+		return nil
+	}
+	if err := planetscale.RegisterMTLS(planetscale.MTLSConfig{
+		CABundlePath:   mtls.CABundle,
+		ClientCertPath: mtls.ClientCert,
+		ClientKeyPath:  mtls.ClientKey,
+	}); err != nil {
+		return fmt.Errorf("register PlanetScale mTLS from planetscale.mtls config: %w", err)
+	}
+	logger.Info("registered PlanetScale mTLS for Vitess engine MySQL connections",
+		"ca_bundle", mtls.CABundle,
+		"client_cert", mtls.ClientCert,
+		"client_key", mtls.ClientKey)
+	return nil
+}
+
 // Build constructs a SchemaBot server from cfg without opening any listener. It
 // resolves and migrates storage, constructs the service, registers
 // embedder-supplied engines, builds the webhook runtime and (when a target
@@ -266,6 +293,13 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 	logger := o.logger
 	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
+
+	// Register PlanetScale mTLS before anything else so a worker with
+	// missing or unreadable certificate material fails startup immediately
+	// instead of failing every Vitess connection it later opens.
+	if err := registerPlanetScaleMTLS(cfg, logger); err != nil {
+		return nil, err
+	}
 
 	// Get storage DSN from config (with fallback to the STORAGE_DSN env var,
 	// then MYSQL_DSN)
