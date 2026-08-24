@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/diffplan"
@@ -113,7 +112,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		}
 	}
 	result.NoChanges = len(result.Changes) == 0
-	result.PlanID = fmt.Sprintf("postgres-plan-%d", time.Now().UnixNano())
+	result.PlanID = engine.NewPlanID()
 	return result, nil
 }
 
@@ -218,39 +217,51 @@ func (e *Engine) Drain() {
 	e.mu.Unlock()
 }
 
-// Stop pauses a running schema change.
+// Stop declines: a PostgreSQL schema change runs each statement as a single
+// transactional DDL with no engine phase to pause — an in-flight statement
+// either commits or fails on its own. The typed decline lets the control
+// path resolve a durable stop request terminally instead of retrying it.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("stop is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
 }
 
-// Cancel terminates a running schema change.
+// Cancel declines: the engine runs each statement as one transaction and does
+// not track the database backend executing it, so it cannot terminate the
+// statement itself. An in-flight DDL can still be interrupted at the database
+// — during a lock pileup that is exactly what an operator needs — so the
+// decline reason points at the out-of-band path instead of stopping at "no".
 func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("cancel is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("cancel is not implemented for PostgreSQL schema changes: the engine cannot terminate its in-flight statement, which commits or fails as one transaction; to interrupt it at the database, find the backend running the DDL in pg_stat_activity and cancel it with pg_cancel_backend")
 }
 
-// Start resumes a stopped schema change.
+// Start declines: PostgreSQL schema changes cannot be stopped, so there is
+// never a stopped engine phase to resume.
 func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("start is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("start is not supported for PostgreSQL schema changes: there is no stopped engine phase to resume")
 }
 
-// Cutover triggers the final table swap.
+// Cutover declines: PostgreSQL schema changes apply DDL directly and have no
+// table-swap phase to trigger.
 func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("cutover is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("cutover is not supported for PostgreSQL schema changes: DDL is applied directly with no table swap")
 }
 
-// Revert rolls back a completed schema change during the revert window.
+// Revert declines: PostgreSQL schema changes commit directly and have no
+// revert window.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("revert is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("revert is not supported for PostgreSQL schema changes: changes commit directly with no revert window")
 }
 
-// SkipRevert ends the revert window early, making changes permanent.
+// SkipRevert declines: PostgreSQL schema changes have no revert window to end
+// early — every committed change is already permanent.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("skip-revert is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported for PostgreSQL schema changes: changes commit directly with no revert window")
 }
 
-// Volume adjusts the schema change speed.
+// Volume declines: PostgreSQL schema changes run statement phases with no
+// tunable row copy to retune.
 func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	return nil, fmt.Errorf("volume is not supported for PostgreSQL schema changes")
+	return nil, engine.NewUnsupportedOperationError("volume is not supported for PostgreSQL schema changes: there is no tunable row copy")
 }
 
 // Compile-time check that Engine implements engine.Engine.

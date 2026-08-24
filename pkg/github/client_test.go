@@ -390,7 +390,7 @@ func TestFetchSchemaFilesOptimizedFollowsSymlinkedNamespaces(t *testing.T) {
 	}
 
 	// Grouping keys each file under its symlink (keyspace) name.
-	grouped, err := groupFilesByNamespace(files, "schema", "")
+	grouped, _, err := groupFilesByNamespace(files, "schema", "", nil)
 	require.NoError(t, err)
 	require.Contains(t, grouped, "shard_001")
 	require.Contains(t, grouped, "shard_002")

@@ -16,9 +16,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-# Strip ANSI escape codes from CLI output for markdown rendering.
+# Strip terminal escape codes from CLI output for markdown rendering: SGR
+# color codes and OSC sequences (hyperlinks), the two families the CLI emits.
 strip_ansi() {
-    sed $'s/\033\\[[0-9;]*m//g'
+    sed -E $'s/\033\\[[0-9;]*m//g; s/\033\\][^\033\007]*(\033\\\\|\007)//g'
 }
 
 # Shared awk function to wrap "--- SECTION NAME ---" lines into collapsible blocks

@@ -72,3 +72,24 @@ func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
 func TestApplyChangeCountsSummaryEmpty(t *testing.T) {
 	assert.Empty(t, countTableProgressChanges(nil).summary())
 }
+
+func TestLoadCLIConfig_ParsesIgnoreNamespaces(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: vitess\nignore_namespaces:\n  - local_fixtures\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"local_fixtures"}, cfg.IgnoreNamespaces)
+}
+
+func TestLoadCLIConfig_RejectsIgnoreNamespacePaths(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: vitess\nignore_namespaces:\n  - schema/local_fixtures\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), "not a path")
+}

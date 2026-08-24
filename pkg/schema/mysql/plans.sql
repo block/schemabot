@@ -16,5 +16,6 @@ CREATE TABLE `plans` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_plan_identifier` (`plan_identifier`),
   KEY `idx_repo_pr` (`repository`,`pull_request`),
-  KEY `idx_database_env` (`database_name`,`database_type`,`environment`)
+  KEY `idx_database_env` (`database_name`,`database_type`,`environment`),
+  KEY `idx_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

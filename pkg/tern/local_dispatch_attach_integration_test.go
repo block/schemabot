@@ -286,6 +286,76 @@ func TestLocalClient_Apply_AttachRefusesApplyTerminalizedUnderneath(t *testing.T
 	assert.Len(t, ops, 1, "the refused attach must not insert its operation")
 }
 
+// manifestDispatchRequest is a shard dispatch that declares its generation
+// manifest, as the control plane's deployment-keyed fan-out sends it.
+func manifestDispatchRequest(planID, key, shard string, manifest []string) *ternv1.ApplyRequest {
+	req := shardDispatchRequest(planID, key, shard)
+	req.GenerationOperationKeys = manifest
+	return req
+}
+
+// A dispatch that declares its generation manifest has it stored on the keyed
+// apply at creation, siblings the manifest names attach normally, and a
+// dispatch for an operation outside the manifest is refused fail-closed: an
+// undeclared operation would attach work the apply's completion gate never
+// waits for, so it signals the two planes disagree about the generation.
+func TestLocalClient_Apply_ManifestStoredAndGatesAttach(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:manifest-gate-test"
+	manifest := []string{"testdb/-80/users", "testdb/80-/users"}
+
+	first, err := client.Apply(ctx, manifestDispatchRequest(planID, key, "-80", manifest))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "first shard dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, manifest, apply.ExpectedOperationKeys, "the dispatch's generation manifest must be stored on the keyed apply")
+
+	second, err := client.Apply(ctx, manifestDispatchRequest(planID, key, "80-", manifest))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "a sibling the manifest names must attach: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId)
+
+	outside, err := client.Apply(ctx, manifestDispatchRequest(planID, key, "c0-", manifest))
+	require.NoError(t, err)
+	assert.False(t, outside.Accepted, "an operation outside the manifest must be refused")
+	assert.Contains(t, outside.ErrorMessage, "generation manifest", "the refusal must name the manifest as the cause")
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the refused dispatch must not attach an operation")
+}
+
+// A dispatch whose declared manifest omits its own operation key is refused at
+// creation: the manifest is the completion authority for the apply the
+// dispatch would create, and an apply whose first operation is outside its own
+// manifest could never complete.
+func TestLocalClient_Apply_ManifestOmittingOwnKeyRefusedAtCreate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:manifest-own-key-test"
+
+	resp, err := client.Apply(ctx, manifestDispatchRequest(planID, key, "-80", []string{"testdb/80-/users"}))
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted, "a dispatch whose manifest omits its own key must be refused")
+	assert.Contains(t, resp.ErrorMessage, "does not include its own operation key")
+
+	existing, err := stor.Applies().GetByIdempotencyKey(ctx, key)
+	require.NoError(t, err)
+	assert.Nil(t, existing, "the refused dispatch must not create an apply")
+}
+
 // The keyed apply's own in-flight tasks are sibling work, not conflicts: a
 // dispatch attaching more work for a shard that apply is already copying on
 // must attach, while another apply's active task on the database still blocks.

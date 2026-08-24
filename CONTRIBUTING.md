@@ -39,6 +39,10 @@ make test     # Run all tests (unit + integration + e2e)
 
 See [docs/architecture.md](./docs/architecture.md) for an overview of how SchemaBot works.
 
+## Releases
+
+Maintainers cut releases by pushing a `vX.Y.Z` tag. See [docs/release.md](./docs/release.md) for the process and the compatibility checks that run before a tag is published.
+
 ## License
 
 By contributing to SchemaBot, you agree that your contributions will be licensed under the [Apache License 2.0](./LICENSE).

@@ -31,6 +31,18 @@ type controlOperationHTTPError struct {
 	err    error
 }
 
+type terminalControlError struct {
+	err error
+}
+
+func (e *terminalControlError) Error() string {
+	return e.err.Error()
+}
+
+func (e *terminalControlError) Unwrap() error {
+	return e.err
+}
+
 func (e *controlOperationHTTPError) Error() string {
 	return e.err.Error()
 }
@@ -48,6 +60,13 @@ func controlConflictf(format string, args ...any) error {
 	}
 }
 
+// terminalControlf marks a control failure that retrying the same request
+// cannot repair: an internal data invariant violation or a deterministic
+// downstream rejection.
+func terminalControlf(format string, args ...any) error {
+	return &terminalControlError{err: fmt.Errorf(format, args...)}
+}
+
 func controlOperationHTTPStatus(err error) int {
 	var httpErr *controlOperationHTTPError
 	if errors.As(err, &httpErr) {
@@ -63,6 +82,14 @@ func controlOperationHTTPStatus(err error) int {
 // warning-level logging for rejections the requester can act on.
 func IsInternalControlError(err error) bool {
 	return controlOperationHTTPStatus(err) >= http.StatusInternalServerError
+}
+
+// IsTerminalControlError reports whether retrying the same control request
+// cannot change its outcome. Internal invariant failures remain HTTP 500s but
+// are terminal for durable command processing.
+func IsTerminalControlError(err error) bool {
+	var terminalErr *terminalControlError
+	return errors.As(err, &terminalErr) || !IsInternalControlError(err)
 }
 
 // ControlOperationHTTPStatus returns the HTTP status associated with a control
@@ -101,20 +128,20 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return nil, nil, controlHTTPErrorf(http.StatusBadRequest, "environment is required")
 	}
 	if s.storage == nil {
-		return nil, nil, fmt.Errorf("storage is not available")
+		return nil, nil, terminalControlf("storage is not available")
 	}
 
 	applyStore := s.storage.Applies()
 	if applyStore == nil {
-		return nil, nil, fmt.Errorf("apply store is not available")
+		return nil, nil, terminalControlf("apply store is not available")
 	}
 	planStore := s.storage.Plans()
 	if planStore == nil {
-		return nil, nil, fmt.Errorf("plan store is not available")
+		return nil, nil, terminalControlf("plan store is not available")
 	}
 	taskStore := s.storage.Tasks()
 	if taskStore == nil {
-		return nil, nil, fmt.Errorf("task store is not available")
+		return nil, nil, terminalControlf("task store is not available")
 	}
 
 	apply, err := applyStore.GetByApplyIdentifier(ctx, req.ApplyIdentifier)
@@ -134,7 +161,7 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, nil, fmt.Errorf("load source plan %d for rollback apply %s: %w", apply.PlanID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return apply, nil, fmt.Errorf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
+		return apply, nil, terminalControlf("source plan %d not found for rollback apply %s", apply.PlanID, apply.ApplyIdentifier)
 	}
 	if !plan.HasOriginalFilesCapture() {
 		return apply, plan, controlConflictf("apply %s cannot be rolled back safely because its source plan has no stored original schema files", apply.ApplyIdentifier)
@@ -151,7 +178,7 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, plan, controlConflictf("apply %s is not the schema change that the current rollback planner would select for database %s environment %s", apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
 	if latestTask.PlanID != apply.PlanID {
-		return apply, plan, fmt.Errorf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
 	}
 
 	return apply, plan, nil

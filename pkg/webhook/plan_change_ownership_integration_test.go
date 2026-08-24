@@ -383,12 +383,12 @@ func TestE2EUnsafeBlockedApplyDisclosesAttributedChange(t *testing.T) {
 	}
 }
 
-// An apply that carries --allow-unsafe passes the unsafe gate and acquires the
-// lock, and the locked comment it posts is the one apply-confirm acts on. The
-// attribution sits there for the same reason as the direct-execution
-// disclosure: the operator confirms against this comment, so what it does not
-// say is not part of the decision.
-func TestE2ELockedApplyCommentDisclosesAttributedChange(t *testing.T) {
+// An apply that carries --allow-unsafe passes the unsafe gate, acquires the
+// lock, and proceeds automatically. That locked comment leaves the operator no
+// decision — the attribution disclosure coaches re-planning, which was
+// actionable on the plan and unsafe-blocked comments the operator already
+// passed through — so it is omitted here.
+func TestE2ELockedAutoApplyCommentOmitsAttributedChange(t *testing.T) {
 	dbName := "webhook_locked_apply_ownership"
 	svc := setupE2EService(t, dbName)
 	resetOwnershipHistory(t, dbName)
@@ -425,9 +425,9 @@ func TestE2ELockedApplyCommentDisclosesAttributedChange(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Lock acquired by")
-		assert.Contains(t, body, "🛑 **Check before applying**")
-		assert.Contains(t, body, "`reconcile_state`")
-		assert.Contains(t, body, "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)")
+		assert.Contains(t, body, "Applying automatically")
+		assert.NotContains(t, body, "Check before applying")
+		assert.NotContains(t, body, "octocat/hello-world#2")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the locked apply comment")
 	}

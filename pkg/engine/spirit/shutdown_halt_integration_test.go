@@ -36,7 +36,8 @@ func TestHaltForShutdownCheckpointsAnInFlightCopy(t *testing.T) {
 	}
 
 	const tableName = "halt_checkpoint_test"
-	eng, db := startCopyForcingAlter(t, tableName)
+	started := startCopyForcingAlter(t, tableName)
+	eng, db := started.eng, started.db
 	defer eng.Drain()
 	// Drain waits on the copy goroutine with nothing cancelling it, so a test
 	// that fails before it halts would wait out the whole copy. Halting first
@@ -97,7 +98,8 @@ func TestHaltForShutdownStopsACopyItCannotCheckpoint(t *testing.T) {
 	}
 
 	const tableName = "halt_checkpoint_failure_test"
-	eng, db := startCopyForcingAlter(t, tableName)
+	started := startCopyForcingAlter(t, tableName)
+	eng, db := started.eng, started.db
 	defer eng.Drain()
 	defer haltForCleanup(t, eng)
 
@@ -125,7 +127,7 @@ func TestHaltForShutdownStopsACopyItCannotCheckpoint(t *testing.T) {
 // changing it in place, so there is copy progress for the caller to act on
 // mid-flight. It returns once the engine has accepted the change; the caller
 // waits for the copy to become observable.
-func startCopyForcingAlter(t *testing.T, tableName string) (*Engine, *sql.DB) {
+func startCopyForcingAlter(t *testing.T, tableName string) startedCopy {
 	t.Helper()
 
 	dsn, db := setupTestMySQL(t)
@@ -137,31 +139,39 @@ func startCopyForcingAlter(t *testing.T, tableName string) (*Engine, *sql.DB) {
 	require.NoError(t, err, "create table %s", tableName)
 	seedTableRows(t, db, tableName)
 
+	// Widening the column past the length-prefix boundary forces a full table
+	// copy rather than an in-place change, so there is a copy to act on.
+	alter := fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `name` varchar(100) NOT NULL", tableName)
+
 	eng := New(Config{
 		Logger: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		// Small chunks and a single thread keep the copy observable for long
-		// enough to act on it partway through.
-		TargetChunkTime: 100 * time.Millisecond,
-		Threads:         1,
+		// A single thread keeps the copy observable for long enough to act on
+		// it partway through.
+		Threads: 1,
 	})
 
 	applyResult, err := eng.Apply(t.Context(), &engine.ApplyRequest{
-		Database: "testdb",
+		Database: testDatabase,
 		Changes: []engine.SchemaChange{{
-			Namespace: "testdb",
-			TableChanges: []engine.TableChange{{
-				Table: tableName,
-				// Widening the column forces a full table copy rather than an
-				// in-place change.
-				DDL: fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `name` varchar(100) NOT NULL", tableName),
-			}},
+			Namespace:    testDatabase,
+			TableChanges: []engine.TableChange{{Table: tableName, DDL: alter}},
 		}},
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
 	require.NoError(t, err, "Apply()")
 	require.True(t, applyResult.Accepted, "apply not accepted: %s", applyResult.Message)
 
-	return eng, db
+	return startedCopy{eng: eng, dsn: dsn, db: db, table: tableName, alter: alter}
+}
+
+// startedCopy is a Spirit row copy underway on a target: the engine driving it,
+// a connection to the target it runs against, and the batch it was given.
+type startedCopy struct {
+	eng   *Engine
+	dsn   string
+	db    *sql.DB
+	table string
+	alter string
 }
 
 // waitForCheckpointReadiness blocks until the schema change can write a

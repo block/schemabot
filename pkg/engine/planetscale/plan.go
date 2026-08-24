@@ -5,18 +5,60 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/vschema"
 )
+
+// vschemaDeletionsMetadata detects structural removals between the current and
+// desired VSchema and encodes them for plan change metadata. Removals gate the
+// apply behind the unsafe opt-in: deleting a vindex, a table routing entry, or
+// a column-vindex association changes Vitess query routing the moment the
+// VSchema lands, so it is as dangerous as destructive DDL. Returns "" when the
+// change removes nothing.
+func vschemaDeletionsMetadata(currentRaw, desired string) (string, error) {
+	deletions, err := vschema.Deletions(currentRaw, desired)
+	if err != nil {
+		return "", err
+	}
+	if len(deletions) == 0 {
+		return "", nil
+	}
+	converted := make([]apitypes.VSchemaDeletion, len(deletions))
+	for i, d := range deletions {
+		converted[i] = apitypes.VSchemaDeletion{Kind: d.Kind, Name: d.Name, Reason: d.Reason}
+	}
+	return apitypes.EncodeVSchemaDeletions(converted)
+}
+
+// vschemaMutationsMetadata detects in-place vindex definition changes between
+// the current and desired VSchema and encodes them for plan change metadata.
+// Mutations gate the apply behind the unsafe opt-in just like removals: a
+// same-name vindex whose type, params, or owner changes alters Vitess query
+// routing and lookup maintenance the moment the VSchema lands. Returns ""
+// when no vindex definition changes.
+func vschemaMutationsMetadata(currentRaw, desired string) (string, error) {
+	mutations, err := vschema.Mutations(currentRaw, desired)
+	if err != nil {
+		return "", err
+	}
+	if len(mutations) == 0 {
+		return "", nil
+	}
+	converted := make([]apitypes.VSchemaMutation, len(mutations))
+	for i, m := range mutations {
+		converted[i] = apitypes.VSchemaMutation{Kind: m.Kind, Name: m.Name, Reason: m.Reason}
+	}
+	return apitypes.EncodeVSchemaMutations(converted)
+}
 
 // Plan computes the schema changes needed by diffing current schema against desired.
 // For each keyspace in the schema files, it fetches the current schema and uses
@@ -86,6 +128,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			if vschemaChanged {
 				sc.Metadata["vschema_changed"] = "true"
 				sc.Metadata["vschema"] = vschema.Diff(currentVSchemaRaw, ns.Files["vschema.json"])
+				deletionsMeta, delErr := vschemaDeletionsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
+				if delErr != nil {
+					return fmt.Errorf("detect VSchema deletions for keyspace %s: %w", ks, delErr)
+				}
+				if deletionsMeta != "" {
+					sc.Metadata[apitypes.VSchemaDeletionsMetadataKey] = deletionsMeta
+				}
+				mutationsMeta, mutErr := vschemaMutationsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
+				if mutErr != nil {
+					return fmt.Errorf("detect VSchema mutations for keyspace %s: %w", ks, mutErr)
+				}
+				if mutationsMeta != "" {
+					sc.Metadata[apitypes.VSchemaMutationsMetadataKey] = mutationsMeta
+				}
 				if strings.TrimSpace(currentVSchemaRaw) == "" {
 					currentVSchemaRaw = "{}"
 				}
@@ -159,13 +215,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 	if len(changes) == 0 {
 		return &engine.PlanResult{
-			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			PlanID:    engine.NewPlanID(),
 			NoChanges: true,
 		}, nil
 	}
 
 	return &engine.PlanResult{
-		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		PlanID:         engine.NewPlanID(),
 		Changes:        changes,
 		LintViolations: lintViolations,
 	}, nil

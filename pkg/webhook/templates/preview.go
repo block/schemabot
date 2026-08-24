@@ -58,6 +58,16 @@ func previewPlanData() PlanCommentData {
 	}
 }
 
+// PreviewCommentPlanIgnoredNamespaces renders a sample plan from a schema root
+// whose config withholds a namespace via ignore_namespaces, showing the
+// exclusion disclosure alongside the remaining namespace's changes.
+func PreviewCommentPlanIgnoredNamespaces() string {
+	data := previewPlanData()
+	data.LintViolations = nil
+	data.IgnoredNamespaces = []string{"local_fixtures"}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {
@@ -152,6 +162,105 @@ func PreviewCommentPlanDirect() string {
 	})
 }
 
+// PreviewCommentPlanCopyDiscarded renders a sample plan comment for a plan
+// whose apply will throw away an unfinished copy already on the target, showing
+// what the operator would lose by applying while that decision is still theirs.
+func PreviewCommentPlanCopyDiscarded() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on the
+// comment of an apply that is already running. Nothing is being asked of the
+// reader and the copy is already gone, so the section is a record of what the
+// apply threw away rather than a warning with a remedy.
+func PreviewCommentPlanCopyDiscardedApplying() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyAdopted renders a sample plan comment for a plan whose
+// apply will resume an unfinished copy already on the target rather than
+// starting it over.
+func PreviewCommentPlanCopyAdopted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		AdoptedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "3h 12m",
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
 // plan containing statements the engine refuses.
 func PreviewCommentApplyBlockedRejected() string {
@@ -204,6 +313,71 @@ func PreviewCommentPlanNoChanges() string {
 		RequestedBy: previewRequestedBy,
 		IsMySQL:     true,
 		Changes:     nil,
+	})
+}
+
+// PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
+// rollup confirmed the reviewed plan on every deployment (uniform clean line).
+func PreviewCommentPlanDriftClean() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "production",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "match"},
+				{Deployment: "us", Class: "match"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
+// rollup found deployments that no longer match the reviewed plan: a
+// per-deployment breakdown naming the matching, diverged, and errored targets.
+func PreviewCommentPlanDriftDetected() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "production",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes:     samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true,
+			Clean:    false,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "eu", Primary: true, Class: "match"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the reviewed plan"},
+				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanDriftUnverified renders a plan comment whose review-time
+// drift rollup could not be computed, so the plan check fails closed.
+func PreviewCommentPlanDriftUnverified() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:        "testapp",
+		SchemaName:      "testapp",
+		Environment:     "production",
+		HeadSHA:         previewHeadSHA,
+		Repository:      previewRepository,
+		RequestedBy:     previewRequestedBy,
+		IsMySQL:         true,
+		Changes:         samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{Computed: false},
 	})
 }
 
@@ -779,7 +953,7 @@ func PreviewCommentLintErrorsBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"`},
+			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`},
 			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
 		},
 	})
@@ -937,6 +1111,65 @@ func PreviewCommentVitessPlan() string {
 		RequestedBy: previewRequestedBy,
 		IsMySQL:     false,
 		Changes:     sampleVitessPlanChanges(),
+	})
+}
+
+// PreviewCommentVitessPlanVSchemaRemoval renders a sample Vitess plan comment
+// where the VSchema change removes a lookup vindex and its column-vindex
+// association — the removals surface in the Issues section as unsafe changes.
+func PreviewCommentVitessPlanVSchemaRemoval() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "commerce",
+		SchemaName:  "commerce",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     false,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace:       "commerce_sharded",
+				VSchemaChanged: true,
+				VSchemaDiff: `--- a/commerce_sharded.json
++++ b/commerce_sharded.json
+@@ -3,10 +3,6 @@
+     "hash": {
+       "type": "hash"
+-    },
+-    "customers_email_lookup": {
+-      "type": "consistent_lookup_unique",
+-      "params": {
+-        "table": "customers_email_lookup",
+-        "from": "email",
+-        "to": "keyspace_id"
+-      },
+-      "owner": "customers"
+     }
+   },
+@@ -18,8 +14,4 @@
+         {
+           "column": "id",
+           "name": "hash"
+-        },
+-        {
+-          "column": "email",
+-          "name": "customers_email_lookup"
+         }
+       ]
+     }`,
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{
+				Table:  "commerce_sharded/vschema.json",
+				Reason: `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+			},
+			{
+				Table:  "commerce_sharded/vschema.json",
+				Reason: `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+			},
+		},
 	})
 }
 
@@ -1444,6 +1677,23 @@ func PreviewCommentApplyRetrying() string {
 	data := sampleApplyData(state.Apply.FailedRetryable, tables)
 	data.Attempt = 1
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentApplyRemoteRetryablePause renders a sample comment for an
+// active apply whose data plane is retrying a failed table on its own. The
+// stored apply stays active through the pause, so the Retrying status is
+// derived from the task rows, and no attempt count is shown — the data plane's
+// attempt number does not cross the wire.
+func PreviewCommentApplyRemoteRetryablePause() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.FailedRetryable
+	tables[1].RowsCopied = 439870
+	tables[1].RowsTotal = 1466232
+	tables[1].PercentComplete = 30
+	tables[1].ErrorMessage = PreviewErrorMiddleFailed
+	tables[2].Status = state.Task.Pending
+	return RenderApplyStatusComment(sampleApplyData(state.Apply.Running, tables))
 }
 
 // PreviewCommentApplyStopped renders a sample apply-stopped comment.

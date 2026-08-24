@@ -905,3 +905,134 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 }
 
 // --- Container helpers (matches e2e/setup_test.go patterns) ---
+
+// TestE2EPlanExcludesIgnoredNamespaces verifies that namespace directories
+// listed in schemabot.yaml ignore_namespaces never reach the plan: a schema
+// root carrying a local-test-only namespace alongside the real one produces a
+// plan (comment, stored record, check) covering only the real namespace, so
+// SchemaBot never tries to reconcile test fixtures against the live database.
+func TestE2EPlanExcludesIgnoredNamespaces(t *testing.T) {
+	dbName := "webhook_plan_ignore_ns"
+	// ignore_namespaces requires the namespace-free MySQL DSN shape (a
+	// database-scoped DSN diffs the whole database as one unit and refuses the
+	// exclusion), so this scenario configures the target the supported way.
+	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{targetDSN: namespaceFreeTargetDSN(t)})
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n", dbName)
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"local_fixtures/widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	// The plan comment covers the real namespace only, and discloses the
+	// exclusion so a reviewer can tell the namespace was withheld by config
+	// rather than unchanged.
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "users")
+		assert.NotContains(t, body, "widgets")
+		assert.Contains(t, body, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+
+	// The stored plan record carries no trace of the ignored namespace.
+	ctx := t.Context()
+	plans, err := svc.Storage().Plans().GetByPR(ctx, "octocat/hello-world", 1)
+	require.NoError(t, err)
+	var plan *storage.Plan
+	for _, p := range plans {
+		if p.Database == dbName {
+			plan = p
+			break
+		}
+	}
+	require.NotNil(t, plan, "expected a plan record for database %s", dbName)
+	require.NotNil(t, plan.Namespaces)
+	assert.Contains(t, plan.Namespaces, dbName)
+	assert.NotContains(t, plan.Namespaces, "local_fixtures")
+}
+
+// TestE2EPlanIgnoringEveryNamespaceFails verifies the safety boundary when
+// ignore_namespaces excludes every namespace in the schema root: the plan
+// must fail with an error naming the exclusion rather than planning an empty
+// desired state, which on a live database would read as "drop everything".
+func TestE2EPlanIgnoringEveryNamespaceFails(t *testing.T) {
+	dbName := "webhook_plan_ignore_all"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\nignore_namespaces:\n  - %s\n  - local_fixtures\n", dbName, dbName)
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"local_fixtures/widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "schema request error handled")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "after excluding ignored namespaces")
+		assert.NotContains(t, body, "No schema changes detected")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}

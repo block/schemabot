@@ -20,7 +20,9 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Globals holds flags shared by all commands.
@@ -70,9 +72,12 @@ var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
 type CLIConfig struct {
-	Database  string `yaml:"database"`
-	Type      string `yaml:"type"`
-	SchemaDir string `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	Database string `yaml:"database"`
+	Type     string `yaml:"type"`
+	// IgnoreNamespaces lists namespace subdirectories of the schema root that
+	// SchemaBot must not reconcile against the live database.
+	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
+	SchemaDir        string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -101,6 +106,9 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 
 	if cfg.Database == "" {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
+	}
+	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml
 	cfg.SchemaDir = dir
@@ -176,10 +184,7 @@ var (
 	loadingSpinnerInterval           = 100 * time.Millisecond
 	loadingSpinnerFrames             = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	loadingSpinnerWriter   io.Writer = os.Stderr
-	loadingSpinnerTerminal           = func() bool {
-		info, err := os.Stderr.Stat()
-		return err == nil && info.Mode()&os.ModeCharDevice != 0
-	}
+	loadingSpinnerTerminal           = func() bool { return ui.IsTerminal(os.Stderr) }
 )
 
 func withLoading(message string, show bool, fn func() error) error {

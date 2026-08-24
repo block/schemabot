@@ -33,14 +33,13 @@ const maxCommitLatency = 100 * time.Millisecond
 // dynamically from there on throttler feedback, so apply throughput tracks
 // the target instance rather than a fixed constant.
 func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
-	threads, chunkTime, lockTimeout := e.copySettings()
+	threads, lockTimeout := e.copySettings()
 	return &spiritmigration.Migration{
 		Host:                          host,
 		Username:                      username,
 		Password:                      &password,
 		Database:                      database,
 		Statement:                     stmt,
-		TargetChunkTime:               chunkTime,
 		Threads:                       threads,
 		WriteThreads:                  0, // auto-size for the target
 		LockWaitTimeout:               lockTimeout,
@@ -357,6 +356,16 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		tables = append(tables, p.Table)
 		ddls = append(ddls, p.Statement)
 	}
+
+	// Every batch Spirit runs arrives here, whether it is a first apply whose
+	// statements routing has just re-evaluated against the target's live schema
+	// or an operator resuming a stopped one from its stored statement. Both hand
+	// Spirit exactly this string, so this is where what Spirit compares against
+	// the checkpoint is known, and the only place a disclosure covers both. The
+	// resumed apply is the one that matters most: a copy stopped for days is
+	// discarded the moment it starts again, and the operator asked for that
+	// start.
+	e.reportExistingCopy(ctx, targetDSN(host, username, password, database), database, combinedStatement, tables)
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover

@@ -26,6 +26,12 @@ type SchemaRequestResult struct {
 	// object and its target so retargeting the environment cannot go unnoticed.
 	SchemaLinkPath string
 	HeadSHA        string // Commit SHA used to fetch schema files
+	// IgnoredNamespaces lists the namespaces that were actually removed from
+	// SchemaFiles by the config's ignore_namespaces, resolved for the
+	// environment and sorted. Surfaces the exclusion on the PR (plan comment)
+	// and travels with the plan request so the data plane can refuse engine
+	// shapes that cannot honor it.
+	IgnoredNamespaces []string
 }
 
 // EnvironmentValidator verifies that a discovered database can be used with
@@ -81,23 +87,41 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	}
 
 	// Group files by keyspace/namespace
-	schemaFiles, err := groupFilesByNamespace(files, schemaRoot, environment)
+	schemaFiles, ignoredNamespaces, err := groupFilesByNamespace(files, schemaRoot, environment, config.IgnoreNamespaces)
 	if err != nil {
 		return nil, err
 	}
+	if len(ignoredNamespaces) > 0 {
+		ic.logger.Info("excluding ignored namespaces from schema request",
+			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
+			"schema_root", schemaRoot, "ignored_namespaces", ignoredNamespaces)
+	}
+	// A configured entry that removed nothing is a typo, a case mismatch, or a
+	// stale entry for a deleted directory — the namespace it names is being
+	// fully reconciled, so surface it rather than letting the config imply an
+	// exclusion that is not happening.
+	if unmatched := schema.UnmatchedIgnoreEntries(config.IgnoreNamespaces, environment, ignoredNamespaces); len(unmatched) > 0 {
+		ic.logger.Warn("ignore_namespaces entries matched no namespace and excluded nothing",
+			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
+			"schema_root", schemaRoot, "unmatched_entries", unmatched)
+	}
 	if len(schemaFiles) == 0 {
+		if len(ignoredNamespaces) > 0 {
+			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)
+		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}
 
 	return &SchemaRequestResult{
-		Database:       config.Database,
-		Type:           string(config.GetType()),
-		SchemaFiles:    schemaFiles,
-		Repository:     repo,
-		PullRequest:    pr,
-		SchemaPath:     schemaRoot,
-		SchemaLinkPath: schemaLinkPath,
-		HeadSHA:        prInfo.HeadSHA,
+		Database:          config.Database,
+		Type:              string(config.GetType()),
+		SchemaFiles:       schemaFiles,
+		Repository:        repo,
+		PullRequest:       pr,
+		SchemaPath:        schemaRoot,
+		SchemaLinkPath:    schemaLinkPath,
+		HeadSHA:           prInfo.HeadSHA,
+		IgnoredNamespaces: ignoredNamespaces,
 	}, nil
 }
 
@@ -183,7 +207,9 @@ func schemaPathWithinDirectory(directory, candidate string) bool {
 // Files in namespace subdirectories (schema/namespace/table.sql) use the
 // subdirectory name as the namespace. Flat files (schema/table.sql) use the
 // schema directory name as the namespace (the MySQL database name).
-func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (map[string]*ternv1.SchemaFiles, error) {
+// Namespaces listed in ignoreNamespaces are excluded from the result; the
+// second return value lists the namespace keys actually removed, sorted.
+func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string, ignoreNamespaces []string) (map[string]*ternv1.SchemaFiles, []string, error) {
 	// Build relativePath → content map for the shared helper.
 	// file.Path is the full path (e.g., "schema/payments/transactions.sql"),
 	// so trimming schemaPath+"/" gives the relative path ("payments/transactions.sql"
@@ -193,14 +219,14 @@ func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (
 	for _, file := range files {
 		relPath, ok := strings.CutPrefix(file.Path, prefix)
 		if !ok {
-			return nil, fmt.Errorf("file path %q does not start with schema path %q", file.Path, prefix)
+			return nil, nil, fmt.Errorf("file path %q does not start with schema path %q", file.Path, prefix)
 		}
 		rawFiles[relPath] = file.Content
 	}
 
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment)
+	grouped, removed, err := schema.GroupFilesByNamespace(rawFiles, path.Base(schemaPath), environment, ignoreNamespaces)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Convert schema.SchemaFiles → ternv1.SchemaFiles
@@ -208,5 +234,5 @@ func groupFilesByNamespace(files []GitHubFile, schemaPath, environment string) (
 	for ns, nsFiles := range grouped {
 		result[ns] = &ternv1.SchemaFiles{Files: nsFiles.Files}
 	}
-	return result, nil
+	return result, removed, nil
 }

@@ -14,7 +14,10 @@ import (
 // storeApplyPlanCheckRecord stores a check record when an apply plan is posted.
 // The apply-time plan does not evaluate review-time deployment drift, so it must
 // not clear a stored drift block: the block depends on live deployment state,
-// not PR content, and only a fresh rollup may clear it.
+// not PR content, and only a fresh rollup may clear it. It also deliberately
+// skips the manual plan path's apply-owned no-op recovery: an in_progress row
+// stamped with an apply ID may belong to a live apply whose terminal outcome
+// must land on it, so only the manual plan command may override that claim.
 func (h *Handler) storeApplyPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
 	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
 }

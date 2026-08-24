@@ -42,3 +42,42 @@ func TestPullCmdTypeIsOptionalAndAcceptsAnyEngine(t *testing.T) {
 	require.NoError(t, err, "a non-mysql type must be accepted")
 	assert.Equal(t, "vitess", cli.Pull.Type)
 }
+
+// Linting on pull is opt-in: the flag defaults to off so a plain pull never
+// pays the lint cost, and --lint turns it on.
+func TestPullCmdLintIsOptIn(t *testing.T) {
+	var cli struct {
+		Pull PullCmd `cmd:""`
+	}
+	parser, err := kong.New(&cli)
+	require.NoError(t, err)
+
+	_, err = parser.Parse([]string{"pull", "-d", "boardgames", "-e", "staging"})
+	require.NoError(t, err)
+	assert.False(t, cli.Pull.Lint, "lint must default to off")
+
+	_, err = parser.Parse([]string{"pull", "-d", "boardgames", "-e", "staging", "--lint"})
+	require.NoError(t, err)
+	assert.True(t, cli.Pull.Lint)
+}
+
+// Pull renders readable SQL for humans by default; -o json emits the full
+// API response for scripts and tooling.
+func TestPullCmdOutputDefaultsToPretty(t *testing.T) {
+	var cli struct {
+		Pull PullCmd `cmd:""`
+	}
+	parser, err := kong.New(&cli)
+	require.NoError(t, err)
+
+	_, err = parser.Parse([]string{"pull", "-d", "boardgames", "-e", "staging"})
+	require.NoError(t, err)
+	assert.Equal(t, "pretty", cli.Pull.Output)
+
+	_, err = parser.Parse([]string{"pull", "-d", "boardgames", "-e", "staging", "-o", "json"})
+	require.NoError(t, err)
+	assert.Equal(t, "json", cli.Pull.Output)
+
+	_, err = parser.Parse([]string{"pull", "-d", "boardgames", "-e", "staging", "-o", "yaml"})
+	require.Error(t, err, "only pretty and json are valid output formats")
+}

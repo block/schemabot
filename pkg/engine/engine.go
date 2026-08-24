@@ -192,6 +192,12 @@ type PlanResult struct {
 	// Lint results from schema analysis. Violations with Severity "error" block
 	// apply unless overridden with --allow-unsafe.
 	LintViolations []LintViolation
+
+	// ExistingCopies is unfinished work earlier schema changes left on the
+	// target that applying this plan will continue or destroy, one entry per
+	// namespace that holds any. Empty when the target holds none, which is the
+	// ordinary case.
+	ExistingCopies []*ExistingCopy
 }
 
 // HasErrors returns true if any lint warning has error severity.
@@ -320,6 +326,84 @@ const (
 	// runs, and it is not revertible.
 	ExecutionModeDirect = "direct"
 )
+
+// CopyDisposition is what applying a plan will do with work an earlier schema
+// change already did on the target and left behind — for engines that copy a
+// table, the partly filled copy and the checkpoint describing it.
+type CopyDisposition string
+
+const (
+	// CopyNone means the target holds no unfinished work for any table in the
+	// plan. This is the ordinary case and is not surfaced.
+	CopyNone CopyDisposition = "none"
+
+	// CopyAdopt means applying continues the existing work rather than
+	// repeating it. Nothing is destroyed, so it is disclosed and proceeds.
+	CopyAdopt CopyDisposition = "adopt"
+
+	// CopyDiscard means applying destroys the existing work and starts the
+	// affected tables over. The cost is everything the earlier schema change
+	// had done, which can be days of copying.
+	CopyDiscard CopyDisposition = "discard"
+)
+
+// Discard reasons, kept distinct because they call for different operator
+// advice: a plan that drifted from the copy's own batch can be restored, an
+// expired checkpoint cannot, and a partial copy is not the operator's doing at
+// all.
+const (
+	// DiscardStatementDiffers means the existing work was done for a different
+	// set of statements than this plan will run, so the engine will not
+	// continue it.
+	DiscardStatementDiffers = "statement_differs"
+
+	// DiscardCheckpointExpired means the statements match but the engine's
+	// record of the existing work is too old to resume from.
+	DiscardCheckpointExpired = "checkpoint_expired"
+
+	// DiscardCopyIncomplete means the existing work covers only some of the
+	// tables this plan changes. An engine that continues work continues all of
+	// it or none, so the tables that did get copied are destroyed along with the
+	// ones that never started.
+	DiscardCopyIncomplete = "copy_incomplete"
+)
+
+// ExistingCopy is unfinished work an earlier schema change left on the target
+// that applying this plan will either continue or destroy. It never carries
+// CopyNone: a plan that destroys nothing reports no ExistingCopy at all.
+type ExistingCopy struct {
+	// Namespace names the target the work sits on, as the engine that read it
+	// addresses that target. An engine planning each namespace separately
+	// reports one ExistingCopy per namespace that holds any. Where several
+	// namespaces share one target — schema subdirectories dividing a single
+	// connection-scoped database only logically — the engine reads that target
+	// once and this names the database it read, not the subdirectory the change
+	// came from. Either way it names something an operator can go and look at,
+	// which is what a disclosure has to do; it is not a key to group or route
+	// on.
+	Namespace string
+	// Disposition is what applying will do with the existing work.
+	Disposition CopyDisposition
+	// Reason names why a discard cannot be avoided by applying as planned.
+	// Empty for an adopt.
+	Reason string
+	// Tables are the tables in this plan that already hold unfinished work.
+	Tables []string
+	// Age is how long ago the engine last recorded progress on it. Zero when
+	// the engine has no record to resume from, which is itself a discard.
+	Age time.Duration
+	// Statement is the schema change this work was started for, verbatim as
+	// the engine recorded it. Empty when the engine has no record of it, which
+	// is itself a reason the work cannot be resumed.
+	//
+	// It is what makes a statement-drift discard answerable rather than just
+	// announced: a surface can say which change the work belongs to, so an
+	// operator told "the schema change differs from the one that started it"
+	// can see what it differs from and decide whether to restore it. For an
+	// adopt it repeats the plan and says nothing new, so a surface renders it
+	// only where the two disagree.
+	Statement string
+}
 
 // Engine metadata keys carrying the direct execution policy from config
 // surfaces (server config, embedder assemblers) to an engine via request

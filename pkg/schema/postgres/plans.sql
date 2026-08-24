@@ -18,3 +18,4 @@ CREATE TABLE plans (
 CREATE UNIQUE INDEX idx_plans_plan_identifier ON plans (plan_identifier);
 CREATE INDEX idx_plans_repo_pr ON plans (repository, pull_request);
 CREATE INDEX idx_plans_database_env ON plans (database_name, database_type, environment);
+CREATE INDEX idx_plans_created_at ON plans (created_at);

@@ -49,10 +49,17 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (a missing apply ID, an apply not found, a non-owned environment, a gate
 //     block on the merits, a source-apply guardrail rejection, a lock held by
-//     another PR, a plan-generation failure other than remote-deployment
-//     unavailability, nothing to do, or a posted rollback plan). A
-//     source-apply validation failure is terminal only when it is a
-//     deterministic rejection; an internal failure there stays retryable.
+//     another PR, a typed deterministic plan-generation rejection, nothing to
+//     do, or a posted rollback plan). Untyped plan-generation failures, such
+//     as storage and remote-service failures, remain retryable. A
+//     source-apply validation failure is terminal only when it is a typed
+//     deterministic rejection or invariant violation; transient storage
+//     failures there stay retryable.
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure resolving the authorization
+//     client): the delivery must not be re-driven, but no PR comment could
+//     be posted without a client, so the error is recorded on the delivery
+//     as its only triage trail rather than marking it completed.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -146,12 +153,18 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	// silent instead of posting a denial for an environment it does not manage.
 	// An unauthorized actor must not learn lock ownership or rollback plan
 	// contents by probing apply IDs.
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, database, environment, action.Rollback)
-	if blocked {
+	client, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, database, environment, action.Rollback)
+	if err != nil {
 		// The gate has already logged the client-creation failure and posted
-		// the authorization-unavailable comment; it fails closed for this
-		// delivery, but a fresh client may succeed on a later attempt.
-		return true, fmt.Errorf("rollback command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
+		// its best-effort authorization-unavailable comment; it fails closed
+		// for this delivery. A GitHub App resolution failure is deterministic
+		// per deployment config, so a re-drive reproduces it and the error is
+		// recorded on the delivery instead; any other cause (an installation
+		// token fetch, for example) may clear on a later attempt.
+		if errors.Is(err, errGitHubAppResolution) {
+			return false, fmt.Errorf("rollback command actor authorization client %s#%d: %w", repo, pr, err)
+		}
+		return true, fmt.Errorf("rollback command actor authorization client %s#%d: %w", repo, pr, err)
 	}
 	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback, result.SuppressRetryComments)
 	if authErr != nil {
@@ -222,7 +235,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		// The released lock lets a re-drive start over, so an internal
 		// validation failure stays retryable; a deterministic guardrail
 		// rejection is the command's answer.
-		if api.IsInternalControlError(err) {
+		if !api.IsTerminalControlError(err) {
 			h.logger.Error("rollback source revalidation failed after lock acquisition",
 				"repo", repo, "pr", pr, "apply_id", applyID,
 				"environment", result.Environment, "database", database, "error", err)
@@ -232,6 +245,11 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 				releaseErr)
 		}
 		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
+		if api.IsInternalControlError(err) {
+			h.postRollbackTerminalInvariant("rollback source revalidation found a terminal data invariant violation",
+				repo, pr, installationID, requestedBy, environment, applyID, database, err)
+			return false, nil
+		}
 		h.logger.Warn("rollback rejected by source apply guardrails after lock acquisition",
 			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", result.Environment, "database", database, "error", err)
@@ -245,10 +263,11 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
 	if err != nil {
 		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
-		// The retryable attribute makes the terminal class queryable: a
-		// non-transient plan failure that recurs in logs is a candidate for
-		// its own transient classifier.
-		retryable := isTransientRemotePlanError(err)
+		// ExecuteRollbackPlanForApply classifies its own failures: transient
+		// infrastructure (storage reads/writes, remote unavailability) stays
+		// untyped and retryable, while data invariant violations and
+		// deterministic engine rejections come back typed terminal.
+		retryable := !api.IsTerminalControlError(err)
 		h.logger.Error("rollback plan failed", "repo", repo, "pr", pr, "apply_id", applyID, "retryable", retryable, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
 		if retryable {
@@ -257,11 +276,6 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 				releaseErr)
 		}
 		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
-		// Failures other than remote-deployment unavailability are treated
-		// as deterministic: the posted error is the command's answer. Some
-		// of them are not truly deterministic (plan generation reads storage
-		// and a live target), so recovery for those is the user re-issuing
-		// the command.
 		return false, nil
 	}
 
@@ -341,18 +355,44 @@ func (h *Handler) handleRollbackSourceError(repo string, pr int, installationID 
 		h.postComment(repo, pr, installationID, templates.RenderRollbackApplyNotFound(applyID))
 		return false, nil
 	}
-	if api.IsInternalControlError(err) {
+	if !api.IsTerminalControlError(err) {
 		h.logger.Error("rollback source validation failed",
 			"repo", repo, "pr", pr, "apply_id", applyID,
 			"environment", environment, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
 		return true, fmt.Errorf("rollback command validate source apply %s#%d apply %s: %w", repo, pr, applyID, err)
 	}
+	if api.IsInternalControlError(err) {
+		database := ""
+		if apply != nil {
+			database = apply.Database
+		}
+		h.postRollbackTerminalInvariant("rollback source validation found a terminal data invariant violation",
+			repo, pr, installationID, requestedBy, environment, applyID, database, err)
+		return false, nil
+	}
 	h.logger.Warn("rollback rejected by source apply guardrails",
 		"repo", repo, "pr", pr, "apply_id", applyID,
 		"environment", environment, "error", err)
 	h.postRollbackRejected(repo, pr, installationID, apply, applyID, environment, "", err.Error())
 	return false, nil
+}
+
+// postRollbackTerminalInvariant logs an internal terminal invariant violation
+// and posts the command error as the delivery's answer. It runs only after
+// IsTerminalControlError has already classified the failure as terminal;
+// IsInternalControlError is re-checked at the call sites because terminal
+// covers two classes with different surfacing: an internal invariant
+// violation (error-level log and a generic command error, handled here) and a
+// sub-500 guardrail rejection (warn-level log and a rejection comment, handled
+// by the caller).
+func (h *Handler) postRollbackTerminalInvariant(logMsg, repo string, pr int, installationID int64, requestedBy, environment, applyID, database string, err error) {
+	attrs := []any{"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment}
+	if database != "" {
+		attrs = append(attrs, "database", database)
+	}
+	h.logger.Error(logMsg, append(attrs, "error", err)...)
+	h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
 }
 
 func (h *Handler) postRollbackRejected(repo string, pr int, installationID int64, apply *storage.Apply, applyID, environment, database, reason string) {

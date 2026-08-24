@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -20,6 +19,9 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -31,8 +33,6 @@ import (
 
 const applyOperationKeyMaxLen = 255
 const finalizerOperationKeySegment = "group_finalizer"
-
-const postgresVerdictUnavailableReason = "PostgreSQL classifier verdict unavailable; this change cannot be applied"
 
 // PlanRequest is the HTTP request body for POST /api/plan.
 type PlanRequest struct {
@@ -48,6 +48,11 @@ type PlanRequest struct {
 	// Optional — absent for non-webhook callers (e.g. CLI plan invocations without a PR).
 	HeadSHA    *string `json:"head_sha,omitempty"`
 	SchemaPath string  `json:"-"`
+	// IgnoredNamespaces lists the namespaces the caller removed from
+	// SchemaFiles per the config's ignore_namespaces, resolved for the
+	// environment. Forwarded to the data plane so it can refuse engine shapes
+	// that cannot honor the exclusion.
+	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
 
 	// SourceTrusted is set by the GitHub webhook path after SchemaBot has
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
@@ -61,6 +66,33 @@ type unsupportedPullSchemaError struct {
 
 func (e *unsupportedPullSchemaError) Error() string {
 	return fmt.Sprintf("pull schema is not supported for %s databases on this deployment", e.DatabaseType)
+}
+
+// unsupportedLintDialectError reports a pull request that asked for linting on
+// a database whose dialect the schema linters cannot parse. Failing the
+// request is deliberate: silently returning zero violations would read as a
+// clean audit.
+type unsupportedLintDialectError struct {
+	DatabaseType string
+}
+
+func (e *unsupportedLintDialectError) Error() string {
+	return fmt.Sprintf("schema linting on pull is not supported for %s databases", e.DatabaseType)
+}
+
+// unlintablePulledTableError reports a pulled table entry whose DDL the schema
+// linters cannot audit — it failed classification, or it is not a CREATE TABLE
+// statement. Failing the request is deliberate: skipping the entry would
+// silently turn the audit into a partial result.
+type unlintablePulledTableError struct {
+	Database  string
+	Namespace string
+	Table     string
+	Detail    string
+}
+
+func (e *unlintablePulledTableError) Error() string {
+	return fmt.Sprintf("lint pulled schema for database %q namespace %q: table %q %s", e.Database, e.Namespace, e.Table, e.Detail)
 }
 
 // databaseTypeMismatchError reports a request whose declared database type
@@ -150,6 +182,18 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusNotImplemented, err.Error())
 			return
 		}
+		var lintDialectErr *unsupportedLintDialectError
+		if errors.As(err, &lintDialectErr) {
+			s.logger.Warn("pull schema lint rejected for unsupported dialect", "database", req.Database, "environment", req.Environment, "type", lintDialectErr.DatabaseType)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var unlintableErr *unlintablePulledTableError
+		if errors.As(err, &unlintableErr) {
+			s.logger.Warn("pull schema lint rejected unlintable pulled table", "database", req.Database, "environment", req.Environment, "namespace", unlintableErr.Namespace, "table", unlintableErr.Table, "detail", unlintableErr.Detail)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		var unavailableErr *RemoteDeploymentUnavailableError
 		if errors.As(err, &unavailableErr) {
 			s.logger.Error("pull schema failed because remote deployment is unavailable",
@@ -197,6 +241,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
 		return nil, typeErr
+	}
+	if req.Lint && schema.DialectForDatabaseType(resolvedTarget.DatabaseType) != schema.DialectMySQL {
+		lintErr := &unsupportedLintDialectError{DatabaseType: resolvedTarget.DatabaseType}
+		span.RecordError(lintErr)
+		span.SetStatus(otelcodes.Error, "lint dialect unsupported")
+		return nil, lintErr
 	}
 	namespaces, err := pullNamespaces(schema.DialectForDatabaseType(resolvedTarget.DatabaseType), req.Namespaces)
 	if err != nil {
@@ -295,7 +345,80 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		"namespace_count", len(merged.Namespaces),
 	)
 
-	return pullSchemaResponseFromProto(merged), nil
+	httpResp := pullSchemaResponseFromProto(merged)
+	if req.Lint {
+		if err := lintPulledNamespaces(httpResp); err != nil {
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, "lint pulled schema")
+			return nil, err
+		}
+	}
+	return httpResp, nil
+}
+
+// lintPulledNamespaces runs the schema-shape linters (primary key types,
+// charsets, and other properties of the schema itself) over every pulled table
+// and attaches the violations to each namespace, using the same linter config
+// a plan uses. A pull carries no proposed change, so the diff-based linters a
+// plan also runs (unsafe drops, invisible-index-before-drop) never apply here:
+// a clean pull audit says the existing schema is well-shaped, not that any
+// particular change to it is safe. Results are sorted for a stable response
+// body regardless of table iteration order.
+func lintPulledNamespaces(resp *apitypes.PullSchemaResponse) error {
+	linter := lint.New()
+	for name, ns := range resp.Namespaces {
+		// Every pulled table entry must be a CREATE TABLE statement. The
+		// linters silently pass over other statement kinds, so an entry of
+		// another kind would go unlinted and turn the audit into a partial
+		// result — fail the request instead.
+		for tableName, tableDDL := range ns.Tables {
+			stmtType, _, err := ddl.ClassifyStatement(tableDDL)
+			if err != nil {
+				return &unlintablePulledTableError{
+					Database:  resp.Database,
+					Namespace: name,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("cannot be classified: %v", err),
+				}
+			}
+			if stmtType != ddl.StatementCreateTable {
+				return &unlintablePulledTableError{
+					Database:  resp.Database,
+					Namespace: name,
+					Table:     tableName,
+					Detail:    fmt.Sprintf("is a %s statement, expected CREATE TABLE", stmtType),
+				}
+			}
+		}
+		results, err := linter.LintSchema(ns.Tables)
+		if err != nil {
+			return fmt.Errorf("lint pulled schema for database %q namespace %q: %w", resp.Database, name, err)
+		}
+		violations := make([]*apitypes.LintViolationResponse, 0, len(results))
+		for _, r := range results {
+			violations = append(violations, &apitypes.LintViolationResponse{
+				Message:  r.Message,
+				Table:    r.Table,
+				Column:   r.Column,
+				Linter:   r.Linter,
+				Severity: r.Severity,
+			})
+		}
+		sort.Slice(violations, func(i, j int) bool {
+			if violations[i].Table != violations[j].Table {
+				return violations[i].Table < violations[j].Table
+			}
+			if violations[i].Column != violations[j].Column {
+				return violations[i].Column < violations[j].Column
+			}
+			if violations[i].Linter != violations[j].Linter {
+				return violations[i].Linter < violations[j].Linter
+			}
+			return violations[i].Message < violations[j].Message
+		})
+		ns.Lint = violations
+	}
+	return nil
 }
 
 func pullNamespaces(dialect schema.Dialect, namespaces []string) ([]string, error) {
@@ -547,13 +670,14 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 
 	ternReq := &ternv1.PlanRequest{
-		Database:    req.Database,
-		Type:        resolvedTarget.DatabaseType,
-		SchemaFiles: req.SchemaFiles,
-		Repository:  req.Repository,
-		Environment: req.Environment,
-		Target:      resolvedTarget.Target,
-		SchemaPath:  trustedSchemaPath,
+		Database:          req.Database,
+		Type:              resolvedTarget.DatabaseType,
+		SchemaFiles:       req.SchemaFiles,
+		Repository:        req.Repository,
+		Environment:       req.Environment,
+		Target:            resolvedTarget.Target,
+		SchemaPath:        trustedSchemaPath,
+		IgnoredNamespaces: req.IgnoredNamespaces,
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
@@ -570,6 +694,19 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		"is_remote", client.IsRemote(),
 		"schema_file_count", len(req.SchemaFiles),
 	)
+	if len(req.IgnoredNamespaces) > 0 {
+		// The desired state is deliberately partial: the caller withheld these
+		// namespaces per the config's ignore_namespaces. Recorded so an operator
+		// tracing "why does this plan not touch namespace X" finds the answer in
+		// server logs.
+		s.logger.Info("plan request excludes ignored namespaces",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"ignored_namespaces", req.IgnoredNamespaces,
+		)
+	}
 
 	resp, err := client.Plan(ctx, ternReq)
 	if err != nil {
@@ -598,9 +735,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 		return nil, nil, err
 	}
-	if resolvedTarget.DatabaseType == storage.DatabaseTypePostgres {
-		blockPostgresPlanWithoutClassifierVerdicts(resp)
-	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
 	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
 	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
@@ -619,6 +753,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
+
 	route := storedPlanRoute{
 		DatabaseType: resolvedTarget.DatabaseType,
 		Deployment:   deployment,
@@ -636,36 +772,56 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	return resp, planResp, nil
 }
 
-// blockPostgresPlanWithoutClassifierVerdicts is the fail-closed seam for the
-// PostgreSQL classifier adapter. Until that adapter supplies authoritative
-// per-statement verdicts, no PostgreSQL statement is eligible to execute.
-func blockPostgresPlanWithoutClassifierVerdicts(resp *ternv1.PlanResponse) {
+// normalizeExecutionVerdicts validates every table change's execution-mode
+// verdict against its closed vocabulary — empty (executable), "blocked", or
+// "direct" — before the plan is stored or returned. The verdict crosses the
+// wire as a free-form string and everything except "blocked" executes as the
+// engine's default path downstream, so a value this build does not recognize
+// (a skewed remote planner, a newer plan contract) must fail closed rather
+// than run.
+func (s *Service) normalizeExecutionVerdicts(resp *ternv1.PlanResponse, database, deployment string) {
 	if resp == nil {
 		return
 	}
-	block := func(change *ternv1.TableChange) {
+	for _, change := range resp.Changes {
 		if change == nil {
-			return
-		}
-		change.ExecutionMode = "blocked"
-		change.ModeReason = postgresVerdictUnavailableReason
-	}
-	for _, schemaChange := range resp.Changes {
-		if schemaChange == nil {
 			continue
 		}
-		for _, tableChange := range schemaChange.TableChanges {
-			block(tableChange)
+		for _, tc := range change.TableChanges {
+			s.normalizeExecutionVerdict(tc, database, deployment)
 		}
 	}
 	for _, shard := range resp.Shards {
 		if shard == nil {
 			continue
 		}
-		for _, tableChange := range shard.Changes {
-			block(tableChange)
+		for _, tc := range shard.Changes {
+			s.normalizeExecutionVerdict(tc, database, deployment)
 		}
 	}
+}
+
+func (s *Service) normalizeExecutionVerdict(tc *ternv1.TableChange, database, deployment string) {
+	if tc == nil || recognizedExecutionMode(tc.ExecutionMode) {
+		return
+	}
+	s.logger.Warn("plan response carried an unrecognized execution-mode verdict; the change will be blocked",
+		"database", database,
+		"deployment", deployment,
+		"table", tc.TableName,
+		"execution_mode", tc.ExecutionMode,
+	)
+	tc.ModeReason = fmt.Sprintf("planner returned execution-mode verdict %q, which this SchemaBot build does not recognize; the change is blocked because SchemaBot cannot determine how the statement would run", tc.ExecutionMode)
+	tc.ExecutionMode = engine.ExecutionModeBlocked
+}
+
+// recognizedExecutionMode reports whether mode is in the closed execution-mode
+// vocabulary: empty (the engine executes the statement on its default path),
+// blocked, or direct.
+func recognizedExecutionMode(mode string) bool {
+	return mode == "" ||
+		strings.EqualFold(mode, engine.ExecutionModeBlocked) ||
+		strings.EqualFold(mode, engine.ExecutionModeDirect)
 }
 
 type storedPlanRoute struct {
@@ -1034,7 +1190,7 @@ func (s *Service) enqueueApply(
 	options map[string]string,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
-	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	applyIdentifier := engine.NewApplyID()
 	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier)
 	if err != nil {
 		return "", 0, err
@@ -1158,12 +1314,15 @@ func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.Ap
 	if applyOpts.AllowUnsafe {
 		return nil
 	}
-	unsafeChanges := plan.UnsafeDDLChanges()
-	if len(unsafeChanges) == 0 {
-		return nil
+	if unsafeChanges := plan.UnsafeDDLChanges(); len(unsafeChanges) > 0 {
+		change := unsafeChanges[0]
+		return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
 	}
-	change := unsafeChanges[0]
-	return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
+	if vschemaChanges := plan.UnsafeVSchemaChanges(); len(vschemaChanges) > 0 {
+		change := vschemaChanges[0]
+		return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
+	}
+	return nil
 }
 
 // rejectBlockedStoredPlan refuses to queue an apply for a plan carrying an
@@ -1441,7 +1600,7 @@ func buildApplyTask(
 	now time.Time,
 ) *storage.Task {
 	return &storage.Task{
-		TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+		TaskIdentifier: engine.NewTaskID(),
 		PlanID:         plan.ID,
 		Database:       plan.Database,
 		DatabaseType:   plan.DatabaseType,
@@ -1463,11 +1622,14 @@ func buildApplyTask(
 
 // ExecuteRollbackPlanForApply generates a rollback plan for a specific apply.
 func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storage.Apply) (*apitypes.PlanResponse, error) {
+	// Every caller resolves the apply through the rollback source guardrails
+	// first, so a nil apply is a programmer invariant violation: an internal
+	// failure that retrying the same request cannot repair.
 	if apply == nil {
-		return nil, fmt.Errorf("apply is required")
+		return nil, terminalControlf("apply is required")
 	}
 	if !state.IsState(apply.State, state.Apply.Completed) {
-		return nil, fmt.Errorf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
+		return nil, controlConflictf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
 
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
@@ -1475,28 +1637,31 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		return nil, fmt.Errorf("get rollback source plan: %w", err)
 	}
 	if plan == nil {
-		return nil, fmt.Errorf("plan not found for apply %s", apply.ApplyIdentifier)
+		return nil, terminalControlf("plan not found for apply %s", apply.ApplyIdentifier)
 	}
 	if !rollbackSourcePlanMatchesApply(plan, apply) {
-		return nil, fmt.Errorf("source plan %s belongs to %s/%s/%s, not apply %s for %s/%s/%s",
+		return nil, terminalControlf("source plan %s belongs to %s/%s/%s, not apply %s for %s/%s/%s",
 			plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Environment,
 			apply.ApplyIdentifier, apply.Database, apply.DatabaseType, apply.Environment)
 	}
 	schemaFiles, err := rollbackSchemaFiles(plan)
 	if err != nil {
-		return nil, err
+		return nil, terminalControlf("rollback source plan is invalid: %w", err)
 	}
 
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
-		return nil, err
+		return nil, terminalControlf("rollback source apply is invalid: %w", err)
 	}
 	if plan.Target == "" {
-		return nil, fmt.Errorf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
+		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
+	// Client resolution is a config lookup: a deployment that cannot resolve a
+	// Tern client resolves the same way on every attempt, so the failure is
+	// terminal until an operator fixes the routing configuration.
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
-		return nil, fmt.Errorf("database %q (%s): %w", apply.Database, apply.Environment, err)
+		return nil, terminalControlf("database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
 
 	prNumber := int32(apply.PullRequest)
@@ -1518,8 +1683,21 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 		Target:      plan.Target,
 	})
 	if err != nil {
-		return nil, err
+		// Mirror ExecutePlanProto's transport classification: only remote
+		// unavailability is worth retrying, because the same rollback plan
+		// request is safe to re-send. Every other failure is the engine's
+		// deterministic answer for this stored plan, so it is terminal for
+		// durable command processing.
+		if client.IsRemote() && grpcstatus.Code(err) == grpccodes.Unavailable {
+			return nil, &RemoteDeploymentUnavailableError{
+				Deployment: deployment,
+				Target:     plan.Target,
+				Err:        err,
+			}
+		}
+		return nil, terminalControlf("rollback plan for database %q (%s): %w", apply.Database, apply.Environment, err)
 	}
+	s.normalizeExecutionVerdicts(resp, apply.Database, deployment)
 	route := storedPlanRoute{
 		DatabaseType: apply.DatabaseType,
 		Deployment:   deployment,

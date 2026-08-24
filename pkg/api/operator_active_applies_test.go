@@ -61,12 +61,13 @@ func attrEquals(set attribute.Set, key, want string) bool {
 }
 
 // The enqueue-time active-apply increment is keyed to a fan-out apply's primary
-// deployment, and operation-scoped drives suppress the parent-level metric, so
-// the operator projection that wins the parent state transition owns releasing
-// it: it decrements once when a multi-operation rollout first reaches a terminal
-// state, re-increments if a continuable failure reopens the parent, and leaves
-// single-operation applies (which still decrement in their direct drive)
-// untouched.
+// deployment, and operation-lease-only drives (multi-operation rollouts, and
+// deployment-keyed applies whose manifest still expects unattached operations)
+// suppress the parent-level metric, so the operator projection that wins the
+// parent state transition owns releasing it: it decrements once when such a
+// rollout first reaches a terminal state, re-increments if a continuable
+// failure reopens the parent, and leaves legacy single-operation applies
+// (which still decrement in their direct parent-lease drive) untouched.
 func TestUpdateApplyStateFromOperations_ActiveAppliesAccounting(t *testing.T) {
 	const (
 		database    = "testdb"
@@ -115,6 +116,50 @@ func TestUpdateApplyStateFromOperations_ActiveAppliesAccounting(t *testing.T) {
 
 		_, ok := activeAppliesValue(t, reader, database, deployment, environment)
 		assert.False(t, ok, "single-op projection must not touch the gauge; its drive owns the decrement")
+	})
+
+	t.Run("keyed apply with unattached manifest operations decrements on terminal failure", func(t *testing.T) {
+		// A deployment-keyed apply drives under the operation lease even while
+		// only one operation has attached, so the drive suppresses the
+		// parent-level gauge; when the lone attached operation fails the
+		// generation permanently, the projection that terminalizes the parent
+		// must release the gauge or the apply counts as in flight forever.
+		reader := installManualMeterReader(t)
+		applyStore := &recordingApplyStore{swapped: true}
+		svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, OperationKey: "ns/-80/users", State: state.ApplyOperation.Failed},
+		}}, applyStore)
+
+		apply := newApply(state.Apply.Running)
+		apply.ExpectedOperationKeys = []string{"ns/-80/users", "ns/80-/users"}
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, applyStore.updated)
+		assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+
+		value, ok := activeAppliesValue(t, reader, database, deployment, environment)
+		require.True(t, ok, "terminalizing a keyed apply driven under the operation lease must adjust the gauge")
+		assert.Equal(t, int64(-1), value)
+	})
+
+	t.Run("fully attached keyed single-operation apply leaves the gauge to the direct drive", func(t *testing.T) {
+		// Once every manifest key has attached, a single-operation keyed apply
+		// takes the legacy parent-lease drive, which releases the gauge itself.
+		reader := installManualMeterReader(t)
+		applyStore := &recordingApplyStore{swapped: true}
+		svc := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, OperationKey: "ns/-80/users", State: state.ApplyOperation.Completed},
+		}}, applyStore)
+
+		apply := newApply(state.Apply.Running)
+		apply.ExpectedOperationKeys = []string{"ns/-80/users"}
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+
+		_, ok := activeAppliesValue(t, reader, database, deployment, environment)
+		assert.False(t, ok, "a fully attached keyed single-op projection must not touch the gauge; its drive owns the decrement")
 	})
 
 	t.Run("lost projection race does not adjust the gauge", func(t *testing.T) {

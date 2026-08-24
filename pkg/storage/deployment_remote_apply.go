@@ -67,7 +67,7 @@ func deploymentSharedID(ops []*ApplyOperation, deployment string, idOf func(*App
 			continue
 		}
 		if id != shared {
-			return "", fmt.Errorf("deployment %q operations record more than one remote apply id (%q on apply_operation %d disagrees with %q)", deployment, id, op.ID, shared)
+			return "", fmt.Errorf("deployment %q operations record more than one data-plane apply id (%q on operation %q disagrees with %q)", deployment, id, op.OperationKey, shared)
 		}
 	}
 	return shared, nil

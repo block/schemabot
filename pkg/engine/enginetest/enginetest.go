@@ -16,10 +16,12 @@
 // fixture without one, so a new engine cannot silently opt out of the
 // contract.
 //
-// The postgres engine is not wired into this suite: it is a stub whose
-// operations are all unimplemented, so it has no control or progress behavior
-// to hold to the contract yet. Wire it here as part of implementing its
-// control operations.
+// The postgres engine is not wired into this suite: it deliberately declines
+// every control operation with a typed UnsupportedOperationError (its
+// statements commit or fail on their own, so there is no engine phase for a
+// command to act on), which its own unit tests pin. The suite's cases target
+// engines whose backends carry per-change control state; wire postgres here
+// if it ever grows backend-driven control behavior.
 package enginetest
 
 import (

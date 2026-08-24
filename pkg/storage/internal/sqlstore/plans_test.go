@@ -118,6 +118,53 @@ func TestPlanStore_LoadsPlansWithoutShardPlans(t *testing.T) {
 	assert.Empty(t, got.Namespaces["commerce"].Shards)
 }
 
+// TestPlanStore_RoundTripsVSchemaMetadata verifies a namespace's gate-facing
+// VSchema change-metadata survives the plan_data SQL round-trip alongside its
+// artifact: the apply-time unsafe gate reads the recorded deletions and
+// mutations from the reloaded plan, so a stored VSchema removal keeps
+// requiring opt-in instead of failing closed as an ambiguous record.
+func TestPlanStore_RoundTripsVSchemaMetadata(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	metadata := map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+		storage.PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
+	}
+	_, err := store.Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: "plan_vschema_meta",
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Deployment:     "primary",
+		Target:         "commerce-target",
+		Repository:     "org/repo",
+		PullRequest:    123,
+		SchemaPath:     "schema/commerce",
+		Environment:    "staging",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata:  metadata,
+			},
+		},
+		CreatedAt: time.Now(),
+	})
+	require.NoError(t, err)
+
+	got, err := store.Plans().Get(ctx, "plan_vschema_meta")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Contains(t, got.Namespaces, "commerce")
+	assert.Equal(t, metadata, got.Namespaces["commerce"].Metadata)
+
+	changes := got.UnsafeVSchemaChanges()
+	require.Len(t, changes, 2)
+	assert.Equal(t, "removing vindex email_idx changes query routing", changes[0].Reason)
+	assert.Equal(t, "changing vindex user_idx type re-computes keyspace ids", changes[1].Reason)
+}
+
 func TestPlanStore_RoundTripsNilPlanDataAsNull(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -141,4 +188,96 @@ func TestPlanStore_RoundTripsNilPlanDataAsNull(t *testing.T) {
 	err = testDB.QueryRowContext(ctx, "SELECT plan_data FROM plans WHERE plan_identifier = ?", "plan_nil_data").Scan(&planData)
 	require.NoError(t, err)
 	assert.Equal(t, "null", planData)
+}
+
+// TestPlanStore_ListFiltersAndOrdersNewestFirst seeds plans across databases,
+// environments, and sources (PR-generated and ad-hoc) and verifies that List
+// applies each filter independently and returns plans newest first, with a
+// deterministic id tiebreak when two plans share a created_at second.
+func TestPlanStore_ListFiltersAndOrdersNewestFirst(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	create := func(identifier, database, environment, repo string, pr int, createdAt time.Time) {
+		t.Helper()
+		_, err := store.Plans().Create(ctx, &storage.Plan{
+			PlanIdentifier: identifier,
+			Database:       database,
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Environment:    environment,
+			Repository:     repo,
+			PullRequest:    pr,
+			SchemaFiles: schema.SchemaFiles{
+				database: {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
+			},
+			CreatedAt: createdAt,
+		})
+		require.NoError(t, err)
+	}
+
+	create("plan_orders_pr_old", "orders", "staging", "org/repo", 7, base)
+	create("plan_orders_adhoc", "orders", "production", "", 0, base.Add(time.Second))
+	create("plan_billing_pr", "billing", "staging", "org/repo", 7, base.Add(2*time.Second))
+	create("plan_orders_same_second", "orders", "staging", "", 0, base.Add(2*time.Second))
+
+	identifiers := func(plans []*storage.Plan) []string {
+		out := make([]string, 0, len(plans))
+		for _, plan := range plans {
+			out = append(out, plan.PlanIdentifier)
+		}
+		return out
+	}
+
+	all, err := store.Plans().List(ctx, storage.ListPlansOptions{Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr", "plan_orders_adhoc", "plan_orders_pr_old"}, identifiers(all),
+		"same-second plans must order by id descending")
+	for _, plan := range all {
+		assert.Nil(t, plan.SchemaFiles, "List must not hydrate SchemaFiles for %s", plan.PlanIdentifier)
+	}
+
+	byDatabase, err := store.Plans().List(ctx, storage.ListPlansOptions{Database: "orders", Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_orders_same_second", "plan_orders_adhoc", "plan_orders_pr_old"}, identifiers(byDatabase))
+
+	byEnvironment, err := store.Plans().List(ctx, storage.ListPlansOptions{Environment: "staging", Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr", "plan_orders_pr_old"}, identifiers(byEnvironment))
+
+	byPR, err := store.Plans().List(ctx, storage.ListPlansOptions{Repository: "org/repo", PullRequest: 7, Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_billing_pr", "plan_orders_pr_old"}, identifiers(byPR))
+
+	since, err := store.Plans().List(ctx, storage.ListPlansOptions{Since: base.Add(2 * time.Second), Limit: 10})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr"}, identifiers(since))
+
+	limited, err := store.Plans().List(ctx, storage.ListPlansOptions{Limit: 2})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr"}, identifiers(limited))
+}
+
+// TestPlanStore_ListRejectsNonPositiveLimit verifies that an unbounded listing
+// is refused rather than silently returning nothing or everything.
+func TestPlanStore_ListRejectsNonPositiveLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	_, err := store.Plans().List(ctx, storage.ListPlansOptions{})
+	require.ErrorContains(t, err, "limit must be positive")
+}
+
+// TestPlanStore_ListRejectsPullRequestWithoutRepository verifies that a PR
+// filter without a repository is refused rather than silently matching plans
+// with the same PR number across every repository.
+func TestPlanStore_ListRejectsPullRequestWithoutRepository(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	_, err := store.Plans().List(ctx, storage.ListPlansOptions{PullRequest: 42, Limit: 10})
+	require.ErrorContains(t, err, "repository filter is required")
 }
