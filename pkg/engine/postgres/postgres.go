@@ -32,12 +32,14 @@ import (
 type Engine struct {
 	mu sync.Mutex
 	wg sync.WaitGroup
-	// progress is the tracked schema change's latest state, keyed by
-	// progressKey (the apply's ResumeState.MigrationContext). One engine is
-	// shared for the lifetime of a target, so Progress must answer for the
-	// apply the caller identifies — never for whichever apply wrote last.
-	progress       *engine.ProgressResult
-	progressKey    string
+	// progress holds the latest state of every schema change this engine is
+	// tracking, keyed by the apply's identity (its
+	// ResumeState.MigrationContext). One engine is shared for the lifetime of a
+	// target, so Progress must answer for the apply the caller identifies — and
+	// accepting a second apply on the same target must not evict the first
+	// one's state while it is still running, or the running apply's driver
+	// would be told its work no longer exists.
+	progress       map[string]*engine.ProgressResult
 	tableSizeLimit int64
 }
 
@@ -364,25 +366,26 @@ func sortedKeys[V any](values map[string]V) []string {
 // change on this engine before it returns, so there is no window in which the
 // engine has accepted work it cannot yet describe. The statement executes in a
 // goroutine of this process with nothing to provision first, and the tracked
-// progress is claimed under the engine mutex before Apply returns; Drain is
-// the only writer that clears it, and a drained engine's work is not coming
-// back. A pending progress report for a task a driver believes is in flight is
-// therefore conclusive rather than a phase to wait out.
+// progress is claimed under the engine mutex before Apply returns. Because
+// progress is tracked per apply, a second apply on the same target cannot
+// displace a running one's entry, so the only ways an entry disappears are
+// Drain and the retirement of an already-terminal entry — neither of which can
+// erase work still in flight. A pending progress report for a task a driver
+// believes is in flight is therefore conclusive rather than a phase to wait out.
 func (e *Engine) RegistersWorkSynchronously() bool {
 	return true
 }
 
-// Drain blocks until every background apply goroutine has finished, then
-// clears the tracked schema change so the next Progress reports the idle
-// sentinel. Resume and recovery paths call this before re-planning so a
-// statement still in flight from a lost lease cannot race the next drive's
-// view of the schema, and so the next poll reads a clean engine instead of
-// the previous change's terminal snapshot.
+// Drain blocks until every background apply goroutine has finished, then stops
+// tracking every schema change so the next Progress reports the idle sentinel.
+// Resume and recovery paths call this before re-planning so a statement still
+// in flight from a lost lease cannot race the next drive's view of the schema,
+// and so the next poll reads a clean engine instead of the previous change's
+// terminal snapshot.
 func (e *Engine) Drain() {
 	e.wg.Wait()
 	e.mu.Lock()
 	e.progress = nil
-	e.progressKey = ""
 	e.mu.Unlock()
 }
 
