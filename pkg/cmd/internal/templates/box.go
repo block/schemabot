@@ -33,7 +33,7 @@ func WriteBox(rows []BoxRow, colorLabel string, colorFn func(string) string) {
 
 	fmt.Printf("┌%s┐\n", strings.Repeat("─", innerWidth))
 	for _, r := range rows {
-		padded := r.Value + strings.Repeat(" ", maxValueLen-ui.VisibleWidth(r.Value))
+		padded := ui.PadVisible(r.Value, maxValueLen)
 		if r.Label == colorLabel && colorFn != nil {
 			padded = colorFn(padded)
 		}

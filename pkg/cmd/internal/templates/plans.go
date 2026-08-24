@@ -84,7 +84,7 @@ func WritePlansList(data PlansListData) {
 		// The change summary can carry emoji markers whose byte, rune, and
 		// terminal-cell counts all differ, so it is padded by visible width
 		// rather than %-*s's byte count.
-		paddedChanges := p.Changes + strings.Repeat(" ", maxChanges-ui.VisibleWidth(p.Changes))
+		paddedChanges := ui.PadVisible(p.Changes, maxChanges)
 		fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 			maxID, p.PlanID,
 			maxDB, p.Database,
@@ -102,6 +102,16 @@ func WritePlansList(data PlansListData) {
 	}
 }
 
+// MarkerUnsafe and MarkerBlocked are the safety markers a plan's change
+// summary carries. The summary is built where the plan data is read and the
+// legend is printed here, so both sides take the glyph from these constants —
+// a legend that named a marker the table no longer prints would be worse than
+// no legend at all.
+const (
+	MarkerUnsafe  = "⚠️"
+	MarkerBlocked = "⛔"
+)
+
 // changesLegend names the safety markers appearing in the listed plans'
 // change summaries, so a marker is never a symbol the operator has to guess
 // at. A listing without markers prints no legend at all.
@@ -113,10 +123,10 @@ func changesLegend(plans []PlanSummaryData) string {
 	}
 	var parts []string
 	if hasUnsafe {
-		parts = append(parts, "⚠️ unsafe change")
+		parts = append(parts, MarkerUnsafe+" unsafe change")
 	}
 	if hasBlocked {
-		parts = append(parts, "⛔ blocked change")
+		parts = append(parts, MarkerBlocked+" blocked change")
 	}
 	return strings.Join(parts, " · ")
 }
