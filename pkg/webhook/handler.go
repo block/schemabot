@@ -431,7 +431,11 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 // is deterministic per deployment config — no configured clients, an unknown
 // repo in multi-App mode — so the same request reproduces the failure until
 // an operator fixes the config. Command cores classifying durability treat it
-// as terminal rather than re-driving.
+// as terminal rather than re-driving. The determinism rests on two facts:
+// the handler's client set is fixed at construction, and the ServerConfig it
+// resolves against has no reload path. If either ever becomes hot-reloadable,
+// a delivery arriving mid-reload could fail transiently, and this terminal
+// classification must be revisited.
 var errGitHubAppResolution = errors.New("GitHub App resolution failed")
 
 // factoryForRepo returns the GitHub App client factory that owns the given
@@ -549,7 +553,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			ops = nil
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
+		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
 		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
@@ -994,11 +998,15 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 // was in scope at the panic site (DSN fragments, hostnames, driver internals),
 // and a PR comment is a public surface — the raw value and stack stay
 // server-side in the log.
-// Usage: defer h.recoverPanic(repo, pr, installationID)
-func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
+// Usage: defer h.recoverPanic(repo, pr, installationID, deliveryID)
+func (h *Handler) recoverPanic(repo string, pr int, installationID int64, deliveryID string) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
+		attrs := []any{"repo", repo, "pr", pr, "installation_id", installationID}
+		if deliveryID != "" {
+			attrs = append(attrs, "delivery_id", deliveryID)
+		}
+		h.logger.Error("goroutine panic", append(attrs, "error", r, "stack", string(stack))...)
 		h.postComment(repo, pr, installationID,
 			"**Internal error while processing this request. This is a bug — please report it.** Details are in the server logs.")
 	}
@@ -1016,9 +1024,9 @@ func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 // (the delayed time.AfterFunc timer case) runs untracked: the drain has
 // committed to a bounded wait and reached empty, so it will not wait for late
 // timers.
-func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
+func (h *Handler) goSafe(repo string, pr int, installationID int64, deliveryID string, fn func()) {
 	run := func() {
-		defer h.recoverPanic(repo, pr, installationID)
+		defer h.recoverPanic(repo, pr, installationID, deliveryID)
 		fn()
 	}
 

@@ -517,7 +517,17 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 // SaveExternalID stores the remote data plane's apply_id on the operation row.
 // It refuses empty IDs so callers do not convert a missing remote field into an
 // apparent successful correlation.
-func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID int64, externalID string) error {
+//
+// The write is atomic with the deployment's one-remote-apply invariant: in one
+// transaction it locks the apply's operation rows, verifies the operation's
+// deployment records no remote apply id other than the one being stored, and
+// only then writes. Sibling operations of one deployment persist concurrently
+// across the driver pool, so a check outside the writing transaction cannot
+// stop two of them from each seeing "no id recorded yet" and committing
+// divergent ids. Divergence — among the siblings themselves or between the
+// siblings and this id — returns an error wrapping
+// storage.ErrRemoteApplyDeploymentIDConflict.
+func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error {
 	if externalID == "" {
 		return fmt.Errorf("save external id for apply_operation %d: external id is empty", operationID)
 	}
@@ -525,15 +535,65 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, operationID in
 	if err != nil {
 		return err
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin save external id transaction for apply_operation %d: %w", operationID, err)
+	}
+	defer rollbackTx(ctx, tx, "save apply_operation external id")
+
+	ops, err := lockApplyOperationsForUpdate(ctx, tx, applyID)
+	if err != nil {
+		return fmt.Errorf("lock apply_operations of apply %d before storing remote apply id for apply_operation %d: %w", applyID, operationID, err)
+	}
+	var current *storage.ApplyOperation
+	for _, op := range ops {
+		if op.ID == operationID {
+			current = op
+			break
+		}
+	}
+	if current == nil {
+		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
+	}
+	sharedID, err := storage.DeploymentRemoteApplyID(ops, current.Deployment)
+	if err != nil {
+		return fmt.Errorf("refusing to store remote apply id %q for apply_operation %d: %w: %w", externalID, operationID, err, storage.ErrRemoteApplyDeploymentIDConflict)
+	}
+	if sharedID != "" && sharedID != externalID {
+		return fmt.Errorf("deployment %q of apply %d already correlates to remote apply %q; refusing to store %q for apply_operation %d: %w", current.Deployment, applyID, sharedID, externalID, operationID, storage.ErrRemoteApplyDeploymentIDConflict)
+	}
+
 	args := append([]any{externalID, operationID}, guard.args()...)
 	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
 		{Column: "external_id", Expr: "?"},
 	})
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save external id for apply_operation %d: %w", operationID, err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save external id transaction for apply_operation %d: %w", operationID, err)
+	}
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
+}
+
+// lockApplyOperationsForUpdate returns all child rows for an apply, locked
+// FOR UPDATE inside the given transaction so concurrent writers that must
+// agree across sibling rows serialize against each other.
+func lockApplyOperationsForUpdate(ctx context.Context, tx *rebindTx, applyID int64) ([]*storage.ApplyOperation, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE apply_id = ?
+		ORDER BY created_at, id
+		FOR UPDATE
+	`, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("lock apply_operations for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplyOperations(rows)
 }
 
 // SaveEngineResumeState stores opaque engine state on the operation that owns
@@ -1543,20 +1603,31 @@ const strandedParentQuiescence = 10 * time.Minute
 // rows in one pass, so there is nothing to scope it to.
 const strandedReaperLockName = "schemabot_stranded_reaper"
 
+// strandedOperationSweep identifies the stranded-operation sweep to the shared
+// election wrapper.
+var strandedOperationSweep = strandedSweep{
+	lockName: strandedReaperLockName,
+	busy:     storage.ErrStrandedReaperBusy,
+	subject:  "stranded apply_operations",
+}
+
 // strandedParentGate renders the EXISTS admitting only parents whose outcome can
-// no longer change, correlated on the given apply_id column. Both the sweep's
-// SELECT and the guarded per-row UPDATE assert it, so the write re-verifies the
-// parent it was chosen for rather than trusting a read that may be seconds old.
+// no longer change, correlated on the given apply_id column. Both a reaper
+// sweep's SELECT and its guarded per-row UPDATE assert it, so the write
+// re-verifies the parent it was chosen for rather than trusting a read that may
+// be seconds old.
 //
 // Two conditions, each for its own reason:
-//   - settled state: the rollout has a verdict, so a pending child describes
-//     work that will never run.
-//   - quiescent: the apply's own paths — stop reconciliation, terminal
-//     derivation — may still be writing sibling rows just after it terminalized.
-func (s *applyOperationStore) strandedParentGate(correlation string) (string, []any) {
+//   - settled state: the rollout has a verdict, so a child row describing
+//     future work (a pending operation, a promised task retry) is dead.
+//   - quiescent for the given window: the apply's own paths — stop
+//     reconciliation, terminal derivation — may still be writing child rows
+//     just after it terminalized. Each reaper picks the window matching what
+//     could still race it.
+func strandedParentGate(d Dialect, correlation string, quiescence time.Duration) (string, []any) {
 	parentStates := settledApplyStates()
-	quiescentBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64(strandedParentQuiescence.Microseconds())), IntervalMicrosecond)
+	quiescentBefore := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(quiescence.Microseconds())), IntervalMicrosecond)
 
 	args := stringArgs(parentStates)
 	return fmt.Sprintf(`EXISTS (
@@ -1571,42 +1642,10 @@ func (s *applyOperationStore) strandedParentGate(correlation string) (string, []
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
-	if s.locker == nil {
-		return nil, fmt.Errorf("reap stranded apply_operations requires an advisory locker; reapers cannot elect a single instance without one")
-	}
-
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get stranded reaper connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	// Do not wait for the lock: whoever holds it is doing this pass's work, and
-	// this instance's next tick is soon enough.
-	acquired, err := s.locker.Acquire(ctx, conn.lockerConn(), strandedReaperLockName, 0)
-	if err != nil {
-		return nil, fmt.Errorf("acquire stranded reaper lock: %w", err)
-	}
-	if !acquired {
-		return nil, storage.ErrStrandedReaperBusy
-	}
-	defer func() {
-		// A held lock parks every instance's reaper until this session is
-		// retired, so the two ways it can survive the pass are reported apart:
-		// the release errored, or it ran and reported the lock was not held.
-		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.lockerConn(), strandedReaperLockName)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to release the stranded reaper lock; reapers stay blocked until this session is retired",
-				"lock", strandedReaperLockName, "error", err)
-			return
-		}
-		if !released {
-			slog.WarnContext(ctx, "the stranded reaper lock was not held at release; another session may have taken it",
-				"lock", strandedReaperLockName)
-		}
-	}()
-
-	return s.reapStranded(ctx, limit)
+	return reapUnderElection(ctx, s.db, s.locker, strandedOperationSweep,
+		func(ctx context.Context) ([]*storage.ReapedOperation, error) {
+			return s.reapStranded(ctx, limit)
+		})
 }
 
 // reapStranded mirrors settled parents' outcomes onto their pending, unleased
@@ -1623,7 +1662,7 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 		return nil, fmt.Errorf("reap stranded apply_operations: limit must be positive, got %d", limit)
 	}
 
-	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 
 	selectArgs := []any{state.ApplyOperation.Pending}
 	selectArgs = append(selectArgs, parentGateArgs...)
@@ -1649,7 +1688,11 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 		return nil, nil
 	}
 
-	parents, err := s.loadStrandedParents(ctx, stranded)
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, op := range stranded {
+		applyIDs = append(applyIDs, op.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded apply_operations")
 	if err != nil {
 		return nil, err
 	}
@@ -1680,31 +1723,32 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 	return reaped, nil
 }
 
-// loadStrandedParents returns the settled parent applies of the reaped rows,
-// keyed by apply id.
-func (s *applyOperationStore) loadStrandedParents(ctx context.Context, stranded []*storage.ApplyOperation) (map[int64]*storage.Apply, error) {
-	applyIDs := make([]any, 0, len(stranded))
-	seen := make(map[int64]bool, len(stranded))
-	for _, op := range stranded {
-		if seen[op.ApplyID] {
+// loadSettledParents returns the settled parent applies of the rows a reaper
+// sweep selected, keyed by apply id. subject names the reaped row kind for
+// error context.
+func loadSettledParents(ctx context.Context, db *rebindDB, applyIDs []int64, subject string) (map[int64]*storage.Apply, error) {
+	args := make([]any, 0, len(applyIDs))
+	seen := make(map[int64]bool, len(applyIDs))
+	for _, applyID := range applyIDs {
+		if seen[applyID] {
 			continue
 		}
-		seen[op.ApplyID] = true
-		applyIDs = append(applyIDs, op.ApplyID)
+		seen[applyID] = true
+		args = append(args, applyID)
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE id IN (`+placeholders(len(applyIDs))+`)
-	`, applyIDs...)
+		WHERE id IN (`+placeholders(len(args))+`)
+	`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query settled parents of %d stranded apply_operations: %w", len(stranded), err)
+		return nil, fmt.Errorf("query settled parents of %d %s: %w", len(applyIDs), subject, err)
 	}
 	applies, err := scanApplies(rows)
 	utils.CloseAndLog(rows)
 	if err != nil {
-		return nil, fmt.Errorf("scan settled parents of %d stranded apply_operations: %w", len(stranded), err)
+		return nil, fmt.Errorf("scan settled parents of %d %s: %w", len(applyIDs), subject, err)
 	}
 
 	parents := make(map[int64]*storage.Apply, len(applies))
@@ -1730,7 +1774,7 @@ func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *sto
 		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())"
 		args = []any{parent.State, nullString(parent.ErrorMessage)}
 	}
-	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 	args = append(args, op.ID, state.ApplyOperation.Pending)
 	args = append(args, parentGateArgs...)
 

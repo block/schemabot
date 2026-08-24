@@ -3,23 +3,18 @@
 package k8s
 
 import (
-	"database/sql"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
 
 func waitForIndex(t *testing.T, dsn, tableName, indexName string, timeout time.Duration) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	var lastErr error
 	testutil.Poll(t, timeout, 500*time.Millisecond,
@@ -43,10 +38,7 @@ func waitForIndex(t *testing.T, dsn, tableName, indexName string, timeout time.D
 
 func markApplyHeartbeatStale(t *testing.T, dsn, applyID, storageName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	result, err := db.ExecContext(t.Context(),
 		"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_identifier = ?",
@@ -82,10 +74,7 @@ func markControlPlaneHeartbeatStale(t *testing.T, applyID string) {
 
 func waitForApplyExternalID(t *testing.T, applyID string, timeout time.Duration) string {
 	t.Helper()
-	db, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 
 	var (
 		lastErr    error
@@ -126,7 +115,16 @@ func startIndexAddApply(t *testing.T, tablePrefix string, waitForRunning bool) r
 
 func startIndexAddApplyWithOptions(t *testing.T, tablePrefix string, waitForRunning bool, applyOpts map[string]string, rowCount int) runningIndexApply {
 	t.Helper()
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	return startIndexAddApplyAtEndpoint(t, testutil.Endpoint(t), tablePrefix, waitForRunning, applyOpts, rowCount)
+}
+
+// startIndexAddApplyAtEndpoint is startIndexAddApplyWithOptions against an
+// explicit control-plane endpoint, for tests that run after a control-plane
+// pod replacement invalidated the suite-level port-forward and therefore
+// bring their own.
+func startIndexAddApplyAtEndpoint(t *testing.T, endpoint, tablePrefix string, waitForRunning bool, applyOpts map[string]string, rowCount int) runningIndexApply {
+	t.Helper()
+	ep, dsn := endpoint, testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName(tablePrefix)
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(

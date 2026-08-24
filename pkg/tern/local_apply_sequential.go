@@ -629,8 +629,27 @@ func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task,
 	c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
 }
 
+// shouldRetryEngineError decides whether an engine error pauses the apply as
+// failed_retryable for operator recovery instead of failing it permanently.
 func (c *LocalClient) shouldRetryEngineError(err error) bool {
-	return c.config.Type == storage.DatabaseTypeMySQL && engine.IsRetryable(err)
+	return recoveryResumesFromCheckpoint(c.config.Type) && engine.IsRetryable(err)
+}
+
+// recoveryResumesFromCheckpoint reports whether the database type's engine can
+// safely retry a failed attempt: a re-claimed recovery attempt resumes the same
+// in-flight work from the engine's durable checkpoint rather than issuing new
+// external work. MySQL drives Spirit, which resumes from its checkpoint
+// tables. Strata engines are embedder-registered, so the invariant is a
+// contract on the registration: an engine registered for Strata must resume
+// its in-flight work from a durable checkpoint on a recovery claim, never
+// redispatch it — an embedder whose engine cannot honor that must not classify
+// its errors retryable. Vitess stays out: its applies are deploy requests on
+// an external provider, where an error-path retry could dispatch duplicate
+// work — its recovery reconciles through resume state instead. Postgres stays
+// out because its engine classifies transient versus permanent failures in its
+// progress results, not through errors.
+func recoveryResumesFromCheckpoint(databaseType string) bool {
+	return databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata
 }
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
@@ -643,6 +662,26 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task, stoppedByUser bool) {
 	now := time.Now()
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A multi-operation drive owns only its operation: the tasks it drove carry
+	// the outcome, the operator derives the operation row from them and projects
+	// the parent, so the parent terminal write, control-request completion,
+	// apply-level metric, and terminal observer are all the operator's to make.
+	// Pending tasks after a failed one are still this drive's to settle, and the
+	// in-memory outcome is still adopted so the drive's own logs report what the
+	// operation settled to rather than the projection's stale running state.
+	if suppressParentApplyWrites(ctx) {
+		if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
+			for _, task := range tasks {
+				if task.State == state.Task.Pending {
+					c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
+				}
+			}
+		}
+		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
+		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
+			"stopped_by_user", stoppedByUser, "failed_task", failedTask != nil, "settled_state", apply.State)
+		return
+	}
 	if freshApply, err := c.storage.Applies().Get(ctx, apply.ID); err != nil {
 		logger.Error("failed to reload apply before sequential finalization",
 			append(apply.MutableLogAttrs(), "error", err)...)
@@ -658,27 +697,14 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		return
 	}
 	previousState := apply.State
-	switch {
-	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
-		apply.State = state.Apply.FailedRetryable
-		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
-		apply.CompletedAt = nil
-	case failedTask != nil:
-		apply.State = state.Apply.Failed
-		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
-		apply.CompletedAt = &now
+	if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
 		for _, task := range tasks {
 			if task.State == state.Task.Pending {
 				c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
 			}
 		}
-	case stoppedByUser:
-		apply.State = state.Apply.Stopped
-	default:
-		apply.State = state.Apply.Completed
-		apply.CompletedAt = &now
 	}
-	apply.UpdatedAt = now
+	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
 	} else {
@@ -713,4 +739,27 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		obs.OnTerminal(apply, tasks)
 		c.clearObserver(apply.ID)
 	}
+}
+
+// adoptSequentialOutcome mutates the in-memory apply to the outcome its
+// sequential task results settle to: failed_retryable for a retryable task
+// failure, failed for a permanent one, stopped for an operator stop, completed
+// otherwise. Callers own persisting (or not persisting) the mutated row.
+func adoptSequentialOutcome(apply *storage.Apply, failedTask *storage.Task, stoppedByUser bool, now time.Time) {
+	switch {
+	case failedTask != nil && failedTask.State == state.Task.FailedRetryable:
+		apply.State = state.Apply.FailedRetryable
+		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
+		apply.CompletedAt = nil
+	case failedTask != nil:
+		apply.State = state.Apply.Failed
+		apply.ErrorMessage = fmt.Sprintf("table %s failed: %s", failedTask.TableName, failedTask.ErrorMessage)
+		apply.CompletedAt = &now
+	case stoppedByUser:
+		apply.State = state.Apply.Stopped
+	default:
+		apply.State = state.Apply.Completed
+		apply.CompletedAt = &now
+	}
+	apply.UpdatedAt = now
 }

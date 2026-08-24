@@ -20,8 +20,13 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	writeMultiDeploymentNextAction(model.NextAction)
 	fmt.Println()
 
-	for _, deployment := range model.Deployments {
-		writeDeploymentProgressSection(deployment, data)
+	// Derive returns one Deployment per input operation, in input order, so
+	// model.Deployments[i] is the projection of data.Operations[i]. Pairing them
+	// by index lets each section render its own operation's identifiers — a
+	// keyed apply has many operations on the same deployment name, so a
+	// name-based lookup cannot tell the sections apart.
+	for i, deployment := range model.Deployments {
+		writeDeploymentProgressSection(deployment, data.Operations[i], data)
 	}
 }
 
@@ -58,12 +63,7 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 	if row, ok := volumeBoxRow(data.Volume, model.State); ok {
 		rows = append(rows, row)
 	}
-	if data.Caller != "" {
-		rows = append(rows, BoxRow{"Caller", data.Caller})
-	}
-	if data.PullRequestURL != "" {
-		rows = append(rows, BoxRow{"PR", data.PullRequestURL})
-	}
+	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if data.StartedAt != "" {
 		if started, err := time.Parse(time.RFC3339, data.StartedAt); err == nil {
 			rows = append(rows, BoxRow{"Started", started.Format("Jan 2 15:04:05 MST")})
@@ -113,16 +113,22 @@ func writeMultiDeploymentNextAction(next presentation.NextAction) {
 	}
 }
 
-func writeDeploymentProgressSection(deployment presentation.Deployment, data ProgressData) {
-	fmt.Printf("%s %s — %s", deployment.Emoji, deployment.Deployment, deployment.Label)
-	if target := targetForDeployment(data.Operations, deployment.Deployment); target != "" {
+func writeDeploymentProgressSection(deployment presentation.Deployment, op ProgressOperation, data ProgressData) {
+	fmt.Printf("%s %s", deployment.Emoji, deployment.Deployment)
+	if op.OperationKey != "" {
+		fmt.Printf(" · %s", op.OperationKey)
+	}
+	fmt.Printf(" — %s", deployment.Label)
+	if target := sectionTarget(op, data.Operations); target != "" {
 		fmt.Printf(" (%s)", target)
 	}
 	fmt.Println()
-	if externalOperationID := externalOperationIDForDeployment(data.Operations, deployment.Deployment); externalOperationID != "" {
-		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, externalOperationID, ANSIReset)
+	// The external operation ID identifies this operation's own data-plane row,
+	// so it never falls back to a sibling's value.
+	if op.ExternalOperationID != "" {
+		fmt.Printf("  %sExternal operation ID: %s%s\n", ANSIDim, op.ExternalOperationID, ANSIReset)
 	}
-	if externalID := externalIDForDeployment(data.Operations, deployment.Deployment); externalID != "" {
+	if externalID := sectionExternalID(op, data.Operations); externalID != "" {
 		fmt.Printf("  %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
 	}
 
@@ -145,28 +151,33 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, data Pro
 	fmt.Println()
 }
 
-func targetForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment {
-			return op.Target
+// sectionTarget resolves the target shown in a section header: the section's
+// own operation when set, falling back to any same-deployment sibling — the
+// target is deployment-level routing, identical across a keyed apply's
+// operations.
+func sectionTarget(op ProgressOperation, ops []ProgressOperation) string {
+	if op.Target != "" {
+		return op.Target
+	}
+	for _, sibling := range ops {
+		if sibling.Deployment == op.Deployment && sibling.Target != "" {
+			return sibling.Target
 		}
 	}
 	return ""
 }
 
-func externalOperationIDForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalOperationID != "" {
-			return op.ExternalOperationID
-		}
+// sectionExternalID resolves the external apply ID shown in a section: the
+// section's own operation when set, falling back to any same-deployment
+// sibling — a keyed apply's operations share one data-plane apply, so a
+// not-yet-dispatched operation still shows the deployment's shared ID.
+func sectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
+	if op.ExternalID != "" {
+		return op.ExternalID
 	}
-	return ""
-}
-
-func externalIDForDeployment(ops []ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalID != "" {
-			return op.ExternalID
+	for _, sibling := range ops {
+		if sibling.Deployment == op.Deployment && sibling.ExternalID != "" {
+			return sibling.ExternalID
 		}
 	}
 	return ""

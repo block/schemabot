@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -382,6 +383,11 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+
+	// Metadata is the subset of the engine's plan change-metadata that
+	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
+	// keys and the rendered VSchema diff apply-time display shows.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -647,6 +653,17 @@ type Apply struct {
 	// are not created through an idempotent remote dispatch (CLI, local mode).
 	IdempotencyKey string
 
+	// ExpectedOperationKeys is the generation manifest of a deployment-keyed
+	// apply: every operation key the dispatcher declared it will send to this
+	// apply, recorded at creation from the first dispatch and immutable after.
+	// A keyed apply's operations attach one dispatch at a time, so the attached
+	// rows alone cannot prove the generation is complete — the manifest is the
+	// completion authority: the state projection derives completed only when
+	// every listed key has an attached, terminal operation, and an attach for a
+	// key outside the manifest is refused. Empty (stored as NULL) means the
+	// apply carries no manifest and completion derives from attached rows alone.
+	ExpectedOperationKeys []string
+
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
 
@@ -718,6 +735,41 @@ func (a *Apply) HasFreshLease(now time.Time) bool {
 		return false
 	}
 	return now.Sub(a.UpdatedAt) < ApplyLeaseStaleAfter
+}
+
+// AllowsOperationKey reports whether an operation with the given key may
+// attach to this apply. An apply without a generation manifest accepts any
+// key (completion derives from attached rows alone, so an extra operation is
+// counted like any other); an apply with a manifest accepts only the keys the
+// dispatcher declared, because an undeclared operation would either never
+// gate completion or signal the two planes disagree about the generation.
+func (a *Apply) AllowsOperationKey(key string) bool {
+	if a == nil || len(a.ExpectedOperationKeys) == 0 {
+		return true
+	}
+	return slices.Contains(a.ExpectedOperationKeys, key)
+}
+
+// MissingExpectedOperationKeys returns the manifest keys with no attached
+// operation row, in the manifest's stored order. An apply without a manifest
+// is missing nothing. The state projection holds an apply's success verdict
+// until this is empty: every operation the dispatcher declared must attach
+// (and then reach a terminal state) before the generation can complete.
+func (a *Apply) MissingExpectedOperationKeys(ops []*ApplyOperation) []string {
+	if a == nil || len(a.ExpectedOperationKeys) == 0 {
+		return nil
+	}
+	attached := make(map[string]bool, len(ops))
+	for _, op := range ops {
+		attached[op.OperationKey] = true
+	}
+	var missing []string
+	for _, key := range a.ExpectedOperationKeys {
+		if !attached[key] {
+			missing = append(missing, key)
+		}
+	}
+	return missing
 }
 
 // IsRollback reports whether this apply reverts a previously applied schema

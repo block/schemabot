@@ -118,6 +118,7 @@ func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposRes
 type PullSchemaOptions struct {
 	Namespaces    []string
 	CatalogDetail string
+	Lint          bool
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
@@ -133,6 +134,7 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 		Environment:   environment,
 		Namespaces:    opts.Namespaces,
 		CatalogDetail: opts.CatalogDetail,
+		Lint:          opts.Lint,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {
@@ -143,26 +145,44 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
-// flat files use the directory name as the namespace.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int) (*apitypes.PlanResponse, error) {
-	schemaFiles, err := ReadSchemaFiles(schemaDir, environment)
+// flat files use the directory name as the namespace. Namespaces listed in
+// ignoreNamespaces are excluded from the plan request. The second return
+// value lists the namespaces actually removed by ignoreNamespaces so callers
+// can disclose the exclusion alongside the plan.
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string) (*apitypes.PlanResponse, []string, error) {
+	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, ignoreNamespaces)
 	if err != nil {
-		return nil, fmt.Errorf("read schema files: %w", err)
+		return nil, nil, fmt.Errorf("read schema files: %w", err)
 	}
 	if len(schemaFiles) == 0 {
-		return nil, fmt.Errorf("no .sql files found in %s", schemaDir)
+		if len(ignored) > 0 {
+			return nil, ignored, fmt.Errorf("no .sql files found in %s after excluding ignored namespaces %v", schemaDir, ignored)
+		}
+		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	return CallPlanAPIWithFiles(endpoint, database, dbType, environment, schemaFiles, repo, pr)
+	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored)
+	if err != nil {
+		return nil, ignored, err
+	}
+	return resp, ignored, nil
 }
 
 // CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
+	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil)
+}
+
+// postPlanRequest posts a plan request. ignoredNamespaces names the
+// namespaces removed from schemaFiles before the call — the server needs
+// them to refuse engine shapes that cannot honor the exclusion.
+func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
-		Database:    database,
-		Type:        dbType,
-		Environment: environment,
-		SchemaFiles: schemaFiles,
-		Repository:  repo,
+		Database:          database,
+		Type:              dbType,
+		Environment:       environment,
+		SchemaFiles:       schemaFiles,
+		Repository:        repo,
+		IgnoredNamespaces: ignoredNamespaces,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
@@ -291,13 +311,17 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // The environment parameter enables $ENV substitution in namespace names.
 // If non-empty, any "$ENV" in directory names or the default namespace is
 // replaced with the environment value (e.g., "bikeshare_$ENV" → "bikeshare_staging").
-func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.SchemaFiles, error) {
+//
+// Namespaces listed in ignoreNamespaces (schemabot.yaml ignore_namespaces) are
+// excluded from the result. The second return value lists the namespace keys
+// actually removed by ignoreNamespaces, sorted.
+func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) (map[string]*apitypes.SchemaFiles, []string, error) {
 	// Collect all files as relativePath → content
 	rawFiles := make(map[string]string)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, entry := range entries {
@@ -313,7 +337,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 			// Read schema files inside the subdirectory
 			subEntries, err := os.ReadDir(filepath.Join(dir, entry.Name()))
 			if err != nil {
-				return nil, fmt.Errorf("read subdirectory %s: %w", entry.Name(), err)
+				return nil, nil, fmt.Errorf("read subdirectory %s: %w", entry.Name(), err)
 			}
 			for _, sub := range subEntries {
 				if sub.IsDir() {
@@ -327,7 +351,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 				relPath := path.Join(entry.Name(), sub.Name())
 				content, err := os.ReadFile(filepath.Join(dir, entry.Name(), sub.Name()))
 				if err != nil {
-					return nil, fmt.Errorf("read %s: %w", relPath, err)
+					return nil, nil, fmt.Errorf("read %s: %w", relPath, err)
 				}
 				rawFiles[relPath] = string(content)
 			}
@@ -338,16 +362,16 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 		}
 		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+			return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
 		}
 		rawFiles[entry.Name()] = string(content)
 	}
 
 	// Group by namespace using the shared helper.
 	// For flat files, the directory name is the database name.
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment)
+	grouped, ignored, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment, ignoreNamespaces)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Convert schema.SchemaFiles → apitypes.SchemaFiles
@@ -355,7 +379,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 	for ns, nsFiles := range grouped {
 		result[ns] = &apitypes.SchemaFiles{Files: nsFiles.Files}
 	}
-	return result, nil
+	return result, ignored, nil
 }
 
 func isSchemaFile(name string) bool {
@@ -627,6 +651,63 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 	}
 	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// PlansOptions filters the stored-plan listing.
+type PlansOptions struct {
+	Limit       int
+	Database    string
+	Environment string
+	// Repository restricts the listing to plans generated for PRs in that
+	// repository (owner/name).
+	Repository string
+	// PullRequest restricts the listing to plans generated for that PR
+	// number; the server requires Repository alongside it.
+	PullRequest int
+	// Last bounds the listing to plans created within this window; zero means
+	// unbounded.
+	Last time.Duration
+}
+
+// GetPlans retrieves recent stored plans as summaries, newest first.
+func GetPlans(endpoint string, opts PlansOptions) (*apitypes.PlansResponse, error) {
+	var result apitypes.PlansResponse
+	values := url.Values{}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.Database != "" {
+		values.Set("database", opts.Database)
+	}
+	if opts.Environment != "" {
+		values.Set("environment", opts.Environment)
+	}
+	if opts.Repository != "" {
+		values.Set("repository", opts.Repository)
+	}
+	if opts.PullRequest > 0 {
+		values.Set("pull_request", strconv.Itoa(opts.PullRequest))
+	}
+	if opts.Last > 0 {
+		values.Set("last", opts.Last.String())
+	}
+	requestPath := "/api/plans"
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
+	}
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStoredPlan retrieves one stored plan with its full content.
+func GetStoredPlan(endpoint, planID string) (*apitypes.StoredPlanResponse, error) {
+	var result apitypes.StoredPlanResponse
+	if err := doGetInto(endpoint, "/api/plans/"+url.PathEscape(planID), &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

@@ -169,8 +169,12 @@ func runControlCommand[R any](
 	if !ok {
 		return nil
 	}
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, actionName)
-	if blocked {
+	client, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, apply.Database, result.Environment, actionName)
+	if err != nil {
+		// Control commands are not durable cores, so there is no driver to
+		// classify the cause; the gate has already logged the failure and
+		// posted the authorization-unavailable comment, and the command
+		// stops here (fail closed).
 		return nil
 	}
 	// Control commands are not durable cores, so an authorization evaluation

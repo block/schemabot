@@ -1236,7 +1236,7 @@ func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
 		logger:    logger,
 	}
 
-	h.goSafe("octocat/hello-world", 1, 12345, func() {
+	h.goSafe("octocat/hello-world", 1, 12345, "delivery-panic-1", func() {
 		panic("boom: mysql://user:secret@internal-host/db")
 	})
 
@@ -1248,5 +1248,30 @@ func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
 	assert.Contains(t, logged, "goroutine panic")
 	assert.Contains(t, logged, "boom: mysql://user:secret@internal-host/db",
 		"the raw panic value must stay triageable in the server log")
+	assert.Contains(t, logged, "delivery_id=delivery-panic-1",
+		"the webhook delivery must stay traceable in the server log")
 	assert.Contains(t, logged, "recoverPanic", "the stack trace must be logged")
+}
+
+func TestGoSafeOmitsEmptyDeliveryIDFromPanicLog(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	h := &Handler{
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    logger,
+	}
+
+	h.goSafe("octocat/hello-world", 1, 12345, "", func() {
+		panic("boom")
+	})
+
+	requireComment(t, comments, "panic recovery comment")
+	logged := logBuf.String()
+	assert.Contains(t, logged, "goroutine panic")
+	assert.NotContains(t, logged, "delivery_id=")
 }

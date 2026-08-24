@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -750,6 +751,28 @@ func TestLocalClient_Apply_RequiresEnvironmentField(t *testing.T) {
 	require.ErrorContains(t, err, "environment is required")
 }
 
+// A database-scoped MySQL target DSN diffs the whole database as one unit, so
+// a namespace withheld via ignore_namespaces would leave its live tables with
+// no declaring file and the diff would plan them as DROP TABLE — the inverse
+// of "ignore". The plan must refuse this combination up front rather than
+// emit a destructive plan.
+func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/testdb",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.planWithEngine(t.Context(), &ternv1.PlanRequest{
+		Database:          "testdb",
+		IgnoredNamespaces: []string{"local_fixtures"},
+	}, "testdb", schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ignore_namespaces is not supported for MySQL targets whose DSN names a database")
+	assert.Contains(t, err.Error(), "local_fixtures")
+}
+
 func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
 	changes := []storage.TableChange{{
 		Namespace:    "testdb",
@@ -765,6 +788,44 @@ func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "DROP COLUMN removes data")
 	assert.NoError(t, rejectUnsafeDDLChangesWithoutOptIn("plan-unsafe", changes, storage.ApplyOptions{AllowUnsafe: true}))
+}
+
+// TestRejectUnsafeVSchemaChangesWithoutOptIn verifies dispatch admission
+// re-checks the stored plan's VSchema disclosures: a recorded deletion is
+// refused without opt-in even though a VSchema-only scope carries no table
+// DDL, opt-in admits it, and an additive VSchema change queues freely.
+func TestRejectUnsafeVSchemaChangesWithoutOptIn(t *testing.T) {
+	unsafePlan := &storage.Plan{
+		PlanIdentifier: "plan-vschema-unsafe",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata: map[string]string{
+					storage.PlanMetadataVSchemaChanged:   "true",
+					storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+				},
+			},
+		},
+	}
+
+	err := rejectUnsafeVSchemaChangesWithoutOptIn(unsafePlan, storage.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsafe VSchema change in namespace "payments"`)
+	assert.Contains(t, err.Error(), "removing vindex email_idx changes query routing")
+	assert.Contains(t, err.Error(), "allow_unsafe=true")
+
+	assert.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(unsafePlan, storage.ApplyOptions{AllowUnsafe: true}))
+
+	additivePlan := &storage.Plan{
+		PlanIdentifier: "plan-vschema-additive",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			},
+		},
+	}
+	assert.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(additivePlan, storage.ApplyOptions{}))
 }
 
 func TestLocalClient_ProgressRequiresApplyID(t *testing.T) {

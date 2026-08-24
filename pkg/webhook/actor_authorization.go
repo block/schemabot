@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -13,9 +14,14 @@ import (
 
 // actorAuthorizationClient resolves the installation-scoped GitHub client used
 // for actor authorization team membership lookups. The client is only needed
-// when PR command authorization is enabled. A client resolution failure fails
-// closed: the command is blocked and an authorization-unavailable comment is
-// posted so the actor knows no schema change action was taken.
+// when PR command authorization is enabled; a nil client with a nil error
+// means authorization is skipped — either the gate is disabled or no GitHub
+// clients are configured. A client resolution failure fails closed: the
+// command is blocked, a best-effort authorization-unavailable comment is
+// posted so the actor knows no schema change action was taken, and the cause
+// is returned so durable callers can classify it — a deterministic GitHub App
+// resolution failure (errGitHubAppResolution) is terminal, while a transient
+// client-creation failure stays retryable.
 func (h *Handler) actorAuthorizationClient(
 	repo string,
 	pr int,
@@ -24,25 +30,37 @@ func (h *Handler) actorAuthorizationClient(
 	database string,
 	environment string,
 	commandName string,
-) (*ghclient.InstallationClient, bool) {
+) (*ghclient.InstallationClient, error) {
 	if !h.service.Config().PRCommandAuthorizationEnabled() || h.ghClients.Len() == 0 {
-		return nil, false
+		return nil, nil
 	}
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		h.logger.Warn("PR command blocked because the actor authorization GitHub client could not be created",
-			"repo", repo, "pr", pr, "database", database,
-			"environment", environment, "command", commandName,
-			"requested_by", requestedBy, "error", err)
+		// A GitHub App resolution failure is deterministic per deployment
+		// config — durable callers dead-letter the command permanently — so
+		// it logs at Error naming the cause, while a transient client-creation
+		// failure (an installation token fetch, for example) may clear on a
+		// later attempt and stays a Warn.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("PR command blocked: cannot resolve GitHub App client for actor authorization",
+				"repo", repo, "pr", pr, "database", database,
+				"environment", environment, "command", commandName,
+				"requested_by", requestedBy, "error", err)
+		} else {
+			h.logger.Warn("PR command blocked because the actor authorization GitHub client could not be created",
+				"repo", repo, "pr", pr, "database", database,
+				"environment", environment, "command", commandName,
+				"requested_by", requestedBy, "error", err)
+		}
 		h.postComment(repo, pr, installationID, templates.RenderPRCommandAuthorizationUnavailable(templates.ActorAuthorizationCommentData{
 			RequestedBy: requestedBy,
 			CommandName: commandName,
 			Database:    database,
 			Environment: environment,
 		}))
-		return nil, true
+		return nil, fmt.Errorf("actor authorization GitHub client for %s command %s#%d: %w", commandName, repo, pr, err)
 	}
-	return client, false
+	return client, nil
 }
 
 func (h *Handler) enforcePRCommandActorAuthorization(

@@ -51,6 +51,15 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	}
 
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A multi-operation drive owns only its operation: the failed tasks above
+	// carry the outcome, the operator derives the operation row from them and
+	// projects the parent, so the parent failed write, apply-level metric, and
+	// failure log are the operator's to make.
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("operation drive failed its tasks; operator derives the operation row and projects the parent",
+			"error_message", errMsg)
+		return
+	}
 	// Re-read the apply from storage — Stop() may have already set a terminal
 	// state (e.g., cancelled) between when the engine error occurred and now.
 	fresh, err := c.storage.Applies().Get(ctx, apply.ID)
@@ -90,6 +99,15 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	}
 
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A multi-operation drive owns only its operation: the failed_retryable
+	// tasks above carry the outcome, the operator derives the operation row from
+	// them and projects the parent, so the parent retryable write, apply-level
+	// metric, retry log, and observer are the operator's to make.
+	if suppressParentApplyWrites(ctx) {
+		logger.Info("operation drive paused its tasks for retry; operator derives the operation row and projects the parent",
+			"error_message", errMsg)
+		return
+	}
 	// Re-read the apply from storage; Stop() may have already moved it to a
 	// terminal state between the engine error and this update.
 	fresh, err := c.storage.Applies().Get(ctx, apply.ID)

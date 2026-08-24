@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -17,6 +18,14 @@ import (
 // planColumns lists all columns for SELECT queries.
 const planColumns = `id, plan_identifier, database_name, database_type,
 	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, created_at`
+
+// planListColumns matches planColumns except schema_files, which is replaced
+// by a NULL placeholder so the scan shape stays identical. schema_files holds
+// the full desired-schema DDL for every table — the bulk of a plan row — and
+// listings never need it, so List leaves SchemaFiles unhydrated rather than
+// transferring megabytes per page.
+const planListColumns = `id, plan_identifier, database_name, database_type,
+	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, created_at`
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
@@ -96,6 +105,59 @@ func (s *planStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 	`, repo, pr)
 	if err != nil {
 		return nil, fmt.Errorf("query plans for %s#%d: %w", repo, pr, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanPlans(rows)
+}
+
+// List returns plans matching opts, newest first, with SchemaFiles left
+// unhydrated (see planListColumns).
+//
+// Ordering is (created_at DESC, id DESC) for the same reason as GetByPR:
+// plans.created_at is datetime (second precision), so the id tiebreaker keeps
+// same-second plans in a deterministic newest-first order.
+func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if opts.Limit <= 0 {
+		return nil, fmt.Errorf("list plans for database %q environment %q: limit must be positive, got %d", opts.Database, opts.Environment, opts.Limit)
+	}
+	if opts.PullRequest > 0 && opts.Repository == "" {
+		return nil, fmt.Errorf("list plans for pull request %d: a repository filter is required, since a pull request number is only meaningful within one repository", opts.PullRequest)
+	}
+
+	var where []string
+	var args []any
+	if opts.Database != "" {
+		where = append(where, "database_name = ?")
+		args = append(args, opts.Database)
+	}
+	if opts.Environment != "" {
+		where = append(where, "environment = ?")
+		args = append(args, opts.Environment)
+	}
+	if opts.Repository != "" {
+		where = append(where, "repository = ?")
+		args = append(args, opts.Repository)
+	}
+	if opts.PullRequest > 0 {
+		where = append(where, "pull_request = ?")
+		args = append(args, opts.PullRequest)
+	}
+	if !opts.Since.IsZero() {
+		where = append(where, "created_at >= ?")
+		args = append(args, opts.Since)
+	}
+
+	query := "SELECT " + planListColumns + " FROM plans"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+	args = append(args, opts.Limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list plans for database %q environment %q: %w", opts.Database, opts.Environment, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -206,6 +268,7 @@ func namespacesWithShardPlans(plan *storage.Plan) map[string]*storage.NamespaceP
 			OriginalFiles:         nsData.OriginalFiles,
 			OriginalFilesCaptured: nsData.OriginalFilesCaptured,
 			Artifacts:             nsData.Artifacts,
+			Metadata:              nsData.Metadata,
 		}
 	}
 	for _, shard := range sortedShardPlans(plan.Shards) {

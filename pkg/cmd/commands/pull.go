@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 )
 
 // PullCmd returns live schema from a source environment without writing files.
@@ -17,6 +18,8 @@ type PullCmd struct {
 	Type          string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces    []string `name:"namespace" help:"Concrete live namespace to pull. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
 	CatalogDetail string   `help:"Structured catalog detail to include" default:"basic" enum:"basic,detailed"`
+	Lint          bool     `help:"Run the schema linters over every pulled table and include the violations per namespace"`
+	Output        string   `short:"o" help:"Output format: pretty renders the schema as readable SQL, json emits the full API response" default:"pretty" enum:"pretty,json"`
 }
 
 // Run executes the pull command.
@@ -31,6 +34,7 @@ func (cmd *PullCmd) Run(g *Globals) error {
 		resp, pullErr = client.CallPullSchemaAPIWithOptions(ep, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{
 			Namespaces:    cmd.Namespaces,
 			CatalogDetail: cmd.CatalogDetail,
+			Lint:          cmd.Lint,
 		})
 		return pullErr
 	})
@@ -40,9 +44,13 @@ func (cmd *PullCmd) Run(g *Globals) error {
 		}
 		return fmt.Errorf("pull schema for database %s environment %s: %w", cmd.Database, cmd.Environment, err)
 	}
-	if err := writePullSchemaResponse(os.Stdout, resp); err != nil {
-		return fmt.Errorf("write pull schema response: %w", err)
+	if cmd.Output == "json" {
+		if err := writePullSchemaResponse(os.Stdout, resp); err != nil {
+			return fmt.Errorf("write pull schema response: %w", err)
+		}
+		return nil
 	}
+	templates.WritePullSchema(resp)
 	return nil
 }
 

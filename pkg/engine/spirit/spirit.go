@@ -34,21 +34,17 @@ import (
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
-// DefaultTargetChunkTime is the default time Spirit aims for per checksum
-// chunk. Lower values = faster verification but more load on the database.
-// The row copy is not sized by this: the copier sizes each chunk against an
-// in-memory byte budget instead, because a copy chunk's measured duration
-// includes time spent waiting in the applier queue, so feeding that duration
-// back would shrink chunks toward nothing whenever the applier falls behind.
-// Spirit requires this to be in range 100ms-5s. Matches volume 3 (default).
-const DefaultTargetChunkTime = 2 * time.Second
-
 // DefaultThreads is the default number of concurrent copier threads.
 // Matches volume 3 (default).
 const DefaultThreads = 2
 
-// DefaultLockWaitTimeout is how long Spirit waits for table locks.
-const DefaultLockWaitTimeout = 30 * time.Second
+// DefaultLockWaitTimeout is how long Spirit waits for table locks. Spirit's
+// ForceKill (on by default) kills blocking transactions at 90% of this
+// timeout. It does not kill an explicit LOCK TABLES holder or a transaction
+// heavier than dbconn.TransactionWeightThreshold — those are left to finish
+// naturally within the timeout, since killing them is considered unsafe. This
+// is fixed regardless of volume — see Volume in control.go.
+const DefaultLockWaitTimeout = 10 * time.Second
 
 // Engine implements the engine.Engine interface for MySQL using Spirit.
 type Engine struct {
@@ -56,11 +52,11 @@ type Engine struct {
 	spiritLogger *slog.Logger // Logger for Spirit (may filter debug logs)
 	linter       *lint.Linter
 
-	// Configuration. targetChunkTime, threads, and lockWaitTimeout are the
-	// configured default Spirit copy settings; they are immutable after New.
-	// Each schema change starts from these defaults and carries its own working
-	// copy on runningSchemaChange, which Volume retunes for that change only.
-	targetChunkTime time.Duration
+	// Configuration; immutable after New. threads is the configured default
+	// Spirit copy thread count — each schema change starts from it and
+	// carries its own working copy on runningSchemaChange, which Volume
+	// retunes for that change only. lockWaitTimeout is not retuned by Volume:
+	// it is fixed for every schema change this engine runs.
 	threads         int
 	lockWaitTimeout time.Duration
 	// debugLogs is toggled at runtime and read from the Spirit log filter on
@@ -118,14 +114,14 @@ type runningSchemaChange struct {
 	directPolicy     directPolicy
 	directStatements []*directStatementProgress
 
-	// Spirit copy settings for this schema change. Initialized from the
-	// engine's configured defaults and retuned by Volume for this change only;
-	// they end with the change, so the next schema change starts from the
-	// configured defaults again.
-	threads         int
-	targetChunkTime time.Duration
-	lockWaitTimeout time.Duration
-	volume          int32 // Explicit volume set via Volume for this change (0 = never set)
+	// threads is the Spirit copy thread count for this schema change. It is
+	// initialized from the engine's configured default and retuned by Volume
+	// for this change only; it ends with the change, so the next schema
+	// change starts from the configured default again. lockWaitTimeout is not
+	// tracked per change: it is fixed engine-wide and Volume never adjusts it
+	// (see DefaultLockWaitTimeout).
+	threads int
+	volume  int32 // Explicit volume set via Volume for this change (0 = never set)
 
 	// For resume support
 	cancelFunc context.CancelFunc
@@ -146,7 +142,6 @@ var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
 // Config holds configuration for the Spirit engine.
 type Config struct {
 	Logger          *slog.Logger
-	TargetChunkTime time.Duration
 	Threads         int
 	LockWaitTimeout time.Duration
 	DebugLogs       bool // Enable Spirit's verbose debug logs (replication events, etc.)
@@ -167,11 +162,6 @@ func New(cfg Config) *Engine {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
-	}
-
-	targetChunkTime := cfg.TargetChunkTime
-	if targetChunkTime == 0 {
-		targetChunkTime = DefaultTargetChunkTime
 	}
 
 	threads := cfg.Threads
@@ -199,7 +189,6 @@ func New(cfg Config) *Engine {
 	eng := &Engine{
 		logger:               logger,
 		linter:               lint.New(),
-		targetChunkTime:      targetChunkTime,
 		threads:              threads,
 		lockWaitTimeout:      lockWaitTimeout,
 		disablePendingDrops:  cfg.DisablePendingDrops,
@@ -378,17 +367,18 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 }
 
 // copySettings returns the Spirit copy settings for the tracked schema change,
-// falling back to the engine's configured defaults when no change is tracked.
-// Each schema change starts from the configured defaults and may be retuned by
-// Volume; the defaults themselves never change, so a volume set on one schema
-// change never affects a later one.
-func (e *Engine) copySettings() (threads int, chunkTime, lockTimeout time.Duration) {
+// falling back to the engine's configured default thread count when no change
+// is tracked. threads may be retuned by Volume for the tracked change only,
+// so a volume set on one schema change never affects a later one.
+// lockWaitTimeout is always the engine's configured value: Volume never
+// retunes it (see DefaultLockWaitTimeout).
+func (e *Engine) copySettings() (threads int, lockTimeout time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if rm := e.runningSchemaChange; rm != nil {
-		return rm.threads, rm.targetChunkTime, rm.lockWaitTimeout
+		return rm.threads, e.lockWaitTimeout
 	}
-	return e.threads, e.targetChunkTime, e.lockWaitTimeout
+	return e.threads, e.lockWaitTimeout
 }
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -463,7 +453,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 	if !plan.HasChanges() {
 		return &engine.PlanResult{
-			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			PlanID:    engine.NewPlanID(),
 			NoChanges: true,
 		}, nil
 	}
@@ -588,9 +578,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	return &engine.PlanResult{
-		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		PlanID:         engine.NewPlanID(),
 		Changes:        schemaChanges,
 		LintViolations: lintViolations,
+		// Applying this plan can meet a copy an earlier schema change left on
+		// the target and continue it or destroy it. Disclose which, so that is
+		// known before anyone confirms rather than after the copy is gone.
+		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes),
 	}, nil
 }
 
@@ -662,22 +656,20 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	rm := &runningSchemaChange{
-		logger:          logger,
-		spiritLogger:    spiritLogger,
-		database:        database,
-		tableNamespace:  tableNamespace,
-		tables:          nil, // Tables will be populated by executeSchemaChange
-		originalDDLs:    req.FlatDDL(),
-		state:           engine.StateRunning,
-		started:         time.Now(),
-		deferCutover:    deferCutover,
-		directPolicy:    directExecPolicy,
-		host:            host,
-		username:        username,
-		password:        password,
-		threads:         e.threads,
-		targetChunkTime: e.targetChunkTime,
-		lockWaitTimeout: e.lockWaitTimeout,
+		logger:         logger,
+		spiritLogger:   spiritLogger,
+		database:       database,
+		tableNamespace: tableNamespace,
+		tables:         nil, // Tables will be populated by executeSchemaChange
+		originalDDLs:   req.FlatDDL(),
+		state:          engine.StateRunning,
+		started:        time.Now(),
+		deferCutover:   deferCutover,
+		directPolicy:   directExecPolicy,
+		host:           host,
+		username:       username,
+		password:       password,
+		threads:        e.threads,
 	}
 	e.runningSchemaChange = rm
 	e.mu.Unlock()

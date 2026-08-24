@@ -191,3 +191,61 @@ func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
+
+// Every lifecycle control declines with a typed unsupported-operation error:
+// PostgreSQL DDL runs each statement as a single transactional statement with
+// no engine phase to pause, resume, swap, revert, or retune. The typed decline
+// is what lets the durable control path resolve a request terminally instead
+// of retrying a rejection forever while the schema change keeps executing.
+func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
+	eng := New()
+
+	tests := []struct {
+		name string
+		call func(t *testing.T) error
+	}{
+		{"stop", func(t *testing.T) error {
+			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+		{"cancel", func(t *testing.T) error {
+			result, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+		{"start", func(t *testing.T) error {
+			result, err := eng.Start(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+		{"cutover", func(t *testing.T) error {
+			result, err := eng.Cutover(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+		{"revert", func(t *testing.T) error {
+			result, err := eng.Revert(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+		{"skip-revert", func(t *testing.T) error {
+			result, err := eng.SkipRevert(t.Context(), &engine.ControlRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+		{"volume", func(t *testing.T) error {
+			result, err := eng.Volume(t.Context(), &engine.VolumeRequest{})
+			assert.Nil(t, result)
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call(t)
+			require.Error(t, err)
+			assert.True(t, engine.IsUnsupportedOperation(err),
+				"the decline must be typed so durable control consumers resolve it terminally")
+		})
+	}
+}

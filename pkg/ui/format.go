@@ -28,6 +28,25 @@ func FormatNumber(n int64) string {
 	return string(result)
 }
 
+// FormatBytes formats a byte count with binary units, one decimal place above
+// the byte range. Storage engines report sizes in bytes, and an operator
+// reading a table's footprint wants the magnitude, not the digits.
+// Example: 1536 → "1.5 KiB", 1048576 → "1.0 MiB"
+func FormatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	value := float64(b)
+	for _, suffix := range []string{"KiB", "MiB", "GiB", "TiB", "PiB"} {
+		value /= unit
+		if value < unit {
+			return fmt.Sprintf("%.1f %s", value, suffix)
+		}
+	}
+	return fmt.Sprintf("%.1f EiB", value/unit)
+}
+
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human
 // label, shared by the CLI progress view and the PR comment so both surfaces
 // describe VSchema application identically.
@@ -37,6 +56,12 @@ func VSchemaStatusLabel(status string) string {
 		return "Applying..."
 	case "applied":
 		return "Applied"
+	case "failed":
+		return "Failed"
+	case "cancelled":
+		return "Cancelled"
+	case "stopped":
+		return "Stopped"
 	case "":
 		return "Pending"
 	default:
@@ -217,15 +242,19 @@ func TableStatePriority(taskState string) int {
 	}
 }
 
-// CleanLintReason strips severity prefixes like "[ERROR] linter_name:" from
-// Spirit's raw lint violation strings for cleaner display. Handles multiple
-// violations joined by "; " by cleaning each segment individually.
-func CleanLintReason(reason string) string {
-	segments := strings.Split(reason, "; ")
-	for i, seg := range segments {
-		segments[i] = cleanSingleLintReason(seg)
+// LintReasons splits an engine-reported unsafe reason into its individual
+// lint violations. Engines join a table's violations with "; ", so renderers
+// use this to give each violation its own line instead of one run-on string.
+// Each returned message has its severity prefix stripped; empty segments are
+// dropped.
+func LintReasons(reason string) []string {
+	var reasons []string
+	for seg := range strings.SplitSeq(reason, "; ") {
+		if cleaned := cleanSingleLintReason(seg); cleaned != "" {
+			reasons = append(reasons, cleaned)
+		}
 	}
-	return strings.Join(segments, "; ")
+	return reasons
 }
 
 func cleanSingleLintReason(reason string) string {

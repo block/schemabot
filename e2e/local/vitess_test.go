@@ -1160,6 +1160,103 @@ func TestVitess_Apply_DropIndex_BlockedWithoutFlag(t *testing.T) {
 	assert.Contains(t, out, "Unsafe Changes Detected")
 }
 
+// TestVitess_Apply_VSchemaVindexRemoval_BlockedWithoutFlag exercises the
+// VSchema safety gate. Removing a vindex from a keyspace's vschema.json is an
+// unsafe change: Vitess stops using the vindex for routing the moment the
+// VSchema is applied, and queries that depended on it can fail or scatter.
+// The plan must disclose the removal as unsafe, an apply without
+// --allow-unsafe must be refused before anything starts, and an apply that
+// acknowledges the removal with --allow-unsafe must complete.
+func TestVitess_Apply_VSchemaVindexRemoval_BlockedWithoutFlag(t *testing.T) {
+	vitessAvailable(t)
+	vitessRestoreBaseSchema(t, "staging")
+	defer vitessRestoreBaseSchema(t, "staging")
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+
+	// Seed a live VSchema carrying an extra xxhash vindex directly via the
+	// admin endpoint, so planning the base schema (which does not define
+	// xxhash) produces a vindex removal and nothing else.
+	vschemaWithXxhash := `{"sharded":true,"vindexes":{"hash":{"type":"hash"},"xxhash":{"type":"xxhash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"users_seq"}},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}],"auto_increment":{"column":"id","sequence":"orders_seq"}},"products":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"products_seq"}}}}`
+	seedBody := fmt.Sprintf(`{"org":%q,"database":%q,"keyspace":%q,"vschema":%s}`,
+		"localscale-staging", vitessDB, "testapp_sharded", vschemaWithXxhash)
+	_, err := localscaleAdminPost(t, "/admin/seed-vschema", seedBody)
+	require.NoError(t, err, "seed VSchema with extra vindex")
+	clearSchemaBotState(t)
+
+	baseSchema := newVitessSchemaDir(t, vitessBaseSchema())
+
+	// The plan discloses the vindex removal as an unsafe change on the
+	// keyspace's vschema.json.
+	planOut := e2eutil.RunCLIInDir(t, binPath, baseSchema, "plan",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint)
+	e2eutil.AssertContains(t, planOut, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, planOut, "xxhash")
+	e2eutil.AssertContains(t, planOut, "vschema.json")
+
+	// Applying without --allow-unsafe is refused.
+	out, err := e2eutil.RunCLIWithErrorInDir(t, binPath, baseSchema, "apply",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "-o", "log")
+	t.Logf("VSchema vindex removal apply output:\n%s", out)
+	require.Error(t, err, "expected apply to fail without --allow-unsafe")
+	assert.Contains(t, out, "Unsafe Changes Detected")
+
+	// Acknowledging the removal with --allow-unsafe lets the apply proceed.
+	clearSchemaBotState(t)
+	vitessApplyAndWait(t, baseSchema, "staging")
+}
+
+// TestVitess_Apply_VSchemaVindexTypeChange_BlockedWithoutFlag exercises the
+// VSchema safety gate for in-place vindex mutations. Changing a vindex's type
+// keeps its name but computes every row's keyspace id differently the moment
+// the VSchema is applied, so queries routed through it can miss rows or
+// scatter. The plan must disclose the mutation as unsafe, an apply without
+// --allow-unsafe must be refused before anything starts, and an apply that
+// acknowledges the mutation with --allow-unsafe must complete.
+func TestVitess_Apply_VSchemaVindexTypeChange_BlockedWithoutFlag(t *testing.T) {
+	vitessAvailable(t)
+	vitessRestoreBaseSchema(t, "staging")
+	defer vitessRestoreBaseSchema(t, "staging")
+	binPath := buildCLI(t)
+	endpoint := schemabotURL(t)
+
+	// Seed a live VSchema carrying a spare xxhash vindex no table routes
+	// through, so the desired schema can retype it without touching live
+	// routing — the plan carries the type change and nothing else.
+	vschemaWithSpareXxhash := `{"sharded":true,"vindexes":{"hash":{"type":"hash"},"spare":{"type":"xxhash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"users_seq"}},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}],"auto_increment":{"column":"id","sequence":"orders_seq"}},"products":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"products_seq"}}}}`
+	seedBody := fmt.Sprintf(`{"org":%q,"database":%q,"keyspace":%q,"vschema":%s}`,
+		"localscale-staging", vitessDB, "testapp_sharded", vschemaWithSpareXxhash)
+	_, err := localscaleAdminPost(t, "/admin/seed-vschema", seedBody)
+	require.NoError(t, err, "seed VSchema with spare vindex")
+	clearSchemaBotState(t)
+
+	// The desired VSchema keeps the spare vindex but changes its type.
+	vschemaWithSpareHash := `{"sharded":true,"vindexes":{"hash":{"type":"hash"},"spare":{"type":"hash"}},"tables":{"users":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"users_seq"}},"orders":{"column_vindexes":[{"column":"user_id","name":"hash"}],"auto_increment":{"column":"id","sequence":"orders_seq"}},"products":{"column_vindexes":[{"column":"id","name":"hash"}],"auto_increment":{"column":"id","sequence":"products_seq"}}}}`
+	retypeSchema := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
+		"testapp_sharded/vschema.json": vschemaWithSpareHash,
+	}))
+
+	// The plan discloses the type change as an unsafe change on the
+	// keyspace's vschema.json.
+	planOut := e2eutil.RunCLIInDir(t, binPath, retypeSchema, "plan",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint)
+	e2eutil.AssertContains(t, planOut, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, planOut, "changes type")
+	e2eutil.AssertContains(t, planOut, "spare")
+	e2eutil.AssertContains(t, planOut, "vschema.json")
+
+	// Applying without --allow-unsafe is refused.
+	out, err := e2eutil.RunCLIWithErrorInDir(t, binPath, retypeSchema, "apply",
+		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "-o", "log")
+	t.Logf("VSchema vindex type-change apply output:\n%s", out)
+	require.Error(t, err, "expected apply to fail without --allow-unsafe")
+	assert.Contains(t, out, "Unsafe Changes Detected")
+
+	// Acknowledging the mutation with --allow-unsafe lets the apply proceed.
+	clearSchemaBotState(t)
+	vitessApplyAndWait(t, retypeSchema, "staging")
+}
+
 func TestVitess_Apply_DropTable_WithVSchema(t *testing.T) {
 	vitessAvailable(t)
 	clearSchemaBotState(t)
@@ -1500,7 +1597,7 @@ func TestVitess_Apply_DeferDeploy(t *testing.T) {
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
-	planResp, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0)
+	planResp, _, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanID)
 	require.NotEmpty(t, planResp.Changes, "expected plan to have changes")
@@ -1554,7 +1651,7 @@ func TestVitess_Apply_DeferDeploy_StartTooEarly(t *testing.T) {
 	schemaDir := newVitessSchemaDir(t, vitessSchemaWithOverrides(map[string]string{
 		"testapp_sharded/users.sql": usersSchemaWithColumn(colName),
 	}))
-	planResp, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0)
+	planResp, _, err := client.CallPlanAPI(endpoint, vitessDB, "vitess", "staging", schemaDir, "", 0, nil)
 	require.NoError(t, err)
 	require.NotEmpty(t, planResp.PlanID)
 

@@ -81,6 +81,7 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -177,6 +178,29 @@ type e2eServiceOpts struct {
 	// observe the initial durable state of queued work (e.g. a pending
 	// apply_operations row) without racing an operator claim.
 	skipOperator bool
+	// databaseType and targetDSN let integration scenarios exercise another
+	// built-in engine while retaining the same API, storage, and operator path.
+	// For MySQL, a non-empty targetDSN overrides the default database-scoped
+	// DSN — e.g. a namespace-free DSN for scenarios where the namespace
+	// selects the database.
+	databaseType string
+	targetDSN    string
+	// preserveDurableState skips the stale-data cleanup so a second service
+	// instance can adopt durable work queued by a previous instance — the
+	// restart fixtures' crash/recovery seam. Only the first instance of a
+	// test may clean; a recovering instance must see the queued rows.
+	preserveDurableState bool
+}
+
+// namespaceFreeTargetDSN returns the shared MySQL target's DSN with no
+// database selected — the shape where each namespace's directory name selects
+// the database it is planned against.
+func namespaceFreeTargetDSN(t *testing.T) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	return cfg.FormatDSN()
 }
 
 // setupE2EServiceOpts creates a real api.Service with a LocalClient for the
@@ -184,23 +208,36 @@ type e2eServiceOpts struct {
 func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *api.Service {
 	t.Helper()
 	ctx := t.Context()
+	databaseType := opts.databaseType
+	if databaseType == "" {
+		databaseType = storage.DatabaseTypeMySQL
+	}
+	appDSN := opts.targetDSN
 
-	// Create the app database on the target
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-	require.NoError(t, err)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
-	require.NoError(t, err)
-	_ = targetDB.Close()
+	if databaseType == storage.DatabaseTypeMySQL {
+		// Create the app database on the target.
+		targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		require.NoError(t, err)
+		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
+		require.NoError(t, err)
+		_ = targetDB.Close()
 
-	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-		if err == nil {
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
-			_ = db.Close()
+		t.Cleanup(func() {
+			db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+			if err == nil {
+				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
+				_ = db.Close()
+			}
+		})
+
+		if appDSN == "" {
+			cfg, err := mysql.ParseDSN(e2eTargetDSN)
+			require.NoError(t, err)
+			cfg.DBName = appDBName
+			appDSN = cfg.FormatDSN()
 		}
-	})
-
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+appDBName, 1)
+	}
+	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
@@ -212,20 +249,31 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		st = opts.wrapStorage(st)
 	}
 
-	// Clean up any stale data from previous test runs (shared storage DB)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	// Delete child apply_operations rows before their parent applies rows so the
-	// operator claim loop cannot re-claim orphan operations whose parent lookup
-	// returns nil.
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
+	if !opts.preserveDurableState {
+		// Clean up any stale data from previous test runs (shared storage DB).
+		// A failed delete must stop the test here: leftover rows surface later
+		// as misleading assertion failures. Child apply_operations rows are
+		// deleted before their parent applies rows so the operator claim loop
+		// cannot re-claim orphan operations whose parent lookup returns nil.
+		for _, cleanup := range []struct {
+			query string
+			args  []any
+		}{
+			{"DELETE FROM checks WHERE database_name = ?", []any{appDBName}},
+			{"DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1", nil},
+			{"DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE FROM plans WHERE database_name = ?", []any{appDBName}},
+		} {
+			_, err := schemabotDB.ExecContext(ctx, cleanup.query, cleanup.args...)
+			require.NoError(t, err, "stale-data cleanup: %s", cleanup.query)
+		}
+	}
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
-		Type:      "mysql",
+		Type:      databaseType,
 		TargetDSN: appDSN,
 		Metadata:  opts.engineMetadata,
 	}, st, logger)
@@ -236,7 +284,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		Drivers: 1,
 		Databases: map[string]api.DatabaseConfig{
 			appDBName: {
-				Type: "mysql",
+				Type: databaseType,
 				Environments: map[string]api.EnvironmentConfig{
 					"staging": {DSN: appDSN},
 				},
@@ -524,7 +572,9 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 }
 
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
-// schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
+// schemaSQL maps filename -> content. Plain filenames are placed under
+// schema/{namespace}/; filenames containing a "/" are placed under schema/
+// as-is, so a test can lay out multiple namespace subdirectories.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
@@ -694,6 +744,16 @@ func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.Tre
 	return level
 }
 
+// schemaFixturePath resolves a schemaSQL key to its repository path: plain
+// filenames live under the namespace subdirectory, keys with a "/" already
+// name their namespace subdirectory.
+func schemaFixturePath(ns, name string) string {
+	if strings.Contains(name, "/") {
+		return "schema/" + name
+	}
+	return "schema/" + ns + "/" + name
+}
+
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
@@ -759,7 +819,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
-				Filename: new("schema/" + ns + "/" + name),
+				Filename: new(schemaFixturePath(ns, name)),
 				Status:   new("added"),
 			})
 		}
@@ -789,7 +849,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		blobIndex++
 		blobContents[sha] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/" + ns + "/" + name),
+			Path: new(schemaFixturePath(ns, name)),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(sha),

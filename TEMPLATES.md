@@ -59,6 +59,55 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-ignored-namespaces"></a><strong>MySQL Plan (Ignored Namespaces)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-many-lint-warnings"></a><strong>MySQL Plan (Many Lint Warnings)</strong></summary>
 
 
@@ -214,6 +263,98 @@ A plan diffs this PR's schema files against the live database, so what another P
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
 
 📋 **Plan**: **1** table to alter, **1** table to drop
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded"></a><strong>MySQL Plan (Existing Copy Discarded)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying copies the tables above again from zero rows, so it runs as long as a first copy would; the work already done is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-applying"></a><strong>MySQL Plan (Existing Copy Discarded, Applying)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+**Applying automatically**
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-adopted"></a><strong>MySQL Plan (Existing Copy Adopted)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+
+ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
+```
+
+♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued
+- `orders`, `products` in `testapp` (last progress 3h 12m ago)
+
+Applying picks up where the existing copy stopped rather than starting over.
+
+📋 **Plan**: **2** tables to alter
 
 
 ---
@@ -504,6 +645,64 @@ CREATE TABLE `addresses` (
 ```
 
 📋 **Plan**: **2** tables to create, **2** vschema updates
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="vitess-plan-vschema-removal-unsafe"></a><strong>Vitess Plan: VSchema Removal (Unsafe)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `commerce` | **Type**: `Vitess`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `commerce_sharded`
+#### VSchema
+```diff
+--- a/commerce_sharded.json
++++ b/commerce_sharded.json
+@@ -3,10 +3,6 @@
+     "hash": {
+       "type": "hash"
+-    },
+-    "customers_email_lookup": {
+-      "type": "consistent_lookup_unique",
+-      "params": {
+-        "table": "customers_email_lookup",
+-        "from": "email",
+-        "to": "keyspace_id"
+-      },
+-      "owner": "customers"
+     }
+   },
+@@ -18,8 +14,4 @@
+         {
+           "column": "id",
+           "name": "hash"
+-        },
+-        {
+-          "column": "email",
+-          "name": "customers_email_lookup"
+         }
+       ]
+     }
+```
+
+⚠️ **Issues**: **2** unsafe changes detected
+- `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
+- `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
+
+📋 **Plan**: **1** vschema update
 
 
 ---
@@ -888,6 +1087,157 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="deployment-drift-clean"></a><strong>Deployment Drift (Clean)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Same plan on all 3 deployments** (eu, au, us).
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="deployment-drift-detected"></a><strong>Deployment Drift (Detected)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:
+
+- `eu` (primary) ✅ matches the reviewed plan
+- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the reviewed plan
+- `us` ❌ could not verify — diff failed; see server logs
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="deployment-drift-could-not-verify"></a><strong>Deployment Drift (Could Not Verify)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="drop-column-blocked"></a><strong>Drop Column Blocked</strong></summary>
 
 
@@ -973,9 +1323,11 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 ---
 
-**⛔ 2 Unsafe Changes Detected:**
-- `orders`: Primary key column "id" has type "int"
-- `users`: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+**⛔ 3 Unsafe Changes Detected:**
+- `orders`:
+  - Primary key column `id` has type `int`
+  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -2861,7 +3213,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ETA: 3m 15s
-- ℹ️ _Throttled: commit-latency 112.4ms >= 100ms_
+- ℹ️ _Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_
 
 **`products`**: ⏳ Queued
 
@@ -3308,6 +3660,53 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 **Schema `testapp`**
 
 **`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically (attempt 2/10)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="middle-table-retrying-remote-dataplane-pause"></a><strong>Middle Table Retrying (Remote Data-plane Pause)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Retrying
+
+📊 1/3 complete · 1 queued · 1 retrying
+
+**Schema `testapp`**
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -5039,7 +5438,7 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,100,000 / 5,000,000
-       • ℹ️ Throttled: commit-latency 112.4ms >= 100ms
+       • ℹ️ Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
@@ -6292,10 +6691,10 @@ Volume: ██░░░░░░░░░ 2/11
 
 3 active schema changes
 
-  APPLY ID      DATABASE   ENV         STATE                STARTED         CALLER
-  apply_abc123  orders-db  staging     Running              15 minutes ago  
-  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  
-  apply_ghi789  analytics  staging     Stopped              2 hours ago     
+  APPLY ID      DATABASE   ENV         STATE                STARTED         SOURCE
+  apply_abc123  orders-db  staging     Running              15 minutes ago  https://github.com/acme/shop/pull/412
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  cli:jdoe
+  apply_ghi789  analytics  staging     Stopped              2 hours ago     https://github.com/acme/analytics/pull/87
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6313,8 +6712,8 @@ No recent schema changes
 
 1 active schema change
 
-  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        CALLER
-  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  octocat
+  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        SOURCE
+  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6322,8 +6721,8 @@ Multiple matching operations:
 
 1 active schema change
 
-  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        CALLER
-  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  octocat
+  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        SOURCE
+  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  https://github.com/acme/shop/pull/412
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6337,11 +6736,11 @@ Use 'schemabot status <apply_id>' to view details
 
 Schema change history for orders-db
 
-  APPLY ID      ENV         STATE      STARTED         DURATION  CALLER
-  apply_abc123  staging     Completed  1 hour ago      15m       cli
-  apply_def456  staging     Running    15 minutes ago  15m       PR 42
-  apply_ghi789  production  Failed     3 hours ago     30m       PR 42
-  apply_jkl012  production  Completed  1 day ago       30m       cli
+  APPLY ID      ENV         STATE      STARTED         DURATION  SOURCE
+  apply_abc123  staging     Completed  1 hour ago      15m       cli:jdoe
+  apply_def456  staging     Running    15 minutes ago  15m       https://github.com/acme/shop/pull/42
+  apply_ghi789  production  Failed     3 hours ago     30m       https://github.com/acme/shop/pull/42
+  apply_jkl012  production  Completed  1 day ago       30m       cli:jdoe
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -7166,6 +7565,88 @@ Shards diverge — grouped by change:
 | `40-80` | ⏳ waiting for -40 |
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-all-shards-completed"></a><strong>Summary: All Shards Completed</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+> Applied successfully — your schema changes are live!
+
+**Shards**: 4 completed
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ✅ completed |
+| `40-80` | ✅ completed |
+| `80-c0` | ✅ completed |
+| `c0-` | ✅ completed |
+
+### VSchema
+
+**`cdb_resolute_sharded`**: Applied
+
+```diff
+--- current
++++ new
+@@ -3,6 +3,11 @@
+   "tables": {
+     "mutes": {
++      "column_vindexes": [
++        {"column": "target_id", "name": "hash"}
++      ]
+     }
+   }
+ }
+```
+
+
+</details>
+
+<details>
+<summary><a name="summary-halt-on-failure-one-shard-failed"></a><strong>Summary: Halt On Failure (One Shard Failed)</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 1 failed, 3 halted
+
+> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
+| `40-80` | ⏸ halted — -40 failed |
+| `80-c0` | ⏸ halted — -40 failed |
+| `c0-` | ⏸ halted — -40 failed |
+
+### VSchema
+
+**`cdb_resolute_sharded`**: Cancelled
+
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
 </details>
 
 ## Multi-Deployment Apply (CLI)
@@ -7175,15 +7656,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ```
 
-┌───────────────────────────────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4                           │
-│  Environment:  production                                     │
-│  State:        running                                        │
-│  Caller:       octocat                                        │
-│  Started:      Jan 15 14:22:00 UTC                            │
-│  Duration:     8m                                             │
-│  Deployments:  1 ready for cutover · 1 running · 1 waiting    │
-└───────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                         │
+│  Environment:  production                                   │
+│  State:        running                                      │
+│  Caller:       github:octocat                               │
+│  Source:       https://github.com/acme/shop/pull/412        │
+│  Started:      Jan 15 14:22:00 UTC                          │
+│  Duration:     8m                                           │
+│  Deployments:  1 ready for cutover · 1 running · 1 waiting  │
+└─────────────────────────────────────────────────────────────┘
 
   Next: cut over us-east
 
@@ -7215,15 +7697,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ```
 
-┌─────────────────────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4                 │
-│  Environment:  production                           │
-│  State:        failed                               │
-│  Caller:       octocat                              │
-│  Started:      Jan 15 14:22:00 UTC                  │
-│  Duration:     8m                                   │
-│  Deployments:  1 completed · 1 halted · 1 failed    │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        failed                                 │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Deployments:  1 completed · 1 halted · 1 failed      │
+└───────────────────────────────────────────────────────┘
 
   ⚠ First failure: eu-west — duplicate key name 'idx_orders_source'
 
@@ -7257,15 +7740,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ```
 
-┌──────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4  │
-│  Environment:  production            │
-│  State:        completed             │
-│  Caller:       octocat               │
-│  Started:      Jan 15 14:22:00 UTC   │
-│  Duration:     7m                    │
-│  Deployments:  3 completed           │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        completed                              │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     7m                                     │
+│  Deployments:  3 completed                            │
+└───────────────────────────────────────────────────────┘
 
 ✅ us-east — completed (orders-us-east)
 
@@ -7784,7 +8268,7 @@ Unsafe allowed: Proceeding with --allow-unsafe flag
 
 🚨 Unsafe Changes (--allow-unsafe enabled)
 
-The following changes will permanently delete data:
+The following unsafe changes will be applied:
   • users: DROP COLUMN email
   • orders: DROP TABLE
 

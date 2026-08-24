@@ -12,11 +12,14 @@ import (
 
 func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T) {
 	result := &apitypes.ProgressResponse{
-		State:  state.Apply.Running,
-		Volume: 3,
+		State:       state.Apply.Running,
+		Volume:      3,
+		Caller:      "github:octocat@acme/shop#412",
+		PullRequest: "https://github.com/acme/shop/pull/412",
 		Operations: []*apitypes.ProgressOperationResponse{
 			{
 				Deployment:          "deploy-a",
+				OperationKey:        "commerce/-80/users",
 				ExternalID:          "remote-apply-a",
 				ExternalOperationID: "remote-operation-a",
 				Target:              "target-a",
@@ -45,6 +48,7 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 
 	require.Len(t, data.Operations, 1)
 	assert.Equal(t, "deploy-a", data.Operations[0].Deployment)
+	assert.Equal(t, "commerce/-80/users", data.Operations[0].OperationKey)
 	assert.Equal(t, "remote-apply-a", data.Operations[0].ExternalID)
 	assert.Equal(t, "remote-operation-a", data.Operations[0].ExternalOperationID)
 	assert.Equal(t, "target-a", data.Operations[0].Target)
@@ -59,6 +63,8 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 	assert.Equal(t, "deploy-a", data.Tables[0].Deployment)
 	assert.Equal(t, state.Task.Running, data.Tables[0].Status)
 	assert.Equal(t, 3, data.Volume)
+	assert.Equal(t, "github:octocat@acme/shop#412", data.Caller)
+	assert.Equal(t, "https://github.com/acme/shop/pull/412", data.PullRequestURL)
 }
 
 // The detail box names the operator-set volume level only while the engine is

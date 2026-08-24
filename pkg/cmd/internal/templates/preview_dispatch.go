@@ -105,6 +105,14 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewStatusDeploymentOutput()
 	case PreviewStatusHistory:
 		previewStatusHistoryOutput()
+	case PreviewPlansList:
+		previewPlansListOutput()
+	case PreviewPullSchema:
+		previewPullSchemaOutput()
+	case PreviewPullSchemaDetailed:
+		previewPullSchemaDetailedOutput()
+	case PreviewPullVitessSchema:
+		previewPullVitessSchemaOutput()
 	case PreviewLintViolations:
 		previewLintViolationsOutput()
 	case PreviewUnsafeBlocked:
@@ -116,10 +124,18 @@ func PreviewCLIOutput(previewType PreviewType) {
 	// Comment template previews
 	case PreviewCommentPlan:
 		fmt.Print(webhooktemplates.PreviewCommentPlan())
+	case PreviewCommentPlanIgnoredNamespaces:
+		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces())
 	case PreviewCommentPlanBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
 	case PreviewCommentPlanDirect:
 		fmt.Print(webhooktemplates.PreviewCommentPlanDirect())
+	case PreviewCommentPlanCopyDiscarded:
+		fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded())
+	case PreviewCommentPlanCopyDiscardedApplying:
+		fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscardedApplying())
+	case PreviewCommentPlanCopyAdopted:
+		fmt.Print(webhooktemplates.PreviewCommentPlanCopyAdopted())
 	case PreviewCommentApplyBlockedRejected:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected())
 	case PreviewCommentPlanTenant:
@@ -144,6 +160,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanLint())
 	case PreviewCommentVitessPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlan())
+	case PreviewCommentVitessPlanVSchemaRemoval:
+		fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval())
 	case PreviewCommentVitessApplyPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan())
 	case PreviewCommentMySQLMultiSchema:
@@ -182,6 +200,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyFailedBeforeRowCopy())
 	case PreviewCommentApplyRetrying:
 		fmt.Print(webhooktemplates.PreviewCommentApplyRetrying())
+	case PreviewCommentApplyRemoteRetryablePause:
+		fmt.Print(webhooktemplates.PreviewCommentApplyRemoteRetryablePause())
 	case PreviewCommentApplyStopped:
 		fmt.Print(webhooktemplates.PreviewCommentApplyStopped())
 	case PreviewCommentApplyWaitingCutover:

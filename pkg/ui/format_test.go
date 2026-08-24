@@ -36,6 +36,9 @@ func TestTableStatePriority(t *testing.T) {
 func TestVSchemaStatusLabel(t *testing.T) {
 	assert.Equal(t, "Applying...", VSchemaStatusLabel("applying"))
 	assert.Equal(t, "Applied", VSchemaStatusLabel("applied"))
+	assert.Equal(t, "Failed", VSchemaStatusLabel("failed"))
+	assert.Equal(t, "Cancelled", VSchemaStatusLabel("cancelled"))
+	assert.Equal(t, "Stopped", VSchemaStatusLabel("stopped"))
 	assert.Equal(t, "Pending", VSchemaStatusLabel(""))
 	assert.Equal(t, "rolling_back", VSchemaStatusLabel("rolling_back"), "unknown status passes through")
 }
@@ -80,44 +83,29 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
-func TestCleanLintReason(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		expect string
-	}{
-		{
-			name:   "strips ERROR prefix and linter name",
-			input:  "[ERROR] invisible_index_before_drop: Index 'idx_status' should be made invisible",
-			expect: "Index 'idx_status' should be made invisible",
-		},
-		{
-			name:   "strips WARNING prefix and linter name",
-			input:  "[WARNING] unsafe: DROP COLUMN removes data",
-			expect: "DROP COLUMN removes data",
-		},
-		{
-			name:   "no prefix passes through",
-			input:  "DROP TABLE removes all data",
-			expect: "DROP TABLE removes all data",
-		},
-		{
-			name:   "multiple reasons joined by semicolon",
-			input:  "[ERROR] unsafe: DROP COLUMN removes data; [ERROR] invisible_index_before_drop: Index should be invisible first",
-			expect: "DROP COLUMN removes data; Index should be invisible first",
-		},
-		{
-			name:   "empty string",
-			input:  "",
-			expect: "",
-		},
-	}
+func TestLintReasons(t *testing.T) {
+	t.Run("splits engine-joined violations into cleaned messages", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{"DROP COLUMN removes data", "Index should be invisible first"},
+			LintReasons("[ERROR] unsafe: DROP COLUMN removes data; [ERROR] invisible_index_before_drop: Index should be invisible first"))
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expect, CleanLintReason(tt.input))
-		})
-	}
+	t.Run("strips severity prefix and linter name", func(t *testing.T) {
+		assert.Equal(t,
+			[]string{"Index 'idx_status' should be made invisible"},
+			LintReasons("[ERROR] invisible_index_before_drop: Index 'idx_status' should be made invisible"))
+		assert.Equal(t,
+			[]string{"DROP COLUMN removes data"},
+			LintReasons("[WARNING] unsafe: DROP COLUMN removes data"))
+	})
+
+	t.Run("single violation yields one message", func(t *testing.T) {
+		assert.Equal(t, []string{"DROP TABLE removes all data"}, LintReasons("DROP TABLE removes all data"))
+	})
+
+	t.Run("empty reason yields nothing", func(t *testing.T) {
+		assert.Empty(t, LintReasons(""))
+	})
 }
 
 func TestCodeQuoteIdentifiers(t *testing.T) {
@@ -166,6 +154,32 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expect, CodeQuoteIdentifiers(tt.input))
+		})
+	}
+}
+
+// A byte count reads as a magnitude: bytes below a kibibyte, and one decimal
+// place with a binary unit above it, so a table's footprint is scannable.
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  int64
+		expect string
+	}{
+		{name: "zero", input: 0, expect: "0 B"},
+		{name: "bytes below a kibibyte", input: 1023, expect: "1023 B"},
+		{name: "exactly one kibibyte", input: 1024, expect: "1.0 KiB"},
+		{name: "fractional kibibytes", input: 1536, expect: "1.5 KiB"},
+		{name: "mebibytes", input: 1024 * 1024, expect: "1.0 MiB"},
+		{name: "gibibytes", input: 4 * 1024 * 1024 * 1024, expect: "4.0 GiB"},
+		{name: "tebibytes", input: 3 * 1024 * 1024 * 1024 * 1024, expect: "3.0 TiB"},
+		{name: "pebibytes", input: 2 * 1024 * 1024 * 1024 * 1024 * 1024, expect: "2.0 PiB"},
+		{name: "beyond pebibytes stays readable", input: 5 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024, expect: "5.0 EiB"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expect, FormatBytes(tt.input))
 		})
 	}
 }

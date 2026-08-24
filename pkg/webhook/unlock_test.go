@@ -100,6 +100,21 @@ func unlockTestHandler(t *testing.T, st storage.Storage, client *ghclient.Instal
 	}
 }
 
+// actorAuthClientSetTestHandler is unlockTestHandler with PR command actor
+// authorization enabled and a caller-chosen client set, for pinning the
+// authorization-client dispositions that only run when the gate is active.
+func actorAuthClientSetTestHandler(t *testing.T, st storage.Storage, ghClients ghclient.ClientSet) *Handler {
+	t.Helper()
+	service := api.New(st, &api.ServerConfig{
+		PRCommandAuthorization: api.PRCommandAuthorizationConfig{Enabled: true},
+	}, nil, testLogger())
+	return &Handler{
+		service:   service,
+		ghClients: ghClients,
+		logger:    testLogger(),
+	}
+}
+
 func recordComments(t *testing.T, mux *http.ServeMux) chan string {
 	t.Helper()
 	comments := make(chan string, 2)

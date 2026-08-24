@@ -11,9 +11,8 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 **runningSchemaChange** — Tracks a running schema change: the Spirit runners, affected tables, DDL statements, state, and a cancel function for stopping. Created by `Apply()`, consumed by `Progress()` and control operations.
 
 **Config** — Engine configuration:
-- `TargetChunkTime` (default 2s): Target time per checksum chunk. Row copies are sized by an in-memory byte budget instead
 - `Threads` (default 2): Number of concurrent copier threads
-- `LockWaitTimeout` (default 30s): How long to wait for table locks during cutover
+- `LockWaitTimeout` (default 10s): How long to wait for table locks during the checksum and cutover. Spirit's ForceKill (on by default) clears blocking transactions at 90% of this timeout — except an explicit LOCK TABLES holder or a transaction heavier than `dbconn.TransactionWeightThreshold`, which are left to finish naturally rather than killed — so this is fixed regardless of volume rather than scaled up for higher volumes
 - `DebugLogs`: Enable verbose Spirit debug output
 
 ## How It Works
@@ -55,14 +54,16 @@ When `defer_cutover` is set, Spirit pauses after row copy completes and waits fo
 
 ### Volume
 
-Adjusts schema change speed by mapping volume levels (1-11) to Spirit settings:
+Adjusts schema change speed by mapping volume levels (1-11) to a copier thread count (lock wait timeout is fixed, see Config above):
 
-| Volume | Threads | Chunk Time | Lock Wait |
-|--------|---------|------------|-----------|
-| 1      | 1       | 500ms      | 5s        |
-| 3      | 2       | 2s         | 30s       |
-| 5      | 4       | 4s         | 30s       |
-| 11     | 16      | 5s         | 30s       |
+| Volume | Threads         |
+|--------|-----------------|
+| 1      | 1               |
+| 3      | 2 (default)     |
+| 5      | 8               |
+| 11     | ceil(cpus/2), capped at 16 |
+
+Volumes 6-11 scale threads from the detected CPU count when available, falling back to fixed counts otherwise; some adjacent levels derive the same thread count and are indistinguishable in practice (see `volumeToSpiritSettings` in `control.go`).
 
 Implementation: Stop → reconfigure → Start. Spirit resumes from its checkpoint with the new settings.
 

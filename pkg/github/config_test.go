@@ -37,6 +37,21 @@ environments:
 	assert.Contains(t, err.Error(), "field environments not found")
 }
 
+func TestSchemabotConfigParsesIgnoreNamespaces(t *testing.T) {
+	yamlData := `
+database: testdb
+type: vitess
+ignore_namespaces:
+  - local_fixtures
+  - fixtures_$ENV
+`
+	var config SchemabotConfig
+	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
+	decoder.KnownFields(true)
+	require.NoError(t, decoder.Decode(&config))
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, config.IgnoreNamespaces)
+}
+
 func TestHasSchemaInputFiles(t *testing.T) {
 	t.Parallel()
 

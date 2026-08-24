@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/caller"
-	"github.com/block/schemabot/pkg/ui"
 )
 
 // ApplyLockConflictData contains data for apply lock conflict comments.
@@ -175,14 +174,10 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
-	fmt.Fprintf(&sb, "**⛔ %d Unsafe %s Detected:**\n", len(data.UnsafeChanges), pluralize("Change", len(data.UnsafeChanges)))
+	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
+	fmt.Fprintf(&sb, "**⛔ %d Unsafe %s Detected:**\n", unsafeCount, pluralize("Change", unsafeCount))
 	for _, c := range data.UnsafeChanges {
-		reason := ui.CleanLintReason(c.Reason)
-		if reason != "" {
-			fmt.Fprintf(&sb, "- `%s`: %s\n", c.Table, reason)
-		} else {
-			fmt.Fprintf(&sb, "- `%s`\n", c.Table)
-		}
+		writeUnsafeChangeItem(&sb, "`"+c.Table+"`", c.Reason)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)

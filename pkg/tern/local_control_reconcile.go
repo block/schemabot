@@ -103,6 +103,12 @@ func (c *LocalClient) reconcileEngineTerminalTruthBeforeCommands(ctx context.Con
 		return false, err
 	}
 	metrics.RecordEngineTerminalTruthReconcile(ctx, apply.Database, apply.Deployment, apply.Environment, "adopted_"+applyState)
+	// A multi-operation drive owns only its operation: once the operator's
+	// projection settles the parent terminal from the adopted task states, it
+	// also completes the mooted pending commands and posts the terminal summary.
+	if suppressParentApplyWrites(ctx) {
+		return true, nil
+	}
 	// The adopted terminal state moots the pending commands: the sweep
 	// completes the pending stop, and the pending cancel too for every adopted
 	// state (none of them is stopped, the one state that keeps a cancel
@@ -217,6 +223,15 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		c.logger.Info("engine terminal-truth reconcile found the apply already terminal; keeping its outcome",
 			append(apply.LogAttrs(), "engine_state", string(progress.State), "requested_by", requestedBy)...)
+		return nil
+	}
+	// A multi-operation drive owns only its operation: the tasks settled above
+	// carry the adopted outcome, the operator derives the operation row from
+	// them and projects the parent, so the parent terminal write is the
+	// operator's to make.
+	if suppressParentApplyWrites(ctx) {
+		c.logger.Info("operation drive adopted the engine's terminal outcome onto its tasks; operator derives the operation row and projects the parent",
+			append(apply.LogAttrs(), "engine_state", string(progress.State), "adopted_state", applyState, "requested_by", requestedBy)...)
 		return nil
 	}
 	previousState := apply.State
