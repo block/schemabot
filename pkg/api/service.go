@@ -3,21 +3,16 @@ package api
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	gomysql "github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/secrets"
@@ -553,15 +548,6 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		}
 	}
 
-	// Register TLS config for PlanetScale MySQL connections if configured
-	var tlsName string
-	if envConfig.TLS != nil {
-		tlsName, err = registerTLSConfig(key, envConfig.TLS)
-		if err != nil {
-			return nil, fmt.Errorf("register TLS for %s: %w", key, err)
-		}
-	}
-
 	// LocalClient uses SchemaBot's storage directly. ServerConfig.Validate
 	// rejects an unparseable or non-positive revert_window_duration at config
 	// load; parsing here fails closed rather than silently falling back to the
@@ -591,9 +577,6 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	}
 	if envConfig.Database != "" {
 		metadata["database"] = envConfig.Database
-	}
-	if tlsName != "" {
-		metadata["tls_name"] = tlsName
 	}
 	if revertWindow > 0 {
 		metadata["revert_window_duration"] = revertWindow.String()
@@ -857,41 +840,4 @@ func (s *Service) Close() error {
 		return fmt.Errorf("close errors: %v", errs)
 	}
 	return nil
-}
-
-// registerTLSConfig registers a named TLS config with the Go MySQL driver.
-// Returns the config name to use in DSN parameters (tls=<name>).
-func registerTLSConfig(name string, cfg *TLSConfig) (string, error) {
-	if cfg.CABundle == "" {
-		return "", fmt.Errorf("tls.ca_bundle is required")
-	}
-
-	caPEM, err := os.ReadFile(cfg.CABundle)
-	if err != nil {
-		return "", fmt.Errorf("read CA bundle %s: %w", cfg.CABundle, err)
-	}
-	rootPool := x509.NewCertPool()
-	if !rootPool.AppendCertsFromPEM(caPEM) {
-		return "", fmt.Errorf("failed to parse CA bundle %s", cfg.CABundle)
-	}
-
-	tlsCfg := &tls.Config{
-		RootCAs:    rootPool,
-		MinVersion: tls.VersionTLS12,
-	}
-
-	// Client certificate is optional (mTLS).
-	if cfg.ClientCert != "" && cfg.ClientKey != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
-		if err != nil {
-			return "", fmt.Errorf("load client cert/key: %w", err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	tlsName := "schemabot-" + name
-	if err := gomysql.RegisterTLSConfig(tlsName, tlsCfg); err != nil {
-		return "", fmt.Errorf("register TLS config %s: %w", tlsName, err)
-	}
-	return tlsName, nil
 }

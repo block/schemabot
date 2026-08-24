@@ -17,6 +17,7 @@ import (
 	gh "github.com/google/go-github/v86/github"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
@@ -827,7 +828,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		if len(incomplete) > 0 {
 			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,
-				URL:     fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+				URL:     caller.PullRequestURL(repo, pr.Number),
 				Title:   pr.Title,
 				HeadSHA: pr.HeadSHA,
 				HeadRef: pr.HeadRef,
@@ -839,7 +840,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		}
 		result.Missing = append(result.Missing, MissingCheckPR{
 			Number:                 pr.Number,
-			URL:                    fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+			URL:                    caller.PullRequestURL(repo, pr.Number),
 			Title:                  pr.Title,
 			HeadSHA:                pr.HeadSHA,
 			HeadRef:                pr.HeadRef,

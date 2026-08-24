@@ -147,11 +147,10 @@ func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo stri
 	if lockPR > 0 && lockRepo != "" {
 		return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 			"**Database**: `%s` | **Environment**: `%s`\n\n"+
-			"A lock is currently held by [%s#%d](https://github.com/%s/pull/%d).\n\n"+
+			"A lock is currently held by %s.\n\n"+
 			"Wait for that operation to complete, or ask the lock owner to run `%s`.",
 			database, environment,
-			lockRepo, lockPR,
-			lockRepo, lockPR,
+			caller.PullRequestMarkdownLink(lockRepo, lockPR),
 			appendTenantFlag("schemabot unlock", tenant)))
 	}
 	return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
