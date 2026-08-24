@@ -638,12 +638,16 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 // recoveryResumesFromCheckpoint reports whether the database type's engine can
 // safely retry a failed attempt: a re-claimed recovery attempt resumes the same
 // in-flight work from the engine's durable checkpoint rather than issuing new
-// external work. MySQL and Strata both drive Spirit (Strata one shard per
-// operation), which resumes from its checkpoint tables. Vitess stays out: its
-// applies are deploy requests on an external provider, where an error-path
-// retry could dispatch duplicate work — its recovery reconciles through resume
-// state instead. Postgres stays out because its engine classifies transient
-// versus permanent failures in its progress results, not through errors.
+// external work. MySQL drives Spirit, which resumes from its checkpoint
+// tables. Strata engines are embedder-registered, so the invariant is a
+// contract on the registration: an engine registered for Strata must resume
+// its in-flight work from a durable checkpoint on a recovery claim, never
+// redispatch it — an embedder whose engine cannot honor that must not classify
+// its errors retryable. Vitess stays out: its applies are deploy requests on
+// an external provider, where an error-path retry could dispatch duplicate
+// work — its recovery reconciles through resume state instead. Postgres stays
+// out because its engine classifies transient versus permanent failures in its
+// progress results, not through errors.
 func recoveryResumesFromCheckpoint(databaseType string) bool {
 	return databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata
 }
