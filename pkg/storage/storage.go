@@ -1188,8 +1188,9 @@ type ControlRequestStore interface {
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
 
 	// ListSettled returns every control request for an apply that has reached a
-	// terminal status, so the plane that accepted a control RPC can learn
-	// whether the operation took effect: accepting a request only queues it.
+	// terminal status, ordered by operation ascending, so the plane that
+	// accepted a control RPC can learn whether the operation took effect:
+	// accepting a request only queues it.
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// RecordRemoteFailure records the terminal failure another plane reported

@@ -14,13 +14,14 @@ import (
 // storage.ApplyCommentStore: the tracked-comment slot per
 // (apply_id, comment_state), the supersede/reactivate lifecycle, the
 // pending-freeze marker, the exactly-once summary-claim machinery, and the
-// apply-lease guard on every mutation.
+// apply-lease guard on every lease-guarded mutation.
 //
-// Two claim behaviors are timestamp-driven and stay in the dialect suites,
-// which can backdate updated_at directly: the stale-window takeover in
-// ReclaimStaleSummaryClaim, and the assertion that every mutation renews
-// updated_at (the claim machinery's freshness signal). The parity suite
-// covers the reclaim decisions that do not require aging a row.
+// Three claim behaviors can only be proven against an aged row and stay in
+// the dialect suites, which can backdate updated_at directly: the
+// stale-window takeover in ReclaimStaleSummaryClaim, its refusal to reclaim
+// a marker recording a posted comment, and the assertion that every mutation
+// renews updated_at (the claim machinery's freshness signal). The parity
+// suite covers the reclaim decisions that do not require aging a row.
 func TestApplyComments(t *testing.T, h Harness) {
 	// Upsert_And_Get verifies the tracked-comment round trip: an insert
 	// stores the posted level and control phase, a conflicting upsert for the
@@ -376,10 +377,11 @@ func TestApplyComments(t *testing.T, h Harness) {
 
 	// ReclaimStaleSummaryClaim_RequiresStaleSentinel verifies the reclaim
 	// refusals that do not depend on aging a row: a missing marker is not
-	// reclaimable, a fresh sentinel is an in-flight publish and stays with
-	// its holder, and a marker recording a real posted comment is never
-	// reclaimable. The stale-window takeover itself requires backdating
-	// updated_at and is exercised by the dialect suites.
+	// reclaimable, and a fresh sentinel is an in-flight publish and stays
+	// with its holder. The stale-window takeover and the refusal to reclaim
+	// a marker recording a real posted comment can only be proven against an
+	// aged row, so both require backdating updated_at and are exercised by
+	// the dialect suites.
 	t.Run("ReclaimStaleSummaryClaim_RequiresStaleSentinel", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -398,15 +400,6 @@ func TestApplyComments(t *testing.T, h Harness) {
 		reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
 		require.NoError(t, err)
 		assert.False(t, reclaimed, "fresh sentinel is an in-flight publish, not reclaimable")
-
-		// Convert the claim to a posted summary; a real comment is never
-		// reclaimable.
-		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
-			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
-		}))
-		reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
-		require.NoError(t, err)
-		assert.False(t, reclaimed, "a posted summary must never be reclaimed")
 	})
 
 	// ReleaseSummaryClaim verifies release deletes only the sentinel form of
@@ -442,11 +435,13 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.Equal(t, int64(9001), posted.GitHubCommentID)
 	})
 
-	// LeaseGuardsWrites verifies comment mutations are apply-lease-guarded:
-	// a caller holding a stale lease fails closed with ErrApplyLeaseLost and
-	// leaves the row untouched, while the current lease holder's writes land.
-	// The lease is established through the driver claim path, so the guard is
-	// exercised exactly as a drive exercises it.
+	// LeaseGuardsWrites verifies every lease-guarded comment mutation —
+	// Upsert, IncrementEditCount, ClearPendingFreeze, and Supersede: a caller
+	// holding a stale lease fails closed with ErrApplyLeaseLost and leaves
+	// the row untouched, the current lease holder's writes land, and a caller
+	// with no lease in context writes unguarded. The lease is established
+	// through the driver claim path, so the guard is exercised exactly as a
+	// drive exercises it.
 	t.Run("LeaseGuardsWrites", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -486,6 +481,15 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
 		assert.Equal(t, 1, retrieved.EditCount)
+		require.NotNil(t, retrieved.LastEditedAt, "IncrementEditCount must stamp last_edited_at")
+
+		// A caller with no lease in context takes the unguarded path: the
+		// increment lands without a lease fence.
+		require.NoError(t, store.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Equal(t, 2, retrieved.EditCount)
 
 		// ClearPendingFreeze is a lease-guarded write like the others: a
 		// stale lease fails closed, the current lease clears the marker.
@@ -504,6 +508,22 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
 		assert.Nil(t, retrieved.PendingFreezeCommentID)
+
+		// Supersede is lease-guarded like the other mutations: a stale lease
+		// cannot retire the tracked comment, the current lease holder's
+		// supersede lands.
+		require.ErrorIs(t, store.ApplyComments().Supersede(staleCtx, apply.ID, state.Comment.Progress), storage.ErrApplyLeaseLost)
+
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.Nil(t, retrieved.SupersededAt, "a stale lease must not retire the comment")
+
+		require.NoError(t, store.ApplyComments().Supersede(ownedCtx, apply.ID, state.Comment.Progress))
+		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, retrieved)
+		assert.NotNil(t, retrieved.SupersededAt)
 	})
 
 	t.Run("Upsert_DBError", func(t *testing.T) {
