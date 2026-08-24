@@ -378,8 +378,8 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 		// table, which is not necessarily the last one to change it: a later
 		// change from a pull request that has since closed leaves no open claim
 		// and is passed over.
-		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
-			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+		fmt.Fprintf(sb, "- `%s`: changed by %s, which is still open\n",
+			d.Table, caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
