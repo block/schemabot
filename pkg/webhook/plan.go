@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -774,11 +775,20 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 		if c.AgeSeconds > 0 {
 			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
 		}
-		if engine.CopyDisposition(c.Disposition) == engine.CopyAdopt {
+		switch engine.CopyDisposition(c.Disposition) {
+		case engine.CopyAdopt:
 			adopted = append(adopted, entry)
-			continue
+		case engine.CopyDiscard:
+			discarded = append(discarded, entry)
+		default:
+			// Reaching here means a deployment reported a disposition this build
+			// has no name for, so the comment warns about work that may in fact
+			// survive. Without this line the ⚠️ section is indistinguishable from
+			// a real discard and there is nothing to reconcile it against.
+			slog.Warn("comment discloses an unfinished copy as discarded because the deployment reported a disposition this build does not recognize",
+				"namespace", c.Namespace, "tables", c.Tables, "disposition", c.Disposition)
+			discarded = append(discarded, entry)
 		}
-		discarded = append(discarded, entry)
 	}
 	return discarded, adopted
 }
