@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -183,6 +184,75 @@ func TestRunStrandedReaperPassTaskReapBusyIsNotAFailure(t *testing.T) {
 	svc.runStrandedReaperPass(t.Context())
 
 	assert.Empty(t, claimFailureReasons(t, reader), "an unelected task reap is not a failure")
+}
+
+// reaperPassDeadline bounds how long a pass may take to reach a state a test is
+// waiting for. Every sweep in these tests is served by an in-memory double, so
+// anything approaching this is a sweep that never ran.
+const reaperPassDeadline = 10 * time.Second
+
+// gatedApplyOperationStore holds its sweep open until the gate is closed, so a
+// test can observe what the pass does while one sweep is still scanning.
+type gatedApplyOperationStore struct {
+	storage.ApplyOperationStore
+	gate <-chan struct{}
+}
+
+func (s *gatedApplyOperationStore) ReapStranded(ctx context.Context, _ int) ([]*storage.ReapedOperation, error) {
+	select {
+	case <-s.gate:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// startedTaskStore reports that its sweep ran by closing started.
+type startedTaskStore struct {
+	storage.TaskStore
+	started chan struct{}
+}
+
+func (s *startedTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
+	close(s.started)
+	return nil, nil
+}
+
+// The two sweeps in a pass share no lock, connection, or row, and the
+// retryable-task sweep is the one that frees a remote drive waiting out a dead
+// pause. A slow operation scan therefore must not hold it behind: both sweeps
+// run in the same pass however long either takes.
+func TestRunStrandedReaperPassDoesNotHoldOneSweepBehindTheOther(t *testing.T) {
+	taskSweepStarted := make(chan struct{})
+	operationSweepGate := make(chan struct{})
+
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{
+		operations: &gatedApplyOperationStore{gate: operationSweepGate},
+		tasks:      &startedTaskStore{started: taskSweepStarted},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), reaperPassDeadline)
+	defer cancel()
+
+	passDone := make(chan struct{})
+	go func() {
+		svc.runStrandedReaperPass(ctx)
+		close(passDone)
+	}()
+
+	select {
+	case <-taskSweepStarted:
+	case <-ctx.Done():
+		t.Fatal("the retryable-task sweep never ran while the operation sweep was still scanning")
+	}
+	close(operationSweepGate)
+
+	select {
+	case <-passDone:
+	case <-ctx.Done():
+		t.Fatal("the pass did not return once both sweeps were released")
+	}
 }
 
 // A task reap pass that settled rows before failing reports the settlements —

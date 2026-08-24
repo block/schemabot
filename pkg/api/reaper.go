@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -121,14 +122,66 @@ func (s *Service) strandedReaperLoop(ctx context.Context, stop <-chan struct{}, 
 	}
 }
 
-// runStrandedReaperPass runs one pass over both kinds of dead rows. It is
+// runStrandedReaperPass runs one pass over both kinds of dead row. It is
 // best-effort maintenance: a storage error is logged and recorded, and the next
 // pass retries. Losing the election is the expected outcome on every instance
-// but one, so it is not an error. The two reaps are independent — a failure in
-// one must not starve the other.
+// but one, so it is not an error.
+//
+// The two sweeps run concurrently. They share nothing — separate election
+// locks, separate connections, no row in common — and neither may wait behind
+// the other: the retryable-task sweep is what frees a remote drive waiting out
+// a dead pause, so a slow scan of the pending-operation set must not defer it
+// to the next tick. A failure in one likewise cannot starve the other.
 func (s *Service) runStrandedReaperPass(ctx context.Context) {
-	s.reapStrandedOperations(ctx)
-	s.reapStrandedRetryableTasks(ctx)
+	var sweeps sync.WaitGroup
+	sweeps.Go(func() { s.reapStrandedOperations(ctx) })
+	sweeps.Go(func() { s.reapStrandedRetryableTasks(ctx) })
+	sweeps.Wait()
+}
+
+// reapSweep identifies one of the reaper's sweeps to the outcome handling they
+// share: the sentinel its election returns when another instance holds the
+// lock, the phrase naming what it settles, and the claim-failure reason a
+// storage error ticks.
+type reapSweep struct {
+	busy          error
+	subject       string
+	failureReason string
+}
+
+var (
+	strandedOperationSweep = reapSweep{
+		busy:          storage.ErrStrandedReaperBusy,
+		subject:       "stranded apply operations",
+		failureReason: "stranded_reaper_error",
+	}
+	strandedRetryableTaskSweep = reapSweep{
+		busy:          storage.ErrStrandedTaskReaperBusy,
+		subject:       "stranded retryable tasks",
+		failureReason: "stranded_task_reaper_error",
+	}
+)
+
+// recordSweepOutcome handles how a sweep ended, after its settlements have
+// already been reported. The three endings stay apart because only the last is
+// a fault: an unelected pass is the expected outcome on every instance but one,
+// and a pass cut short by shutdown is a routine deploy, so neither may tick the
+// claim-failure counter operators alert on.
+func (s *Service) recordSweepOutcome(ctx context.Context, sweep reapSweep, reaped int, err error) {
+	if errors.Is(err, sweep.busy) {
+		s.logger.Debug("operator: another instance is reaping " + sweep.subject + "; skipping this pass")
+		return
+	}
+	if ctx.Err() != nil {
+		s.logger.Debug("operator: reaper sweep interrupted by shutdown",
+			"sweep", sweep.subject, "reaped_before_shutdown", reaped, "error", err)
+		return
+	}
+	if err != nil {
+		s.logger.Error("operator: failed to reap "+sweep.subject,
+			"reaped_before_failure", reaped, "error", err)
+		metrics.RecordOperatorClaimFailure(ctx, sweep.failureReason)
+	}
 }
 
 // reapStrandedOperations settles pending operation rows under settled parent
@@ -148,23 +201,7 @@ func (s *Service) reapStrandedOperations(ctx context.Context) {
 		metrics.RecordOperatorStrandedOperationReaped(ctx, parent.Database, op.Deployment, parent.Environment, parent.State)
 	}
 
-	if errors.Is(err, storage.ErrStrandedReaperBusy) {
-		s.logger.Debug("operator: another instance is reaping stranded apply operations; skipping this pass")
-		return
-	}
-	if ctx.Err() != nil {
-		// A pass interrupted by shutdown is a routine deploy, not a fault, and
-		// must not tick the claim-failure counter operators alert on.
-		s.logger.Debug("operator: stranded-operation reaper pass interrupted by shutdown",
-			"reaped_before_shutdown", len(reaped), "error", err)
-		return
-	}
-	if err != nil {
-		s.logger.Error("operator: failed to reap stranded apply operations",
-			"reaped_before_failure", len(reaped), "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "stranded_reaper_error")
-		return
-	}
+	s.recordSweepOutcome(ctx, strandedOperationSweep, len(reaped), err)
 }
 
 // reapStrandedRetryableTasks hardens failed_retryable task rows under settled
@@ -180,28 +217,17 @@ func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
 	// operator asking who changed a settled apply's task rows must find them.
 	for _, settled := range reaped {
 		parent, task := settled.Parent, settled.Task
+		// task_state, not the parent's state: the line's own subject is the task
+		// it hardened, while parent.LogAttrs() carries the settled verdict the
+		// retry promise died under — which is as often completed or cancelled as
+		// failed. A monitor keyed on the outcome needs the task's.
 		s.logger.Info("operator: reaped a stranded retryable task to failed; its settled parent apply will never dispatch the retry",
 			append(parent.LogAttrs(),
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
+				"task_state", task.State,
 				"task_error", task.ErrorMessage)...)
 	}
 
-	if errors.Is(err, storage.ErrStrandedTaskReaperBusy) {
-		s.logger.Debug("operator: another instance is reaping stranded retryable tasks; skipping this pass")
-		return
-	}
-	if ctx.Err() != nil {
-		// A pass interrupted by shutdown is a routine deploy, not a fault, and
-		// must not tick the claim-failure counter operators alert on.
-		s.logger.Debug("operator: stranded retryable-task reaper pass interrupted by shutdown",
-			"reaped_before_shutdown", len(reaped), "error", err)
-		return
-	}
-	if err != nil {
-		s.logger.Error("operator: failed to reap stranded retryable tasks",
-			"reaped_before_failure", len(reaped), "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "stranded_task_reaper_error")
-		return
-	}
+	s.recordSweepOutcome(ctx, strandedRetryableTaskSweep, len(reaped), err)
 }
