@@ -627,45 +627,21 @@ const strandedRetryableQuiescence = retryableRecoveryFreshnessDays*24*time.Hour 
 // sweeps never serialize on each other.
 const strandedTaskReaperLockName = "schemabot_stranded_task_reaper"
 
+// strandedRetryableTaskSweep identifies the retryable-task sweep to the shared
+// election wrapper.
+var strandedRetryableTaskSweep = strandedSweep{
+	lockName: strandedTaskReaperLockName,
+	busy:     storage.ErrStrandedTaskReaperBusy,
+	subject:  "stranded retryable tasks",
+}
+
 // ReapStrandedRetryable elects one reaper per pass and reaps under the lock.
 // See storage.TaskStore for the contract.
 func (s *taskStore) ReapStrandedRetryable(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
-	if s.locker == nil {
-		return nil, fmt.Errorf("reap stranded retryable tasks requires an advisory locker; reapers cannot elect a single instance without one")
-	}
-
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get stranded retryable-task reaper connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	// Do not wait for the lock: whoever holds it is doing this pass's work, and
-	// this instance's next tick is soon enough.
-	acquired, err := s.locker.Acquire(ctx, conn.lockerConn(), strandedTaskReaperLockName, 0)
-	if err != nil {
-		return nil, fmt.Errorf("acquire stranded retryable-task reaper lock: %w", err)
-	}
-	if !acquired {
-		return nil, storage.ErrStrandedTaskReaperBusy
-	}
-	defer func() {
-		// A held lock parks every instance's reaper until this session is
-		// retired, so the two ways it can survive the pass are reported apart:
-		// the release errored, or it ran and reported the lock was not held.
-		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.lockerConn(), strandedTaskReaperLockName)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to release the stranded retryable-task reaper lock; reapers stay blocked until this session is retired",
-				"lock", strandedTaskReaperLockName, "error", err)
-			return
-		}
-		if !released {
-			slog.WarnContext(ctx, "the stranded retryable-task reaper lock was not held at release; another session may have taken it",
-				"lock", strandedTaskReaperLockName)
-		}
-	}()
-
-	return s.reapStrandedRetryable(ctx, limit)
+	return reapUnderElection(ctx, s.db, s.locker, strandedRetryableTaskSweep,
+		func(ctx context.Context) ([]*storage.ReapedTask, error) {
+			return s.reapStrandedRetryable(ctx, limit)
+		})
 }
 
 // reapStrandedRetryable hardens failed_retryable task rows under settled,

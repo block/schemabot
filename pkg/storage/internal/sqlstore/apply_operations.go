@@ -1603,6 +1603,14 @@ const strandedParentQuiescence = 10 * time.Minute
 // rows in one pass, so there is nothing to scope it to.
 const strandedReaperLockName = "schemabot_stranded_reaper"
 
+// strandedOperationSweep identifies the stranded-operation sweep to the shared
+// election wrapper.
+var strandedOperationSweep = strandedSweep{
+	lockName: strandedReaperLockName,
+	busy:     storage.ErrStrandedReaperBusy,
+	subject:  "stranded apply_operations",
+}
+
 // strandedParentGate renders the EXISTS admitting only parents whose outcome can
 // no longer change, correlated on the given apply_id column. Both a reaper
 // sweep's SELECT and its guarded per-row UPDATE assert it, so the write
@@ -1634,42 +1642,10 @@ func strandedParentGate(d Dialect, correlation string, quiescence time.Duration)
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
-	if s.locker == nil {
-		return nil, fmt.Errorf("reap stranded apply_operations requires an advisory locker; reapers cannot elect a single instance without one")
-	}
-
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get stranded reaper connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	// Do not wait for the lock: whoever holds it is doing this pass's work, and
-	// this instance's next tick is soon enough.
-	acquired, err := s.locker.Acquire(ctx, conn.lockerConn(), strandedReaperLockName, 0)
-	if err != nil {
-		return nil, fmt.Errorf("acquire stranded reaper lock: %w", err)
-	}
-	if !acquired {
-		return nil, storage.ErrStrandedReaperBusy
-	}
-	defer func() {
-		// A held lock parks every instance's reaper until this session is
-		// retired, so the two ways it can survive the pass are reported apart:
-		// the release errored, or it ran and reported the lock was not held.
-		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.lockerConn(), strandedReaperLockName)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to release the stranded reaper lock; reapers stay blocked until this session is retired",
-				"lock", strandedReaperLockName, "error", err)
-			return
-		}
-		if !released {
-			slog.WarnContext(ctx, "the stranded reaper lock was not held at release; another session may have taken it",
-				"lock", strandedReaperLockName)
-		}
-	}()
-
-	return s.reapStranded(ctx, limit)
+	return reapUnderElection(ctx, s.db, s.locker, strandedOperationSweep,
+		func(ctx context.Context) ([]*storage.ReapedOperation, error) {
+			return s.reapStranded(ctx, limit)
+		})
 }
 
 // reapStranded mirrors settled parents' outcomes onto their pending, unleased
