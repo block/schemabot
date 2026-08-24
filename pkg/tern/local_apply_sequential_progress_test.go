@@ -427,6 +427,50 @@ func TestPollTaskToCompletion_LostEngineWorkNeverCompletesARevertPhaseTask(t *te
 	assert.Equal(t, 0, eng.planCalls, "the target schema is never consulted for a revert-phase task")
 }
 
+// A task parked at an operator gate — a held cutover, a deferred deploy, an
+// open revert window — is motionless by design for as long as the operator
+// takes to act. The stall watchdog must stay quiet for those states, so the
+// warning keeps meaning "this task should be moving and is not".
+func TestPollTaskToCompletion_StallWatchdogStaysQuietAtAnOperatorGate(t *testing.T) {
+	var results []*engine.ProgressResult
+	for range 60 {
+		results = append(results, &engine.ProgressResult{State: engine.StateWaitingForCutover})
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+	}
+	handler := &recordingLogHandler{}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+		},
+		logger:                        slog.New(handler),
+		taskPollIntervalOverride:      time.Millisecond,
+		taskStallWarnIntervalOverride: 20 * time.Millisecond,
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	for _, msg := range handler.messages(slog.LevelWarn) {
+		assert.NotContains(t, msg, "stall-warning interval", "a task waiting on an operator is not stalled")
+	}
+}
+
 // The lost-work trust budget is a clock, not a poll counter: a shorter poll
 // cadence must not shorten how long an engine is trusted, and the first pending
 // report of a run only starts the clock.

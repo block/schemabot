@@ -693,7 +693,12 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				return taskContinue
 			}
 
-			if stalledFor, warn := watchdog.observe(now, taskProgressSnapshotOf(task)); warn {
+			// The watchdog observes every poll so entering or leaving a state
+			// always restarts its clock, but a task parked at a gate is
+			// motionless by design and warning about it would fire on every
+			// deferred cutover and deferred deploy for as long as the operator
+			// takes to act.
+			if stalledFor, warn := watchdog.observe(now, taskProgressSnapshotOf(task)); warn && !taskWaitsForOperatorAction(task.State) {
 				c.logger.Warn("task state and progress fields are unchanged past the stall-warning interval; the drive continues polling the engine",
 					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "stalled_for", stalledFor.Round(time.Second), "engine_state", result.State)...)
 			}
@@ -830,6 +835,15 @@ func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.A
 	c.markTaskRetryable(ctx, task,
 		fmt.Sprintf("engine reports no active schema change for table %s but the target still needs the change; a fresh claim will re-drive it", task.TableName))
 	return taskFailed, nil
+}
+
+// taskWaitsForOperatorAction reports whether a task's state is one the drive is
+// meant to sit in without moving, because the next step belongs to an operator
+// rather than to the engine: a held cutover, a deferred deploy, or an open
+// revert window. Progress fields do not advance in these states by design, so
+// stall detection has nothing to say about them.
+func taskWaitsForOperatorAction(taskState string) bool {
+	return state.IsState(taskState, state.Task.WaitingForCutover, state.Task.WaitingForDeploy, state.Task.RevertWindow)
 }
 
 // taskProgressSnapshot captures the fields whose movement shows a polled task
