@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
@@ -216,13 +215,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 	if len(changes) == 0 {
 		return &engine.PlanResult{
-			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			PlanID:    engine.NewPlanID(),
 			NoChanges: true,
 		}, nil
 	}
 
 	return &engine.PlanResult{
-		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		PlanID:         engine.NewPlanID(),
 		Changes:        changes,
 		LintViolations: lintViolations,
 	}, nil

@@ -3888,7 +3888,7 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			pct = 100
 		}
 		shardTask := &storage.Task{
-			TaskIdentifier:   newTaskIdentifier(),
+			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          storedTask.ApplyID,
 			ApplyOperationID: storedTask.ApplyOperationID,
 			PlanID:           storedTask.PlanID,
