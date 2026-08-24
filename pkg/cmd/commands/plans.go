@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // PlansCmd lists recently generated plans, or shows one stored plan's content.
@@ -164,10 +165,10 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))
 	}
 	if p.UnsafeCount > 0 {
-		parts = append(parts, markerWithCount(templates.MarkerUnsafe, p.UnsafeCount))
+		parts = append(parts, markerWithCount(glyph.Attention, p.UnsafeCount))
 	}
 	if p.BlockedCount > 0 {
-		parts = append(parts, markerWithCount(templates.MarkerBlocked, p.BlockedCount))
+		parts = append(parts, markerWithCount(glyph.Refused, p.BlockedCount))
 	}
 	return strings.Join(parts, " · ")
 }
