@@ -61,7 +61,9 @@ func TestRegisterPlanetScaleMTLSAbsentIsNoOp(t *testing.T) {
 
 // A configured planetscale.mtls block with readable certificate material
 // registers successfully, so every MySQL connection the Vitess engine opens
-// presents the client identity.
+// presents the client identity. Registration is idempotent (the driver
+// overwrites the named config), so a rebuilt server in the same process —
+// Build is the exported embedding seam — registers again without error.
 func TestRegisterPlanetScaleMTLSValidMaterial(t *testing.T) {
 	certPath, keyPath := writeTestCertPair(t, t.TempDir())
 	cfg := &api.ServerConfig{
@@ -73,6 +75,7 @@ func TestRegisterPlanetScaleMTLSValidMaterial(t *testing.T) {
 			},
 		},
 	}
+	require.NoError(t, registerPlanetScaleMTLS(cfg, slog.New(slog.DiscardHandler)))
 	require.NoError(t, registerPlanetScaleMTLS(cfg, slog.New(slog.DiscardHandler)))
 }
 

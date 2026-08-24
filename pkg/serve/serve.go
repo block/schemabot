@@ -253,13 +253,6 @@ type Server struct {
 	engines    map[string]tern.EngineFactory
 }
 
-// Build constructs a SchemaBot server from cfg without opening any listener. It
-// resolves and migrates storage, constructs the service, registers
-// embedder-supplied engines, builds the webhook runtime and (when a target
-// resolver is configured) the shared data-plane client, sets up authentication
-// and telemetry, and returns a Server. The caller wires it to a transport
-// (RegisterGRPC / Handler), starts background work (Start), and releases
-// resources (Close). Run is Build plus SchemaBot's own gRPC/HTTP listeners.
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
 // certificates with the Go MySQL driver, making every MySQL connection the
 // Vitess engine opens (branch hosts and vtgates) present the client identity.
@@ -286,6 +279,13 @@ func registerPlanetScaleMTLS(cfg *api.ServerConfig, logger *slog.Logger) error {
 	return nil
 }
 
+// Build constructs a SchemaBot server from cfg without opening any listener. It
+// resolves and migrates storage, constructs the service, registers
+// embedder-supplied engines, builds the webhook runtime and (when a target
+// resolver is configured) the shared data-plane client, sets up authentication
+// and telemetry, and returns a Server. The caller wires it to a transport
+// (RegisterGRPC / Handler), starts background work (Start), and releases
+// resources (Close). Run is Build plus SchemaBot's own gRPC/HTTP listeners.
 func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server, error) {
 	o := options{logger: slog.Default()}
 	for _, opt := range opts {

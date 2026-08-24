@@ -554,11 +554,11 @@ file is missing or unparseable — a worker never comes up without the identity
 its endpoints require, where it would otherwise fail (or silently degrade) on
 every Vitess connection.
 
-This is the right knob for dynamically resolved targets (a data plane using
-`target_resolver`), where there is no per-database config to attach TLS to.
-Statically registered databases can instead use the per-database
-`tls:` block, which supports server-only TLS (client cert optional) and scopes
-the config to that one database.
+This is the knob for the Vitess engine's own connections, and it works the
+same for statically registered databases and dynamically resolved targets (a
+data plane using `target_resolver`, which has no per-database config to
+attach TLS to). The engine applies the process-wide registration to every
+connection it opens; it does not consult the per-database `tls:` block.
 
 Certificate delivery is deployment infrastructure, not server config: in the
 Helm chart, mount the certificate secret with `extraVolumes` /
