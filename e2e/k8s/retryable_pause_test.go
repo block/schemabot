@@ -47,8 +47,8 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	pods := podNamesForInstance(t, "data-plane")
 	require.NotEmpty(t, pods, "expected k8s e2e data plane pods")
 	podClient := dialDataPlanePod(t, pods[0])
-	killer := openMySQL(t, testutil.TernStagingDSN(t))
-	controlPlaneDB := openMySQL(t, testutil.SchemabotDSN(t))
+	killer := testutil.OpenMySQL(t, testutil.TernStagingDSN(t))
+	controlPlaneDB := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 
 	// Return from the fixture at dispatch rather than waiting for the control
 	// plane to report running: the control plane's view lags the engine by a
@@ -97,17 +97,6 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	assert.True(t, state.IsState(dataPlaneTaskState, state.Task.Completed),
 		"data-plane task should complete after recovery, got %s", dataPlaneTaskState)
 	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
-}
-
-// openMySQL opens and verifies a MySQL handle for direct test-side access to a
-// plane's storage or target database.
-func openMySQL(t *testing.T, dsn string) *sql.DB {
-	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoError(t, db.PingContext(t.Context()))
-	return db
 }
 
 // storedControlPlaneApplyState reads the control plane's stored apply state.
