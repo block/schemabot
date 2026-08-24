@@ -81,6 +81,67 @@ func (s *Service) SetStrandedReaperInterval(interval time.Duration) error {
 	return nil
 }
 
+// strandedReaperHeartbeatPasses is how many passes one heartbeat summary covers.
+// Summarizing a window rather than narrating every pass keeps a healthy reaper to
+// a few lines an hour at the default interval, which is quiet enough to leave on
+// and frequent enough that its absence is noticeable.
+const strandedReaperHeartbeatPasses = 15
+
+// strandedReaperPassOutcome is what one pass did, for the heartbeat's tally.
+type strandedReaperPassOutcome int
+
+const (
+	// strandedReaperPassRan is an elected pass that completed, whether or not it
+	// found anything to settle.
+	strandedReaperPassRan strandedReaperPassOutcome = iota
+	// strandedReaperPassNotElected is a pass another instance was already running.
+	strandedReaperPassNotElected
+	// strandedReaperPassFailed is a pass that ended in a storage error.
+	strandedReaperPassFailed
+)
+
+// strandedReaperHeartbeat tallies what the reaper's passes did so that a reaper
+// with nothing to settle still says so.
+//
+// An idle pass is silent by design — it settles nothing, and an instance that
+// loses the election has nothing to report at all — which leaves a healthy steady
+// state indistinguishable from a reaper that stopped ticking. An operator reading
+// hours of INFO logs finds neither, and telling those two apart is the first
+// question during an incident. The heartbeat answers it without putting a line in
+// front of them on every pass.
+type strandedReaperHeartbeat struct {
+	passes     int
+	settled    int
+	notElected int
+	failed     int
+}
+
+// observe folds one pass into the current window and returns the summary to log
+// once the window is full, or nil while it is still filling.
+func (h *strandedReaperHeartbeat) observe(outcome strandedReaperPassOutcome, settled int) []any {
+	h.passes++
+	h.settled += settled
+	switch outcome {
+	case strandedReaperPassNotElected:
+		h.notElected++
+	case strandedReaperPassFailed:
+		h.failed++
+	case strandedReaperPassRan:
+	}
+
+	if h.passes < strandedReaperHeartbeatPasses {
+		return nil
+	}
+	summary := []any{
+		"passes", h.passes,
+		"operations_settled", h.settled,
+		"passes_not_elected", h.notElected,
+		"passes_failed", h.failed,
+	}
+	*h = strandedReaperHeartbeat{}
+	return summary
+}
+
 // strandedReaperLoop runs a pass on every tick until the operator stops. It
 // shares the driver lifecycle rather than having its own: the rows it settles are
 // the residue of driving applies, so a process that does not run the operator has
@@ -89,26 +150,44 @@ func (s *Service) strandedReaperLoop(ctx context.Context, stop <-chan struct{}, 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	s.runStrandedReaperPass(ctx)
+	// State the reaper's cadence and batch size once at startup. Every later
+	// heartbeat is a count of passes, and an operator reads that count against
+	// this line to know what stretch of time it covers.
+	s.logger.Info("operator: stranded-operation reaper started",
+		"interval", interval.String(),
+		"batch", strandedReaperBatch,
+		"heartbeat_passes", strandedReaperHeartbeatPasses)
+
+	var heartbeat strandedReaperHeartbeat
+	s.runPassAndBeat(ctx, &heartbeat)
 
 	for {
 		select {
 		case <-stop:
-			s.logger.Debug("operator: stranded-operation reaper stopping")
+			s.logger.Info("operator: stranded-operation reaper stopping")
 			return
 		case <-ctx.Done():
-			s.logger.Debug("operator: stranded-operation reaper stopping", "error", ctx.Err())
+			s.logger.Info("operator: stranded-operation reaper stopping", "error", ctx.Err())
 			return
 		case <-ticker.C:
-			s.runStrandedReaperPass(ctx)
+			s.runPassAndBeat(ctx, &heartbeat)
 		}
 	}
 }
 
-// runStrandedReaperPass runs one pass. It is best-effort maintenance: a storage
-// error is logged and recorded, and the next pass retries. Losing the election is
-// the expected outcome on every instance but one, so it is not an error.
-func (s *Service) runStrandedReaperPass(ctx context.Context) {
+// runPassAndBeat runs one pass and emits the heartbeat when its window closes.
+func (s *Service) runPassAndBeat(ctx context.Context, heartbeat *strandedReaperHeartbeat) {
+	outcome, settled := s.runStrandedReaperPass(ctx)
+	if summary := heartbeat.observe(outcome, settled); summary != nil {
+		s.logger.Info("operator: stranded-operation reaper heartbeat", summary...)
+	}
+}
+
+// runStrandedReaperPass runs one pass, reporting what it did so the heartbeat can
+// tally it. It is best-effort maintenance: a storage error is logged and
+// recorded, and the next pass retries. Losing the election is the expected
+// outcome on every instance but one, so it is not an error.
+func (s *Service) runStrandedReaperPass(ctx context.Context) (strandedReaperPassOutcome, int) {
 	reaped, err := s.storage.ApplyOperations().ReapStranded(ctx, strandedReaperBatch)
 
 	// Report what landed before handling the error. A failed pass still returns
@@ -125,19 +204,25 @@ func (s *Service) runStrandedReaperPass(ctx context.Context) {
 
 	if errors.Is(err, storage.ErrStrandedReaperBusy) {
 		s.logger.Debug("operator: another instance is reaping stranded apply operations; skipping this pass")
-		return
+		return strandedReaperPassNotElected, len(reaped)
 	}
 	if ctx.Err() != nil {
 		// A pass interrupted by shutdown is a routine deploy, not a fault, and
-		// must not tick the claim-failure counter operators alert on.
-		s.logger.Debug("operator: stranded-operation reaper pass interrupted by shutdown",
-			"reaped_before_shutdown", len(reaped), "error", err)
-		return
+		// must not tick the claim-failure counter operators alert on. The line
+		// reports the shutdown as the reason, since a pass that finished cleanly
+		// just as the context ended has no error of its own to name.
+		attrs := []any{"reaped_before_shutdown", len(reaped), "error", ctx.Err()}
+		if err != nil {
+			attrs = append(attrs, "pass_error", err)
+		}
+		s.logger.Debug("operator: stranded-operation reaper pass interrupted by shutdown", attrs...)
+		return strandedReaperPassRan, len(reaped)
 	}
 	if err != nil {
 		s.logger.Error("operator: failed to reap stranded apply operations",
 			"reaped_before_failure", len(reaped), "error", err)
 		metrics.RecordOperatorClaimFailure(ctx, "stranded_reaper_error")
-		return
+		return strandedReaperPassFailed, len(reaped)
 	}
+	return strandedReaperPassRan, len(reaped)
 }
