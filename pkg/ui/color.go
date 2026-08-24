@@ -20,9 +20,5 @@ func stdoutSupportsColors() bool {
 	if os.Getenv("TERM") == "dumb" {
 		return false
 	}
-	info, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return IsTerminal(os.Stdout)
 }

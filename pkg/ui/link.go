@@ -34,11 +34,7 @@ func stdoutSupportsHyperlinks() bool {
 	if os.Getenv("TMUX") != "" || strings.HasPrefix(term, "screen") || strings.HasPrefix(term, "tmux") {
 		return false
 	}
-	info, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return IsTerminal(os.Stdout)
 }
 
 // Link renders text as an OSC 8 hyperlink to url when stdout is an
