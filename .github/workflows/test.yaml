@@ -632,14 +632,15 @@ jobs:
           driver: docker
           cpus: 2
           memory: 2048
-      - name: "Build and load image"
-        run: |
-          CGO_ENABLED=0 GOOS=linux go build -o bin/schemabot-linux ./pkg/cmd
-          cp bin/schemabot-linux deploy/local/schemabot-dev
-          eval $(minikube docker-env)
-          docker build -t schemabot:test -f deploy/local/Dockerfile.dev deploy/local/
-          rm -f deploy/local/schemabot-dev
+      # The script builds the schemabot image into minikube's docker daemon
+      # under its own per-run tag, so no separate build step is needed here.
       - name: "Deploy and test"
+        # Pin the namespace so the failure log dump below reads the same stack
+        # the script deployed, and keep it on exit so there is a stack left to
+        # read; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          E2E_K8S_NAMESPACE: schemabot-e2e
+          KEEP_NAMESPACE: "1"
         run: e2e/k8s/e2e-test.sh
       - name: "Pod logs on failure"
         if: failure()

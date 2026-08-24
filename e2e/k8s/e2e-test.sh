@@ -5,33 +5,57 @@
 # MySQL + control plane + data plane via Helm, then runs the e2e/k8s test
 # suite against the control plane's HTTP API.
 #
-# Prerequisites: minikube, helm, and docker installed.
+# Prerequisites: minikube, helm, docker, kubectl, go, and git installed.
 #
 # Usage:
 #   e2e/k8s/e2e-test.sh
+#
+# Environment:
+#   E2E_K8S_NAMESPACE  pin the namespace instead of deriving one per run
+#   KEEP_NAMESPACE=1   leave the stack up on exit (to read pod logs, or inspect)
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
+# --- Prerequisites ---
+
+for cmd in minikube helm docker kubectl go git; do
+    if ! command -v "$cmd" > /dev/null 2>&1; then
+        echo "Error: $cmd is not installed"
+        exit 1
+    fi
+done
+
+# --- Per-run isolation ---
+
 # The namespace and local ports are derived per run so concurrent suites on
 # one cluster (e.g. two worktrees) deploy isolated stacks instead of fighting
 # over one namespace and one set of localhost forwards. E2E_K8S_NAMESPACE is
 # exported to the Go tests, which target the same namespace for pod crashes
-# and replacement port-forwards.
-sanitized_branch() {
-    git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null \
-        | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' \
+# and replacement port-forwards; setting it beforehand pins the namespace for
+# a caller that needs to know it in advance.
+#
+# run_slug names this run. The branch is the recognizable handle when several
+# worktrees share a cluster, and a detached HEAD (a CI checkout, a bisect) has
+# no branch to read, so the commit stands in for it.
+run_slug() {
+    local ref
+    ref="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [ -z "$ref" ] || [ "$ref" = "HEAD" ]; then
+        ref="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+    fi
+    printf '%s' "$ref" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' \
         | sed 's/^-*//' | cut -c1-40 | sed 's/-*$//'
 }
-BRANCH_SLUG="$(sanitized_branch)"
-NAMESPACE="${E2E_K8S_NAMESPACE:-schemabot-e2e-${BRANCH_SLUG:-local}}"
+RUN_SLUG="$(run_slug)"
+NAMESPACE="${E2E_K8S_NAMESPACE:-schemabot-e2e-${RUN_SLUG:-local}}"
 export E2E_K8S_NAMESPACE="$NAMESPACE"
 
 # free_local_port picks a random port nothing is listening on, from the given
-# base/span. The probe uses bash's /dev/tcp so it needs no external tool, and
-# each forward draws from its own disjoint range so the three ports can never
-# collide with each other.
+# base/span. The probe uses bash's /dev/tcp in a subshell so it needs no
+# external tool and leaves no descriptor behind, and each forward draws from
+# its own disjoint range so the three ports can never collide with each other.
 free_local_port() {
     local base="$1" span="$2" port
     while :; do
@@ -40,21 +64,11 @@ free_local_port() {
             echo "$port"
             return
         fi
-        exec 3>&-
     done
 }
 CONTROL_PLANE_PORT="$(free_local_port 20000 6000)"
 MYSQL_CONTROL_PLANE_PORT="$(free_local_port 26000 6000)"
 MYSQL_DATA_PLANE_PORT="$(free_local_port 32000 6000)"
-
-# --- Prerequisites ---
-
-for cmd in minikube helm docker kubectl go; do
-    if ! command -v "$cmd" > /dev/null 2>&1; then
-        echo "Error: $cmd is not installed"
-        exit 1
-    fi
-done
 
 # --- Minikube ---
 
@@ -68,7 +82,7 @@ fi
 # The image tag is per-run for the same reason as the namespace: the chart
 # pulls with pullPolicy Never, so a concurrent run rebuilding a shared tag
 # would swap the binary under this run's pod restarts.
-IMAGE_TAG="e2e-${BRANCH_SLUG:-local}"
+IMAGE_TAG="e2e-${RUN_SLUG:-local}"
 
 echo "Building image schemabot:${IMAGE_TAG} for minikube..."
 CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/schemabot-linux" ./pkg/cmd
@@ -77,11 +91,13 @@ eval $(minikube docker-env)
 docker build -t "schemabot:${IMAGE_TAG}" -f "$REPO_ROOT/deploy/local/Dockerfile.dev" "$REPO_ROOT/deploy/local/"
 rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 
-# Track background PIDs for cleanup
+# Track background PIDs for cleanup. The trap is armed before the forwards
+# exist, so the array can still be empty when it fires — under `set -u` an
+# empty "${PIDS[@]}" would abort the cleanup itself.
 PIDS=()
 cleanup() {
     echo "Cleaning up port-forwards..."
-    for pid in "${PIDS[@]}"; do
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
 }
@@ -166,10 +182,16 @@ E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_DATA_PLANE_P
 
 # --- Teardown ---
 
-echo "Tearing down..."
-kubectl delete namespace "$NAMESPACE" --ignore-not-found
-# Best-effort: without this, per-run image tags accumulate in minikube's
-# docker daemon across branches.
-docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
+# KEEP_NAMESPACE=1 leaves the stack and its image in place so the caller can
+# read pod logs after a failure, or inspect the deployment by hand.
+if [ "${KEEP_NAMESPACE:-0}" = "1" ]; then
+    echo "Keeping namespace $NAMESPACE and image schemabot:${IMAGE_TAG}"
+else
+    echo "Tearing down..."
+    kubectl delete namespace "$NAMESPACE" --ignore-not-found
+    # Best-effort: without this, per-run image tags accumulate in minikube's
+    # docker daemon across branches.
+    docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
+fi
 
 exit "$TEST_EXIT_CODE"
