@@ -3,7 +3,7 @@ package templates
 import (
 	"time"
 
-	"github.com/block/schemabot/pkg/ui"
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 func previewPlansListOutput() {
@@ -16,9 +16,9 @@ func previewPlansListOutput() {
 				PlanID:       "plan-1700000000000000004",
 				Database:     "billing-db",
 				Environment:  "production",
-				Source:       ui.Link("acme/billing#77", "https://github.com/acme/billing/pull/77"),
+				Source:       PullRequestLink("acme/billing", 77),
 				CreatedAt:    previewTime.Add(-5 * time.Minute),
-				Changes:      "1 alter · ⛔",
+				Changes:      "1 alter · " + glyph.Refused,
 				BlockedCount: 1,
 			},
 			{
@@ -28,16 +28,16 @@ func previewPlansListOutput() {
 				// Sources arrive pre-rendered by the command layer, so the
 				// preview mirrors its terminal form: the short name linked to
 				// the PR, falling back to the full URL off a terminal.
-				Source:      ui.Link("acme/shop#412", "https://github.com/acme/shop/pull/412"),
+				Source:      PullRequestLink("acme/shop", 412),
 				CreatedAt:   previewTime.Add(-10 * time.Minute),
-				Changes:     "1 create, 2 alter · ⚠️",
+				Changes:     "1 create, 2 alter · " + glyph.Attention,
 				UnsafeCount: 1,
 			},
 			{
 				PlanID:      "plan-1700000000000000002",
 				Database:    "users-db",
 				Environment: "production",
-				Source:      ui.Link("acme/shop#410", "https://github.com/acme/shop/pull/410"),
+				Source:      PullRequestLink("acme/shop", 410),
 				CreatedAt:   previewTime.Add(-2 * time.Hour),
 				Changes:     "1 alter",
 			},

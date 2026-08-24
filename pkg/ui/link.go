@@ -123,13 +123,13 @@ func VisibleWidth(s string) int {
 	return cells
 }
 
-// PadVisible right-pads s with spaces until it occupies width terminal cells,
+// PadVisible right-pads s with spaces until it occupies cells terminal cells,
 // so a column of colored, hyperlinked, or emoji-bearing values lines up where
-// fmt's byte-counting %-*s would not. A value already at or past width is
+// fmt's byte-counting %-*s would not. A value already at or past cells is
 // returned unchanged, so a caller that sized the column from a subset of its
 // rows still renders every one of them.
-func PadVisible(s string, width int) string {
-	if pad := width - VisibleWidth(s); pad > 0 {
+func PadVisible(s string, cells int) string {
+	if pad := cells - VisibleWidth(s); pad > 0 {
 		return s + strings.Repeat(" ", pad)
 	}
 	return s

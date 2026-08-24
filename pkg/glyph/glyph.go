@@ -21,7 +21,10 @@
 // misaligning it.
 //
 // Apply-operation states (completed, running, cancelled, ...) are a separate
-// vocabulary owned by pkg/presentation; the two share no glyphs.
+// vocabulary owned by pkg/presentation: a state glyph names where an operation
+// is in its lifecycle, not how urgently an operator should react. Where a
+// state is itself a severity — a failed operation — presentation takes the
+// glyph from this package so the two vocabularies cannot drift apart.
 package glyph
 
 const (
