@@ -260,6 +260,41 @@ func TestRenderSupersededProgressComment(t *testing.T) {
 		"the generic fold does not claim a resume caused it")
 }
 
+// TestRenderTerminalSummarySupersededProgressComment verifies the frozen body
+// written over the progress comment once the terminal summary posted: it links
+// the summary comment and preserves the final per-operation status inside a
+// details block that arrives expanded for a small apply — so its completion
+// bars stay visible on the PR — and collapsed for a larger one.
+func TestRenderTerminalSummarySupersededProgressComment(t *testing.T) {
+	t.Run("a small apply's fold arrives expanded", func(t *testing.T) {
+		rendered := RenderTerminalSummarySupersededProgressComment(TerminalSummarySupersededProgressData{
+			Repo:         "acme/testapp",
+			PR:           42,
+			NewCommentID: 2222222222,
+			PreviousBody: "**Status**: Applied\n\n**`users`**: 🟩🟩 ✅ Complete",
+			Operations:   2,
+		})
+		assert.Contains(t, rendered, "🏁 Schema change finished")
+		assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+		assert.Contains(t, rendered, "<details open>")
+		assert.Contains(t, rendered, "<summary>Progress while the schema change ran</summary>")
+		assert.Contains(t, rendered, "✅ Complete",
+			"the final per-operation status is preserved inside the fold")
+	})
+
+	t.Run("a larger apply's fold arrives collapsed", func(t *testing.T) {
+		rendered := RenderTerminalSummarySupersededProgressComment(TerminalSummarySupersededProgressData{
+			Repo:         "acme/testapp",
+			PR:           42,
+			NewCommentID: 2222222222,
+			PreviousBody: "**Status**: Applied",
+			Operations:   4,
+		})
+		assert.Contains(t, rendered, "<details>")
+		assert.NotContains(t, rendered, "<details open>")
+	})
+}
+
 // TestIsSupersededProgressComment verifies the frozen-body predicate accepts
 // every frozen flavor — so a freeze retry never folds a frozen body inside a
 // second fold — and rejects live bodies, including ones that open with the
@@ -273,12 +308,17 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		"volume": RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
 			Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
 		}),
-		"resume":           RenderResumeSupersededProgressComment(shared),
-		"revert":           RenderRevertSupersededProgressComment(shared),
-		"skip-revert":      RenderSkipRevertSupersededProgressComment(shared),
-		"cutover":          RenderCutoverSupersededComment(shared),
-		"generic":          RenderSupersededProgressComment(shared),
-		"terminal-summary": RenderTerminalSummarySupersededProgressComment(shared),
+		"resume":      RenderResumeSupersededProgressComment(shared),
+		"revert":      RenderRevertSupersededProgressComment(shared),
+		"skip-revert": RenderSkipRevertSupersededProgressComment(shared),
+		"cutover":     RenderCutoverSupersededComment(shared),
+		"generic":     RenderSupersededProgressComment(shared),
+		"terminal-summary-open": RenderTerminalSummarySupersededProgressComment(TerminalSummarySupersededProgressData{
+			Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old", Operations: 1,
+		}),
+		"terminal-summary-collapsed": RenderTerminalSummarySupersededProgressComment(TerminalSummarySupersededProgressData{
+			Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old", Operations: 8,
+		}),
 	}
 	for flavor, body := range frozen {
 		assert.Truef(t, IsSupersededProgressComment(body),

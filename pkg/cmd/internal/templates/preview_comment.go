@@ -99,6 +99,7 @@ func previewCommentAllOutput() {
 		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"FINISHED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentTerminalSummarySupersededProgress()) }},
+		{"FINISHED: SUPERSEDED PROGRESS COMMENT (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentTerminalSummarySupersededProgressLarge()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
@@ -283,6 +284,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"FINISHED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentTerminalSummarySupersededProgress()) }},
+		{"FINISHED: SUPERSEDED PROGRESS COMMENT (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentTerminalSummarySupersededProgressLarge()) }},
 		// Summaries
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},

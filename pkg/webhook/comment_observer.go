@@ -489,20 +489,28 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 		}
 
 		// Then freeze the tracked progress comment at its final per-operation
-		// status. With a live summary the freeze folds into a collapsed block
+		// status. With a live summary the freeze folds into a details block
 		// pointing at it — the summary is the authoritative terminal record at
 		// the bottom of the PR, and an unfolded freeze would leave two
-		// near-identical status comments ending every apply. Stopped applies
-		// keep the full rendering: stopped is the only terminal state that
-		// returns to active, and the resume rotation folds the frozen-at-stop
-		// progress comment itself. When the summary's location is unknown
-		// (publish failed, or another writer's publish is still in flight) the
-		// full rendering also stands, as it does for a per-driver observer
+		// near-identical status comments ending every apply. The fold arrives
+		// expanded for a small apply so its per-table completion bars stay
+		// visible, and collapsed past that. Stopped applies keep the full
+		// rendering: stopped is the only terminal state that returns to
+		// active, and the resume rotation folds the frozen-at-stop progress
+		// comment itself. When the summary's location is unknown (publish
+		// failed, or another writer's publish is still in flight) the full
+		// rendering also stands, as it does for a per-driver observer
 		// deferring to the aggregate publisher — which re-edits it with the
 		// full task set for multi-operation applies.
 		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
 		if summaryCommentID != 0 && !state.IsState(apply.State, state.Apply.Stopped) {
-			finalBody = o.frozenSupersededProgressBody(supersededByTerminalSummary, 0, summaryCommentID, finalBody)
+			finalBody = templates.RenderTerminalSummarySupersededProgressComment(templates.TerminalSummarySupersededProgressData{
+				Repo:         o.repo,
+				PR:           o.pr,
+				NewCommentID: summaryCommentID,
+				PreviousBody: finalBody,
+				Operations:   len(tasks),
+			})
 		}
 		o.editTrackedComment(apply, activeCommentState, finalBody)
 	}
@@ -1265,11 +1273,6 @@ const (
 	// records which comment is owed a fold but not which rotation superseded
 	// it, so a retry renders the generic fold instead of guessing a headline.
 	supersededByPriorRotation
-	// supersededByTerminalSummary freezes the tracked progress comment once
-	// the terminal summary is live, pointing at the summary as the
-	// authoritative final record instead of leaving two near-identical status
-	// comments on the PR.
-	supersededByTerminalSummary
 )
 
 // frozenSupersededProgressBody renders the folded body written over a
@@ -1307,13 +1310,6 @@ func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgress
 		})
 	case supersededByPriorRotation:
 		return templates.RenderSupersededProgressComment(templates.SupersededProgressData{
-			Repo:         o.repo,
-			PR:           o.pr,
-			NewCommentID: newCommentID,
-			PreviousBody: previousBody,
-		})
-	case supersededByTerminalSummary:
-		return templates.RenderTerminalSummarySupersededProgressComment(templates.SupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,

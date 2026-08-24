@@ -4303,7 +4303,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 🏁 Schema change finished — the final status is in [the summary comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
 
-<details>
+<details open>
 <summary>Progress while the schema change ran</summary>
 
 ## Schema Change Status — Staging
@@ -4318,6 +4318,55 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+
+</details>
+
+</details>
+
+<details>
+<summary><a name="finished-superseded-progress-comment-large"></a><strong>Finished: Superseded Progress Comment (Large)</strong></summary>
+
+
+🏁 Schema change finished — the final status is in [the summary comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress while the schema change ran</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applied
+
+📊 4/4 complete
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`sessions`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `sessions` ADD INDEX `idx_expires_at`(`expires_at`);
 ```
 
 

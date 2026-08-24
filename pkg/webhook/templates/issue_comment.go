@@ -357,20 +357,26 @@ type SupersededProgressData struct {
 // Every rotation flavor shares this shape and differs only in its headline
 // (which must start with that flavor's superseded prefix) and fold label.
 func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
-	return renderFoldWithMarker(headline, supersededFoldMarker, foldLabel, repo, pr, newCommentID, previousBody)
+	return renderFoldWithMarker(headline, supersededFoldMarker, foldLabel, false, repo, pr, newCommentID, previousBody)
 }
 
 // renderFoldWithMarker is the shared fold shape behind every frozen body: a
 // headline whose successor link opens with the given marker, and the frozen
-// comment's last rendered body preserved inside a collapsed details block. The
-// marker names what the successor is — a fresh progress comment for rotation
-// flavors, the terminal summary for the terminal fold — and is what
-// IsSupersededProgressComment keys on.
-func renderFoldWithMarker(headline, marker, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
+// comment's last rendered body preserved inside a details block. The marker
+// names what the successor is — a fresh progress comment for rotation flavors,
+// the terminal summary for the terminal fold — and is what
+// IsSupersededProgressComment keys on. The details block collapses by default;
+// open renders it pre-expanded, keeping the preserved body visible on the PR
+// while still reading (and collapsing) as superseded history.
+func renderFoldWithMarker(headline, marker, foldLabel string, open bool, repo string, pr int, newCommentID int64, previousBody string) string {
+	detailsTag := "<details>"
+	if open {
+		detailsTag = "<details open>"
+	}
 	return fmt.Sprintf(
 		"%s%s%s/pull/%d#issuecomment-%d).\n\n"+
-			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
-		headline, marker, repo, pr, newCommentID, foldLabel, previousBody)
+			"%s\n<summary>%s</summary>\n\n%s\n\n</details>\n",
+		headline, marker, repo, pr, newCommentID, detailsTag, foldLabel, previousBody)
 }
 
 // RenderVolumeSupersededProgressComment renders the frozen body written over a
@@ -471,14 +477,42 @@ const terminalSummarySupersededPrefix = "🏁 Schema change finished"
 // supersededFoldMarker so a terminal fold is recognized as already frozen.
 const terminalSummaryFoldMarker = " [the summary comment](https://github.com/"
 
+// TerminalSummarySupersededProgressData contains the data for freezing the
+// progress comment once the terminal summary has posted: where the summary
+// lives, the progress comment's last rendered body, and how many operations
+// that body covers.
+type TerminalSummarySupersededProgressData struct {
+	// Repo is the "owner/name" repository, used to link the summary comment.
+	Repo string
+	// PR is the pull request number, used to link the summary comment.
+	PR int
+	// NewCommentID is the GitHub comment ID of the terminal summary comment.
+	NewCommentID int64
+	// PreviousBody is the progress comment's last rendered body, preserved
+	// inside the folded details block.
+	PreviousBody string
+	// Operations is the number of operations whose final status PreviousBody
+	// renders; it decides whether the fold arrives expanded or collapsed.
+	Operations int
+}
+
+// terminalFoldOpenOperationLimit is the largest operation count whose terminal
+// fold renders pre-expanded. A small apply's per-table completion bars are a
+// completion signal worth showing without a click; past this size the expanded
+// fold would dominate the timeline, so it collapses.
+const terminalFoldOpenOperationLimit = 3
+
 // RenderTerminalSummarySupersededProgressComment renders the frozen body
 // written over the progress comment once the terminal summary has posted. The
 // summary at the bottom of the PR is the authoritative final record, so the
 // progress comment folds its last per-operation rendering into a details block
 // pointing at it instead of standing as a near-identical duplicate above it.
-func RenderTerminalSummarySupersededProgressComment(data SupersededProgressData) string {
+// For a small apply the block arrives expanded, keeping the per-table
+// completion bars visible on the PR; a larger apply's block collapses.
+func RenderTerminalSummarySupersededProgressComment(data TerminalSummarySupersededProgressData) string {
+	open := data.Operations <= terminalFoldOpenOperationLimit
 	return renderFoldWithMarker(terminalSummarySupersededPrefix+" — the final status is in", terminalSummaryFoldMarker,
-		"Progress while the schema change ran",
+		"Progress while the schema change ran", open,
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 

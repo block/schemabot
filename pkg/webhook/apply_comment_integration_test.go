@@ -2543,9 +2543,10 @@ func TestE2ECancelSurfacesThroughTerminalSummaryComment(t *testing.T) {
 
 // When an apply completes, exactly one live status rendering ends the PR: the
 // terminal summary posts at the bottom of the timeline, and the tracked
-// progress comment folds its final per-operation status into a collapsed
-// details block pointing at the summary — instead of standing above it as a
-// near-identical duplicate.
+// progress comment folds its final per-operation status into a details block
+// pointing at the summary — instead of standing above it as a near-identical
+// duplicate. A small apply's fold arrives expanded so its per-table completion
+// bars stay visible without a click.
 func TestE2ETerminalSummarySupersedesProgressComment(t *testing.T) {
 	ctx := t.Context()
 
@@ -2586,7 +2587,7 @@ func TestE2ETerminalSummarySupersedesProgressComment(t *testing.T) {
 	case edited := <-capture.edits:
 		assert.Equal(t, progressID, edited.CommentID, "the fold lands on the tracked progress comment")
 		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", summaryID), "the fold points at the terminal summary")
-		assert.Contains(t, edited.Body, "<details>", "the final status collapses into a details block")
+		assert.Contains(t, edited.Body, "<details open>", "a single-table apply's fold arrives expanded")
 		assert.Contains(t, edited.Body, "**Status**: Applied", "the final per-operation status is preserved inside the fold")
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected the progress comment to be folded toward the terminal summary")

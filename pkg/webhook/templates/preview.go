@@ -1981,9 +1981,10 @@ func PreviewCommentCutoverSuperseded() string {
 }
 
 // PreviewCommentTerminalSummarySupersededProgress renders the progress comment
-// after the apply finished and the terminal summary posted: the final
-// per-operation status collapses into a details block under a pointer to the
-// summary comment, which is the authoritative final record on the PR.
+// after a small apply finished and the terminal summary posted: the final
+// per-operation status folds into a pre-expanded details block under a pointer
+// to the summary comment, keeping the completion bars visible on the PR while
+// the summary stays the authoritative final record.
 func PreviewCommentTerminalSummarySupersededProgress() string {
 	table := sampleSingleTable()
 	table.Status = state.Task.Completed
@@ -1991,11 +1992,41 @@ func PreviewCommentTerminalSummarySupersededProgress() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.Completed, table)
-	return RenderTerminalSummarySupersededProgressComment(SupersededProgressData{
+	return RenderTerminalSummarySupersededProgressComment(TerminalSummarySupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
 		NewCommentID: 2222222222,
 		PreviousBody: RenderApplyStatusComment(data),
+		Operations:   len(data.Tables),
+	})
+}
+
+// PreviewCommentTerminalSummarySupersededProgressLarge renders the progress
+// comment after a larger apply finished and the terminal summary posted: with
+// this many operations the expanded fold would dominate the timeline, so the
+// final per-operation status collapses under the pointer to the summary
+// comment instead.
+func PreviewCommentTerminalSummarySupersededProgressLarge() string {
+	tables := []TableProgressData{
+		{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)"},
+		{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)"},
+		{TableName: "sessions", DDL: "ALTER TABLE `sessions` ADD INDEX `idx_expires_at` (`expires_at`)"},
+	}
+	for i := range tables {
+		tables[i].Status = state.Task.Completed
+		tables[i].RowsCopied = 7200000
+		tables[i].RowsTotal = 7200000
+		tables[i].PercentComplete = 100
+	}
+	data := sampleSingleApplyData(state.Apply.Completed, tables[0])
+	data.Tables = tables
+	return RenderTerminalSummarySupersededProgressComment(TerminalSummarySupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+		Operations:   len(data.Tables),
 	})
 }
 
