@@ -120,6 +120,24 @@ type Lock struct {
 	// path treats empty as "skip the freshness check" rather than fail closed.
 	PendingPlanID string
 
+	// DisclosedCopyDiscard records that the comment this pending confirmation
+	// was posted with told the operator applying would throw away an unfinished
+	// row copy on the target. It is a consent record: it says what the operator
+	// was shown at the moment they were asked, so the apply can tell whether a
+	// discard it is about to perform is the one they agreed to.
+	//
+	// It travels with PendingPlanID and is written by the same statement, so the
+	// flag always describes the plan the confirm command loads. It is
+	// deliberately not the copy itself: a copy disposition is a reading of the
+	// target that is always re-read at apply time, and only this answer to "did
+	// they know?" has to be durable.
+	//
+	// False for locks acquired outside the PR apply path (rollback, CLI) and for
+	// rows written before this column existed, which is the safe default — an
+	// unrecorded disclosure is treated as no disclosure, so the apply asks again
+	// rather than assuming consent.
+	DisclosedCopyDiscard bool
+
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
 

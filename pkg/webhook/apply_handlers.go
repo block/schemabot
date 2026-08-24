@@ -343,13 +343,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
+	// DisclosedCopyDiscard records whether that plan's comment tells the operator
+	// a copy is destroyed, so the apply can later tell a discard they agreed to
+	// from one that appeared after they were asked.
 	lock := &storage.Lock{
-		DatabaseName:  database,
-		DatabaseType:  dbType,
-		Owner:         lockOwner,
-		Repository:    repo,
-		PullRequest:   pr,
-		PendingPlanID: planResp.PlanID,
+		DatabaseName:         database,
+		DatabaseType:         dbType,
+		Owner:                lockOwner,
+		Repository:           repo,
+		PullRequest:          pr,
+		PendingPlanID:        planResp.PlanID,
+		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
 	}
 	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
@@ -487,7 +491,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
 }
 
@@ -742,7 +746,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, existingLock.DisclosedCopyDiscard)
 	return false, nil
 }
 

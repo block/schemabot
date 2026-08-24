@@ -20,11 +20,18 @@ import (
 // When storedPlan is non-nil (auto-confirm path), the re-plan DDL is compared against it.
 // If the DDL differs, execution is downgraded to manual confirmation — a plan comment is
 // posted with a warning and the user must run apply-confirm separately.
+//
+// disclosedCopyDiscard is what the comment behind this apply told the operator
+// about an unfinished copy on the target, read from the lock's pending
+// confirmation. It is the consent this re-plan is checked against: the plan
+// decided whether to stop, and the same decision is made again here, against the
+// target as it is now.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan *storage.Plan, expectedPendingPlanID string,
+	disclosedCopyDiscard bool,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -146,26 +153,34 @@ func (h *Handler) executeApply(
 	}
 
 	// The copy on the target is read fresh on every plan, so this re-plan can
-	// discover a discard the reviewed comment never showed: another apply can
-	// start a copy, or an adopted copy's checkpoint can age out, between the
-	// operator's review and this moment. Downgrade so the operator confirms
-	// against a comment that discloses the copy actually at stake. A stored
-	// plan is what marks this as the automatic path; the confirm path arrives
-	// here with none and deliberately does not stop again. That exemption is
-	// only as good as the comment the operator confirmed: the disposition can
-	// flip to a discard that comment never disclosed (a checkpoint ages past
-	// its resume bound, or apply-time routing changes the batch), and this
-	// path does not know what the confirmed comment showed, so it cannot tell
-	// an acknowledged discard from an unseen one.
-	if storedPlan != nil {
-		if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
-			h.logger.Info("automatic apply downgraded: re-plan discards an existing copy",
-				"repo", repo, "pr", pr, "database", database, "environment", environment,
-				"discarded_copies", len(discarded))
-			h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				msgCopyDiscardDowngrade)
+	// discover a discard the comment behind this apply never showed: another
+	// apply can start a copy, or an adopted copy's checkpoint can age out,
+	// between the disclosure and this moment. An apply that was allowed to reach
+	// here because nothing was at stake must not become one that destroys hours
+	// of work with nobody asked, so it stops and asks against a comment that
+	// discloses the copy actually at stake.
+	//
+	// A discard the operator was already shown proceeds. They agreed to that
+	// cost, and asking again on every confirm would make the stop unpassable.
+	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 && !disclosedCopyDiscard {
+		h.logger.Info("apply stopped for confirmation: re-plan discards an existing copy the disclosure did not show",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "action", actionName,
+			"plan_id", planResp.PlanID, "discarded_copies", len(discarded))
+		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, planResp.PlanID, true); err != nil {
+			// Without the re-pin the confirm command would load the disclosure
+			// that showed no discard and stop again, so say what happened rather
+			// than posting a confirmation the operator cannot pass.
+			h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the discard",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "error", err)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"Applying would destroy work in progress on the target. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to see what is at stake.")
 			return
 		}
+		h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			msgCopyDiscardDowngrade)
+		return
 	}
 
 	// --defer-cutover only affects engine-driven statements; an all-direct
@@ -351,6 +366,27 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AutoConfirmDowngradeReason = reason
 	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+}
+
+// repinPendingConfirmation moves this PR's apply lock onto the plan whose
+// comment is being posted now, together with what that comment discloses about
+// an unfinished copy on the target. Both move in one storage write, so the
+// record can never describe a plan other than the one apply-confirm loads.
+//
+// A stop that does not re-pin is a stop nobody can pass: the confirm command
+// reads the lock to learn what the operator was shown, so a lock still pointing
+// at the comment that disclosed nothing would stop the same apply again on every
+// attempt.
+func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, planID string, disclosedCopyDiscard bool) error {
+	return h.service.Storage().Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:         database,
+		DatabaseType:         dbType,
+		Owner:                fmt.Sprintf("%s#%d", repo, pr),
+		Repository:           repo,
+		PullRequest:          pr,
+		PendingPlanID:        planID,
+		DisclosedCopyDiscard: disclosedCopyDiscard,
+	})
 }
 
 // releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a

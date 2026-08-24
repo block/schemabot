@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,7 +257,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 
 	h.executeApply(t.Context(), installClient, repo, pr, schemaResult, "staging", 1, "testuser",
 		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true},
-		storedPlan, planResp.PlanID)
+		storedPlan, planResp.PlanID, false)
 
 	select {
 	case body := <-result.comments:
@@ -282,4 +283,121 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, lock, "the paused apply keeps the database locked for this PR")
 	assert.Equal(t, fmt.Sprintf("%s#%d", repo, pr), lock.Owner)
+}
+
+// The copy on the target is read fresh on every plan, so one can appear between
+// the comment an operator confirms and the moment the apply dispatches: another
+// apply starts a copy, or an adopted copy's checkpoint ages out. A confirmation
+// carries what its comment disclosed, so an apply the operator agreed to while
+// nothing was at stake stops rather than destroying the copy — and it moves the
+// pending confirmation onto the comment that discloses it, so the operator has a
+// stop they can actually pass.
+func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
+	const dbName = "webhook_copy_discard_recheck"
+	f := setupDiscardGate(t, dbName)
+
+	// The operator is confirming a comment that told them nothing about a copy.
+	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-disclosing-no-copy",
+	}))
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
+			"the confirm stops and discloses the copy instead of dispatching over it")
+		assert.Contains(t, body, "`events`")
+		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "schemabot apply-confirm -e staging")
+		assert.NotContains(t, body, "Schema Change Status", "the apply must not have started")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the stopped apply-confirm comment")
+	}
+
+	// The pending confirmation moved onto the plan behind the comment just
+	// posted, and records that this one discloses the discard — without that the
+	// next confirm would load the comment that disclosed nothing and stop again.
+	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the stop must keep the lock so the operator can confirm")
+	assert.True(t, lock.DisclosedCopyDiscard, "the disclosure the operator was just shown must be recorded")
+	assert.NotEqual(t, "plan-disclosing-no-copy", lock.PendingPlanID)
+	plan, err := f.svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, plan, "the re-pinned confirmation must name a stored plan")
+	assert.Equal(t, dbName, plan.Database)
+
+	applies, err := f.svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	for _, a := range applies {
+		assert.NotEqual(t, dbName, a.Database, "no apply for %s should have been started", dbName)
+	}
+}
+
+// A discard the operator was already shown is one they agreed to. The
+// confirmation records that disclosure, so the apply it authorizes runs and
+// throws the copy away rather than asking a second time — a stop that reappeared
+// on every confirm would be unpassable.
+func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
+	const dbName = "webhook_copy_discard_consented"
+	f := setupDiscardGate(t, dbName)
+
+	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:         dbName,
+		DatabaseType:         "mysql",
+		Repository:           "octocat/hello-world",
+		PullRequest:          1,
+		Owner:                "octocat/hello-world#1",
+		PendingPlanID:        "plan-disclosing-the-copy",
+		DisclosedCopyDiscard: true,
+	}))
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	require.Eventually(t, func() bool {
+		select {
+		case body := <-f.result.comments:
+			assert.NotContains(t, body, msgCopyDiscardDowngrade,
+				"a discard the operator already agreed to must not stop the apply again")
+			return strings.Contains(body, "Schema Change Applied")
+		default:
+			return false
+		}
+	}, webhookIntegrationPollDeadline, 200*time.Millisecond,
+		"expected the confirmed apply to discard the copy and run to completion")
+
+	// The copy the operator agreed to lose is gone, and the index they asked for
+	// is on the table.
+	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var shadowTables int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		dbName, utils.NewTableName("events")).Scan(&shadowTables))
+	assert.Zero(t, shadowTables, "the discarded copy's shadow table must not survive the apply")
+
+	var indexes int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = ? AND table_name = 'events' AND index_name = 'idx_actor_id'",
+		dbName).Scan(&indexes))
+	assert.Positive(t, indexes, "the confirmed schema change must be on the target")
 }
