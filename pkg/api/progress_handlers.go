@@ -222,6 +222,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
 	resp := &apitypes.ProgressOperationResponse{
 		Deployment:          op.Deployment,
+		OperationKey:        op.OperationKey,
 		ExternalID:          op.ExternalID,
 		ExternalOperationID: op.ExternalOperationID,
 		OperationKind:       op.OperationKind,
