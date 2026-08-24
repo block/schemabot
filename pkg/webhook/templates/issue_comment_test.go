@@ -273,11 +273,12 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		"volume": RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
 			Volume: 8, Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
 		}),
-		"resume":      RenderResumeSupersededProgressComment(shared),
-		"revert":      RenderRevertSupersededProgressComment(shared),
-		"skip-revert": RenderSkipRevertSupersededProgressComment(shared),
-		"cutover":     RenderCutoverSupersededComment(shared),
-		"generic":     RenderSupersededProgressComment(shared),
+		"resume":           RenderResumeSupersededProgressComment(shared),
+		"revert":           RenderRevertSupersededProgressComment(shared),
+		"skip-revert":      RenderSkipRevertSupersededProgressComment(shared),
+		"cutover":          RenderCutoverSupersededComment(shared),
+		"generic":          RenderSupersededProgressComment(shared),
+		"terminal-summary": RenderTerminalSummarySupersededProgressComment(shared),
 	}
 	for flavor, body := range frozen {
 		assert.Truef(t, IsSupersededProgressComment(body),
@@ -289,6 +290,7 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		"cutover-complete wording": "Cutover complete — the schema change is finalizing.",
 		"reverting wording":        "Schema change reverting — see the table below.",
 		"skip-revert wording":      "Revert skipped by the operator.",
+		"finished wording":         "🏁 Schema change finished without errors.",
 	}
 	for name, body := range live {
 		assert.Falsef(t, IsSupersededProgressComment(body),

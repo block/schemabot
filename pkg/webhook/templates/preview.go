@@ -2062,6 +2062,25 @@ func PreviewCommentCutoverSuperseded() string {
 	})
 }
 
+// PreviewCommentTerminalSummarySupersededProgress renders the progress comment
+// after the apply finished and the terminal summary posted: the final
+// per-operation status collapses into a details block under a pointer to the
+// summary comment, which is the authoritative final record on the PR.
+func PreviewCommentTerminalSummarySupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.Completed
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.Completed, table)
+	return RenderTerminalSummarySupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentSupersededProgress renders an old progress comment after a
 // freeze retry folded it without knowing which rotation superseded it: the
 // final progress collapses into a details block under a pointer to the fresh

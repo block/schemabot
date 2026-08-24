@@ -395,8 +395,8 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 }
 
 // OnTerminal is called when the apply reaches a terminal state.
-// Edits the active comment to final state, posts summary comment,
-// and updates check runs.
+// Posts the summary comment, freezes the active comment — folded toward the
+// summary when one is live — and updates check runs.
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return
@@ -473,25 +473,38 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 			o.supersedeCutoverComment(ctx, apply)
 		}
 	} else {
-		// Edit the progress comment to its final state (completed bars / error).
-		// This is the per-operation status freeze, not the apply-level summary, so
-		// it always runs; the aggregate publisher re-edits it with the full task
-		// set for multi-operation applies.
-		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
-		o.editTrackedComment(apply, activeCommentState, finalBody)
-
-		// Post a separate summary comment. A new comment is more reliable than
-		// an edit — GitHub renders edits with a delay, but new comments appear
-		// immediately and trigger notifications for PR subscribers. A
-		// multi-operation (fan-out) apply publishes its single apply-level
-		// summary through the operator's aggregate CAS-winner observer instead
-		// (see publishTerminalSummaryIfWon / NewAggregateTerminalCommentObserver),
-		// so a per-driver observer holding one operation's task slice must defer
-		// to it rather than post a duplicate, partial summary.
+		// Post the separate summary comment first. A new comment is more
+		// reliable than an edit — GitHub renders edits with a delay, but new
+		// comments appear immediately and trigger notifications for PR
+		// subscribers. A multi-operation (fan-out) apply publishes its single
+		// apply-level summary through the operator's aggregate CAS-winner
+		// observer instead (see publishTerminalSummaryIfWon /
+		// NewAggregateTerminalCommentObserver), so a per-driver observer
+		// holding one operation's task slice must defer to it rather than post
+		// a duplicate, partial summary.
+		var summaryCommentID int64
 		if o.shouldPublishSeparateSummary(apply, ops, opsErr) {
 			summaryBody := o.summaryCommentFromOps(ctx, apply, ops, opsErr, tasks, shardsByTable)
-			o.publishClaimedSummary(apply, summaryBody)
+			summaryCommentID = o.publishClaimedSummary(apply, summaryBody)
 		}
+
+		// Then freeze the tracked progress comment at its final per-operation
+		// status. With a live summary the freeze folds into a collapsed block
+		// pointing at it — the summary is the authoritative terminal record at
+		// the bottom of the PR, and an unfolded freeze would leave two
+		// near-identical status comments ending every apply. Stopped applies
+		// keep the full rendering: stopped is the only terminal state that
+		// returns to active, and the resume rotation folds the frozen-at-stop
+		// progress comment itself. When the summary's location is unknown
+		// (publish failed, or another writer's publish is still in flight) the
+		// full rendering also stands, as it does for a per-driver observer
+		// deferring to the aggregate publisher — which re-edits it with the
+		// full task set for multi-operation applies.
+		finalBody := o.statusCommentFromOps(apply, ops, opsErr, tasks, shardsByTable)
+		if summaryCommentID != 0 && !state.IsState(apply.State, state.Apply.Stopped) {
+			finalBody = o.frozenSupersededProgressBody(supersededByTerminalSummary, 0, summaryCommentID, finalBody)
+		}
+		o.editTrackedComment(apply, activeCommentState, finalBody)
 	}
 
 	// Run terminal hook (e.g., update check runs)
@@ -1262,6 +1275,11 @@ const (
 	// records which comment is owed a fold but not which rotation superseded
 	// it, so a retry renders the generic fold instead of guessing a headline.
 	supersededByPriorRotation
+	// supersededByTerminalSummary freezes the tracked progress comment once
+	// the terminal summary is live, pointing at the summary as the
+	// authoritative final record instead of leaving two near-identical status
+	// comments on the PR.
+	supersededByTerminalSummary
 )
 
 // frozenSupersededProgressBody renders the folded body written over a
@@ -1299,6 +1317,13 @@ func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgress
 		})
 	case supersededByPriorRotation:
 		return templates.RenderSupersededProgressComment(templates.SupersededProgressData{
+			Repo:         o.repo,
+			PR:           o.pr,
+			NewCommentID: newCommentID,
+			PreviousBody: previousBody,
+		})
+	case supersededByTerminalSummary:
+		return templates.RenderTerminalSummarySupersededProgressComment(templates.SupersededProgressData{
 			Repo:         o.repo,
 			PR:           o.pr,
 			NewCommentID: newCommentID,
@@ -1588,7 +1613,13 @@ func (o *CommentObserver) renderPRComment(body string) string {
 // are deliberately lease-free — a writer whose apply lease was re-claimed (for
 // example by stop reconciliation) must still be able to lose the claim cleanly,
 // and the winner must be able to record its post.
-func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body string) {
+//
+// Returns the summary's GitHub comment ID whenever it is known live on the PR
+// — posted by this call, or already posted by another writer whose marker
+// records it — so the caller can fold the progress comment toward it. Returns
+// 0 when the summary's location is unknown: the publish failed, or another
+// writer's claim is still in flight.
+func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body string) int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1596,11 +1627,25 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 	if err != nil {
 		o.logError(apply, "observer: failed to claim terminal summary; summary not posted, left for reconciliation",
 			"error", err)
-		return
+		return 0
 	}
 	if !won {
-		o.logInfo(apply, "observer: terminal summary already claimed or posted by another writer; skipping")
-		return
+		// Another writer owns the publish. A marker recording a real comment
+		// ID means its summary is already live; a claim sentinel means the
+		// publish is still in flight and the summary's location is unknown.
+		marker, merr := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Summary)
+		if merr != nil {
+			o.logError(apply, "observer: terminal summary claimed by another writer and marker lookup failed; treating its location as unknown",
+				"error", merr)
+			return 0
+		}
+		if marker == nil || marker.GitHubCommentID == 0 {
+			o.logInfo(apply, "observer: terminal summary claimed by another writer and not yet posted; skipping")
+			return 0
+		}
+		o.logInfo(apply, "observer: terminal summary already posted by another writer; skipping",
+			"comment_id", marker.GitHubCommentID)
+		return marker.GitHubCommentID
 	}
 
 	client, err := o.ghClient.ForInstallation(o.installationID)
@@ -1608,14 +1653,14 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		o.logError(apply, "observer: failed to create GitHub client for claimed terminal summary; releasing claim",
 			"error", err)
 		o.releaseSummaryClaim(ctx, apply)
-		return
+		return 0
 	}
 	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post claimed terminal summary; releasing claim",
 			"error", err)
 		o.releaseSummaryClaim(ctx, apply)
-		return
+		return 0
 	}
 
 	marker := &storage.ApplyComment{
@@ -1631,6 +1676,7 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		o.logError(apply, "observer: posted terminal summary but failed to record its comment ID",
 			"error", err, "comment_id", commentID)
 	}
+	return commentID
 }
 
 // releaseSummaryClaim returns a won-but-unused summary claim so another
