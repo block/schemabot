@@ -124,6 +124,7 @@ func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration
 		Reason:      reason,
 		Tables:      c.CopiedTables,
 		Age:         c.Age,
+		Statement:   c.Statement,
 	}}
 }
 

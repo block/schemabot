@@ -236,7 +236,30 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		httpResp.Shards = append(httpResp.Shards, apiSP)
 	}
 
+	httpResp.ExistingCopies = existingCopiesFromProto(resp.ExistingCopies)
+
 	return httpResp
+}
+
+// existingCopiesFromProto carries the target's unfinished copies through to the
+// plan response so the operator is told, before applying, whether the apply
+// resumes an existing copy or throws it away and starts over.
+func existingCopiesFromProto(copies []*ternv1.ExistingCopy) []*apitypes.ExistingCopyResponse {
+	var result []*apitypes.ExistingCopyResponse
+	for _, c := range copies {
+		if c == nil {
+			continue
+		}
+		result = append(result, &apitypes.ExistingCopyResponse{
+			Namespace:   c.Namespace,
+			Disposition: c.Disposition,
+			Reason:      c.Reason,
+			Tables:      c.Tables,
+			AgeSeconds:  c.AgeSeconds,
+			Statement:   c.Statement,
+		})
+	}
+	return result
 }
 
 // protoChangesToNamespaces converts proto SchemaChanges to storage namespace plan data.

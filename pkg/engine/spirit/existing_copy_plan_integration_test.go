@@ -127,9 +127,9 @@ func TestPlanDisclosesAContinuedCopy(t *testing.T) {
 // before anyone confirms.
 func TestPlanDisclosesADiscardedCopy(t *testing.T) {
 	target := newPlanTarget(t, "plan_discarded_copy")
+	started := "ALTER TABLE `" + target.tables[0] + "` ADD INDEX idx_name (name)"
 
-	seedCopy(t, target.db, target.tables, utils.CheckpointTableName(target.tables[0]),
-		"ALTER TABLE `"+target.tables[0]+"` ADD INDEX idx_name (name)")
+	seedCopy(t, target.db, target.tables, utils.CheckpointTableName(target.tables[0]), started)
 
 	result, _ := target.plan(t)
 	require.Len(t, result.ExistingCopies, 1, "the plan meets a copy of its own table")
@@ -138,6 +138,9 @@ func TestPlanDisclosesADiscardedCopy(t *testing.T) {
 	assert.Equal(t, engine.CopyDiscard, disclosed.Disposition)
 	assert.Equal(t, engine.DiscardStatementDiffers, disclosed.Reason)
 	assert.Equal(t, target.tables, disclosed.Tables)
+	assert.Equal(t, started, disclosed.Statement,
+		"a discard for a differing statement carries the one the copy was started for, "+
+			"so the disclosure can name what the plan differs from")
 }
 
 // A copy whose statement still matches this plan but whose checkpoint is too

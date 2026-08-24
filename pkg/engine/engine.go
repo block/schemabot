@@ -392,6 +392,17 @@ type ExistingCopy struct {
 	// Age is how long ago the engine last recorded progress on it. Zero when
 	// the engine has no record to resume from, which is itself a discard.
 	Age time.Duration
+	// Statement is the schema change this work was started for, verbatim as
+	// the engine recorded it. Empty when the engine has no record of it, which
+	// is itself a reason the work cannot be resumed.
+	//
+	// It is what makes a statement-drift discard answerable rather than just
+	// announced: a surface can say which change the work belongs to, so an
+	// operator told "the schema change differs from the one that started it"
+	// can see what it differs from and decide whether to restore it. For an
+	// adopt it repeats the plan and says nothing new, so a surface renders it
+	// only where the two disagree.
+	Statement string
 }
 
 // Engine metadata keys carrying the direct execution policy from config
