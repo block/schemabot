@@ -60,10 +60,18 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 // annotation renders a "--" comment line dimmed on interactive terminals, so
 // the schema content stands out from its scaffolding. Plain everywhere else.
 func annotation(s string) string {
+	return styled(ANSIDim, s)
+}
+
+// styled wraps s in an ANSI code when stdout is an interactive terminal, and
+// returns it untouched otherwise. colorWrap owns the escape shape; this adds
+// the color gate the pull rendering needs, because redirecting a pull to a
+// .sql file must produce the plain text byte for byte.
+func styled(code, s string) string {
 	if !ui.Colors {
 		return s
 	}
-	return ANSIDim + s + ANSIReset
+	return colorWrap(code)(s)
 }
 
 // emphasis bolds a name inside an annotation line, resuming the dim style
@@ -103,14 +111,11 @@ func writePulledLint(violations []*apitypes.LintViolationResponse) {
 // interactive terminals so warnings and errors are scannable at a glance.
 func severityTag(severity string) string {
 	tag := "[" + severity + "]"
-	if !ui.Colors {
-		return tag
-	}
 	switch strings.ToLower(severity) {
 	case "warning":
-		return ANSIYellow + tag + ANSIReset
+		return styled(ANSIYellow, tag)
 	case "error":
-		return ANSIRed + tag + ANSIReset
+		return styled(ANSIRed, tag)
 	default:
 		return tag
 	}
