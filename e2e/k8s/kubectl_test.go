@@ -303,7 +303,18 @@ func startControlPlanePortForward(t *testing.T) (string, *exec.Cmd) {
 	go func() { _ = cmd.Wait() }()
 
 	endpoint := fmt.Sprintf("http://localhost:%d", port)
+	// A failed health wait fails the test before the caller can record the
+	// process for suite teardown, which would orphan a detached kubectl
+	// holding the port for the rest of the binary. Kill the forward on that
+	// path; a healthy handover disarms the kill by returning first.
+	handedOver := false
+	defer func() {
+		if !handedOver {
+			_ = cmd.Process.Kill()
+		}
+	}()
 	waitForHTTPStatus(t, endpoint+"/health", http.StatusOK, testutil.PollDeadline)
+	handedOver = true
 	return endpoint, cmd
 }
 

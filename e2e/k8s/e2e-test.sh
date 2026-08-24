@@ -38,7 +38,10 @@ done
 #
 # run_slug names this run. The branch is the recognizable handle when several
 # worktrees share a cluster, and a detached HEAD (a CI checkout, a bisect) has
-# no branch to read, so the commit stands in for it.
+# no branch to read, so the commit stands in for it. The PID makes the handle
+# per-run rather than per-ref: two runs at the same ref would otherwise share
+# a namespace, Helm releases, and image tag, and the first to tear down would
+# destroy the other's stack.
 run_slug() {
     local ref
     ref="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
@@ -49,13 +52,18 @@ run_slug() {
         | sed 's/^-*//' | cut -c1-40 | sed 's/-*$//'
 }
 RUN_SLUG="$(run_slug)"
-NAMESPACE="${E2E_K8S_NAMESPACE:-schemabot-e2e-${RUN_SLUG:-local}}"
+RUN_ID="${RUN_SLUG:-local}-$$"
+NAMESPACE="${E2E_K8S_NAMESPACE:-schemabot-e2e-${RUN_ID}}"
 export E2E_K8S_NAMESPACE="$NAMESPACE"
 
 # free_local_port picks a random port nothing is listening on, from the given
 # base/span. The probe uses bash's /dev/tcp in a subshell so it needs no
 # external tool and leaves no descriptor behind, and each forward draws from
 # its own disjoint range so the three ports can never collide with each other.
+# All three ranges sit below the OS ephemeral port ranges (32768+ on Linux,
+# 49152+ on macOS): the probe only sees listening sockets, so a port inside
+# the ephemeral range could probe free while held as an outbound source port
+# and then fail the forward's bind minutes later.
 free_local_port() {
     local base="$1" span="$2" port
     while :; do
@@ -66,9 +74,9 @@ free_local_port() {
         fi
     done
 }
-CONTROL_PLANE_PORT="$(free_local_port 20000 6000)"
-MYSQL_CONTROL_PLANE_PORT="$(free_local_port 26000 6000)"
-MYSQL_DATA_PLANE_PORT="$(free_local_port 32000 6000)"
+CONTROL_PLANE_PORT="$(free_local_port 20000 4000)"
+MYSQL_CONTROL_PLANE_PORT="$(free_local_port 24000 4000)"
+MYSQL_DATA_PLANE_PORT="$(free_local_port 28000 4000)"
 
 # --- Minikube ---
 
@@ -82,7 +90,7 @@ fi
 # The image tag is per-run for the same reason as the namespace: the chart
 # pulls with pullPolicy Never, so a concurrent run rebuilding a shared tag
 # would swap the binary under this run's pod restarts.
-IMAGE_TAG="e2e-${RUN_SLUG:-local}"
+IMAGE_TAG="e2e-${RUN_ID}"
 
 echo "Building image schemabot:${IMAGE_TAG} for minikube..."
 CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/schemabot-linux" ./pkg/cmd
@@ -93,13 +101,27 @@ rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 
 # Track background PIDs for cleanup. The trap is armed before the forwards
 # exist, so the array can still be empty when it fires — under `set -u` an
-# empty "${PIDS[@]}" would abort the cleanup itself.
+# empty "${PIDS[@]}" would abort the cleanup itself. Teardown lives in the
+# trap so an exit anywhere past this point — a failed wait, a failed forward,
+# an interrupt — removes this run's namespace and image instead of leaving a
+# per-run stack behind. KEEP_NAMESPACE=1 leaves the stack and its image in
+# place so the caller can read pod logs after a failure, or inspect the
+# deployment by hand.
 PIDS=()
 cleanup() {
     echo "Cleaning up port-forwards..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
+    if [ "${KEEP_NAMESPACE:-0}" = "1" ]; then
+        echo "Keeping namespace $NAMESPACE and image schemabot:${IMAGE_TAG}"
+    else
+        echo "Tearing down..."
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found
+        # Best-effort: without this, per-run image tags accumulate in
+        # minikube's docker daemon across runs.
+        docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
@@ -148,22 +170,51 @@ wait_for_ready_pods "app.kubernetes.io/instance=control-plane"
 
 # --- Port-forwards ---
 
+# wait_for_forward waits until a port-forward accepts connections on its
+# local port while its own kubectl process is still running. The ports were
+# probed free at derivation time, minutes before the binds — a forward that
+# lost its port in between exits immediately, and the port answering without
+# it would silently route this run's traffic to whichever process owns the
+# port instead.
+wait_for_forward() {
+    local name="$1" port="$2" pid="$3"
+    for i in $(seq 1 30); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "Port-forward for $name exited before serving :$port; the port was taken between the free probe and the bind"
+            exit 1
+        fi
+        if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+            echo "$name port-forward is serving :$port"
+            return
+        fi
+        sleep 1
+    done
+    echo "Timeout waiting for the $name port-forward on :$port"
+    exit 1
+}
+
 echo "Starting port-forwards (namespace $NAMESPACE, control plane :$CONTROL_PLANE_PORT, mysql :$MYSQL_CONTROL_PLANE_PORT/:$MYSQL_DATA_PLANE_PORT)..."
 kubectl port-forward -n "$NAMESPACE" svc/control-plane-schemabot "${CONTROL_PLANE_PORT}:8080" &
-PIDS+=($!)
+CONTROL_PLANE_FWD_PID=$!
+PIDS+=("$CONTROL_PLANE_FWD_PID")
 kubectl port-forward -n "$NAMESPACE" svc/mysql-control-plane "${MYSQL_CONTROL_PLANE_PORT}:3306" &
-PIDS+=($!)
+MYSQL_CONTROL_PLANE_FWD_PID=$!
+PIDS+=("$MYSQL_CONTROL_PLANE_FWD_PID")
 kubectl port-forward -n "$NAMESPACE" svc/mysql-data-plane "${MYSQL_DATA_PLANE_PORT}:3306" &
-PIDS+=($!)
+MYSQL_DATA_PLANE_FWD_PID=$!
+PIDS+=("$MYSQL_DATA_PLANE_FWD_PID")
 
 echo "Waiting for port-forwards..."
+wait_for_forward "control-plane" "$CONTROL_PLANE_PORT" "$CONTROL_PLANE_FWD_PID"
+wait_for_forward "mysql-control-plane" "$MYSQL_CONTROL_PLANE_PORT" "$MYSQL_CONTROL_PLANE_FWD_PID"
+wait_for_forward "mysql-data-plane" "$MYSQL_DATA_PLANE_PORT" "$MYSQL_DATA_PLANE_FWD_PID"
 for i in $(seq 1 30); do
     if curl -sf "http://localhost:${CONTROL_PLANE_PORT}/health" > /dev/null 2>&1; then
         echo "Control plane is healthy"
         break
     fi
     if [ "$i" -eq 30 ]; then
-        echo "Timeout waiting for port-forward"
+        echo "Timeout waiting for the control plane to answer /health"
         exit 1
     fi
     sleep 1
@@ -180,18 +231,5 @@ E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_CONTROL_PLANE_P
 E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_DATA_PLANE_PORT})/testapp?parseTime=true&multiStatements=true" \
     go test -count=1 -v -tags=e2e -timeout=10m -skip 'TestK8sEtre|TestK8sVitess' ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
-# --- Teardown ---
-
-# KEEP_NAMESPACE=1 leaves the stack and its image in place so the caller can
-# read pod logs after a failure, or inspect the deployment by hand.
-if [ "${KEEP_NAMESPACE:-0}" = "1" ]; then
-    echo "Keeping namespace $NAMESPACE and image schemabot:${IMAGE_TAG}"
-else
-    echo "Tearing down..."
-    kubectl delete namespace "$NAMESPACE" --ignore-not-found
-    # Best-effort: without this, per-run image tags accumulate in minikube's
-    # docker daemon across branches.
-    docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
-fi
-
+# Teardown runs in the EXIT trap.
 exit "$TEST_EXIT_CODE"

@@ -686,6 +686,10 @@ jobs:
       # The script builds both the schemabot and etre images into minikube's
       # docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
+        # Keep the namespace on exit so the failure log dump below can read pod
+        # logs; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          KEEP_NAMESPACE: "1"
         run: e2e/k8s/e2e-etre-test.sh
       - name: "Pod logs on failure"
         if: failure()
