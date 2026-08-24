@@ -82,10 +82,13 @@ const (
 	PreviewVolumeMode PreviewType = "volume_mode" // Volume adjustment mode
 
 	// Status previews
-	PreviewStatusList       PreviewType = "status_list"       // List of active schema changes
-	PreviewStatusDeployment PreviewType = "status_deployment" // Deployment-scoped schema change status
-	PreviewStatusHistory    PreviewType = "status_history"    // Database apply history
-	PreviewPlansList        PreviewType = "plans_list"        // List of recently generated plans
+	PreviewStatusList         PreviewType = "status_list"          // List of active schema changes
+	PreviewStatusDeployment   PreviewType = "status_deployment"    // Deployment-scoped schema change status
+	PreviewStatusHistory      PreviewType = "status_history"       // Database apply history
+	PreviewPlansList          PreviewType = "plans_list"           // List of recently generated plans
+	PreviewPullSchema         PreviewType = "pull_schema"          // Pulled live schema rendered as readable SQL
+	PreviewPullSchemaDetailed PreviewType = "pull_schema_detailed" // Pulled live schema with the detailed catalog's estimates
+	PreviewPullVitessSchema   PreviewType = "pull_schema_vitess"   // Multi-keyspace Vitess pull with VSchema artifacts
 
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output

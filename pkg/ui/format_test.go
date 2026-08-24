@@ -157,3 +157,29 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 		})
 	}
 }
+
+// A byte count reads as a magnitude: bytes below a kibibyte, and one decimal
+// place with a binary unit above it, so a table's footprint is scannable.
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  int64
+		expect string
+	}{
+		{name: "zero", input: 0, expect: "0 B"},
+		{name: "bytes below a kibibyte", input: 1023, expect: "1023 B"},
+		{name: "exactly one kibibyte", input: 1024, expect: "1.0 KiB"},
+		{name: "fractional kibibytes", input: 1536, expect: "1.5 KiB"},
+		{name: "mebibytes", input: 1024 * 1024, expect: "1.0 MiB"},
+		{name: "gibibytes", input: 4 * 1024 * 1024 * 1024, expect: "4.0 GiB"},
+		{name: "tebibytes", input: 3 * 1024 * 1024 * 1024 * 1024, expect: "3.0 TiB"},
+		{name: "pebibytes", input: 2 * 1024 * 1024 * 1024 * 1024 * 1024, expect: "2.0 PiB"},
+		{name: "beyond pebibytes stays readable", input: 5 * 1024 * 1024 * 1024 * 1024 * 1024 * 1024, expect: "5.0 EiB"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expect, FormatBytes(tt.input))
+		})
+	}
+}
