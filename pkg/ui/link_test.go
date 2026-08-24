@@ -125,4 +125,51 @@ func TestVisibleWidth(t *testing.T) {
 	t.Run("SGR color codes are zero width", func(t *testing.T) {
 		assert.Equal(t, 7, VisibleWidth("\x1b[32mRunning\x1b[0m"))
 	})
+
+	t.Run("a default-emoji-presentation symbol occupies two cells", func(t *testing.T) {
+		assert.Equal(t, 2, VisibleWidth("⛔"))
+	})
+
+	t.Run("an emoji variation sequence occupies two cells", func(t *testing.T) {
+		assert.Equal(t, 2, VisibleWidth("⚠️"))
+	})
+
+	t.Run("a text-presentation symbol occupies one cell", func(t *testing.T) {
+		assert.Equal(t, 1, VisibleWidth("⚠"))
+	})
+
+	t.Run("wide runes count double inside surrounding text", func(t *testing.T) {
+		assert.Equal(t, 12, VisibleWidth("1 alter · ⛔"))
+		assert.Equal(t, 22, VisibleWidth("1 create, 2 alter · ⚠️"))
+	})
+
+	t.Run("a variation selector without a narrow base adds nothing", func(t *testing.T) {
+		assert.Equal(t, 2, VisibleWidth("⛔️"))
+		assert.Equal(t, 0, VisibleWidth("️"))
+	})
+}
+
+func TestPadVisible(t *testing.T) {
+	t.Run("pads plain text to the requested cell count", func(t *testing.T) {
+		assert.Equal(t, "ab   ", PadVisible("ab", 5))
+	})
+
+	t.Run("pads by cells, not bytes, so emoji columns line up", func(t *testing.T) {
+		// "1 alter · ⚠️" is 14 bytes but 12 cells, so byte-based padding
+		// would stop two cells short of the column.
+		padded := PadVisible("1 alter · ⚠️", 14)
+		assert.Equal(t, 14, VisibleWidth(padded))
+		assert.Equal(t, "1 alter · ⚠️  ", padded)
+	})
+
+	t.Run("pads by cells, not bytes, for hyperlinked values", func(t *testing.T) {
+		setHyperlinks(t, true)
+		padded := PadVisible(Link("acme/shop#412", "https://github.com/acme/shop/pull/412"), 15)
+		assert.Equal(t, 15, VisibleWidth(padded))
+	})
+
+	t.Run("returns a value already at or past the width unchanged", func(t *testing.T) {
+		assert.Equal(t, "abcde", PadVisible("abcde", 5))
+		assert.Equal(t, "abcdefg", PadVisible("abcdefg", 5))
+	})
 }
