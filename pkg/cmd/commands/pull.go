@@ -29,7 +29,7 @@ func (cmd *PullCmd) Run(g *Globals) error {
 		return err
 	}
 	var resp *apitypes.PullSchemaResponse
-	err = withLoading("Pulling live schema...", cmd.Output != "json", func() error {
+	err = withLoading("Pulling live schema...", true, func() error {
 		var pullErr error
 		resp, pullErr = client.CallPullSchemaAPIWithOptions(ep, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{
 			Namespaces:    cmd.Namespaces,
