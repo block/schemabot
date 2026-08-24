@@ -28,7 +28,9 @@ func TestPlans(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.Nil(t, got)
 
-		created := time.Now().UTC().Truncate(time.Second)
+		// Backdated so the round-trip tolerance below cannot be satisfied by
+		// a store that discards the caller's time and stamps its own clock.
+		created := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 		planID, err := store.Plans().Create(ctx, &storage.Plan{
 			PlanIdentifier: "plan_round_trip",
 			Database:       "commerce",
@@ -106,7 +108,7 @@ func TestPlans(t *testing.T, h Harness) {
 		change := storage.TableChange{
 			Namespace:    "commerce",
 			Table:        "users",
-			DDL:          "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			DDL:          "ALTER TABLE `users` DROP COLUMN `email`",
 			Operation:    "alter",
 			IsUnsafe:     true,
 			UnsafeReason: "DROP COLUMN removes data",
@@ -171,9 +173,9 @@ func TestPlans(t *testing.T, h Harness) {
 		got, err := store.Plans().Get(ctx, "plan_no_shards")
 		require.NoError(t, err)
 		require.NotNil(t, got)
-		assert.Empty(t, got.Shards)
+		assert.Nil(t, got.Shards)
 		require.Contains(t, got.Namespaces, "commerce")
-		assert.Empty(t, got.Namespaces["commerce"].Shards)
+		assert.Nil(t, got.Namespaces["commerce"].Shards)
 	})
 
 	t.Run("RoundTripsVSchemaMetadata", func(t *testing.T) {
