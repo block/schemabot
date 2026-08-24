@@ -108,7 +108,7 @@ func httpGet(t *testing.T, url string) *http.Response {
 // =============================================================================
 
 func TestK8s_ControlPlane_Health(t *testing.T) {
-	resp := httpGet(t, testutil.Endpoint(t)+"/health")
+	resp := httpGet(t, controlPlaneEndpoint(t)+"/health")
 	defer resp.Body.Close()
 	require.Equal(t, 200, resp.StatusCode)
 
@@ -118,7 +118,7 @@ func TestK8s_ControlPlane_Health(t *testing.T) {
 }
 
 func TestK8s_DataPlaneHealth(t *testing.T) {
-	resp := httpGet(t, testutil.Endpoint(t)+"/tern-health/data-plane/staging")
+	resp := httpGet(t, controlPlaneEndpoint(t)+"/tern-health/data-plane/staging")
 	defer resp.Body.Close()
 	require.Equal(t, 200, resp.StatusCode)
 
@@ -137,7 +137,7 @@ func TestK8s_DataPlaneHealth(t *testing.T) {
 // gRPC path in Kubernetes. The control plane receives the HTTP request and
 // delegates to the data plane over gRPC, which runs Spirit against the target DB.
 func TestK8s_PlanApply_AddColumn(t *testing.T) {
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_addcol")
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
@@ -250,7 +250,7 @@ func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableN
 func TestK8s_ApplyLinksTasksToApplyOperation(t *testing.T) {
 	cleanupState(t)
 
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_applyop")
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
@@ -318,7 +318,7 @@ func taskIdentifiers(tasks []*storage.Task) []string {
 func TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus(t *testing.T) {
 	cleanupState(t)
 
-	endpoint := testutil.Endpoint(t)
+	endpoint := controlPlaneEndpoint(t)
 	failureMessage := "remote schema change failed while checking target connectivity"
 	tableName := testutil.UniqueTableName("k8s_remote_failure")
 
@@ -492,7 +492,7 @@ func formatLogEntries(logs []*client.LogEntry) string {
 
 // TestK8s_PlanApply_CreateTable tests creating a new table through the two-tier path.
 func TestK8s_PlanApply_CreateTable(t *testing.T) {
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_create")
 	cleanupState(t)
 
@@ -526,7 +526,7 @@ func TestK8s_PlanApply_CreateTable(t *testing.T) {
 // TestK8s_Progress tests that progress reporting works over the gRPC path.
 // Adds an index on a table with 500k rows to force Spirit's copy phase.
 func TestK8s_Progress(t *testing.T) {
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_progress")
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
@@ -919,7 +919,10 @@ func TestK8s_Operator_ControlPlanePodRestartReconnectsToRunningDataPlane(t *test
 	markControlPlaneHeartbeatStale(t, fixture.ApplyID)
 	waitForReplacementPodReady(t, "control-plane", crashedPod, 2*time.Minute)
 
-	recoveredEndpoint := startControlPlanePortForward(t)
+	// Crashing the pod killed the port-forward behind the shared suite
+	// endpoint. controlPlaneEndpoint detects that and establishes a
+	// replacement forward that later tests inherit.
+	recoveredEndpoint := controlPlaneEndpoint(t)
 	waitForTernHealth(t, recoveredEndpoint, "data-plane", "staging", testutil.PollDeadline)
 
 	testutil.WaitForState(t, recoveredEndpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
