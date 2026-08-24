@@ -117,14 +117,27 @@ func TestWritePlansListAlignsChangeSummaries(t *testing.T) {
 			Limit:    20,
 			MaxLimit: 200,
 			Plans: []PlanSummaryData{
+				// The widest summary is plain ASCII, so the marker-bearing
+				// rows below it have to be padded to reach the column width.
+				// A marker row that is itself the widest needs no padding at
+				// all and would align under any padding rule.
 				{
-					PlanID:      "plan-1700000000000000002",
+					PlanID:      "plan-1700000000000000003",
 					Database:    "orders-db",
 					Environment: "staging",
-					Source:      "https://github.com/acme/shop/pull/412",
+					Source:      "ad-hoc",
 					CreatedAt:   created,
-					Changes:     "3 alter · ⚠️",
-					UnsafeCount: 1,
+					Changes:     "12 create, 34 alter, 5 drop",
+				},
+				{
+					PlanID:       "plan-1700000000000000002",
+					Database:     "orders-db",
+					Environment:  "staging",
+					Source:       "https://github.com/acme/shop/pull/412",
+					CreatedAt:    created,
+					Changes:      "3 alter · ⚠️ · ⛔ 2",
+					UnsafeCount:  1,
+					BlockedCount: 2,
 				},
 				{
 					PlanID:      "plan-1700000000000000001",
@@ -139,16 +152,17 @@ func TestWritePlansListAlignsChangeSummaries(t *testing.T) {
 	})
 
 	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
-	require.GreaterOrEqual(t, len(lines), 5)
+	require.GreaterOrEqual(t, len(lines), 6)
 	createdText := ui.FormatTimeAgo(created)
-	withMarker := lines[3]
-	plain := lines[4]
-	withMarkerIdx := strings.Index(withMarker, createdText)
-	plainIdx := strings.Index(plain, createdText)
-	require.NotEqual(t, -1, withMarkerIdx, "row missing CREATED value: %q", withMarker)
-	require.NotEqual(t, -1, plainIdx, "row missing CREATED value: %q", plain)
-	assert.Equal(t,
-		ui.VisibleWidth(withMarker[:withMarkerIdx]),
-		ui.VisibleWidth(plain[:plainIdx]),
-		"CREATED column misaligned:\n%q\n%q", withMarker, plain)
+	rows := lines[3:6]
+	offsets := make([]int, 0, len(rows))
+	for _, row := range rows {
+		idx := strings.Index(row, createdText)
+		require.NotEqual(t, -1, idx, "row missing CREATED value: %q", row)
+		offsets = append(offsets, ui.VisibleWidth(row[:idx]))
+	}
+	for _, offset := range offsets[1:] {
+		assert.Equal(t, offsets[0], offset,
+			"CREATED column misaligned:\n%q", strings.Join(rows, "\n"))
+	}
 }
