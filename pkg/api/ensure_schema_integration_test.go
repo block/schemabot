@@ -370,9 +370,11 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
 		"surplus column from the newer schema must not be dropped by default")
 
-	// The refusal names only the destructive clauses, not the additive ones.
+	// The refusal names only the destructive clauses, not the additive ones,
+	// and carries the combined ALTER it was split from.
 	logs := logBuf.String()
-	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, "refusing destructive clauses of a mixed storage-schema ALTER")
+	assert.Contains(t, logs, "split_from_ddl")
 	assert.Contains(t, logs, surplusColumn)
 
 	// A repeat run converges: the additive work is done, the destructive
@@ -380,6 +382,39 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
 	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
 	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn))
+}
+
+// A live storage table whose primary key is wider than the embedded schema's
+// makes the Spirit diff emit a combined DROP PRIMARY KEY, ADD PRIMARY KEY
+// statement. The ADD half cannot run without the refused DROP, so the change
+// is refused whole: startup succeeds and the wider primary key survives.
+func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// Widen the primary key beyond the embedded schema's declaration. The
+	// AUTO_INCREMENT column stays leftmost so the live table remains valid.
+	_, err := db.ExecContext(ctx, "ALTER TABLE `tasks` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `apply_id`)")
+	require.NoError(t, err)
+
+	primaryKeyColumns := func() int {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'schemabot' AND TABLE_NAME = 'tasks' AND INDEX_NAME = 'PRIMARY'").Scan(&n))
+		return n
+	}
+	require.Equal(t, 2, primaryKeyColumns())
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with a refused primary-key change must not fail startup")
+	assert.Equal(t, 2, primaryKeyColumns(),
+		"the wider live primary key must survive: an ADD PRIMARY KEY cannot execute without the refused DROP PRIMARY KEY")
 }
 
 // An operator who intentionally removed a storage table and column opts in to

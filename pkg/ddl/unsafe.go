@@ -50,6 +50,14 @@ func UnsafeStatement(stmt string) (bool, string, error) {
 // are restored in the parser's canonical form, not sliced from the input
 // text.
 //
+// The safe partition must also be independently executable, because callers
+// run it while refusing the unsafe partition. A clause that is safe on its
+// own but cannot run without a refused clause moves into the unsafe
+// partition with it: the ADD PRIMARY KEY half of a primary-key change is
+// only valid while the table has no primary key, so when the DROP PRIMARY
+// KEY is refused the add would be rejected by the database rather than
+// executed.
+//
 // The safe partition is re-classified before it is returned, and an unsafe
 // verdict there is an error: a split must never widen what the caller will
 // execute. The input must be exactly one parseable ALTER TABLE statement;
@@ -67,8 +75,9 @@ func SplitUnsafeAlter(stmt string) (safeDDL, unsafeDDL string, err error) {
 		return "", "", statement.ErrNotAlterTable
 	}
 
-	var safeSpecs, unsafeSpecs []*ast.AlterTableSpec
-	for _, spec := range alter.Specs {
+	unsafeClause := make([]bool, len(alter.Specs))
+	dropsPrimaryKey := false
+	for i, spec := range alter.Specs {
 		clause, err := restoreAlterWithSpecs(alter, []*ast.AlterTableSpec{spec})
 		if err != nil {
 			return "", "", err
@@ -77,11 +86,24 @@ func SplitUnsafeAlter(stmt string) (safeDDL, unsafeDDL string, err error) {
 		if err != nil {
 			return "", "", fmt.Errorf("classify clause %q: %w", clause, err)
 		}
-		if unsafe {
-			unsafeSpecs = append(unsafeSpecs, spec)
-		} else {
-			safeSpecs = append(safeSpecs, spec)
+		unsafeClause[i] = unsafe
+		if unsafe && spec.Tp == ast.AlterTableDropPrimaryKey {
+			dropsPrimaryKey = true
 		}
+	}
+
+	// Partition in original clause order, keeping coupled clauses together:
+	// an ADD PRIMARY KEY is executable only while the table has no primary
+	// key, so when this ALTER's unsafe partition carries the DROP PRIMARY
+	// KEY, the add is refused with the drop instead of being orphaned into a
+	// statement the database will reject.
+	var safeSpecs, unsafeSpecs []*ast.AlterTableSpec
+	for i, spec := range alter.Specs {
+		if unsafeClause[i] || (dropsPrimaryKey && isAddPrimaryKey(spec)) {
+			unsafeSpecs = append(unsafeSpecs, spec)
+			continue
+		}
+		safeSpecs = append(safeSpecs, spec)
 	}
 
 	if len(safeSpecs) > 0 {
@@ -89,6 +111,12 @@ func SplitUnsafeAlter(stmt string) (safeDDL, unsafeDDL string, err error) {
 		if err != nil {
 			return "", "", err
 		}
+		// Defense in depth: Spirit's UnsafeLinter classifies clause by
+		// clause with no cross-clause state, so a subset of individually
+		// safe clauses cannot re-classify unsafe today and this guard is
+		// unreachable. It stays because the linter is an external authority
+		// whose rules may grow cross-clause reasoning, and a split must
+		// never widen what the caller will execute.
 		unsafe, reason, err := UnsafeStatement(safeDDL)
 		if err != nil {
 			return "", "", fmt.Errorf("re-classify safe partition %q: %w", safeDDL, err)
@@ -104,6 +132,14 @@ func SplitUnsafeAlter(stmt string) (safeDDL, unsafeDDL string, err error) {
 		}
 	}
 	return safeDDL, unsafeDDL, nil
+}
+
+// isAddPrimaryKey reports whether the ALTER TABLE clause adds a primary key
+// constraint.
+func isAddPrimaryKey(spec *ast.AlterTableSpec) bool {
+	return spec.Tp == ast.AlterTableAddConstraint &&
+		spec.Constraint != nil &&
+		spec.Constraint.Tp == ast.ConstraintPrimaryKey
 }
 
 // restoreAlterWithSpecs restores the given ALTER TABLE statement with its

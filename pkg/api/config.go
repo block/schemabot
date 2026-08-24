@@ -484,9 +484,11 @@ type StorageConfig struct {
 	// AllowDestructiveSchemaChanges permits EnsureSchema to execute destructive
 	// DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) when converging
 	// the storage schema at startup. Default false: destructive statements are
-	// refused and skipped whole — including additive clauses in a mixed ALTER
-	// TABLE — while the remaining non-destructive statements still apply and
-	// startup proceeds. This keeps an older binary — starting during a rolling
+	// refused and skipped — a mixed ALTER TABLE is split so its additive
+	// clauses still execute (clauses that cannot run without a refused clause,
+	// such as the ADD PRIMARY KEY half of a primary-key change, are refused
+	// with it) — while the remaining non-destructive statements still apply
+	// and startup proceeds. This keeps an older binary — starting during a rolling
 	// deploy or rollback — from destroying tables or columns a newer binary's
 	// schema added. Set true only when intentionally removing storage tables or
 	// columns, after every running pod is on a binary whose embedded schema no

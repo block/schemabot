@@ -137,6 +137,19 @@ func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 		assert.Equal(t, "ALTER TABLE `applies` DROP COLUMN `lease_owner`", refused[0].change.DDL)
 		assert.Contains(t, refused[0].reason, "DROP COLUMN")
 		assert.Contains(t, refused[0].reason, "lease_owner")
+		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`", refused[0].splitFrom)
+	})
+
+	t.Run("a primary-key change is refused whole because its ADD half cannot run alone", func(t *testing.T) {
+		t.Parallel()
+		pkChange := "ALTER TABLE `applies` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `caller`)"
+		allowed, refused, err := partitionDestructiveChanges(single(pkChange))
+		require.NoError(t, err)
+		assert.Empty(t, allowed)
+		require.Len(t, refused, 1)
+		assert.Equal(t, pkChange, refused[0].change.DDL)
+		assert.NotEmpty(t, refused[0].reason)
+		assert.Empty(t, refused[0].splitFrom)
 	})
 
 	t.Run("a statement Spirit cannot classify fails the bootstrap", func(t *testing.T) {

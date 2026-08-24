@@ -101,6 +101,27 @@ func TestSplitUnsafeAlter(t *testing.T) {
 		assert.Equal(t, "ALTER TABLE `users` DROP COLUMN `fax`, DROP COLUMN `pager`", unsafeDDL)
 	})
 
+	t.Run("a primary key change refuses the ADD PRIMARY KEY with its DROP", func(t *testing.T) {
+		safeDDL, unsafeDDL, err := SplitUnsafeAlter("ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `org_id`)")
+		require.NoError(t, err)
+		assert.Empty(t, safeDDL, "an ADD PRIMARY KEY cannot run while the refused DROP leaves the old key in place")
+		assert.Equal(t, "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY(`id`, `org_id`)", unsafeDDL)
+	})
+
+	t.Run("a mixed primary key change keeps only independently executable clauses", func(t *testing.T) {
+		safeDDL, unsafeDDL, err := SplitUnsafeAlter("ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20), DROP PRIMARY KEY, ADD PRIMARY KEY (`id`)")
+		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `phone` VARCHAR(20)", safeDDL)
+		assert.Equal(t, "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY(`id`)", unsafeDDL)
+	})
+
+	t.Run("ADD PRIMARY KEY without a DROP stays in the safe statement", func(t *testing.T) {
+		safeDDL, unsafeDDL, err := SplitUnsafeAlter("ALTER TABLE `users` ADD PRIMARY KEY (`id`)")
+		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD PRIMARY KEY(`id`)", safeDDL)
+		assert.Empty(t, unsafeDDL)
+	})
+
 	t.Run("DROP INDEX loses no data and lands in the safe statement", func(t *testing.T) {
 		safeDDL, unsafeDDL, err := SplitUnsafeAlter("ALTER TABLE `users` DROP INDEX `idx_email`, DROP COLUMN `email`")
 		require.NoError(t, err)
