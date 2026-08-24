@@ -179,6 +179,12 @@ type ServerConfig struct {
 	// incident kill switch. A database's own metadata entry for the same
 	// key wins over this server-level value.
 	Spirit SpiritConfig `yaml:"spirit,omitempty"`
+
+	// PlanetScale configures process-wide behavior for the Vitess engine's
+	// connections to PlanetScale-compatible endpoints. It applies to every
+	// Vitess database this server drives, unlike the per-database tls block,
+	// which only covers statically registered databases.
+	PlanetScale PlanetScaleConfig `yaml:"planetscale,omitempty"`
 }
 
 // PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
@@ -1080,6 +1086,53 @@ type TLSConfig struct {
 	ClientKey string `yaml:"client_key,omitempty"`
 }
 
+// PlanetScaleConfig holds process-wide settings for the Vitess engine's
+// connections to PlanetScale-compatible endpoints.
+type PlanetScaleConfig struct {
+	// MTLS holds certificate paths for mutual TLS on every MySQL connection
+	// the Vitess engine opens (branch hosts and vtgates). When set, the server
+	// registers the certificates with the Go MySQL driver at startup and fails
+	// to start if any file is missing or unparseable, so a worker never
+	// silently drives Vitess applies without the client identity the endpoint
+	// requires.
+	MTLS *PlanetScaleMTLSConfig `yaml:"mtls,omitempty"`
+}
+
+// PlanetScaleMTLSConfig holds certificate paths for mutual TLS with
+// PlanetScale-compatible endpoints. All three paths are required: unlike the
+// per-database tls block, this config always presents a client identity.
+type PlanetScaleMTLSConfig struct {
+	// CABundle is the path to the CA certificate bundle (PEM) that verifies
+	// the endpoint's server certificate.
+	CABundle string `yaml:"ca_bundle"`
+
+	// ClientCert is the path to the client certificate (PEM) presented to the
+	// endpoint.
+	ClientCert string `yaml:"client_cert"`
+
+	// ClientKey is the path to the client private key (PEM).
+	ClientKey string `yaml:"client_key"`
+}
+
+// validate checks that an mtls block, when present, names all three
+// certificate paths. File readability is checked at startup registration, not
+// here, so config validation stays filesystem-independent.
+func (c *PlanetScaleConfig) validate() error {
+	if c.MTLS == nil {
+		return nil
+	}
+	if c.MTLS.CABundle == "" {
+		return fmt.Errorf("planetscale.mtls.ca_bundle is required when planetscale.mtls is set")
+	}
+	if c.MTLS.ClientCert == "" {
+		return fmt.Errorf("planetscale.mtls.client_cert is required when planetscale.mtls is set")
+	}
+	if c.MTLS.ClientKey == "" {
+		return fmt.Errorf("planetscale.mtls.client_key is required when planetscale.mtls is set")
+	}
+	return nil
+}
+
 // RepoConfig holds configuration for a specific repository.
 type RepoConfig struct {
 	// EnableChecks controls whether SchemaBot publishes GitHub Check Runs for
@@ -1288,6 +1341,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
+		return err
+	}
+	if err := c.PlanetScale.validate(); err != nil {
 		return err
 	}
 	if err := c.validateRequiredChecksNotAggregate(); err != nil {

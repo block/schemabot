@@ -19,6 +19,7 @@
 - [Storage Dialect](#storage-dialect)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
+- [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
@@ -531,6 +532,37 @@ A database can override the server-level value by setting the same key
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+## PlanetScale mTLS
+
+Some PlanetScale-compatible endpoints require mutual TLS: every MySQL
+connection must present a client certificate in addition to verifying the
+server. The `planetscale:` block registers that identity process-wide at
+startup, and the Vitess engine then applies it to every MySQL connection it
+opens — branch hosts and vtgates alike:
+
+```yaml
+planetscale:
+  mtls:
+    ca_bundle: /etc/ssl/certs/ca-certificates.crt  # verifies the endpoint's server cert
+    client_cert: /etc/secrets/pca/tls.crt          # client identity presented to the endpoint
+    client_key: /etc/secrets/pca/tls.key
+```
+
+All three paths are required together, and the server fails startup when any
+file is missing or unparseable — a worker never comes up without the identity
+its endpoints require, where it would otherwise fail (or silently degrade) on
+every Vitess connection.
+
+This is the right knob for dynamically resolved targets (a data plane using
+`target_resolver`), where there is no per-database config to attach TLS to.
+Statically registered databases can instead use the per-database
+`tls:` block, which supports server-only TLS (client cert optional) and scopes
+the config to that one database.
+
+Certificate delivery is deployment infrastructure, not server config: in the
+Helm chart, mount the certificate secret with `extraVolumes` /
+`extraVolumeMounts` and point these paths at the mount.
 
 ## Storage Schema Changes
 

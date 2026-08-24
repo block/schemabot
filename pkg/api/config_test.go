@@ -4145,3 +4145,66 @@ spirit:
 		require.ErrorContains(t, err, "must be positive")
 	})
 }
+
+// The planetscale.mtls block always presents a client identity, so a partial
+// block is rejected at config load rather than producing a worker that starts
+// and then fails or degrades on every Vitess connection it opens.
+func TestValidatePlanetScaleMTLS(t *testing.T) {
+	configWith := func(ps PlanetScaleConfig) *ServerConfig {
+		return &ServerConfig{
+			PlanetScale: ps,
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mtls    *PlanetScaleMTLSConfig
+		wantErr string
+	}{
+		{
+			name: "absent block is valid",
+			mtls: nil,
+		},
+		{
+			name: "complete block is valid",
+			mtls: &PlanetScaleMTLSConfig{
+				CABundle:   "/etc/ssl/certs/ca-certificates.crt",
+				ClientCert: "/etc/secrets/pca/tls.crt",
+				ClientKey:  "/etc/secrets/pca/tls.key",
+			},
+		},
+		{
+			name:    "missing ca_bundle",
+			mtls:    &PlanetScaleMTLSConfig{ClientCert: "/c.crt", ClientKey: "/c.key"},
+			wantErr: "planetscale.mtls.ca_bundle is required",
+		},
+		{
+			name:    "missing client_cert",
+			mtls:    &PlanetScaleMTLSConfig{CABundle: "/ca.crt", ClientKey: "/c.key"},
+			wantErr: "planetscale.mtls.client_cert is required",
+		},
+		{
+			name:    "missing client_key",
+			mtls:    &PlanetScaleMTLSConfig{CABundle: "/ca.crt", ClientCert: "/c.crt"},
+			wantErr: "planetscale.mtls.client_key is required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := configWith(PlanetScaleConfig{MTLS: tt.mtls}).Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
