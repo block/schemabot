@@ -53,7 +53,8 @@ func writeTestCertPair(t *testing.T, dir string) (certPath, keyPath string) {
 }
 
 // Without a planetscale.mtls block the server starts without registering any
-// process-wide TLS config, leaving per-database TLS settings in charge.
+// process-wide TLS config, and the Vitess engine's MySQL connections use no
+// TLS.
 func TestRegisterPlanetScaleMTLSAbsentIsNoOp(t *testing.T) {
 	cfg := &api.ServerConfig{}
 	require.NoError(t, registerPlanetScaleMTLS(cfg, slog.New(slog.DiscardHandler)))

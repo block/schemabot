@@ -557,8 +557,16 @@ every Vitess connection.
 This is the knob for the Vitess engine's own connections, and it works the
 same for statically registered databases and dynamically resolved targets (a
 data plane using `target_resolver`, which has no per-database config to
-attach TLS to). The engine applies the process-wide registration to every
-connection it opens; it does not consult the per-database `tls:` block.
+attach TLS to). The registration is process-wide with no per-database
+opt-out: once set, every Vitess database this server serves connects with
+mTLS. Serve endpoints that require mTLS and plaintext endpoints (such as a
+LocalScale instance) from separate server processes.
+
+Certificate rotation on the configured paths takes effect without a restart:
+the client certificate and key are re-read from disk on every new
+connection's handshake, so replacing the mounted files (as a certificate
+manager does when renewing) rotates the presented identity on its own. The
+CA bundle is read once at startup — replacing it requires a restart.
 
 Certificate delivery is deployment infrastructure, not server config: in the
 Helm chart, mount the certificate secret with `extraVolumes` /

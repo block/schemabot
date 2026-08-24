@@ -262,7 +262,7 @@ type Server struct {
 func registerPlanetScaleMTLS(cfg *api.ServerConfig, logger *slog.Logger) error {
 	mtls := cfg.PlanetScale.MTLS
 	if mtls == nil {
-		logger.Debug("planetscale.mtls not configured; Vitess engine MySQL connections use per-database TLS config only")
+		logger.Debug("planetscale.mtls not configured; Vitess engine MySQL connections use no TLS")
 		return nil
 	}
 	if err := planetscale.RegisterMTLS(planetscale.MTLSConfig{

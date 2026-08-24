@@ -4208,3 +4208,33 @@ func TestValidatePlanetScaleMTLS(t *testing.T) {
 		})
 	}
 }
+
+// The planetscale.mtls block from the configuration docs decodes through the
+// strict config loader: the yaml tags on PlanetScaleConfig and
+// PlanetScaleMTLSConfig are what real config files exercise, and the loader's
+// KnownFields decoding rejects any key they fail to cover, so this pins the
+// block's on-disk spelling end to end.
+func TestLoadServerConfigPlanetScaleMTLSFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: mysql
+    environments:
+      staging:
+        dsn: root@tcp(localhost:3306)/mydb
+planetscale:
+  mtls:
+    ca_bundle: /etc/ssl/certs/ca-certificates.crt
+    client_cert: /etc/secrets/pca/tls.crt
+    client_key: /etc/secrets/pca/tls.key
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(path)
+	require.NoError(t, err)
+	require.Equal(t, &PlanetScaleMTLSConfig{
+		CABundle:   "/etc/ssl/certs/ca-certificates.crt",
+		ClientCert: "/etc/secrets/pca/tls.crt",
+		ClientKey:  "/etc/secrets/pca/tls.key",
+	}, cfg.PlanetScale.MTLS)
+}

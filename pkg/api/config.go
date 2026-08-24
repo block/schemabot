@@ -996,11 +996,6 @@ type EnvironmentConfig struct {
 	// APIURL is the PlanetScale API base URL (e.g., "http://localscale:8080").
 	// DSN is the vtgate MySQL endpoint for schema queries and SHOW VITESS_MIGRATIONS.
 	APIURL string `yaml:"api_url,omitempty"`
-
-	// TLS configures MySQL TLS for branch connections.
-	// When set, registers a named TLS config with the Go MySQL driver.
-	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
-	TLS *TLSConfig `yaml:"tls,omitempty"`
 }
 
 // DirectExecutionConfig configures direct execution of engine-refused ALTER
@@ -1074,18 +1069,6 @@ type externalDatabaseEndpoint struct {
 	Database string `yaml:"database"`
 }
 
-// TLSConfig holds TLS certificate paths for MySQL connections to PlanetScale branches.
-type TLSConfig struct {
-	// CABundle is the path to the CA certificate bundle (PEM).
-	CABundle string `yaml:"ca_bundle"`
-
-	// ClientCert is the path to the client certificate (PEM).
-	ClientCert string `yaml:"client_cert,omitempty"`
-
-	// ClientKey is the path to the client private key (PEM).
-	ClientKey string `yaml:"client_key,omitempty"`
-}
-
 // PlanetScaleConfig holds process-wide settings for the Vitess engine's
 // connections to PlanetScale-compatible endpoints.
 type PlanetScaleConfig struct {
@@ -1099,8 +1082,8 @@ type PlanetScaleConfig struct {
 }
 
 // PlanetScaleMTLSConfig holds certificate paths for mutual TLS with
-// PlanetScale-compatible endpoints. All three paths are required: unlike the
-// per-database tls block, this config always presents a client identity.
+// PlanetScale-compatible endpoints. All three paths are required: the config
+// always presents a client identity.
 type PlanetScaleMTLSConfig struct {
 	// CABundle is the path to the CA certificate bundle (PEM) that verifies
 	// the endpoint's server certificate.
