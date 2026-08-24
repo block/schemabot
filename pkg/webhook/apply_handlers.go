@@ -432,15 +432,29 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
 			"discarded_copies", len(discarded))
-		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		// Store the check record before posting the paused comment: the pause
+		// is acknowledged only once the stored check state blocks the merge
+		// gate on the pending changes. A storage failure releases the lock
+		// (keyed on this plan's intent) and stays retryable — the re-drive
+		// re-plans from the top, reacquires the lock, and reaches this gate
+		// again — so the pause is never acknowledged over unknown check state.
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkRunErr != nil {
-			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
+			h.logger.Error("failed to store check state for copy-discard downgrade; the merge gate does not reflect the pending changes, so the command stays retryable",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", checkRunErr)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "copy-discard downgrade check state store failure")
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not record the check state for this apply. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command copy-discard downgrade check record %s#%d: %w", repo, pr, checkRunErr)
 		}
 		if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		}
+		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		return false, nil
 	}
 
