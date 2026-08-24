@@ -275,9 +275,18 @@ func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 // re-run the whole engine attempt until the budget is spent while the control
 // plane correctly keeps the operation open through each pause — a bounded
 // sequence of engine runs and recovery waits far longer than a test deadline
-// should cover. With the budget spent up front, the first retryable failure
-// goes through the real expiry pass immediately, settling the operation to the
-// same terminal state exhaustion would reach, with the engine error intact.
+// should cover. With the budget spent, the failed_retryable apply goes through
+// the real expiry pass immediately, settling the operation to the same
+// terminal state exhaustion would reach, with the engine error intact.
+//
+// The spend must not race the remote driver: a drive holds the apply row in
+// memory and writes attempt back on finalize, so an out-of-band write while a
+// drive is live gets clobbered. failed_retryable is the one window with no
+// live drive — the failing drive has finalized and released the row, and a
+// spent budget makes the row ineligible for another recovery claim — so the
+// spend waits for that state and writes with a state guard. A zero-row write
+// means a recovery claim flipped the row first; the next retryable failure
+// reopens the window, so the poll simply tries again.
 //
 // Each test starts from multiDeployEnsureNoActiveChange, which clears every
 // deployment's Tern storage, so the apply this test dispatched is the only
@@ -289,41 +298,40 @@ func multiDeploySpendRecoveryBudget(t *testing.T, deployment string) {
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern storage db (%s)", deployment)
 
-	// The control plane dispatches to the remote asynchronously after accepting
-	// the apply, so poll for the remote row to exist before spending its budget.
-	var applyIdentifier string
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
-			rows, err := db.QueryContext(t.Context(), "SELECT apply_identifier FROM `applies`")
+			rows, err := db.QueryContext(t.Context(),
+				"SELECT apply_identifier, state FROM `applies`")
 			require.NoErrorf(t, err, "read dispatched applies on %s", deployment)
 			defer utils.CloseAndLog(rows)
-			var identifiers []string
+			var applyIdentifier, applyState string
+			var found int
 			for rows.Next() {
-				var identifier string
-				require.NoError(t, rows.Scan(&identifier))
-				identifiers = append(identifiers, identifier)
+				require.NoError(t, rows.Scan(&applyIdentifier, &applyState))
+				found++
 			}
 			require.NoError(t, rows.Err())
-			if len(identifiers) == 0 {
+			if found == 0 {
+				// The control plane dispatches to the remote asynchronously
+				// after accepting the apply.
 				return false
 			}
-			require.Lenf(t, identifiers, 1,
+			require.Equalf(t, 1, found,
 				"expected exactly the apply this test dispatched on %s", deployment)
-			applyIdentifier = identifiers[0]
-			return true
+			if !state.IsState(applyState, state.Apply.FailedRetryable) {
+				return false
+			}
+			result, err := db.ExecContext(t.Context(),
+				"UPDATE `applies` SET attempt = ? WHERE apply_identifier = ? AND state = ?",
+				storage.MaxRecoveryAttempts, applyIdentifier, applyState)
+			require.NoErrorf(t, err, "spend the recovery budget on %s apply %s", deployment, applyIdentifier)
+			spent, err := result.RowsAffected()
+			require.NoError(t, err, "read spent recovery budget rows")
+			return spent == 1
 		},
 		func() string {
-			return fmt.Sprintf("timeout waiting for the apply to be dispatched to %s", deployment)
+			return fmt.Sprintf("timeout waiting to spend the recovery budget on the %s apply between recovery claims", deployment)
 		})
-
-	result, err := db.ExecContext(t.Context(),
-		"UPDATE `applies` SET attempt = ? WHERE apply_identifier = ?",
-		storage.MaxRecoveryAttempts, applyIdentifier)
-	require.NoErrorf(t, err, "spend the recovery budget on %s apply %s", deployment, applyIdentifier)
-	spent, err := result.RowsAffected()
-	require.NoError(t, err, "read spent recovery budget rows")
-	require.EqualValuesf(t, 1, spent,
-		"expected to spend the recovery budget on %s apply %s", deployment, applyIdentifier)
 }
 
 // multiDeployEnsureNoActiveChange clears any active schema change for the
