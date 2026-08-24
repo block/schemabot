@@ -108,19 +108,21 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 	})
 }
 
-// An aggregate participant cannot make a fleet-wide ownership decision when
-// its local schema directory hints cannot recover config discovery from a
-// truncated repository. It defers silently to the leader instead of retrying
-// a permanent condition and eventually posting Apply Failed.
-func TestApplyCommandCoreParticipantTruncatedDiscoveryDefersToLeader(t *testing.T) {
+// An aggregate participant that cannot enumerate a truncated repository does
+// not know whether it owns the changed schema — it might be the owner and
+// simply unable to prove it. A silent defer here could drop a command with no
+// deployment answering, so the failure surfaces fail-closed and stays
+// retryable for a durable driver.
+func TestApplyCommandCoreParticipantTruncatedDiscoverySurfaces(t *testing.T) {
 	h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 	serveTruncatedRepoWithChangedSchemaFile(t, mux)
 
 	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "production", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
-	require.NoError(t, err)
-	assert.False(t, retry, "participant discovery uncertainty is a terminal silent defer, not retryable work")
-	assert.Empty(t, comments, "the participant must not post Apply Failed for incomplete fleet discovery")
+	require.Error(t, err)
+	assert.True(t, retry, "incomplete discovery is not the command's answer, so it must stay retryable")
+	body := requireComment(t, comments, "participant truncated-discovery error")
+	assert.Contains(t, body, "truncated repository tree")
 }
 
 // A GitHub read failure during config discovery (here, fetching the changed

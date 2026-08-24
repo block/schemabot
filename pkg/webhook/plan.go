@@ -258,7 +258,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
 			if h.skipUnownedUnscopedCommand(repo, tenant, findErr) {
-				h.logger.Debug("unscoped fan-out plan cannot establish database ownership from participant discovery; staying silent",
+				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
 				return
 			}
