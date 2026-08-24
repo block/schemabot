@@ -1303,6 +1303,14 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
+	// High-water row-copy progress across the whole run. An operator retry
+	// relaunches the engine's row copy, so the live fields above track only the
+	// current attempt — whichever attempt was written last, not the furthest the
+	// copy ever got. The store raises these on every update and never lets them
+	// regress, so failure surfaces can report the run's real furthest point.
+	// Read-only for callers: values assigned here are ignored on update.
+	BestRowsCopied      int64
+	BestProgressPercent int
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64

@@ -173,6 +173,7 @@ const (
 	PreviewCommentSingleStopped            PreviewType = "comment_single_stopped"              // Single table stopped
 	PreviewCommentSummaryCompleted         PreviewType = "comment_summary_completed"           // Summary: completed
 	PreviewCommentSummaryFailed            PreviewType = "comment_summary_failed"              // Summary: failed
+	PreviewCommentSummaryFailedRetries     PreviewType = "comment_summary_failed_retries"      // Summary: failed after retry budget exhausted
 	PreviewCommentSummaryStopped           PreviewType = "comment_summary_stopped"             // Summary: stopped
 	PreviewCommentSummaryCompletedLarge    PreviewType = "comment_summary_completed_large"     // Summary: completed (8 tables, rollup)
 	PreviewCommentSummaryVitessVSchema     PreviewType = "comment_summary_vitess_vschema"      // Summary: completed Vitess DDL + VSchema

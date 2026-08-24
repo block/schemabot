@@ -4594,6 +4594,41 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="summary-failed-retries-exhausted"></a><strong>Summary: Failed (Retries Exhausted)</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 2h 15m
+
+*Applied by @jackjackbits at 2026-03-15 12:15:00 UTC*
+
+> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+
+1 of 2 tables completed before failure.
+
+**`users`** — Failed at 47%
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`**
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="summary-stopped"></a><strong>Summary: Stopped</strong></summary>
 
 

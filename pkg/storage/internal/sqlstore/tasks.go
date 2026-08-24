@@ -18,7 +18,7 @@ import (
 const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
+	rows_copied, rows_total, progress_percent, best_rows_copied, best_progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
@@ -57,21 +57,23 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 		options = []byte("{}")
 	}
 
+	// A new row's live sample is trivially its high-water, so the best columns
+	// start from the same values the live progress columns start from.
 	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO tasks (
 			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, shard, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
-			rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
+			rows_copied, rows_total, progress_percent, best_rows_copied, best_progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
 			is_instant, engine_migration_id,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.RowsCopied, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
@@ -103,7 +105,7 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.RowsCopied, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt,
 		task.ID,
@@ -135,10 +137,19 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 		verifyLeaseStillOwned = func() error { return ensureApplyLeaseStillOwned(ctx, s.db, lease) }
 	}
 
+	// The best_* columns are the run's high-water row-copy progress. Every
+	// progress write funnels through this statement, so raising them here (and
+	// never letting them regress) is what lets failure surfaces report the
+	// furthest the copy ever got even after an operator retry relaunches the
+	// copy and the live columns reset. The struct's Best* fields are read-only
+	// mirrors and deliberately not bound: the live sample is compared against
+	// the stored high-water, not against whatever the caller last loaded.
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE tasks SET
 			state = ?, error_message = ?, options = ?, attempt = ?,
-			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, throttled = ?, throttle_reason = ?, cutover_attempts = ?,
+			rows_copied = ?, rows_total = ?, progress_percent = ?,
+			best_rows_copied = GREATEST(best_rows_copied, ?), best_progress_percent = GREATEST(best_progress_percent, ?),
+			eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, throttled = ?, throttle_reason = ?, cutover_attempts = ?,
 			is_instant = ?, engine_migration_id = ?,
 			started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?`+leasePredicate+`
@@ -269,7 +280,7 @@ const shardTaskInsertColumns = `
 	task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
+	rows_copied, rows_total, progress_percent, best_rows_copied, best_progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
@@ -282,13 +293,15 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
-	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+	// A new row's live sample is trivially its high-water, so the best columns
+	// start from the same values the live progress columns start from.
+	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		[]any{
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-			task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
+			task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.RowsCopied, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
@@ -657,6 +670,8 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.RowsCopied,
 		&task.RowsTotal,
 		&task.ProgressPercent,
+		&task.BestRowsCopied,
+		&task.BestProgressPercent,
 		&etaSeconds,
 		&task.ChecksumRowsChecked,
 		&task.ChecksumRowsTotal,

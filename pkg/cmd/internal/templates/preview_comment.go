@@ -104,6 +104,7 @@ func previewCommentAllOutput() {
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
+		{"SUMMARY: FAILED (RETRIES EXHAUSTED)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedAfterRetries()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
 		{"SUMMARY: COMPLETED (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedLarge()) }},
 		{"SUMMARY: VITESS DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedVitessDDLWithVSchema()) }},
@@ -292,6 +293,7 @@ func previewCommentApplyFlowAllOutput() {
 		// Summaries
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
+		{"SUMMARY: FAILED (RETRIES EXHAUSTED)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedAfterRetries()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
 		{"SUMMARY: CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCancelled()) }},
 		{"SUMMARY: COMPLETED (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedLarge()) }},

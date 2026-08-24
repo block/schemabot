@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -466,6 +467,75 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Stopped),
 		"observer must see the settled verdict, got %s", observer.terminal[0].State)
+}
+
+// Resuming an already-started sequential apply records the relaunch on the
+// timeline without asserting a checkpoint reattach. Whether the engine
+// reattached to a durable checkpoint or restarted the copy from scratch is the
+// engine's own outcome, recorded separately once the engine reports it — an
+// operator reading the timeline must be able to trust a "checkpoint" claim as
+// evidence that copied rows survived. Drive a reclaimed sequential apply to
+// completion with an engine that reports no checkpoint resume and assert the
+// relaunch event carries no checkpoint claim.
+func TestResumeApplySequentialRelaunchEventClaimsNoCheckpoint(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              31,
+		ApplyIdentifier: "apply-seq-resume",
+		PlanID:          5,
+		Database:        "testapp",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Running,
+		StartedAt:       &time.Time{},
+	}
+	tasks := []*storage.Task{{
+		ID:             3,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-seq-resume",
+		Database:       "testapp",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:      "alter",
+		State:          state.Task.Running,
+	}}
+	logs := &mockApplyLogStore{}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testapp", Type: storage.DatabaseTypeMySQL,
+			TargetDSN: "user:pass@tcp(127.0.0.1:3306)/testapp"},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			plans:           &scriptedPlanStore{plan: &storage.Plan{ID: 5, PlanIdentifier: "plan-1"}},
+			logs:            logs,
+		},
+		spiritEngine: &fakeControlEngine{
+			planResult:     alterUsersEmailPlan(),
+			progressResult: &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		heartbeatInterval: time.Hour,
+		logger:            slog.Default(),
+	}
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+
+	require.NoError(t, err)
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Completed),
+		"the resumed drive must run the remaining work to completion, got %s", applyStore.apply.State)
+	relaunchEvents := 0
+	for _, entry := range logs.logs {
+		if entry.Message == "Apply resumed (sequential)" {
+			relaunchEvents++
+			assert.Equal(t, storage.LogEventStateTransition, entry.EventType)
+			assert.Equal(t, state.Apply.Running, entry.NewState)
+		}
+		assert.NotContains(t, entry.Message, "checkpoint",
+			"no timeline event may claim a checkpoint reattach the engine never reported")
+	}
+	assert.Equal(t, 1, relaunchEvents, "the resumed drive records its relaunch once")
 }
 
 // A reverted task is terminal: the revert already landed for it, so the resume

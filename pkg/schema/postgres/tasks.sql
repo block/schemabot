@@ -22,6 +22,8 @@ CREATE TABLE tasks (
   rows_copied bigint DEFAULT 0,
   rows_total bigint DEFAULT 0,
   progress_percent integer DEFAULT 0,
+  best_rows_copied bigint NOT NULL DEFAULT 0,
+  best_progress_percent integer NOT NULL DEFAULT 0,
   eta_seconds integer DEFAULT NULL,
   checksum_rows_checked bigint DEFAULT 0,
   checksum_rows_total bigint DEFAULT 0,

@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1062,6 +1063,39 @@ func TestRenderApplyStatusComment_FailedAfterCopyProgressKeepsBar(t *testing.T) 
 	}
 }
 
+// An apply that consumed operator retries relaunches the engine's row copy on
+// each attempt, so the live percent is whichever attempt was sampled last —
+// not the run's furthest point. The failed row draws its bar from the stored
+// high-water so an operator sees how far the copy actually got, not an
+// arbitrary attempt's progress.
+func TestRenderApplyStatusComment_FailedAfterRetriesUsesHighWaterProgress(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		Attempt:     3,
+		Tables: []TableProgressData{
+			{
+				TableName:           "users",
+				DDL:                 "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+				Status:              state.Task.Failed,
+				PercentComplete:     12,
+				RowsCopied:          120000,
+				RowsTotal:           1000000,
+				BestPercentComplete: 47,
+				BestRowsCopied:      470000,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`users`**: "+ui.ProgressBarFailed(47)+" ❌ Failed\n",
+		"the failed bar shows the run's furthest progress, not the last-sampled attempt's")
+	assert.NotContains(t, result, ui.ProgressBarFailed(12))
+	assert.NotContains(t, result, "(before row copy started)")
+}
+
 func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:     "testapp",
@@ -1785,6 +1819,80 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "**`users`** — Failed at 30%")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`products`** — Cancelled")
+}
+
+// A run that consumed operator retries relaunches the engine's row copy on
+// each attempt, so the live percent is whichever attempt was sampled last —
+// not the run's furthest point. The terminal summary labels the failure with
+// the stored high-water percent: a stale last-sampled percent understates a
+// run whose earlier attempt got further, and a stale "Failed at 100%" from an
+// earlier attempt reads as a completed copy.
+func TestRenderApplySummaryComment_FailedAfterRetriesReportsHighWaterPercent(t *testing.T) {
+	tables := []TableProgressData{
+		{
+			Namespace:           "testapp",
+			TableName:           "users",
+			DDL:                 "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			Status:              state.Task.Failed,
+			PercentComplete:     12,
+			RowsCopied:          173201,
+			RowsTotal:           1466232,
+			BestPercentComplete: 47,
+			BestRowsCopied:      689129,
+		},
+	}
+	data := ApplyStatusCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  "aparajon",
+		State:        state.Apply.Failed,
+		Engine:       "Spirit",
+		ErrorMessage: "lock wait timeout exceeded; try restarting transaction",
+		Attempt:      storage.MaxRecoveryAttempts,
+		Tables:       tables,
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "**`users`** — Failed at 47%\n",
+		"the failure label reports the run's furthest progress, not the last-sampled attempt's")
+	assert.NotContains(t, result, "Failed at 12%")
+}
+
+// A failed table whose copy never started on any attempt renders a bare
+// "Failed" label: with both the live sample and the high-water at zero there
+// is no copy progress to report.
+func TestRenderApplySummaryComment_FailedBeforeCopyOmitsPercent(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		Tables: []TableProgressData{
+			{
+				Namespace: "testapp",
+				TableName: "users",
+				DDL:       "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+				Status:    state.Task.Failed,
+			},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "**`users`** — Failed\n")
+	assert.NotContains(t, result, "Failed at")
+}
+
+func TestPreviewCommentSummaryFailedAfterRetries(t *testing.T) {
+	result := PreviewCommentSummaryFailedAfterRetries()
+
+	assert.Contains(t, result, "Schema Change Failed")
+	assert.Contains(t, result, "lock wait timeout")
+	assert.Contains(t, result, "1 of 2 tables completed before failure.")
+	assert.Contains(t, result, "**`users`** — Failed at 47%\n",
+		"the failure label reports the run's high-water, not the last-sampled 12%")
+	assert.NotContains(t, result, "Failed at 12%")
+	assert.Contains(t, result, "**`orders`**")
 }
 
 func TestPreviewCommentSummaryStopped(t *testing.T) {
