@@ -336,6 +336,52 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 	assert.True(t, testutil.TableExists(t, db, "schemabot", surplusTable))
 }
 
+// When the live storage database drifts from the embedded schema on the same
+// table in both directions — it misses a column the starting binary requires
+// and holds a surplus column a newer binary wrote — Spirit's diff emits one
+// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. EnsureSchema must
+// split that statement: the required column is added so the binary can run,
+// while the destructive clause is refused and the surplus column survives.
+func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// Same-table drift in both directions: `tasks` misses an embedded column
+	// the binary requires and holds a surplus column it does not declare.
+	const missingColumn = "throttle_reason"
+	surplusColumn, _ := seedSurplusStorageState(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with a mixed additive/destructive ALTER must not fail startup")
+
+	// The required column was added; the surplus column survived.
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn),
+		"missing embedded column must be added even when the same ALTER carries destructive clauses")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+		"surplus column from the newer schema must not be dropped by default")
+
+	// The refusal names only the destructive clauses, not the additive ones.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, surplusColumn)
+
+	// A repeat run converges: the additive work is done, the destructive
+	// remainder keeps being refused without error.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn))
+}
+
 // An operator who intentionally removed a storage table and column opts in to
 // destructive storage-schema changes; EnsureSchema then executes the DROP
 // statements and converges the database to the embedded schema.

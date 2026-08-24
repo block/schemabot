@@ -2,8 +2,11 @@ package ddl
 
 import (
 	"fmt"
+	"strings"
 
 	spiritlint "github.com/block/spirit/pkg/lint"
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/format"
 	"github.com/block/spirit/pkg/statement"
 )
 
@@ -36,4 +39,82 @@ func UnsafeStatement(stmt string) (bool, string, error) {
 		return false, "", nil
 	}
 	return true, violations[0].Message, nil
+}
+
+// SplitUnsafeAlter partitions a single ALTER TABLE statement into a safe
+// statement and an unsafe statement in Spirit's unsafe vocabulary. Each
+// clause is restored on its own and classified through UnsafeStatement, so
+// Spirit's UnsafeLinter remains the single authority on the unsafe set —
+// there is no local clause vocabulary to drift out of agreement. Either
+// returned statement is empty when no clause falls in that partition; both
+// are restored in the parser's canonical form, not sliced from the input
+// text.
+//
+// The safe partition is re-classified before it is returned, and an unsafe
+// verdict there is an error: a split must never widen what the caller will
+// execute. The input must be exactly one parseable ALTER TABLE statement;
+// anything else is an error, which callers must treat as fail-closed.
+func SplitUnsafeAlter(stmt string) (safeDDL, unsafeDDL string, err error) {
+	parsed, err := statement.New(stmt)
+	if err != nil {
+		return "", "", fmt.Errorf("parse statement: %w", err)
+	}
+	if len(parsed) != 1 {
+		return "", "", fmt.Errorf("expected exactly one statement, got %d", len(parsed))
+	}
+	alter, ok := (*parsed[0].StmtNode).(*ast.AlterTableStmt)
+	if !ok {
+		return "", "", statement.ErrNotAlterTable
+	}
+
+	var safeSpecs, unsafeSpecs []*ast.AlterTableSpec
+	for _, spec := range alter.Specs {
+		clause, err := restoreAlterWithSpecs(alter, []*ast.AlterTableSpec{spec})
+		if err != nil {
+			return "", "", err
+		}
+		unsafe, _, err := UnsafeStatement(clause)
+		if err != nil {
+			return "", "", fmt.Errorf("classify clause %q: %w", clause, err)
+		}
+		if unsafe {
+			unsafeSpecs = append(unsafeSpecs, spec)
+		} else {
+			safeSpecs = append(safeSpecs, spec)
+		}
+	}
+
+	if len(safeSpecs) > 0 {
+		safeDDL, err = restoreAlterWithSpecs(alter, safeSpecs)
+		if err != nil {
+			return "", "", err
+		}
+		unsafe, reason, err := UnsafeStatement(safeDDL)
+		if err != nil {
+			return "", "", fmt.Errorf("re-classify safe partition %q: %w", safeDDL, err)
+		}
+		if unsafe {
+			return "", "", fmt.Errorf("safe partition %q re-classified unsafe: %s", safeDDL, reason)
+		}
+	}
+	if len(unsafeSpecs) > 0 {
+		unsafeDDL, err = restoreAlterWithSpecs(alter, unsafeSpecs)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return safeDDL, unsafeDDL, nil
+}
+
+// restoreAlterWithSpecs restores the given ALTER TABLE statement with its
+// clause list replaced by specs, in the parser's canonical form.
+func restoreAlterWithSpecs(alter *ast.AlterTableStmt, specs []*ast.AlterTableSpec) (string, error) {
+	clone := *alter
+	clone.Specs = specs
+	var sb strings.Builder
+	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
+	if err := clone.Restore(rCtx); err != nil {
+		return "", fmt.Errorf("restore ALTER TABLE clauses: %w", err)
+	}
+	return sb.String(), nil
 }

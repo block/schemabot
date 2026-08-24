@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -69,14 +70,18 @@ func TestEnsureSchemaDefaultsToMySQLDialect(t *testing.T) {
 // partitionDestructiveChanges delegates its refusal vocabulary to Spirit's
 // UnsafeLinter, so these cases pin the accept/refuse boundary the
 // storage-schema bootstrap relies on: statements that destroy data are
-// refused whole (never rewritten), statements that lose nothing execute, and
-// a statement Spirit cannot classify fails the bootstrap rather than
-// executing unclassified.
+// refused, statements that lose nothing execute, an ALTER that mixes both is
+// split so only its destructive clauses are refused, and a statement Spirit
+// cannot classify fails the bootstrap rather than executing unclassified.
 func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 	t.Parallel()
 
-	single := func(ddl string) []engine.SchemaChange {
-		return []engine.SchemaChange{{TableChanges: []engine.TableChange{{Table: "applies", DDL: ddl}}}}
+	single := func(ddlStmt string) []engine.SchemaChange {
+		// Operation mirrors what the Spirit engine sets on planned changes; a
+		// classification error leaves it Unknown, matching a change the
+		// engine could not classify.
+		stmtType, _, _ := ddl.ClassifyStatement(ddlStmt)
+		return []engine.SchemaChange{{TableChanges: []engine.TableChange{{Table: "applies", Operation: stmtType, DDL: ddlStmt}}}}
 	}
 
 	refusedCases := []struct {
@@ -85,7 +90,6 @@ func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 	}{
 		{name: "DROP TABLE", ddl: "DROP TABLE `applies`"},
 		{name: "DROP COLUMN", ddl: "ALTER TABLE `applies` DROP COLUMN `caller`"},
-		{name: "DROP COLUMN mixed with additive clauses is refused whole", ddl: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`"},
 		{name: "DROP PRIMARY KEY", ddl: "ALTER TABLE `applies` DROP PRIMARY KEY"},
 		{name: "DROP PARTITION", ddl: "ALTER TABLE `applies` DROP PARTITION p2020"},
 		{name: "TRUNCATE PARTITION", ddl: "ALTER TABLE `applies` TRUNCATE PARTITION p2020"},
@@ -121,6 +125,19 @@ func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 			assert.Equal(t, tt.ddl, allowed[0].TableChanges[0].DDL)
 		})
 	}
+
+	t.Run("a mixed ALTER splits so only its destructive clauses are refused", func(t *testing.T) {
+		t.Parallel()
+		allowed, refused, err := partitionDestructiveChanges(single("ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`"))
+		require.NoError(t, err)
+		require.Len(t, allowed, 1)
+		require.Len(t, allowed[0].TableChanges, 1)
+		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)", allowed[0].TableChanges[0].DDL)
+		require.Len(t, refused, 1)
+		assert.Equal(t, "ALTER TABLE `applies` DROP COLUMN `lease_owner`", refused[0].change.DDL)
+		assert.Contains(t, refused[0].reason, "DROP COLUMN")
+		assert.Contains(t, refused[0].reason, "lease_owner")
+	})
 
 	t.Run("a statement Spirit cannot classify fails the bootstrap", func(t *testing.T) {
 		t.Parallel()

@@ -360,10 +360,12 @@ type refusedStorageChange struct {
 // unsafe statement when the live storage database holds a table or column the
 // starting binary's embedded schema does not declare — during a rolling
 // deploy or rollback that surplus state usually belongs to a newer binary,
-// not to a removal the operator intended. A statement is refused whole: an
-// ALTER TABLE that mixes additive clauses with a DROP COLUMN is not
-// rewritten, because executing a partial statement would diverge from the
-// plan Spirit produced.
+// not to a removal the operator intended. Spirit's diff emits one combined
+// ALTER per table, so an unsafe ALTER that also carries additive clauses is
+// split (ddl.SplitUnsafeAlter): the safe clauses the starting binary needs
+// still execute, and only the destructive clauses are refused. A split that
+// cannot be performed fails startup — classification or partitioning
+// uncertainty must never widen what the bootstrap will execute.
 func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
 	for _, sc := range changes {
 		kept := sc
@@ -373,12 +375,30 @@ func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engin
 			if err != nil {
 				return nil, nil, fmt.Errorf("classify storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
 			}
-			if unsafe {
-				// The caller logs each refusal with the exact DDL and reason.
-				refused = append(refused, refusedStorageChange{change: tc, reason: reason})
+			if !unsafe {
+				kept.TableChanges = append(kept.TableChanges, tc)
 				continue
 			}
-			kept.TableChanges = append(kept.TableChanges, tc)
+			if tc.Operation == ddl.StatementAlterTable {
+				safeDDL, unsafeDDL, err := ddl.SplitUnsafeAlter(tc.DDL)
+				if err != nil {
+					return nil, nil, fmt.Errorf("split unsafe storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
+				}
+				if safeDDL != "" {
+					// A mixed ALTER: execute the clauses that lose nothing and
+					// refuse only the destructive remainder. The caller logs the
+					// refusal with the destructive clauses' exact DDL.
+					keptChange := tc
+					keptChange.DDL = safeDDL
+					kept.TableChanges = append(kept.TableChanges, keptChange)
+					refusedChange := tc
+					refusedChange.DDL = unsafeDDL
+					refused = append(refused, refusedStorageChange{change: refusedChange, reason: reason})
+					continue
+				}
+			}
+			// The caller logs each refusal with the exact DDL and reason.
+			refused = append(refused, refusedStorageChange{change: tc, reason: reason})
 		}
 		if len(kept.TableChanges) > 0 {
 			allowed = append(allowed, kept)
