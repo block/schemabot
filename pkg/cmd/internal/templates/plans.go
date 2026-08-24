@@ -14,14 +14,22 @@ type PlanSummaryData struct {
 	PlanID      string
 	Database    string
 	Environment string
-	// Source is the plan's provenance, rendered for the operator: the PR's URL
-	// when the plan came from one, the repository alone when the plan names a
-	// repository but no PR, and "ad-hoc" for a plan created without either.
+	// Source is the plan's provenance, pre-rendered for the operator the same
+	// way the status list renders an apply's source: the short "owner/repo#pr"
+	// as an OSC 8 hyperlink on an interactive terminal (the full URL otherwise),
+	// the repository alone when the plan names no PR, and "ad-hoc" for a plan
+	// created without either. It may carry zero-width escape bytes, so it
+	// renders as the unpadded last column.
 	Source    string
 	CreatedAt time.Time
 	// Changes is the rendered change summary, such as
-	// "3 changes: 1 create, 2 alter · 1 unsafe".
+	// "1 create, 2 alter · ⚠️".
 	Changes string
+	// UnsafeCount and BlockedCount say which safety markers the change
+	// summary carries, so the table can print a legend naming exactly the
+	// markers on display and nothing when the listing is clean.
+	UnsafeCount  int
+	BlockedCount int
 }
 
 // PlansListData drives WritePlansList.
@@ -34,7 +42,10 @@ type PlansListData struct {
 	Plans []PlanSummaryData
 }
 
-// WritePlansList renders stored plans newest-first as a column table.
+// WritePlansList renders stored plans newest-first as a column table, in the
+// status list's column order: the identifier first, then the target, then what
+// the plan holds, with the linkable source last so its escape bytes never sit
+// inside a padded column.
 func WritePlansList(data PlansListData) {
 	if len(data.Plans) == 0 {
 		window := ""
@@ -47,41 +58,77 @@ func WritePlansList(data PlansListData) {
 
 	fmt.Printf("%sRecent plans%s%s\n\n", ANSIBold, ANSIReset, plansWindowSuffix(data))
 
-	maxCreated := len("CREATED")
 	maxID := len("PLAN ID")
 	maxDB := len("DATABASE")
 	maxEnv := len("ENV")
-	maxSource := len("SOURCE")
+	maxChanges := len("CHANGES")
+	maxCreated := len("CREATED")
 	for _, p := range data.Plans {
-		maxCreated = maxLen(maxCreated, len(ui.FormatTimeAgo(p.CreatedAt)))
 		maxID = maxLen(maxID, len(p.PlanID))
 		maxDB = maxLen(maxDB, len(p.Database))
 		maxEnv = maxLen(maxEnv, len(p.Environment))
-		maxSource = maxLen(maxSource, len(p.Source))
+		maxChanges = maxLen(maxChanges, ui.VisibleWidth(p.Changes))
+		maxCreated = maxLen(maxCreated, len(ui.FormatTimeAgo(p.CreatedAt)))
 	}
 
 	fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
 		ANSIDim,
-		maxCreated, "CREATED",
 		maxID, "PLAN ID",
 		maxDB, "DATABASE",
 		maxEnv, "ENV",
-		maxSource, "SOURCE",
-		"CHANGES",
+		maxChanges, "CHANGES",
+		maxCreated, "CREATED",
+		"SOURCE",
 		ANSIReset)
 	for _, p := range data.Plans {
-		fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n",
-			maxCreated, ui.FormatTimeAgo(p.CreatedAt),
+		// The change summary can carry emoji markers whose byte, rune, and
+		// terminal-cell counts all differ, so it is padded by visible width
+		// rather than %-*s's byte count.
+		paddedChanges := ui.PadVisible(p.Changes, maxChanges)
+		fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
 			maxID, p.PlanID,
 			maxDB, p.Database,
 			maxEnv, p.Environment,
-			maxSource, p.Source,
-			p.Changes)
+			paddedChanges,
+			maxCreated, ui.FormatTimeAgo(p.CreatedAt),
+			p.Source)
+	}
+	if legend := changesLegend(data.Plans); legend != "" {
+		fmt.Printf("\n  %s%s%s\n", ANSIDim, legend, ANSIReset)
 	}
 	if data.HasMore {
 		fmt.Printf("\n  %sShowing %d plans; more available — raise --limit (max %d) or narrow with filters%s\n",
 			ANSIDim, len(data.Plans), data.MaxLimit, ANSIReset)
 	}
+}
+
+// MarkerUnsafe and MarkerBlocked are the safety markers a plan's change
+// summary carries. The summary is built where the plan data is read and the
+// legend is printed here, so both sides take the glyph from these constants —
+// a legend that named a marker the table no longer prints would be worse than
+// no legend at all.
+const (
+	MarkerUnsafe  = "⚠️"
+	MarkerBlocked = "⛔"
+)
+
+// changesLegend names the safety markers appearing in the listed plans'
+// change summaries, so a marker is never a symbol the operator has to guess
+// at. A listing without markers prints no legend at all.
+func changesLegend(plans []PlanSummaryData) string {
+	var hasUnsafe, hasBlocked bool
+	for _, p := range plans {
+		hasUnsafe = hasUnsafe || p.UnsafeCount > 0
+		hasBlocked = hasBlocked || p.BlockedCount > 0
+	}
+	var parts []string
+	if hasUnsafe {
+		parts = append(parts, MarkerUnsafe+" unsafe change")
+	}
+	if hasBlocked {
+		parts = append(parts, MarkerBlocked+" blocked change")
+	}
+	return strings.Join(parts, " · ")
 }
 
 func plansWindowSuffix(data PlansListData) string {

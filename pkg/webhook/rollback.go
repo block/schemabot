@@ -55,6 +55,11 @@ func (h *Handler) handleRollbackCommand(repo string, pr int, installationID int6
 //     source-apply validation failure is terminal only when it is a typed
 //     deterministic rejection or invariant violation; transient storage
 //     failures there stay retryable.
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure resolving the authorization
+//     client): the delivery must not be re-driven, but no PR comment could
+//     be posted without a client, so the error is recorded on the delivery
+//     as its only triage trail rather than marking it completed.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -148,12 +153,18 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	// silent instead of posting a denial for an environment it does not manage.
 	// An unauthorized actor must not learn lock ownership or rollback plan
 	// contents by probing apply IDs.
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, database, environment, action.Rollback)
-	if blocked {
+	client, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, database, environment, action.Rollback)
+	if err != nil {
 		// The gate has already logged the client-creation failure and posted
-		// the authorization-unavailable comment; it fails closed for this
-		// delivery, but a fresh client may succeed on a later attempt.
-		return true, fmt.Errorf("rollback command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
+		// its best-effort authorization-unavailable comment; it fails closed
+		// for this delivery. A GitHub App resolution failure is deterministic
+		// per deployment config, so a re-drive reproduces it and the error is
+		// recorded on the delivery instead; any other cause (an installation
+		// token fetch, for example) may clear on a later attempt.
+		if errors.Is(err, errGitHubAppResolution) {
+			return false, fmt.Errorf("rollback command actor authorization client %s#%d: %w", repo, pr, err)
+		}
+		return true, fmt.Errorf("rollback command actor authorization client %s#%d: %w", repo, pr, err)
 	}
 	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.Rollback, result.SuppressRetryComments)
 	if authErr != nil {

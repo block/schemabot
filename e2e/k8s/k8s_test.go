@@ -184,9 +184,7 @@ func TestK8s_PlanApply_AddColumn(t *testing.T) {
 	// Verify lifecycle fields on the control plane's storage. external_id is
 	// the data-plane apply ID returned over gRPC, while started_at/completed_at
 	// prove the control-plane poller persisted the remote lifecycle to storage.
-	sbDB, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(sbDB)
+	sbDB := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 
 	externalID, startedAt, completedAt := waitForControlPlaneApplyLifecycle(t, sbDB, applyResp.ApplyID)
 	assert.NotEmpty(t, externalID, "external_id should be set — proves data plane returned its apply ID over gRPC")
@@ -277,10 +275,7 @@ func TestK8s_ApplyLinksTasksToApplyOperation(t *testing.T) {
 
 	// The control plane owns the apply, its apply_operations rows, and the
 	// tasks. Inspect that storage directly to prove the per-operation linkage.
-	sbDB, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(sbDB)
-	require.NoError(t, sbDB.PingContext(t.Context()))
+	sbDB := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 	store := mysqlstore.New(sbDB)
 
 	apply, err := store.Applies().GetByApplyIdentifier(t.Context(), applyResp.ApplyID)
@@ -403,10 +398,7 @@ func TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus(t *testing.T) {
 func createStoredK8sApplyWithTask(t *testing.T, dsn string, apply *storage.Apply, task *storage.Task) string {
 	t.Helper()
 
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	now := time.Now()
 	task.CreatedAt = now
@@ -437,7 +429,7 @@ func createStoredK8sApplyWithTask(t *testing.T, dsn string, apply *storage.Apply
 	}
 
 	store := mysqlstore.New(db)
-	_, err = store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{operation})
+	_, err := store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{operation})
 	require.NoError(t, err)
 	return apply.ApplyIdentifier
 }
@@ -676,10 +668,7 @@ func waitForControlPlaneStartControlRequestCompleted(t *testing.T, applyID strin
 func waitForControlPlaneControlRequestCompleted(t *testing.T, applyID string, operation storage.ControlOperation) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 
 	var (
 		status       string
@@ -866,10 +855,7 @@ func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool
 
 func storedK8sApplyAndTaskStates(t *testing.T, dsn, applyID string) (string, string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	var applyState, taskState string
 	require.NoError(t, db.QueryRowContext(t.Context(), `
@@ -883,10 +869,7 @@ func storedK8sApplyAndTaskStates(t *testing.T, dsn, applyID string) (string, str
 
 func waitForDataPlaneStopControlRequestPending(t *testing.T, dsn, applyID string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	var status string
 	var lastErr error

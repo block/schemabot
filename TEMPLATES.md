@@ -275,6 +275,98 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-existing-copy-discarded"></a><strong>MySQL Plan (Existing Copy Discarded)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying copies the tables above again from zero rows, so it runs as long as a first copy would; the work already done is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-applying"></a><strong>MySQL Plan (Existing Copy Discarded, Applying)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+**Applying automatically**
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-adopted"></a><strong>MySQL Plan (Existing Copy Adopted)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+
+ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
+```
+
+♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued
+- `orders`, `products` in `testapp` (last progress 3h 12m ago)
+
+Applying picks up where the existing copy stopped rather than starting over.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
 
 
@@ -995,6 +1087,157 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="deployment-drift-clean"></a><strong>Deployment Drift (Clean)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+✅ **Same plan on all 3 deployments** (eu, au, us).
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="deployment-drift-detected"></a><strong>Deployment Drift (Detected)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:
+
+- `eu` (primary) ✅ matches the reviewed plan
+- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the reviewed plan
+- `us` ❌ could not verify — diff failed; see server logs
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="deployment-drift-could-not-verify"></a><strong>Deployment Drift (Could Not Verify)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="drop-column-blocked"></a><strong>Drop Column Blocked</strong></summary>
 
 
@@ -1080,9 +1323,11 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 ---
 
-**⛔ 2 Unsafe Changes Detected:**
-- `orders`: Primary key column "id" has type "int"
-- `users`: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+**⛔ 3 Unsafe Changes Detected:**
+- `orders`:
+  - Primary key column `id` has type `int`
+  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
+- `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -3415,6 +3660,53 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 **Schema `testapp`**
 
 **`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically (attempt 2/10)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="middle-table-retrying-remote-dataplane-pause"></a><strong>Middle Table Retrying (Remote Data-plane Pause)</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Retrying
+
+📊 1/3 complete · 1 queued · 1 retrying
+
+**Schema `testapp`**
+
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔄 Interrupted — retrying automatically
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);

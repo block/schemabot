@@ -50,6 +50,35 @@ func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
 		"an additive alter stays out; a destructive one is attributed by its table")
 }
 
+// The unsafe gate reads only the namespace-level changes: a destructive change
+// visible only on an individual shard is outside it, so applying never
+// solicits --allow-unsafe consent for that table.
+func TestUnsafeGateTables_OmitsShardOnlyDestruction(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "orders", ChangeType: "drop"},
+				{TableName: "users", ChangeType: "alter"},
+			},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{{
+			Namespace: "keyspace",
+			Shard:     "-80",
+			Changes: []*apitypes.TableChangeResponse{
+				{TableName: "audit_log", ChangeType: "drop"},
+				{TableName: "orders", ChangeType: "drop"},
+			},
+		}},
+	}
+
+	gated := unsafeGateTables(planResp)
+
+	assert.Contains(t, gated, "orders", "a namespace-level drop passes through the opt-in gate")
+	assert.NotContains(t, gated, "audit_log", "a shard-only drop never solicits consent")
+	assert.NotContains(t, gated, "users", "an additive alter is not gated at all")
+}
+
 func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
 	planResp := &apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{{
@@ -104,6 +133,107 @@ func TestRenderPlanComment_UnresolvedDropOwnershipReadsAsUnresolved(t *testing.T
 
 	assert.Contains(t, rendered, "ownership could not be established; see server logs")
 	assert.Contains(t, rendered, "▶️ **To apply**")
+}
+
+// The attribution disclosure coaches re-planning, which is only actionable
+// before the apply starts: the plan comment carries it for review, and the
+// locked apply comment omits it — an apply already in flight has no re-plan
+// move left, and the --allow-unsafe opt-in already solicited consent for the
+// destruction.
+func TestRenderPlanComment_LockedApplyCommentOmitsAttributedChanges(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "drinks",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+		IsLocked:     true,
+		LockOwner:    "block/schemabot#7",
+		LockAcquired: "2026-08-22 00:13:52 UTC",
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "🔒 **Lock acquired by**")
+	assert.NotContains(t, rendered, "Check before applying")
+	assert.NotContains(t, rendered, "block/schemabot#42")
+
+	data.IsLocked = false
+	data.LockOwner = ""
+	data.LockAcquired = ""
+	planRendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, planRendered, "🛑 **Check before applying**")
+	assert.Contains(t, planRendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+}
+
+// A destructive change confined to individual shards never passes through the
+// --allow-unsafe opt-in gate, so consent for it was never solicited: the
+// locked auto-apply comment keeps the disclosure — it is the operator's only
+// notice of that destruction.
+func TestRenderPlanComment_LockedApplyCommentKeepsUngatedAttributedChange(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:             "drinks",
+			Repository:        "block/schemabot",
+			PullRequest:       42,
+			OutsideUnsafeGate: true,
+		}},
+		IsLocked:     true,
+		LockOwner:    "block/schemabot#7",
+		LockAcquired: "2026-08-22 00:13:52 UTC",
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "🔒 **Lock acquired by**")
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+}
+
+// A locked comment downgraded to manual confirmation pauses for apply-confirm,
+// so the operator still holds the decision the attribution informs: the
+// disclosure renders alongside the confirmation it coaches.
+func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
+		}},
+		AttributedChanges: []templates.AttributedChangeData{{
+			Table:       "drinks",
+			Repository:  "block/schemabot",
+			PullRequest: 42,
+		}},
+		IsLocked:                   true,
+		LockOwner:                  "block/schemabot#7",
+		LockAcquired:               "2026-08-22 00:13:52 UTC",
+		AutoConfirmDowngradeReason: "Could not verify plan — confirm manually",
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "⚠️ **Automatic apply paused**")
+	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
+	assert.Contains(t, rendered, "schemabot apply-confirm -e staging")
 }
 
 // The unsafe-blocked comment is where an operator is told how to override the

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -1191,7 +1190,7 @@ func (s *Service) enqueueApply(
 	options map[string]string,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
-	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	applyIdentifier := engine.NewApplyID()
 	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier)
 	if err != nil {
 		return "", 0, err
@@ -1601,7 +1600,7 @@ func buildApplyTask(
 	now time.Time,
 ) *storage.Task {
 	return &storage.Task{
-		TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+		TaskIdentifier: engine.NewTaskID(),
 		PlanID:         plan.ID,
 		Database:       plan.Database,
 		DatabaseType:   plan.DatabaseType,

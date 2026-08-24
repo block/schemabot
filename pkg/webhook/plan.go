@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -134,10 +137,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
+	commentData.DeploymentDrift = driftPreview
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 
 	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
@@ -195,8 +199,12 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 			"repo", repo, "pr", pr, "database", databaseName)
 		return false
 	}
-	authzClient, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, databaseName, environment, action.Plan)
-	if blocked {
+	authzClient, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, databaseName, environment, action.Plan)
+	if err != nil {
+		// The plan handler is not a durable core, so there is no driver to
+		// classify the cause; the gate has already logged the failure and
+		// posted the authorization-unavailable comment, and the plan is
+		// blocked (fail closed).
 		return true
 	}
 	if authzClient == nil {
@@ -412,7 +420,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -436,6 +444,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint())
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
+		commentData.DeploymentDrift = driftPreview
 		multiEnvData.Plans[env] = &commentData
 	}
 
@@ -480,8 +489,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"environments", len(driftBlockUnstored))
 	}
 
-	// Auto-plan: skip comment if no changes and no errors (reduce PR noise)
-	// Check runs are still created above so PR status shows green
+	// Auto-plan: skip the comment only when there is genuinely nothing to show —
+	// no changes, no errors, and no deployment drift. A drifted or unverifiable
+	// deployment fails the check closed even when every primary plan is a clean
+	// no-op, so the comment must still post to explain why the check is red;
+	// skipping it would leave a red check with no visible reason on the PR.
 	if isAutoPlan {
 		hasErrors := len(multiEnvData.Errors) > 0
 		anyChanges := false
@@ -491,11 +503,11 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				break
 			}
 		}
-		if !anyChanges && !hasErrors {
+		if !anyChanges && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) {
 			// The no-changes outcome supersedes older plan comments just as a
 			// new plan comment would: a prior head's comment still advertises
 			// pending DDL and an apply prompt that no longer match the branch.
-			h.logger.Info("auto-plan: no changes detected; skipping comment and minimizing plan comments from prior heads",
+			h.logger.Info("auto-plan: no changes, errors, or drift detected; skipping comment and minimizing plan comments from prior heads",
 				"repo", repo, "pr", pr, "database", multiEnvData.Database,
 				"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
 			h.minimizeStalePlanComments(ctx, client, repo, pr,
@@ -747,6 +759,44 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 	return out
 }
 
+// splitExistingCopies sorts the target's unfinished copies by what the apply
+// will do to them. The two sections are opposite promises to the operator —
+// one says the work survives, the other says it is destroyed — so a
+// disposition this build does not recognize is shown as a discard: warning
+// about work that in fact survives costs a second look, while promising
+// survival to work that is destroyed costs the copy.
+func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, adopted []templates.ExistingCopyData) {
+	for _, c := range copies {
+		if c == nil {
+			continue
+		}
+		entry := templates.ExistingCopyData{
+			Namespace: c.Namespace,
+			Tables:    c.Tables,
+			Reason:    c.Reason,
+			Statement: c.Statement,
+		}
+		if c.AgeSeconds > 0 {
+			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
+		}
+		switch engine.CopyDisposition(c.Disposition) {
+		case engine.CopyAdopt:
+			adopted = append(adopted, entry)
+		case engine.CopyDiscard:
+			discarded = append(discarded, entry)
+		default:
+			// Reaching here means a deployment reported a disposition this build
+			// has no name for, so the comment warns about work that may in fact
+			// survive. Without this line the ⚠️ section is indistinguishable from
+			// a real discard and there is nothing to reconcile it against.
+			slog.Warn("comment discloses an unfinished copy as discarded because the deployment reported a disposition this build does not recognize",
+				"namespace", c.Namespace, "tables", c.Tables, "disposition", c.Disposition)
+			discarded = append(discarded, entry)
+		}
+	}
+	return discarded, adopted
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -894,6 +944,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 		}
 	}
+
+	data.DiscardedCopies, data.AdoptedCopies = splitExistingCopies(planResp.ExistingCopies)
 
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {

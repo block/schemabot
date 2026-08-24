@@ -158,8 +158,9 @@ func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
 // RecordPlanChangeOwnership counts one planned destructive change's ownership
 // verdict. Outcomes: "unowned" (no other pull request is attributed the table,
 // so the change renders normally), "owned" (an open pull request is attributed
-// it, so the change is annotated), "storage_error" and "pr_state_error" (the
-// lookup could not decide, so the change is annotated as unresolved —
+// it, so the disclosure carries the attribution on every comment whose reader
+// still holds the apply decision), "storage_error" and "pr_state_error" (the
+// lookup could not decide, so the change is attributed as unresolved —
 // investigate storage or GitHub API health respectively).
 // Sustained error outcomes mean operators are seeing destructive changes they
 // cannot get an attribution for; a rising "owned" count means pull requests are
@@ -1105,6 +1106,7 @@ func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deploy
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
 	"stranded_reaper_error":                    true,
+	"stranded_task_reaper_error":               true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
 	"missing_operation_lease_token":            true,

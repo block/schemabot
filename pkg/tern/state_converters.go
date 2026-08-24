@@ -112,7 +112,7 @@ func storageStateToProto(ts string) ternv1.State {
 	case state.Task.Failed:
 		return ternv1.State_STATE_FAILED
 	case state.Task.FailedRetryable, state.Apply.FailedRetryable:
-		return ternv1.State_STATE_FAILED
+		return ternv1.State_STATE_FAILED_RETRYABLE
 	case state.Task.Stopped:
 		return ternv1.State_STATE_STOPPED
 	case state.Task.Cancelled:
@@ -235,6 +235,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Completed
 	case ternv1.State_STATE_FAILED:
 		return state.Apply.Failed
+	case ternv1.State_STATE_FAILED_RETRYABLE:
+		return state.Apply.FailedRetryable
 	case ternv1.State_STATE_STOPPED:
 		return state.Apply.Stopped
 	case ternv1.State_STATE_CANCELLED:

@@ -90,20 +90,37 @@ func IsInFlightTaskState(s string) bool {
 //
 // Inputs arrive as exact engine strings: Spirit camelCase ("copyRows"),
 // Vitess lowercase ("running"), or storage snake_case ("waiting_for_cutover").
+//
+// Unknown statuses normalize to Running so unrecognized in-flight work stays
+// visible and blocking; callers that need positive evidence of a state (rather
+// than that fail-open default) must check RecognizedTaskStatus first.
 func NormalizeTaskStatus(raw string) string {
+	normalized, _ := normalizeTaskStatus(raw)
+	return normalized
+}
+
+// RecognizedTaskStatus reports whether the raw engine status maps to a known
+// task state, as opposed to falling back to NormalizeTaskStatus's in-flight
+// default for unknown values.
+func RecognizedTaskStatus(raw string) bool {
+	_, recognized := normalizeTaskStatus(raw)
+	return recognized
+}
+
+func normalizeTaskStatus(raw string) (string, bool) {
 	s := strings.TrimPrefix(strings.TrimPrefix(raw, "STATE_"), "state_")
 
 	switch s {
 	// Completed — Vitess "complete", Spirit "close"
 	case string(vitessstatus.OnlineDDLStatusComplete),
 		spiritstatus.Close.String():
-		return Task.Completed
+		return Task.Completed, true
 
 	// Checksumming — Spirit verifies the copied data against the source before
 	// cutover. On a large table this phase can run for hours, so it is surfaced
 	// as its own table state rather than folded into Running.
 	case spiritstatus.Checksum.String():
-		return Task.Checksumming
+		return Task.Checksumming, true
 
 	// Catching up — the row copy is done and Spirit is applying the changeset
 	// accumulated from the binlog during the copy. This catch-up can run for
@@ -111,7 +128,7 @@ func NormalizeTaskStatus(raw string) string {
 	// own table state rather than folded into Running, where a stalled
 	// catch-up would render as a serene complete copy.
 	case spiritstatus.ApplyChangeset.String():
-		return Task.CatchingUp
+		return Task.CatchingUp, true
 
 	// Post-checksum — the verify passed and Spirit is applying the changes
 	// that accumulated while it ran. Same catch-up mechanics as CatchingUp,
@@ -119,7 +136,7 @@ func NormalizeTaskStatus(raw string) string {
 	// pin the stored (monotonic) task state at Checksumming for the whole
 	// second drain, rendering an indeterminate verify that already finished.
 	case spiritstatus.PostChecksum.String():
-		return Task.PostChecksum
+		return Task.PostChecksum, true
 
 	// Running — Spirit sub-states (camelCase from Spirit's State.String())
 	case spiritstatus.CopyRows.String(),
@@ -127,54 +144,54 @@ func NormalizeTaskStatus(raw string) string {
 		spiritstatus.RestoreSecondaryIndexes.String(),
 		spiritstatus.AnalyzeTable.String(),
 		spiritstatus.ErrCleanup.String():
-		return Task.Running
+		return Task.Running, true
 
 	// Running — Vitess
 	case string(vitessstatus.OnlineDDLStatusRunning):
-		return Task.Running
+		return Task.Running, true
 
 	// Waiting for cutover
 	case spiritstatus.WaitingOnSentinelTable.String(), "ready_to_complete":
-		return Task.WaitingForCutover
+		return Task.WaitingForCutover, true
 
 	// Cutting over
 	case spiritstatus.CutOver.String():
-		return Task.CuttingOver
+		return Task.CuttingOver, true
 
 	// Pending — Vitess queue states
 	case string(vitessstatus.OnlineDDLStatusQueued),
 		string(vitessstatus.OnlineDDLStatusReady),
 		string(vitessstatus.OnlineDDLStatusRequested):
-		return Task.Pending
+		return Task.Pending, true
 
 	// Failed
 	case string(vitessstatus.OnlineDDLStatusFailed):
-		return Task.Failed
+		return Task.Failed, true
 
 	// Cancelled
 	case string(vitessstatus.OnlineDDLStatusCancelled):
-		return Task.Cancelled
+		return Task.Cancelled, true
 
 	// Pass-through for already-normalized values
 	case Task.Pending, Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverting, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:
-		return s
+		return s, true
 	}
 
 	switch normalized := NormalizeState(s); normalized {
 	case NormalizeState(string(vitessstatus.OnlineDDLStatusComplete)):
-		return Task.Completed
+		return Task.Completed, true
 	case Task.Pending, Task.Running, Task.CatchingUp, Task.Checksumming, Task.PostChecksum, Task.Completed, Task.Stopped, Task.Failed,
 		Task.FailedRetryable, Task.RevertWindow, Task.Reverting, Task.Reverted,
 		Task.WaitingForDeploy, Task.WaitingForCutover, Task.Recovering,
 		Task.CuttingOver, Task.Cancelled:
-		return normalized
+		return normalized, true
 	default:
 		// Unknown engine states represent in-flight work until proven otherwise.
 		// Keep them visible and blocking, and add an explicit mapping once known.
-		return Task.Running
+		return Task.Running, false
 	}
 }
 
