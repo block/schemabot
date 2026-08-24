@@ -11,12 +11,12 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// insertPlanComment stores a plan comment for the given slot in the org/repo
-// repository and returns it with its stored ID.
-func insertPlanComment(t *testing.T, store storage.Storage, pr int, database, databaseType, envScope, headSHA string, commentID int64) *storage.PlanComment {
+// InsertPlanComment stores a plan comment for the given repository slot and
+// returns it with its stored ID.
+func InsertPlanComment(t *testing.T, store storage.Storage, repo string, pr int, database, databaseType, envScope, headSHA string, commentID int64) *storage.PlanComment {
 	t.Helper()
 	comment := &storage.PlanComment{
-		Repository:       "org/repo",
+		Repository:       repo,
 		PullRequest:      pr,
 		DatabaseName:     database,
 		DatabaseType:     databaseType,
@@ -46,10 +46,10 @@ func TestPlanComments(t *testing.T, h Harness) {
 		// Two comments in the orders slot, one in a different-database slot on
 		// the same PR, and one for the same database on a different PR: the
 		// slot listing must return only its own slot, id ascending.
-		first := insertPlanComment(t, store, 42, "orders", "mysql", "production,staging", "sha1", 100)
-		second := insertPlanComment(t, store, 42, "orders", "mysql", "production,staging", "sha2", 200)
-		insertPlanComment(t, store, 42, "billing", "mysql", "production,staging", "sha1", 300)
-		insertPlanComment(t, store, 7, "orders", "mysql", "production,staging", "sha1", 400)
+		first := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "production,staging", "sha1", 100)
+		second := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "production,staging", "sha2", 200)
+		InsertPlanComment(t, store, "org/repo", 42, "billing", "mysql", "production,staging", "sha1", 300)
+		InsertPlanComment(t, store, "org/repo", 7, "orders", "mysql", "production,staging", "sha1", 400)
 
 		comments, err := store.PlanComments().ListUnminimizedForSlot(ctx, "org/repo", 42, "orders", "mysql")
 		require.NoError(t, err)
@@ -81,10 +81,10 @@ func TestPlanComments(t *testing.T, h Harness) {
 
 		// The repo-PR listing spans every database slot on the PR but never
 		// leaks other PRs, and minimized comments drop out of it.
-		orders := insertPlanComment(t, store, 42, "orders", "mysql", "staging", "sha1", 100)
-		billing := insertPlanComment(t, store, 42, "billing", "vitess", "staging", "sha1", 200)
-		minimized := insertPlanComment(t, store, 42, "orders", "mysql", "staging", "sha2", 300)
-		insertPlanComment(t, store, 7, "orders", "mysql", "staging", "sha1", 400)
+		orders := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+		billing := InsertPlanComment(t, store, "org/repo", 42, "billing", "vitess", "staging", "sha1", 200)
+		minimized := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha2", 300)
+		InsertPlanComment(t, store, "org/repo", 7, "orders", "mysql", "staging", "sha1", 400)
 
 		require.NoError(t, store.PlanComments().MarkMinimized(ctx, minimized.ID))
 
@@ -103,8 +103,8 @@ func TestPlanComments(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		first := insertPlanComment(t, store, 42, "orders", "mysql", "staging", "sha1", 100)
-		second := insertPlanComment(t, store, 42, "orders", "mysql", "staging", "sha2", 200)
+		first := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+		second := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha2", 200)
 
 		require.NoError(t, store.PlanComments().MarkMinimized(ctx, first.ID))
 
@@ -161,11 +161,17 @@ func TestPlanComments(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.False(t, exists, "a different head is not owned while the plan row proves the apply's head")
 
-		// Other PRs and other databases are isolated.
+		// Other repositories, PRs, databases, and database types are isolated.
+		exists, err = store.Applies().ExistsForDatabaseHead(ctx, "org/other", 123, "testdb", "mysql", "shaA")
+		require.NoError(t, err)
+		assert.False(t, exists)
 		exists, err = store.Applies().ExistsForDatabaseHead(ctx, "org/repo", 999, "testdb", "mysql", "shaA")
 		require.NoError(t, err)
 		assert.False(t, exists)
 		exists, err = store.Applies().ExistsForDatabaseHead(ctx, "org/repo", 123, "otherdb", "mysql", "shaA")
+		require.NoError(t, err)
+		assert.False(t, exists)
+		exists, err = store.Applies().ExistsForDatabaseHead(ctx, "org/repo", 123, "testdb", "vitess", "shaA")
 		require.NoError(t, err)
 		assert.False(t, exists)
 

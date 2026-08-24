@@ -51,6 +51,40 @@ func TestPostgresStorageParity(t *testing.T) {
 	storagetest.Run(t, h)
 	t.Run("SettingsUpdatedAtAdvances", func(t *testing.T) { testPostgresSettingsUpdatedAtAdvances(t, h) })
 	t.Run("LeaseGuardedApplyLogAppend", func(t *testing.T) { testPostgresLeaseGuardedApplyLogAppend(t, h) })
+	t.Run("MarkMinimizedPreservesStamp", func(t *testing.T) { testPostgresMarkMinimizedPreservesStamp(t, h) })
+}
+
+// testPostgresMarkMinimizedPreservesStamp reads the raw minimized_at column to
+// prove a repeat mark does not move the original stamp. The row is backdated
+// between marks so the assertion cannot pass on write-clock proximity alone.
+func testPostgresMarkMinimizedPreservesStamp(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	comment := storagetest.InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, comment.ID))
+
+	var minimizedAt *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&minimizedAt))
+	require.NotNil(t, minimizedAt, "the row is stamped, not deleted")
+
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE plan_comments SET minimized_at = now() - interval '1 hour' WHERE id = $1`, comment.ID)
+	require.NoError(t, err)
+	var backdated *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&backdated))
+	require.NotNil(t, backdated)
+
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, comment.ID))
+
+	var afterRepeat *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&afterRepeat))
+	require.NotNil(t, afterRepeat)
+	assert.Equal(t, *backdated, *afterRepeat, "a repeat mark must not move the stamp")
 }
 
 // testPostgresSettingsUpdatedAtAdvances proves that a second Set renews

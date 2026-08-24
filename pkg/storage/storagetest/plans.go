@@ -65,7 +65,8 @@ func TestPlans(t *testing.T, h Harness) {
 			require.Contains(t, got.SchemaFiles, "commerce")
 			assert.Equal(t, "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)",
 				got.SchemaFiles["commerce"].Files["users.sql"])
-			assert.False(t, got.CreatedAt.IsZero())
+			assert.WithinDuration(t, created, got.CreatedAt, time.Second,
+				"the caller-provided creation time must round-trip, not be replaced by a store-side clock")
 		}
 
 		byIdentifier, err := store.Plans().Get(ctx, "plan_round_trip")
@@ -145,6 +146,36 @@ func TestPlans(t *testing.T, h Harness) {
 		assert.Equal(t, []storage.TableChange{change}, got.Namespaces["commerce"].Tables)
 	})
 
+	t.Run("LoadsPlansWithoutShardPlans", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A plan with namespace data but no shard plans reloads with the
+		// shard lists absent rather than fabricated.
+		_, err := store.Plans().Create(ctx, &storage.Plan{
+			PlanIdentifier: "plan_no_shards",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {
+					Tables: []storage.TableChange{{Namespace: "commerce", Table: "users", Operation: "alter"}},
+				},
+			},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		})
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_no_shards")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Empty(t, got.Shards)
+		require.Contains(t, got.Namespaces, "commerce")
+		assert.Empty(t, got.Namespaces["commerce"].Shards)
+	})
+
 	t.Run("RoundTripsVSchemaMetadata", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -209,8 +240,8 @@ func TestPlans(t *testing.T, h Harness) {
 		got, err := store.Plans().Get(ctx, "plan_no_data")
 		require.NoError(t, err)
 		require.NotNil(t, got)
-		assert.Empty(t, got.Namespaces)
-		assert.Empty(t, got.Shards)
+		assert.Nil(t, got.Namespaces)
+		assert.Nil(t, got.Shards)
 	})
 
 	t.Run("GetByPR_NewestFirstWithIDTiebreak", func(t *testing.T) {
@@ -263,10 +294,15 @@ func TestPlans(t *testing.T, h Harness) {
 		create("plan_orders_adhoc", "orders", "production", "", 0, base.Add(time.Second))
 		create("plan_billing_pr", "billing", "staging", "org/repo", 7, base.Add(2*time.Second))
 		create("plan_orders_same_second", "orders", "staging", "", 0, base.Add(2*time.Second))
+		// Near-miss plans for the PR filter: the same PR number in another
+		// repository, and another PR in the same repository. Only the
+		// unfiltered listing may include them.
+		create("plan_other_repo_same_pr", "billing", "production", "org/other", 7, base)
+		create("plan_same_repo_other_pr", "billing", "production", "org/repo", 8, base)
 
 		all, err := store.Plans().List(ctx, storage.ListPlansOptions{Limit: 10})
 		require.NoError(t, err)
-		assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr", "plan_orders_adhoc", "plan_orders_pr_old"}, planIdentifiers(all),
+		assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr", "plan_orders_adhoc", "plan_same_repo_other_pr", "plan_other_repo_same_pr", "plan_orders_pr_old"}, planIdentifiers(all),
 			"same-second plans must order by id descending")
 		for _, plan := range all {
 			assert.Nil(t, plan.SchemaFiles, "List must not hydrate SchemaFiles for %s", plan.PlanIdentifier)
@@ -291,6 +327,10 @@ func TestPlans(t *testing.T, h Harness) {
 		limited, err := store.Plans().List(ctx, storage.ListPlansOptions{Limit: 2})
 		require.NoError(t, err)
 		assert.Equal(t, []string{"plan_orders_same_second", "plan_billing_pr"}, planIdentifiers(limited))
+
+		unmatched, err := store.Plans().List(ctx, storage.ListPlansOptions{Database: "payments", Limit: 10})
+		require.NoError(t, err)
+		assert.Empty(t, unmatched, "a filter matching nothing lists as empty, not an error")
 	})
 
 	t.Run("List_RejectsNonPositiveLimit", func(t *testing.T) {
@@ -337,12 +377,15 @@ func TestPlans(t *testing.T, h Harness) {
 		createPlanAt(t, store, "plan_pr42_a", "orders", "org/repo", 42, base)
 		createPlanAt(t, store, "plan_pr42_b", "billing", "org/repo", 42, base)
 		createPlanAt(t, store, "plan_pr7", "orders", "org/repo", 7, base)
+		createPlanAt(t, store, "plan_other_repo_pr42", "orders", "org/other", 42, base)
 
 		require.NoError(t, store.Plans().DeleteByPR(ctx, "org/repo", 42))
 
+		// Only the named repository's PR is deleted; the same PR number in
+		// another repository and other PRs in the same repository survive.
 		remaining, err := store.Plans().List(ctx, storage.ListPlansOptions{Limit: 10})
 		require.NoError(t, err)
-		assert.Equal(t, []string{"plan_pr7"}, planIdentifiers(remaining))
+		assert.Equal(t, []string{"plan_other_repo_pr42", "plan_pr7"}, planIdentifiers(remaining))
 
 		// Deleting a PR with no plans is a no-op, not an error.
 		require.NoError(t, store.Plans().DeleteByPR(ctx, "org/repo", 999))
@@ -358,6 +401,8 @@ func TestPlans(t *testing.T, h Harness) {
 			CreatedAt:      time.Now().UTC().Truncate(time.Second),
 		})
 		require.Error(t, err)
+		require.NotErrorIs(t, err, storage.ErrPlanIDExists,
+			"an unreachable database must surface as a driver error, not a duplicate-identifier verdict")
 	})
 
 	t.Run("Get_DBError", func(t *testing.T) {
@@ -386,7 +431,10 @@ func TestPlans(t *testing.T, h Harness) {
 
 	t.Run("Delete_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
-		require.Error(t, store.Plans().Delete(t.Context(), 1))
+		err := store.Plans().Delete(t.Context(), 1)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, storage.ErrPlanNotFound,
+			"an unreachable database must surface as a driver error, not a missing-plan verdict")
 	})
 
 	t.Run("DeleteByPR_DBError", func(t *testing.T) {
