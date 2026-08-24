@@ -9,7 +9,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/ui"
 )
 
 // PlansCmd lists recently generated plans, or shows one stored plan's content.
@@ -131,8 +130,7 @@ func showStoredPlan(endpoint, planID string, outputJSON bool) error {
 // when the plan names no PR, and "ad-hoc" for a plan created without either.
 func planSource(p *apitypes.PlanSummaryResponse) string {
 	if p.Repository != "" && p.PullRequest > 0 {
-		url := fmt.Sprintf("https://github.com/%s/pull/%d", p.Repository, p.PullRequest)
-		return ui.Link(fmt.Sprintf("%s#%d", p.Repository, p.PullRequest), url)
+		return templates.PullRequestLink(p.Repository, p.PullRequest)
 	}
 	if p.Repository != "" {
 		return p.Repository
@@ -166,10 +164,10 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))
 	}
 	if p.UnsafeCount > 0 {
-		parts = append(parts, markerWithCount("⚠️", p.UnsafeCount))
+		parts = append(parts, markerWithCount(templates.MarkerUnsafe, p.UnsafeCount))
 	}
 	if p.BlockedCount > 0 {
-		parts = append(parts, markerWithCount("⛔", p.BlockedCount))
+		parts = append(parts, markerWithCount(templates.MarkerBlocked, p.BlockedCount))
 	}
 	return strings.Join(parts, " · ")
 }
