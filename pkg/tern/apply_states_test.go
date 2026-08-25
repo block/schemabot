@@ -222,6 +222,31 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.Checksumming,
 		},
 		{
+			name: "queued work holds the apply in running over a sibling's checksum",
+			tasks: []*storage.Task{
+				{State: state.Task.Checksumming},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "queued work holds the apply in running over a sibling's drain",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CatchingUp},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "queued work holds the apply in running over a sibling's post-checksum",
+			tasks: []*storage.Task{
+				{State: state.Task.PostChecksum},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
 			name: "a copying table dominates a sibling's post-copy phase",
 			tasks: []*storage.Task{
 				{State: state.Task.PostChecksum},
