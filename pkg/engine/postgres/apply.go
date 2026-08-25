@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	optimisticTableSizeLimit = int64(1 << 30)
 	optimisticLockTimeout    = 3 * time.Second
 	optimisticStatementLimit = 30 * time.Second
 
@@ -122,7 +121,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
-	err := executeOptimistic(ctx, conn, change)
+	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit)
 	if err == nil {
 		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
 		return
@@ -204,7 +203,7 @@ func classifyRefusal(err error, table string) *refusal {
 	return nil
 }
 
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply) error {
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -226,7 +225,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply)
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, optimisticTableSizeLimit)
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
 	}

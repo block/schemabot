@@ -3764,6 +3764,16 @@ func TestNewLocalClientUsesPostgresEngine(t *testing.T) {
 	assert.Equal(t, ternv1.Engine_ENGINE_POSTGRES, c.protoEngine())
 }
 
+func TestNewLocalClientConfiguresPostgresTableSizeLimit(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{
+		Database:                         "orders",
+		Type:                             storage.DatabaseTypePostgres,
+		PostgresNativeSafeTableSizeLimit: 4 << 30,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	assert.Equal(t, storage.EnginePostgres, c.getEngine().Name())
+}
+
 // A type with no built-in engine and no registered factory fails closed.
 func TestNewLocalClientErrorsWhenEngineUnregistered(t *testing.T) {
 	_, err := NewLocalClient(LocalConfig{Database: "db", Type: "customengine"}, nil, slog.Default())

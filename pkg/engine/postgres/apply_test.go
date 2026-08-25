@@ -76,6 +76,17 @@ func TestClassifyRefusal(t *testing.T) {
 	}
 }
 
+func TestConfiguredTableSizeLimitIsReportedInRefusal(t *testing.T) {
+	const limit = int64(4 << 30)
+	eng := NewWithTableSizeLimit(limit)
+	assert.Equal(t, limit, eng.tableSizeLimit)
+
+	r := classifyRefusal(&preflight.SizeError{TotalBytes: limit + 1, LimitBytes: eng.tableSizeLimit}, "users")
+	require.NotNil(t, r)
+	assert.Equal(t, "table-too-large", r.reason)
+	assert.Contains(t, r.detail, "4294967296-byte threshold")
+}
+
 // TestProgressIsKeyedToTheRequestingApply proves the engine answers Progress
 // for the apply the caller identifies, not for whichever apply wrote last:
 // one engine is shared for a target's lifetime, so a mismatched identity must

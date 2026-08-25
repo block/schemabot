@@ -31,13 +31,27 @@ type Engine struct {
 	// progressKey (the apply's ResumeState.MigrationContext). One engine is
 	// shared for the lifetime of a target, so Progress must answer for the
 	// apply the caller identifies — never for whichever apply wrote last.
-	progress    *engine.ProgressResult
-	progressKey string
+	progress       *engine.ProgressResult
+	progressKey    string
+	tableSizeLimit int64
 }
+
+// DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
+// ceiling when the server does not configure one.
+const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
-	return &Engine{}
+	return NewWithTableSizeLimit(DefaultNativeSafeTableSizeLimitBytes)
+}
+
+// NewWithTableSizeLimit creates a PostgreSQL engine with the native-safe
+// table size ceiling expressed in bytes.
+func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
+	if tableSizeLimit <= 0 {
+		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
+	}
+	return &Engine{tableSizeLimit: tableSizeLimit}
 }
 
 // Name returns the engine identifier.
