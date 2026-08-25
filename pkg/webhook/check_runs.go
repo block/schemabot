@@ -75,6 +75,15 @@ var applyCancelledBlock = checkBlockReason{
 	message:        "The apply was cancelled before completion; re-plan and re-apply if the schema change is still wanted, or remove it and re-run `schemabot plan` to converge this check.",
 }
 
+// applyCancelledAfterTaskCompletedBlock is used when part of a forward apply
+// completed before the remaining work was cancelled. The completed task is
+// durable evidence that the target may have changed, so planning alone cannot
+// release the apply-owned merge gate.
+var applyCancelledAfterTaskCompletedBlock = checkBlockReason{
+	blockingReason: "apply_cancelled_after_task_completed",
+	message:        "Part of the apply completed before cancellation; reconcile the PR and live schema before this check can pass.",
+}
+
 // githubConfigDiscoveryUnavailableBlock is used when GitHub is unavailable
 // while SchemaBot is discovering which managed schema changes exist. The
 // aggregate check must fail closed until SchemaBot can read PR metadata and

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -397,15 +398,22 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 // success, while a safely cancelled forward apply must release retained
 // ownership. Rows owned by an older apply or with no owner qualify; the
 // newer-apply guard protects work that started after this terminal outcome.
+// Cancelled forward applies additionally require that no completed forward
+// task exists under this or an earlier apply for the target.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
 	leasePredicate := ""
+	completedTaskPredicate := ""
 	args := []any{check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		apply.ID, apply.ID}
+	if state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback() {
+		completedTaskPredicate = s.completedForwardTaskPredicate(false)
+		args = append(args, apply.ID, state.Task.Completed)
+	}
 	lease := apply.Lease()
 	if lease.Valid() {
 		leasePredicate = `
@@ -441,7 +449,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		      AND newer.database_type = checks.database_type
 		      AND newer.database_name = checks.database_name
 		      AND newer.id > ?
-		  )`+leasePredicate+`
+		  )`+completedTaskPredicate+leasePredicate+`
 	`, args...)
 	if err != nil {
 		return false, err
@@ -457,6 +465,95 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		}
 	}
 	return rows > 0, nil
+}
+
+// MarkCancelledApplyFailed records the terminal blocked state for a cancelled
+// forward apply when completed task history proves that the target may have
+// changed. Exact ownership and the completed-task predicate keep this write
+// from overwriting a newer apply or retaining a cancellation that is safe to
+// release.
+func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+	leasePredicate := ""
+	args := []any{check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		apply.ID, apply.ID, apply.ID, state.Task.Completed}
+	lease := apply.Lease()
+	if lease.Valid() {
+		leasePredicate = `
+		  AND EXISTS (
+		    SELECT 1
+		    FROM applies lease_apply
+		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
+		  )`
+		args = append(args, lease.ApplyID, lease.Token)
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = ?,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?,
+		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND apply_id = ?
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM applies newer
+		    WHERE newer.repository = checks.repository
+		      AND newer.pull_request = checks.pull_request
+		      AND newer.environment = checks.environment
+		      AND newer.database_type = checks.database_type
+		      AND newer.database_name = checks.database_name
+		      AND newer.id > ?
+		  )`+s.completedForwardTaskPredicate(true)+leasePredicate+`
+	`, args...)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 && lease.Valid() {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return false, err
+		}
+	}
+	return rows > 0, nil
+}
+
+func (s *checkStore) completedForwardTaskPredicate(required bool) string {
+	exists := "NOT EXISTS"
+	if required {
+		exists = "EXISTS"
+	}
+	rollbackApply := s.dialect.JSONBooleanIsTrue("task_apply.options", []string{"rollback"})
+	return `
+		  AND ` + exists + ` (
+		    SELECT 1
+		    FROM tasks completed_task
+		    JOIN applies task_apply ON task_apply.id = completed_task.apply_id
+		    WHERE task_apply.repository = checks.repository
+		      AND task_apply.pull_request = checks.pull_request
+		      AND task_apply.environment = checks.environment
+		      AND task_apply.database_type = checks.database_type
+		      AND task_apply.database_name = checks.database_name
+		      AND task_apply.id <= ?
+		      AND completed_task.state = ?
+		      AND NOT ` + rollbackApply + `
+		  )`
 }
 
 // Get returns a check by its unique key (PR + env + database), or nil if not found.

@@ -44,6 +44,29 @@ func createCancelledCheckApply(t *testing.T, svc *api.Service, database string, 
 	return apply
 }
 
+func createCancelledCheckTask(t *testing.T, svc *api.Service, apply *storage.Apply, identifier, taskState string) {
+	t.Helper()
+	now := time.Now()
+	_, err := svc.Storage().Tasks().Create(t.Context(), &storage.Task{
+		TaskIdentifier: identifier,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Repository:     apply.Repository,
+		PullRequest:    apply.PullRequest,
+		Environment:    apply.Environment,
+		State:          taskState,
+		TableName:      "users",
+		DDL:            "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+		DDLAction:      "ALTER",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+}
+
 func storeCancelledOwnedCheck(t *testing.T, svc *api.Service, apply *storage.Apply, status, conclusion string) {
 	t.Helper()
 	require.NoError(t, svc.Storage().Checks().Upsert(t.Context(), &storage.Check{
@@ -90,6 +113,32 @@ func TestUpdateCheckRecordForApplyResult_CancelledForwardApplyReleasesOwnership(
 	assert.True(t, check.HasChanges)
 	assert.Equal(t, applyCancelledBlock.blockingReason, check.BlockingReason)
 	assert.Equal(t, applyCancelledBlock.message, check.ErrorMessage)
+}
+
+// When one task completed before its sibling was cancelled, the cancelled
+// apply may have changed the target. Terminal handling must retain ownership
+// and leave an actionable failure that does not reconcile repeatedly.
+func TestUpdateCheckRecordForApplyResult_CancelledForwardApplyWithCompletedTaskRetainsOwnership(t *testing.T) {
+	database := "webhook_cancelled_partial_completion"
+	svc := setupE2EService(t, database)
+	apply := createCancelledCheckApply(t, svc, database, false)
+	createCancelledCheckTask(t, svc, apply, "task-cancelled-completed", state.Task.Completed)
+	createCancelledCheckTask(t, svc, apply, "task-cancelled-sibling", state.Task.Cancelled)
+	storeCancelledOwnedCheck(t, svc, apply, checkStatusInProgress, "")
+	h := NewHandler(svc, nil, nil, testLogger())
+
+	updated, err := h.updateCheckRecordForApplyResult(t.Context(), cancelledCheckRepo, cancelledCheckPR, apply)
+	require.NoError(t, err)
+	assert.True(t, updated)
+
+	check := loadCancelledCheck(t, svc, database)
+	assert.Equal(t, apply.ID, check.ApplyID)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionFailure, check.Conclusion)
+	assert.True(t, check.HasChanges)
+	assert.Equal(t, applyCancelledAfterTaskCompletedBlock.blockingReason, check.BlockingReason)
+	assert.Equal(t, applyCancelledAfterTaskCompletedBlock.message, check.ErrorMessage)
+	assert.False(t, checkNeedsTerminalReconcile(check, apply))
 }
 
 // A cancelled apply's terminal state can be authoritative while its stored
@@ -148,23 +197,27 @@ func TestUpdateCheckRecordForApplyResult_CancelledRollbackRetainsOwnership(t *te
 	assert.True(t, check.HasChanges)
 }
 
-// An earlier completed forward apply means the target environment may contain
-// a schema change even though the newest apply was cancelled. Ownership must
-// remain intact, and a plan with no managed files must keep the gate blocked.
-func TestE2EPlanCancelledApplyWithEarlierCompletionStaysBlocked(t *testing.T) {
+// A completed task under an earlier failed forward apply proves that part of
+// the schema change reached the target. A later clean cancellation must retain
+// ownership, and a plan with no managed files must keep the gate blocked.
+func TestE2EPlanCancelledApplyWithEarlierFailedApplyCompletedTaskStaysBlocked(t *testing.T) {
 	database := "webhook_cancelled_prior_complete"
 	svc := setupE2EService(t, database)
 	priorID, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
-		ApplyIdentifier: "apply-prior-completed",
+		ApplyIdentifier: "apply-prior-failed",
 		Database:        database,
 		DatabaseType:    storage.DatabaseTypeMySQL,
 		Environment:     cancelledCheckEnv,
 		Repository:      cancelledCheckRepo,
 		PullRequest:     cancelledCheckPR,
-		State:           state.Apply.Completed,
+		State:           state.Apply.Failed,
 		Engine:          storage.EngineSpirit,
 	})
 	require.NoError(t, err)
+	priorApply, err := svc.Storage().Applies().Get(t.Context(), priorID)
+	require.NoError(t, err)
+	require.NotNil(t, priorApply)
+	createCancelledCheckTask(t, svc, priorApply, "task-prior-completed", state.Task.Completed)
 	apply := createCancelledCheckApply(t, svc, database, false)
 	require.Greater(t, apply.ID, priorID)
 	storeCancelledOwnedCheck(t, svc, apply, checkStatusInProgress, "")
@@ -195,7 +248,25 @@ func TestE2EPlanCancelledApplyWithEarlierCompletionStaysBlocked(t *testing.T) {
 
 	check := loadCancelledCheck(t, svc, database)
 	assert.Equal(t, apply.ID, check.ApplyID)
-	assert.Equal(t, checkStatusInProgress, check.Status)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionFailure, check.Conclusion)
+	assert.Equal(t, applyCancelledAfterTaskCompletedBlock.blockingReason, check.BlockingReason)
+	assert.False(t, checkNeedsTerminalReconcile(check, apply))
+}
+
+func TestCompletedForwardTaskBeforeCancellationIgnoresRollbackAndUnrelatedHistory(t *testing.T) {
+	cancelled := &storage.Apply{ID: 4, Database: "target", DatabaseType: storage.DatabaseTypeMySQL, Environment: cancelledCheckEnv}
+	rollback := &storage.Apply{
+		ID: 2, Database: "target", DatabaseType: storage.DatabaseTypeMySQL, Environment: cancelledCheckEnv,
+		Options: storage.MarshalApplyOptions(storage.ApplyOptions{Rollback: true}),
+	}
+	unrelated := &storage.Apply{ID: 3, Database: "other", DatabaseType: storage.DatabaseTypeMySQL, Environment: cancelledCheckEnv}
+	tasks := []*storage.Task{
+		{ApplyID: rollback.ID, State: state.Task.Completed},
+		{ApplyID: unrelated.ID, State: state.Task.Completed},
+	}
+
+	assert.Nil(t, completedForwardTaskBeforeCancellation([]*storage.Apply{rollback, unrelated, cancelled}, tasks, cancelled))
 }
 
 // When a cancelled apply is the only apply for a schema change removed from
