@@ -418,7 +418,7 @@ func FormatProgressState(s string) string {
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
-		return ANSIOrange + "⏸️  Stopped" + ANSIReset
+		return ANSIOrange + "⏹️  Stopped" + ANSIReset
 	case state.Apply.Cancelled:
 		return ANSIOrange + "🚫 Cancelled" + ANSIReset
 	case state.Apply.RevertWindow:
@@ -838,7 +838,7 @@ type StopData struct {
 
 // WriteStopSuccess writes the stop command success output.
 func WriteStopSuccess(data StopData) {
-	fmt.Printf("%s%s⏸️  Schema change stopped%s\n", ANSIBold, ANSIYellow, ANSIReset)
+	fmt.Printf("%s%s⏹️  Schema change stopped%s\n", ANSIBold, ANSIYellow, ANSIReset)
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)

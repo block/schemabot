@@ -6698,7 +6698,7 @@ ESC detach • s stop • v volume
 
 Stop command: User runs 'schemabot stop -e staging <apply_id>'
 
-⏸️  Schema change stopped
+⏹️  Schema change stopped
 
 Database:    myapp
 Environment: staging

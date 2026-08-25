@@ -285,11 +285,11 @@ func deriveDeployment(ops []Operation, i int) Deployment {
 	case state.ApplyOperation.FailedRetryable:
 		d.set(StateRetrying, "retrying", "🔁", true)
 	case state.ApplyOperation.Stopped:
-		d.set(StateStopped, "stopped — resume to continue", "⏸", true)
+		d.set(StateStopped, "stopped — resume to continue", "⏹️", true)
 	case state.ApplyOperation.RevertWindow:
 		d.set(StateRevertWindow, "in revert window", "⏳", true)
 	case state.ApplyOperation.Cancelled:
-		d.set(StateCancelled, "cancelled", "⛔", false)
+		d.set(StateCancelled, "cancelled", "🚫", false)
 	case state.ApplyOperation.Reverted:
 		d.set(StateReverted, "reverted", "↩️", false)
 	case state.ApplyOperation.Pending:
