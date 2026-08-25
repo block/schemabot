@@ -319,7 +319,8 @@ func TestLocks(t *testing.T, h Harness) {
 
 		lock := CreateLock(t, store, "update_db", storage.DatabaseTypeMySQL)
 
-		// Touching an existing lock succeeds and keeps the row intact.
+		// Touching an existing lock as its owner succeeds and keeps the row
+		// intact.
 		require.NoError(t, store.Locks().Update(ctx, lock))
 
 		stored, err := store.Locks().Get(ctx, "update_db", storage.DatabaseTypeMySQL)
@@ -327,10 +328,25 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NotNil(t, stored)
 		assert.Equal(t, "testuser", stored.Owner)
 
+		// The touch is owner-scoped: a caller whose lock was re-acquired by
+		// somebody else must not refresh the new owner's row.
+		intruder := &storage.Lock{
+			DatabaseName: "update_db",
+			DatabaseType: storage.DatabaseTypeMySQL,
+			Owner:        "other-owner",
+		}
+		require.ErrorIs(t, store.Locks().Update(ctx, intruder), storage.ErrLockNotOwned)
+
+		stored, err = store.Locks().Get(ctx, "update_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "testuser", stored.Owner, "a refused touch must not change ownership")
+
 		// Touching a lock that does not exist reports it missing.
 		missing := &storage.Lock{
 			DatabaseName: "update_missing_db",
 			DatabaseType: storage.DatabaseTypeMySQL,
+			Owner:        "testuser",
 		}
 		require.ErrorIs(t, store.Locks().Update(ctx, missing), storage.ErrLockNotFound)
 	})

@@ -94,7 +94,11 @@ type LockStore interface {
 	// List returns all active locks.
 	List(ctx context.Context) ([]*Lock, error)
 
-	// Update updates lock metadata (e.g., updated_at timestamp).
+	// Update touches updated_at to mark liveness of the caller's own lock.
+	// The touch is owner-scoped: it returns ErrLockNotFound when no lock
+	// exists for the database, and ErrLockNotOwned when another owner holds
+	// it — a caller whose lock was force-released and re-acquired elsewhere
+	// must not refresh the new owner's row.
 	Update(ctx context.Context, lock *Lock) error
 
 	// GetByPR returns all locks associated with a PR (for cleanup on merge/close).
