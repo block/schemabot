@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,6 +52,9 @@ func TestPostgresStorageParity(t *testing.T) {
 	storagetest.Run(t, h)
 	t.Run("SettingsUpdatedAtAdvances", func(t *testing.T) { testPostgresSettingsUpdatedAtAdvances(t, h) })
 	t.Run("LeaseGuardedApplyLogAppend", func(t *testing.T) { testPostgresLeaseGuardedApplyLogAppend(t, h) })
+	t.Run("MarkMinimizedPreservesStamp", func(t *testing.T) { testPostgresMarkMinimizedPreservesStamp(t, h) })
+	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
+	t.Run("LockAcquireSameOwnerConcurrent", func(t *testing.T) { testPostgresLockAcquireSameOwnerConcurrent(t, h) })
 	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
 	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
@@ -219,6 +223,39 @@ func testPostgresApplyCommentClaimConversionRestartsStaleWindow(t *testing.T, h 
 	assert.False(t, reclaimed, "a just-converted sentinel is a fresh in-flight publish, not reclaimable")
 }
 
+// testPostgresMarkMinimizedPreservesStamp reads the raw minimized_at column to
+// prove a repeat mark does not move the original stamp. The row is backdated
+// between marks so the assertion cannot pass on write-clock proximity alone.
+func testPostgresMarkMinimizedPreservesStamp(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	comment := storagetest.InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, comment.ID))
+
+	var minimizedAt *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&minimizedAt))
+	require.NotNil(t, minimizedAt, "the row is stamped, not deleted")
+
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE plan_comments SET minimized_at = now() - interval '1 hour' WHERE id = $1`, comment.ID)
+	require.NoError(t, err)
+	var backdated *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&backdated))
+	require.NotNil(t, backdated)
+
+	require.NoError(t, store.PlanComments().MarkMinimized(ctx, comment.ID))
+
+	var afterRepeat *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&afterRepeat))
+	require.NotNil(t, afterRepeat)
+	assert.Equal(t, *backdated, *afterRepeat, "a repeat mark must not move the stamp")
+}
+
 // testPostgresSettingsUpdatedAtAdvances proves that a second Set renews
 // updated_at through the upsert's explicit stamp. The row is backdated between
 // writes so the assertion cannot pass on write-clock proximity alone; the
@@ -287,6 +324,117 @@ func testPostgresLeaseGuardedApplyLogAppend(t *testing.T, h postgresHarness) {
 	require.NoError(t, err)
 	require.Len(t, logs, 1)
 	assert.Equal(t, "owned driver log", logs[0].Message)
+}
+
+// testPostgresLockUpdatedAtAdvances proves that the liveness touch and the
+// pending-plan refresh each renew updated_at through their explicit stamps.
+// The row is backdated between writes so the assertion cannot pass on
+// write-clock proximity alone; the PostgreSQL schema has no automatic renewal,
+// so a dropped stamp would leave the backdated value in place.
+func testPostgresLockUpdatedAtAdvances(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "stamp_db", storage.DatabaseTypeMySQL)
+
+	backdate := func(t *testing.T) *storage.Lock {
+		t.Helper()
+		_, err := h.db.ExecContext(ctx,
+			`UPDATE locks SET updated_at = now() - interval '1 hour' WHERE database_name = $1 AND database_type = $2`,
+			lock.DatabaseName, lock.DatabaseType)
+		require.NoError(t, err)
+		got, err := store.Locks().Get(ctx, lock.DatabaseName, lock.DatabaseType)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		return got
+	}
+
+	backdated := backdate(t)
+	require.NoError(t, store.Locks().Update(ctx, lock))
+	touched, err := store.Locks().Get(ctx, lock.DatabaseName, lock.DatabaseType)
+	require.NoError(t, err)
+	require.NotNil(t, touched)
+	assert.True(t, touched.UpdatedAt.After(backdated.UpdatedAt),
+		"Update must advance updated_at (got %s, was %s)", touched.UpdatedAt, backdated.UpdatedAt)
+
+	backdated = backdate(t)
+	refresh := &storage.Lock{
+		DatabaseName:  lock.DatabaseName,
+		DatabaseType:  lock.DatabaseType,
+		Repository:    lock.Repository,
+		PullRequest:   lock.PullRequest,
+		Owner:         lock.Owner,
+		PendingPlanID: "plan-refresh",
+	}
+	require.NoError(t, store.Locks().Acquire(ctx, refresh))
+	refreshed, err := store.Locks().Get(ctx, lock.DatabaseName, lock.DatabaseType)
+	require.NoError(t, err)
+	require.NotNil(t, refreshed)
+	assert.Equal(t, "plan-refresh", refreshed.PendingPlanID)
+	assert.True(t, refreshed.UpdatedAt.After(backdated.UpdatedAt),
+		"pending-plan refresh must advance updated_at (got %s, was %s)", refreshed.UpdatedAt, backdated.UpdatedAt)
+	assert.True(t, refreshed.CreatedAt.Equal(backdated.CreatedAt), "refresh must not rewrite created_at")
+}
+
+// testPostgresLockAcquireSameOwnerConcurrent forces the lock INSERT race on a
+// real PostgreSQL server. Concurrent same-owner Acquire calls collide on the
+// UNIQUE(database_name, database_type) constraint; every loser's duplicate-key
+// error must be recognized by the classifier and resolved as a same-owner
+// success rather than surfacing a hard error.
+func testPostgresLockAcquireSameOwnerConcurrent(t *testing.T, h postgresHarness) {
+	clearPostgresTables(t, h.db)
+	ctx := t.Context()
+
+	const drivers = 16
+	stores := make([]*Storage, drivers)
+	for i := range drivers {
+		db, openErr := sql.Open("pgx", h.dsn)
+		require.NoError(t, openErr)
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		t.Cleanup(func() {
+			require.NoError(t, db.Close())
+		})
+		require.NoError(t, db.PingContext(ctx))
+		stores[i] = NewPostgres(db)
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+
+	for i := range drivers {
+		driverStore := stores[i]
+		planID := fmt.Sprintf("plan-%d", i)
+		wg.Go(func() {
+			<-start
+			err := driverStore.Locks().Acquire(ctx, &storage.Lock{
+				DatabaseName:  "concurrent_db",
+				DatabaseType:  storage.DatabaseTypeMySQL,
+				Repository:    "org/repo",
+				PullRequest:   123,
+				Owner:         "org/repo#123",
+				PendingPlanID: planID,
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+			}
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	require.Empty(t, errs, "all same-owner Acquire calls should succeed")
+
+	lock, err := stores[0].Locks().Get(ctx, "concurrent_db", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "org/repo#123", lock.Owner)
+	assert.Contains(t, lock.PendingPlanID, "plan-", "stored plan should be one of the concurrent attempts")
 }
 
 func TestPGXStdlibValueContracts(t *testing.T) {

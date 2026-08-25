@@ -4,6 +4,11 @@ import "errors"
 
 // Common storage errors.
 var (
+	// ErrNotImplemented is returned by interface methods that no
+	// implementation supports yet. Callers must treat it as a hard error,
+	// never as an empty result.
+	ErrNotImplemented = errors.New("not implemented")
+
 	// ErrLockHeld is returned when attempting to acquire a lock that is already held.
 	ErrLockHeld = errors.New("lock is already held")
 

@@ -220,21 +220,25 @@ func (s *lockStore) List(ctx context.Context) ([]*storage.Lock, error) {
 	return scanLocks(rows)
 }
 
-// Update touches updated_at to mark lock liveness.
+// Update touches updated_at to mark lock liveness. The touch is owner-scoped,
+// like every other lock mutator: a process whose lock was force-released and
+// re-acquired by another owner must not keep the new owner's row looking
+// alive, so it gets ErrLockNotOwned instead of a silent success.
 //
 // RowsAffected==0 is ambiguous and must not be read as "the lock does not
 // exist". Under MySQL's default changed-rows semantics, a matched row reports
 // zero affected rows when updated_at already equals NOW() — which happens when
 // Update runs twice within the same one-second DATETIME tick. The lock still
 // exists in that case, so the touch has succeeded. To distinguish that from a
-// genuinely missing lock, re-read it and return ErrLockNotFound only when the
-// row is actually gone.
+// genuinely missing lock or an ownership change, re-read the row and return
+// ErrLockNotFound when it is gone or ErrLockNotOwned when another owner holds
+// it.
 func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
 		SET updated_at = NOW()
-		WHERE database_name = ? AND database_type = ?
-	`, lock.DatabaseName, lock.DatabaseType)
+		WHERE database_name = ? AND database_type = ? AND owner = ?
+	`, lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	if err != nil {
 		return fmt.Errorf("touch lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
 	}
@@ -254,6 +258,9 @@ func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
 	}
 	if current == nil {
 		return storage.ErrLockNotFound
+	}
+	if current.Owner != lock.Owner {
+		return storage.ErrLockNotOwned
 	}
 	return nil
 }
