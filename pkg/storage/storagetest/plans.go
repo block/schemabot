@@ -13,8 +13,9 @@ import (
 
 // TestPlans runs the behavioral parity suite for storage.PlanStore.
 //
-// GetByLock is not exercised: the implementation is an acknowledged stub that
-// returns no rows, and the suite must not pin stub behavior as contract.
+// GetByLock is not exercised: it is unimplemented and returns
+// storage.ErrNotImplemented. When an implementation lands, it joins this
+// family.
 func TestPlans(t *testing.T, h Harness) {
 	t.Run("Create_And_Get", func(t *testing.T) {
 		ctx := t.Context()

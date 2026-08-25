@@ -428,7 +428,9 @@ type PlanStore interface {
 	// GetByID returns a plan by ID, or nil if not found.
 	GetByID(ctx context.Context, id int64) (*Plan, error)
 
-	// GetByLock returns plans for a lock (0-2: staging + production).
+	// GetByLock is not implemented: plans carry no direct lock association,
+	// and every implementation returns ErrNotImplemented so a caller can
+	// never mistake the missing capability for "no plans".
 	GetByLock(ctx context.Context, lockID int64) ([]*Plan, error)
 
 	// GetByPR returns all plans for a PR.

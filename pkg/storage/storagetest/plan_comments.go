@@ -35,9 +35,10 @@ func InsertPlanComment(t *testing.T, store storage.Storage, repo string, pr int,
 // guard that decides whether a superseded plan comment may be minimized.
 //
 // MarkMinimized stamp preservation on repeat marks needs to read the raw
-// minimized_at column and is covered dialect-side; the parity contract here
-// is the visible behavior — a minimized comment drops out of the unminimized
-// listings and repeat or missing-id marks are no-ops.
+// minimized_at column and is covered in each dialect's own suite (the MySQL
+// and PostgreSQL sqlstore tests); the parity contract here is the visible
+// behavior — a minimized comment drops out of the unminimized listings and
+// repeat or missing-id marks are no-ops.
 func TestPlanComments(t *testing.T, h Harness) {
 	t.Run("Insert_And_ListUnminimizedForSlot", func(t *testing.T) {
 		ctx := t.Context()
