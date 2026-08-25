@@ -65,6 +65,7 @@ func Run(t *testing.T, h Harness) {
 	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
 	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
 	t.Run("Locks", func(t *testing.T) { TestLocks(t, h) })
+	t.Run("ApplyOperations", func(t *testing.T) { TestApplyOperations(t, h) })
 	t.Run("ApplyComments", func(t *testing.T) { TestApplyComments(t, h) })
 	t.Run("ControlRequests", func(t *testing.T) { TestControlRequests(t, h) })
 }
