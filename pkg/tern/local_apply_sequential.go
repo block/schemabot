@@ -196,7 +196,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 		return taskStopped
 	}
 	taskCreds := creds
-	if c.config.Type == storage.DatabaseTypeMySQL {
+	if usesPerNamespaceCredentials(c.config.Type) {
 		var err error
 		taskCreds, err = c.credentialsForMySQLNamespace(task.Namespace)
 		if err != nil {
@@ -649,7 +649,20 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 // out because its engine classifies transient versus permanent failures in its
 // progress results, not through errors.
 func recoveryResumesFromCheckpoint(databaseType string) bool {
-	return databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return true
+	case storage.DatabaseTypeStrata:
+		return true
+	case storage.DatabaseTypeVitess:
+		return false
+	case storage.DatabaseTypePostgres:
+		return false
+	case "":
+		return false
+	default:
+		panic(fmt.Sprintf("checkpoint recovery disposition is not declared for database type %q", databaseType))
+	}
 }
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.

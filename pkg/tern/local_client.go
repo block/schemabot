@@ -437,7 +437,7 @@ func (c *LocalClient) credentials() *engine.Credentials {
 }
 
 func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	hasDatabase, err := mysqlDSNHasDatabase(c.config.TargetDSN)
@@ -494,13 +494,30 @@ func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
 }
 
 func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	if task == nil {
 		return nil, fmt.Errorf("task is required for MySQL credentials")
 	}
 	return c.credentialsForMySQLNamespace(task.Namespace)
+}
+
+func usesPerNamespaceCredentials(databaseType string) bool {
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return true
+	case storage.DatabaseTypeVitess:
+		return false
+	case storage.DatabaseTypeStrata:
+		return false
+	case storage.DatabaseTypePostgres:
+		return false
+	case "":
+		return false
+	default:
+		panic(fmt.Sprintf("namespace credential disposition is not declared for database type %q", databaseType))
+	}
 }
 
 // credentialsForGroupedApply resolves the single-namespace credentials for a
