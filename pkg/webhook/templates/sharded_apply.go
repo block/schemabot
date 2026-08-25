@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -317,9 +318,9 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		}
 		shard := html.EscapeString(s.Shard)
 		if msg := SanitizeInlineError(s.Error); msg == "" {
-			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code>\n", shard)
+			fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** shard <code>%s</code>\n", shard)
 		} else {
-			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))
+			fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))
 		}
 		return
 	}
@@ -327,7 +328,7 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		return
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
-		fmt.Fprintf(sb, "\n> ⚠️ **Failure:** %s\n", html.EscapeString(msg))
+		fmt.Fprintf(sb, "\n> "+glyph.Failed+" **Failure:** %s\n", html.EscapeString(msg))
 	}
 }
 

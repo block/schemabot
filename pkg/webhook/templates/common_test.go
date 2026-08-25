@@ -126,7 +126,7 @@ func TestWriteErrorBlock(t *testing.T) {
 	t.Run("multi-line error stays inside the blockquote", func(t *testing.T) {
 		var sb strings.Builder
 		writeErrorBlock(&sb, "first line\nsecond line")
-		assert.Equal(t, "\n> ⚠️ **Error:** first line\n> second line\n", sb.String())
+		assert.Equal(t, "\n> ❌ **Error:** first line\n> second line\n", sb.String())
 	})
 
 	t.Run("whitespace-only error writes nothing", func(t *testing.T) {

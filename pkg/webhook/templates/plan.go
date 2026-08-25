@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -360,7 +361,7 @@ func RenderPlanComment(data PlanCommentData) string {
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, "⚠️ **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
+			fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
@@ -569,7 +570,7 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 	for i, ns := range ignored {
 		quoted[i] = fmt.Sprintf("`%s`", ns)
 	}
-	fmt.Fprintf(sb, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
 }
 
 // multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
@@ -623,14 +624,14 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 		for i, ns := range plan.IgnoredNamespaces {
 			quoted[i] = fmt.Sprintf("`%s`", ns)
 		}
-		fmt.Fprintf(sb, "ℹ️ **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
+		fmt.Fprintf(sb, glyph.Info+" **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
 	}
 }
 
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	sb.WriteString("✅ **No schema changes detected**\n")
 	if data.RecoveredApplyOwnedCheckState {
-		sb.WriteString("\nℹ️ SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
+		sb.WriteString("\n" + glyph.Info + " SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
 	}
 }
 
@@ -856,7 +857,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	}
 
 	if !drift.Computed {
-		sb.WriteString("⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
+		sb.WriteString(glyph.Attention + " **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
 		return
 	}
 
@@ -866,7 +867,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
-	sb.WriteString("⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
 	for _, d := range drift.Deployments {
 		name := "`" + d.Deployment + "`"
 		if d.Primary {
@@ -876,9 +877,9 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		case "match":
 			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
 		case "diverged":
-			fmt.Fprintf(sb, "- %s ⚠️ diverged%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s\n", name, driftDetailSuffix(d.Detail))
 		default:
-			fmt.Fprintf(sb, "- %s ❌ could not verify%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s\n", name, driftDetailSuffix(d.Detail))
 		}
 	}
 	sb.WriteString("\n")
@@ -908,7 +909,7 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 // unsupported shape needs a rewrite, a missing grant needs provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: **%d** %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -968,7 +969,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := countUnsafeFindings(changes)
-	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Attention+" **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -1491,7 +1492,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	if len(envsWithErrors) > 0 {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
-			fmt.Fprintf(sb, "⚠️ **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
+			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
 			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot plan", env, data.Tenant))
 		}
 	}

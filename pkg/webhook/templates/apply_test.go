@@ -54,7 +54,7 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 		rendered := RenderApplyBlockedByPriorEnv("testapp", "production", "staging", "has pending changes", "Apply staging first")
 		firstLine, _, _ := strings.Cut(rendered, "\n")
 
-		assert.Equal(t, "## ❌ Apply Blocked — Production", firstLine)
+		assert.Equal(t, "## ⛔ Apply Blocked — Production", firstLine)
 	})
 }
 
@@ -952,7 +952,7 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Failed")
-	assert.Contains(t, result, "⚠️ **Error:**")
+	assert.Contains(t, result, "❌ **Error:**")
 	assert.Contains(t, result, "lock wait timeout exceeded")
 	assert.Contains(t, result, "🟥") // red bar for failed table
 	assert.Contains(t, result, "❌ Failed")
@@ -1106,36 +1106,36 @@ func TestRenderApplyStatusComment_FailedTableErrorLine(t *testing.T) {
 
 	t.Run("table error distinct from apply error renders below the row", func(t *testing.T) {
 		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 35)
-		assert.Contains(t, result, "> ⚠️ **Error:** 1 of 2 tables failed")
-		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+		assert.Contains(t, result, "> ❌ **Error:** 1 of 2 tables failed")
+		assert.Contains(t, result, "> ❌ Last error: preflight enumReorder check failed")
 	})
 
 	t.Run("table error identical to apply error is not repeated", func(t *testing.T) {
 		result := render("preflight enumReorder check failed", "preflight enumReorder check failed", 35)
-		assert.Contains(t, result, "> ⚠️ **Error:** preflight enumReorder check failed")
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.Contains(t, result, "> ❌ **Error:** preflight enumReorder check failed")
+		assert.NotContains(t, result, "> ❌ Last error:")
 		assert.Equal(t, 1, strings.Count(result, "preflight enumReorder check failed"))
 	})
 
 	t.Run("table without an error renders no error line", func(t *testing.T) {
 		result := render("apply-level failure", "", 35)
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.NotContains(t, result, "> ❌ Last error:")
 	})
 
 	t.Run("table error differing only by whitespace is not repeated", func(t *testing.T) {
 		result := render("preflight enumReorder check failed", "preflight enumReorder check failed\n", 35)
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.NotContains(t, result, "> ❌ Last error:")
 	})
 
 	t.Run("all-whitespace table error renders no error line", func(t *testing.T) {
 		result := render("apply-level failure", "  \n", 35)
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.NotContains(t, result, "> ❌ Last error:")
 	})
 
 	t.Run("pre-copy failure renders error line without a progress bar", func(t *testing.T) {
 		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 0)
 		assert.Contains(t, result, "**`users`**: ❌ Failed (before row copy started)")
-		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+		assert.Contains(t, result, "> ❌ Last error: preflight enumReorder check failed")
 		assert.NotContains(t, result, "0%")
 	})
 }
@@ -1174,7 +1174,7 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	// The retry detail lives on the affected table, not in the headline, and
 	// counts the upcoming retry against the operator redispatch budget.
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 1/10)")
-	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
+	assert.Contains(t, result, "> ❌ Last error: remote deployment unavailable")
 	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
 	// Progress summary counts the retrying table.
 	assert.Contains(t, result, "1/2 complete")
@@ -1218,7 +1218,7 @@ func TestRenderApplyStatusComment_RemoteRetryablePauseDerivesRetryingFromTasks(t
 	assert.NotContains(t, result, "**Status**: In Progress")
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically\n")
 	assert.NotContains(t, result, "(attempt")
-	assert.Contains(t, result, "> ⚠️ Last error: failed to execute chunklet insert: Error 1041 (HY000): Out of memory")
+	assert.Contains(t, result, "> ❌ Last error: failed to execute chunklet insert: Error 1041 (HY000): Out of memory")
 	assert.Contains(t, result, "1 retrying")
 	assert.Contains(t, result, "SchemaBot retries automatically and marks it failed if retries are exhausted")
 	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
@@ -1306,7 +1306,7 @@ func TestRenderApplyStatusComment_FailedRetryableMultilineError(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "> ⚠️ Last error: rpc error: code = Unavailable\n> desc = upstream connect error")
+	assert.Contains(t, result, "> ❌ Last error: rpc error: code = Unavailable\n> desc = upstream connect error")
 }
 
 func TestRenderApplyStatusComment_Stopped(t *testing.T) {
@@ -1995,7 +1995,7 @@ func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {
 
 	result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "— Staging")
 	assert.Contains(t, result, "Cannot apply while PR checks are not passing")
 	assert.Contains(t, result, "| Check | Status |")
@@ -2024,7 +2024,7 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 	for _, notPassing := range [][]BlockingCheck{nil, {}} {
 		result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Cannot apply while PR checks are not passing.")
 		assert.Contains(t, result, "Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n```\nschemabot apply -e staging\n```",
@@ -2042,7 +2042,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.NotContains(t, result, "500 Internal Server Error",
@@ -2059,7 +2059,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 			MissingPermissions: []string{"Checks: Read"},
 		})
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "— Production")
 		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
 		assert.Contains(t, result, "cannot read PR check statuses")
@@ -2091,7 +2091,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 	t.Run("nil error renders the same sanitized copy", func(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
@@ -2103,7 +2103,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	t.Run("renders reason with sanitized detail", func(t *testing.T) {
 		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details")
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details. Retry the apply command.")
 		assert.Contains(t, result, "_See server logs for details._")
 	})
@@ -2116,7 +2116,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	})
 
 	t.Run("full body is stable", func(t *testing.T) {
-		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
+		expected := "## ⛔ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
 
 		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
 	})
@@ -2125,7 +2125,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByMissingPriorEnvCheck("staging")
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "could not find a completed `staging` check")
 	assert.Contains(t, result, "schemabot plan -e staging")
 	assert.Contains(t, result, "apply `staging`")
@@ -2135,7 +2135,7 @@ func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 func TestRenderApplyBlockedByUntrustedPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"schemabot-staging"})
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "`SchemaBot (staging)`")
 	assert.Contains(t, result, "- `schemabot-staging`")
 	assert.Contains(t, result, "does not trust")

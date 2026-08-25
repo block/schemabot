@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // capitalizeFirst capitalizes the first letter of a string.
@@ -306,7 +308,7 @@ func writeErrorBlock(sb *strings.Builder, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **Error:** %s\n", quoteBlockLines(html.EscapeString(sanitized)))
+	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **Error:** %s\n", quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // writeTableErrorLine writes a task's last error as a blockquote below its
@@ -317,7 +319,7 @@ func writeTableErrorLine(sb *strings.Builder, msg string) {
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "> ⚠️ Last error: %s\n", quoteBlockLines(html.EscapeString(sanitized)))
+	fmt.Fprintf(sb, "> "+glyph.Failed+" Last error: %s\n", quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // taskErrorAddsDetail reports whether a failed table's own error message adds

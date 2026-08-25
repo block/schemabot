@@ -1121,7 +1121,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ### Production
 
 
-> ⚠️ **Error:** tern client: resolve DSN for testapp/production: connection refused
+> ❌ **Error:** tern client: resolve DSN for testapp/production: connection refused
 
 ---
 
@@ -1368,7 +1368,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 
 ---
 
-**⛔ 1 Unsafe Change Detected:**
+**⛔ Apply rejected**: **1** unsafe change detected
 - `customers`: Unsafe operation detected: DROP COLUMN `nickname`
 
 **Destructive drop guidance:**
@@ -1401,7 +1401,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 
 ---
 
-**⛔ 1 Unsafe Change Detected:**
+**⛔ Apply rejected**: **1** unsafe change detected
 - `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
 
 **Destructive drop guidance:**
@@ -1436,7 +1436,7 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 ---
 
-**⛔ 3 Unsafe Changes Detected:**
+**⛔ Apply rejected**: **3** unsafe changes detected
 - `orders`:
   - Primary key column `id` has type `int`
   - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
@@ -1544,7 +1544,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -2678,7 +2678,7 @@ _Requested by @jackjackbits_
 <summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
 
 
-## ❌ Apply Blocked — Production
+## ⛔ Apply Blocked — Production
 
 **Database**: `testapp`
 
@@ -2695,7 +2695,7 @@ schemabot apply -e staging
 <summary><a name="apply-blocked-by-prior-env-failed"></a><strong>Apply Blocked By Prior Env (Failed)</strong></summary>
 
 
-## ❌ Apply Blocked — Production
+## ⛔ Apply Blocked — Production
 
 **Database**: `testapp`
 
@@ -2730,7 +2730,7 @@ schemabot apply -e production
 <summary><a name="apply-blocked-prior-env-check-missing"></a><strong>Apply Blocked: Prior Env Check Missing</strong></summary>
 
 
-## ❌ Apply Blocked
+## ⛔ Apply Blocked
 
 SchemaBot could not find a completed `staging` check for this PR.
 
@@ -2748,7 +2748,7 @@ If the plan finds changes, apply `staging` and wait for the SchemaBot check to s
 <summary><a name="apply-blocked-prior-env-check-read-error"></a><strong>Apply Blocked: Prior Env Check Read Error</strong></summary>
 
 
-## ❌ Apply Blocked
+## ⛔ Apply Blocked
 
 Could not verify staging status: failed to query check runs. Retry the apply command.
 
@@ -2761,7 +2761,7 @@ _See server logs for details._
 <summary><a name="apply-blocked-prior-env-check-untrusted"></a><strong>Apply Blocked: Prior Env Check Untrusted</strong></summary>
 
 
-## ❌ Apply Blocked
+## ⛔ Apply Blocked
 
 A `staging` check named `SchemaBot (staging)` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:
 
@@ -2782,7 +2782,7 @@ Re-running `schemabot plan -e staging` will not resolve this.
 <summary><a name="apply-blocked-environment-not-in-promotion-order"></a><strong>Apply Blocked: Environment Not In Promotion Order</strong></summary>
 
 
-## ❌ Apply Blocked — Development
+## ⛔ Apply Blocked — Development
 
 `development` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.
 
@@ -2861,7 +2861,7 @@ Schema changes require approval from an authorized reviewer before applying.
 <summary><a name="apply-blocked-checks-not-passing"></a><strong>Apply Blocked: Checks Not Passing</strong></summary>
 
 
-## ❌ Apply Blocked — Staging
+## ⛔ Apply Blocked — Staging
 
 Cannot apply while PR checks are not passing:
 
@@ -2903,7 +2903,7 @@ schemabot apply -e staging
 <summary><a name="apply-blocked-check-status-read-error"></a><strong>Apply Blocked: Check Status Read Error</strong></summary>
 
 
-## ❌ Apply Blocked — Staging
+## ⛔ Apply Blocked — Staging
 
 The SchemaBot GitHub App `schemabot-app` cannot read PR check statuses for this repository.
 
@@ -3076,7 +3076,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -3777,7 +3777,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
+> ❌ Last error: lock wait timeout exceeded; try restarting transaction
 
 **`products`**: ⏳ Queued
 
@@ -3824,7 +3824,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
+> ❌ Last error: lock wait timeout exceeded; try restarting transaction
 
 **`products`**: ⏳ Queued
 
@@ -3886,7 +3886,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** Error 1061: Duplicate key name &#39;idx_user_id&#39;
+> ❌ **Error:** Error 1061: Duplicate key name &#39;idx_user_id&#39;
 
 ---
 
@@ -3933,7 +3933,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -3966,7 +3966,7 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `orders` MODIFY COLUMN `status` enum('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL;
 ```
-> ⚠️ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
+> ❌ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
 **`users`**: ⊘ Cancelled (not started)
 
@@ -3981,7 +3981,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** table orders failed: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
+> ❌ **Error:** table orders failed: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
 ---
 
@@ -4748,7 +4748,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field &#39;name&#39; doesn&#39;t have a default value
+> ❌ **Error:** table users failed: schema change failed: unsafe warning: Field &#39;name&#39; doesn&#39;t have a default value
 
 1 of 3 tables completed before failure.
 
@@ -4997,7 +4997,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 *Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
 
-> ⚠️ **Error:** Error 1062: Duplicate entry &#39;12345&#39; for key &#39;addresses.idx_user_id&#39;
+> ❌ **Error:** Error 1062: Duplicate entry &#39;12345&#39; for key &#39;addresses.idx_user_id&#39;
 
 4 of 8 tables completed before failure.
 
@@ -5075,7 +5075,7 @@ schemabot apply -e staging
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
+> ❌ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
 
 3 of 5 tables completed before failure.
 
@@ -7004,7 +7004,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
-> ⚠️ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
+> ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -7085,7 +7085,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -7365,7 +7365,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
-> ⚠️ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
+> ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -7421,7 +7421,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 *Applied by @aparajon at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 1 of 3 tables completed before failure.
 
@@ -7628,7 +7628,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Shards**: 1 failed, 3 halted
 
-> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -7738,7 +7738,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Shards**: 1 failed, 3 halted
 
-> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
 #### Keyspace `cdb_resolute_sharded`
 

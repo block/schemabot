@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -220,7 +221,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Schema Change Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
@@ -242,7 +243,7 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Rollback Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
@@ -979,7 +980,7 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", table.TableName, ui.ProgressBarActivity(), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
-			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
 			return
 		}
 
@@ -1030,10 +1031,10 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
 		return
 	}
-	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -1581,7 +1582,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 	}
 
 	if states[state.Task.Failed] {
-		return "❌"
+		return glyph.Failed
 	}
 	if states["reverted"] {
 		return "↩️"

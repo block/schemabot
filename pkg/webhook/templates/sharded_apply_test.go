@@ -47,7 +47,7 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "## Schema Change Status")
-	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+failErr)
+	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.Contains(t, out, failErr, "the error also appears in the failed shard's row")
 	assert.Contains(t, out, "To retry:")
 }
@@ -153,7 +153,7 @@ func TestRenderShardedApplyComment_FailedErrorSanitized(t *testing.T) {
 	})
 
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
-	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — dial tcp [endpoint redacted]: connect refused retry | later\n",
+	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — dial tcp [endpoint redacted]: connect refused retry | later\n",
 		"the first-failure line stays on one line")
 	assert.Contains(t, out, "| `-40` | ❌ failed — dial tcp [endpoint redacted]: connect refused retry / later |",
 		"the status cell neutralizes the cell separator")
@@ -200,7 +200,7 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
 	assert.NotContains(t, out, "Applied successfully", "a failed apply writes no success line")
-	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+failErr)
+	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.Contains(t, out, "| `80-` | ⏸ halted — -40 failed |", "halted siblings keep their final state in the results")
 	assert.Contains(t, out, "To retry:")
 }
@@ -255,7 +255,7 @@ func TestRenderShardedApplySummaryComment_FailureOutsideShardWorkSurfacesApplyEr
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
-	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: dial tcp [endpoint redacted]: connect refused retry | later second line",
+	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: dial tcp [endpoint redacted]: connect refused retry | later second line",
 		"the apply-level error is surfaced when no shard failed, sanitized to one line")
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints never render in PR comments")
 	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
@@ -275,7 +275,7 @@ func TestRenderShardedApplyComment_ShardFailureOwnsCallout(t *testing.T) {
 		Cells: []ShardCell{mutesCell("-40")},
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+failErr)
+	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.NotContains(t, out, "**Failure:** apply failed")
 }
 
@@ -371,6 +371,6 @@ func TestRenderShardedApplyComment_FailureOutsideShardWorkSurfacesApplyError(t *
 	})
 
 	assert.Contains(t, out, "## Schema Change Status — Staging")
-	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")
+	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")
 	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
 }

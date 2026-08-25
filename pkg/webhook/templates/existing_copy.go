@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -77,9 +78,9 @@ type ExistingCopyData struct {
 // Both keep the same verb so the two read as one disclosure rather than two.
 func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
-	marker, subject := "⚠️", "Applying"
+	marker, subject := glyph.Attention, "Applying"
 	if alreadyApplying {
-		marker, subject = "ℹ️", "This apply"
+		marker, subject = glyph.Info, "This apply"
 	}
 	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target\n",
 		marker, subject, n, copyNoun(n))
