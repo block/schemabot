@@ -55,7 +55,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			{Column: "conclusion"},
 			{Column: "blocking_reason"},
 			{Column: "error_message"},
-			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
+			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), checks.change_summary)"},
 			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
 	)

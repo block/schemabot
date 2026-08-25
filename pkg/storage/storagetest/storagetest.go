@@ -71,6 +71,7 @@ func Run(t *testing.T, h Harness) {
 	t.Run("ControlRequests", func(t *testing.T) { TestControlRequests(t, h) })
 	t.Run("Tasks", func(t *testing.T) { TestTasks(t, h) })
 	t.Run("WebhookEvents", func(t *testing.T) { TestWebhookEvents(t, h) })
+	t.Run("Checks", func(t *testing.T) { TestChecks(t, h) })
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the
