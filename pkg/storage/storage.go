@@ -881,7 +881,10 @@ type ApplyCommentStore interface {
 	// last_edited_at for a comment. Called after each successful edit.
 	IncrementEditCount(ctx context.Context, applyID int64, commentState string) error
 
-	// DeleteByApply removes all comment records for an apply.
+	// DeleteByApply removes all comment records for an apply. It is
+	// deliberately lease-agnostic: it serves per-apply teardown where the
+	// apply row itself is being removed, so no live drive holds a lease that
+	// could fence it.
 	DeleteByApply(ctx context.Context, applyID int64) error
 
 	// Supersede retires the tracked comment for a single (apply_id, comment_state)
@@ -1190,7 +1193,9 @@ type ControlRequestStore interface {
 	// ListSettled returns every control request for an apply that has reached a
 	// terminal status, ordered by operation ascending, so the plane that
 	// accepted a control RPC can learn whether the operation took effect:
-	// accepting a request only queues it.
+	// accepting a request only queues it. The ordering is a varchar sort and
+	// therefore collation-dependent in principle; every ControlOperation value
+	// is lowercase ASCII, which all supported dialects order identically.
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// RecordRemoteFailure records the terminal failure another plane reported

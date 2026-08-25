@@ -171,6 +171,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 	// DeleteByApply verifies the per-apply cleanup: all of one apply's
 	// comment records are removed, another apply's records survive, and
 	// deleting for an apply with no records is a no-op, not an error.
+	// DeleteByApply is deliberately lease-agnostic — it serves teardown of
+	// the apply itself — so no lease fixture is involved here.
 	t.Run("DeleteByApply", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
