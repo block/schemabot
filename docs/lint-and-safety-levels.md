@@ -172,5 +172,5 @@ Presentation notes:
   the collapsed header. Short lists render inline.
 - Quoted identifiers and types inside finding messages (index names, column
   types) render as inline code.
-- The CLI uses ⛔ for unsafe changes at both plan and apply time, since the
-  terminal is both the review surface and the gate.
+- The CLI and the plan comment share the same severity reading: ⚠️ marks
+  unsafe changes awaiting review at plan time, and ⛔ marks the refused apply.
