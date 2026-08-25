@@ -45,6 +45,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		requiresEnv         bool
 		hasApplyID          bool
 		supportsDB          bool
+		supportsApp         bool
 		supportsSkipRevert  bool
 		supportsDefer       bool
 		supportsAllowUnsafe bool
@@ -53,9 +54,9 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 	}{
 		{name: action.Help},
 		{name: action.Plan, requiresEnv: true, supportsDB: true},
-		{name: action.Apply, requiresEnv: true, supportsDB: true,
+		{name: action.Apply, requiresEnv: true, supportsDB: true, supportsApp: true,
 			supportsSkipRevert: true, supportsDefer: true, supportsAllowUnsafe: true},
-		{name: action.ApplyConfirm, requiresEnv: true, supportsDB: true,
+		{name: action.ApplyConfirm, requiresEnv: true, supportsDB: true, supportsApp: true,
 			supportsSkipRevert: true, supportsDefer: true, supportsAllowUnsafe: true},
 		{name: action.Unlock, supportsDB: true, supportsForce: true},
 		{name: action.FixLint, supportsDB: true},
@@ -77,6 +78,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			assert.Equal(t, tc.requiresEnv, spec.RequiresEnv, "RequiresEnv")
 			assert.Equal(t, tc.hasApplyID, spec.HasApplyID, "HasApplyID")
 			assert.Equal(t, tc.supportsDB, spec.SupportsDB, "SupportsDB")
+			assert.Equal(t, tc.supportsApp, spec.SupportsApp, "SupportsApp")
 			assert.Equal(t, tc.supportsSkipRevert, spec.SupportsSkipRevert, "SupportsSkipRevert")
 			assert.Equal(t, tc.supportsDefer, spec.SupportsDeferCutover, "SupportsDeferCutover")
 			assert.Equal(t, tc.supportsAllowUnsafe, spec.SupportsAllowUnsafe, "SupportsAllowUnsafe")
@@ -270,6 +272,162 @@ func TestParseTenantFlag(t *testing.T) {
 			assert.Equal(t, tc.result, parser.ParseCommand(tc.body))
 		})
 	}
+}
+
+// TestParseAppFlag verifies that apply and apply-confirm parse `--app` into an
+// application identifier, that a present-but-unusable value is flagged via
+// AppError so the dispatcher can post usage help instead of silently dropping
+// the flag, and that commands whose spec does not opt into SupportsApp never
+// populate App. Whether the identifier names a configured application is the
+// dispatcher's job, so unknown apps parse cleanly here.
+func TestParseAppFlag(t *testing.T) {
+	parser := NewCommandParser()
+
+	tests := []struct {
+		name   string
+		body   string
+		result CommandResult
+	}{
+		{
+			name: "apply command",
+			body: "schemabot apply -e production --app billing-service",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				App:         "billing-service",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "apply-confirm command",
+			body: "schemabot apply-confirm -e staging --app billing-service",
+			result: CommandResult{
+				Action:      action.ApplyConfirm,
+				Environment: "staging",
+				App:         "billing-service",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "app value is case-normalized",
+			body: "schemabot apply -e production --app Billing-Service",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				App:         "billing-service",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "app with allow-unsafe",
+			body: "schemabot apply -e production --app billing-service --allow-unsafe",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				App:         "billing-service",
+				AllowUnsafe: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "app and database both parse; the dispatcher rejects the combination",
+			body: "schemabot apply -e production --app billing-service -d billing-ledger",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				App:         "billing-service",
+				Database:    "billing-ledger",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "missing value",
+			body: "schemabot apply -e production --app",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				AppError:    true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "invalid value",
+			body: "schemabot apply -e production --app billing@service",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				AppError:    true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "app value cannot look like another flag",
+			body: "schemabot apply -e production --app --allow-unsafe",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				AppError:    true,
+				AllowUnsafe: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "plan does not support app",
+			body: "schemabot plan -e staging --app billing-service",
+			result: CommandResult{
+				Action:      action.Plan,
+				Environment: "staging",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "app prose after directive is ignored",
+			body: "schemabot apply -e production\n\nDo not use --app here.",
+			result: CommandResult{
+				Action:      action.Apply,
+				Environment: "production",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.result, parser.ParseCommand(tc.body))
+		})
+	}
+}
+
+func TestCommandSupportsAppFlag(t *testing.T) {
+	assert.True(t, commandSupportsAppFlag(action.Apply))
+	assert.True(t, commandSupportsAppFlag(action.ApplyConfirm))
+	assert.False(t, commandSupportsAppFlag(action.Plan))
+	assert.False(t, commandSupportsAppFlag(action.Unlock))
+	assert.False(t, commandSupportsAppFlag("nonexistent"))
+}
+
+func TestHasAppFlag(t *testing.T) {
+	p := NewCommandParser()
+	assert.True(t, p.HasAppFlag("schemabot plan -e staging --app billing-service"))
+	assert.True(t, p.HasAppFlag("schemabot unlock --app"))
+	assert.False(t, p.HasAppFlag("schemabot apply -e staging"))
+	assert.False(t, p.HasAppFlag(""))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasAppFlag("schemabot plan -e staging\n\nnext time we can use --app billing-service"))
+	assert.False(t, p.HasAppFlag("schemabot plan -e staging\n\n```\nschemabot apply -e staging --app billing-service\n```\n"))
+	assert.False(t, p.HasAppFlag("we could pass --app billing-service here"))
 }
 
 // TestParseVolumeCommand verifies the volume command parses its apply id,

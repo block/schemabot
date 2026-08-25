@@ -321,6 +321,18 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted())
 	case PreviewCommentVolumeInvalid:
 		fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel())
+	case PreviewCommentAppScopedDispatch:
+		fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatch())
+	case PreviewCommentAppScopedHalted:
+		fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatchHalted())
+	case PreviewCommentAppScopedNotAuthorized:
+		fmt.Print(webhooktemplates.PreviewCommentAppScopedNotAuthorized())
+	case PreviewCommentAppScopedRejected:
+		fmt.Print(webhooktemplates.PreviewCommentAppScopedRejected())
+	case PreviewCommentAppFlagInvalid:
+		fmt.Print(webhooktemplates.PreviewCommentAppFlagInvalid())
+	case PreviewCommentAppFlagConflicts:
+		fmt.Print(webhooktemplates.PreviewCommentAppFlagConflicts())
 	// Paired aggregate previews (PR + CLI subsections)
 	case PreviewCommentPlanAll:
 		previewCommentPlanAllOutput()

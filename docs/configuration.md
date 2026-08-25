@@ -27,6 +27,7 @@
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
 - [Repository Allowlist](#repository-allowlist)
+- [App-Scoped Commands](#app-scoped-commands)
 - [PR Checks Gate](#pr-checks-gate)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
 - [Review Gate](#review-gate)
@@ -860,6 +861,59 @@ unlisted repository:
   so operators can detect unexpected webhook delivery or missing configuration.
 
 If `repos` is not configured or empty, all repositories are allowed.
+
+## App-Scoped Commands
+
+Databases that belong to one application can declare a shared `app` identifier.
+`schemabot apply --app <name>` and `schemabot apply-confirm --app <name>` PR
+comments then expand to every database declaring that app, running the normal
+single-database apply once per database — each gets its own plan verification,
+lock, apply, progress comments, and check.
+
+```yaml
+databases:
+  tenants-shard-01:
+    type: mysql
+    app: tenants
+    environments:
+      staging:
+        dsn: "env:SHARD_01_DSN"
+  tenants-shard-02:
+    type: mysql
+    app: tenants
+    environments:
+      staging:
+        dsn: "env:SHARD_02_DSN"
+```
+
+App identifiers are lowercase alphanumeric with interior hyphens (e.g.
+`billing-service`), at most 64 characters. A database with no `app` field
+belongs to no app.
+
+App-scoped commands fail closed before any database is touched:
+
+- An app no configured database declares is rejected.
+- Only databases with the target environment configured **and** a stored plan
+  for the PR and environment participate; the others are listed as skipped in
+  the expansion summary. An expansion with no participating databases is
+  rejected.
+- The PR source policy (`allowed_repos`/`allowed_dirs`) is re-checked for every
+  participating database; any denial rejects the whole command.
+- When PR command actor authorization (`pr_command_authorization`) is enabled,
+  the requesting user must be authorized for **every** participating database;
+  any denial rejects the whole command and nothing is applied.
+- The command runs against a single PR head commit: dispatch pins the PR head
+  before the first database starts, and a new commit landing mid-dispatch halts
+  the remaining databases with a comment listing which ones were not started.
+- On a repository routed to multiple SchemaBot deployments (an [aggregate
+  repository](#multi-app-routing)), an unscoped app command is rejected —
+  the preflight checks above run per deployment and cannot be coordinated
+  across the fleet. Target one deployment with `-t <tenant>` (see
+  [tenant-scoped command routing](#tenant-scoped-command-routing)).
+
+`--app` is mutually exclusive with `-d`, and `--defer-cutover` is not supported
+with `--app` — canary a single database with `-d --defer-cutover` first, then
+apply to the fleet with `--app`.
 
 ## PR Checks Gate
 

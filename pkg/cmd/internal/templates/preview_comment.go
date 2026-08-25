@@ -262,6 +262,13 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: ACTOR NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandNotAuthorized()) }},
 		{"ACTOR AUTHORIZATION: UNAVAILABLE", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandAuthorizationUnavailable()) }},
 		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
+		// App-scoped commands: --app expands to every database in the app
+		{"APP-SCOPED APPLY: DISPATCH SUMMARY", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatch()) }},
+		{"APP-SCOPED APPLY: DISPATCH HALTED (HEAD ADVANCED)", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatchHalted()) }},
+		{"APP-SCOPED APPLY: ACTOR NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedNotAuthorized()) }},
+		{"APP-SCOPED APPLY: REJECTED", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedRejected()) }},
+		{"APP FLAG: MISSING OR INVALID", func() { fmt.Print(webhooktemplates.PreviewCommentAppFlagInvalid()) }},
+		{"APP FLAG: CONFLICTING FLAGS", func() { fmt.Print(webhooktemplates.PreviewCommentAppFlagConflicts()) }},
 		// Single-table (most common case)
 		{"SINGLE TABLE: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgress()) }},
 		{"SINGLE TABLE: RUNNING (VOLUME TUNED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgressVolume()) }},

@@ -839,6 +839,13 @@ type DatabaseConfig struct {
 	// Type is the database type: "mysql", "vitess", or "strata".
 	Type string `yaml:"type"`
 
+	// App optionally names the application this database belongs to. Databases
+	// sharing an app value form one application and can be targeted together by
+	// app-scoped PR comment commands (`--app <name>`), which expand to every
+	// database declaring that app. Values are lowercase alphanumeric with
+	// interior hyphens (e.g. "billing-service").
+	App string `yaml:"app,omitempty"`
+
 	// Environments contains per-environment configuration.
 	Environments map[string]EnvironmentConfig `yaml:"environments"`
 
@@ -1394,6 +1401,9 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
+			return err
+		}
+		if err := validateDatabaseApp(name, dbConfig); err != nil {
 			return err
 		}
 		switch dbConfig.Type {
