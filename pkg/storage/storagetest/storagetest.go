@@ -59,8 +59,11 @@ type Harness interface {
 // opt out of part of the contract — each new family is added here as it
 // lands.
 func Run(t *testing.T, h Harness) {
+	t.Run("Plans", func(t *testing.T) { TestPlans(t, h) })
+	t.Run("PlanComments", func(t *testing.T) { TestPlanComments(t, h) })
 	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
 	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
+	t.Run("Locks", func(t *testing.T) { TestLocks(t, h) })
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the

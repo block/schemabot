@@ -5,7 +5,7 @@
 
 image:
   repository: schemabot
-  tag: test
+  # The tag is per-run and always passed by e2e-test.sh via --set image.tag.
   pullPolicy: Never
 
 replicaCount: 2

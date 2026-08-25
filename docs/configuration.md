@@ -19,6 +19,7 @@
 - [Storage Dialect](#storage-dialect)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
+- [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
@@ -531,6 +532,45 @@ A database can override the server-level value by setting the same key
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+## PlanetScale mTLS
+
+Some PlanetScale-compatible endpoints require mutual TLS: every MySQL
+connection must present a client certificate in addition to verifying the
+server. The `planetscale:` block registers that identity process-wide at
+startup, and the Vitess engine then applies it to every MySQL connection it
+opens — branch hosts and vtgates alike:
+
+```yaml
+planetscale:
+  mtls:
+    ca_bundle: /etc/ssl/certs/ca-certificates.crt  # verifies the endpoint's server cert
+    client_cert: /etc/secrets/pca/tls.crt          # client identity presented to the endpoint
+    client_key: /etc/secrets/pca/tls.key
+```
+
+All three paths are required together, and the server fails startup when any
+file is missing or unparseable — a worker never comes up without the identity
+its endpoints require, where it would otherwise fail (or silently degrade) on
+every Vitess connection.
+
+This is the knob for the Vitess engine's own connections, and it works the
+same for statically registered databases and dynamically resolved targets (a
+data plane using `target_resolver`, which has no per-database config to
+attach TLS to). The registration is process-wide with no per-database
+opt-out: once set, every Vitess database this server serves connects with
+mTLS. Serve endpoints that require mTLS and plaintext endpoints (such as a
+LocalScale instance) from separate server processes.
+
+Certificate rotation on the configured paths takes effect without a restart:
+the client certificate and key are re-read from disk on every new
+connection's handshake, so replacing the mounted files (as a certificate
+manager does when renewing) rotates the presented identity on its own. The
+CA bundle is read once at startup — replacing it requires a restart.
+
+Certificate delivery is deployment infrastructure, not server config: in the
+Helm chart, mount the certificate secret with `extraVolumes` /
+`extraVolumeMounts` and point these paths at the mount.
 
 ## Storage Schema Changes
 

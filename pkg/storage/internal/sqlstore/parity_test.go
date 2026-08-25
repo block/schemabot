@@ -18,11 +18,13 @@ import (
 type mysqlHarness struct{}
 
 func (mysqlHarness) NewStorage(t *testing.T) storage.Storage {
+	t.Helper()
 	clearTables(t)
 	return NewMySQL(testDB)
 }
 
 func (mysqlHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
+	t.Helper()
 	db, err := sql.Open("mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
