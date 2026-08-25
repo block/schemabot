@@ -55,6 +55,172 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("MarkMinimizedPreservesStamp", func(t *testing.T) { testPostgresMarkMinimizedPreservesStamp(t, h) })
 	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
 	t.Run("LockAcquireSameOwnerConcurrent", func(t *testing.T) { testPostgresLockAcquireSameOwnerConcurrent(t, h) })
+	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
+	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
+	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
+}
+
+// backdatePostgresSummaryClaim pushes an apply's summary marker updated_at
+// past the stale-claim window, simulating a publisher that crashed after
+// claiming.
+func backdatePostgresSummaryClaim(t *testing.T, db *sql.DB, applyID int64) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), `
+		UPDATE apply_comments SET updated_at = now() - make_interval(secs => $1)
+		WHERE apply_id = $2 AND comment_state = $3
+	`, int64(storage.SummaryClaimStaleAfter.Seconds())+1, applyID, state.Comment.Summary)
+	require.NoError(t, err)
+}
+
+// testPostgresApplyCommentReclaimStaleSummaryClaim verifies crashed-publisher
+// takeover on PostgreSQL: a claim sentinel older than the stale window
+// transfers to the reclaimer (bumping updated_at so a second reclaimer
+// loses), while a fresh sentinel, a missing marker, and a recorded real
+// comment are all not reclaimable. Aging the sentinel requires backdating
+// updated_at with raw SQL, which the storage interface cannot express, so
+// the scenario lives in each dialect suite.
+func testPostgresApplyCommentReclaimStaleSummaryClaim(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_reclaim_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_reclaim", 720)
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "missing marker is not reclaimable")
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "fresh sentinel is an in-flight publish, not reclaimable")
+
+	// Backdate the sentinel past the stale window to simulate a publisher that
+	// crashed between claiming and posting.
+	backdatePostgresSummaryClaim(t, h.db, apply.ID)
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.True(t, reclaimed, "stale sentinel transfers to the reclaimer")
+
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-reclaimed sentinel is fresh again; a second reclaimer loses")
+
+	// A recorded real comment is never reclaimable, however old.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	backdatePostgresSummaryClaim(t, h.db, apply.ID)
+	reclaimed, err = store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a posted summary must never be reclaimed")
+}
+
+// testPostgresApplyCommentMutationsStampUpdatedAt verifies that every comment
+// mutation renews the row's updated_at on PostgreSQL. The summary-claim
+// machinery reads the column as its freshness signal, and stamping it is the
+// application's responsibility on every dialect — the PostgreSQL schema has
+// no automatic renewal, so a dropped stamp would leave the backdated value in
+// place. An upsert replay that writes identical values still counts as
+// publisher activity and renews the timestamp.
+func testPostgresApplyCommentMutationsStampUpdatedAt(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_stamp_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_updated_at_stamp", 721)
+
+	frozen := int64(900)
+	comment := &storage.ApplyComment{
+		ApplyID:                apply.ID,
+		CommentState:           state.Comment.Progress,
+		GitHubCommentID:        1001,
+		PendingFreezeCommentID: &frozen,
+	}
+	require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+
+	backdate := func(t *testing.T) time.Time {
+		t.Helper()
+		_, err := h.db.ExecContext(t.Context(), `
+			UPDATE apply_comments SET updated_at = now() - interval '1 hour'
+			WHERE apply_id = $1 AND comment_state = $2
+		`, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		stale, err := store.ApplyComments().Get(t.Context(), apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, stale)
+		return stale.UpdatedAt
+	}
+
+	// The subtests mutate one shared comment row and depend on this order:
+	// "clear pending freeze" only matches because the preceding upserts re-set
+	// the freeze marker, and "supersede" must run last because it retires the
+	// row from further mutation.
+	mutations := []struct {
+		name   string
+		mutate func(t *testing.T)
+	}{
+		{"upsert conflict update", func(t *testing.T) {
+			comment.GitHubCommentID = 1002
+			require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+		}},
+		{"identical-value upsert replay", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
+		}},
+		{"increment edit count", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().IncrementEditCount(ctx, apply.ID, state.Comment.Progress))
+		}},
+		{"clear pending freeze", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
+		}},
+		{"supersede", func(t *testing.T) {
+			require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Progress))
+		}},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			stale := backdate(t)
+			m.mutate(t)
+			got, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.True(t, got.UpdatedAt.After(stale),
+				"mutation must renew updated_at (stale=%s got=%s)", stale, got.UpdatedAt)
+		})
+	}
+}
+
+// testPostgresApplyCommentClaimConversionRestartsStaleWindow verifies on
+// PostgreSQL that converting a superseded posted summary marker back into a
+// claim sentinel restarts the stale-claim window. The conversion is a
+// brand-new claim, so ReclaimStaleSummaryClaim must not immediately hand the
+// same claim to a second publisher.
+func testPostgresApplyCommentClaimConversionRestartsStaleWindow(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_claim_fresh_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_claim_fresh", 722)
+
+	// A stop's summary was posted and later consumed by a resume rotation,
+	// then the row sat idle long past the stale window.
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9001,
+	}))
+	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
+	backdatePostgresSummaryClaim(t, h.db, apply.ID)
+
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	require.NoError(t, err)
+	require.True(t, won, "the superseded posted marker converts back into a claim sentinel")
+
+	reclaimed, err := store.ApplyComments().ReclaimStaleSummaryClaim(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.False(t, reclaimed, "a just-converted sentinel is a fresh in-flight publish, not reclaimable")
 }
 
 // testPostgresMarkMinimizedPreservesStamp reads the raw minimized_at column to

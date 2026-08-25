@@ -17,6 +17,11 @@ type Dialect interface {
 	// named unique-key columns conflict. Modifier is placed between INSERT and
 	// INTO; Suffix is placed after the VALUES clause. A successful insert must
 	// report one affected row, while a conflict must report zero affected rows.
+	// The dialects diverge on non-conflict failures: MySQL's INSERT IGNORE
+	// downgrades other errors (value truncation, NOT NULL violations) to
+	// warnings, while PostgreSQL's ON CONFLICT DO NOTHING suppresses only the
+	// named conflict and surfaces everything else as an error. Callers must
+	// bind values that are valid for the schema so the two behave identically.
 	InsertIfAbsent(conflictColumns []string) InsertIfAbsentSyntax
 	// UpsertClause returns the trailing conflict-resolution clause that turns an
 	// INSERT into an upsert. conflictColumns names the unique key that defines a
@@ -167,6 +172,9 @@ var plainJSONIdentifier = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // InsertIfAbsent uses MySQL's INSERT IGNORE modifier. MySQL infers conflicts
 // from every unique key on the table, so conflictColumns is not rendered.
+// IGNORE suppresses more than duplicate-key conflicts — it also downgrades
+// value truncation and NOT NULL violations to warnings — so callers must bind
+// schema-valid values (see the Dialect interface contract).
 func (MySQLDialect) InsertIfAbsent(_ []string) InsertIfAbsentSyntax {
 	return InsertIfAbsentSyntax{Modifier: " IGNORE"}
 }
