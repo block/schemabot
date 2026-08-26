@@ -193,6 +193,13 @@ func TestTasks(t *testing.T, h Harness) {
 		_, err = store.Tasks().Create(ctx, task)
 		require.NoError(t, err)
 
+		bystander := newTask(apply, "task_shard_notable_bystander", "orders", created.Add(time.Second))
+		bystander.ApplyOperationID = &opID
+		bystander.Namespace = namespace
+		bystander.Shard = shard
+		_, err = store.Tasks().Create(ctx, bystander)
+		require.NoError(t, err)
+
 		byApply, err := store.Tasks().GetByApplyID(ctx, apply.ID)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"task_shard_notable"}, taskIdentifiers(byApply),
