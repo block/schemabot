@@ -82,11 +82,12 @@ func (s *planStore) GetByID(ctx context.Context, id int64) (*storage.Plan, error
 	return scanPlan(row)
 }
 
-// GetByLock returns plans for a lock.
+// GetByLock is not implemented: plans carry no direct lock association (a
+// join through applies would be required), and no caller needs one yet.
+// Returning ErrNotImplemented keeps the missing capability loud — a silent
+// empty result would be indistinguishable from "no plans for this lock".
 func (s *planStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Plan, error) {
-	// Plans don't have a direct lock_id, so we join through applies
-	// For now, return empty - this can be implemented when needed
-	return nil, nil
+	return nil, fmt.Errorf("get plans by lock %d: %w", lockID, storage.ErrNotImplemented)
 }
 
 // GetByPR returns all plans for a PR, newest first.

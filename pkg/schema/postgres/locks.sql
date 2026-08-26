@@ -6,6 +6,7 @@ CREATE TABLE locks (
   pull_request bigint NOT NULL,
   owner varchar(255) NOT NULL,
   pending_plan_id varchar(255) NOT NULL DEFAULT '',
+  disclosed_copy_discard boolean NOT NULL DEFAULT FALSE,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)

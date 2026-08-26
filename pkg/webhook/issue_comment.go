@@ -92,7 +92,7 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	if !result.Found {
 		return issueCommentGateCommandNotFound
 	}
-	if result.Action != action.Apply && parser.HasAutoConfirmFlag(commentBody) {
+	if parser.HasAutoConfirmFlag(commentBody) {
 		return issueCommentGateAutoConfirm
 	}
 	if result.Action == action.Rollback && parser.HasDeferCutoverFlag(commentBody) {
@@ -390,7 +390,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Reject -y/--yes on commands that don't support it
+	// Reject -y/--yes: it is a CLI flag, and no comment command takes it
 	if gateReason == issueCommentGateAutoConfirm {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping unsupported auto-confirm flag reply for unscoped fan-out; the leader posts it once",
@@ -612,19 +612,29 @@ func unscopedCommandFansOut(result CommandResult) bool {
 	return result.MissingEnv && result.Action == action.Plan
 }
 
-// postComment posts a comment on a PR.
-func (h *Handler) postComment(repo string, pr int, installationID int64, body string) {
+// postCommentReportingError posts a comment on a PR and reports whether it
+// landed. A caller that records durable state describing what a comment told
+// the operator must post through this rather than postComment: a swallowed post
+// failure would leave the record claiming they were shown something they never
+// saw.
+func (h *Handler) postCommentReportingError(repo string, pr int, installationID int64, body string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
-		h.logger.Error("failed to create GitHub client for comment",
-			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
-		return
+		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
 	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body)); err != nil {
+		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
+	}
+	return nil
+}
+
+// postComment posts a comment on a PR, best effort.
+func (h *Handler) postComment(repo string, pr int, installationID int64, body string) {
+	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
 		h.logger.Error("failed to post comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)
 	}

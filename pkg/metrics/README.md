@@ -97,9 +97,9 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
-**operation** (check ownership): `apply_finished`, `rollback_finished`
+**operation** (check ownership): `apply_finished`, `apply_cancelled_finished`, `rollback_finished`
 
-**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`, `schema_config_source_policy`, `schema_config_environment_validation`
+**operation** (status checks): `plan_check_recorded`, `apply_started`, `apply_finished`, `apply_cancelled_finished`, `rollback_finished`, `aggregate_check_sync`, `stale_check_cleanup`, `stale_check_reconciliation`, `schema_config_discovery`, `schema_config_source_policy`, `schema_config_environment_validation`
 
 **status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
@@ -172,6 +172,7 @@ Operation values:
 | Operation | Meaning |
 |---|---|
 | `apply_finished` | A driver tried to record a terminal apply result, but the stored check state no longer belonged to that apply. |
+| `apply_cancelled_finished` | A driver tried to record a cancelled forward apply result, but a newer apply superseded the cancellation. |
 | `rollback_finished` | A rollback driver tried to mark the check `action_required`, but the stored check state no longer belonged to that rollback apply. |
 
 A spike is still dangerous because the live database can keep changing after the
@@ -224,6 +225,7 @@ Operation values:
 | `plan_check_recorded` | SchemaBot stored per-database check state for a plan result. This is the internal state later rolled into the aggregate GitHub Check Run. |
 | `apply_started` | SchemaBot marked stored check state as owned by an accepted apply and set it to `in_progress`. This is a check lifecycle event, not proof that the engine has started copying rows. |
 | `apply_finished` | SchemaBot updated stored check state after an apply reached a terminal state, such as success or failure. |
+| `apply_cancelled_finished` | SchemaBot finalized a cancelled forward apply, either releasing ownership when no task completed or retaining a terminal failure when part of the schema change reached the target. |
 | `rollback_finished` | SchemaBot marked stored check state `action_required` after a rollback succeeded because the PR's desired schema is no longer present in that environment. |
 | `aggregate_check_sync` | SchemaBot tried to make the visible aggregate GitHub Check Run match stored per-database check state. The status label says whether it created/updated, skipped, blocked, or failed. |
 | `stale_check_cleanup` | SchemaBot handled stored check state for a database that is no longer touched by the latest commit on the PR branch. Plan-only state can be cleared; apply-owned state stays blocked. |

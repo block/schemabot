@@ -4,10 +4,12 @@ package spirit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/checksum"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
@@ -22,6 +24,17 @@ import (
 // in redo-aware mode this throttler is also the backstop that lets the
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
+
+// classifyRunnerError marks runner failures that reproduce after every
+// completed checksum attempt as permanent so operator retries are not spent
+// repeating a lossy schema change. Attempts that errored before establishing
+// row differences remain retryable.
+func classifyRunnerError(err error) error {
+	if errors.Is(err, checksum.ErrDifferencesExhausted) {
+		return &engine.PermanentError{Err: err}
+	}
+	return err
+}
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
@@ -334,7 +347,7 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	defer utils.CloseAndLog(runner)
 
 	if err := runner.Run(ctx); err != nil {
-		return fmt.Errorf("run Spirit: %w", err)
+		return fmt.Errorf("run Spirit: %w", classifyRunnerError(err))
 	}
 
 	return nil
@@ -424,9 +437,10 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 		logger.Error("schema change failed",
 			"error", err,
 		)
-		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", err))
+		classifiedErr := classifyRunnerError(err)
+		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", classifiedErr))
 		utils.CloseAndLog(runner)
-		return err
+		return classifiedErr
 	}
 
 	utils.CloseAndLog(runner)

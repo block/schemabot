@@ -140,7 +140,7 @@ type LocalConfig struct {
 	// engine via Credentials.Metadata and reads specific keys as needed.
 	// Keys used by PlanetScale: organization, database (the PlanetScale
 	// database name when it differs from the registered identifier),
-	// token_name, token_value, tls_name, revert_window_duration, main_branch.
+	// token_name, token_value, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)

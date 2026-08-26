@@ -1028,7 +1028,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 
 	optionsUpdate := ""
 	args := []any{
-		apply.State, apply.ErrorMessage, apply.Attempt,
+		apply.State, apply.ErrorMessage,
 		apply.ExternalID,
 	}
 	if len(apply.Options) > 0 {
@@ -1042,9 +1042,14 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		args = append(args, lease.Token)
 	}
 
+	// The recovery budget (attempt) is deliberately not written here. It is
+	// owned by the insert at create time and by the claim transition's atomic
+	// attempt + 1: a driver's in-memory copy goes stale the moment the stored
+	// budget is adjusted out-of-band mid-drive, and persisting it absolutely
+	// would silently reset that adjustment and re-open expired recovery.
 	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
-		SET state = ?, error_message = ?, attempt = ?,
+		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?%s
 	`, optionsUpdate, leasePredicate), args...)
