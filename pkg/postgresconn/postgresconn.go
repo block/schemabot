@@ -49,6 +49,21 @@ func WithConnectTimeout(d time.Duration) Option {
 	}
 }
 
+// WithRootCAs pins the certificate authorities the connection trusts when the
+// DSN requests certificate verification, replacing the trust the DSN or the
+// RDS default would otherwise install. The caller parses the bundle, so a
+// missing or malformed bundle fails closed where it is resolved rather than
+// inside a later dial. A DSN that does not negotiate TLS carries no trust to
+// pin, so the option leaves it untouched.
+func WithRootCAs(roots *x509.CertPool) Option {
+	return func(cfg *pgx.ConnConfig) {
+		if cfg.TLSConfig == nil {
+			return
+		}
+		cfg.TLSConfig.RootCAs = roots
+	}
+}
+
 // Open returns a PostgreSQL connection pool with SchemaBot's required
 // transport settings applied (see ConnectionDSN). A DSN that requests
 // certificate verification against an RDS host without naming a root bundle

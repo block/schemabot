@@ -41,6 +41,15 @@ type nativeApply struct {
 	sql       string
 }
 
+// targetConn carries one background apply's connection inputs: the raw DSN
+// (normalized at open time) and the CA bundle path the pool verifies the
+// target against — empty when the embedded RDS trust or the DSN's own
+// settings apply.
+type targetConn struct {
+	dsn        string
+	caCertPath string
+}
+
 // Apply starts one native-safe PostgreSQL statement under pg-sprite's bounded
 // optimistic executor. Planner-produced sequences use the same execution seam
 // but are deliberately not admitted by this first increment.
@@ -49,17 +58,23 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, err
 	}
+	// Resolve the CA reference at acceptance so a trust root the engine
+	// cannot honor refuses the apply before any background work is queued.
+	caPath, err := caCertPath(req.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
+	}
 
 	started := time.Now()
 	key := progressIdentity(req.ResumeState)
 	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""))
 	bgCtx := context.WithoutCancel(ctx)
-	dsn := req.Credentials.DSN
+	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	logger := req.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e.wg.Go(func() { e.runOptimisticApply(bgCtx, dsn, change, key, started, logger) })
+	e.wg.Go(func() { e.runOptimisticApply(bgCtx, conn, change, key, started, logger) })
 
 	return &engine.ApplyResult{
 		Accepted:    true,
@@ -94,12 +109,12 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
 }
 
-func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nativeApply, key string, started time.Time, logger *slog.Logger) {
+func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
-	err := executeOptimistic(ctx, dsn, change)
+	err := executeOptimistic(ctx, conn, change)
 	if err == nil {
 		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
 		return
@@ -181,12 +196,12 @@ func classifyRefusal(err error, table string) *refusal {
 	return nil
 }
 
-func executeOptimistic(ctx context.Context, rawDSN string, change nativeApply) error {
-	dsn, err := postgresconn.ConnectionDSN(rawDSN)
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply) error {
+	dsn, err := postgresconn.ConnectionDSN(conn.dsn)
 	if err != nil {
 		return fmt.Errorf("normalize PostgreSQL DSN for apply: %w", err)
 	}
-	pool, err := dbconn.NewPool(ctx, dbconn.Config{URL: dsn})
+	pool, err := dbconn.NewPool(ctx, dbconn.Config{URL: dsn, CACertPath: conn.caCertPath})
 	if err != nil {
 		return fmt.Errorf("open pg-sprite apply pool: %w", err)
 	}

@@ -2,6 +2,7 @@ package postgresconn
 
 import (
 	"context"
+	"crypto/x509"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -141,6 +142,21 @@ func TestConnectionConfigVerifiesRDSHostsWithEmbeddedRoots(t *testing.T) {
 	assert.Nil(t, cfg.TLSConfig.RootCAs)
 }
 
+// A caller-supplied bundle always wins: WithRootCAs replaces the RDS default
+// trust, and a DSN that negotiates no TLS has nothing to pin.
+func TestWithRootCAsPinsVerificationTrust(t *testing.T) {
+	roots := x509.NewCertPool()
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.cluster-abc123.eu-west-1.rds.amazonaws.com:5432/app?sslmode=verify-full", WithRootCAs(roots))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Same(t, roots, cfg.TLSConfig.RootCAs)
+}
+
+func TestWithRootCAsLeavesNonTLSConnectionsUntouched(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app?sslmode=disable", WithRootCAs(x509.NewCertPool()))
+	require.NoError(t, err)
+	assert.Nil(t, cfg.TLSConfig)
+}
 func TestWithConnectTimeout(t *testing.T) {
 	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))
 	require.NoError(t, err)
