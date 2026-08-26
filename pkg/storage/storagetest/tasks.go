@@ -162,6 +162,48 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, int64(2), count, "the unfiltered count includes reflected shard rows")
 	})
 
+	// A shard row with no table name stores table_name as NULL, and
+	// storage.ShardOperationKey builds its key with an empty table segment
+	// ("ns/shard/"). Both shard-scoped loaders must apply the same key
+	// semantics: the row matches a work operation keyed with the empty
+	// table segment, on every dialect.
+	t.Run("ShardScopedLoaders_EmptyTableNameKey", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_shard_notable_db", storage.DatabaseTypeStrata)
+		apply := CreateApply(t, store, lock, "apply_task_shard_notable", 906)
+		created := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+		namespace, shard := "commerce", "80-"
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:       apply.ID,
+			Deployment:    "region-a",
+			OperationKey:  storage.ShardOperationKey(namespace, shard, ""),
+			OperationKind: storage.ApplyOperationKindWork,
+			Target:        apply.Database,
+		})
+		require.NoError(t, err)
+
+		task := newTask(apply, "task_shard_notable", "", created)
+		task.ApplyOperationID = &opID
+		task.Namespace = namespace
+		task.Shard = shard
+		task.DDL = "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"
+		task.DDLAction = "create"
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+
+		byApply, err := store.Tasks().GetByApplyID(ctx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"task_shard_notable"}, taskIdentifiers(byApply),
+			"an empty-table shard row must match its work operation's empty-table key")
+
+		byOp, err := store.Tasks().GetByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"task_shard_notable"}, taskIdentifiers(byOp),
+			"the operation-scoped loader must apply the same empty-table key semantics")
+	})
+
 	t.Run("Update_LeaseGuardsWrites", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
