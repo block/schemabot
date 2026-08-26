@@ -1543,11 +1543,12 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	// (e.g. the remote side has not settled yet) would be re-claimed on every
 	// poll. A lease acquired after the request blocks rematching until the
 	// request is re-issued (cr.updated_at moves past lease_acquired_at) or the
-	// lease goes stale. The comparison admits equal timestamps: both columns
-	// have second precision, so a cancel issued in the same second as the last
-	// lease rotation (an operator stopping then immediately cancelling) must
-	// still claim now rather than wait out the staleness window; the claim's
-	// own lease rotation bounds any same-second rematch to that one second.
+	// lease goes stale. The comparison admits equal timestamps: some dialects
+	// store these columns no finer than one second, so a cancel issued close
+	// enough to the last lease rotation to share its stored timestamp (an
+	// operator stopping then immediately cancelling) must still claim now
+	// rather than wait out the staleness window; the claim's own lease
+	// rotation bounds any equal-timestamp rematch to that one tick.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a

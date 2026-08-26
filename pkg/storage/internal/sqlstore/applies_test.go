@@ -3132,9 +3132,10 @@ func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *tes
 // keeps its stopped state (the drive, not the claim, terminalizes it) and the
 // cancel request stays pending for the drive to consume. A lease acquired
 // after the request blocks rematching, so a cancel the drive could not finish
-// is retried on lease staleness, not on every poll — but a request issued in
-// the same second as the lease (the timestamps have second precision) still
-// claims, so a stop-then-cancel operator never waits out the staleness window.
+// is retried on lease staleness, not on every poll — but a request whose
+// stored timestamp equals the lease's (some dialects store them no finer than
+// one second) still claims, so a stop-then-cancel operator never waits out
+// the staleness window.
 func TestApplyStore_ClaimApplyByIDClaimsStoppedWithPendingCancel(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -4065,9 +4066,6 @@ func createTestLockWithPR(t *testing.T, store *Storage, dbName, dbType, repo str
 	return storagetest.CreateLockWithPR(t, store, dbName, dbType, repo, pr)
 }
 
-// getStartControlRequest reads the 'start' control request for an apply
-// regardless of status, so tests can assert on a failed request that the
-// status-scoped GetPending accessor cannot return.
 // requestPendingControlOperation records a pending control request of the
 // given operation for the apply, failing the test if one is already pending.
 func requestPendingControlOperation(t *testing.T, store *Storage, applyID int64, op storage.ControlOperation) {
@@ -4082,6 +4080,9 @@ func requestPendingControlOperation(t *testing.T, store *Storage, applyID int64,
 	require.False(t, alreadyPending)
 }
 
+// getStartControlRequest reads the 'start' control request for an apply
+// regardless of status, so tests can assert on a failed request that the
+// status-scoped GetPending accessor cannot return.
 func getStartControlRequest(t *testing.T, applyID int64) *storage.ApplyControlRequest {
 	t.Helper()
 	row := testDB.QueryRowContext(t.Context(), `

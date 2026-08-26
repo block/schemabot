@@ -1115,10 +1115,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// keeps matching that predicate and a peer could re-lease it mid-drive.
 		// As resuming (an active state) it is re-leasable only by the
 		// heartbeat-guarded stale-active clause, which recovers a crashed drive.
-		// A cancel drive holds resuming only transiently — it terminalizes the
-		// row from its cancelled tasks — and a declined cancel's leftover
-		// resuming row is reconciled from the stopped parent when the
-		// stale-active clause recovers it (reconcileUnclaimableParent).
+		// A cancel drive holds resuming only transiently: after the drive the
+		// row is re-derived from its own tasks — cancelled tasks terminalize
+		// it, and a drive that delivered nothing settles it back to stopped.
+		// A crashed drive's leftover resuming row is recovered by the
+		// stale-active clause, whose next drive re-derives it the same way or,
+		// when the parent already terminalized, mirrors the terminal parent
+		// down (reconcileUnclaimableParent).
 		// WHERE state = ? guards a concurrent transition landing between the
 		// SELECT and this UPDATE; RowsAffected == 0 means another writer moved it.
 		result, err := tx.ExecContext(ctx, `
