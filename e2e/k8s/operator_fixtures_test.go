@@ -115,16 +115,7 @@ func startIndexAddApply(t *testing.T, tablePrefix string, waitForRunning bool) r
 
 func startIndexAddApplyWithOptions(t *testing.T, tablePrefix string, waitForRunning bool, applyOpts map[string]string, rowCount int) runningIndexApply {
 	t.Helper()
-	return startIndexAddApplyAtEndpoint(t, testutil.Endpoint(t), tablePrefix, waitForRunning, applyOpts, rowCount)
-}
-
-// startIndexAddApplyAtEndpoint is startIndexAddApplyWithOptions against an
-// explicit control-plane endpoint, for tests that run after a control-plane
-// pod replacement invalidated the suite-level port-forward and therefore
-// bring their own.
-func startIndexAddApplyAtEndpoint(t *testing.T, endpoint, tablePrefix string, waitForRunning bool, applyOpts map[string]string, rowCount int) runningIndexApply {
-	t.Helper()
-	ep, dsn := endpoint, testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName(tablePrefix)
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(

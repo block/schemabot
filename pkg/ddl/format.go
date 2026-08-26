@@ -133,12 +133,13 @@ func formatCreateTable(ddl string) string {
 
 	// Format table options
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
+	options, partition := splitPartitionClause(options)
 
 	if len(parts) <= 1 {
 		// Single column — no line-break formatting for columns,
 		// but still format table options if present
-		if options != "" {
-			return header + strings.TrimSpace(body) + ") " + formatTableOptions(options)
+		if options != "" || partition != "" {
+			return header + strings.TrimSpace(body) + ")" + formatFooter(options, partition)
 		}
 		return ddl
 	}
@@ -156,13 +157,49 @@ func formatCreateTable(ddl string) string {
 		sb.WriteString("\n")
 	}
 	sb.WriteString(")")
+	sb.WriteString(formatFooter(options, partition))
 
-	// Format table options: each on its own line (2-space indent, PlanetScale style)
+	return sb.String()
+}
+
+// splitPartitionClause separates the trailing PARTITION BY clause, if any,
+// from a CREATE TABLE options footer. Quoted strings are skipped so a COMMENT
+// mentioning PARTITION BY is not mistaken for the clause.
+func splitPartitionClause(options string) (opts, partition string) {
+	const clause = "PARTITION BY"
+	inQuote := false
+	for i := 0; i+len(clause) <= len(options); i++ {
+		if options[i] == '\'' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		if strings.EqualFold(options[i:i+len(clause)], clause) {
+			return strings.TrimSpace(options[:i]), strings.TrimSpace(options[i:])
+		}
+	}
+	return options, ""
+}
+
+// formatFooter renders what follows the column list's closing parenthesis:
+// table options each on their own line (2-space indent, PlanetScale style),
+// then the PARTITION BY clause on its own line.
+func formatFooter(options, partition string) string {
+	var sb strings.Builder
 	if options != "" {
 		sb.WriteString(" ")
 		sb.WriteString(formatTableOptions(options))
 	}
-
+	if partition != "" {
+		if options != "" {
+			sb.WriteString("\n  ")
+		} else {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(partition)
+	}
 	return sb.String()
 }
 

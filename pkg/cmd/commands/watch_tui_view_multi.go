@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -59,9 +60,9 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 		if model.FirstFailure.Error != "" {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf("⚠ First failure: %s — %s", model.FirstFailure.Deployment, model.FirstFailure.Error)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s — %s", model.FirstFailure.Deployment, model.FirstFailure.Error)))
 		} else {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf("⚠ First failure: %s", model.FirstFailure.Deployment)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Deployment)))
 		}
 	}
 	if m.applyID != "" {

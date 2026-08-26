@@ -3,6 +3,7 @@ package templates
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -28,4 +29,18 @@ func TestWriteUnsafeChangesWarning_SplitsJoinedReasons(t *testing.T) {
 	assert.Contains(t, out, "  • users: DROP TABLE removes all data\n")
 	assert.Contains(t, out, "  • audit_log: drop\n")
 	assert.NotContains(t, out, "data; ")
+}
+
+// Plan-time unsafe changes await consent, so the heading carries Attention;
+// a blocked apply is a refusal, so its heading carries Refused and names the
+// refusal itself, with the Escalation instruction for granting consent.
+func TestUnsafeChangeHeadings_PlanWarnsApplyRefuses(t *testing.T) {
+	changes := []UnsafeChange{{Table: "users", Reason: "DROP TABLE removes all data"}}
+
+	planOut := captureStdout(t, func() { WriteUnsafeChangesWarning(changes) })
+	assert.Contains(t, planOut, glyph.Attention+" Unsafe Changes Detected:")
+
+	applyOut := captureStdout(t, func() { WriteUnsafeChangesBlocked(changes, "testapp", "staging", ".") })
+	assert.Contains(t, applyOut, glyph.Refused+" Apply blocked: 1 unsafe change(s) detected")
+	assert.Contains(t, applyOut, glyph.Escalation+" To proceed with these destructive changes, re-run with --allow-unsafe:")
 }

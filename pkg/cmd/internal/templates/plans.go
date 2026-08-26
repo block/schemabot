@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -102,19 +103,12 @@ func WritePlansList(data PlansListData) {
 	}
 }
 
-// MarkerUnsafe and MarkerBlocked are the safety markers a plan's change
-// summary carries. The summary is built where the plan data is read and the
-// legend is printed here, so both sides take the glyph from these constants —
-// a legend that named a marker the table no longer prints would be worse than
-// no legend at all.
-const (
-	MarkerUnsafe  = "⚠️"
-	MarkerBlocked = "⛔"
-)
-
 // changesLegend names the safety markers appearing in the listed plans'
 // change summaries, so a marker is never a symbol the operator has to guess
-// at. A listing without markers prints no legend at all.
+// at. A listing without markers prints no legend at all. The summary is built
+// where the plan data is read and the legend is printed here, so both sides
+// take the glyph from pkg/glyph — a legend that named a marker the table no
+// longer prints would be worse than no legend at all.
 func changesLegend(plans []PlanSummaryData) string {
 	var hasUnsafe, hasBlocked bool
 	for _, p := range plans {
@@ -123,10 +117,10 @@ func changesLegend(plans []PlanSummaryData) string {
 	}
 	var parts []string
 	if hasUnsafe {
-		parts = append(parts, MarkerUnsafe+" unsafe change")
+		parts = append(parts, glyph.Attention+" unsafe change")
 	}
 	if hasBlocked {
-		parts = append(parts, MarkerBlocked+" blocked change")
+		parts = append(parts, glyph.Refused+" blocked change")
 	}
 	return strings.Join(parts, " · ")
 }

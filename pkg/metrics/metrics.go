@@ -602,8 +602,9 @@ func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{
-	"apply_finished":    true,
-	"rollback_finished": true,
+	"apply_finished":           true,
+	"apply_cancelled_finished": true,
+	"rollback_finished":        true,
 }
 
 // RecordCheckOwnershipMiss increments the counter for guarded check updates
@@ -2031,6 +2032,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,
 	"apply_finished":                       true,
+	"apply_cancelled_finished":             true,
 	"rollback_finished":                    true,
 	"aggregate_check_sync":                 true,
 	"stale_check_cleanup":                  true,

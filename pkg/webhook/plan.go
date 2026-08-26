@@ -52,9 +52,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, tenant, err) {
-			h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+			h.logger.Debug("unscoped fan-out plan resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
 		}
@@ -257,12 +257,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
+					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
+				return
+			}
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
 			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
-			if h.skipUnownedUnscopedCommand(repo, tenant, unownedErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, unownedErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
@@ -274,7 +279,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	} else {
 		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
 		if findErr != nil {
-			if h.skipUnownedUnscopedCommand(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "error", findErr)
 				return

@@ -2021,7 +2021,7 @@ schemabot apply -e staging
 ```
 
 
-❌ Apply Blocked: Database Locked
+⛔ Apply blocked: database locked
 
 ┌───────────────────────────────────┐
 │  Database:   testapp (mysql)      │
@@ -2047,7 +2047,7 @@ Options:
 ```
 
 
-❌ Apply Blocked: Database Locked
+⛔ Apply blocked: database locked
 
 ┌────────────────────────────────────────────────┐
 │  Database:   testapp (mysql)                   │
@@ -7708,7 +7708,7 @@ schemabot apply -e production
 │  Deployments:  1 completed · 1 halted · 1 failed      │
 └───────────────────────────────────────────────────────┘
 
-  ⚠ First failure: eu-west — duplicate key name 'idx_orders_source'
+  ❌ First failure: eu-west — duplicate key name 'idx_orders_source'
 
   Next: review failure in eu-west
 
@@ -8243,7 +8243,7 @@ Lint violations: Non-blocking warnings during plan/apply
 
 Unsafe blocked: Destructive changes require --allow-unsafe
 
-⛔ Unsafe Changes Detected:
+⛔ Apply blocked: 3 unsafe change(s) detected
   • users: DROP COLUMN email
   • orders: DROP TABLE
   • products:

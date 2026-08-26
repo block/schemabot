@@ -96,14 +96,17 @@ var Apply = struct {
 //  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
 //  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
 //  11. Any task RUNNING → Apply RUNNING
-//  12. Any task CATCHING_UP → Apply CATCHING_UP
-//  13. Any task CHECKSUMMING → Apply CHECKSUMMING
-//  14. Any task POST_CHECKSUM → Apply POST_CHECKSUM
-//  15. Otherwise → Apply PENDING
+//  12. Any task in a post-copy phase while any task is still PENDING → Apply RUNNING
+//  13. Any task CATCHING_UP → Apply CATCHING_UP
+//  14. Any task CHECKSUMMING → Apply CHECKSUMMING
+//  15. Any task POST_CHECKSUM → Apply POST_CHECKSUM
+//  16. Otherwise → Apply PENDING
 //
-// The post-copy phases (11–14) surface the least-advanced active phase:
-// while any table is still copying rows the apply is Running; once every
-// active table is draining or verifying, the apply names that phase.
+// The post-copy phases (13–15) surface the least-advanced active phase, and
+// only once every table has started: while any table is still copying rows —
+// or still queued with its whole copy ahead of it — the apply is Running.
+// Once every table has at least begun and the active ones are draining or
+// verifying, the apply names that phase.
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -159,6 +162,9 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Running] > 0 {
 		return Apply.Running
 	}
+	if postCopyPhaseWithQueuedWork(counts) {
+		return Apply.Running
+	}
 	if counts[Apply.CatchingUp] > 0 {
 		return Apply.CatchingUp
 	}
@@ -169,6 +175,18 @@ func DeriveApplyState(taskStates []string) string {
 		return Apply.PostChecksum
 	}
 	return Apply.Pending
+}
+
+// postCopyPhaseWithQueuedWork reports whether a task is draining or verifying
+// (catching up, checksumming, or post-checksum) while another task has not
+// started. Naming the phase at the apply level would overstate progress — the
+// queued tables still have their whole copy ahead — so the apply stays Running
+// until every table has begun.
+func postCopyPhaseWithQueuedWork(counts map[string]int) bool {
+	if counts[Apply.Pending] == 0 {
+		return false
+	}
+	return counts[Apply.CatchingUp] > 0 || counts[Apply.Checksumming] > 0 || counts[Apply.PostChecksum] > 0
 }
 
 // RolloutChild is one apply_operation's contribution to the parent apply's
