@@ -4,6 +4,7 @@ package tern
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -398,4 +399,87 @@ func TestAdoptingTheSameLiveApplyIsRepeatableAndRecordedOnItsTimeline(t *testing
 		}
 	}
 	assert.Equal(t, 2, adoptions, "each adoption must leave its own entry on the apply's timeline")
+}
+
+// A batch at realistic size: ten tables having a column widened, one of which
+// finished before the apply lost its tracker. The operator's re-plan carries
+// nine changes against a live apply that owns ten, and the change is a column
+// type modification rather than an addition — the two sides of the comparison
+// render it from different sources, so the DDL each produces must still agree
+// once canonicalized. A live task carrying stale error text from a failure it
+// already recovered from must not perturb the match either.
+func TestApplyAdoptsALiveMultiTableApplyThatFinishedOneTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	const tableCount = 10
+	desired := make(map[string]string, tableCount)
+	names := make([]string, 0, tableCount)
+	for i := range tableCount {
+		name := fmt.Sprintf("widgets_%02d", i+1)
+		names = append(names, name)
+		_, err := f.db.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY, owner_id BIGINT)", name))
+		require.NoError(t, err)
+		desired[name] = fmt.Sprintf(
+			"CREATE TABLE %s (id INT PRIMARY KEY, owner_id BIGINT NOT NULL)", name)
+	}
+
+	first := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-batch-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	tasks, err := f.stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, tableCount, "the live apply must own every table's change")
+
+	// The first table finishes: its change lands on the target and its task
+	// completes. The rest are still in flight and still hold the database.
+	finished := names[0]
+	_, err = f.db.ExecContext(t.Context(),
+		fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN owner_id BIGINT NOT NULL", finished))
+	require.NoError(t, err)
+	res, err := f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Completed, apply.ID, finished)
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "exactly one table's task must be completed")
+
+	// A copy that recovered from a transient failure keeps running while still
+	// carrying the error text of the failure it survived.
+	res, err = f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ?, error_message = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Running, "schema change failed: failed to execute chunklet insert",
+		apply.ID, names[1])
+	require.NoError(t, err)
+	affected, err = res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "one table's copy must be running with stale error text")
+
+	// Re-planned against the target as it now stands, only the nine unfinished
+	// tables still differ.
+	secondPlan := f.planFor(t, desired)
+	second := f.dispatchPlan(t, secondPlan, "schemabot:v1:adopt-batch-second")
+	require.True(t, second.Accepted,
+		"a dispatch for the work still in flight must be adopted: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId,
+		"the dispatch must resolve into the live apply rather than starting a second one")
+	assert.Equal(t, first.ApplyOperationId, second.ApplyOperationId,
+		"the adopted dispatch must address the live apply's own operation")
+
+	var applies int
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	assert.Equal(t, 1, applies, "adoption must not create a second apply")
+
+	tasksAfter, err := f.stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, tasksAfter, tableCount, "adoption must not duplicate the live apply's work")
 }
