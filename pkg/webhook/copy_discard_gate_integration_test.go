@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/utils"
 	gh "github.com/google/go-github/v86/github"
@@ -36,6 +39,14 @@ const indexAddSchema = "CREATE TABLE `events` (\n" +
 // leaves behind, and it is the state a fresh apply would destroy.
 func seedAbandonedCopy(t *testing.T, dbName string) {
 	t.Helper()
+	seedPreChangeEvents(t, dbName)
+	seedCopyArtifacts(t, dbName)
+}
+
+// seedPreChangeEvents creates the `events` table in its pre-change shape, so
+// the schema the PR declares plans as a single ALTER against it.
+func seedPreChangeEvents(t *testing.T, dbName string) {
+	t.Helper()
 	db, err := sql.Open("mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
@@ -47,6 +58,17 @@ func seedAbandonedCopy(t *testing.T, dbName string) {
 		"  PRIMARY KEY (`id`)\n"+
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "seed pre-change events table")
+}
+
+// seedCopyArtifacts puts the unfinished copy itself on the target: the shadow
+// table and a checkpoint recording a different statement than the one the
+// PR's plan will hand the engine.
+func seedCopyArtifacts(t *testing.T, dbName string) {
+	t.Helper()
+	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()), "connect to target")
 
 	_, err = db.ExecContext(t.Context(), fmt.Sprintf(
 		"CREATE TABLE `%s` (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)", utils.NewTableName("events")))
@@ -160,4 +182,104 @@ func TestE2EDiscardingCopyDowngradesToConfirm(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, plan, "the pinned plan is the disclosing one that was stored")
 	assert.Equal(t, "webhook_copy_discard_gate", plan.Database)
+}
+
+// The copy on the target is read fresh on every plan, so a copy can appear
+// between the plan the automatic apply stored and the re-plan its dispatch
+// runs: another apply starts one, or an adopted copy's checkpoint ages out.
+// The dispatch-time re-plan gate downgrades to manual confirmation instead of
+// destroying, unattended, a copy the reviewed comment never disclosed. The
+// window has no user action inside it, so the test drives the dispatch core
+// directly with a stored plan made before the copy existed.
+func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
+	dbName := "webhook_copy_replan_gate"
+	svc := setupE2EService(t, dbName)
+	seedPreChangeEvents(t, dbName)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{"events.sql": indexAddSchema}, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), "schemabot")
+
+	const repo = "octocat/hello-world"
+	const pr = 1
+	schemaResult, err := h.createManagedSchemaRequestFromPR(t.Context(), installClient, repo, pr, "staging", "", action.Apply)
+	require.NoError(t, err)
+
+	// The plan the operator reviewed: made while the target holds no copy, so
+	// it discloses none.
+	prNumber := int32(pr)
+	planResp, err := h.executePlanWithTransientRetry(t.Context(), api.PlanRequest{
+		Database:          schemaResult.Database,
+		Environment:       "staging",
+		Type:              schemaResult.Type,
+		SchemaFiles:       schemaResult.SchemaFiles,
+		Repository:        repo,
+		PullRequest:       &prNumber,
+		HeadSHA:           &schemaResult.HeadSHA,
+		SchemaPath:        schemaResult.SchemaPath,
+		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		SourceTrusted:     true,
+	}, repo, pr)
+	require.NoError(t, err)
+	require.True(t, planResp.HasChanges(), "the schema declares an index the target does not have")
+	require.Empty(t, planResp.DiscardedCopies(), "the reviewed plan must disclose no copy for the window to exist")
+
+	storedPlan, err := svc.Storage().Plans().Get(t.Context(), planResp.PlanID)
+	require.NoError(t, err)
+	require.NotNil(t, storedPlan)
+
+	// The lock the automatic apply holds across the dispatch, pinned to the
+	// plan the operator was shown.
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Owner:         fmt.Sprintf("%s#%d", repo, pr),
+		Repository:    repo,
+		PullRequest:   pr,
+		PendingPlanID: planResp.PlanID,
+	}))
+
+	// The copy appears inside the window: after the reviewed plan, before the
+	// dispatch re-plans.
+	seedCopyArtifacts(t, dbName)
+
+	h.executeApply(t.Context(), installClient, repo, pr, schemaResult, "staging", 1, "testuser",
+		CommandResult{Action: action.Apply, Environment: "staging", Found: true, IsMention: true},
+		storedPlan, planResp.PlanID)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
+			"the downgraded comment discloses the copy the reviewed comment never showed")
+		assert.Contains(t, body, "`events`")
+		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "schemabot apply-confirm -e staging")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the downgraded plan comment")
+	}
+
+	// The downgrade spends nothing: the copy is untouched and no apply was
+	// dispatched against it.
+	requireCopyIntact(t, dbName)
+	applies, err := svc.Storage().Applies().GetByPR(t.Context(), repo, pr)
+	require.NoError(t, err)
+	for _, a := range applies {
+		assert.NotEqual(t, dbName, a.Database, "the paused dispatch must not have started an apply")
+	}
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the paused apply keeps the database locked for this PR")
+	assert.Equal(t, fmt.Sprintf("%s#%d", repo, pr), lock.Owner)
 }

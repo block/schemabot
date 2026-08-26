@@ -149,10 +149,14 @@ func (h *Handler) executeApply(
 	// discover a discard the reviewed comment never showed: another apply can
 	// start a copy, or an adopted copy's checkpoint can age out, between the
 	// operator's review and this moment. Downgrade so the operator confirms
-	// against a comment that discloses the copy actually at stake. A stored plan
-	// is what marks this as the automatic path; the confirm path arrives here
-	// with none, carrying the operator's own acknowledgement of the copy the
-	// comment they confirmed disclosed, so it does not stop again.
+	// against a comment that discloses the copy actually at stake. A stored
+	// plan is what marks this as the automatic path; the confirm path arrives
+	// here with none and deliberately does not stop again. That exemption is
+	// only as good as the comment the operator confirmed: the disposition can
+	// flip to a discard that comment never disclosed (a checkpoint ages past
+	// its resume bound, or apply-time routing changes the batch), and this
+	// path does not know what the confirmed comment showed, so it cannot tell
+	// an acknowledged discard from an unseen one.
 	if storedPlan != nil {
 		if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
 			h.logger.Info("automatic apply downgraded: re-plan discards an existing copy",
