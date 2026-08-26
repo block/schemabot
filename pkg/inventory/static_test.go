@@ -288,9 +288,47 @@ func TestNewStaticResolverValidatesDSNFromConfig(t *testing.T) {
 			wantErr: "dsn_from missing password_ref",
 		},
 		{
-			name:    "dsn_from non-mysql type",
+			name:    "dsn_from unsupported type",
 			target:  StaticTarget{DatabaseType: "vitess", DSNFrom: &StaticDSNFromConfig{ConfigRef: "env:X", Username: "u", PasswordRef: "env:P"}},
-			wantErr: "dsn_from is only supported for mysql",
+			wantErr: "dsn_from is only supported for mysql and postgres",
+		},
+		{
+			name: "mysql dsn_from with postgres-only ca_ref",
+			target: StaticTarget{DatabaseType: "mysql", DSNFrom: &StaticDSNFromConfig{
+				ConfigRef: "env:X", Username: "u", PasswordRef: "env:P", CARef: "embedded:rds-global",
+			}},
+			wantErr: "ca_ref is only supported for postgres",
+		},
+		{
+			name: "mysql dsn_from with postgres-only dbname path",
+			target: StaticTarget{DatabaseType: "mysql", DSNFrom: &StaticDSNFromConfig{
+				ConfigRef: "env:X", Username: "u", PasswordRef: "env:P",
+				ConfigPaths: StaticDSNFromPaths{DBName: "database"},
+			}},
+			wantErr: "config_paths.dbname is only supported for postgres",
+		},
+		{
+			name: "postgres dsn_from with weak sslmode",
+			target: StaticTarget{DatabaseType: "postgres", DSNFrom: &StaticDSNFromConfig{
+				ConfigRef: "env:X", Username: "u", PasswordRef: "env:P",
+				Params: map[string]string{"sslmode": "require"},
+			}},
+			wantErr: `sslmode must be "verify-full"`,
+		},
+		{
+			name: "postgres dsn_from with unknown param",
+			target: StaticTarget{DatabaseType: "postgres", DSNFrom: &StaticDSNFromConfig{
+				ConfigRef: "env:X", Username: "u", PasswordRef: "env:P",
+				Params: map[string]string{"sslrootcert": "/tmp/ca.pem"},
+			}},
+			wantErr: `params support only "sslmode"`,
+		},
+		{
+			name: "postgres dsn_from with malformed ca_ref",
+			target: StaticTarget{DatabaseType: "postgres", DSNFrom: &StaticDSNFromConfig{
+				ConfigRef: "env:X", Username: "u", PasswordRef: "env:P", CARef: "system",
+			}},
+			wantErr: "ca_ref must be",
 		},
 	}
 
@@ -500,4 +538,140 @@ func TestNewStaticResolverValidatesSchemaOverrides(t *testing.T) {
 			assert.ErrorContains(t, err, tt.wantErr)
 		})
 	}
+}
+
+// A postgres dsn_from target assembles one libpq URL carrying the database
+// name from the config document — unlike MySQL, where the request supplies the
+// schema per operation — and surfaces the resolved CA reference as engine
+// metadata alongside the configured metadata.
+func TestStaticResolverResolveTargetDSNFromPostgres(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"orders.cluster-abc.us-east-1.rds.amazonaws.com","port":5432,"dbname":"orders"}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"orders-prod": {
+			DatabaseType: "postgres",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "pgsprite_engine",
+				PasswordRef: "env:TARGET_PASSWORD",
+				Params:      map[string]string{"sslmode": "verify-full"},
+			},
+			Metadata: map[string]string{"extra": "field"},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod", DatabaseType: "postgres"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "orders-prod", got.Target)
+	assert.Equal(t, "postgres", got.DatabaseType)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN)
+	assert.Equal(t, map[string]string{
+		"extra":               "field",
+		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
+	}, got.Metadata)
+}
+
+// The port defaults to 5432 and the sslmode to verify-full when the config
+// document and params omit them, so a minimal postgres entry still assembles a
+// verified-TLS DSN.
+func TestStaticResolverDSNFromPostgresDefaults(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"orders.cluster-abc.us-east-1.rds.amazonaws.com","dbname":"orders"}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"orders-prod": {
+			DatabaseType: "postgres",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "pgsprite_engine",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod"})
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN)
+	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, got.Metadata[MetadataPostgresCARef])
+}
+
+// config_paths.dbname selects a different key in the config document, matching
+// how host and port keys are remappable.
+func TestStaticResolverDSNFromPostgresDBNamePath(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"orders.cluster-abc.us-east-1.rds.amazonaws.com","database":"orders"}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"orders-prod": {
+			DatabaseType: "postgres",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				ConfigPaths: StaticDSNFromPaths{DBName: "database"},
+				Username:    "pgsprite_engine",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod"})
+	require.NoError(t, err)
+	assert.Contains(t, got.DSN, "/orders?")
+}
+
+// A postgres config document without the database name fails closed: a
+// PostgreSQL connection is made to one database, so a DSN without one would
+// only fail at dial time with a confusing server-side error.
+func TestStaticResolverDSNFromPostgresRequiresDBName(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"orders.cluster-abc.us-east-1.rds.amazonaws.com","port":5432}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"orders-prod": {
+			DatabaseType: "postgres",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "pgsprite_engine",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	_, err = resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `read dbname for target "orders-prod"`)
+	assert.ErrorContains(t, err, `missing key "dbname"`)
+}
+
+// A non-RDS host with no configured ca_ref fails per request: a verified CA is
+// required, and the ambient trust store is never an implicit fallback. A
+// file: ca_ref makes the same host resolvable.
+func TestStaticResolverDSNFromPostgresRequiresCAForNonRDSHost(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"proxy.internal.example","dbname":"orders"}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	newResolver := func(t *testing.T, caRef string) *StaticResolver {
+		t.Helper()
+		resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+			"orders-qa": {
+				DatabaseType: "postgres",
+				DSNFrom: &StaticDSNFromConfig{
+					ConfigRef:   "env:TARGET_CONFIG",
+					Username:    "pgsprite_engine",
+					PasswordRef: "env:TARGET_PASSWORD",
+					CARef:       caRef,
+				},
+			},
+		}})
+		require.NoError(t, err)
+		return resolver
+	}
+
+	_, err := newResolver(t, "").ResolveTarget(t.Context(), Request{Target: "orders-qa"})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "verified CA is required")
+
+	got, err := newResolver(t, "file:/etc/ssl/private-ca.pem").ResolveTarget(t.Context(), Request{Target: "orders-qa"})
+	require.NoError(t, err)
+	assert.Equal(t, "file:/etc/ssl/private-ca.pem", got.Metadata[MetadataPostgresCARef])
 }

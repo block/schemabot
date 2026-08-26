@@ -26,9 +26,10 @@ type StaticTarget struct {
 	// when the resolver is constructed, and cached. Mutually exclusive with
 	// DSNFrom.
 	DSN string `yaml:"dsn,omitempty"`
-	// DSNFrom assembles a namespace-free MySQL DSN from separate config and
-	// password secret references. Unlike DSN it is resolved fresh on every request
-	// so a rotated target credential (for example one re-synced by the External
+	// DSNFrom assembles a DSN from separate config and password secret
+	// references: a namespace-free MySQL DSN, or a PostgreSQL libpq URL carrying
+	// the database name. Unlike DSN it is resolved fresh on every request so a
+	// rotated target credential (for example one re-synced by the External
 	// Secrets Operator) is picked up without restarting the worker. Mutually
 	// exclusive with DSN.
 	//
@@ -55,18 +56,22 @@ type StaticTarget struct {
 	SchemaOverrides map[string]string `yaml:"schema_overrides,omitempty"`
 }
 
-// StaticDSNFromConfig assembles a namespace-free MySQL DSN for a static target
-// from secret references, resolved fresh on every request. It deliberately never
+// StaticDSNFromConfig assembles a DSN for a static target from secret
+// references, resolved fresh on every request. For MySQL it deliberately never
 // reads a database name: the per-operation request supplies the schema, so the
-// assembled DSN carries none (a DSN with a database name is rejected).
+// assembled DSN carries none (a DSN with a database name is rejected). For
+// PostgreSQL the connection is made to one database, so the config document
+// must carry the database name and the assembled DSN includes it; the request
+// namespace selects a schema within that database.
 type StaticDSNFromConfig struct {
 	// ConfigRef is a secret reference to a JSON document holding the target's
-	// connection metadata (host and port). Like PasswordRef it may contain a
-	// "{target}" placeholder, replaced with the request target for per-target
-	// secret naming, and is resolved fresh on every request.
+	// connection metadata (host and port, plus the database name for
+	// PostgreSQL). Like PasswordRef it may contain a "{target}" placeholder,
+	// replaced with the request target for per-target secret naming, and is
+	// resolved fresh on every request.
 	ConfigRef string `yaml:"config_ref"`
-	// ConfigPaths selects which keys in ConfigRef hold the host and port,
-	// defaulting to "host" and "port".
+	// ConfigPaths selects which keys in ConfigRef hold the connection fields,
+	// defaulting to "host", "port", and (PostgreSQL only) "dbname".
 	ConfigPaths StaticDSNFromPaths `yaml:"config_paths,omitempty"`
 	// Username is the database user included in the assembled DSN.
 	Username string `yaml:"username"`
@@ -74,16 +79,27 @@ type StaticDSNFromConfig struct {
 	// contain a "{target}" placeholder, replaced with the request target for
 	// per-target secret naming, and is resolved fresh on every request.
 	PasswordRef string `yaml:"password_ref"`
-	// Params are appended as MySQL DSN query parameters (for example TLS
-	// settings).
+	// Params are appended as DSN query parameters. For MySQL they are freeform
+	// (for example TLS settings); for PostgreSQL only "sslmode: verify-full" is
+	// accepted — TLS trust material is configured via CARef, never via raw
+	// libpq parameters.
 	Params map[string]string `yaml:"params,omitempty"`
+	// CARef (PostgreSQL only) selects the CA bundle the data plane verifies the
+	// server against: "embedded:rds-global" or "file:<absolute-path>". Empty
+	// defaults to the embedded RDS bundle when the resolved host is an RDS
+	// endpoint and fails otherwise — a verified CA is required.
+	CARef string `yaml:"ca_ref,omitempty"`
 }
 
-// StaticDSNFromPaths selects the host and port keys in a StaticDSNFromConfig's
-// config document. Keys are looked up at the top level of the document.
+// StaticDSNFromPaths selects the connection-field keys in a
+// StaticDSNFromConfig's config document. Keys are looked up at the top level of
+// the document.
 type StaticDSNFromPaths struct {
 	Host string `yaml:"host,omitempty"`
 	Port string `yaml:"port,omitempty"`
+	// DBName is the key holding the PostgreSQL database name, defaulting to
+	// "dbname". PostgreSQL only: MySQL targets stay namespace-free.
+	DBName string `yaml:"dbname,omitempty"`
 }
 
 // StaticResolver resolves targets from static configuration.
@@ -147,15 +163,25 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 			return nil, fmt.Errorf("target %q is configured for database type %q, not %q", req.Target, entry.databaseType, requestedType)
 		}
 	}
-	dsn, err := entry.resolveDSN(ctx, req)
+	dsn, assembled, err := entry.resolveConnection(ctx, req)
 	if err != nil {
 		return nil, err
+	}
+	// Configured metadata supplies extra engine fields but must not override
+	// the fields the assembler resolved (for example the PostgreSQL CA
+	// reference), so it is written first and the assembled fields last.
+	metadata := maps.Clone(entry.metadata)
+	if len(assembled) > 0 {
+		if metadata == nil {
+			metadata = make(map[string]string, len(assembled))
+		}
+		maps.Copy(metadata, assembled)
 	}
 	return &Target{
 		Target:          entry.target,
 		DatabaseType:    entry.databaseType,
 		DSN:             dsn,
-		Metadata:        maps.Clone(entry.metadata),
+		Metadata:        metadata,
 		SchemaOverrides: maps.Clone(entry.schemaOverrides),
 	}, nil
 }
@@ -186,10 +212,10 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 		schemaOverrides: maps.Clone(entry.SchemaOverrides),
 	}
 	if hasDSNFrom {
-		if databaseType != "mysql" {
-			return nil, fmt.Errorf("target %q dsn_from is only supported for mysql, not %q", target, databaseType)
+		if databaseType != "mysql" && databaseType != "postgres" {
+			return nil, fmt.Errorf("target %q dsn_from is only supported for mysql and postgres, not %q", target, databaseType)
 		}
-		if err := entry.DSNFrom.validate(target); err != nil {
+		if err := entry.DSNFrom.validate(target, databaseType); err != nil {
 			return nil, err
 		}
 		prepared.dsnFrom = entry.DSNFrom
@@ -209,20 +235,21 @@ func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry
 	return prepared, nil
 }
 
-// resolveDSN returns the entry's DSN: the cached value for a dsn entry, or a
-// freshly assembled namespace-free DSN for a dsn_from entry.
-func (e staticTargetEntry) resolveDSN(ctx context.Context, req Request) (string, error) {
+// resolveConnection returns the entry's DSN and any assembled engine metadata:
+// the cached DSN for a dsn entry, or a freshly assembled DSN (plus, for
+// PostgreSQL, the resolved CA reference) for a dsn_from entry.
+func (e staticTargetEntry) resolveConnection(ctx context.Context, req Request) (string, map[string]string, error) {
 	if e.dsn != nil {
-		return *e.dsn, nil
+		return *e.dsn, nil, nil
 	}
-	dsn, err := e.dsnFrom.assemble(ctx, req, e.databaseType)
+	dsn, assembled, err := e.dsnFrom.assemble(ctx, req, e.databaseType)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := validateResolvedStaticTargetDSN(e.target, e.databaseType, dsn); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return dsn, nil
+	return dsn, assembled, nil
 }
 
 func canonicalDatabaseType(databaseType string) string {
@@ -294,9 +321,13 @@ func validateResolvedStaticTargetDSN(target, databaseType, dsn string) error {
 }
 
 // validate checks that a dsn_from entry has the fields required to assemble a
-// DSN. The password is not read here — it is resolved per request so a rotated
-// credential is picked up without a restart.
-func (c *StaticDSNFromConfig) validate(target string) error {
+// DSN, including the engine-specific ones: the PostgreSQL-only fields are
+// rejected on other engines rather than silently ignored, and the PostgreSQL
+// TLS configuration is checked here so a misconfiguration surfaces at
+// construction, not on the first routed request. The password is not read here
+// — it is resolved per request so a rotated credential is picked up without a
+// restart.
+func (c *StaticDSNFromConfig) validate(target, databaseType string) error {
 	if c.ConfigRef == "" {
 		return fmt.Errorf("target %q dsn_from missing config_ref", target)
 	}
@@ -306,46 +337,102 @@ func (c *StaticDSNFromConfig) validate(target string) error {
 	if c.PasswordRef == "" {
 		return fmt.Errorf("target %q dsn_from missing password_ref", target)
 	}
+	if databaseType != "postgres" {
+		if c.CARef != "" {
+			return fmt.Errorf("target %q dsn_from ca_ref is only supported for postgres, not %q", target, databaseType)
+		}
+		if c.ConfigPaths.DBName != "" {
+			return fmt.Errorf("target %q dsn_from config_paths.dbname is only supported for postgres, not %q", target, databaseType)
+		}
+		return nil
+	}
+	if err := validatePostgresDSNParams(c.Params); err != nil {
+		return fmt.Errorf("target %q dsn_from: %w", target, err)
+	}
+	if c.CARef != "" {
+		if err := validatePostgresCARef(c.CARef); err != nil {
+			return fmt.Errorf("target %q dsn_from: %w", target, err)
+		}
+	}
 	return nil
 }
 
-// assemble builds a namespace-free MySQL DSN from the config document (host and
-// port) and the password reference, both resolved fresh. It reuses the shared
-// MySQL assembler and the fail-closed secret-ref credential resolver so a rotated
+// assemble builds the entry's DSN from the config document and the password
+// reference, both resolved fresh, routing to the engine's assembler: a
+// namespace-free MySQL DSN, or a PostgreSQL libpq URL carrying the database
+// name plus the resolved CA reference as engine metadata. It reuses the shared
+// assemblers and the fail-closed secret-ref credential resolver so a rotated
 // password or empty secret is handled identically to the Etre data-plane path.
-func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databaseType string) (string, error) {
-	host, port, err := c.resolveEndpoint(ctx, req.Target)
+func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databaseType string) (string, map[string]string, error) {
+	document, err := c.resolveConfigDocument(ctx, req.Target)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	creds, err := SecretRefCredentialResolver{Username: c.Username, PasswordRef: c.PasswordRef}.ResolveCredentials(ctx, req, nil)
 	if err != nil {
-		return "", err
+		return "", nil, err
+	}
+	if databaseType == "postgres" {
+		return c.assemblePostgres(document, creds, req.Target)
+	}
+	host, port, err := c.endpoint(document, req.Target, "3306")
+	if err != nil {
+		return "", nil, err
 	}
 	assembler := MySQLConnectionAssembler{Type: databaseType, DefaultPort: port, Params: c.Params}
 	dsn, _, err := assembler.Assemble(host, nil, creds)
 	if err != nil {
-		return "", fmt.Errorf("assemble DSN for target %q: %w", req.Target, err)
+		return "", nil, fmt.Errorf("assemble DSN for target %q: %w", req.Target, err)
 	}
-	return dsn, nil
+	return dsn, nil, nil
 }
 
-// resolveEndpoint resolves the config document and reads the target host and
-// port from it. The port defaults to 3306 when absent; the database name in the
-// document, if any, is ignored (static target DSNs are namespace-free).
-func (c *StaticDSNFromConfig) resolveEndpoint(ctx context.Context, target string) (host, port string, err error) {
+// assemblePostgres builds a PostgreSQL libpq URL from the config document's
+// host, port, and database name. The database name is required: a PostgreSQL
+// connection is made to one database, and assembling a DSN without one would
+// fail closed only at dial time with a confusing server-side error.
+func (c *StaticDSNFromConfig) assemblePostgres(document map[string]any, creds *Credentials, target string) (string, map[string]string, error) {
+	host, port, err := c.endpoint(document, target, "5432")
+	if err != nil {
+		return "", nil, err
+	}
+	dbnameKey := c.ConfigPaths.DBName
+	if dbnameKey == "" {
+		dbnameKey = PostgresDBNameAttribute
+	}
+	dbname, err := requiredStringField(document, dbnameKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("read dbname for target %q: %w", target, err)
+	}
+	assembler := PostgresConnectionAssembler{DefaultPort: port, Params: c.Params, CARef: c.CARef}
+	dsn, metadata, err := assembler.Assemble(host, map[string]string{PostgresDBNameAttribute: dbname}, creds)
+	if err != nil {
+		return "", nil, fmt.Errorf("assemble DSN for target %q: %w", target, err)
+	}
+	return dsn, metadata, nil
+}
+
+// resolveConfigDocument resolves the config reference and parses it as a JSON
+// document.
+func (c *StaticDSNFromConfig) resolveConfigDocument(ctx context.Context, target string) (map[string]any, error) {
 	ref := strings.ReplaceAll(c.ConfigRef, "{target}", target)
 	document, err := secrets.ResolveContext(ctx, ref, "")
 	if err != nil {
-		return "", "", fmt.Errorf("resolve config reference for target %q: %w", target, err)
+		return nil, fmt.Errorf("resolve config reference for target %q: %w", target, err)
 	}
 	if document == "" {
-		return "", "", fmt.Errorf("config reference for target %q resolved an empty value", target)
+		return nil, fmt.Errorf("config reference for target %q resolved an empty value", target)
 	}
 	var config map[string]any
 	if err := json.Unmarshal([]byte(document), &config); err != nil {
-		return "", "", fmt.Errorf("parse config for target %q: %w", target, err)
+		return nil, fmt.Errorf("parse config for target %q: %w", target, err)
 	}
+	return config, nil
+}
+
+// endpoint reads the target host and port from the config document. The port
+// defaults to the engine's default when absent.
+func (c *StaticDSNFromConfig) endpoint(document map[string]any, target, defaultPort string) (host, port string, err error) {
 	hostKey := c.ConfigPaths.Host
 	if hostKey == "" {
 		hostKey = "host"
@@ -354,16 +441,16 @@ func (c *StaticDSNFromConfig) resolveEndpoint(ctx context.Context, target string
 	if portKey == "" {
 		portKey = "port"
 	}
-	host, err = requiredStringField(config, hostKey)
+	host, err = requiredStringField(document, hostKey)
 	if err != nil {
 		return "", "", fmt.Errorf("read host for target %q: %w", target, err)
 	}
-	port, err = optionalNumericField(config, portKey)
+	port, err = optionalNumericField(document, portKey)
 	if err != nil {
 		return "", "", fmt.Errorf("read port for target %q: %w", target, err)
 	}
 	if port == "" {
-		port = "3306"
+		port = defaultPort
 	}
 	return host, port, nil
 }

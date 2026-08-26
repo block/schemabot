@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/url"
 	"strings"
 
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -101,6 +103,164 @@ func hostWithDefaultPort(host, defaultPort string) string {
 	}
 	bare := strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	return net.JoinHostPort(bare, defaultPort)
+}
+
+// PostgresDBNameAttribute is the endpoint attribute the PostgreSQL assembler
+// reads the database name from. Unlike MySQL — where the schema is injected per
+// operation and the DSN stays namespace-free — a PostgreSQL connection is made
+// to one database, so the DSN must carry it; the request namespace selects a
+// schema within that database.
+const PostgresDBNameAttribute = "dbname"
+
+// MetadataPostgresCARef is the metadata key carrying the CA reference the
+// PostgreSQL data plane resolves into verified TLS trust. It is the only
+// engine metadata the PostgreSQL assembler emits.
+const MetadataPostgresCARef = "postgres_ca_ref"
+
+// PostgresCARefEmbeddedRDSGlobal selects pg-sprite's reviewed, embedded AWS RDS
+// global CA bundle. It is the default when the resolved host is an RDS
+// endpoint, so an omitted ca_ref stays on verified TLS and never falls back to
+// the ambient trust store.
+const PostgresCARefEmbeddedRDSGlobal = "embedded:rds-global"
+
+// postgresCARefFilePrefix prefixes a CA reference naming a read-only mounted
+// PEM bundle by absolute path, for private proxies and test endpoints whose
+// chain is not in the embedded RDS bundle.
+const postgresCARefFilePrefix = "file:"
+
+// postgresSSLModeVerifyFull is the only accepted sslmode: encrypt the session,
+// validate the certificate chain, and verify the endpoint hostname. Weaker
+// modes (require, prefer, verify-ca, disable) prove at most encryption, not
+// server identity, so they are rejected rather than silently accepted.
+const postgresSSLModeVerifyFull = "verify-full"
+
+// PostgresConnectionAssembler assembles a PostgreSQL Target: one libpq URL
+// carrying the database name, built with net/url so every component is escaped
+// — never by string concatenation — plus the CA reference in Metadata.
+//
+// Transport is fail-closed: the DSN always carries sslmode=verify-full (the
+// only allowlisted value), and the CA the data plane verifies against is
+// always explicit — the embedded RDS bundle by default for RDS endpoints, a
+// mounted file by configuration, and an error for a non-RDS endpoint with no
+// configured CA. The ambient system trust store is never used.
+type PostgresConnectionAssembler struct {
+	// DefaultPort is appended to the host when it has no port.
+	DefaultPort string
+	// Params are extra libpq URL parameters. Only "sslmode" is accepted, and
+	// only with the value "verify-full"; TLS trust material is configured via
+	// CARef, never via raw libpq parameters.
+	Params map[string]string
+	// CARef selects the CA bundle the data plane verifies the server against:
+	// PostgresCARefEmbeddedRDSGlobal or "file:<absolute-path>". Empty defaults
+	// to the embedded RDS bundle when the host is an RDS endpoint and fails
+	// otherwise.
+	CARef string
+	// Metadata is attached to every assembled target for engine-specific
+	// configuration the data plane reads, merged before the authoritative
+	// CA reference.
+	Metadata map[string]string
+}
+
+var _ ConnectionAssembler = PostgresConnectionAssembler{}
+
+// DatabaseType returns the PostgreSQL engine type.
+func (PostgresConnectionAssembler) DatabaseType() string { return "postgres" }
+
+// Assemble builds a PostgreSQL libpq URL from the host, the "dbname" endpoint
+// attribute, and credentials, and emits the resolved CA reference in Metadata.
+func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]string, creds *Credentials) (string, map[string]string, error) {
+	if host == "" {
+		return "", nil, fmt.Errorf("postgres connection requires a host")
+	}
+	if creds == nil {
+		return "", nil, fmt.Errorf("postgres connection requires credentials")
+	}
+	if creds.Username == "" {
+		return "", nil, fmt.Errorf("postgres connection requires a username")
+	}
+	dbname := attrs[PostgresDBNameAttribute]
+	if dbname == "" {
+		return "", nil, fmt.Errorf("postgres connection requires the %q endpoint attribute", PostgresDBNameAttribute)
+	}
+	if err := validatePostgresDSNParams(a.Params); err != nil {
+		return "", nil, err
+	}
+	if a.DefaultPort != "" {
+		host = hostWithDefaultPort(host, a.DefaultPort)
+	}
+	caRef, err := a.resolveCARef(host)
+	if err != nil {
+		return "", nil, err
+	}
+	query := url.Values{}
+	for key, value := range a.Params {
+		query.Set(key, value)
+	}
+	if !query.Has("sslmode") {
+		query.Set("sslmode", postgresSSLModeVerifyFull)
+	}
+	u := url.URL{
+		Scheme:   "postgresql",
+		User:     url.UserPassword(creds.Username, creds.Password),
+		Host:     host,
+		Path:     "/" + dbname,
+		RawQuery: query.Encode(),
+	}
+	metadata := maps.Clone(a.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]string, 1)
+	}
+	metadata[MetadataPostgresCARef] = caRef
+	return u.String(), metadata, nil
+}
+
+// resolveCARef returns the CA reference for the resolved host: the configured
+// one when set, the embedded RDS bundle for an RDS endpoint, and an error
+// otherwise — a verified CA is required, and the ambient trust store is never
+// an implicit fallback.
+func (a PostgresConnectionAssembler) resolveCARef(host string) (string, error) {
+	if a.CARef != "" {
+		if err := validatePostgresCARef(a.CARef); err != nil {
+			return "", err
+		}
+		return a.CARef, nil
+	}
+	if dbconn.IsRDSHost(host) {
+		return PostgresCARefEmbeddedRDSGlobal, nil
+	}
+	return "", fmt.Errorf("a verified CA is required: host %q is not an RDS endpoint and no ca_ref is configured", host)
+}
+
+// validatePostgresCARef checks a CA reference's form: the embedded RDS bundle
+// selector, or a file reference with an absolute path.
+func validatePostgresCARef(caRef string) error {
+	if caRef == PostgresCARefEmbeddedRDSGlobal {
+		return nil
+	}
+	if path, ok := strings.CutPrefix(caRef, postgresCARefFilePrefix); ok {
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("postgres ca_ref file path must be absolute, got %q", caRef)
+		}
+		return nil
+	}
+	return fmt.Errorf("postgres ca_ref must be %q or \"file:<absolute-path>\", got %q", PostgresCARefEmbeddedRDSGlobal, caRef)
+}
+
+// validatePostgresDSNParams enforces the closed parameter allowlist for
+// assembled PostgreSQL DSNs: only sslmode, and only verify-full. Arbitrary
+// libpq parameters could weaken transport security (sslmode downgrades) or
+// smuggle TLS material outside CARef (sslrootcert, sslcert), so unknown keys
+// fail closed rather than pass through.
+func validatePostgresDSNParams(params map[string]string) error {
+	for key, value := range params {
+		if key != "sslmode" {
+			return fmt.Errorf("postgres connection params support only \"sslmode\", got %q", key)
+		}
+		if value != postgresSSLModeVerifyFull {
+			return fmt.Errorf("postgres sslmode must be %q, got %q", postgresSSLModeVerifyFull, value)
+		}
+	}
+	return nil
 }
 
 // Metadata keys the Vitess (PlanetScale) engine reads from a resolved Target.
