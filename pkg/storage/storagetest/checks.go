@@ -238,6 +238,121 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Empty(t, stored.BlockingReason)
 	})
 
+	t.Run("RecoverApplyOwnedCheckRequiresNoOpSuccess", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "recovery_guard_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "recovery-guard", 702, state.Apply.Running, "staging")
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 123, HeadSHA: "same-sha",
+			Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "recovery_guard_db",
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress", BlockingReason: "schema_change_running",
+		}))
+
+		// Only a successful no-op plan proves the target already matches the
+		// PR schema; any other plan result must leave the apply owning the row.
+		for name, plan := range map[string]*storage.Check{
+			"PlanWithChanges": {Status: "completed", Conclusion: "success", HasChanges: true},
+			"FailedPlan":      {Status: "completed", Conclusion: "failure", HasChanges: false},
+			"InProgressPlan":  {Status: "in_progress", HasChanges: false},
+		} {
+			plan.Repository = "org/repo"
+			plan.PullRequest = 123
+			plan.HeadSHA = "same-sha"
+			plan.Environment = "staging"
+			plan.DatabaseType = storage.DatabaseTypeMySQL
+			plan.DatabaseName = "recovery_guard_db"
+			recovered, err := store.Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, plan)
+			require.NoError(t, err, name)
+			assert.False(t, recovered, name)
+		}
+
+		stored, err := store.Checks().Get(ctx, "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "recovery_guard_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "in_progress", stored.Status)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+		assert.Equal(t, "schema_change_running", stored.BlockingReason)
+	})
+
+	t.Run("CompleteForApplyGuards", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "complete_guard_db", storage.DatabaseTypeMySQL)
+		owner := CreateApplyWithStateAndEnv(t, store, lock, "complete-owner", 703, state.Apply.Running, "staging")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: owner.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		completion := *check
+		completion.Status = "completed"
+		completion.Conclusion = "success"
+		completion.HasChanges = false
+
+		// An apply that does not own the row must not complete it.
+		intruder := CreateApplyWithStateAndEnv(t, store, lock, "complete-intruder", 704, state.Apply.Completed, "staging")
+		updated, err := store.Checks().CompleteForApply(ctx, &completion, intruder)
+		require.NoError(t, err)
+		assert.False(t, updated, "completion by a non-owning apply must not land")
+
+		// Once a newer apply exists for the same key, the owner's completion
+		// must not land either: the newer apply's outcome is authoritative.
+		updated, err = store.Checks().CompleteForApply(ctx, &completion, owner)
+		require.NoError(t, err)
+		assert.False(t, updated, "completion must not overwrite state a newer apply owns")
+
+		stored, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "in_progress", stored.Status)
+		assert.Empty(t, stored.Conclusion)
+		assert.Equal(t, owner.ID, stored.ApplyID)
+	})
+
+	t.Run("MarkActionRequiredForApplyGuards", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "action_guard_db", storage.DatabaseTypeMySQL)
+		rollback := CreateApplyWithStateAndEnv(t, store, lock, "action-rollback", 705, state.Apply.Completed, "staging")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: rollback.ID + 1000, Status: "completed", Conclusion: "success",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		demand := *check
+		demand.HasChanges = true
+		demand.Conclusion = "action_required"
+
+		// A row owned by an apply newer than the rollback stays untouched even
+		// when the applies table holds nothing newer for the key.
+		updated, err := store.Checks().MarkActionRequiredForApply(ctx, &demand, rollback)
+		require.NoError(t, err)
+		assert.False(t, updated, "a rollback must not overwrite a row owned by a newer apply")
+
+		// Release ownership, then start a newer apply for the same key: the
+		// rollback's action_required must not pull the rug out from under a
+		// re-apply that started after it.
+		check.ApplyID = 0
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+		CreateApplyWithStateAndEnv(t, store, lock, "action-reapply", 706, state.Apply.Running, "staging")
+		updated, err = store.Checks().MarkActionRequiredForApply(ctx, &demand, rollback)
+		require.NoError(t, err)
+		assert.False(t, updated, "a rollback must not overwrite state once a newer apply exists")
+
+		stored, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "success", stored.Conclusion)
+	})
+
 	t.Run("PlanDriftDisposition", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -278,7 +393,8 @@ func TestChecks(t *testing.T, h Harness) {
 		stored, err = store.Checks().Get(ctx, "org/repo", 123, "production", storage.DatabaseTypeMySQL, "drift_predicate_db")
 		require.NoError(t, err)
 		require.NotNil(t, stored)
-		assert.Equal(t, "old error", stored.ErrorMessage, "an incoming drift block preserves the existing error consistently across dialects")
+		assert.Equal(t, "new error", stored.ErrorMessage, "preservation keys on the stored blocking reason, not the incoming write")
+		assert.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, stored.BlockingReason)
 
 		clean := *notEvaluated
 		clean.HeadSHA = "sha-3"
@@ -318,6 +434,23 @@ func TestChecks(t *testing.T, h Harness) {
 		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, guarded)
 		require.NoError(t, err)
 		assert.False(t, marked)
+
+		// Apply ownership guards independently of status: a completed
+		// apply-owned row still records that an apply reached the live
+		// database, so stale cleanup must not convert it to a passing check.
+		owned := &storage.Check{Repository: "org/repo", PullRequest: 123, HeadSHA: "old", Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "owned_completed_stale_db", ApplyID: apply.ID, Status: "completed", Conclusion: "action_required"}
+		require.NoError(t, store.Checks().Upsert(ctx, owned))
+		owned.HeadSHA = "new"
+		owned.ApplyID = 0
+		owned.Conclusion = "success"
+		marked, err = store.Checks().MarkStalePlanSuccessful(ctx, owned)
+		require.NoError(t, err)
+		assert.False(t, marked)
+		stored, err := store.Checks().Get(ctx, "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "owned_completed_stale_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "action_required", stored.Conclusion)
+		assert.Equal(t, apply.ID, stored.ApplyID)
 	})
 
 	t.Run("ClearAggregateBlock", func(t *testing.T) {
@@ -330,6 +463,19 @@ func TestChecks(t *testing.T, h Harness) {
 		cleared, err := store.Checks().ClearAggregateBlock(ctx, &stale)
 		require.NoError(t, err)
 		assert.False(t, cleared)
+
+		// The clear is pinned to the blocking reason the caller read: a block
+		// recorded concurrently for a different reason must be preserved.
+		mismatchedReason := *check
+		mismatchedReason.BlockingReason = "other_guard_failed"
+		cleared, err = store.Checks().ClearAggregateBlock(ctx, &mismatchedReason)
+		require.NoError(t, err)
+		assert.False(t, cleared)
+		stored, err := store.Checks().Get(ctx, "org/repo", 123, "_aggregate", "_aggregate", "_aggregate")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "guard_failed", stored.BlockingReason)
+
 		cleared, err = store.Checks().ClearAggregateBlock(ctx, check)
 		require.NoError(t, err)
 		assert.True(t, cleared)
@@ -384,6 +530,8 @@ func TestChecks(t *testing.T, h Harness) {
 					{Repository: "org/repo", PullRequest: 123, Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "plan_only", Status: "completed"},
 					{Repository: "org/repo", PullRequest: 123, Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "blocking", ApplyID: 1, Status: "completed", Conclusion: "failure"},
 					{Repository: "org/repo", PullRequest: 123, Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "successful", ApplyID: 2, Status: "completed", Conclusion: "success"},
+					{Repository: "org/repo", PullRequest: 123, Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "applying", ApplyID: 3, Status: "in_progress", Conclusion: "success"},
+					{Repository: "org/repo", PullRequest: 456, Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "other_pr", Status: "completed"},
 				}
 				for _, row := range rows {
 					require.NoError(t, store.Checks().Upsert(ctx, row))
@@ -391,12 +539,19 @@ func TestChecks(t *testing.T, h Harness) {
 				require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "org/repo", 123, merged))
 				remaining, err := store.Checks().GetByPR(ctx, "org/repo", 123)
 				require.NoError(t, err)
-				if merged {
-					require.Len(t, remaining, 1)
-				} else {
-					require.Len(t, remaining, 2)
+				names := make([]string, len(remaining))
+				for i, row := range remaining {
+					names[i] = row.DatabaseName
 				}
-				assert.Equal(t, "blocking", remaining[0].DatabaseName)
+				if merged {
+					assert.Equal(t, []string{"applying", "blocking"}, names, "an in_progress apply-owned row is retained on a merged close even when concluded success")
+				} else {
+					assert.Equal(t, []string{"applying", "blocking", "successful"}, names)
+				}
+
+				otherPR, err := store.Checks().GetByPR(ctx, "org/repo", 456)
+				require.NoError(t, err)
+				require.Len(t, otherPR, 1, "closing one PR must not touch another PR's stored check state")
 			})
 		}
 	})
