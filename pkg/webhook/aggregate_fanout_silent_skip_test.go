@@ -286,6 +286,53 @@ func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
 	})
 }
 
+// `apply -d` and `apply-confirm -d` fan out exactly like a database-scoped
+// plan: naming a database does not name a deployment. So a participant whose
+// exhaustive local discovery cannot resolve that database defers, and only the
+// leader publishes Database Not Found as the fleet-authoritative answer —
+// otherwise every participant on the repo posts the same failure beside it.
+func TestDatabaseScopedApplyDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(*Handler)
+	}{
+		{"apply", func(h *Handler) {
+			h.handleApplyCommand("octocat/hello-world", 1, "staging", "orders", 12345, "hubot",
+				CommandResult{Action: action.Apply})
+		}},
+		{"apply-confirm", func(h *Handler) {
+			h.handleApplyConfirmCommand("octocat/hello-world", 1, "staging", "orders", 12345, "hubot",
+				CommandResult{Action: action.ApplyConfirm})
+		}},
+	}
+
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			t.Run("participant stays silent", func(t *testing.T) {
+				h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+				serveSchemaConfigForDatabase(t, mux, "inventory")
+				serveCompleteRootConfigTree(t, mux)
+
+				command.run(h)
+
+				assert.Empty(t, comments, "a participant database discovery miss must defer silently to the leader")
+			})
+
+			t.Run("leader reports database not found", func(t *testing.T) {
+				h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+				serveSchemaConfigForDatabase(t, mux, "inventory")
+				serveCompleteRootConfigTree(t, mux)
+
+				command.run(h)
+
+				body := requireComment(t, comments, "database-not-found leader "+command.name+" error")
+				assert.Contains(t, body, "Database Not Found")
+				assert.Contains(t, body, "orders")
+			})
+		})
+	}
+}
+
 // On an aggregate repo, an unscoped `rollback <apply-id> -e <env>` fans out to
 // every deployment, but the apply lives in exactly one tenant's storage. A
 // deployment whose storage has no such apply stays silent so only the owning
