@@ -650,18 +650,18 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 // progress results, not through errors.
 func recoveryResumesFromCheckpoint(databaseType string) bool {
 	switch databaseType {
-	case storage.DatabaseTypeMySQL:
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata:
 		return true
-	case storage.DatabaseTypeStrata:
-		return true
-	case storage.DatabaseTypeVitess:
-		return false
-	case storage.DatabaseTypePostgres:
-		return false
-	case "":
+	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres:
 		return false
 	default:
-		panic(fmt.Sprintf("checkpoint recovery disposition is not declared for database type %q", databaseType))
+		// LocalConfig.Type is open-world: embedder-registered engine types
+		// (EngineFactories) and the zero-value type used by tests land here
+		// and get the conservative disposition — no checkpoint resume, so a
+		// failed attempt fails the apply instead of pausing it for a retry
+		// that could dispatch duplicate work. Nothing pins the checkpoint
+		// contract on those registrations.
+		return false
 	}
 }
 

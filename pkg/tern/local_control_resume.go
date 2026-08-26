@@ -187,7 +187,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	// selects the connection schema (per-target overrides can remap it to a
 	// different physical schema), so with mixed namespaces every task would
 	// silently run against tasks[0]'s schema.
-	if c.config.Type == storage.DatabaseTypeMySQL {
+	if usesPerNamespaceCredentials(c.config.Type) {
 		if _, err := singleTaskNamespace(applyTasks); err != nil {
 			return nil, fmt.Errorf("deferred deploy for apply %s: %w", apply.ApplyIdentifier, err)
 		}

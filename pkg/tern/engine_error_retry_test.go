@@ -52,6 +52,7 @@ func TestEngineDispositionsByDatabaseType(t *testing.T) {
 		{"strata", storage.DatabaseTypeStrata, false, true},
 		{"postgres", storage.DatabaseTypePostgres, false, false},
 		{"unset", "", false, false},
+		{"embedder-registered type gets conservative defaults", "customengine", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -59,15 +60,4 @@ func TestEngineDispositionsByDatabaseType(t *testing.T) {
 			assert.Equal(t, tc.wantCheckpointBasedRecovery, recoveryResumesFromCheckpoint(tc.databaseType))
 		})
 	}
-}
-
-func TestEngineDispositionsRejectUnknownDatabaseType(t *testing.T) {
-	assert.PanicsWithValue(t,
-		`namespace credential disposition is not declared for database type "unknown"`,
-		func() { usesPerNamespaceCredentials("unknown") },
-	)
-	assert.PanicsWithValue(t,
-		`checkpoint recovery disposition is not declared for database type "unknown"`,
-		func() { recoveryResumesFromCheckpoint("unknown") },
-	)
 }

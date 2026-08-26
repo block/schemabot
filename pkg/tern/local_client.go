@@ -503,20 +503,22 @@ func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credential
 	return c.credentialsForMySQLNamespace(task.Namespace)
 }
 
+// usesPerNamespaceCredentials reports whether the database type's engine needs
+// credentials resolved per namespace instead of sharing the target-level
+// credentials. MySQL resolves a namespace-specific DSN so each task connects
+// to its own schema (per-target overrides can remap a namespace to a different
+// physical schema).
 func usesPerNamespaceCredentials(databaseType string) bool {
 	switch databaseType {
 	case storage.DatabaseTypeMySQL:
 		return true
-	case storage.DatabaseTypeVitess:
-		return false
-	case storage.DatabaseTypeStrata:
-		return false
-	case storage.DatabaseTypePostgres:
-		return false
-	case "":
+	case storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		return false
 	default:
-		panic(fmt.Sprintf("namespace credential disposition is not declared for database type %q", databaseType))
+		// LocalConfig.Type is open-world: embedder-registered engine types
+		// (EngineFactories) and the zero-value type used by tests land here
+		// and get the conservative disposition — shared target credentials.
+		return false
 	}
 }
 
@@ -526,7 +528,7 @@ func usesPerNamespaceCredentials(databaseType string) bool {
 // than pick a namespace by map iteration order (or silently use a namespace-free
 // DSN) if that invariant is ever violated.
 func (c *LocalClient) credentialsForGroupedApply(plan *storage.Plan) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	if len(plan.Namespaces) != 1 {
