@@ -25,12 +25,13 @@ own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 
 ## Supported changes
 
-The executable path accepts a plan only when all of these conditions hold:
+The apply path executes a plan one statement at a time. Each statement runs as
+its own task and its own PostgreSQL transaction, and each must independently
+satisfy all of these conditions:
 
-- The plan contains exactly one statement for one table.
 - pg-sprite classifies the statement for native execution.
-- The statement is one `ALTER TABLE` or `CREATE INDEX` shape accepted by
-  pg-sprite's privilege-tier check. Other statement kinds fail closed.
+- The statement is an `ALTER TABLE` shape accepted by pg-sprite's
+  privilege-tier check. Other statement kinds fail closed.
 - The target is an ordinary or partitioned table and its measured on-disk
   size is no more than 1 GiB. For a partitioned parent, the measurement
   includes its complete partition tree.
@@ -44,16 +45,27 @@ ALTER TABLE public.users ADD COLUMN email text;
 ```
 
 The planner, rather than a fixed list in SchemaBot, decides whether a
-particular `ALTER TABLE` or `CREATE INDEX` can use the native path. Review the
-plan result for the decision on the exact target schema. Even a native-routed
-statement is bounded at apply time: each attempt has a 3-second lock budget
-and a 30-second statement budget, with bounded retries for lock contention.
-A statement that exceeds the execution budget is not allowed to continue
+particular `ALTER TABLE` can use the native path. Review the plan result for
+the decision on the exact target schema. Even a native-routed statement is
+bounded at apply time: each attempt has a 3-second lock budget and a
+30-second statement budget, with bounded retries for lock contention. A
+statement that exceeds the execution budget is not allowed to continue
 unbounded.
 
-The one-statement restriction applies to the rendered plan, not just the
-schema file. A declarative edit that the planner expands into several steps is
-not executable in this support increment.
+A multi-statement plan — several tables changed, or one declarative edit that
+the planner expands into several steps — is not applied atomically. The
+statements execute in order, each committing or failing in its own
+transaction, so a mid-plan failure leaves the earlier statements committed and
+the schema partially changed. Keep a PostgreSQL change to a single statement
+when a partially applied plan would be unsafe to leave in place.
+
+`CREATE INDEX` passes planning but cannot complete on the current apply path.
+pg-sprite renders every executable index build as `CREATE INDEX
+CONCURRENTLY`, which PostgreSQL refuses to run inside a transaction block, and
+the apply path runs every statement inside a transaction. The apply fails and
+is recorded as retryable, but a retry cannot succeed. Do not include index
+builds in a PostgreSQL change until the apply path executes them outside a
+transaction.
 
 ### Partitioned tables
 
@@ -72,7 +84,9 @@ This includes changes that require copy-and-swap, require a rewrite before
 they can be planned safely, are refused by pg-sprite, or carry an unrecognized
 planner contract or verdict. A native verdict is also blocked when its
 statement shape is outside the `ALTER TABLE` and `CREATE INDEX` set accepted
-by the apply path.
+by the apply path's shape check. That shape check admits `CREATE INDEX`, so
+an index build is not blocked at plan time even though it fails at apply
+time, as described above.
 
 The plan comment lists the table and SchemaBot's reason for the refusal. For a
 PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
@@ -111,10 +125,11 @@ PostgreSQL targets do not support:
 - deferred cutover (`--defer-cutover`);
 - stop, cancel, start, cutover, revert, skip-revert, or volume controls.
 
-PostgreSQL DDL on this path runs as one transaction that commits or fails. A
-stop or cancel request is stored through the normal durable control path, but
-the engine resolves it as a typed, terminal unsupported-operation decline; it
-does not report a successful stop or keep retrying the request. The apply
+Each PostgreSQL DDL statement on this path runs as its own transaction that
+commits or fails. A stop or cancel request is stored through the normal
+durable control path, but the engine resolves it as a typed, terminal
+unsupported-operation decline; it does not report a successful stop or keep
+retrying the request. The apply
 continues to its own completion or failure. If an in-flight statement must be
 interrupted, find its backend in `pg_stat_activity` and use PostgreSQL's
 `pg_cancel_backend` through an operator-controlled database session.
@@ -133,10 +148,10 @@ recovery path re-plans, then clears its in-memory progress so stale state from
 one apply cannot be reported for another.
 
 This recovery guarantee does not make the DDL resumable within a statement.
-The statement is one PostgreSQL transaction: it commits or fails, and recovery
-re-plans against the live target before further work. A privilege refusal is a
-permanent failed task, includes the required provisioning advice, and leaves
-the target unchanged.
+Each statement is one PostgreSQL transaction: it commits or fails, and
+recovery re-plans against the live target before further work. A privilege
+refusal is a permanent failed task, includes the required provisioning
+advice, and leaves the target unchanged.
 
 ## Configuration and credentials
 
@@ -159,11 +174,19 @@ left to the PostgreSQL driver's defaults. Set `sslmode` explicitly for
 multi-host DSNs and whenever the deployment requires a stronger verification
 mode or custom certificate settings.
 
-The target role must be able to connect to the database, use the target
-schema, and act as the table owner for in-place `ALTER TABLE`. Statements that
-build an index also require `CREATE` on the schema. SchemaBot checks the tier
-required by the exact planned statement and refuses before execution with
-specific provisioning advice when the role is insufficient.
+For apply, the target role must be able to connect to the database, use the
+target schema, and act as the table owner for in-place `ALTER TABLE`.
+SchemaBot checks the tier required by the exact planned statement and refuses
+before execution with specific provisioning advice when the role is
+insufficient.
+
+Planning requires a strictly stronger grant than the apply-time set above.
+pg-sprite's planner introspects the desired schema by creating a scratch
+schema inside a transaction it then rolls back, so the planning role also
+needs `CREATE` on the target database, and the connection must be read-write
+rather than a hot standby. Nothing persists — the transaction is rolled back —
+but a role provisioned with only the apply-time privileges fails at plan time
+with a permission error on the database.
 
 ## SchemaBot storage
 
