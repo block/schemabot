@@ -45,7 +45,6 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		requiresEnv         bool
 		hasApplyID          bool
 		supportsDB          bool
-		supportsAutoConfirm bool
 		supportsSkipRevert  bool
 		supportsDefer       bool
 		supportsAllowUnsafe bool
@@ -55,8 +54,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.Help},
 		{name: action.Plan, requiresEnv: true, supportsDB: true},
 		{name: action.Apply, requiresEnv: true, supportsDB: true,
-			supportsAutoConfirm: true, supportsSkipRevert: true,
-			supportsDefer: true, supportsAllowUnsafe: true},
+			supportsSkipRevert: true, supportsDefer: true, supportsAllowUnsafe: true},
 		{name: action.ApplyConfirm, requiresEnv: true, supportsDB: true,
 			supportsSkipRevert: true, supportsDefer: true, supportsAllowUnsafe: true},
 		{name: action.Unlock, supportsDB: true, supportsForce: true},
@@ -79,7 +77,6 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			assert.Equal(t, tc.requiresEnv, spec.RequiresEnv, "RequiresEnv")
 			assert.Equal(t, tc.hasApplyID, spec.HasApplyID, "HasApplyID")
 			assert.Equal(t, tc.supportsDB, spec.SupportsDB, "SupportsDB")
-			assert.Equal(t, tc.supportsAutoConfirm, spec.SupportsAutoConfirm, "SupportsAutoConfirm")
 			assert.Equal(t, tc.supportsSkipRevert, spec.SupportsSkipRevert, "SupportsSkipRevert")
 			assert.Equal(t, tc.supportsDefer, spec.SupportsDeferCutover, "SupportsDeferCutover")
 			assert.Equal(t, tc.supportsAllowUnsafe, spec.SupportsAllowUnsafe, "SupportsAllowUnsafe")
@@ -95,12 +92,41 @@ func TestHasAutoConfirmFlag(t *testing.T) {
 	assert.True(t, p.HasAutoConfirmFlag("schemabot apply -e staging --yes"))
 	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging"))
 	assert.False(t, p.HasAutoConfirmFlag(""))
+
+	// A flag is a token on the command, not a substring of one: an
+	// environment ending in `-y` is a legal environment name.
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging-y"))
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e prod --yes-really"))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging\n\nlast time I had to pass --yes locally"))
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging\n\n```\nschemabot apply -e staging -y\n```\n"))
+	assert.False(t, p.HasAutoConfirmFlag("we could pass --yes here"))
 }
 
 func TestHasDatabaseFlag(t *testing.T) {
 	p := NewCommandParser()
 	assert.True(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging -d users"))
 	assert.False(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging"))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasDatabaseFlag("schemabot stop apply_abc123 -e production\n\nthe plan only touches -d accounts"))
+	assert.False(t, p.HasDatabaseFlag("schemabot stop apply_abc123 -e production\n\n```\nschemabot unlock -d accounts\n```\n"))
+	assert.False(t, p.HasDatabaseFlag("try passing -d accounts next time"))
+}
+
+func TestHasDeferCutoverFlag(t *testing.T) {
+	p := NewCommandParser()
+	assert.True(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging --defer-cutover"))
+	assert.False(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging"))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging\n\nlast time we used --defer-cutover here"))
+	assert.False(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging\n\n```\nschemabot rollback-confirm -e staging --defer-cutover\n```\n"))
+	assert.False(t, p.HasDeferCutoverFlag("we could pass --defer-cutover here"))
 }
 
 func TestParseTenantFlag(t *testing.T) {
@@ -901,29 +927,17 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "apply with -y short flag",
+			name: "-y carries no meaning on apply",
 			body: "schemabot apply -e staging -y",
 			expected: CommandResult{
 				Action:      "apply",
 				Environment: "staging",
 				Found:       true,
 				IsMention:   true,
-				AutoConfirm: true,
 			},
 		},
 		{
-			name: "apply with --yes long flag",
-			body: "schemabot apply -e staging --yes",
-			expected: CommandResult{
-				Action:      "apply",
-				Environment: "staging",
-				Found:       true,
-				IsMention:   true,
-				AutoConfirm: true,
-			},
-		},
-		{
-			name: "apply with -y and --allow-unsafe",
+			name: "-y alongside a supported flag leaves that flag parsed",
 			body: "schemabot apply -e production --allow-unsafe -y",
 			expected: CommandResult{
 				Action:      "apply",
@@ -931,11 +945,10 @@ func TestParseCommand(t *testing.T) {
 				Found:       true,
 				IsMention:   true,
 				AllowUnsafe: true,
-				AutoConfirm: true,
 			},
 		},
 		{
-			name: "-y ignored on apply-confirm (already a confirmation)",
+			name: "-y carries no meaning on apply-confirm",
 			body: "schemabot apply-confirm -e staging -y",
 			expected: CommandResult{
 				Action:      "apply-confirm",
@@ -945,7 +958,7 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "-y ignored on plan",
+			name: "-y carries no meaning on plan",
 			body: "schemabot plan -e staging -y",
 			expected: CommandResult{
 				Action:      "plan",

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -31,9 +32,14 @@ func RenderRollbackMissingEnv() string {
 }
 
 // RenderUnsupportedAutoConfirm renders the message posted when the `-y` /
-// `--yes` auto-confirm flag is supplied to a command that does not support it.
+// `--yes` flag is supplied to a comment command. No comment command takes it,
+// so the reply names the surface it does belong to rather than leaving an
+// operator who copied it from a CLI example with nowhere to go.
 func RenderUnsupportedAutoConfirm(action string) string {
-	return fmt.Sprintf("The `-y` flag is not supported for `%s`.", action)
+	return fmt.Sprintf("The `-y` flag is not supported for `%s`.\n\n"+
+		"`-y` belongs to the CLI, where it skips an interactive confirmation prompt. "+
+		"A PR comment has no prompt to skip: when a command stops for confirmation, "+
+		"it is asking you to read what it discloses and reply with the confirm command it posts.", action)
 }
 
 // RenderUnsupportedDatabaseFlag renders the message posted when `-d` is
@@ -332,7 +338,7 @@ const volumeSupersededPrefix = "⏩ Volume changed to"
 // in the headline of every frozen body. IsSupersededProgressComment requires
 // it alongside a flavor prefix, so a live comment that merely opens with the
 // same words as a prefix is never misread as already frozen.
-const supersededFoldMarker = " [a new progress comment](https://github.com/"
+const supersededFoldMarker = " [a new progress comment]("
 
 // SupersededProgressData contains the data every superseded-comment fold
 // shares: where the successor comment lives and the superseded comment's last
@@ -358,9 +364,9 @@ type SupersededProgressData struct {
 // (which must start with that flavor's superseded prefix) and fold label.
 func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID int64, previousBody string) string {
 	return fmt.Sprintf(
-		"%s"+supersededFoldMarker+"%s/pull/%d#issuecomment-%d).\n\n"+
+		"%s"+supersededFoldMarker+"%s#issuecomment-%d).\n\n"+
 			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
-		headline, repo, pr, newCommentID, foldLabel, previousBody)
+		headline, caller.PullRequestURL(repo, pr), newCommentID, foldLabel, previousBody)
 }
 
 // RenderVolumeSupersededProgressComment renders the frozen body written over a

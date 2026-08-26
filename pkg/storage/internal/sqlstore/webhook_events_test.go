@@ -17,60 +17,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-func TestWebhookEventStore_CreateDeduplicatesDeliveryID(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	event := &storage.WebhookEvent{
-		DeliveryID:  "delivery-1",
-		Event:       "pull_request",
-		Action:      "opened",
-		Repository:  "block/example",
-		PullRequest: 123,
-		HeadSHA:     "abc123",
-		TenantID:    "456",
-		Payload:     []byte(`{"action":"opened"}`),
-	}
-	inserted, err := store.WebhookEvents().Create(ctx, event)
-	require.NoError(t, err)
-	require.True(t, inserted)
-	require.NotZero(t, event.ID)
-
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
-		DeliveryID: "delivery-1",
-		Event:      "pull_request",
-		Payload:    []byte(`{}`),
-	})
-	require.NoError(t, err)
-	require.False(t, inserted)
-
-	got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, storage.WebhookProviderGitHub, got.Provider)
-	assert.Equal(t, storage.WebhookEventPending, got.State)
-	assert.Equal(t, "block/example", got.Repository)
-	assert.Equal(t, 123, got.PullRequest)
-	assert.Equal(t, "456", got.TenantID)
-	assert.JSONEq(t, `{"action":"opened"}`, string(got.Payload))
-}
-
-func TestWebhookEventStore_CreateDeduplicatesByProviderAndDeliveryID(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: storage.WebhookProviderGitHub, DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.False(t, inserted)
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{Provider: "gitlab", DeliveryID: "delivery-1", Event: "merge_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-}
+// The behavioral suite for WebhookEventStore lives in
+// pkg/storage/storagetest and runs against every dialect via parity_test.go.
+// The tests here cover only behaviors that require raw SQL, database-specific
+// conditions, or methods not yet represented in the cross-dialect suite.
 
 func TestWebhookEventStore_HasEventForHead(t *testing.T) {
 	clearTables(t)
@@ -536,33 +486,6 @@ func TestWebhookEventStore_SupersedeIfCoveredRedeliveryReopensAndWins(t *testing
 	assert.True(t, superseded, "the redelivered row's live claim must cover the older delivery")
 }
 
-func TestWebhookEventStore_FindNextClaimsOldestPendingEvent(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-2", Event: "pull_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, "delivery-1", claimed.DeliveryID)
-	assert.Equal(t, storage.WebhookEventProcessing, claimed.State)
-	assert.Equal(t, 1, claimed.Attempts)
-	assert.Equal(t, "driver-a", claimed.LeaseOwner)
-	assert.NotEmpty(t, claimed.LeaseToken)
-
-	next, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, next)
-	assert.Equal(t, "delivery-2", next.DeliveryID)
-}
-
 // A pending delivery created with a not-before time is durable immediately but
 // invisible to dispatch until the time passes: a deferred producer — a
 // redundant convergence signal that should lose the race to the primary
@@ -769,74 +692,6 @@ func TestWebhookEventStore_FindNextRequiresOwnerWithoutLeaseLostSentinel(t *test
 	assert.False(t, errors.Is(err, storage.ErrWebhookEventLeaseLost))
 }
 
-func TestWebhookEventStore_FindNextSkipsFreshLeaseAndReclaimsExpiredLease(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-
-	none, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
-	require.NoError(t, err)
-	assert.Nil(t, none)
-
-	_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET lease_expires_at = NOW() - INTERVAL 1 SECOND WHERE id = ?`, claimed.ID)
-	require.NoError(t, err)
-
-	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, reclaimed)
-	assert.Equal(t, claimed.ID, reclaimed.ID)
-	assert.Equal(t, 2, reclaimed.Attempts)
-	assert.Equal(t, "driver-b", reclaimed.LeaseOwner)
-	assert.NotEqual(t, claimed.LeaseToken, reclaimed.LeaseToken)
-}
-
-func TestWebhookEventStore_MarkFailedRetryableAndCompleted(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-
-	retryAfter := time.Now().Add(-time.Minute)
-	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "temporary failure", &retryAfter))
-
-	retryable, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
-	require.NoError(t, err)
-	require.NotNil(t, retryable)
-	assert.Equal(t, storage.WebhookEventFailedRetryable, retryable.State)
-	assert.Equal(t, "temporary failure", retryable.LastError)
-	assert.NotNil(t, retryable.RetryAfter)
-	assert.Nil(t, retryable.CompletedAt)
-
-	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, reclaimed)
-	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, reclaimed.ID, reclaimed.LeaseToken))
-
-	completed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
-	require.NoError(t, err)
-	require.NotNil(t, completed)
-	assert.Equal(t, storage.WebhookEventCompleted, completed.State)
-	assert.NotNil(t, completed.CompletedAt)
-	// The lease token is retained on terminal rows so a committed-but-unacked
-	// retry of MarkCompleted stays idempotent rather than reporting a lost lease.
-	assert.Equal(t, reclaimed.LeaseToken, completed.LeaseToken)
-}
-
 // A dead-lettered delivery is terminal and sticky: MarkFailedPermanent records
 // the error that proved the head can never succeed, FindNext never reclaims
 // the row, and only a redelivery of the same GUID (GitHub Redeliver) reopens
@@ -915,59 +770,6 @@ func TestWebhookEventStore_LeaseTokenGuardsWrites(t *testing.T) {
 	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
 }
 
-func TestWebhookEventStore_CreateReopensTerminalDelivery(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "permanent failure", nil))
-
-	// GitHub "Redeliver" reuses the original delivery GUID; it must re-open a
-	// terminally failed row instead of being deduplicated into a no-op.
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":2}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
-	require.NoError(t, err)
-	require.NotNil(t, reopened)
-	assert.Equal(t, storage.WebhookEventPending, reopened.State)
-	assert.Equal(t, 0, reopened.Attempts)
-	assert.Empty(t, reopened.LeaseToken)
-	assert.Nil(t, reopened.CompletedAt)
-	assert.Nil(t, reopened.StartedAt)
-	assert.JSONEq(t, `{"attempt":2}`, string(reopened.Payload))
-
-	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, reclaimed)
-	require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, reclaimed.ID, reclaimed.LeaseToken))
-
-	// A completed row is also re-opened on redelivery: completion is recorded
-	// before the detached plan goroutines have durably persisted their work, so
-	// a crash in that window can lose the auto-plan while leaving the row
-	// completed. Re-running auto-plan on the same head SHA is idempotent, so an
-	// operator Redeliver is a safe recovery lever rather than a permanent no-op.
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":3}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	reopenedAgain, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
-	require.NoError(t, err)
-	require.NotNil(t, reopenedAgain)
-	assert.Equal(t, storage.WebhookEventPending, reopenedAgain.State)
-	assert.Equal(t, 0, reopenedAgain.Attempts)
-	assert.Nil(t, reopenedAgain.CompletedAt)
-	assert.JSONEq(t, `{"attempt":3}`, string(reopenedAgain.Payload))
-}
-
 func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1011,33 +813,6 @@ func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, reclaimed, "reopened row must be claimable again")
 	assert.Equal(t, 1, reclaimed.Attempts)
-}
-
-func TestWebhookEventStore_CreateDedupesProcessingWithLiveLease(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":1}`)})
-	require.NoError(t, err)
-	require.True(t, inserted)
-
-	// A live driver owns the row (unexpired lease), so it is genuinely in
-	// flight — a duplicate delivery must dedup rather than yank it away.
-	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{DeliveryID: "delivery-1", Event: "pull_request", Payload: []byte(`{"attempt":2}`)})
-	require.NoError(t, err)
-	require.False(t, inserted, "a processing row with a live lease must dedup, not reopen")
-
-	current, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
-	require.NoError(t, err)
-	require.NotNil(t, current)
-	assert.Equal(t, storage.WebhookEventProcessing, current.State)
-	assert.Equal(t, claimed.LeaseToken, current.LeaseToken, "the live driver's lease must be untouched")
-	assert.JSONEq(t, `{"attempt":1}`, string(current.Payload), "payload must not be overwritten while in flight")
 }
 
 func TestWebhookEventStore_ReleaseRefundsAttemptAndRequeues(t *testing.T) {

@@ -24,8 +24,12 @@ func TestRenderRollbackMissingEnv(t *testing.T) {
 }
 
 func TestRenderUnsupportedAutoConfirm(t *testing.T) {
-	rendered := RenderUnsupportedAutoConfirm("plan")
-	assert.Equal(t, "The `-y` flag is not supported for `plan`.", rendered)
+	rendered := RenderUnsupportedAutoConfirm("apply")
+	assert.Contains(t, rendered, "The `-y` flag is not supported for `apply`.")
+	assert.Contains(t, rendered, "`-y` belongs to the CLI",
+		"an operator who copied the flag from a CLI example is told where it works")
+	assert.Contains(t, rendered, "reply with the confirm command it posts",
+		"the reply points at the two-step confirm rather than a way around it")
 }
 
 func TestRenderUnsupportedDatabaseFlag(t *testing.T) {

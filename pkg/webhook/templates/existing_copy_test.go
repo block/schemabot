@@ -40,9 +40,9 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 		"the copy's age dates its last checkpoint, so it can never be read as elapsed copying")
 	assert.NotContains(t, plan, "3h 12m already spent",
 		"a live copy checkpoints continuously, so its age understates what discarding costs")
-	assert.Contains(t, plan, "it runs as long as a first copy would; the work already done is lost and cannot be recovered",
+	assert.Contains(t, plan, "Applying restarts the copy from zero rows.",
 		"what confirming costs is the whole copy over again, named as work rather than as a duration")
-	assert.Contains(t, plan, "apply the same schema change that started it")
+	assert.Contains(t, plan, "To keep the work already done, apply the schema change that started it.")
 
 	// A locked apply that stopped for confirmation is the same situation: the
 	// copy is still there and confirming is what destroys it, so the warning
@@ -51,7 +51,7 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	data.AutoConfirmDowngradeReason = "Applying destroys work in progress on the target"
 	paused := RenderPlanComment(data)
 	assert.Contains(t, paused, "⚠️ **Applying destroys work in progress**")
-	assert.Contains(t, paused, "apply the same schema change that started it")
+	assert.Contains(t, paused, "apply the schema change that started it")
 }
 
 // An apply that is already running has nothing to ask and no move to offer: the
@@ -80,9 +80,9 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 		"a reader with no move to make is being informed, not warned")
 	assert.NotContains(t, out, "**Applying destroys work in progress**",
 		"the hypothetical subject belongs to a comment where applying is still a choice")
-	assert.NotContains(t, out, "apply the same schema change that started it",
+	assert.NotContains(t, out, "apply the schema change that started it",
 		"the remedy is out of reach once the copy is being destroyed")
-	assert.NotContains(t, out, "runs as long as a first copy would",
+	assert.NotContains(t, out, "restarts the copy from zero rows",
 		"the entries are the whole record; a closing line here could only restate them")
 }
 
@@ -269,10 +269,10 @@ func TestRenderPlanComment_SeveralDiscardedCopiesReadAsPlural(t *testing.T) {
 	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **2** unfinished copies on the target\n")
 	assert.Contains(t, out, "- `orders` in `orders_a` (last progress 3h 12m ago): the schema change differs from the one that started it")
 	assert.Contains(t, out, "- `orders` in `orders_b` (last progress 9d 4h ago): it is too old to resume")
-	assert.Contains(t, out, "the work already done is lost and cannot be recovered")
-	assert.Contains(t, out, "To continue the existing copies instead, apply the same schema changes that started them.",
+	assert.Contains(t, out, "Applying restarts the copies from zero rows.")
+	assert.Contains(t, out, "To keep the work already done, apply the schema changes that started them.",
 		"two copies were started by two schema changes, so the remedy names both in the plural")
-	assert.NotContains(t, out, "the same schema change that started it",
+	assert.NotContains(t, out, "the schema change that started it",
 		"the singular remedy points at one statement an operator cannot identify from two copies")
 }
 
@@ -291,7 +291,7 @@ func TestRenderPlanComment_DiscardedCopyWithoutAge(t *testing.T) {
 	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
 	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it",
 		"an unknown age is omitted rather than rendered as a bare zero, which would read as a copy that just started")
-	assert.Contains(t, out, "the work already done is lost and cannot be recovered")
+	assert.Contains(t, out, "To keep the work already done, apply the schema change that started it.")
 	assert.NotContains(t, out, "last progress")
 }
 

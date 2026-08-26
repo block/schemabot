@@ -348,3 +348,40 @@ func TestPlanResponse_AllChangesDirect(t *testing.T) {
 		})
 	}
 }
+
+// DiscardedCopies selects the copies an apply destroys. The caller uses it to
+// decide whether an operator must confirm first, so an adopted copy — where
+// nothing is lost — is the only thing it leaves out.
+func TestPlanResponseDiscardedCopies(t *testing.T) {
+	resp := &PlanResponse{
+		ExistingCopies: []*ExistingCopyResponse{
+			{Namespace: "orders_ks", Disposition: ExistingCopyDiscard, Tables: []string{"orders"}},
+			{Namespace: "products_ks", Disposition: ExistingCopyAdopt, Tables: []string{"products"}},
+		},
+	}
+
+	discarded := resp.DiscardedCopies()
+
+	require.Len(t, discarded, 1)
+	assert.Equal(t, "orders_ks", discarded[0].Namespace)
+}
+
+// A disposition this build does not recognize counts as discarded: the
+// confirmation exists to protect work already done, and an unreadable verdict
+// is not a reason to skip it.
+func TestPlanResponseDiscardedCopiesCountsUnknownDisposition(t *testing.T) {
+	resp := &PlanResponse{
+		ExistingCopies: []*ExistingCopyResponse{
+			{Namespace: "orders_ks", Disposition: "recycle", Tables: []string{"orders"}},
+		},
+	}
+
+	require.Len(t, resp.DiscardedCopies(), 1)
+}
+
+// A clean target has nothing to confirm, so the apply proceeds as it always
+// has.
+func TestPlanResponseDiscardedCopiesEmpty(t *testing.T) {
+	assert.Empty(t, (&PlanResponse{}).DiscardedCopies())
+	assert.Empty(t, (*PlanResponse)(nil).DiscardedCopies())
+}

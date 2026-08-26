@@ -50,9 +50,11 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	if state != storage.WebhookEventPending {
 		return false, fmt.Errorf("create webhook event (delivery_id=%s): new deliveries must be pending, got %q", event.DeliveryID, state)
 	}
-	receivedAt := event.ReceivedAt
-	if receivedAt.IsZero() {
-		receivedAt = time.Now()
+	// Timestamp columns store UTC wall clocks, and not every SQL driver
+	// converts a zoned time.Time before binding it, so normalize here.
+	receivedAt := event.ReceivedAt.UTC()
+	if event.ReceivedAt.IsZero() {
+		receivedAt = time.Now().UTC()
 	}
 
 	// A caller-set RetryAfter is a not-before time: the row is durable

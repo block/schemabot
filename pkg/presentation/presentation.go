@@ -19,6 +19,7 @@ package presentation
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -277,7 +278,7 @@ func deriveDeployment(ops []Operation, i int) Deployment {
 	case state.ApplyOperation.CuttingOver:
 		d.set(StateCuttingOver, "cutting over", "🔁", true)
 	case state.ApplyOperation.Failed:
-		d.set(StateFailed, "failed", "❌", true)
+		d.set(StateFailed, "failed", glyph.Failed, true)
 	case state.ApplyOperation.FailedRetryable:
 		d.set(StateRetrying, "retrying", "🔁", true)
 	case state.ApplyOperation.Stopped:

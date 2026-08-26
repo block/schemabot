@@ -18,6 +18,11 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// The behavioral suite for ApplyOperationStore lives in
+// pkg/storage/storagetest and runs against every dialect via parity_test.go.
+// The tests here cover behavior not represented in that suite, including
+// timestamp-driven cases that require backdating rows with raw SQL.
+
 func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2293,53 +2298,6 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.
 	assert.Equal(t, state.ApplyOperation.Running, persisted.State)
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings verifies that
-// a multi-deployment apply is claimed one deployment at a time, in insertion
-// (deployment_order) order: a later sibling stays unclaimable until every
-// earlier sibling has completed. This is the sequential rollout an operator
-// expects — region B never starts before region A finishes.
-func TestApplyOperationStore_FindNextApplyOperation_OrdersSiblings(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_op_ordered", 1)
-
-	deployments := []string{"region-a", "region-b", "region-c"}
-	ids := make([]int64, len(deployments))
-	for i, deployment := range deployments {
-		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-			ApplyID: apply.ID, Deployment: deployment,
-		})
-		require.NoError(t, err)
-		ids[i] = id
-	}
-
-	// Each claim returns the next deployment in order; the rollout only
-	// advances once the prior deployment is marked completed.
-	for i, deployment := range deployments {
-		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
-		require.NoError(t, err)
-		require.NotNil(t, claimed, "deployment %q should be claimable once earlier siblings completed", deployment)
-		assert.Equal(t, ids[i], claimed.ID)
-		assert.Equal(t, deployment, claimed.Deployment)
-
-		// A second claim before completing the current row yields nothing:
-		// the claimed row is running (not completed), so it gates its siblings.
-		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
-		require.NoError(t, err)
-		assert.Nil(t, blocked, "later siblings must wait while %q is still running", deployment)
-
-		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, claimed.ID))
-	}
-
-	// All deployments completed → nothing left to claim.
-	done, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
-	require.NoError(t, err)
-	assert.Nil(t, done)
-}
-
 func TestApplyOperationStore_FindNextApplyOperation_ClaimsFinalizerAfterWorkSiblingsComplete(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -4126,18 +4084,6 @@ func TestApplyOperationStore_FindNextApplyOperation_IsolatesApplies(t *testing.T
 	assert.Equal(t, bID, claimed.ID, "the only claimable row is apply B's first deployment")
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_DBError covers the error
-// surface when the underlying connection is gone.
-func TestApplyOperationStore_FindNextApplyOperation_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-
-	store := NewMySQL(db)
-	_, err = store.ApplyOperations().FindNextApplyOperation(t.Context(), "test-operator")
-	require.Error(t, err)
-}
-
 // TestApplyOperationStore_Heartbeat verifies that Heartbeat moves updated_at
 // forward for an existing row and is a silent no-op for an unknown id.
 func TestApplyOperationStore_Heartbeat(t *testing.T) {
@@ -4633,109 +4579,6 @@ func TestApplyOperationStore_FindNextApplyOperation_PendingStopDoesNotBlockStale
 	require.NotNil(t, claimed, "a stale active row is recovering started work and is not gated by a pending stop")
 	assert.Equal(t, runningID, claimed.ID)
 	assert.Equal(t, state.ApplyOperation.Running, claimed.State, "re-lease keeps the running state for the resume drive")
-}
-
-// TestApplyOperationStore_MarkPendingStoppedByApply verifies the operator stop
-// reconciliation primitive: it terminalizes only the still-pending operations of
-// an apply to stopped, leaving running and already-terminal rows untouched, and
-// keeps completed_at nil because stopped is resumable.
-func TestApplyOperationStore_MarkPendingStoppedByApply(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_mark_stopped", 1, state.Apply.Running, "staging")
-
-	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Failed, OnFailure: storage.OnFailureContinue,
-	})
-	require.NoError(t, err)
-	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.Running, OnFailure: storage.OnFailureContinue,
-	})
-	require.NoError(t, err)
-	pendingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-c", OnFailure: storage.OnFailureContinue,
-	})
-	require.NoError(t, err)
-
-	stopped, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), stopped, "only the single pending row is stopped")
-
-	pending, err := store.ApplyOperations().Get(ctx, pendingID)
-	require.NoError(t, err)
-	assert.Equal(t, state.ApplyOperation.Stopped, pending.State, "pending row is terminalized to stopped")
-	assert.Nil(t, pending.CompletedAt, "stopped is resumable, so completed_at stays nil")
-
-	failed, err := store.ApplyOperations().Get(ctx, failedID)
-	require.NoError(t, err)
-	assert.Equal(t, state.ApplyOperation.Failed, failed.State, "an already-terminal row keeps its recorded result")
-
-	running, err := store.ApplyOperations().Get(ctx, runningID)
-	require.NoError(t, err)
-	assert.Equal(t, state.ApplyOperation.Running, running.State, "an in-flight row is left for its own driver")
-
-	// A second call is a no-op once nothing is pending.
-	again, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), again, "no pending rows remain to stop")
-}
-
-// Under fan-out multi-operation mode the driving driver holds only an operation
-// lease, not the parent apply lease. MarkPendingStoppedByApply must still let it
-// stop the apply's pending siblings, authorized by the owning operation row's
-// own lease token, and must fail closed when that token is stale or names a
-// different apply so a displaced driver cannot stop siblings it no longer owns.
-func TestApplyOperationStore_MarkPendingStoppedByApply_OperationLease(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_mark_stopped_oplease", 1, state.Apply.Running, "staging")
-
-	// The owning operation the driver holds a lease on. It is running (driving),
-	// so MarkPendingStoppedByApply never touches it.
-	ownerID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-owner")
-	require.NoError(t, store.ApplyOperations().UpdateState(ctx, ownerID, state.ApplyOperation.Running))
-	stampOperationLease(t, ownerID, "driver", "op-token")
-
-	pendingID := createApplyOperationForLeaseTest(t, store, apply.ID, "region-pending")
-
-	opCtx := func(applyID, opID int64, token string) context.Context {
-		return storage.WithOperationLease(ctx, storage.OperationLease{
-			ApplyID:     applyID,
-			OperationID: opID,
-			Owner:       "driver",
-			Token:       token,
-		})
-	}
-
-	// A stale operation token while a pending sibling remains fails closed and
-	// leaves the sibling pending.
-	_, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "stale-op-token"), apply.ID)
-	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-	assertApplyOperationState(t, store, pendingID, state.ApplyOperation.Pending)
-
-	// An operation lease naming a different apply does not authorize the stop.
-	_, err = store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID+1, ownerID, "op-token"), apply.ID)
-	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-	assertApplyOperationState(t, store, pendingID, state.ApplyOperation.Pending)
-
-	// The current operation token stops the pending sibling and leaves the
-	// running owner untouched.
-	stopped, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "op-token"), apply.ID)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), stopped)
-	assertApplyOperationState(t, store, pendingID, state.ApplyOperation.Stopped)
-	assertApplyOperationState(t, store, ownerID, state.ApplyOperation.Running)
-
-	// A repeat under the current token is a clean no-op (lease still owned).
-	again, err := store.ApplyOperations().MarkPendingStoppedByApply(opCtx(apply.ID, ownerID, "op-token"), apply.ID)
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), again)
 }
 
 // backdateApplyUpdatedAt ages a parent apply's updated_at so the stranded sweep

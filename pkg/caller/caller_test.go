@@ -161,3 +161,12 @@ func TestShort(t *testing.T) {
 		assert.Equal(t, "cli:jdoe", Short("cli:jdoe"))
 	})
 }
+
+func TestPullRequestURL(t *testing.T) {
+	assert.Equal(t, "https://github.com/acme/shop/pull/412", PullRequestURL("acme/shop", 412))
+}
+
+func TestPullRequestMarkdownLink(t *testing.T) {
+	assert.Equal(t, "[acme/shop#412](https://github.com/acme/shop/pull/412)",
+		PullRequestMarkdownLink("acme/shop", 412))
+}

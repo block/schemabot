@@ -62,7 +62,7 @@ func TestSplitExistingCopiesFailsTowardDiscard(t *testing.T) {
 // which would read as having just started.
 func TestSplitExistingCopiesOmitsUnknownAge(t *testing.T) {
 	discarded, _ := splitExistingCopies([]*apitypes.ExistingCopyResponse{
-		{Namespace: "orders_ks", Disposition: string(engine.CopyDiscard), Tables: []string{"orders"}},
+		{Namespace: "orders_ks", Disposition: apitypes.ExistingCopyDiscard, Tables: []string{"orders"}},
 	})
 
 	require.Len(t, discarded, 1)
@@ -76,4 +76,13 @@ func TestSplitExistingCopiesEmpty(t *testing.T) {
 
 	assert.Empty(t, discarded)
 	assert.Empty(t, adopted)
+}
+
+// apitypes carries its own copy of the disposition vocabulary because it is
+// dependency-free by design. This package imports both, so it is where the two
+// are held together: a rename on the engine side that misses the wire side
+// would otherwise silently route every copy down the discard path.
+func TestExistingCopyDispositionsMatchTheEngine(t *testing.T) {
+	assert.Equal(t, string(engine.CopyAdopt), apitypes.ExistingCopyAdopt)
+	assert.Equal(t, string(engine.CopyDiscard), apitypes.ExistingCopyDiscard)
 }

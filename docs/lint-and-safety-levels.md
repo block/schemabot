@@ -158,8 +158,8 @@ rejected up front while they are present.
 
 | Icon | Where it appears | Meaning |
 |---|---|---|
-| ⛔ | Plan comment (**Cannot apply**), apply-rejection comments (**Unsafe Changes Detected**, **Apply rejected**, **Apply Blocked: PR Is Merged/Closed**), CLI unsafe-changes list | Refusal: this will not or did not proceed |
-| ⚠️ | Plan comment (**Issues**) | Caution: unsafe changes to review before applying |
+| ⛔ | Plan comment (**Cannot apply**), apply-rejection comments (**Unsafe Changes Detected**, **Apply rejected**, **Apply Blocked: PR Is Merged/Closed**), CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
+| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**) | Caution: unsafe changes to review before applying |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
@@ -172,5 +172,5 @@ Presentation notes:
   the collapsed header. Short lists render inline.
 - Quoted identifiers and types inside finding messages (index names, column
   types) render as inline code.
-- The CLI uses ⛔ for unsafe changes at both plan and apply time, since the
-  terminal is both the review surface and the gate.
+- The CLI and the plan comment share the same severity reading: ⚠️ marks
+  unsafe changes awaiting review at plan time, and ⛔ marks the refused apply.

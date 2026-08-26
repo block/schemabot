@@ -269,7 +269,7 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 
 // checkNeedsTerminalReconcile reports whether stored check state is stale
 // relative to the newest apply for its target and must be repaired from that
-// apply's terminal outcome. Two stale shapes exist:
+// apply's terminal outcome. Three stale shapes exist:
 //
 //   - an in_progress row whose newest apply is already terminal: the driver
 //     died between finishing the apply and updating stored check state;
@@ -277,6 +277,9 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 //     rollback: the rollback never claimed the row (its claim failed or the
 //     driver crashed before the claim landed), so the row's success predates
 //     the revert and would let the PR merge with the change missing.
+//   - an apply-owned row whose newest apply is a cancelled forward apply: the
+//     terminal outcome requires the row to be re-driven so ownership is
+//     released when the apply history proves that is safe.
 //
 // Successful rows without apply ownership are left alone: releasing ownership
 // is how a deliberate stale-cleanup unblock records its decision, and
@@ -288,9 +291,19 @@ func checkNeedsTerminalReconcile(check *storage.Check, apply *storage.Apply) boo
 	if check.Status == checkStatusInProgress {
 		return true
 	}
-	return check.ApplyID != 0 &&
-		check.Conclusion == checkConclusionSuccess &&
-		isCompletedRollback(apply)
+	if check.ApplyID == 0 {
+		return false
+	}
+	if check.Conclusion == checkConclusionSuccess && isCompletedRollback(apply) {
+		return true
+	}
+	if !state.IsState(apply.State, state.Apply.Cancelled) || apply.IsRollback() {
+		return false
+	}
+	retainedCancellationIsSettled := check.Status == checkStatusCompleted &&
+		check.Conclusion == checkConclusionFailure &&
+		check.BlockingReason == applyCancelledAfterTaskCompletedBlock.blockingReason
+	return !retainedCancellationIsSettled
 }
 
 // reconcileStaleChecks repairs stored check state from authoritative apply
@@ -429,19 +442,48 @@ func isCompletedRollback(a *storage.Apply) bool {
 	return a.IsRollback() && state.IsState(a.State, state.Apply.Completed)
 }
 
+// completedForwardTaskBeforeCancellation returns durable evidence that the
+// cancelled apply or an earlier forward apply changed the same target. Apply
+// rows cannot provide this proof because an apply may be cancelled or failed
+// after one of its independently driven tasks completed.
+func completedForwardTaskBeforeCancellation(applies []*storage.Apply, tasks []*storage.Task, cancelled *storage.Apply) *storage.Task {
+	forwardApplyIDs := make(map[int64]bool)
+	for _, apply := range applies {
+		if apply.ID > cancelled.ID || apply.IsRollback() {
+			continue
+		}
+		if apply.Environment == cancelled.Environment &&
+			apply.DatabaseType == cancelled.DatabaseType &&
+			apply.Database == cancelled.Database {
+			forwardApplyIDs[apply.ID] = true
+		}
+	}
+
+	for _, task := range tasks {
+		if forwardApplyIDs[task.ApplyID] && state.IsState(task.State, state.Task.Completed) {
+			return task
+		}
+	}
+	return nil
+}
+
 // updateCheckRecordForApplyResult updates stored check state after an apply
-// reaches a terminal state. A completed rollback lands action_required; other
-// terminal states map to success or failure. The rollback routing lives here —
-// not in callers — because every terminal path (observer, operator-driven
-// drive, recovery, stale reconciliation) must honor the rollback intent from
-// the durable apply row. The aggregate check is updated separately to reflect
-// the new status on the PR.
+// reaches a terminal state. A completed rollback lands action_required. A
+// cancelled forward apply also lands action_required and releases ownership
+// when apply history proves no schema change reached the target. Other terminal
+// states map to success or failure. This routing lives here — not in callers —
+// because every terminal path (observer, operator-driven drive, recovery, stale
+// reconciliation) must honor the durable apply outcome. The aggregate check is
+// updated separately to reflect the new status on the PR.
 func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo string, pr int, apply *storage.Apply) (bool, error) {
-	// Metrics keep rollback finalization distinct from ordinary apply completion
-	// so operators can alert on the two outcomes separately.
+	// Metrics keep cancellation and rollback finalization distinct from ordinary
+	// apply completion so operators can alert on each outcome separately.
 	operation := "apply_finished"
-	if isCompletedRollback(apply) {
+	switch {
+	case isCompletedRollback(apply):
 		operation = "rollback_finished"
+	case state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback():
+		operation = "apply_cancelled_finished"
 	}
 	recordOutcome := func(status string) {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -482,8 +524,33 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		return false, nil
 	}
 
+	cancelledForwardApply := state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback()
+	retainCancelledOwnership := false
+	if cancelledForwardApply {
+		applies, getErr := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+		if getErr != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("look up apply history before releasing cancelled apply check ownership repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, getErr)
+		}
+		tasks, getErr := h.service.Storage().Tasks().GetByPR(ctx, repo, pr)
+		if getErr != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("look up task history before releasing cancelled apply check ownership repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, getErr)
+		}
+		if completedTask := completedForwardTaskBeforeCancellation(applies, tasks, apply); completedTask != nil {
+			retainCancelledOwnership = true
+			h.logger.Info("cancelled apply has a completed forward task; check ownership will remain and reconciliation will stay blocked",
+				append(apply.LogAttrs(), "completed_task_id", completedTask.TaskIdentifier,
+					"completed_task_table", completedTask.TableName, "check_status", check.Status,
+					"check_conclusion", check.Conclusion)...)
+		}
+	}
+
 	var updated bool
-	if isCompletedRollback(apply) {
+	switch {
+	case isCompletedRollback(apply):
 		check.Status = checkStatusCompleted
 		check.Conclusion = checkConclusionActionRequired
 		check.HasChanges = true
@@ -498,7 +565,40 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			return false, fmt.Errorf("mark stored check state action_required after rollback repo %s pr %d environment %s database_type %s database %s: %w",
 				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 		}
-	} else {
+	case cancelledForwardApply && retainCancelledOwnership:
+		setCancelledApplyRetainedFailure(check)
+		updated, err = h.service.Storage().Checks().MarkCancelledApplyFailed(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("retain failed stored check state after partially completed cancelled apply repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
+	case cancelledForwardApply:
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		check.BlockingReason = applyCancelledBlock.blockingReason
+		check.ErrorMessage = applyCancelledBlock.message
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after cancelled apply repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
+		if !updated {
+			setCancelledApplyRetainedFailure(check)
+			updated, err = h.service.Storage().Checks().MarkCancelledApplyFailed(ctx, check, apply)
+			if err != nil {
+				recordOutcome("error")
+				return false, fmt.Errorf("retain failed stored check state after completed task raced cancelled apply ownership release repo %s pr %d environment %s database_type %s database %s: %w",
+					repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+			}
+			if updated {
+				h.logger.Info("completed forward task appeared before cancelled apply ownership release; check ownership remains and reconciliation stays blocked",
+					append(apply.LogAttrs(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
+			}
+		}
+	default:
 		var conclusion string
 		switch {
 		case state.IsState(apply.State, state.Apply.Completed) && checkBlockedByRemovedSchemaAfterApply(check):
@@ -529,12 +629,13 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	if !updated {
 		metrics.RecordCheckOwnershipMiss(ctx, operation, repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
 		recordOutcome("skipped")
-		// The two writes skip for different reasons: the rollback write yields
-		// only to an apply newer than the rollback, while the ordinary completion
-		// requires the row to still be owned by this apply.
+		// The action-required writes yield only to a newer apply, while ordinary
+		// completion requires the row to still be owned by this apply.
 		msg := "skipping check state update because stored state no longer belongs to apply"
 		if isCompletedRollback(apply) {
 			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
+		} else if cancelledForwardApply {
+			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,
@@ -553,4 +654,12 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		"blocking_reason", check.BlockingReason)
 	recordOutcome("success")
 	return true, nil
+}
+
+func setCancelledApplyRetainedFailure(check *storage.Check) {
+	check.Status = checkStatusCompleted
+	check.Conclusion = checkConclusionFailure
+	check.HasChanges = true
+	check.BlockingReason = applyCancelledAfterTaskCompletedBlock.blockingReason
+	check.ErrorMessage = applyCancelledAfterTaskCompletedBlock.message
 }

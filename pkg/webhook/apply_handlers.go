@@ -95,9 +95,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
-			h.logger.Debug("unscoped fan-out apply touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
@@ -343,13 +343,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
+	// DisclosedCopyDiscard records whether that plan's comment tells the operator
+	// a copy is destroyed, so the apply can later tell a discard they agreed to
+	// from one that appeared after they were asked.
 	lock := &storage.Lock{
-		DatabaseName:  database,
-		DatabaseType:  dbType,
-		Owner:         lockOwner,
-		Repository:    repo,
-		PullRequest:   pr,
-		PendingPlanID: planResp.PlanID,
+		DatabaseName:         database,
+		DatabaseType:         dbType,
+		Owner:                lockOwner,
+		Repository:           repo,
+		PullRequest:          pr,
+		PendingPlanID:        planResp.PlanID,
+		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
 	}
 	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
@@ -411,13 +415,55 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
+			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
+			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
+		}
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkRunErr != nil {
 			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
 		}
 		if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
+		return false, nil
+	}
+
+	// Discarding an unfinished copy destroys work already done on the target —
+	// often hours of it — so it never happens in one step. Downgrade to the
+	// two-step confirm against the locked comment that discloses what is being
+	// thrown away, the same way a direct-execution change does: the operator
+	// spends the hours, so the operator decides, and there is no flag that
+	// converts an automatic apply into that consent.
+	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
+		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
+			"repo", repo, "pr", pr, "database", database, "environment", environment,
+			"discarded_copies", len(discarded))
+		// Store the check record before posting the paused comment: the pause
+		// is acknowledged only once the stored check state blocks the merge
+		// gate on the pending changes. A storage failure releases the lock
+		// (keyed on this plan's intent) and stays retryable — the re-drive
+		// re-plans from the top, reacquires the lock, and reaches this gate
+		// again — so the pause is never acknowledged over unknown check state.
+		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		if checkRunErr != nil {
+			h.logger.Error("failed to store check state for copy-discard downgrade; the merge gate does not reflect the pending changes, so the command stays retryable",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", checkRunErr)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "copy-discard downgrade check state store failure")
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not record the check state for this apply. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command copy-discard downgrade check record %s#%d: %w", repo, pr, checkRunErr)
+		}
+		if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
+		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
+		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
+			templates.RenderPlanComment(commentData), "copy-discard downgrade disclosure post failure"); postErr != nil {
+			return true, fmt.Errorf("apply command copy-discard downgrade disclosure %s#%d: %w", repo, pr, postErr)
 		}
 		return false, nil
 	}
@@ -451,8 +497,35 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
+}
+
+// postPendingConfirmation posts the plan comment a pending confirmation is meant
+// to be confirmed against, and releases the confirmation when the comment does
+// not land. The lock is acquired before this comment exists and already records
+// what the comment discloses about an unfinished copy, so a post that fails
+// would leave consent behind for a disclosure nobody was shown. A confirmation
+// whose comment never appeared is also one no operator can act on: they were
+// told nothing to confirm, and the lock would sit until someone unlocked it by
+// hand.
+//
+// The release is keyed on this plan's intent, so a lock that has since changed
+// hands or been re-pinned is preserved. Callers stay retryable — the re-drive
+// re-plans from the top, reacquires the lock, and asks again — and do not post a
+// command error, because posting is the operation that just failed.
+func (h *Handler) postPendingConfirmation(
+	ctx context.Context, repo string, pr int, installationID int64,
+	database, dbType, environment, planID, body, reason string,
+) error {
+	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+		h.logger.Error("failed to post the comment the pending confirmation is confirmed against, so the confirmation was released rather than left recording consent for a disclosure that was never shown",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planID, "reason", reason, "error", err)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planID, reason)
+		return err
+	}
+	return nil
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
@@ -536,9 +609,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
-			h.logger.Debug("unscoped fan-out apply-confirm touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply-confirm resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {
@@ -706,8 +779,31 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID)
+	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
+	if existingLock.DisclosedCopyDiscard && !disclosedCopyDiscard {
+		h.logger.Info("copy-discard disclosure not applied to this confirm: it was shown for another environment",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+	}
+
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
+}
+
+// disclosureDescribesThisApply reports whether the consent recorded on the
+// pending confirmation was earned for the apply about to run. The lock carries
+// no environment dimension, so a disclosure the operator was shown confirming
+// one environment must not disarm the copy gate in another: the pinned plan
+// names the environment they actually saw. A confirmation with no loadable plan
+// counts as no disclosure, so the apply asks rather than assuming consent.
+func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
+	if !lock.DisclosedCopyDiscard {
+		return false
+	}
+	if plan == nil {
+		return false
+	}
+	return plan.Environment == environment
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command. It is

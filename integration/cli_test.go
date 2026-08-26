@@ -428,7 +428,8 @@ CREATE TABLE accounts (
 		// Should exit with error
 		require.Error(t, err, "expected apply to fail without --allow-unsafe")
 		// Should show unsafe changes message
-		assertContains(t, out, "Unsafe Changes Detected")
+		assertContains(t, out, "Apply blocked")
+		assertContains(t, out, "unsafe change(s) detected")
 		assertContains(t, out, "--allow-unsafe")
 	})
 

@@ -67,7 +67,11 @@ func deploymentSharedID(ops []*ApplyOperation, deployment string, idOf func(*App
 			continue
 		}
 		if id != shared {
-			return "", fmt.Errorf("deployment %q operations record more than one data-plane apply id (%q on operation %q disagrees with %q)", deployment, id, op.OperationKey, shared)
+			// Pin the offending row by apply_operation id: the operation key is
+			// the readable handle but is legitimately empty on a legacy
+			// single-operation row — the exact shape a dispatch-key rollout
+			// leaves disagreeing.
+			return "", fmt.Errorf("deployment %q operations record more than one data-plane apply id (%q on apply_operation %d (operation key %q) disagrees with %q)", deployment, id, op.ID, op.OperationKey, shared)
 		}
 	}
 	return shared, nil
