@@ -19,7 +19,9 @@ import (
 //
 // When storedPlan is non-nil (auto-confirm path), the re-plan DDL is compared against it.
 // If the DDL differs, execution is downgraded to manual confirmation — a plan comment is
-// posted with a warning and the user must run apply-confirm separately.
+// posted with a warning and the user must run apply-confirm separately. The copy-discard
+// gate below is not scoped that way: it stops an operator's own apply-confirm too,
+// because a copy can appear after the comment they confirmed was posted.
 //
 // disclosedCopyDiscard is what the comment behind this apply told the operator
 // about an unfinished copy on the target, read from the lock's pending
@@ -135,8 +137,12 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			"Schema changes differ from auto-plan — review and confirm manually")
+		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Schema changes differ from auto-plan — review and confirm manually"); err != nil {
+			h.logger.Error("failed to post the DDL-drift downgrade comment",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", err)
+		}
 		return
 	}
 
@@ -147,8 +153,12 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			"Plan contains direct-execution changes — review the disclosure and confirm manually")
+		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Plan contains direct-execution changes — review the disclosure and confirm manually"); err != nil {
+			h.logger.Error("failed to post the direct-execution downgrade comment",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", err)
+		}
 		return
 	}
 
@@ -167,19 +177,27 @@ func (h *Handler) executeApply(
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "action", actionName,
 			"plan_id", planResp.PlanID, "discarded_copies", len(discarded))
-		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, planResp.PlanID, true); err != nil {
+		// The disclosure is posted before it is recorded. The record's whole
+		// claim is that the operator was shown the copy, so a post that never
+		// lands must leave no consent behind: the next attempt stops and asks
+		// again rather than dispatching over a disclosure nobody read.
+		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			msgCopyDiscardDowngrade); err != nil {
+			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "error", err)
+			return
+		}
+		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, true); err != nil {
 			// Without the re-pin the confirm command would load the disclosure
 			// that showed no discard and stop again, so say what happened rather
-			// than posting a confirmation the operator cannot pass.
+			// than leaving a confirmation the operator cannot pass.
 			h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the discard",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 				"Applying would destroy work in progress on the target. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to see what is at stake.")
-			return
 		}
-		h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			msgCopyDiscardDowngrade)
 		return
 	}
 
@@ -352,11 +370,14 @@ func applyExecutionErrorMessage(err error) string {
 // change to a table another pull request owns. The attributed-change disclosure
 // belongs on this comment for the same reason as the direct-execution one: it
 // must sit on the comment the confirmation acts on.
+// It reports whether the comment landed, so a caller that records what the
+// comment disclosed can decline to record it when the operator was shown
+// nothing.
 func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
-) {
+) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 	commentData.IsLocked = true
@@ -365,7 +386,10 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AutoConfirmDowngradeReason = reason
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// An operator who ran apply-confirm themselves paused nothing automatic, so
+	// the comment names what actually stopped: their own apply.
+	commentData.StoppedConfirmedApply = result.Action == action.ApplyConfirm
+	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
 // repinPendingConfirmation moves this PR's apply lock onto the plan whose
@@ -377,7 +401,28 @@ func (h *Handler) postAutoConfirmDowngrade(
 // reads the lock to learn what the operator was shown, so a lock still pointing
 // at the comment that disclosed nothing would stop the same apply again on every
 // attempt.
-func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, planID string, disclosedCopyDiscard bool) error {
+// The re-pin is skipped when the lock no longer carries the pending intent this
+// apply observed — a rollback the operator issued while the gate ran owns the
+// lock now, and overwriting its pin would answer "no pending rollback" to the
+// rollback-confirm they are about to send. Declining leaves the copy gate armed,
+// so the next apply-confirm stops and discloses again rather than proceeding on
+// consent that was never recorded.
+func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
+	lock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
+	if err != nil {
+		return fmt.Errorf("load apply lock for %s (%s) to re-pin the pending confirmation: %w", database, dbType, err)
+	}
+	if lock == nil {
+		return fmt.Errorf("apply lock for %s (%s) is gone, so the pending confirmation cannot be re-pinned", database, dbType)
+	}
+	if lock.PendingPlanID != expectedPendingPlanID {
+		h.logger.Warn("preserved a newer pending intent instead of re-pinning the confirmation onto the disclosing plan",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"expected_pending_plan_id", expectedPendingPlanID, "observed_pending_plan_id", lock.PendingPlanID,
+			"plan_id", planID)
+		return nil
+	}
+
 	return h.service.Storage().Locks().Acquire(ctx, &storage.Lock{
 		DatabaseName:         database,
 		DatabaseType:         dbType,

@@ -746,8 +746,31 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, existingLock.DisclosedCopyDiscard)
+	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
+	if existingLock.DisclosedCopyDiscard && !disclosedCopyDiscard {
+		h.logger.Info("copy-discard disclosure not applied to this confirm: it was shown for another environment",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+	}
+
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
+}
+
+// disclosureDescribesThisApply reports whether the consent recorded on the
+// pending confirmation was earned for the apply about to run. The lock carries
+// no environment dimension, so a disclosure the operator was shown confirming
+// one environment must not disarm the copy gate in another: the pinned plan
+// names the environment they actually saw. A confirmation with no loadable plan
+// counts as no disclosure, so the apply asks rather than assuming consent.
+func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
+	if !lock.DisclosedCopyDiscard {
+		return false
+	}
+	if plan == nil {
+		return false
+	}
+	return plan.Environment == environment
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command. It is

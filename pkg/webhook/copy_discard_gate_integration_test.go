@@ -117,6 +117,60 @@ type discardGateFixture struct {
 	handler *Handler
 	result  *planFlowResult
 	svc     *api.Service
+	client  *gh.Client
+	dbName  string
+}
+
+// disclosingPlanID stores a plan made against the target as it is now — copy
+// and all — and returns its identifier. It stands for the comment an operator
+// was shown: pinning a confirmation to it is what records that they saw the
+// discard before agreeing to it.
+func (f discardGateFixture) disclosingPlanID(t *testing.T) string {
+	t.Helper()
+
+	installClient := ghclient.NewInstallationClientWithSlug(f.client, testLogger(), "schemabot")
+	schemaResult, err := f.handler.createManagedSchemaRequestFromPR(t.Context(), installClient,
+		"octocat/hello-world", 1, "staging", "", action.Apply)
+	require.NoError(t, err)
+
+	prNumber := int32(1)
+	planResp, err := f.handler.executePlanWithTransientRetry(t.Context(), api.PlanRequest{
+		Database:          schemaResult.Database,
+		Environment:       "staging",
+		Type:              schemaResult.Type,
+		SchemaFiles:       schemaResult.SchemaFiles,
+		Repository:        "octocat/hello-world",
+		PullRequest:       &prNumber,
+		HeadSHA:           &schemaResult.HeadSHA,
+		SchemaPath:        schemaResult.SchemaPath,
+		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		SourceTrusted:     true,
+	}, "octocat/hello-world", 1)
+	require.NoError(t, err)
+	require.NotEmpty(t, planResp.DiscardedCopies(), "the plan behind the confirmation must disclose the copy")
+
+	stored, err := f.svc.Storage().Plans().Get(t.Context(), planResp.PlanID)
+	require.NoError(t, err)
+	require.NotNil(t, stored, "the disclosing plan must be stored for apply-confirm to load")
+	return planResp.PlanID
+}
+
+// requireLockEventually waits for the durable state a stop leaves behind. The
+// disclosure is posted before it is recorded, so the comment arriving on the
+// fake GitHub does not mean the confirmation has been re-pinned yet.
+func (f discardGateFixture) requireLockEventually(t *testing.T, check func(*storage.Lock) bool, msg string) *storage.Lock {
+	t.Helper()
+
+	var lock *storage.Lock
+	require.Eventually(t, func() bool {
+		var err error
+		lock, err = f.svc.Storage().Locks().Get(t.Context(), f.dbName, "mysql")
+		if err != nil || lock == nil {
+			return false
+		}
+		return check(lock)
+	}, webhookIntegrationPollDeadline, 50*time.Millisecond, msg)
+	return lock
 }
 
 func setupDiscardGate(t *testing.T, dbName string) discardGateFixture {
@@ -138,7 +192,7 @@ func setupDiscardGate(t *testing.T, dbName string) discardGateFixture {
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	result := setupFakeGitHubForPlan(t, mux, map[string]string{"events.sql": indexAddSchema}, schemabotConfig, dbName)
 
-	return discardGateFixture{handler: newE2EHandler(t, svc, client), result: result, svc: svc}
+	return discardGateFixture{handler: newE2EHandler(t, svc, client), result: result, svc: svc, client: client, dbName: dbName}
 }
 
 // An apply that would throw away an unfinished copy on the target never runs
@@ -318,7 +372,9 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
 			"the confirm stops and discloses the copy instead of dispatching over it")
 		assert.Contains(t, body, "`events`")
-		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "⚠️ **Apply stopped**: Applying destroys work in progress on the target\n",
+			"the operator issued this apply themselves, so nothing automatic was paused")
+		assert.NotContains(t, body, "Automatic apply paused")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 		assert.NotContains(t, body, "Schema Change Status", "the apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):
@@ -328,15 +384,15 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 	// The pending confirmation moved onto the plan behind the comment just
 	// posted, and records that this one discloses the discard — without that the
 	// next confirm would load the comment that disclosed nothing and stop again.
-	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, lock, "the stop must keep the lock so the operator can confirm")
-	assert.True(t, lock.DisclosedCopyDiscard, "the disclosure the operator was just shown must be recorded")
-	assert.NotEqual(t, "plan-disclosing-no-copy", lock.PendingPlanID)
+	lock := f.requireLockEventually(t, func(l *storage.Lock) bool {
+		return l.DisclosedCopyDiscard && l.PendingPlanID != "plan-disclosing-no-copy"
+	}, "the stop must re-pin the confirmation onto the plan it just disclosed")
 	plan, err := f.svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
 	require.NoError(t, err)
 	require.NotNil(t, plan, "the re-pinned confirmation must name a stored plan")
 	assert.Equal(t, dbName, plan.Database)
+	assert.Equal(t, "staging", plan.Environment,
+		"the re-pinned plan names the environment the operator was shown")
 
 	applies, err := f.svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
@@ -359,7 +415,7 @@ func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
 		Repository:           "octocat/hello-world",
 		PullRequest:          1,
 		Owner:                "octocat/hello-world#1",
-		PendingPlanID:        "plan-disclosing-the-copy",
+		PendingPlanID:        f.disclosingPlanID(t),
 		DisclosedCopyDiscard: true,
 	}))
 
@@ -400,4 +456,101 @@ func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
 		"SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = ? AND table_name = 'events' AND index_name = 'idx_actor_id'",
 		dbName).Scan(&indexes))
 	assert.Positive(t, indexes, "the confirmed schema change must be on the target")
+}
+
+// A stop re-pins the pending confirmation onto the comment that discloses the
+// copy, but only while the lock still carries the intent the stopping apply
+// observed. An operator who issued a rollback while the gate ran owns the
+// pending confirmation now, and overwriting it would answer "no pending
+// rollback" to the rollback-confirm they are about to send.
+func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
+	const dbName = "webhook_copy_discard_repin"
+	f := setupDiscardGate(t, dbName)
+
+	const repo = "octocat/hello-world"
+	const pr = 1
+	acquire := func(t *testing.T, pendingPlanID string) {
+		t.Helper()
+		require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+			DatabaseName:  dbName,
+			DatabaseType:  "mysql",
+			Repository:    repo,
+			PullRequest:   pr,
+			Owner:         fmt.Sprintf("%s#%d", repo, pr),
+			PendingPlanID: pendingPlanID,
+		}))
+	}
+
+	// The rollback the operator issued while the gate ran holds the pending
+	// confirmation, so the stop leaves it alone.
+	acquire(t, "rollback:the-operator-just-asked-for-this")
+	require.NoError(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+		"plan-the-apply-observed", "plan-disclosing-the-copy", true))
+
+	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "rollback:the-operator-just-asked-for-this", lock.PendingPlanID,
+		"the newer intent must survive the stop")
+	assert.False(t, lock.DisclosedCopyDiscard,
+		"declining to re-pin leaves the copy gate armed for the next confirm")
+
+	// With the observed intent still in place, the re-pin moves the confirmation
+	// onto the disclosing plan and records what that comment showed.
+	acquire(t, "plan-the-apply-observed")
+	require.NoError(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+		"plan-the-apply-observed", "plan-disclosing-the-copy", true))
+
+	lock, err = f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "plan-disclosing-the-copy", lock.PendingPlanID)
+	assert.True(t, lock.DisclosedCopyDiscard)
+}
+
+// The consent record's whole claim is that the operator was shown the copy, so
+// it must not survive a disclosure that never reached them. When the comment
+// fails to post, nothing is recorded and the confirmation stays pinned where it
+// was, leaving the gate armed for the next attempt.
+func TestE2EApplyConfirmRecordsNoConsentWhenTheDisclosureCannotBePosted(t *testing.T) {
+	const dbName = "webhook_copy_discard_post_fails"
+	f := setupDiscardGate(t, dbName)
+	f.result.FailCommentPost.Store(true)
+
+	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-disclosing-no-copy",
+	}))
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The disclosure was attempted — GitHub rejected it.
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the disclosure post attempt")
+	}
+
+	// Consent the operator never saw must not be on the lock, and the copy the
+	// gate protects is still on the target.
+	require.Never(t, func() bool {
+		lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		if err != nil || lock == nil {
+			return false
+		}
+		return lock.DisclosedCopyDiscard || lock.PendingPlanID != "plan-disclosing-no-copy"
+	}, 2*time.Second, 100*time.Millisecond,
+		"a disclosure that never reached the operator must record no consent")
+
+	requireCopyIntact(t, dbName)
 }

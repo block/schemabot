@@ -122,15 +122,21 @@ type Lock struct {
 
 	// DisclosedCopyDiscard records that the comment this pending confirmation
 	// was posted with told the operator applying would throw away an unfinished
-	// row copy on the target. It is a consent record: it says what the operator
-	// was shown at the moment they were asked, so the apply can tell whether a
-	// discard it is about to perform is the one they agreed to.
+	// row copy on the target. It is a consent record, and its question is
+	// exactly "were they shown a discard at all?" — not which copy, or how
+	// many. An apply that finds a larger discard set than the one disclosed
+	// therefore still proceeds; narrowing that to the copies actually named
+	// needs the disclosed set persisted, not a flag.
 	//
 	// It travels with PendingPlanID and is written by the same statement, so the
 	// flag always describes the plan the confirm command loads. It is
 	// deliberately not the copy itself: a copy disposition is a reading of the
 	// target that is always re-read at apply time, and only this answer to "did
 	// they know?" has to be durable.
+	//
+	// The lock carries no environment dimension, so the flag alone does not say
+	// which environment the operator was shown. Readers pair it with the pinned
+	// plan's environment before treating it as consent for the apply at hand.
 	//
 	// False for locks acquired outside the PR apply path (rollback, CLI) and for
 	// rows written before this column existed, which is the safe default — an
