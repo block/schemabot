@@ -2413,7 +2413,10 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return refusal, nil
 	}
 
-	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
+	// An attach already belongs to a keyed apply, so a conflict here is another
+	// apply holding the database and there is nothing for this dispatch to
+	// resolve into. Adoption is a create-path outcome only.
+	if _, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -2556,7 +2559,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
+	if blocking, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
@@ -2566,6 +2569,14 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
 				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
 			return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "conflict_race")
+		}
+		// A dispatch whose key resolves to nothing may still be a re-apply of the
+		// change the blocking apply is running — the recovery for work that
+		// outlived the apply identity that started it. Resolve into that apply
+		// rather than being refused by it; anything short of an exact match keeps
+		// the refusal.
+		if adopted, ok := c.adoptLiveApplyForDispatch(ctx, req, plan, scope, blocking); ok {
+			return adopted, nil
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
