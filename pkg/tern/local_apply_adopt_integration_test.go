@@ -8,6 +8,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -39,13 +40,15 @@ func newAdoptTestFixture(t *testing.T, desired map[string]string) *adoptTestFixt
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
 
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE users (id INT PRIMARY KEY)")
 	require.NoError(t, err)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	stor := createStorage(t, dsn)
+	t.Cleanup(func() { utils.CloseAndLog(stor) })
 
 	client, err := NewLocalClient(LocalConfig{
 		Database:  "testdb",
@@ -53,7 +56,7 @@ func newAdoptTestFixture(t *testing.T, desired map[string]string) *adoptTestFixt
 		TargetDSN: dsn,
 	}, stor, logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = client.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(client) })
 
 	planResp, err := client.Plan(t.Context(), &ternv1.PlanRequest{
 		Type:     storage.DatabaseTypeMySQL,

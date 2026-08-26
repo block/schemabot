@@ -2574,9 +2574,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		// change the blocking apply is running — the recovery for work that
 		// outlived the apply identity that started it. Resolve into that apply
 		// rather than being refused by it; anything short of an exact match keeps
-		// the refusal.
-		if adopted, ok := c.adoptLiveApplyForDispatch(ctx, req, plan, scope, blocking); ok {
-			return adopted, nil
+		// the refusal. Adoption only answers a conflict the check actually found:
+		// an error without a named blocking task is a storage read failure, and
+		// there is no apply to resolve into.
+		if blocking.blocks() {
+			if adopted, ok := c.adoptLiveApplyForDispatch(ctx, req, plan, scope, blocking); ok {
+				return adopted, nil
+			}
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
