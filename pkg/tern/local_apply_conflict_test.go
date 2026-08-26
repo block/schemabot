@@ -78,7 +78,7 @@ func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	assert.Nil(t, stopped.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "a new apply must be refused while a stopped task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Stopped, stopped.State)
@@ -107,7 +107,7 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	assert.Nil(t, retryable.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "a new apply must be refused while a retryable task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State)
@@ -255,7 +255,7 @@ func TestConflictCheckCancelsOrphanedPendingTask(t *testing.T) {
 			}}
 
 			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-			err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+			_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 			require.NoError(t, err, "an orphaned pending task must not refuse a new apply")
 			assert.Equal(t, state.Task.Cancelled, orphan.State, "the orphaned task must be cancelled")
 			assert.Contains(t, orphan.ErrorMessage, "orphaned")
@@ -284,7 +284,7 @@ func TestConflictCheckPreservesPendingTaskOfActiveApply(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "a pending task of an active apply must refuse a new apply")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Pending, pending.State, "the pending task must be left untouched")
@@ -310,7 +310,7 @@ func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
 		client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: nil}
 
 		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-		err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+		_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 		require.Error(t, err, "a pending task with a missing apply row must keep blocking")
 		assert.Equal(t, state.Task.Pending, pending.State)
 		assert.Nil(t, pending.CompletedAt)
@@ -330,7 +330,7 @@ func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
 		client.storage.(*exactProgressStorage).applies = &erroringApplyStore{err: errors.New("storage down")}
 
 		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-		err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+		_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 		require.Error(t, err, "a pending task must keep blocking when its apply cannot be loaded")
 		assert.Equal(t, state.Task.Pending, pending.State)
 		assert.Nil(t, pending.CompletedAt)
@@ -375,7 +375,7 @@ func TestConflictCheckKeepsOrphanWhenCancellationWriteFails(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "the orphan must keep blocking when its cancellation cannot be written")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Pending, orphan.State, "the task must be restored to pending for a clean retry")
@@ -427,7 +427,7 @@ func TestConflictCheckLeavesActivelyDrivenTask(t *testing.T) {
 			client.spiritEngine = &fakeControlEngine{progressResult: memory}
 
 			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-			err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+			_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 			require.Error(t, err, "a task with an actively driven apply must refuse a new apply")
 			assert.Contains(t, err.Error(), "schema change already in progress")
 			assert.Equal(t, state.Task.Running, running.State, "the driven task must be left untouched")
@@ -464,7 +464,7 @@ func TestConflictCheckRefusesForeignTerminalReport(t *testing.T) {
 	}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.Error(t, err, "another process's task must not be stamped from this process's engine memory")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Running, running.State, "the task must be left for driver recovery")
@@ -498,7 +498,7 @@ func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
 	}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.NoError(t, err, "this process's own terminal report must settle the task and admit the new apply")
 	assert.Equal(t, state.Task.Completed, running.State, "the task must carry the engine's terminal state")
 	assert.NotNil(t, running.CompletedAt)
@@ -528,7 +528,7 @@ func TestConflictCheckFailsAbandonedTaskWithStaleForeignLease(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.NoError(t, err, "an abandoned task under a crashed process's stale lease must be failed and unblock")
 	assert.Equal(t, state.Task.Failed, running.State)
 	assert.Contains(t, running.ErrorMessage, "server may have crashed")
@@ -549,7 +549,7 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
 	require.NoError(t, err, "new apply should proceed once the abandoned task is failed")
 	assert.Equal(t, state.Task.Failed, running.State)
 }
@@ -569,20 +569,18 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 		{
 			name: "a stopped apply holds its database until an operator decides its fate",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.Stopped,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
 			},
 			want: []string{"table xfers", "task-holding", "apply-holding", "stopped", "started or cancelled"},
 		},
 		{
 			name: "a running apply releases its database on its own, unless it parks for cutover",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.Running,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
 			want: []string{
 				"table xfers", "task-holding", "apply-holding", "running",
@@ -592,70 +590,63 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 		{
 			name: "a post-copy phase is still the running family",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.CatchingUp,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.CatchingUp},
 			},
 			want: []string{"apply-holding", "releases the database when it finishes"},
 		},
 		{
 			name: "a sharded change names the shard, since only that shard is held",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				shard:           "-40",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.Running,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				shard:          "-40",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
 			want: []string{"table xfers shard -40", "task-holding", "apply-holding"},
 		},
 		{
 			name: "a multi-table atomic change records no table, so the task names it",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.Running,
+				taskIdentifier: "task-holding",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
 			want: []string{"task task-holding is held by apply apply-holding"},
 		},
 		{
 			name: "a sharded multi-table change still names the shard it holds",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				shard:           "-40",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.Running,
+				taskIdentifier: "task-holding",
+				shard:          "-40",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
 			want: []string{"shard -40 (task task-holding)", "apply-holding"},
 		},
 		{
 			name: "a retryable failure rests holding its database, so a decision is owed",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.FailedRetryable,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.FailedRetryable},
 			},
 			want: []string{"table xfers", "task-holding", "apply-holding", "failed_retryable", "retried or cancelled"},
 		},
 		{
 			name: "an apply parked at the cutover barrier holds its database until cut over",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.WaitingForCutover,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.WaitingForCutover},
 			},
 			want: []string{"table xfers", "task-holding", "apply-holding", "waiting_for_cutover", "cut over or cancelled"},
 		},
 		{
 			name: "an apply in its revert window rests holding its database, so a decision is owed",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.RevertWindow,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.RevertWindow},
 			},
 			want: []string{
 				"table xfers", "task-holding", "apply-holding", "revert_window",
@@ -665,20 +656,18 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 		{
 			name: "a revert already under way finishes on its own",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.Reverting,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Reverting},
 			},
 			want: []string{"apply-holding", "reverting", "releases the database when the revert finishes"},
 		},
 		{
 			name: "finalizing skip-revert finishes on its own too",
 			blocking: blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      state.Apply.SkippingRevert,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.SkippingRevert},
 			},
 			want: []string{"apply-holding", "skipping_revert", "releases the database when the revert finishes"},
 		},
@@ -708,11 +697,10 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 // loses the separator — all of which every substring assertion still passes.
 func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
 	held := blockingTask{
-		taskIdentifier:  "task-holding",
-		table:           "xfers",
-		shard:           "-40",
-		applyIdentifier: "apply-holding",
-		applyState:      state.Apply.Stopped,
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		shard:          "-40",
+		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
 	}
 	assert.Equal(t,
 		"table xfers shard -40 (task task-holding) is held by apply apply-holding (stopped); "+
@@ -732,9 +720,8 @@ func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
 // guess, so an operator is never pointed at an action the apply will not honour.
 func TestBlockingTaskOffersNoResolutionForAnUncertainState(t *testing.T) {
 	blocking := blockingTask{
-		taskIdentifier:  "task-holding",
-		applyIdentifier: "apply-holding",
-		applyState:      state.Apply.CuttingOver,
+		taskIdentifier: "task-holding",
+		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.CuttingOver},
 	}
 
 	assert.Empty(t, blocking.resolution(), "cutting over has no operator action to offer")
@@ -751,10 +738,9 @@ func TestBlockingTaskOffersNoCancelInsideTheRevertWindow(t *testing.T) {
 	} {
 		t.Run(applyState, func(t *testing.T) {
 			blocking := blockingTask{
-				taskIdentifier:  "task-holding",
-				table:           "xfers",
-				applyIdentifier: "apply-holding",
-				applyState:      applyState,
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: applyState},
 			}
 
 			assert.NotEmpty(t, blocking.resolution(), "the revert phase names what clears the database")
@@ -803,9 +789,9 @@ func TestConflictCheckReportsTheStoppedApplyHoldingTheDatabase(t *testing.T) {
 	require.True(t, blocking.blocks(), "a stopped task holds the database and refuses a new apply")
 	assert.Equal(t, "task-stopped", blocking.taskIdentifier)
 	assert.Equal(t, "users", blocking.table, "the refusal names the table being changed")
-	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier,
+	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier(),
 		"the refusal names the apply an operator acts on, not only the task")
-	assert.Equal(t, state.Apply.Stopped, blocking.applyState)
+	assert.Equal(t, state.Apply.Stopped, blocking.applyStateName())
 	assert.Contains(t, blocking.describe(), "table users",
 		"the table an operator recognizes leads the refusal")
 	assert.Contains(t, blocking.describe(), "started or cancelled",
