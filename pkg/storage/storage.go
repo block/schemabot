@@ -578,7 +578,8 @@ type ApplyStore interface {
 
 	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
 	// driver (pending with child rows, stale active state, retryable within
-	// budget, or a pending start control request). On a
+	// budget, a pending start control request, or stopped with a pending
+	// cancel control request). On a
 	// successful claim it rotates the lease (owner, token, acquired_at) and
 	// refreshes the heartbeat so operator-owned writes can fail closed after
 	// ownership changes. Returns the claimed apply, or nil if the apply does not
@@ -1042,9 +1043,9 @@ type ApplyOperationStore interface {
 	// the same transaction, returning the row populated with that lease.
 	//
 	// Pending rows are transitioned to running and stamped with started_at; a
-	// stopped row whose parent apply has a pending start request is resumable
-	// and is transitioned to resuming (so the request-gated stopped predicate
-	// stops matching once the row is claimed); already-active rows whose
+	// stopped row whose parent apply has a pending start or cancel request is
+	// claimable and is transitioned to resuming (so the request-gated stopped
+	// predicate stops matching once the row is claimed); already-active rows whose
 	// heartbeat has been stale for more than one minute are re-leased without
 	// changing their state. Other terminal rows
 	// (completed/failed/cancelled/reverted) are never claimed.

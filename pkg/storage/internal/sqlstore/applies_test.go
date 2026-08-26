@@ -3126,6 +3126,173 @@ func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *tes
 	assert.Nil(t, again, "the just-resumed apply belongs to its claimer; a repeat claim must not steal the fresh lease")
 }
 
+// TestApplyStore_ClaimApplyByIDClaimsStoppedWithPendingCancel verifies that a
+// stopped apply carrying a pending cancel control request is claimable so a
+// drive can deliver the cancel. The claim rotates only the lease: the apply
+// keeps its stopped state (the drive, not the claim, terminalizes it) and the
+// cancel request stays pending for the drive to consume. A lease acquired
+// after the request blocks rematching, so a cancel the drive could not finish
+// is retried on lease staleness, not on every poll — but a request issued in
+// the same second as the lease (the timestamps have second precision) still
+// claims, so a stop-then-cancel operator never waits out the staleness window.
+func TestApplyStore_ClaimApplyByIDClaimsStoppedWithPendingCancel(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_cancel", 1, state.Apply.Stopped, "staging")
+
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationCancel)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a stopped apply with a pending cancel must be claimable")
+	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
+	assert.Equal(t, "operator-a", claimed.LeaseOwner)
+	assert.NotEmpty(t, claimed.LeaseToken)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Stopped, persisted.State, "a cancel claim rotates only the lease; the drive terminalizes the state")
+
+	stillPending, err := store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, stillPending, "the cancel request stays pending for the drive to consume")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET updated_at = NOW() - INTERVAL 2 SECOND
+		WHERE apply_id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	assert.Nil(t, again, "a lease acquired after the request must block rematching until the request is re-issued or the lease goes stale")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET updated_at = (SELECT lease_acquired_at FROM applies WHERE id = ?)
+		WHERE apply_id = ?
+	`, apply.ID, apply.ID)
+	require.NoError(t, err)
+
+	sameSecond, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-c")
+	require.NoError(t, err)
+	require.NotNil(t, sameSecond, "a request issued in the same second as the lease must claim without waiting out the staleness window")
+	assert.Equal(t, "operator-c", sameSecond.LeaseOwner)
+}
+
+// TestApplyStore_ClaimApplyByIDStoppedCancelReclaimableWhenLeaseStale verifies
+// the retry pacing of the stopped-cancel claim: a claim whose drive could not
+// finish the cancel leaves the apply stopped with the request pending, and once
+// the lease heartbeat goes stale the apply is claimable again so a peer can
+// retry delivery.
+func TestApplyStore_ClaimApplyByIDStoppedCancelReclaimableWhenLeaseStale(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_cancel_stale", 1, state.Apply.Stopped, "staging")
+
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationCancel)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW() - INTERVAL 2 MINUTE
+		WHERE id = ?
+	`, apply.ID)
+	require.NoError(t, err)
+
+	reclaimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a stale lease with the cancel still pending must make the apply claimable again")
+	assert.Equal(t, "operator-b", reclaimed.LeaseOwner)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Stopped, persisted.State)
+}
+
+// TestApplyStore_ClaimStoppedCancelWinsOverPendingStart verifies precedence
+// when a stopped apply carries both a pending start and a pending cancel: the
+// claim delivers the cancel (the apply stays stopped, never resuming) and fails
+// the start request in the same transaction — resuming a copy the operator
+// asked to discard is never the right answer, and once the apply terminalizes
+// nothing would consume the start.
+func TestApplyStore_ClaimStoppedCancelWinsOverPendingStart(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_cancel_vs_start", 1, state.Apply.Stopped, "staging")
+
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationStart)
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationCancel)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Stopped, persisted.State, "cancel wins: the claim must not transition the apply toward resume")
+
+	cancelPending, err := store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, cancelPending, "the cancel request stays pending for the drive to consume")
+
+	startPending, err := store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, startPending, "the superseded start request must no longer be pending")
+
+	failedStart := getStartControlRequest(t, apply.ID)
+	assert.Equal(t, storage.ControlRequestFailed, failedStart.Status)
+	assert.Contains(t, failedStart.ErrorMessage, "cancel request is pending")
+}
+
+// TestApplyStore_ClaimStoppedCancelAllowedWhileTargetActive verifies that a
+// newer active apply on the same target does not block cancelling an older
+// stopped apply: the cancel claim performs no active-target re-check because
+// delivering a cancel cannot add active work to the target. This is the shape
+// an operator hits when a stopped apply must be discarded so its retry — often
+// already running on the same database — can proceed cleanly.
+func TestApplyStore_ClaimStoppedCancelAllowedWhileTargetActive(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	active := createTestApplyWithStateAndEnv(t, store, lock, "apply_active_retry", 1, state.Apply.Running, "staging")
+	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_stopped_discard", 2, state.Apply.Stopped, "staging")
+
+	requestPendingControlOperation(t, store, stopped.ID, storage.ControlOperationCancel)
+
+	claimed, err := store.Applies().ClaimApplyByID(ctx, stopped.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "an active apply on the target must not block a cancel claim of the stopped apply")
+
+	persisted, err := store.Applies().Get(ctx, stopped.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Stopped, persisted.State)
+
+	persistedActive, err := store.Applies().Get(ctx, active.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persistedActive)
+	assert.Equal(t, state.Apply.Running, persistedActive.State)
+}
+
 func TestApplyStore_ClaimApplyByIDDoesNotClaimFreshRunningStopControlRequest(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3901,6 +4068,20 @@ func createTestLockWithPR(t *testing.T, store *Storage, dbName, dbType, repo str
 // getStartControlRequest reads the 'start' control request for an apply
 // regardless of status, so tests can assert on a failed request that the
 // status-scoped GetPending accessor cannot return.
+// requestPendingControlOperation records a pending control request of the
+// given operation for the apply, failing the test if one is already pending.
+func requestPendingControlOperation(t *testing.T, store *Storage, applyID int64, op storage.ControlOperation) {
+	t.Helper()
+	_, alreadyPending, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID:   applyID,
+		Operation: op,
+		Status:    storage.ControlRequestPending,
+		Metadata:  []byte(`{}`),
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+}
+
 func getStartControlRequest(t *testing.T, applyID int64) *storage.ApplyControlRequest {
 	t.Helper()
 	row := testDB.QueryRowContext(t.Context(), `

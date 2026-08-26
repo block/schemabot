@@ -1454,6 +1454,40 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingStar
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingCancel
+// verifies that a stopped operation whose parent apply has a pending cancel
+// request is claimable so the drive can terminalize it. The claim transitions
+// the row to resuming exactly like the start case — the stopped-row predicate
+// is request-gated, so the row must leave stopped atomically or a peer could
+// re-lease it mid-drive — and the cancel drive then settles the row from its
+// cancelled tasks.
+func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingCancel(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_stopped_cancel", 1, state.Apply.Stopped, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationCancel)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "stopped operation with a pending cancel request must be claimable")
+	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.Stopped, claimed.State, "caller sees the pre-claim state")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.ApplyOperation.Resuming, persisted.State, "claim transitions the stopped operation to resuming so a peer cannot re-claim it mid-drive")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaimsStoppedWithPendingStart
 // pins the exclusivity of resuming a stopped operation: when several drivers
 // race to claim the same stopped operation that has a pending start request,

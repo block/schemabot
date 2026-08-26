@@ -1483,8 +1483,10 @@ func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.Rece
 // ClaimApplyByID atomically claims one specific apply by ID: a claim selects
 // the row when it needs a driver — pending with persisted child rows; a stale
 // active state whose heartbeat expired beyond the lease staleness window;
-// recently failed_retryable with retry budget; or pending, stopped, or
-// waiting-for-deploy with a pending start control request — and rotates a
+// recently failed_retryable with retry budget; pending, stopped, or
+// waiting-for-deploy with a pending start control request; or stopped with a
+// pending cancel control request (the drive delivers the cancel; the apply
+// keeps its stopped state unless the cancel terminalizes it) — and rotates a
 // fresh lease onto it (owner, token, heartbeat) in the same transaction. The
 // operation-level claim loop calls this after claiming an apply_operations row
 // to acquire the parent apply lease that lease-guarded writes (ResumeApply,
@@ -1519,6 +1521,9 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	queryArgs = append(queryArgs,
 		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.Apply.Stopped,
+		storage.ControlOperationCancel, storage.ControlRequestPending)
 
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
@@ -1530,6 +1535,19 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	// claimed. Creation dual-writes tasks and the apply_operations row in one
 	// transaction, so either proves the create committed fully; a VSchema-only
 	// apply carries an operation row but no tasks, so tasks alone would strand it.
+	//
+	// The stopped + pending cancel clause claims the apply so the drive can
+	// deliver the cancel. The claim rotates only the lease and leaves the state
+	// stopped (see persistApplyClaim), so the clause carries the lease-staleness
+	// rematch guard: without it, a cancel the drive could not finish this claim
+	// (e.g. the remote side has not settled yet) would be re-claimed on every
+	// poll. A lease acquired after the request blocks rematching until the
+	// request is re-issued (cr.updated_at moves past lease_acquired_at) or the
+	// lease goes stale. The comparison admits equal timestamps: both columns
+	// have second precision, so a cancel issued in the same second as the last
+	// lease rotation (an operator stopping then immediately cancelling) must
+	// still claim now rather than wait out the staleness window; the claim's
+	// own lease rotation bounds any same-second rematch to that one second.
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1570,10 +1588,23 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						)
 					)
 				)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+						AND (
+							a.lease_acquired_at IS NULL
+							OR a.lease_acquired_at <= cr.updated_at
+							OR a.updated_at < %s
+						)
+					)
+				)
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff, staleClaimCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1844,6 +1875,12 @@ func (o claimOutcome) claimedAndComplete() bool {
 // window between the re-check and the commit. When another active apply owns the
 // target the claim is refused and the pending start control request is failed so
 // the operator sees why.
+//
+// A stopped apply with a pending cancel request is claimed to deliver the
+// cancel, not to resume: the pending cancel routes the claim to
+// claimStoppedApplyForCancel, which rotates only the lease. Cancel wins over a
+// simultaneously pending start — resuming a copy the operator asked to discard
+// is never the right answer.
 func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
@@ -1852,6 +1889,13 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
 	if state.IsState(apply.State, state.Apply.Stopped) {
+		cancelPending, err := hasPendingCancelControlRequestTx(ctx, tx, apply.ID)
+		if err != nil {
+			return claimLostRace, err
+		}
+		if cancelPending {
+			return claimStoppedApplyForCancel(ctx, tx, apply, owner, leaseToken)
+		}
 		return claimStoppedApplyUnderTargetLock(ctx, db, locker, dialect, tx, apply, owner, leaseToken)
 	}
 
@@ -1920,6 +1964,49 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker 
 		return claimLostRace, fmt.Errorf("commit claim stopped apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
 	}
 	return claimAcquiredCommitted, nil
+}
+
+// claimStoppedApplyForCancel rotates the lease onto a stopped apply that has a
+// pending cancel request, leaving the state stopped. The drive exists to
+// terminalize the apply, not to resume it, so there is no stopped→resuming
+// transition and no active-target re-check — delivering a cancel cannot add
+// active work to the target. A pending start request is failed in the same
+// transaction: the cancel supersedes it, and once the apply terminalizes to
+// cancelled nothing would ever consume the start, so leaving it pending would
+// silently strand it.
+func claimStoppedApplyForCancel(ctx context.Context, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+	if err := failPendingStartControlRequestTx(ctx, tx, apply.ID, "start refused: a cancel request is pending for this apply"); err != nil {
+		return claimLostRace, fmt.Errorf("fail pending start superseded by cancel for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW(),
+		    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, owner, leaseToken, apply.ID); err != nil {
+		return claimLostRace, fmt.Errorf("rotate lease onto stopped apply %d (%s) for pending cancel: %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	return claimAcquired, nil
+}
+
+// hasPendingCancelControlRequestTx reports whether a pending cancel control
+// request exists for the apply, read inside the claim transaction so the
+// claim's stopped-state routing (cancel delivery vs start resume) and the
+// lease rotation commit atomically.
+func hasPendingCancelControlRequestTx(ctx context.Context, tx *rebindTx, applyID int64) (bool, error) {
+	var exists int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ? AND status = ?
+		LIMIT 1
+	`, applyID, storage.ControlOperationCancel, storage.ControlRequestPending).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check pending cancel control request for apply %d: %w", applyID, err)
+	}
+	return true, nil
 }
 
 // isStartingClaim reports whether a claim of an apply in this state transitions

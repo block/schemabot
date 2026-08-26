@@ -856,7 +856,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
-		storage.ControlOperationStart, storage.ControlRequestPending)
+		storage.ControlOperationStart, storage.ControlOperationCancel,
+		storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -876,8 +877,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// neither carries a deployment-order gate, because both rows already ran —
 	// resuming them is recovering work they started, not starting a new deployment.
 	//
-	//   - A stopped operation whose parent apply has a pending start request is
-	//     reclaimable so the operator can resume it.
+	//   - A stopped operation whose parent apply has a pending start or cancel
+	//     request is reclaimable — for start so the operator can resume it, for
+	//     cancel so the drive can terminalize it.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -1009,7 +1011,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					SELECT 1
 					FROM apply_control_requests cr
 					WHERE cr.apply_id = apply_operations.apply_id
-						AND cr.operation = ?
+						AND cr.operation IN (?, ?)
 						AND cr.status = ?
 				)
 			)
@@ -1106,13 +1108,17 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		}
 	case state.ApplyOperation.Stopped:
 		// Stopped → resuming: a stopped operation whose parent apply has a
-		// pending start request is a resumable claim, mirroring the apply-level
-		// stopped claim (transitionClaimToState). The claim must move the row out
-		// of stopped atomically with the lease rotation because the stopped-row
-		// predicate is request-gated, not heartbeat-gated: while the row stays
-		// stopped it keeps matching that predicate and a peer could re-lease it
-		// mid-drive. As resuming (an active state) it is re-leasable only by the
+		// pending start or cancel request is claimable, mirroring the
+		// apply-level stopped claim. The claim must move the row out of stopped
+		// atomically with the lease rotation because the stopped-row predicate
+		// is request-gated, not heartbeat-gated: while the row stays stopped it
+		// keeps matching that predicate and a peer could re-lease it mid-drive.
+		// As resuming (an active state) it is re-leasable only by the
 		// heartbeat-guarded stale-active clause, which recovers a crashed drive.
+		// A cancel drive holds resuming only transiently — it terminalizes the
+		// row from its cancelled tasks — and a declined cancel's leftover
+		// resuming row is reconciled from the stopped parent when the
+		// stale-active clause recovers it (reconcileUnclaimableParent).
 		// WHERE state = ? guards a concurrent transition landing between the
 		// SELECT and this UPDATE; RowsAffected == 0 means another writer moved it.
 		result, err := tx.ExecContext(ctx, `
