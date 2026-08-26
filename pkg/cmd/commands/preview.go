@@ -65,7 +65,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Status types
 	case templates.PreviewStatusList, templates.PreviewStatusDeployment, templates.PreviewStatusHistory,
-		templates.PreviewPlansList:
+		templates.PreviewPlansList, templates.PreviewPullSchema, templates.PreviewPullSchemaDetailed,
+		templates.PreviewPullVitessSchema:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
@@ -74,6 +75,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
 		templates.PreviewCommentPlanDirect,
+		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
+		templates.PreviewCommentPlanCopyAdopted,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
@@ -228,6 +231,9 @@ Status:
   status_deployment     Deployment-scoped schema change status
   status_history        Database apply history
   plans_list            List of recently generated plans
+  pull_schema           Pulled live schema rendered as readable SQL
+  pull_schema_detailed  Pulled live schema with the detailed catalog's estimates
+  pull_schema_vitess    Multi-keyspace Vitess pull with VSchema artifacts
 
 Lint and Unsafe:
   lint_violations         Lint violations output

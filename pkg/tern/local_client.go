@@ -103,7 +103,6 @@ import (
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -141,7 +140,7 @@ type LocalConfig struct {
 	// engine via Credentials.Metadata and reads specific keys as needed.
 	// Keys used by PlanetScale: organization, database (the PlanetScale
 	// database name when it differs from the registered identifier),
-	// token_name, token_value, tls_name, revert_window_duration, main_branch.
+	// token_name, token_value, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
@@ -1434,6 +1433,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Changes:        changes,
 		LintViolations: violations,
 		Shards:         protoShards,
+		ExistingCopies: protoExistingCopies(result),
 	}, nil
 }
 
@@ -1567,6 +1567,29 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 	return changes, violations, shards
 }
 
+// protoExistingCopies converts the plan's copy disclosures for the wire. It is
+// separate from planResultToProtoChanges because a disclosure describes the
+// target rather than the change set: it exists whether or not the plan's
+// statements differ from what a copy was made for, and that is precisely the
+// case it warns about.
+func protoExistingCopies(result *engine.PlanResult) []*ternv1.ExistingCopy {
+	if len(result.ExistingCopies) == 0 {
+		return nil
+	}
+	copies := make([]*ternv1.ExistingCopy, len(result.ExistingCopies))
+	for i, c := range result.ExistingCopies {
+		copies[i] = &ternv1.ExistingCopy{
+			Namespace:   c.Namespace,
+			Disposition: string(c.Disposition),
+			Reason:      c.Reason,
+			Tables:      c.Tables,
+			AgeSeconds:  int64(c.Age.Seconds()),
+			Statement:   c.Statement,
+		}
+	}
+	return copies
+}
+
 func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
 	eng := c.getEngine()
 	if eng == nil {
@@ -1628,7 +1651,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	}
 	sort.Strings(namespaces)
 
-	result := &engine.PlanResult{PlanID: fmt.Sprintf("plan-%d", time.Now().UnixNano()), NoChanges: true}
+	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true}
 	for _, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
@@ -1640,6 +1663,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		}
 		result.Changes = append(result.Changes, nsResult.Changes...)
 		result.LintViolations = append(result.LintViolations, nsResult.LintViolations...)
+		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false
 		}
@@ -2137,11 +2161,6 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 	return existing, nil
 }
 
-// newTaskIdentifier returns a fresh opaque task identifier (`task-<16 hex>`).
-func newTaskIdentifier() string {
-	return "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-}
-
 // dispatchScope is the execution shape derived from a dispatch request: the
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
 // dispatch, and whether the dispatch is a task-less VSchema finalizer.
@@ -2241,7 +2260,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 	tasks := make([]*storage.Task, len(scope.ddlChanges))
 	for i, ddlChange := range scope.ddlChanges {
 		tasks[i] = &storage.Task{
-			TaskIdentifier: newTaskIdentifier(),
+			TaskIdentifier: engine.NewTaskID(),
 			PlanID:         plan.ID,
 			Database:       plan.Database,
 			DatabaseType:   plan.DatabaseType,
@@ -2601,7 +2620,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// same keyed generation attach one at a time, and the manifest is what the
 	// state projection holds the apply's success verdict on until every
 	// declared operation has attached and finished.
-	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	applyIdentifier := engine.NewApplyID()
 	apply := &storage.Apply{
 		ApplyIdentifier:       applyIdentifier,
 		PlanID:                plan.ID,

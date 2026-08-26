@@ -216,7 +216,7 @@ func writeEnvPlan(result *apitypes.PlanResponse) {
 
 // writePlanBody writes the plan body (errors, changes, unsafe warnings, lint, summary).
 // Used by both writeEnvPlan (plan command) and OutputPlanResult (apply command).
-// When isApply is true, the ⛔ unsafe warning is skipped (apply shows its own 🚨 warning).
+// When isApply is true, the ⚠️ unsafe warning is skipped (apply shows its own 🚨 warning).
 func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Check for errors
 	if len(result.Errors) > 0 {
@@ -295,7 +295,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database)
 	}
 
-	// Check for unsafe changes and show with ⛔ (error level)
+	// Check for unsafe changes and show with ⚠️ (attention — the changes await consent)
 	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed
 	unsafeChanges := result.UnsafeChanges()
 	if len(unsafeChanges) > 0 && !isApply {

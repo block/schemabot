@@ -463,6 +463,22 @@ type PlanResponse struct {
 	// keyspace to one entry, so a keyspace whose shards diverge is represented
 	// faithfully only here. Empty for non-sharded plans.
 	Shards []*ShardPlanResponse `json:"shards,omitempty"`
+	// ExistingCopies carries the unfinished copies already on the target that
+	// applying this plan will adopt or discard, one entry per namespace holding
+	// any. Empty when the target is clean, which is the ordinary case.
+	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
+}
+
+// ExistingCopyResponse is an unfinished copy sitting on the target and what
+// applying the plan will do to it: adopt it and resume, or discard it and copy
+// again from the start.
+type ExistingCopyResponse struct {
+	Namespace   string   `json:"namespace,omitempty"`
+	Disposition string   `json:"disposition"`
+	Reason      string   `json:"reason,omitempty"`
+	Tables      []string `json:"tables,omitempty"`
+	AgeSeconds  int64    `json:"age_seconds,omitempty"`
+	Statement   string   `json:"statement,omitempty"`
 }
 
 // ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and
@@ -903,6 +919,11 @@ type ProgressResponse struct {
 // ProgressOperationResponse represents progress for one deployment operation.
 type ProgressOperationResponse struct {
 	Deployment string `json:"deployment"`
+	// OperationKey disambiguates multiple execution operations in the same
+	// apply and deployment, correlating this row with the stored
+	// apply_operation and its data-plane work. Empty is the legacy
+	// single-operation key.
+	OperationKey string `json:"operation_key,omitempty"`
 	// ExternalID is the remote data plane's stable apply identifier.
 	ExternalID string `json:"external_id,omitempty"`
 	// ExternalOperationID is the remote data plane's numeric operation row ID.

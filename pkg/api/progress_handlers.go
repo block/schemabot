@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -222,6 +223,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
 	resp := &apitypes.ProgressOperationResponse{
 		Deployment:          op.Deployment,
+		OperationKey:        op.OperationKey,
 		ExternalID:          op.ExternalID,
 		ExternalOperationID: op.ExternalOperationID,
 		OperationKind:       op.OperationKind,
@@ -426,7 +428,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	httpResp.Environment = apply.Environment
 	httpResp.Caller = apply.Caller
 	if apply.Repository != "" && apply.PullRequest > 0 {
-		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
+		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
 	}
 
 	// Re-read the apply record — the tern client's Progress call may have
@@ -1119,7 +1121,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		Caller:      apply.Caller,
 	}
 	if apply.Repository != "" && apply.PullRequest > 0 {
-		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
+		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
 	}
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)

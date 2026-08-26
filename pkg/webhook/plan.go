@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -49,9 +52,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, tenant, err) {
-			h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+			h.logger.Debug("unscoped fan-out plan resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
 		}
@@ -254,12 +257,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
+					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
+				return
+			}
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
 			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
-			if h.skipUnownedUnscopedCommand(repo, tenant, unownedErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, unownedErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
@@ -271,7 +279,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	} else {
 		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
 		if findErr != nil {
-			if h.skipUnownedUnscopedCommand(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "error", findErr)
 				return
@@ -756,6 +764,44 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 	return out
 }
 
+// splitExistingCopies sorts the target's unfinished copies by what the apply
+// will do to them. The two sections are opposite promises to the operator —
+// one says the work survives, the other says it is destroyed — so a
+// disposition this build does not recognize is shown as a discard: warning
+// about work that in fact survives costs a second look, while promising
+// survival to work that is destroyed costs the copy.
+func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, adopted []templates.ExistingCopyData) {
+	for _, c := range copies {
+		if c == nil {
+			continue
+		}
+		entry := templates.ExistingCopyData{
+			Namespace: c.Namespace,
+			Tables:    c.Tables,
+			Reason:    c.Reason,
+			Statement: c.Statement,
+		}
+		if c.AgeSeconds > 0 {
+			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
+		}
+		switch engine.CopyDisposition(c.Disposition) {
+		case engine.CopyAdopt:
+			adopted = append(adopted, entry)
+		case engine.CopyDiscard:
+			discarded = append(discarded, entry)
+		default:
+			// Reaching here means a deployment reported a disposition this build
+			// has no name for, so the comment warns about work that may in fact
+			// survive. Without this line the ⚠️ section is indistinguishable from
+			// a real discard and there is nothing to reconcile it against.
+			slog.Warn("comment discloses an unfinished copy as discarded because the deployment reported a disposition this build does not recognize",
+				"namespace", c.Namespace, "tables", c.Tables, "disposition", c.Disposition)
+			discarded = append(discarded, entry)
+		}
+	}
+	return discarded, adopted
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -903,6 +949,8 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 		}
 	}
+
+	data.DiscardedCopies, data.AdoptedCopies = splitExistingCopies(planResp.ExistingCopies)
 
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {

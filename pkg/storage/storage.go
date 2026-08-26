@@ -94,7 +94,11 @@ type LockStore interface {
 	// List returns all active locks.
 	List(ctx context.Context) ([]*Lock, error)
 
-	// Update updates lock metadata (e.g., updated_at timestamp).
+	// Update touches updated_at to mark liveness of the caller's own lock.
+	// The touch is owner-scoped: it returns ErrLockNotFound when no lock
+	// exists for the database, and ErrLockNotOwned when another owner holds
+	// it — a caller whose lock was force-released and re-acquired elsewhere
+	// must not refresh the new owner's row.
 	Update(ctx context.Context, lock *Lock) error
 
 	// GetByPR returns all locks associated with a PR (for cleanup on merge/close).
@@ -428,7 +432,9 @@ type PlanStore interface {
 	// GetByID returns a plan by ID, or nil if not found.
 	GetByID(ctx context.Context, id int64) (*Plan, error)
 
-	// GetByLock returns plans for a lock (0-2: staging + production).
+	// GetByLock is not implemented: plans carry no direct lock association,
+	// and every implementation returns ErrNotImplemented so a caller can
+	// never mistake the missing capability for "no plans".
 	GetByLock(ctx context.Context, lockID int64) ([]*Plan, error)
 
 	// GetByPR returns all plans for a PR.
@@ -799,6 +805,50 @@ type TaskStore interface {
 
 	// List returns tasks matching the filter criteria.
 	List(ctx context.Context, filter TaskFilter) ([]*Task, error)
+
+	// ReapStrandedRetryable hardens to failed the failed_retryable task rows
+	// whose parent apply has already settled, returning what it reaped (at
+	// most limit rows, oldest first). A failed_retryable task promises a retry, but
+	// retries are dispatched by the parent's recovery path: once the parent has
+	// settled, no driver will ever pick the row up again, so the promise is
+	// dead. Left in place, the row poisons every reader that treats
+	// failed_retryable as "a retry is coming" — most critically the control
+	// plane's remote-progress snapshot, which copies the row verbatim and reads
+	// it as a permanent retryable pause. Such rows are the residue of a partial
+	// failure write: a task update that errored mid-transition, or a retryable
+	// writer racing a concurrent failure writer.
+	//
+	// The row keeps its own error message — its failure is real; only the
+	// retry promise is retired — so the task is hardened to failed rather than
+	// mirroring the parent's state. Only settled parents (completed, failed,
+	// cancelled, reverted) that have been quiescent past the retryable-task
+	// reaper's own window qualify — longer than the retryable-recovery
+	// freshness window (and than ReapStranded's), so a retry admitted at the
+	// freshness window's edge, which refreshes the parent heartbeat on claim,
+	// can never race the reap. Stopped and failed_retryable parents are
+	// resumable, and their failed_retryable tasks belong to the resume/retry
+	// path. Each write
+	// re-verifies the row is still failed_retryable and the parent is still
+	// settled, so a row a concurrent writer advanced is skipped rather than
+	// overwritten. The parent apply row is never touched.
+	//
+	// One instance reaps per pass, guarded by an advisory lock;
+	// ErrStrandedTaskReaperBusy reports that another instance holds it. As with
+	// ReapStranded, the lock is an efficiency gate, not a safety one.
+	ReapStrandedRetryable(ctx context.Context, limit int) ([]*ReapedTask, error)
+}
+
+// ErrStrandedTaskReaperBusy reports that another instance holds the stranded
+// retryable-task reaper lock, so this pass did no work. It is an expected
+// outcome on every instance but one, not a failure.
+var ErrStrandedTaskReaperBusy = errors.New("another instance is reaping stranded retryable tasks")
+
+// ReapedTask records one failed_retryable task row hardened to failed under a
+// settled parent apply, carrying both rows so callers can log what the reaper
+// did with the canonical triage attributes.
+type ReapedTask struct {
+	Task   *Task
+	Parent *Apply
 }
 
 // TableRef names one table in a single deployment target. Namespace
@@ -837,7 +887,10 @@ type ApplyCommentStore interface {
 	// last_edited_at for a comment. Called after each successful edit.
 	IncrementEditCount(ctx context.Context, applyID int64, commentState string) error
 
-	// DeleteByApply removes all comment records for an apply.
+	// DeleteByApply removes all comment records for an apply. It is
+	// deliberately lease-agnostic: it serves per-apply teardown where the
+	// apply row itself is being removed, so no live drive holds a lease that
+	// could fence it.
 	DeleteByApply(ctx context.Context, applyID int64) error
 
 	// Supersede retires the tracked comment for a single (apply_id, comment_state)
@@ -1144,8 +1197,11 @@ type ControlRequestStore interface {
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
 
 	// ListSettled returns every control request for an apply that has reached a
-	// terminal status, so the plane that accepted a control RPC can learn
-	// whether the operation took effect: accepting a request only queues it.
+	// terminal status, ordered by operation ascending, so the plane that
+	// accepted a control RPC can learn whether the operation took effect:
+	// accepting a request only queues it. The ordering is a varchar sort and
+	// therefore collation-dependent in principle; every ControlOperation value
+	// is lowercase ASCII, which all supported dialects order identically.
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// RecordRemoteFailure records the terminal failure another plane reported

@@ -276,6 +276,12 @@ enum State {
   STATE_CATCHING_UP = 19;
   STATE_CHECKSUMMING = 20;
   STATE_POST_CHECKSUM = 21;
+  // The apply failed but is parked for the serving plane's own retry: a later
+  // recovery attempt will claim it, so this is a pause, not a verdict. Clients
+  // must keep polling and must not treat it as terminal. Distinct from
+  // STATE_FAILED, which means the failure settled (retries exhausted or the
+  // failure is not retryable).
+  STATE_FAILED_RETRYABLE = 22;
 }
 
 // ChangeType represents the type of schema change.
@@ -492,6 +498,31 @@ message LintViolation {
   string severity = 6; // "error", "warning", or "info"
 }
 
+// ExistingCopy is unfinished work an earlier schema change left on the target
+// that applying this plan will either continue or destroy. A plan reports one
+// per namespace that holds any, and none at all when nothing is at stake.
+message ExistingCopy {
+  // Where the work sits, so a plan spanning several namespaces says which
+  // target each disclosure is about.
+  string namespace = 1;
+  // What applying will do with it: "adopt" continues the work, "discard"
+  // destroys it and starts the affected tables over.
+  string disposition = 2;
+  // Why a discard cannot be avoided by applying as planned:
+  // "statement_differs" or "checkpoint_expired". Empty for an adopt.
+  string reason = 3;
+  // The tables in this plan that already hold unfinished work.
+  repeated string tables = 4;
+  // How long ago the engine last recorded progress on the work. Zero when the
+  // engine has no record to resume from, which is itself a discard.
+  int64 age_seconds = 5;
+  // The schema change the work was started for, verbatim as the engine
+  // recorded it. Empty when the engine has no record of it. This is what lets
+  // a surface show what a drifted schema change differs *from*, rather than
+  // only that it differs; for an adopt it repeats the plan.
+  string statement = 6;
+}
+
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing
 // when changes is non-empty; carrying the changes (rather than a separate
 // needs_change flag) means a keyspace whose shards diverge — drift, or a
@@ -518,6 +549,9 @@ message PlanResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 6;
+  // Unfinished work already on the target that applying this plan will
+  // continue or destroy. Empty when nothing is at stake.
+  repeated ExistingCopy existing_copies = 7;
 }
 
 // PlanDiffResponse contains a deployment's desired-vs-live diff. It mirrors

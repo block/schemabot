@@ -4,7 +4,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"unicode/utf8"
+
+	"golang.org/x/text/width"
 )
 
 // Hyperlinks reports whether OSC 8 hyperlink escapes may be emitted on
@@ -34,11 +35,7 @@ func stdoutSupportsHyperlinks() bool {
 	if os.Getenv("TMUX") != "" || strings.HasPrefix(term, "screen") || strings.HasPrefix(term, "tmux") {
 		return false
 	}
-	info, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return IsTerminal(os.Stdout)
 }
 
 // Link renders text as an OSC 8 hyperlink to url when stdout is an
@@ -99,11 +96,57 @@ func isControl(r rune) bool {
 // codes.
 var terminalEscapePattern = regexp.MustCompile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b\\[[0-9;]*m")
 
-// VisibleWidth counts the runes a string displays after stripping zero-width
-// terminal escapes, so padded layouts stay aligned around colored or
-// hyperlinked values. It treats every rune as one column, which holds for
-// the identifiers and URLs this CLI renders but undercounts double-width
-// runes such as CJK characters.
+// VisibleWidth counts the terminal cells a string occupies after stripping
+// zero-width terminal escapes, so padded layouts stay aligned around
+// colored, hyperlinked, or emoji-bearing values. East Asian wide and
+// fullwidth runes occupy two cells, and an emoji variation selector widens
+// its narrow base rune to two, matching how terminals render
+// emoji-presentation sequences such as "⚠️".
 func VisibleWidth(s string) int {
-	return utf8.RuneCountInString(terminalEscapePattern.ReplaceAllString(s, ""))
+	cells := 0
+	prevCells := 0
+	for _, r := range terminalEscapePattern.ReplaceAllString(s, "") {
+		switch {
+		case r == emojiVariationSelector:
+			if prevCells == 1 {
+				cells++
+				prevCells = 2
+			}
+		case isWideRune(r):
+			cells += 2
+			prevCells = 2
+		default:
+			cells++
+			prevCells = 1
+		}
+	}
+	return cells
+}
+
+// PadVisible right-pads s with spaces until it occupies cells terminal cells,
+// so a column of colored, hyperlinked, or emoji-bearing values lines up where
+// fmt's byte-counting %-*s would not. A value already at or past cells is
+// returned unchanged, so a caller that sized the column from a subset of its
+// rows still renders every one of them.
+func PadVisible(s string, cells int) string {
+	if pad := cells - VisibleWidth(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+// emojiVariationSelector (U+FE0F) is zero width itself but requests emoji
+// presentation for the rune it follows, which terminals render two cells
+// wide.
+const emojiVariationSelector = '\uFE0F'
+
+// isWideRune reports whether a rune occupies two terminal cells on its own,
+// such as CJK characters and default-emoji-presentation symbols like "⛔".
+func isWideRune(r rune) bool {
+	switch width.LookupRune(r).Kind() {
+	case width.EastAsianWide, width.EastAsianFullwidth:
+		return true
+	default:
+		return false
+	}
 }

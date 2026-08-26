@@ -82,10 +82,13 @@ const (
 	PreviewVolumeMode PreviewType = "volume_mode" // Volume adjustment mode
 
 	// Status previews
-	PreviewStatusList       PreviewType = "status_list"       // List of active schema changes
-	PreviewStatusDeployment PreviewType = "status_deployment" // Deployment-scoped schema change status
-	PreviewStatusHistory    PreviewType = "status_history"    // Database apply history
-	PreviewPlansList        PreviewType = "plans_list"        // List of recently generated plans
+	PreviewStatusList         PreviewType = "status_list"          // List of active schema changes
+	PreviewStatusDeployment   PreviewType = "status_deployment"    // Deployment-scoped schema change status
+	PreviewStatusHistory      PreviewType = "status_history"       // Database apply history
+	PreviewPlansList          PreviewType = "plans_list"           // List of recently generated plans
+	PreviewPullSchema         PreviewType = "pull_schema"          // Pulled live schema rendered as readable SQL
+	PreviewPullSchemaDetailed PreviewType = "pull_schema_detailed" // Pulled live schema with the detailed catalog's estimates
+	PreviewPullVitessSchema   PreviewType = "pull_schema_vitess"   // Multi-keyspace Vitess pull with VSchema artifacts
 
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output
@@ -115,6 +118,9 @@ const (
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
+	PreviewCommentPlanCopyDiscarded            PreviewType = "comment_plan_copy_discarded"             // Plan whose apply would throw away an unfinished copy on the target
+	PreviewCommentPlanCopyDiscardedApplying    PreviewType = "comment_plan_copy_discarded_applying"    // Running apply recording the unfinished copy it threw away
+	PreviewCommentPlanCopyAdopted              PreviewType = "comment_plan_copy_adopted"               // Plan whose apply resumes an unfinished copy on the target
 	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes

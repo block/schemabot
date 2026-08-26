@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // PlansCmd lists recently generated plans, or shows one stored plan's content.
@@ -70,12 +71,14 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 	rows := make([]templates.PlanSummaryData, 0, len(result.Plans))
 	for _, p := range result.Plans {
 		rows = append(rows, templates.PlanSummaryData{
-			PlanID:      p.PlanID,
-			Database:    p.Database,
-			Environment: p.Environment,
-			Source:      planSource(p),
-			CreatedAt:   p.CreatedAt,
-			Changes:     planChangeSummary(p),
+			PlanID:       p.PlanID,
+			Database:     p.Database,
+			Environment:  p.Environment,
+			Source:       planSource(p),
+			CreatedAt:    p.CreatedAt,
+			Changes:      planChangeSummary(p),
+			UnsafeCount:  p.UnsafeCount,
+			BlockedCount: p.BlockedCount,
 		})
 	}
 	templates.WritePlansList(templates.PlansListData{
@@ -122,11 +125,13 @@ func showStoredPlan(endpoint, planID string, outputJSON bool) error {
 	return nil
 }
 
-// planSource renders a plan's provenance: the PR it was generated for as a
-// full clickable URL, or "ad-hoc" when it was created without one.
+// planSource renders a plan's provenance the way the status list renders an
+// apply's source: the short "owner/repo#pr" as an OSC 8 hyperlink to the PR on
+// an interactive terminal (the full URL everywhere else), the repository alone
+// when the plan names no PR, and "ad-hoc" for a plan created without either.
 func planSource(p *apitypes.PlanSummaryResponse) string {
 	if p.Repository != "" && p.PullRequest > 0 {
-		return fmt.Sprintf("https://github.com/%s/pull/%d", p.Repository, p.PullRequest)
+		return templates.PullRequestLink(p.Repository, p.PullRequest)
 	}
 	if p.Repository != "" {
 		return p.Repository
@@ -134,8 +139,8 @@ func planSource(p *apitypes.PlanSummaryResponse) string {
 	return "ad-hoc"
 }
 
-// planChangeSummary renders a stored plan's change counts as one line, such as
-// "3 changes: 1 create, 2 alter · 1 unsafe".
+// planChangeSummary renders a stored plan's change counts as one line, such
+// as "1 create, 2 alter · ⚠️".
 func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 	total := 0
 	for _, count := range p.ChangeCounts {
@@ -145,28 +150,37 @@ func planChangeSummary(p *apitypes.PlanSummaryResponse) string {
 		return "no changes"
 	}
 
+	// The per-operation breakdown carries the total implicitly, so no "N
+	// changes" head repeats it — the summary competes for row width with
+	// every other column.
 	var parts []string
 	if total > 0 {
-		head := fmt.Sprintf("%d change", total)
-		if total != 1 {
-			head += "s"
-		}
 		var ops []string
 		for _, op := range orderedChangeOperations(p.ChangeCounts) {
 			ops = append(ops, fmt.Sprintf("%d %s", p.ChangeCounts[op], op))
 		}
-		parts = append(parts, head+": "+strings.Join(ops, ", "))
+		parts = append(parts, strings.Join(ops, ", "))
 	}
 	if p.VSchemaChangeCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d vschema", p.VSchemaChangeCount))
 	}
 	if p.UnsafeCount > 0 {
-		parts = append(parts, fmt.Sprintf("⚠️ %d unsafe", p.UnsafeCount))
+		parts = append(parts, markerWithCount(glyph.Attention, p.UnsafeCount))
 	}
 	if p.BlockedCount > 0 {
-		parts = append(parts, fmt.Sprintf("⛔ %d blocked", p.BlockedCount))
+		parts = append(parts, markerWithCount(glyph.Refused, p.BlockedCount))
 	}
 	return strings.Join(parts, " · ")
+}
+
+// markerWithCount renders a safety marker, carrying its count only when more
+// than one change is flagged: the single-violation case reads from the marker
+// alone, and the legend under the table names what each marker flags.
+func markerWithCount(marker string, count int) string {
+	if count == 1 {
+		return marker
+	}
+	return fmt.Sprintf("%s %d", marker, count)
 }
 
 // orderedChangeOperations returns the plan's change operations with the

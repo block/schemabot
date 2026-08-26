@@ -308,8 +308,8 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	} else {
 		sb.WriteString("Another PR currently holds the lock for this database.\n\n")
 		if data.LockRepo != "" {
-			fmt.Fprintf(&sb, "**Locked by**: [%s#%d](https://github.com/%s/pull/%d)\n",
-				data.LockRepo, data.LockPR, data.LockRepo, data.LockPR)
+			fmt.Fprintf(&sb, "**Locked by**: %s\n",
+				caller.PullRequestMarkdownLink(data.LockRepo, data.LockPR))
 		} else {
 			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 		}

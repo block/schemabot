@@ -28,6 +28,25 @@ func FormatNumber(n int64) string {
 	return string(result)
 }
 
+// FormatBytes formats a byte count with binary units, one decimal place above
+// the byte range. Storage engines report sizes in bytes, and an operator
+// reading a table's footprint wants the magnitude, not the digits.
+// Example: 1536 → "1.5 KiB", 1048576 → "1.0 MiB"
+func FormatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	value := float64(b)
+	for _, suffix := range []string{"KiB", "MiB", "GiB", "TiB", "PiB"} {
+		value /= unit
+		if value < unit {
+			return fmt.Sprintf("%.1f %s", value, suffix)
+		}
+	}
+	return fmt.Sprintf("%.1f EiB", value/unit)
+}
+
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human
 // label, shared by the CLI progress view and the PR comment so both surfaces
 // describe VSchema application identically.

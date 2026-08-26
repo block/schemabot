@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/diffplan"
@@ -113,7 +112,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		}
 	}
 	result.NoChanges = len(result.Changes) == 0
-	result.PlanID = fmt.Sprintf("postgres-plan-%d", time.Now().UnixNano())
+	result.PlanID = engine.NewPlanID()
 	return result, nil
 }
 

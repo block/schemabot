@@ -3647,15 +3647,19 @@ func remoteProgressErrorMessage(applyState, remoteErrorMessage, existingErrorMes
 	return ""
 }
 
-// remoteApplyPausedForDataPlaneRetry reports whether a remote STATE_FAILED
-// progress snapshot is a retryable pause rather than a final verdict. The tern
-// wire has no failed-retryable apply state: the data plane reports a
-// failed_retryable apply as STATE_FAILED and reveals the retryable truth only
-// on the per-table status strings. A table still reporting failed_retryable
-// means the data plane's own recovery will claim another attempt, so the
-// control plane must keep polling instead of terminalizing — a terminal
-// verdict here would orphan a live remote apply that can still cut over.
+// remoteApplyPausedForDataPlaneRetry reports whether a remote progress
+// snapshot is a retryable pause rather than a final verdict: the data plane's
+// own recovery will claim another attempt, so the control plane must keep
+// polling instead of terminalizing — a terminal verdict here would orphan a
+// live remote apply that can still cut over. A current data plane says so
+// directly with STATE_FAILED_RETRYABLE. A data plane from before that wire
+// state reports the pause as STATE_FAILED and reveals the retryable truth only
+// on the per-table status strings, so a STATE_FAILED snapshot with a table
+// still in failed_retryable is also a pause.
 func remoteApplyPausedForDataPlaneRetry(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) bool {
+	if protoState == ternv1.State_STATE_FAILED_RETRYABLE {
+		return true
+	}
 	if protoState != ternv1.State_STATE_FAILED {
 		return false
 	}
@@ -3671,19 +3675,20 @@ func remoteApplyPausedForDataPlaneRetry(protoState ternv1.State, remoteTasks []*
 }
 
 // remoteProgressIsTerminal reports whether a remote progress snapshot settles
-// the apply. It refines isTerminalProtoState with the per-table statuses: a
-// STATE_FAILED snapshot that is really a retryable pause is not terminal. A
-// failed snapshot with no tables (for example a dispatch-level failure that
-// never created tasks) stays terminal — the guard only holds the drive open
-// when a table proves the data plane will retry.
+// the apply. It refines isTerminalProtoState with the pause check: a snapshot
+// that is really a retryable pause is not terminal. A STATE_FAILED snapshot
+// with no retryable table (for example a dispatch-level failure that never
+// created tasks, or exhausted retries) stays terminal — the guard only holds
+// the drive open when the snapshot proves the data plane will retry.
 func remoteProgressIsTerminal(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) bool {
 	return isTerminalProtoState(protoState) && !remoteApplyPausedForDataPlaneRetry(protoState, remoteTasks)
 }
 
 // remoteProgressApplyState maps a remote progress snapshot to the stored apply
-// state it represents, resolving the wire's collapse of failed_retryable into
-// STATE_FAILED: a snapshot that is a retryable pause maps to failed_retryable,
-// not failed. Like ProtoStateToStorage it returns "" for an unmapped state.
+// state it represents: a snapshot that is a retryable pause maps to
+// failed_retryable, not failed, even when an older data plane reported the
+// pause as STATE_FAILED. Like ProtoStateToStorage it returns "" for an
+// unmapped state.
 func remoteProgressApplyState(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) string {
 	mapped := ProtoStateToStorage(protoState)
 	if mapped == "" {
@@ -3888,7 +3893,7 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			pct = 100
 		}
 		shardTask := &storage.Task{
-			TaskIdentifier:   newTaskIdentifier(),
+			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          storedTask.ApplyID,
 			ApplyOperationID: storedTask.ApplyOperationID,
 			PlanID:           storedTask.PlanID,

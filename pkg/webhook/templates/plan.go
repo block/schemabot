@@ -112,6 +112,13 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
+	// Unfinished copies already on the target that the apply will throw away
+	// and copy again from the start.
+	DiscardedCopies []ExistingCopyData
+
+	// Unfinished copies already on the target that the apply will resume.
+	AdoptedCopies []ExistingCopyData
+
 	// Tables carrying a destructive change that another pull request owns, or
 	// whose ownership could not be established.
 	AttributedChanges []AttributedChangeData
@@ -160,6 +167,17 @@ type DeploymentDriftEntry struct {
 	// Detail is a short human explanation for a diverged or errored deployment;
 	// empty for a match.
 	Detail string
+}
+
+// applyingWithoutConfirmation reports whether this comment announces an apply
+// that is already running rather than one waiting on the operator: a locked
+// comment with nothing pausing it. Nothing on such a comment is a question, so
+// the disclosures above the footer state what the apply is doing instead of
+// warning about what confirming would cost, and never offer a remedy that is
+// already out of reach. The footer reads the same predicate, so the two cannot
+// disagree about whether the reader still has a decision to make.
+func (d PlanCommentData) applyingWithoutConfirmation() bool {
+	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -261,6 +279,18 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
 	}
 
+	// Copies already on the target. Shown on the locked apply comment too:
+	// discarding an unfinished copy destroys hours of work already done, so the
+	// disclosure must sit on the comment the confirmation acts on. The copy is
+	// read from the target at plan time, so it can appear on the apply comment
+	// without having been on the plan comment that preceded it.
+	if len(data.DiscardedCopies) > 0 {
+		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.AdoptedCopies) > 0 {
+		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
+	}
+
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
@@ -304,7 +334,7 @@ func RenderPlanComment(data PlanCommentData) string {
 			applyConfirmCmd += " --skip-revert"
 		}
 
-		if data.AutoConfirmDowngradeReason != "" {
+		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
 			fmt.Fprintf(&sb, "⚠️ **Automatic apply paused**: %s\n\n", data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
@@ -378,8 +408,8 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 		// table, which is not necessarily the last one to change it: a later
 		// change from a pull request that has since closed leaves no open claim
 		// and is passed over.
-		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
-			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+		fmt.Fprintf(sb, "- `%s`: changed by %s, which is still open\n",
+			d.Table, caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
@@ -1358,6 +1388,15 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
+	// Copies already on the target — read per environment, since each
+	// environment has its own target.
+	if len(plan.DiscardedCopies) > 0 {
+		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
+	}
+	if len(plan.AdoptedCopies) > 0 {
+		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
+	}
+
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
@@ -1482,51 +1521,24 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	return false
 }
 
-// driftIdentical reports whether two plans' deployment-drift rollups render the
-// same, so environments are only deduplicated when their drift is identical too.
-func driftIdentical(a, b *DeploymentDriftData) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.Computed != b.Computed || a.Clean != b.Clean || len(a.Deployments) != len(b.Deployments) {
-		return false
-	}
-	for i := range a.Deployments {
-		if a.Deployments[i] != b.Deployments[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// plansIdentical checks if two plans have the same DDL statements. Plans that
-// excluded different namespaces are never identical: deduplicating them into
-// one section would show one environment's exclusion disclosure for both.
+// plansIdentical reports whether two environments' plan sections are the same
+// section, so one may stand in for both under a combined header.
+//
+// It answers that by rendering both and comparing the bytes, because every
+// disclosure in a section is a promise about one environment's target and
+// standing in for the other means making that promise for a target it was never
+// read from. Identical DDL does not make those promises identical: execution
+// policy, the task history that attributes a change, and unfinished copies on
+// the target are all resolved per environment, so a section can differ on any of
+// them while the statements match. Comparing what the section says is the only
+// comparison that stays right as sections gain disclosures — a field-by-field
+// version silently drops each one added after it was written, and drops it from
+// the comment operators apply from.
 func plansIdentical(a, b *PlanCommentData) bool {
-	if !slices.Equal(a.IgnoredNamespaces, b.IgnoredNamespaces) {
-		return false
-	}
-	if len(a.Changes) != len(b.Changes) {
-		return false
-	}
-	for i, aChange := range a.Changes {
-		bChange := b.Changes[i]
-		if aChange.Keyspace != bChange.Keyspace {
-			return false
-		}
-		if len(aChange.Statements) != len(bChange.Statements) {
-			return false
-		}
-		for j, stmt := range aChange.Statements {
-			if stmt != bChange.Statements[j] {
-				return false
-			}
-		}
-		if aChange.VSchemaChanged != bChange.VSchemaChanged || aChange.VSchemaDiff != bChange.VSchemaDiff {
-			return false
-		}
-	}
-	return driftIdentical(a.DeploymentDrift, b.DeploymentDrift)
+	var renderedA, renderedB strings.Builder
+	writeEnvironmentPlanSection(&renderedA, a)
+	writeEnvironmentPlanSection(&renderedB, b)
+	return renderedA.String() == renderedB.String()
 }
 
 // capitalizeEnvNames joins environment names with " & " and capitalizes each.
