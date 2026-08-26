@@ -97,13 +97,14 @@ func TestTasks(t *testing.T, h Harness) {
 		lock := CreateLock(t, store, "task_order_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_task_order", 902)
 		other := CreateApplyWithStateAndEnv(t, store, lock, "apply_task_order_other", 903, state.Apply.Completed, "production")
-		created := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 
 		for _, task := range []*storage.Task{
-			newTask(apply, "task_order_users", "users", created),
-			newTask(apply, "task_order_orders", "orders", created),
-			newTask(apply, "task_order_products", "products", created),
-			newTask(other, "task_order_other", "other", created),
+			newTask(apply, "task_order_products", "products", base.Add(2*time.Second)),
+			newTask(apply, "task_order_users", "users", base),
+			newTask(apply, "task_order_orders", "orders", base.Add(time.Second)),
+			newTask(apply, "task_order_accounts", "accounts", base.Add(time.Second)),
+			newTask(other, "task_order_other", "other", base.Add(2*time.Second)),
 		} {
 			_, err := store.Tasks().Create(ctx, task)
 			require.NoError(t, err)
@@ -111,12 +112,85 @@ func TestTasks(t *testing.T, h Harness) {
 
 		tasks, err := store.Tasks().GetByApplyID(ctx, apply.ID)
 		require.NoError(t, err)
-		require.Len(t, tasks, 3)
-		assert.Equal(t, []string{"task_order_users", "task_order_orders", "task_order_products"}, taskIdentifiers(tasks))
+		require.Len(t, tasks, 4)
+		assert.Equal(t, []string{"task_order_users", "task_order_orders", "task_order_accounts", "task_order_products"}, taskIdentifiers(tasks),
+			"same-second tasks must order by id ascending")
 
 		count, err := store.Tasks().CountByApplyID(ctx, apply.ID)
 		require.NoError(t, err)
-		assert.Equal(t, int64(3), count)
+		assert.Equal(t, int64(4), count)
+	})
+
+	t.Run("GetByApplyID_ShardScopedDriveTasksAndUnfilteredCount", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_shard_db", storage.DatabaseTypeStrata)
+		apply := CreateApply(t, store, lock, "apply_task_shard", 905)
+		created := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+		namespace, shard, table := "commerce", "-80", "users"
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID:       apply.ID,
+			Deployment:    "region-a",
+			OperationKey:  storage.ShardOperationKey(namespace, shard, table),
+			OperationKind: storage.ApplyOperationKindWork,
+			Target:        apply.Database,
+		})
+		require.NoError(t, err)
+
+		matched := newTask(apply, "task_shard_matched", table, created)
+		matched.ApplyOperationID = &opID
+		matched.Namespace = namespace
+		matched.Shard = shard
+		_, err = store.Tasks().Create(ctx, matched)
+		require.NoError(t, err)
+
+		unmatched := newTask(apply, "task_shard_unmatched", "orders", created.Add(time.Second))
+		unmatched.ApplyOperationID = &opID
+		unmatched.Namespace = namespace
+		unmatched.Shard = shard
+		_, err = store.Tasks().Create(ctx, unmatched)
+		require.NoError(t, err)
+
+		tasks, err := store.Tasks().GetByApplyID(ctx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"task_shard_matched"}, taskIdentifiers(tasks),
+			"only the shard row matching its work operation is drive work")
+
+		count, err := store.Tasks().CountByApplyID(ctx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), count, "the unfiltered count includes reflected shard rows")
+	})
+
+	t.Run("Update_LeaseGuardsWrites", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_lease_db", storage.DatabaseTypeMySQL)
+		apply := CreateClaimedApply(t, store, lock, "apply_task_lease", 906, "current-driver")
+
+		ownedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
+			ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken,
+		})
+		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
+			ApplyID: apply.ID, Owner: "old-driver", Token: "stale-token",
+		})
+		task, err := store.Tasks().Get(ctx, "task_"+apply.ApplyIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, task)
+
+		task.State = state.Task.Failed
+		require.ErrorIs(t, store.Tasks().Update(staleCtx, task), storage.ErrApplyLeaseLost)
+		reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Pending, reloaded.State, "a stale lease must not update the task")
+
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(ownedCtx, task))
+		reloaded, err = store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Completed, reloaded.State)
 	})
 
 	t.Run("ExpireRetryable_TerminalizesUnfinishedTasks", func(t *testing.T) {
@@ -138,6 +212,8 @@ func TestTasks(t *testing.T, h Harness) {
 			require.NoError(t, err)
 		}
 
+		// Exhaust the recovery budget through the storage interface because the
+		// parity suite cannot backdate the attempt counter with dialect-specific SQL.
 		for range storage.MaxRecoveryAttempts {
 			claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "test-driver")
 			require.NoError(t, err)
@@ -158,6 +234,11 @@ func TestTasks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+		reloadedApply, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloadedApply)
+		assert.Equal(t, state.Apply.Failed, reloadedApply.State)
+		assert.NotNil(t, reloadedApply.CompletedAt)
 
 		assertTask := func(identifier, wantState string, wantCompletedAt time.Time) {
 			t.Helper()
@@ -173,6 +254,90 @@ func TestTasks(t *testing.T, h Harness) {
 		assertTask("task_expiry_retryable", state.Task.Failed, time.Time{})
 		assertTask("task_expiry_pending", state.Task.Cancelled, time.Time{})
 		assertTask("task_expiry_completed", state.Task.Completed, completedAt)
+	})
+
+	t.Run("Create_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().Create(t.Context(), &storage.Task{TaskIdentifier: "task_err"})
+		require.Error(t, err)
+	})
+
+	t.Run("Get_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().Get(t.Context(), "task_err")
+		require.Error(t, err)
+	})
+
+	t.Run("Update_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		require.Error(t, store.Tasks().Update(t.Context(), &storage.Task{ID: 1}))
+	})
+
+	t.Run("UpsertShardProgress_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
+		operationID := int64(1)
+		require.Error(t, store.Tasks().UpsertShardProgress(ctx, &storage.Task{ApplyID: 1, ApplyOperationID: &operationID}))
+	})
+
+	t.Run("GetByApplyID_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetByApplyID(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("CountByApplyID_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().CountByApplyID(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("GetByApplyOperationID_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetByApplyOperationID(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("GetShardProgressByApplyOperationID_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetShardProgressByApplyOperationID(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("GetByDatabase_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetByDatabase(t.Context(), "database")
+		require.Error(t, err)
+	})
+
+	t.Run("GetActive_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetActive(t.Context())
+		require.Error(t, err)
+	})
+
+	t.Run("GetByPR_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().GetByPR(t.Context(), "org/repo", 1)
+		require.Error(t, err)
+	})
+
+	t.Run("FindTableOwners_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().FindTableOwners(t.Context(), storage.TableRef{Database: "database", TableName: "users"})
+		require.Error(t, err)
+	})
+
+	t.Run("List_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().List(t.Context(), storage.TaskFilter{})
+		require.Error(t, err)
+	})
+
+	t.Run("ReapStrandedRetryable_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().ReapStrandedRetryable(t.Context(), 1)
+		require.Error(t, err)
 	})
 }
 
