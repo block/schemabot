@@ -49,7 +49,11 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, event.ID, stored.ID)
+		assert.Equal(t, storage.WebhookProviderGitHub, stored.Provider)
 		assert.Equal(t, storage.WebhookEventPending, stored.State)
+		assert.Equal(t, "block/example", stored.Repository)
+		assert.Equal(t, 123, stored.PullRequest)
+		assert.Equal(t, "456", stored.TenantID)
 		assert.JSONEq(t, `{"action":"synchronize"}`, string(stored.Payload))
 
 		otherProvider := newEvent("delivery-dedup")
@@ -80,6 +84,10 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, first)
 		assert.Equal(t, "delivery-first", first.DeliveryID)
+		assert.Equal(t, storage.WebhookEventProcessing, first.State)
+		assert.Equal(t, 1, first.Attempts)
+		assert.Equal(t, "driver-a", first.LeaseOwner)
+		assert.NotEmpty(t, first.LeaseToken)
 
 		second, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
 		require.NoError(t, err)
@@ -117,6 +125,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NotNil(t, retryable)
 		require.NotNil(t, retryable.RetryAfter)
 		assert.Equal(t, storage.WebhookEventFailedRetryable, retryable.State)
+		assert.Equal(t, "retry now", retryable.LastError)
 		assert.WithinDuration(t, past, *retryable.RetryAfter, time.Second)
 
 		reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
@@ -125,7 +134,11 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.Equal(t, claimed.ID, reclaimed.ID)
 		assert.Equal(t, 2, reclaimed.Attempts)
 		assert.NotEqual(t, claimed.LeaseToken, reclaimed.LeaseToken)
-		assert.Nil(t, reclaimed.RetryAfter, "claiming consumes the retry window")
+
+		persisted, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-retry")
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Nil(t, persisted.RetryAfter, "claiming consumes the persisted retry window, not just the returned mirror")
 	})
 
 	t.Run("ExpiredProcessingLeaseIsReclaimed", func(t *testing.T) {
@@ -181,6 +194,55 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.JSONEq(t, `{"redelivered":true}`, string(reopened.Payload))
 	})
 
+	t.Run("Create_DeduplicatesProcessingDeliveryWithLiveLease", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		event := newEvent("delivery-live-lease")
+		inserted, err := store.WebhookEvents().Create(ctx, event)
+		require.NoError(t, err)
+		require.True(t, inserted)
+
+		claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		redelivery := newEvent("delivery-live-lease")
+		redelivery.Payload = []byte(`{"redelivered":true}`)
+		inserted, err = store.WebhookEvents().Create(ctx, redelivery)
+		require.NoError(t, err)
+		assert.False(t, inserted, "a processing row with a live lease must deduplicate")
+
+		current, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-live-lease")
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		assert.Equal(t, storage.WebhookEventProcessing, current.State)
+		assert.Equal(t, claimed.LeaseOwner, current.LeaseOwner)
+		assert.Equal(t, claimed.LeaseToken, current.LeaseToken)
+		assert.JSONEq(t, `{"action":"synchronize"}`, string(current.Payload))
+	})
+
+	t.Run("MarkFailed_TerminalFailure", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		inserted, err := store.WebhookEvents().Create(ctx, newEvent("delivery-failed"))
+		require.NoError(t, err)
+		require.True(t, inserted)
+		claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "terminal failure", nil))
+
+		failed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-failed")
+		require.NoError(t, err)
+		require.NotNil(t, failed)
+		assert.Equal(t, storage.WebhookEventFailed, failed.State)
+		assert.Equal(t, "terminal failure", failed.LastError)
+		assert.NotNil(t, failed.CompletedAt)
+	})
+
 	t.Run("TerminalTransitionsAndRedelivery", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -201,6 +263,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NotNil(t, completed)
 		assert.Equal(t, storage.WebhookEventCompleted, completed.State)
 		assert.NotNil(t, completed.CompletedAt)
+		assert.Equal(t, claimed.LeaseToken, completed.LeaseToken)
 
 		redelivery := newEvent("delivery-terminal")
 		redelivery.Payload = []byte(`{"redelivered":true}`)
