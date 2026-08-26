@@ -210,6 +210,21 @@ func TestPrivilegeBlockReason(t *testing.T) {
 			},
 		},
 		{
+			name: "database-sourced identifiers are sanitized for Markdown",
+			err: fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{
+				Tier:  preflight.TierAlterInPlace,
+				Check: "pg_has_role(evil\nrole, app|owner, 'USAGE')",
+				Grant: "GRANT \"app|owner\" TO \"evil\nrole\"\x1b[31m",
+				Hint:  "membership\tmust be inheritable",
+			}),
+			refused: true,
+			wantReason: []string{
+				`GRANT "app/owner" TO "evil role"`,
+				"pg_has_role(evil role, app/owner, 'USAGE')",
+				"membership must be inheritable",
+			},
+		},
+		{
 			name:       "missing table blocks with a re-plan instruction",
 			err:        fmt.Errorf("check privileges: %w", preflight.ErrTableNotFound),
 			refused:    true,

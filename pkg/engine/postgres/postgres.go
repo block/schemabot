@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/diffplan"
@@ -210,10 +212,12 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 
 // privilegeBlockReason maps a typed preflight refusal to an operator-facing
 // blocked reason. A PrivilegeError carries the exact grant that provisions
-// the missing access — the Grant field is Sanitize()-quoted by pg-sprite and
-// safe to echo as executable SQL, while the Check predicate is display prose.
-// A false second return means the failure is operational, not a refusal, and
-// the caller must fail the plan instead of blocking the change.
+// the missing access; the Grant and Check fields embed database-sourced
+// identifiers (role, schema, owner names), so the composed reason is
+// sanitized before it leaves the engine — a blocked reason renders verbatim
+// in PR Markdown. A false second return means the failure is operational,
+// not a refusal, and the caller must fail the plan instead of blocking the
+// change.
 func privilegeBlockReason(err error, table string) (string, bool) {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
@@ -222,7 +226,7 @@ func privilegeBlockReason(err error, table string) (string, bool) {
 		if privilegeErr.Hint != "" {
 			reason += "; " + privilegeErr.Hint
 		}
-		return reason, true
+		return sanitizeReasonText(reason), true
 	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return fmt.Sprintf("table %q was not found while verifying privileges; re-plan against the current schema", table), true
@@ -231,6 +235,23 @@ func privilegeBlockReason(err error, table string) (string, bool) {
 		return fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table), true
 	}
 	return "", false
+}
+
+// sanitizeReasonText makes text that embeds database-sourced identifiers safe
+// for the single-line Markdown surfaces that render a blocked reason: control
+// and format characters (including bidi overrides usable for visual spoofing)
+// are stripped, whitespace runs — including newlines — collapse to one space,
+// and the table cell separator is neutralized so a crafted identifier cannot
+// break comment layout.
+func sanitizeReasonText(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.ReplaceAll(s, "|", "/")
 }
 
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string) (string, string) {
