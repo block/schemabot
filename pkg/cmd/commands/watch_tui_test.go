@@ -284,7 +284,7 @@ func TestWatchModel_MultiDeploymentView(t *testing.T) {
 	view := m.View()
 
 	assert.Contains(t, view, "1 completed · 1 halted · 1 failed")
-	assert.Contains(t, view, "⚠ First failure: eu-west — duplicate key name 'idx_orders_source'")
+	assert.Contains(t, view, "❌ First failure: eu-west — duplicate key name 'idx_orders_source'")
 	assert.Contains(t, view, "Apply ID: apply-multi-test")
 	assert.Contains(t, view, "Environment: production")
 	assertContainsInOrder(t, view,
@@ -318,7 +318,7 @@ func TestWatchModel_MultiDeploymentViewRunningDegraded(t *testing.T) {
 
 	assert.Contains(t, view, "running (degraded)")
 	assert.Contains(t, view, "1 running · 1 failed")
-	assert.Contains(t, view, "⚠ First failure: eu — duplicate column")
+	assert.Contains(t, view, "❌ First failure: eu — duplicate column")
 	assert.Contains(t, view, "🔄 us — running table copy")
 }
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -91,10 +92,10 @@ func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
 		return
 	}
 	if failure.Error == "" {
-		fmt.Printf("\n  %s⚠ First failure: %s%s\n", ANSIRed, failure.Deployment, ANSIReset)
+		fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s%s\n", ANSIRed, failure.Deployment, ANSIReset)
 		return
 	}
-	fmt.Printf("\n  %s⚠ First failure: %s — %s%s\n", ANSIRed, failure.Deployment, failure.Error, ANSIReset)
+	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Deployment, failure.Error, ANSIReset)
 }
 
 func writeMultiDeploymentNextAction(next presentation.NextAction) {
