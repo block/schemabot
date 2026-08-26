@@ -25,6 +25,7 @@ CREATE TABLE applies (
   started_at timestamp DEFAULT NULL,
   completed_at timestamp DEFAULT NULL,
   revert_skipped_at timestamp DEFAULT NULL,
+  superseded_by varchar(255) NOT NULL DEFAULT '',
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)

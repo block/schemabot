@@ -658,6 +658,20 @@ type ApplyStore interface {
 	// call it without disturbing recovery-claim staleness.
 	SetRevertSkipped(ctx context.Context, applyID int64, at time.Time) error
 
+	// MarkSuperseded records that successor took over the apply's unfinished
+	// work, by ApplyIdentifier. It is a targeted write of superseded_by that
+	// preserves the apply's updated_at lease heartbeat and touches no other
+	// fields, so the apply that handed off keeps whatever terminal state it
+	// settled in.
+	//
+	// The marker is write-once: it must outlive the successor, so it is never
+	// cleared and never reassigned. Marking again with the same successor
+	// succeeds, since a redelivered handoff records the same fact. Marking with
+	// a different successor returns ErrApplyAlreadySuperseded — two applies
+	// claiming the same handoff means the takeover decision is ambiguous, and an
+	// ambiguous decision must not be resolved by overwriting.
+	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
+
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error
