@@ -55,14 +55,14 @@ func TestResolveStorageDSN_ConfigResolvesPostgresStorageDSN(t *testing.T) {
 	path := writeStorageTestConfig(t, `
 storage:
   dialect: postgres
-  dsn: postgres://schemabot:test@storage-host:5432/schemabot
+  dsn: postgres://schemabot:hunter2-distinctive@storage-host:5432/schemabot
 `)
 	cmd := &ResyncIdentitySequencesCmd{Config: path}
 	dsn, source, err := cmd.resolveStorageDSN()
 	require.NoError(t, err)
-	assert.Equal(t, "postgres://schemabot:test@storage-host:5432/schemabot", dsn)
+	assert.Equal(t, "postgres://schemabot:hunter2-distinctive@storage-host:5432/schemabot", dsn)
 	assert.Contains(t, source, path)
-	assert.NotContains(t, source, "test@storage-host", "the loggable source must not leak DSN credentials")
+	assert.NotContains(t, source, "hunter2-distinctive", "the loggable source must not leak DSN credentials")
 }
 
 func TestResolveStorageDSN_ConfigFromEnvFallback(t *testing.T) {
@@ -87,4 +87,41 @@ storage:
 	cmd := &ResyncIdentitySequencesCmd{Config: path}
 	_, _, err := cmd.resolveStorageDSN()
 	require.ErrorContains(t, err, `only applies to "postgres" storage`)
+}
+
+func TestResolveStorageDSN_EmptyConfigDSN(t *testing.T) {
+	t.Setenv("STORAGE_DSN", "")
+	t.Setenv("MYSQL_DSN", "")
+	path := writeStorageTestConfig(t, `
+storage:
+  dialect: postgres
+`)
+	cmd := &ResyncIdentitySequencesCmd{Config: path}
+	_, _, err := cmd.resolveStorageDSN()
+	require.ErrorContains(t, err, "storage DSN not configured")
+}
+
+func TestResolveStorageDSN_WhitespaceDirectDSN(t *testing.T) {
+	cmd := &ResyncIdentitySequencesCmd{DSN: "   "}
+	_, _, err := cmd.resolveStorageDSN()
+	require.ErrorContains(t, err, "storage DSN not configured")
+}
+
+func TestResolveStorageDSN_ReportsEnvironmentSource(t *testing.T) {
+	path := writeStorageTestConfig(t, `
+storage:
+  dialect: postgres
+`)
+	t.Setenv("STORAGE_DSN", "postgres://schemabot@storage-host:5432/schemabot")
+	t.Setenv("MYSQL_DSN", "postgres://legacy@storage-host:5432/schemabot")
+	cmd := &ResyncIdentitySequencesCmd{Config: path}
+	_, source, err := cmd.resolveStorageDSN()
+	require.NoError(t, err)
+	assert.Equal(t, "STORAGE_DSN environment variable", source)
+}
+
+func TestResyncIdentitySequencesCmd_PingFailure(t *testing.T) {
+	cmd := &ResyncIdentitySequencesCmd{DSN: "postgres://user@127.0.0.1:1/db?sslmode=disable"}
+	err := cmd.Run(t.Context(), &Globals{Version: "test"})
+	require.ErrorContains(t, err, "ping storage database:")
 }

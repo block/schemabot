@@ -4,10 +4,11 @@ package commands
 
 import (
 	"database/sql"
+	"errors"
 	"log/slog"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
@@ -41,7 +42,17 @@ func requireDefaultInsertResumes(t *testing.T, db *sql.DB) {
 	err := db.QueryRowContext(t.Context(),
 		`INSERT INTO settings (setting_key, setting_value) VALUES ('after-resync', '') RETURNING id`).Scan(&id)
 	require.NoError(t, err, "default insert must succeed after the resync")
-	assert.Equal(t, int64(4), id, "the first default insert after the resync draws max+1")
+	require.Equal(t, int64(4), id, "the first default insert after the resync draws max+1")
+}
+
+func requireDefaultInsertCollides(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		`INSERT INTO settings (setting_key, setting_value) VALUES ('before-resync', '')`)
+	require.Error(t, err)
+	var pgErr *pgconn.PgError
+	require.True(t, errors.As(err, &pgErr), "default insert must return a PostgreSQL error")
+	require.Equal(t, "23505", pgErr.Code, "default insert must collide before the resync")
 }
 
 // After an explicit-id bulk load, the operator runs the resync subcommand
@@ -49,9 +60,10 @@ func requireDefaultInsertResumes(t *testing.T, db *sql.DB) {
 // above the loaded ids instead of colliding with them.
 func TestResyncIdentitySequencesCmd_DSNFlag(t *testing.T) {
 	dsn, db := startResyncStorage(t)
+	requireDefaultInsertCollides(t, db)
 
 	cmd := &ResyncIdentitySequencesCmd{DSN: dsn}
-	require.NoError(t, cmd.Run(t.Context()))
+	require.NoError(t, cmd.Run(t.Context(), &Globals{Version: "test"}))
 
 	requireDefaultInsertResumes(t, db)
 }
@@ -61,6 +73,7 @@ func TestResyncIdentitySequencesCmd_DSNFlag(t *testing.T) {
 // DSN from the config's storage section and resyncs the same way.
 func TestResyncIdentitySequencesCmd_ConfigFile(t *testing.T) {
 	dsn, db := startResyncStorage(t)
+	requireDefaultInsertCollides(t, db)
 
 	path := writeStorageTestConfig(t, `
 storage:
@@ -68,7 +81,7 @@ storage:
   dsn: `+dsn+`
 `)
 	cmd := &ResyncIdentitySequencesCmd{Config: path}
-	require.NoError(t, cmd.Run(t.Context()))
+	require.NoError(t, cmd.Run(t.Context(), &Globals{Version: "test"}))
 
 	requireDefaultInsertResumes(t, db)
 }

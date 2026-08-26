@@ -17,6 +17,7 @@
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
+  - [Resyncing PostgreSQL identity sequences](#resyncing-postgresql-identity-sequences)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [PlanetScale mTLS](#planetscale-mtls)
@@ -454,6 +455,29 @@ MySQL-format DSN and is only supported with the `mysql` dialect; combining it
 with `postgres` fails config validation. See
 [Storage Schema Changes](#storage-schema-changes) for how schema
 bootstrapping differs between the two dialects.
+
+### Resyncing PostgreSQL identity sequences
+
+After an explicit-ID bulk load into PostgreSQL storage, advance the identity
+sequences before SchemaBot resumes default inserts. Run the command only after
+the load has fully committed. It advances sequences when needed, never rewinds
+them, and is idempotent and safe to rerun.
+
+Pass the storage DSN directly:
+
+```shell
+schemabot storage resync-identity-sequences --dsn "$STORAGE_DSN"
+```
+
+Or resolve it from the server configuration:
+
+```shell
+schemabot storage resync-identity-sequences --config /etc/schemabot/config.yaml
+```
+
+The command refuses to run when none of SchemaBot's storage tables exist in
+the target database. Confirm the target and complete the resync before
+restarting the server or otherwise allowing default inserts.
 
 ## Storage Connection Pool
 

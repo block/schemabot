@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
@@ -19,7 +20,7 @@ import (
 // themselves and work while the server is down — they exist for maintenance
 // windows such as a cross-dialect data move or a restore from a dump.
 type StorageCmd struct {
-	ResyncIdentitySequences ResyncIdentitySequencesCmd `cmd:"" name:"resync-identity-sequences" help:"Advance PostgreSQL identity sequences on storage tables past their columns' stored maxima after an explicit-id bulk load"`
+	ResyncIdentitySequences ResyncIdentitySequencesCmd `cmd:"" name:"resync-identity-sequences" help:"Advance PostgreSQL identity sequences on storage tables past their columns' stored maxima after an explicit-id bulk load; run after the load has fully committed and before default inserts resume — advance-only and safe to rerun."`
 }
 
 // ResyncIdentitySequencesCmd resyncs the identity sequences of SchemaBot's
@@ -42,10 +43,10 @@ type ResyncIdentitySequencesCmd struct {
 // database fails the command promptly instead of hanging it.
 const storagePingTimeout = 10 * time.Second
 
-func (cmd *ResyncIdentitySequencesCmd) Run(ctx context.Context) error {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+func (cmd *ResyncIdentitySequencesCmd) Run(ctx context.Context, g *Globals) error {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel(),
-	}))
+	})).With("schemabot_version", g.Version)
 
 	dsn, source, err := cmd.resolveStorageDSN()
 	if err != nil {
@@ -78,11 +79,15 @@ func (cmd *ResyncIdentitySequencesCmd) Run(ctx context.Context) error {
 // not postgres. The source never contains the DSN itself, which may embed
 // credentials.
 func (cmd *ResyncIdentitySequencesCmd) resolveStorageDSN() (string, string, error) {
-	if cmd.DSN != "" && cmd.Config != "" {
+	directDSN := strings.TrimSpace(cmd.DSN)
+	if directDSN != "" && cmd.Config != "" {
 		return "", "", fmt.Errorf("--dsn and --config are mutually exclusive; pass the storage DSN directly or resolve it from a server config, not both")
 	}
 	if cmd.DSN != "" {
-		return cmd.DSN, "--dsn flag", nil
+		if directDSN == "" {
+			return "", "", fmt.Errorf("storage DSN not configured: --dsn contains only whitespace")
+		}
+		return directDSN, "--dsn flag", nil
 	}
 
 	configPath := cmd.Config
@@ -95,7 +100,13 @@ func (cmd *ResyncIdentitySequencesCmd) resolveStorageDSN() (string, string, erro
 		source = fmt.Sprintf("server config %s ($SCHEMABOT_CONFIG_FILE)", configPath)
 	}
 
-	cfg, err := api.LoadServerConfigFromFile(configPath)
+	var cfg *api.ServerConfig
+	var err error
+	if cmd.Config == "" {
+		cfg, err = api.LoadServerConfig()
+	} else {
+		cfg, err = api.LoadServerConfigFromFile(configPath)
+	}
 	if err != nil {
 		return "", "", fmt.Errorf("load %s: %w", source, err)
 	}
@@ -112,8 +123,16 @@ func (cmd *ResyncIdentitySequencesCmd) resolveStorageDSN() (string, string, erro
 	if err != nil {
 		return "", "", fmt.Errorf("resolve storage DSN from %s: %w", source, err)
 	}
+	dsn = strings.TrimSpace(dsn)
 	if dsn == "" {
-		return "", "", fmt.Errorf("storage DSN not configured in %s (set storage.dsn in the config or the STORAGE_DSN env var)", source)
+		return "", "", fmt.Errorf("storage DSN not configured (set --dsn, config storage.dsn or storage.dsn_from, STORAGE_DSN, or MYSQL_DSN)")
+	}
+	if cfg.Storage.DSN == "" && cfg.Storage.DSNFrom == nil {
+		if strings.TrimSpace(os.Getenv("STORAGE_DSN")) != "" {
+			source = "STORAGE_DSN environment variable"
+		} else if strings.TrimSpace(os.Getenv("MYSQL_DSN")) != "" {
+			source = "MYSQL_DSN environment variable"
+		}
 	}
 	return dsn, source, nil
 }
