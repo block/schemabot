@@ -268,9 +268,20 @@ func (c *LocalClient) dispatchMatchesApplyChangeSet(ctx context.Context, apply *
 // change set that apply is executing — the only representation of it that
 // outlives the dispatch which created it.
 //
-// Rows are counted regardless of task state. An apply that has already finished
-// copying one table still owns that table's change, so excluding finished work
-// would make a partly-done apply look like it covers less than it does.
+// Completed rows are excluded, because a completed task's change is already on
+// the target and so cannot appear on the other side of the comparison: the
+// differ that builds a dispatch's change set reads the target's current schema
+// and no longer emits a change that has been applied. Counting completed rows
+// would therefore make every apply that finished a table before losing its
+// tracker permanently unadoptable — and the longer such an apply ran, the more
+// certainly it would be refused, which is backwards from what the operator
+// needs. The exclusion cannot hide unapplied work: a completed row whose change
+// had not really landed would still be emitted by the differ, reappear on the
+// dispatch side alone, and fail the comparison closed.
+//
+// Only Completed is excluded. Failed, Cancelled and Reverted rows are terminal
+// too, but their DDL is not on the target, so they remain part of the change set
+// the apply admitted and must still be matched.
 //
 // shardScope restricts the reconstruction to the shard a dispatch targets, the
 // same scoping rule the conflict check applies: a sharded apply's other shards
@@ -290,6 +301,9 @@ func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope s
 			return nil, fmt.Errorf("apply carries a nil task row")
 		}
 		if t.Shard != shardScope {
+			continue
+		}
+		if state.IsState(t.State, state.Task.Completed) {
 			continue
 		}
 		if t.TableName == "" {
