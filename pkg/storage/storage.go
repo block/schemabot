@@ -158,11 +158,13 @@ type CheckStore interface {
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkCancelledApplyFailed marks stored check state as a terminal failure
-	// while retaining exact apply ownership when a completed forward task proves
-	// that a cancelled apply may have changed the target. It also accepts an
+	// owned by a cancelled apply when a completed forward task proves that apply
+	// may have changed the target. The row may be owned by this apply, an older
+	// apply, or no apply, so a cancelled apply whose claim never landed can still
+	// block the stale check the owning apply left behind. It also accepts an
 	// already-completed owned row so stale reconciliation can durably record the
-	// decision. Returns false when the task evidence is absent, ownership changed,
-	// or a newer apply exists for the target.
+	// decision. Returns false when the task evidence is absent or a newer apply
+	// exists for the target.
 	MarkCancelledApplyFailed(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.

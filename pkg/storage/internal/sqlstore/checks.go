@@ -469,9 +469,13 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 
 // MarkCancelledApplyFailed records the terminal blocked state for a cancelled
 // forward apply when completed task history proves that the target may have
-// changed. Exact ownership and the completed-task predicate keep this write
-// from overwriting a newer apply or retaining a cancellation that is safe to
-// release.
+// changed, and claims the row for that apply. Like MarkActionRequiredForApply
+// the write does not require the row to already be owned by this apply: a
+// cancelled apply whose claim never landed still has to block the stale check
+// left behind by the apply that owns the row. Rows owned by an older apply or
+// with no owner qualify; the newer-apply guard protects work that started
+// after the cancellation, and the completed-task predicate keeps a
+// cancellation that is safe to release from being retained here.
 func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -506,7 +510,7 @@ func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storag
 		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?
-		  AND apply_id = ?
+		  AND (apply_id IS NULL OR apply_id <= ?)
 		  AND NOT EXISTS (
 		    SELECT 1
 		    FROM applies newer

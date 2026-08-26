@@ -1826,6 +1826,41 @@ func TestCheckStore_MarkCancelledApplyFailedRetainsOwnership(t *testing.T) {
 	assert.Equal(t, check.ErrorMessage, retrieved.ErrorMessage)
 }
 
+// A cancelled apply's claim on stored check state can fail to land — the claim
+// write errored, or the driver died before it. The cancelled apply is still
+// the newest one for the target, so its terminal blocked state must take the
+// row from the older apply that owns it rather than leaving that apply's stale
+// state in place with nothing able to repair it.
+func TestCheckStore_MarkCancelledApplyFailedClaimsRowOwnedByOlderApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	earlier := createCheckStoreApply(t, store, "apply-earlier-failed", state.Apply.Failed)
+	createCheckStoreTask(t, store, earlier, "task-completed-before-cancel", state.Task.Completed)
+	cancelled := createCheckStoreApply(t, store, "apply-cancelled-unclaimed", state.Apply.Cancelled)
+	require.Greater(t, cancelled.ID, earlier.ID)
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "abc123",
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "testdb",
+		ApplyID: earlier.ID, HasChanges: true, Status: "completed", Conclusion: "failure",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.BlockingReason = "apply_cancelled_after_task_completed"
+	check.ErrorMessage = "reconciliation required"
+	updated, err := store.Checks().MarkCancelledApplyFailed(ctx, check, cancelled)
+	require.NoError(t, err)
+	assert.True(t, updated, "the newest apply's terminal outcome must repair a row owned by an older apply")
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, cancelled.ID, retrieved.ApplyID)
+	assert.Equal(t, "failure", retrieved.Conclusion)
+	assert.Equal(t, check.BlockingReason, retrieved.BlockingReason)
+}
+
 // Completed rollback tasks do not prove that a later cancelled forward apply
 // changed the target, so they must not prevent the safe ownership release.
 func TestCheckStore_MarkActionRequiredForApplyIgnoresCompletedRollbackTask(t *testing.T) {

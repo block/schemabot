@@ -261,12 +261,87 @@ func TestCompletedForwardTaskBeforeCancellationIgnoresRollbackAndUnrelatedHistor
 		Options: storage.MarshalApplyOptions(storage.ApplyOptions{Rollback: true}),
 	}
 	unrelated := &storage.Apply{ID: 3, Database: "other", DatabaseType: storage.DatabaseTypeMySQL, Environment: cancelledCheckEnv}
+	newer := &storage.Apply{ID: 5, Database: "target", DatabaseType: storage.DatabaseTypeMySQL, Environment: cancelledCheckEnv}
 	tasks := []*storage.Task{
 		{ApplyID: rollback.ID, State: state.Task.Completed},
 		{ApplyID: unrelated.ID, State: state.Task.Completed},
+		{ApplyID: newer.ID, State: state.Task.Completed},
 	}
 
-	assert.Nil(t, completedForwardTaskBeforeCancellation([]*storage.Apply{rollback, unrelated, cancelled}, tasks, cancelled))
+	assert.Nil(t, completedForwardTaskBeforeCancellation([]*storage.Apply{rollback, unrelated, newer, cancelled}, tasks, cancelled))
+}
+
+// A completed task under the cancelled apply itself, or under an earlier
+// forward apply for the same target, is the evidence that keeps the merge gate
+// blocked: either one means live schema may already have changed. Cancelled
+// and failed sibling tasks carry no such proof.
+func TestCompletedForwardTaskBeforeCancellationFindsForwardEvidence(t *testing.T) {
+	target := func(id int64) *storage.Apply {
+		return &storage.Apply{ID: id, Database: "target", DatabaseType: storage.DatabaseTypeMySQL, Environment: cancelledCheckEnv}
+	}
+	earlier, cancelled := target(2), target(4)
+	applies := []*storage.Apply{earlier, cancelled}
+
+	own := completedForwardTaskBeforeCancellation(applies, []*storage.Task{
+		{TaskIdentifier: "task-cancelled-sibling", ApplyID: cancelled.ID, State: state.Task.Cancelled},
+		{TaskIdentifier: "task-own-completed", ApplyID: cancelled.ID, State: state.Task.Completed},
+	}, cancelled)
+	require.NotNil(t, own)
+	assert.Equal(t, "task-own-completed", own.TaskIdentifier)
+
+	prior := completedForwardTaskBeforeCancellation(applies, []*storage.Task{
+		{TaskIdentifier: "task-earlier-completed", ApplyID: earlier.ID, State: state.Task.Completed},
+		{TaskIdentifier: "task-own-failed", ApplyID: cancelled.ID, State: state.Task.Failed},
+	}, cancelled)
+	require.NotNil(t, prior)
+	assert.Equal(t, "task-earlier-completed", prior.TaskIdentifier)
+
+	assert.Nil(t, completedForwardTaskBeforeCancellation(applies, []*storage.Task{
+		{TaskIdentifier: "task-own-cancelled", ApplyID: cancelled.ID, State: state.Task.Cancelled},
+		{TaskIdentifier: "task-earlier-failed", ApplyID: earlier.ID, State: state.Task.Failed},
+	}, cancelled))
+}
+
+// An apply's claim on stored check state is written after the apply starts, so
+// a drift block or a storage failure can leave the row owned by the previous
+// apply while the newer one runs. When that newer apply is cancelled with a
+// completed forward task behind it, its terminal blocked state must still take
+// the row: leaving it with the older apply would keep reconciliation asking
+// for a repair no pass can make.
+func TestUpdateCheckRecordForApplyResult_CancelledForwardApplyRepairsCheckOwnedByOlderApply(t *testing.T) {
+	database := "webhook_cancelled_stale_owner"
+	svc := setupE2EService(t, database)
+	earlierID, err := svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: "apply-earlier-failed",
+		Database:        database,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     cancelledCheckEnv,
+		Repository:      cancelledCheckRepo,
+		PullRequest:     cancelledCheckPR,
+		State:           state.Apply.Failed,
+		Engine:          storage.EngineSpirit,
+	})
+	require.NoError(t, err)
+	earlier, err := svc.Storage().Applies().Get(t.Context(), earlierID)
+	require.NoError(t, err)
+	require.NotNil(t, earlier)
+	createCancelledCheckTask(t, svc, earlier, "task-earlier-completed", state.Task.Completed)
+
+	apply := createCancelledCheckApply(t, svc, database, false)
+	require.Greater(t, apply.ID, earlierID)
+	storeCancelledOwnedCheck(t, svc, earlier, checkStatusCompleted, checkConclusionFailure)
+	h := NewHandler(svc, nil, nil, testLogger())
+
+	updated, err := h.updateCheckRecordForApplyResult(t.Context(), cancelledCheckRepo, cancelledCheckPR, apply)
+	require.NoError(t, err)
+	assert.True(t, updated, "the cancelled apply's terminal outcome must repair a row owned by an older apply")
+
+	check := loadCancelledCheck(t, svc, database)
+	assert.Equal(t, apply.ID, check.ApplyID)
+	assert.Equal(t, checkStatusCompleted, check.Status)
+	assert.Equal(t, checkConclusionFailure, check.Conclusion)
+	assert.Equal(t, applyCancelledAfterTaskCompletedBlock.blockingReason, check.BlockingReason)
+	assert.False(t, checkNeedsTerminalReconcile(check, apply), "the repaired row must settle instead of asking for another pass")
 }
 
 // When a cancelled apply is the only apply for a schema change removed from
