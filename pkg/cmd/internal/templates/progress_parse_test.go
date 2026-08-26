@@ -165,3 +165,75 @@ func TestParseProgressResponseCarriesTableAndShardETA(t *testing.T) {
 	assert.Equal(t, "-80", data.Tables[0].Shards[0].Shard)
 	assert.Equal(t, int64(480), data.Tables[0].Shards[0].ETASeconds)
 }
+
+// A sharded table without its own estimate takes the slowest shard's ETA, and
+// a shard reporting rows but no percent gets its percent derived from them.
+func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *testing.T) {
+	result := &apitypes.ProgressResponse{
+		State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{
+			{
+				TableName: "users",
+				Keyspace:  "testdb",
+				Status:    state.Task.Running,
+				Shards: []*apitypes.ShardProgressResponse{
+					{Shard: "-80", Status: state.Task.Running, RowsCopied: 125000, RowsTotal: 250000, ETASeconds: 480},
+					{Shard: "80-", Status: state.Task.Running, RowsCopied: 60000, RowsTotal: 240000, ETASeconds: 900},
+				},
+			},
+		},
+	}
+
+	data := ParseProgressResponse(result)
+
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, int64(900), data.Tables[0].ETASeconds)
+	require.Len(t, data.Tables[0].Shards, 2)
+	assert.Equal(t, 50, data.Tables[0].Shards[0].PercentComplete)
+	assert.Equal(t, 25, data.Tables[0].Shards[1].PercentComplete)
+}
+
+// Spirit internal tables (shadow, checkpoint, sentinel) are working artifacts
+// of the copy, not schema changes: they never reach the rendered table list.
+func TestParseProgressResponseFiltersSpiritInternalTables(t *testing.T) {
+	result := &apitypes.ProgressResponse{
+		State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{
+			{TableName: "users", Status: state.Task.Running},
+			{TableName: "_users_new", Status: state.Task.Running},
+			{TableName: "_spirit_sentinel", Status: state.Task.Running},
+		},
+	}
+
+	data := ParseProgressResponse(result)
+
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, "users", data.Tables[0].TableName)
+}
+
+// Spirit's progress string is the freshest copy signal: when it parses, the
+// structured percent and row counts follow it so every consumer renders the
+// same numbers, and raw engine statuses normalize to canonical task states.
+func TestParseProgressResponsePrefersSpiritProgressStringAndNormalizesStatus(t *testing.T) {
+	result := &apitypes.ProgressResponse{
+		State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{
+			{
+				TableName:       "users",
+				Status:          "copyRows",
+				RowsCopied:      100,
+				RowsTotal:       200,
+				PercentComplete: 50,
+				ProgressDetail:  "71436/221193 32.30% copyRows ETA TBD",
+			},
+		},
+	}
+
+	data := ParseProgressResponse(result)
+
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, state.Task.Running, data.Tables[0].Status)
+	assert.Equal(t, int64(71436), data.Tables[0].RowsCopied)
+	assert.Equal(t, int64(221193), data.Tables[0].RowsTotal)
+	assert.Equal(t, 32, data.Tables[0].PercentComplete)
+}

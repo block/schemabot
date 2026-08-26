@@ -135,10 +135,10 @@ func externalIDForTUIDeployment(ops []templates.ProgressOperation, deployment st
 	return ""
 }
 
-func tablesForDeployment(tables []tableProgress, deployment string) []tableProgress {
-	deploymentTables := make([]tableProgress, 0, len(tables))
+func tablesForDeployment(tables []templates.TableProgress, deployment string) []templates.TableProgress {
+	deploymentTables := make([]templates.TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.Name != "" {
+		if table.Deployment == deployment && table.TableName != "" {
 			deploymentTables = append(deploymentTables, table)
 		}
 	}

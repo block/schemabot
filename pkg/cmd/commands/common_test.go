@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/e2eutil"
 )
 
@@ -50,7 +51,7 @@ func TestLoadCLIConfig_RejectsDeployment(t *testing.T) {
 }
 
 func TestApplyChangeCountsSummary(t *testing.T) {
-	tables := []tableProgress{
+	tables := []templates.TableProgress{
 		{ChangeType: "CREATE"},
 		{ChangeType: "CHANGE_TYPE_CREATE"},
 		{ChangeType: "ALTER"},
@@ -64,7 +65,7 @@ func TestApplyChangeCountsSummary(t *testing.T) {
 }
 
 func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
-	tables := []tableProgress{{ChangeType: "vschema_update"}}
+	tables := []templates.TableProgress{{ChangeType: "vschema_update"}}
 
 	assert.Equal(t, "Changes: 1 VSchema update.", countTableProgressChanges(tables).summary())
 }

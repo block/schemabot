@@ -92,13 +92,13 @@ func TestWatchModel_CompletedViewShowsCompactSummary(t *testing.T) {
 	m.applyID = "apply-abc123"
 	m.state = state.Apply.Completed
 	m.initialized = true
-	m.tables = []tableProgress{
-		{Name: "users", ChangeType: "CREATE"},
-		{Name: "orders", ChangeType: "CREATE"},
-		{Name: "products", ChangeType: "CREATE"},
-		{Name: "audit_events", ChangeType: "CREATE"},
-		{Name: "legacy_orders", ChangeType: "DROP"},
-		{Name: "VSchema: commerce", ChangeType: "vschema_update"},
+	m.tables = []templates.TableProgress{
+		{TableName: "users", ChangeType: "CREATE"},
+		{TableName: "orders", ChangeType: "CREATE"},
+		{TableName: "products", ChangeType: "CREATE"},
+		{TableName: "audit_events", ChangeType: "CREATE"},
+		{TableName: "legacy_orders", ChangeType: "DROP"},
+		{TableName: "VSchema: commerce", ChangeType: "vschema_update"},
 	}
 
 	view := m.View()
@@ -137,8 +137,8 @@ func TestWatchModel_MidFlightError_PreservesLastState(t *testing.T) {
 	// First: a successful poll with running state.
 	successMsg := progressMsg{
 		state: state.Apply.Running,
-		tables: []tableProgress{
-			{Name: "users", Status: state.Apply.Running, RowsCopied: 500, RowsTotal: 1000, Percent: 50},
+		tables: []templates.TableProgress{
+			{TableName: "users", Status: state.Apply.Running, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50},
 		},
 	}
 	updated, _ := m.Update(successMsg)
@@ -187,10 +187,10 @@ func TestWatchModel_StoppedWithErrorShowsReason(t *testing.T) {
 	updated, _ := m.Update(progressMsg{
 		state:    state.Apply.Stopped,
 		errorMsg: "remote apply remote-123 remained stopped after start grace period 30s",
-		tables: []tableProgress{{
-			Name:    "users",
-			Status:  state.Task.Stopped,
-			Percent: 40,
+		tables: []templates.TableProgress{{
+			TableName:       "users",
+			Status:          state.Task.Stopped,
+			PercentComplete: 40,
 		}},
 	})
 	model := updated.(WatchModel)
@@ -207,10 +207,10 @@ func TestWatchModel_RecoveringShowsBlockedCutoverMessage(t *testing.T) {
 
 	updated, _ := m.Update(progressMsg{
 		state: state.Apply.Recovering,
-		tables: []tableProgress{{
-			Name:    "users",
-			Status:  state.Task.Recovering,
-			Percent: 100,
+		tables: []templates.TableProgress{{
+			TableName:       "users",
+			Status:          state.Task.Recovering,
+			PercentComplete: 100,
 		}},
 	})
 	model := updated.(WatchModel)
@@ -221,18 +221,50 @@ func TestWatchModel_RecoveringShowsBlockedCutoverMessage(t *testing.T) {
 	assert.NotContains(t, view, "Press Enter to proceed with cutover")
 }
 
+// A checksumming table's verify progress reaches the live watch view: the
+// fetch parse carries the checksum counters through to the shared renderer, so
+// watching an apply shows the same verify percent and rows-verified line as
+// the status view.
+func TestWatchModel_ChecksummingShowsVerifyProgress(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.applyID = "apply-checksumming"
+
+	updated, _ := m.Update(parseProgressResult(&apitypes.ProgressResponse{
+		State: state.Apply.Checksumming,
+		Tables: []*apitypes.TableProgressResponse{{
+			TableName:           "sessions",
+			DDL:                 "ALTER TABLE `sessions` ADD INDEX `idx_app` (`app_id`)",
+			ChangeType:          "ALTER",
+			Status:              state.Task.Checksumming,
+			RowsCopied:          832771089,
+			RowsTotal:           832771089,
+			PercentComplete:     100,
+			ChecksumRowsChecked: 73075845,
+			ChecksumRowsTotal:   832771089,
+			Throttled:           true,
+			ThrottleReason:      "replication lag",
+		}},
+	}))
+	model := updated.(WatchModel)
+
+	view := model.View()
+	assert.Contains(t, view, "Checksumming to verify data (8%)")
+	assert.Contains(t, view, "Rows verified: 73,075,845 / 832,771,089")
+	assert.Contains(t, view, "(throttled)")
+}
+
 func TestWatchModel_RecoveringShowsCopyingRows(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
 	m.applyID = "apply-recovering-cutover"
 
 	updated, _ := m.Update(progressMsg{
 		state: state.Apply.Recovering,
-		tables: []tableProgress{{
-			Name:       "users",
-			Status:     state.Task.Recovering,
-			RowsCopied: 420,
-			RowsTotal:  1000,
-			Percent:    42,
+		tables: []templates.TableProgress{{
+			TableName:       "users",
+			Status:          state.Task.Recovering,
+			RowsCopied:      420,
+			RowsTotal:       1000,
+			PercentComplete: 42,
 		}},
 	})
 	model := updated.(WatchModel)
@@ -252,12 +284,12 @@ func TestWatchModel_EstimateExceededUsesActivityLabel(t *testing.T) {
 	m.initialized = true
 	m.state = state.Apply.Running
 	m.activityLabelFrame = 2
-	m.tables = []tableProgress{{
-		Name:       "users",
-		Status:     state.Task.Running,
-		RowsCopied: 145000,
-		RowsTotal:  100000,
-		Percent:    145,
+	m.tables = []templates.TableProgress{{
+		TableName:       "users",
+		Status:          state.Task.Running,
+		RowsCopied:      145000,
+		RowsTotal:       100000,
+		PercentComplete: 145,
 	}}
 
 	view := m.View()
@@ -327,12 +359,12 @@ func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	m.applyID = "apply-single-test"
 	m.state = state.Apply.Running
 	m.initialized = true
-	m.tables = []tableProgress{{
-		Name:       "orders",
-		Status:     state.Task.Running,
-		RowsCopied: 420,
-		RowsTotal:  1000,
-		Percent:    42,
+	m.tables = []templates.TableProgress{{
+		TableName:       "orders",
+		Status:          state.Task.Running,
+		RowsCopied:      420,
+		RowsTotal:       1000,
+		PercentComplete: 42,
 	}}
 
 	withoutOperations := m.View()

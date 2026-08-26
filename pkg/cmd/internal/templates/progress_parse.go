@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -179,14 +180,14 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		})
 	}
 
-	for _, tbl := range result.Tables {
+	for _, tbl := range ddl.FilterInternalTablesTyped(result.Tables) {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
 			Namespace:           tbl.Keyspace,
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
-			Status:              state.NormalizeState(tbl.Status),
+			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			PercentComplete:     int(tbl.PercentComplete),
@@ -198,16 +199,33 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			IsInstant:           tbl.IsInstant,
 			ProgressDetail:      tbl.ProgressDetail,
 		}
+		// Spirit's progress string is the freshest copy signal; when it
+		// parses, prefer it over the stored copy fields so the percent, the
+		// rows line, and anything aggregated from them agree.
+		if info := ParseSpiritProgress(tp.ProgressDetail); info != nil {
+			tp.PercentComplete = info.Percent
+			tp.RowsCopied = info.RowsCopied
+			tp.RowsTotal = info.RowsTotal
+		}
 		for _, sh := range tbl.Shards {
+			pct := int(sh.PercentComplete)
+			if pct == 0 && sh.RowsTotal > 0 {
+				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
+			}
 			tp.Shards = append(tp.Shards, ShardProgress{
 				Shard:           sh.Shard,
 				Status:          state.NormalizeShardStatus(sh.Status),
 				RowsCopied:      sh.RowsCopied,
 				RowsTotal:       sh.RowsTotal,
 				ETASeconds:      sh.ETASeconds,
-				PercentComplete: int(sh.PercentComplete),
+				PercentComplete: pct,
 				CutoverAttempts: int(sh.CutoverAttempts),
 			})
+			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
+			// the slowest shard's for a sharded (Vitess) table.
+			if sh.ETASeconds > tp.ETASeconds {
+				tp.ETASeconds = sh.ETASeconds
+			}
 		}
 		data.Tables = append(data.Tables, tp)
 	}
