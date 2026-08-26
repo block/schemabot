@@ -192,9 +192,11 @@ func TestApplyAdoptsALiveApplyThatAlreadyFinishedOneTable(t *testing.T) {
 	assert.Equal(t, first.ApplyId, second.ApplyId,
 		"the dispatch must resolve into the live apply rather than starting a second one")
 
-	var applies int
+	var applies, taskRows int
 	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM tasks").Scan(&taskRows))
 	assert.Equal(t, 1, applies, "adoption must not create a second apply")
+	assert.Equal(t, 2, taskRows, "adoption must not duplicate the live apply's work")
 }
 
 // Adoption is only ever a resolution to work the operator already asked for, so
@@ -482,4 +484,48 @@ func TestApplyAdoptsALiveMultiTableApplyThatFinishedOneTable(t *testing.T) {
 	tasksAfter, err := f.stor.Tasks().GetByApplyID(t.Context(), apply.ID)
 	require.NoError(t, err)
 	assert.Len(t, tasksAfter, tableCount, "adoption must not duplicate the live apply's work")
+}
+
+// Excluding a completed table from the live side rests on the target really
+// having that change: the planner reads the target, so a table wrongly marked
+// finished is still planned, lands on the dispatch side alone, and unbalances the
+// comparison. A dispatch is then refused rather than resolved into an apply that
+// is not running the operator's change — the boundary that makes the exclusion
+// safe to make at all.
+func TestApplyRefusesAdoptionWhenACompletedTaskChangeNeverLanded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	desired := map[string]string{
+		"users":  "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+		"orders": "CREATE TABLE orders (id INT PRIMARY KEY, total INT)",
+	}
+	f := newAdoptTestFixture(t, desired)
+	_, err := f.db.ExecContext(t.Context(), "CREATE TABLE orders (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	first := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-lying-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	// `users` is marked finished, but its ALTER is deliberately never run, so the
+	// target still lacks the column and the planner still asks for it.
+	res, err := f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Completed, apply.ID, "users")
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "exactly one table's task must be marked completed")
+
+	second := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-lying-second")
+	assert.False(t, second.Accepted,
+		"a dispatch carrying work the live apply is not running must not be adopted")
+
+	var applies int
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	assert.Equal(t, 1, applies, "a refused dispatch must not create a second apply")
 }

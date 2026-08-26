@@ -160,11 +160,12 @@ func TestChangeSetReconstructionExcludesCompletedTasks(t *testing.T) {
 }
 
 // Only a completed task's change is on the target. A task that failed, was
-// cancelled, or was reverted is terminal but its DDL never landed, so it remains
-// part of the change set the apply admitted — a dispatch that omits it is asking
-// for different work and must not adopt.
+// cancelled, or was reverted is terminal but its DDL never landed, and one that
+// failed retryably is not even terminal — it is a copy the apply is still
+// carrying. All of them remain part of the change set the apply admitted, so a
+// dispatch that omits one is asking for different work and must not adopt.
 func TestChangeSetReconstructionCountsTerminalTasksWhoseChangeNeverLanded(t *testing.T) {
-	for _, taskState := range []string{state.Task.Failed, state.Task.Cancelled, state.Task.Reverted} {
+	for _, taskState := range []string{state.Task.Failed, state.Task.Cancelled, state.Task.Reverted, state.Task.FailedRetryable} {
 		t.Run(taskState, func(t *testing.T) {
 			client := newMultisetClient("testdb", storage.DatabaseTypeMySQL)
 
@@ -497,4 +498,35 @@ func TestDispatchWithNoTableChangesNeverMatchesALiveApply(t *testing.T) {
 	matched := client.dispatchMatchesApplyChangeSet(t.Context(), apply, dispatchScope{}, blockingTask{taskIdentifier: "task-live"})
 
 	assert.False(t, matched, "a dispatch carrying no table changes has no change set to prove identical")
+}
+
+// A shard-scoped dispatch does not carry a freshly diffed plan: its change set is
+// rebuilt from task rows, which list every table the apply admitted including the
+// ones already finished. Both sides must therefore count completed rows alike, so
+// the live side keeps them whenever a shard is scoped — dropping them on one side
+// only would refuse every sharded apply that finished a table.
+func TestChangeSetReconstructionKeepsCompletedTasksForAShardScopedDispatch(t *testing.T) {
+	client := newMultisetClient("testdb", storage.DatabaseTypeMySQL)
+
+	tasks := []*storage.Task{
+		alterTaskInState("task-1", "orders", "-80", "amendments", "ALTER TABLE amendments MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Completed),
+		alterTaskInState("task-2", "orders", "-80", "loans", "ALTER TABLE loans MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Running),
+	}
+
+	fromTasks, err := client.driftMultisetFromTasks(tasks, "-80")
+	require.NoError(t, err)
+	require.Len(t, fromTasks, 2, "a shard-scoped live side must still count the finished table")
+
+	// The dispatch is reconstructed from the same rows, so it lists the finished
+	// table too and the two sides agree.
+	fromScope, err := client.driftMultisetFromDispatchScope(dispatchScope{
+		shard: "-80",
+		ddlChanges: []storage.TableChange{
+			alterChange("orders", "amendments", "ALTER TABLE amendments MODIFY COLUMN customer_id bigint NOT NULL"),
+			alterChange("orders", "loans", "ALTER TABLE loans MODIFY COLUMN customer_id bigint NOT NULL"),
+		},
+	})
+	require.NoError(t, err)
+
+	assert.NoError(t, compareDriftMultisets(fromTasks, fromScope))
 }
