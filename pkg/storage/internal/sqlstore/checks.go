@@ -132,8 +132,8 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
 				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
 				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
-				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
-				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
+				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? OR COALESCE(?, '') = ? THEN error_message   ELSE ? END,
+				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? OR COALESCE(?, '') = ? THEN change_summary  ELSE ? END,
 				    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 				WHERE repository = ? AND pull_request = ?
 				  AND environment = ? AND database_type = ? AND database_name = ?
@@ -144,8 +144,8 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
-				storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason, storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason, storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
 				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 				checkStatusInProgress)
 			return err
