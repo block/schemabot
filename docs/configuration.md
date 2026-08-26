@@ -656,10 +656,12 @@ on the storage dialect:
 The rest of this section describes the MySQL flow.
 
 By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped whole (a
-mixed `ALTER TABLE` is not rewritten, so its additive clauses are skipped with
-it), while the remaining non-destructive statements still apply and startup
-proceeds. This protects
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
+`ALTER TABLE` is split: its additive clauses still execute and only the
+destructive clauses are refused, except that a clause which cannot run
+without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
+is refused with it. The remaining non-destructive statements still apply and
+startup proceeds. This protects
 against rolling deploys and rollbacks: a pod running an older binary sees a
 newer binary's tables and columns as surplus, and without the gate would drop
 them (destroying data the newer pods depend on). Each refused statement is
