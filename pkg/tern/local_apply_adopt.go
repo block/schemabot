@@ -31,6 +31,15 @@ import (
 //	                                          ├─ yes ─▶ resolve into the live apply
 //	                                          └─ no  ─▶ refuse (unchanged)
 //
+// It writes nothing to the apply it resolves into, including the dispatch's
+// idempotency key: that key is a unique column naming the apply's own creator,
+// and an adopted apply already has one. Repeatability comes from the decision
+// being a pure function of stored state instead — a retry meets the same
+// conflict, compares the same change sets, and resolves into the same apply.
+// What that leaves is a dispatch whose key resolves to nothing if the adopted
+// work finishes before the retry arrives, which then creates a fresh apply for
+// a change set no longer running, exactly as a first dispatch would.
+//
 // Returns ok=false to decline adoption, leaving the caller's refusal intact.
 func (c *LocalClient) adoptLiveApplyForDispatch(ctx context.Context, req *ternv1.ApplyRequest, plan *storage.Plan, scope dispatchScope, blocking blockingTask) (*ternv1.ApplyResponse, bool) {
 	apply, ok := c.adoptableApply(req, plan, scope, blocking)
@@ -63,6 +72,29 @@ func (c *LocalClient) adoptLiveApplyForDispatch(ctx context.Context, req *ternv1
 			append(apply.LogAttrs(), "operation_key", operationKey)...)
 		return nil, false
 	}
+	// The operation is the only row in the comparison that records a target, and
+	// two targets can share one namespace and environment. Neither the task rows
+	// the conflict check scans nor the apply row carries one, so without this the
+	// change sets of two targets under the same namespace compare as identical
+	// work. Legacy and single-target shapes leave both sides empty and match.
+	if op.Target != plan.Target {
+		c.logger.Warn("adopt: live apply's operation runs against a different target; it keeps blocking the database",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"operation_target", op.Target,
+				"dispatch_target", plan.Target)...)
+		return nil, false
+	}
+	// An operation that has finished is not running the dispatch's work even
+	// under a parent that is still live, so handing back its id would resolve the
+	// operator to a handle that never moves.
+	if state.IsApplyOperationTerminal(op.State) {
+		c.logger.Warn("adopt: live apply's operation for this dispatch has already terminalized; it keeps blocking the database",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"operation_state", op.State)...)
+		return nil, false
+	}
 
 	// The apply row was read at the start of the conflict check, and its work can
 	// settle while the change sets are compared. Re-read it before answering so a
@@ -79,9 +111,9 @@ func (c *LocalClient) adoptLiveApplyForDispatch(ctx context.Context, req *ternv1
 			apply.LogAttrs()...)
 		return nil, false
 	}
-	if state.IsTerminalApplyState(fresh.State) {
-		c.logger.Warn("adopt: live apply terminalized while its change set was being compared; it keeps blocking the database",
-			fresh.LogAttrs()...)
+	if refusal := adoptionRefusalForState(fresh.State); refusal != "" {
+		c.logger.Warn("adopt: live apply stopped being adoptable while its change set was being compared; it keeps blocking the database",
+			append(fresh.LogAttrs(), "refusal", refusal)...)
 		return nil, false
 	}
 
@@ -92,6 +124,14 @@ func (c *LocalClient) adoptLiveApplyForDispatch(ctx context.Context, req *ternv1
 			"dispatch_plan_id", plan.PlanIdentifier,
 			"dispatch_shard", scope.shard,
 			"blocking_task_id", blocking.taskIdentifier)...)
+	// Adoption hands an operator control of row copying they did not start in
+	// this dispatch, so the apply's own timeline records that it changed hands.
+	// Server logs answer this today only while they are retained, and the
+	// question an operator asks later — who is driving this apply, and since
+	// when — is one the apply itself should be able to answer.
+	c.logApplyEvent(ctx, fresh.ID, nil, "info", "apply_adopted", "schemabot",
+		fmt.Sprintf("dispatch from plan %s resolved into this apply, which is already running its change set", plan.PlanIdentifier),
+		"", "")
 	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "adopted")
 	return dispatchApplyResponse(fresh, op.ID, operationKey), true
 }
@@ -109,17 +149,15 @@ func (c *LocalClient) adoptableApply(req *ternv1.ApplyRequest, plan *storage.Pla
 	// fail-closed shape: without the apply there is nothing to prove adoptable.
 	if blocking.apply == nil {
 		c.logger.Warn("adopt: blocking task's apply could not be loaded; the task keeps blocking the database",
-			"task_id", blocking.taskIdentifier, "database", plan.Database)
+			"task_id", blocking.taskIdentifier, "database", plan.Database,
+			"dispatch_database_type", plan.DatabaseType, "dispatch_environment", req.Environment)
 		return nil, false
 	}
 	apply := blocking.apply
 
-	// A terminal apply is not running anything to rejoin. Its work may still be
-	// alive on the target, but the control plane has stopped driving it, so
-	// resolving a dispatch into it would hand back a handle that never moves.
-	if state.IsTerminalApplyState(apply.State) {
-		c.logger.Warn("adopt: blocking apply is terminal, so there is no live work to resolve into; it keeps blocking the database",
-			apply.LogAttrs()...)
+	if refusal := adoptionRefusalForState(apply.State); refusal != "" {
+		c.logger.Warn("adopt: blocking apply's state is not one a dispatch can resolve into; it keeps blocking the database",
+			append(apply.LogAttrs(), "refusal", refusal)...)
 		return nil, false
 	}
 
@@ -143,6 +181,36 @@ func (c *LocalClient) adoptableApply(req *ternv1.ApplyRequest, plan *storage.Pla
 		return nil, false
 	}
 	return apply, true
+}
+
+// adoptionRefusalForState names why an apply's state disqualifies it from being
+// adopted, or "" when the state is one a dispatch may resolve into.
+//
+// It fails closed on a state this build does not recognize. Every other gate in
+// this file refuses what it cannot prove, and liveness cannot be proved of a
+// string the state registry has never seen — a newer writer's state, or a
+// hand-edited row — so an unrecognized state is one adoption has no argument
+// for rather than one it reads as live work.
+//
+// A terminal apply is not running anything to rejoin. Its work may still be
+// alive on the target, but the control plane has stopped driving it, so
+// resolving a dispatch into it would hand back a handle that never moves.
+//
+// Reverting states are excluded for the opposite reason: they are recognized
+// and live, but they are running the change backwards. Resolving a forward
+// dispatch into one would report the operator's schema change as under way
+// while the system is actively removing it.
+func adoptionRefusalForState(s string) string {
+	info, known := state.LookupApply(state.NormalizeState(s))
+	switch {
+	case !known:
+		return "the state is not one this build recognizes, so the apply cannot be proved to be running live work"
+	case info.Terminal:
+		return "the control plane has stopped driving the apply, so there is no live work to resolve into"
+	case state.IsState(s, state.Apply.Reverting, state.Apply.SkippingRevert):
+		return "the apply is undoing its change rather than making it"
+	}
+	return ""
 }
 
 // dispatchMatchesApplyChangeSet reports whether the dispatch would admit
@@ -181,12 +249,14 @@ func (c *LocalClient) dispatchMatchesApplyChangeSet(ctx context.Context, apply *
 			append(apply.LogAttrs(), "error", err)...)
 		return false
 	}
-	if err := compareDriftMultisets(owned, dispatched); err != nil {
+	onlyDispatched, onlyLive := diffDriftMultisets(owned, dispatched)
+	if len(onlyDispatched) > 0 || len(onlyLive) > 0 {
 		c.logger.Info("adopt: dispatch is a different change set than the live apply is running; it keeps blocking the database",
 			append(apply.LogAttrs(),
 				"blocking_task_id", blocking.taskIdentifier,
 				"dispatch_shard", scope.shard,
-				"difference", err.Error())...)
+				"only_in_dispatch", onlyDispatched,
+				"only_in_live_apply", onlyLive)...)
 		return false
 	}
 	return true

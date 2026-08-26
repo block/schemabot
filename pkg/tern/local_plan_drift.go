@@ -195,25 +195,36 @@ func canonicalDDLForDrift(raw string) (string, error) {
 	return ddl.Canonicalize(raw), nil
 }
 
-// compareDriftMultisets reports drift unless the recomputed and dispatched table
-// DDL multisets are exactly equal.
-func compareDriftMultisets(recomputed, dispatched driftChangeMultiset) error {
-	var missing, unexpected []string
+// diffDriftMultisets returns the changes each side of a comparison holds that
+// the other does not, rendered and sorted for a message. Both are empty exactly
+// when the two multisets are equal.
+//
+// The set arithmetic is shared, the vocabulary is not: what a difference means
+// depends on what is being compared, and a caller comparing two dispatches has
+// no "reviewed" side to name. Callers phrase their own message from these.
+func diffDriftMultisets(recomputed, dispatched driftChangeMultiset) (onlyInDispatched, onlyInRecomputed []string) {
 	for key, want := range dispatched {
 		if recomputed[key] < want {
-			missing = append(missing, formatDriftKey(key))
+			onlyInDispatched = append(onlyInDispatched, formatDriftKey(key))
 		}
 	}
 	for key, have := range recomputed {
 		if have > dispatched[key] {
-			unexpected = append(unexpected, formatDriftKey(key))
+			onlyInRecomputed = append(onlyInRecomputed, formatDriftKey(key))
 		}
 	}
+	sort.Strings(onlyInDispatched)
+	sort.Strings(onlyInRecomputed)
+	return onlyInDispatched, onlyInRecomputed
+}
+
+// compareDriftMultisets reports drift unless the recomputed and dispatched table
+// DDL multisets are exactly equal.
+func compareDriftMultisets(recomputed, dispatched driftChangeMultiset) error {
+	missing, unexpected := diffDriftMultisets(recomputed, dispatched)
 	if len(missing) == 0 && len(unexpected) == 0 {
 		return nil
 	}
-	sort.Strings(missing)
-	sort.Strings(unexpected)
 	return fmt.Errorf("reviewed changes this deployment would not plan: %v; changes this deployment would plan that were not reviewed: %v", missing, unexpected)
 }
 

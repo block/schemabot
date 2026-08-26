@@ -191,3 +191,136 @@ func TestApplyRefusesToAdoptATerminalApply(t *testing.T) {
 	assert.False(t, resp.Accepted, "a terminal apply has no live work to adopt")
 	assert.Contains(t, resp.ErrorMessage, "schema change already in progress")
 }
+
+// An apply that is reverting is live, but it is running the change backwards.
+// Resolving a forward dispatch into it would report the operator's schema
+// change as under way while the system is actively removing it, so the refusal
+// stands and names the apply the operator has to deal with first.
+func TestApplyRefusesToAdoptAnApplyThatIsUndoingItsChange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	first := f.dispatch(t, "schemabot:v1:adopt-reverting-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	_, err = f.db.ExecContext(t.Context(), "UPDATE applies SET state = ? WHERE id = ?", state.Apply.Reverting, apply.ID)
+	require.NoError(t, err)
+
+	resp := f.dispatch(t, "schemabot:v1:adopt-reverting-second")
+	assert.False(t, resp.Accepted, "an apply undoing its change is not forward work a dispatch can rejoin")
+	assert.Contains(t, resp.ErrorMessage, "schema change already in progress")
+}
+
+// Two targets can share one namespace and environment, and the operation is the
+// only row in the comparison that records which one an apply runs against. A
+// dispatch for a different target therefore stays refused even though its
+// change set is identical — adopting it would report a schema change as under
+// way on a target nothing is applying it to.
+func TestApplyRefusesToAdoptAnOperationRunningAgainstADifferentTarget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	first := f.dispatch(t, "schemabot:v1:adopt-target-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	res, err := f.db.ExecContext(t.Context(),
+		"UPDATE apply_operations SET target = ? WHERE apply_id = ?", "another-target", apply.ID)
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Positive(t, affected, "the live apply must have an operation whose target can differ")
+
+	resp := f.dispatch(t, "schemabot:v1:adopt-target-second")
+	assert.False(t, resp.Accepted, "work running against another target is not the dispatch's own")
+	assert.Contains(t, resp.ErrorMessage, "schema change already in progress")
+}
+
+// An operation that has finished is not running the dispatch's work even under
+// a parent apply that is still live, so its id is never handed back: it would
+// resolve the operator to a handle that never moves again.
+func TestApplyRefusesToAdoptAnOperationThatHasAlreadyTerminalized(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	first := f.dispatch(t, "schemabot:v1:adopt-op-terminal-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	_, err = f.db.ExecContext(t.Context(),
+		"UPDATE apply_operations SET state = ? WHERE apply_id = ?", state.Apply.Completed, apply.ID)
+	require.NoError(t, err)
+	_, err = f.db.ExecContext(t.Context(),
+		"UPDATE applies SET state = ? WHERE id = ?", state.Apply.Running, apply.ID)
+	require.NoError(t, err)
+
+	resp := f.dispatch(t, "schemabot:v1:adopt-op-terminal-second")
+	assert.False(t, resp.Accepted, "a finished operation is not live work to resolve into")
+	assert.Contains(t, resp.ErrorMessage, "schema change already in progress")
+}
+
+// Adoption writes nothing to the apply it resolves into, so its repeatability
+// comes from the decision being a pure function of stored state rather than
+// from a recorded idempotency key. A dispatcher that retries under a fresh key
+// after losing its answer therefore lands on the same apply and the same
+// operation instead of starting a second copy of work already running. The
+// apply's own timeline records that it changed hands, so who is driving it and
+// since when survives the retention of any server log.
+func TestAdoptingTheSameLiveApplyIsRepeatableAndRecordedOnItsTimeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	first := f.dispatch(t, "schemabot:v1:adopt-repeat-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	for _, key := range []string{"schemabot:v1:adopt-repeat-retry-1", "schemabot:v1:adopt-repeat-retry-2"} {
+		retry := f.dispatch(t, key)
+		require.True(t, retry.Accepted, "every retry of the running change set must be adopted: %s", retry.ErrorMessage)
+		assert.Equal(t, first.ApplyId, retry.ApplyId, "each retry must resolve into the same live apply")
+		assert.Equal(t, first.ApplyOperationId, retry.ApplyOperationId, "each retry must address the same operation")
+	}
+
+	var applies, tasks int
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM tasks").Scan(&tasks))
+	assert.Equal(t, 1, applies, "repeated adoption must not create a second apply")
+	assert.Equal(t, 1, tasks, "repeated adoption must not duplicate the live apply's work")
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	logs, err := f.stor.ApplyLogs().GetByApply(t.Context(), apply.ID)
+	require.NoError(t, err)
+	var adoptions int
+	for _, l := range logs {
+		if l.EventType == "apply_adopted" {
+			adoptions++
+			assert.Contains(t, l.Message, "already running its change set",
+				"the timeline entry must say what the dispatch resolved into")
+		}
+	}
+	assert.Equal(t, 2, adoptions, "each adoption must leave its own entry on the apply's timeline")
+}
