@@ -573,6 +573,30 @@ func TestStaticResolverResolveTargetDSNFromPostgres(t *testing.T) {
 	}, got.Metadata)
 }
 
+// The assembled CA reference is authoritative: a configured metadata entry
+// under the same key cannot redirect trust to a different bundle, so target
+// metadata is not a path around the transport policy.
+func TestStaticResolverDSNFromPostgresAssembledCARefWins(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"orders.cluster-abc.us-east-1.rds.amazonaws.com","port":5432,"dbname":"orders"}`)
+	t.Setenv("TARGET_PASSWORD", "s3cret")
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"orders-prod": {
+			DatabaseType: "postgres",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "pgsprite_engine",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+			Metadata: map[string]string{MetadataPostgresCARef: "file:/tmp/attacker-ca.pem"},
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod"})
+	require.NoError(t, err)
+	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, got.Metadata[MetadataPostgresCARef])
+}
+
 // The port defaults to 5432 and the sslmode to verify-full when the config
 // document and params omit them, so a minimal postgres entry still assembles a
 // verified-TLS DSN.

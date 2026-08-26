@@ -330,7 +330,8 @@ func TestDecodePlanetScaleSecretRejectsBadInput(t *testing.T) {
 // unlike MySQL, where the request supplies the schema per operation — with
 // verify-full TLS and the resolved CA reference in metadata.
 func TestPostgresConnectionAssemblerBuildsLibpqURL(t *testing.T) {
-	a := PostgresConnectionAssembler{DefaultPort: "5432", Metadata: map[string]string{"extra": "field"}}
+	configured := map[string]string{"extra": "field"}
+	a := PostgresConnectionAssembler{DefaultPort: "5432", Metadata: configured}
 
 	dsn, meta, err := a.Assemble(
 		"orders.cluster-abc.us-east-1.rds.amazonaws.com",
@@ -343,6 +344,66 @@ func TestPostgresConnectionAssemblerBuildsLibpqURL(t *testing.T) {
 		"extra":               "field",
 		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
 	}, meta)
+	// The assembler is a shared value type: the caller's map must not gain the
+	// resolved CA reference.
+	assert.Equal(t, map[string]string{"extra": "field"}, configured)
+}
+
+// DNS names are case-insensitive: an uppercase RDS endpoint resolves the same
+// embedded-bundle default instead of failing as a non-RDS host.
+func TestPostgresConnectionAssemblerRDSHostCaseInsensitive(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+
+	_, meta, err := a.Assemble(
+		"ORDERS.CLUSTER-ABC.US-EAST-1.RDS.AMAZONAWS.COM",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, meta[MetadataPostgresCARef])
+}
+
+// A comma in the host would smuggle a multi-host libpq DSN through single-host
+// validation: pgx dials the hosts in order while the RDS check matches the end
+// of the whole string, so the TLS policy could be decided by a host that is
+// never dialed. Rejected regardless of ordering.
+func TestPostgresConnectionAssemblerRejectsMultiHost(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+	dbname := map[string]string{PostgresDBNameAttribute: "orders"}
+
+	for _, host := range []string{
+		"attacker.example,db.example.rds.amazonaws.com",
+		"db.example.rds.amazonaws.com,attacker.example",
+	} {
+		_, _, err := a.Assemble(host, dbname, creds)
+		require.Error(t, err, "host %q must be rejected", host)
+		assert.Contains(t, err.Error(), "single host")
+	}
+}
+
+// A database name containing "/" is the one character net/url would pass
+// through unescaped — it would add path segments instead of naming a database
+// — so it is rejected, as is a whitespace-only name.
+func TestPostgresConnectionAssemblerRejectsMalformedDBName(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+
+	_, _, err := a.Assemble(
+		"db.example.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "orders/evil"},
+		creds,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `must not contain "/"`)
+
+	_, _, err = a.Assemble(
+		"db.example.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "   "},
+		creds,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `requires the "dbname" endpoint attribute`)
 }
 
 // Credentials and database names are escaped through net/url, so characters

@@ -449,9 +449,11 @@ keyword/value string (`postgres://user:pass@host:5432/schemabot`) for
 `postgres`. Both dialects support the same secret reference formats (`env:`,
 `file:`, `secretsmanager:`). When `storage.dsn` is unset, the DSN is read
 from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
-legacy name that is honored regardless of dialect. `dsn_from` assembles a
-MySQL-format DSN and is only supported with the `mysql` dialect; combining it
-with `postgres` fails config validation. See
+legacy name that is honored regardless of dialect. `storage.dsn_from` assembles
+a MySQL-format DSN and is only supported with the `mysql` storage dialect;
+combining it with `postgres` fails config validation. (This restriction is
+specific to the storage database — `dsn_from` on a `target_resolver` target
+supports both `mysql` and `postgres`.) See
 [Storage Schema Changes](#storage-schema-changes) for how schema
 bootstrapping differs between the two dialects.
 

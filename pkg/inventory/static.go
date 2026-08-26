@@ -23,8 +23,12 @@ type StaticConfig struct {
 type StaticTarget struct {
 	DatabaseType string `yaml:"type"`
 	// DSN is a full connection string or secret reference. It is resolved once,
-	// when the resolver is constructed, and cached. Mutually exclusive with
-	// DSNFrom.
+	// when the resolver is constructed, and cached. A PostgreSQL DSN is passed
+	// through as written: the dsn_from transport gate (the sslmode allowlist
+	// and CA resolution) does not apply, so an explicit weaker sslmode —
+	// including disable — is honored. It is the deliberate escape hatch for
+	// dev and compatibility setups; production PostgreSQL targets should use
+	// DSNFrom. Mutually exclusive with DSNFrom.
 	DSN string `yaml:"dsn,omitempty"`
 	// DSNFrom assembles a DSN from separate config and password secret
 	// references: a namespace-free MySQL DSN, or a PostgreSQL libpq URL carrying
@@ -324,9 +328,11 @@ func validateResolvedStaticTargetDSN(target, databaseType, dsn string) error {
 // DSN, including the engine-specific ones: the PostgreSQL-only fields are
 // rejected on other engines rather than silently ignored, and the PostgreSQL
 // TLS configuration is checked here so a misconfiguration surfaces at
-// construction, not on the first routed request. The password is not read here
-// — it is resolved per request so a rotated credential is picked up without a
-// restart.
+// construction, not on the first routed request. The assembler enforces the
+// same TLS rules again per request; that copy is the only gate for inventory
+// sources that construct the assembler directly, so neither check is
+// redundant. The password is not read here — it is resolved per request so a
+// rotated credential is picked up without a restart.
 func (c *StaticDSNFromConfig) validate(target, databaseType string) error {
 	if c.ConfigRef == "" {
 		return fmt.Errorf("target %q dsn_from missing config_ref", target)
@@ -368,14 +374,16 @@ func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databas
 	if err != nil {
 		return "", nil, err
 	}
-	creds, err := SecretRefCredentialResolver{Username: c.Username, PasswordRef: c.PasswordRef}.ResolveCredentials(ctx, req, nil)
+	if databaseType == "postgres" {
+		return c.assemblePostgres(ctx, document, req)
+	}
+	// The database name in the document, if any, is ignored: static MySQL
+	// target DSNs are namespace-free, the request supplies the schema.
+	host, port, err := c.endpoint(document, req.Target, "3306")
 	if err != nil {
 		return "", nil, err
 	}
-	if databaseType == "postgres" {
-		return c.assemblePostgres(document, creds, req.Target)
-	}
-	host, port, err := c.endpoint(document, req.Target, "3306")
+	creds, err := c.resolveCredentials(ctx, req)
 	if err != nil {
 		return "", nil, err
 	}
@@ -391,7 +399,8 @@ func (c *StaticDSNFromConfig) assemble(ctx context.Context, req Request, databas
 // host, port, and database name. The database name is required: a PostgreSQL
 // connection is made to one database, and assembling a DSN without one would
 // fail closed only at dial time with a confusing server-side error.
-func (c *StaticDSNFromConfig) assemblePostgres(document map[string]any, creds *Credentials, target string) (string, map[string]string, error) {
+func (c *StaticDSNFromConfig) assemblePostgres(ctx context.Context, document map[string]any, req Request) (string, map[string]string, error) {
+	target := req.Target
 	host, port, err := c.endpoint(document, target, "5432")
 	if err != nil {
 		return "", nil, err
@@ -404,12 +413,24 @@ func (c *StaticDSNFromConfig) assemblePostgres(document map[string]any, creds *C
 	if err != nil {
 		return "", nil, fmt.Errorf("read dbname for target %q: %w", target, err)
 	}
+	creds, err := c.resolveCredentials(ctx, req)
+	if err != nil {
+		return "", nil, err
+	}
 	assembler := PostgresConnectionAssembler{DefaultPort: port, Params: c.Params, CARef: c.CARef}
 	dsn, metadata, err := assembler.Assemble(host, map[string]string{PostgresDBNameAttribute: dbname}, creds)
 	if err != nil {
 		return "", nil, fmt.Errorf("assemble DSN for target %q: %w", target, err)
 	}
 	return dsn, metadata, nil
+}
+
+// resolveCredentials resolves the entry's username and per-request password.
+// It runs after the config document's connection fields are read so a
+// malformed document fails before it costs a password secret read, and with
+// the endpoint error rather than a later credential one.
+func (c *StaticDSNFromConfig) resolveCredentials(ctx context.Context, req Request) (*Credentials, error) {
+	return SecretRefCredentialResolver{Username: c.Username, PasswordRef: c.PasswordRef}.ResolveCredentials(ctx, req, nil)
 }
 
 // resolveConfigDocument resolves the config reference and parses it as a JSON

@@ -8,6 +8,7 @@ package postgresconn
 
 import (
 	"context"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -49,8 +50,11 @@ func WithConnectTimeout(d time.Duration) Option {
 }
 
 // Open returns a PostgreSQL connection pool with SchemaBot's required
-// transport settings applied (see ConnectionDSN). Options customize the
-// parsed config (for example WithConnectTimeout) before the pool is opened.
+// transport settings applied (see ConnectionDSN). A DSN that requests
+// certificate verification against an RDS host without naming a root bundle
+// (sslmode=verify-full, no sslrootcert) verifies against the embedded RDS
+// global CA bundle. Options customize the parsed config (for example
+// WithConnectTimeout) before the pool is opened.
 func Open(dsn string, opts ...Option) (*sql.DB, error) {
 	cfg, err := connectionConfig(dsn, opts...)
 	if err != nil {
@@ -326,11 +330,39 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if !hasRuntimeParam(cfg.RuntimeParams, "timezone") {
 		cfg.RuntimeParams["timezone"] = "UTC"
 	}
+	// A verifying TLS config (sslmode=verify-full) against an RDS host with no
+	// explicit sslrootcert would fall back to the ambient system trust store,
+	// which does not carry the private Amazon RDS roots — every handshake would
+	// fail with an unknown-authority error. Verify against the embedded RDS
+	// global bundle instead, matching the root pool pg-sprite's data-plane
+	// pools use, so both layers trust the same roots. sslmode=require is left
+	// untouched: pgx marks it InsecureSkipVerify (encrypted, unauthenticated),
+	// and injecting roots there would not change what it proves.
+	if tc := cfg.TLSConfig; tc != nil && !tc.InsecureSkipVerify && tc.RootCAs == nil && dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
+		roots, err := rdsRootPool()
+		if err != nil {
+			return nil, err
+		}
+		tc.RootCAs = roots
+	}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	return cfg, nil
 }
+
+// rdsRootPool returns the certificate pool holding the embedded AWS RDS global
+// CA bundle. RDS server certificates chain to private Amazon roots that no
+// system trust store carries, so verifying an RDS connection requires this
+// pool explicitly. The pool is built once and shared: it is read-only after
+// construction.
+var rdsRootPool = sync.OnceValues(func() (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(dbconn.GetEmbeddedRDSBundle()) {
+		return nil, fmt.Errorf("embedded RDS global CA bundle contains no usable certificates")
+	}
+	return pool, nil
+})
 
 // hasRuntimeParam reports whether params carries key under PostgreSQL's
 // case-insensitive GUC name matching, so TimeZone and timezone are the same
@@ -358,7 +390,9 @@ func ConnectionDSN(dsn string) (string, error) {
 	if err != nil {
 		return "", dsnParseError(err)
 	}
-	if !dbconn.IsRDSHost(cfg.Host) {
+	// DNS names are case-insensitive, so an uppercase RDS endpoint must get
+	// the same injection.
+	if !dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
 		return dsn, nil
 	}
 	if isURLForm(dsn) {

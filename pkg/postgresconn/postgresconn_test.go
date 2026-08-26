@@ -106,6 +106,41 @@ func TestConnectionDSN(t *testing.T) {
 	}
 }
 
+// A verifying DSN (sslmode=verify-full) against an RDS host names no root
+// bundle of its own, so the connection verifies against the embedded RDS
+// global CA bundle — the ambient system trust store does not carry the
+// private Amazon RDS roots and would fail every handshake.
+func TestConnectionConfigVerifiesRDSHostsWithEmbeddedRoots(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	assert.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	// DNS names are case-insensitive: an uppercase RDS endpoint gets the same
+	// roots.
+	cfg, err = connectionConfig("postgres://schemabot:secret@DB.EXAMPLE.RDS.AMAZONAWS.COM:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	// sslmode=require encrypts without authenticating (pgx marks it
+	// InsecureSkipVerify); the RDS roots would prove nothing, so the config is
+	// left untouched.
+	cfg, err = connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=require")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.True(t, cfg.TLSConfig.InsecureSkipVerify)
+	assert.Nil(t, cfg.TLSConfig.RootCAs)
+
+	// The embedded bundle holds RDS roots only: a non-RDS host gets no
+	// implicit trust material.
+	cfg, err = connectionConfig("postgres://schemabot:secret@db.internal.example:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Nil(t, cfg.TLSConfig.RootCAs)
+}
+
 func TestWithConnectTimeout(t *testing.T) {
 	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))
 	require.NoError(t, err)

@@ -136,19 +136,25 @@ const postgresSSLModeVerifyFull = "verify-full"
 
 // PostgresConnectionAssembler assembles a PostgreSQL Target: one libpq URL
 // carrying the database name, built with net/url so every component is escaped
-// — never by string concatenation — plus the CA reference in Metadata.
+// — never by string concatenation — plus the CA reference in Metadata. A
+// database name containing "/" (the one character URL path encoding leaves
+// unescaped) is rejected rather than escaped.
 //
 // Transport is fail-closed: the DSN always carries sslmode=verify-full (the
-// only allowlisted value), and the CA the data plane verifies against is
-// always explicit — the embedded RDS bundle by default for RDS endpoints, a
-// mounted file by configuration, and an error for a non-RDS endpoint with no
-// configured CA. The ambient system trust store is never used.
+// only allowlisted value), and the CA reference in Metadata is always explicit
+// — the embedded RDS bundle by default for RDS endpoints, a mounted file by
+// configuration, and an error for a non-RDS endpoint with no configured CA.
+// The data plane does not read the reference yet: the connection layer
+// verifies RDS endpoints against its own embedded RDS bundle, and a file:
+// reference fails the TLS handshake rather than falling back to the ambient
+// trust store, until the engine adapter consumes it in a follow-up.
 type PostgresConnectionAssembler struct {
 	// DefaultPort is appended to the host when it has no port.
 	DefaultPort string
 	// Params are extra libpq URL parameters. Only "sslmode" is accepted, and
-	// only with the value "verify-full"; TLS trust material is configured via
-	// CARef, never via raw libpq parameters.
+	// only with the value "verify-full" — the mode every assembled DSN carries
+	// regardless, so the field is validate-only; TLS trust material is
+	// configured via CARef, never via raw libpq parameters.
 	Params map[string]string
 	// CARef selects the CA bundle the data plane verifies the server against:
 	// PostgresCARefEmbeddedRDSGlobal or "file:<absolute-path>". Empty defaults
@@ -178,10 +184,23 @@ func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]stri
 	if creds.Username == "" {
 		return "", nil, fmt.Errorf("postgres connection requires a username")
 	}
-	dbname := attrs[PostgresDBNameAttribute]
+	// A comma would smuggle a multi-host libpq DSN through single-host
+	// validation: pgx dials the hosts in order while the RDS check below
+	// matches the end of the whole string, so the TLS policy could be decided
+	// by a host that is dialed last or never.
+	if strings.Contains(host, ",") {
+		return "", nil, fmt.Errorf("postgres connection requires a single host, got %q", host)
+	}
+	dbname := strings.TrimSpace(attrs[PostgresDBNameAttribute])
 	if dbname == "" {
 		return "", nil, fmt.Errorf("postgres connection requires the %q endpoint attribute", PostgresDBNameAttribute)
 	}
+	if strings.Contains(dbname, "/") {
+		return "", nil, fmt.Errorf("postgres database name must not contain \"/\", got %q", dbname)
+	}
+	// Params are validated on every call, not only at config load: Assemble is
+	// the only gate for inventory sources that construct the assembler
+	// directly.
 	if err := validatePostgresDSNParams(a.Params); err != nil {
 		return "", nil, err
 	}
@@ -192,13 +211,9 @@ func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]stri
 	if err != nil {
 		return "", nil, err
 	}
-	query := url.Values{}
-	for key, value := range a.Params {
-		query.Set(key, value)
-	}
-	if !query.Has("sslmode") {
-		query.Set("sslmode", postgresSSLModeVerifyFull)
-	}
+	// The allowlist admits exactly the default, so the query is fixed; Params
+	// exist to be validated, never to vary the assembled DSN.
+	query := url.Values{"sslmode": {postgresSSLModeVerifyFull}}
 	u := url.URL{
 		Scheme:   "postgresql",
 		User:     url.UserPassword(creds.Username, creds.Password),
@@ -225,7 +240,9 @@ func (a PostgresConnectionAssembler) resolveCARef(host string) (string, error) {
 		}
 		return a.CARef, nil
 	}
-	if dbconn.IsRDSHost(host) {
+	// DNS names are case-insensitive, so an uppercase RDS endpoint gets the
+	// same default rather than a misleading not-an-RDS-endpoint error.
+	if dbconn.IsRDSHost(strings.ToLower(host)) {
 		return PostgresCARefEmbeddedRDSGlobal, nil
 	}
 	return "", fmt.Errorf("a verified CA is required: host %q is not an RDS endpoint and no ca_ref is configured", host)
