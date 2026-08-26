@@ -268,9 +268,34 @@ func (c *LocalClient) dispatchMatchesApplyChangeSet(ctx context.Context, apply *
 // change set that apply is executing — the only representation of it that
 // outlives the dispatch which created it.
 //
-// Rows are counted regardless of task state. An apply that has already finished
-// copying one table still owns that table's change, so excluding finished work
-// would make a partly-done apply look like it covers less than it does.
+// A completed task's change is already on the target, so whether its row belongs
+// in this multiset depends on how the other side of the comparison was built.
+//
+// A non-sharded dispatch carries a stored plan, diffed against the target at
+// plan time. A plan created after a table completed does not list that table, so
+// counting the completed row would leave the live side permanently larger than
+// any dispatch: every apply that finished a table before losing its tracker
+// would be unadoptable, and the longer it ran the more certainly it would be
+// refused, which is backwards from what the operator needs. Completed rows are
+// therefore dropped. Replaying a plan created *before* the table completed is
+// deliberately refused instead — that plan still lists the finished table, so
+// the dispatch is asking for work this apply is no longer doing.
+//
+// A sharded dispatch's change set is reconstructed from task rows rather than
+// diffed, and carries completed rows itself, so both sides must count them
+// alike. Completed rows are kept whenever a shard is scoped.
+//
+// Dropping them cannot hide unapplied work: a completed row whose change had not
+// really landed is still emitted by the planner, so it reappears on the dispatch
+// side alone and fails the comparison closed.
+//
+// Only Completed is dropped. Failed, Cancelled and Reverted rows are terminal
+// too, but their DDL is not on the target, so they remain part of the change set
+// the apply admitted and must still be matched. Revert-phase rows are also kept,
+// even though a post-cutover change is on the target: no engine produces an
+// apply whose rows mix a revert-phase row with unfinished ones, since the
+// grouped drive writes one state to every task, so the case does not arise. If
+// one ever does, such a row needs the same treatment as Completed.
 //
 // shardScope restricts the reconstruction to the shard a dispatch targets, the
 // same scoping rule the conflict check applies: a sharded apply's other shards
@@ -284,12 +309,19 @@ func (c *LocalClient) dispatchMatchesApplyChangeSet(ctx context.Context, apply *
 // statement — so an apply whose change set cannot be reconstructed is never
 // mistaken for one that matches.
 func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope string) (driftChangeMultiset, error) {
+	// Only a plan-derived dispatch side omits finished tables; a shard-scoped one
+	// is rebuilt from task rows and still lists them.
+	dispatchIsPlanDerived := shardScope == ""
+
 	ms := driftChangeMultiset{}
 	for _, t := range tasks {
 		if t == nil {
 			return nil, fmt.Errorf("apply carries a nil task row")
 		}
 		if t.Shard != shardScope {
+			continue
+		}
+		if dispatchIsPlanDerived && state.IsState(t.State, state.Task.Completed) {
 			continue
 		}
 		if t.TableName == "" {

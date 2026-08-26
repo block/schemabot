@@ -4,6 +4,7 @@ package tern
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
@@ -75,8 +76,15 @@ func newAdoptTestFixture(t *testing.T, desired map[string]string) *adoptTestFixt
 // call is a distinct dispatch identity rather than an idempotent replay.
 func (f *adoptTestFixture) dispatch(t *testing.T, key string) *ternv1.ApplyResponse {
 	t.Helper()
+	return f.dispatchPlan(t, f.planID, key)
+}
+
+// dispatchPlan applies a named plan, for tests that re-plan after the target
+// changes rather than reusing the plan the fixture was built with.
+func (f *adoptTestFixture) dispatchPlan(t *testing.T, planID, key string) *ternv1.ApplyResponse {
+	t.Helper()
 	resp, err := f.client.Apply(t.Context(), &ternv1.ApplyRequest{
-		PlanId:         f.planID,
+		PlanId:         planID,
 		Environment:    localClientTestEnvironment,
 		Database:       "testdb",
 		Type:           storage.DatabaseTypeMySQL,
@@ -84,6 +92,22 @@ func (f *adoptTestFixture) dispatch(t *testing.T, key string) *ternv1.ApplyRespo
 	})
 	require.NoError(t, err)
 	return resp
+}
+
+// planFor stores a plan for the target as it stands now, so a test can re-plan
+// against a target that changed since the fixture was built.
+func (f *adoptTestFixture) planFor(t *testing.T, desired map[string]string) string {
+	t.Helper()
+	resp, err := f.client.Plan(t.Context(), &ternv1.PlanRequest{
+		Type:     storage.DatabaseTypeMySQL,
+		Database: "testdb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"testdb": {Files: buildSchemaWithAllTables(t, f.dsn, desired)},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.PlanId)
+	return resp.PlanId
 }
 
 // A row copy can outlive the apply identity that started it: the work keeps
@@ -119,6 +143,60 @@ func TestApplyAdoptsTheLiveApplyRunningTheSameChangeSet(t *testing.T) {
 	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM tasks").Scan(&tasks))
 	assert.Equal(t, 1, applies, "adoption must not create a second apply")
 	assert.Equal(t, 1, tasks, "adoption must not duplicate the live apply's work")
+}
+
+// A batch can finish one table and then lose its tracker with the rest still
+// running. Re-planning no longer emits the finished table — its change is
+// already on the target — so the dispatch carries a strictly smaller change set
+// than the live apply owns. It is still the same work: what the operator is
+// asking for is exactly what is still in flight, so the dispatch resolves into
+// the live apply rather than being refused on behalf of a table that is done.
+func TestApplyAdoptsALiveApplyThatAlreadyFinishedOneTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	desired := map[string]string{
+		"users":  "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+		"orders": "CREATE TABLE orders (id INT PRIMARY KEY, total INT)",
+	}
+	f := newAdoptTestFixture(t, desired)
+	_, err := f.db.ExecContext(t.Context(), "CREATE TABLE orders (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	first := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-partial-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	tasks, err := f.stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2, "the live apply must own both tables' changes")
+
+	// `users` finishes: its change lands on the target, and its task completes.
+	// The other table's copy is still in flight and still holds the database.
+	_, err = f.db.ExecContext(t.Context(), "ALTER TABLE users ADD COLUMN email VARCHAR(255)")
+	require.NoError(t, err)
+	res, err := f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Completed, apply.ID, "users")
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "exactly one table's task must be completed")
+
+	// Re-planned against the target as it now stands, only `orders` still differs.
+	second := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-partial-second")
+	require.True(t, second.Accepted,
+		"a dispatch for the work still in flight must be adopted: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId,
+		"the dispatch must resolve into the live apply rather than starting a second one")
+
+	var applies, taskRows int
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM tasks").Scan(&taskRows))
+	assert.Equal(t, 1, applies, "adoption must not create a second apply")
+	assert.Equal(t, 2, taskRows, "adoption must not duplicate the live apply's work")
 }
 
 // Adoption is only ever a resolution to work the operator already asked for, so
@@ -323,4 +401,131 @@ func TestAdoptingTheSameLiveApplyIsRepeatableAndRecordedOnItsTimeline(t *testing
 		}
 	}
 	assert.Equal(t, 2, adoptions, "each adoption must leave its own entry on the apply's timeline")
+}
+
+// A batch at realistic size: ten tables having a column widened, one of which
+// finished before the apply lost its tracker. The operator's re-plan carries
+// nine changes against a live apply that owns ten, and the change is a column
+// type modification rather than an addition — the two sides of the comparison
+// render it from different sources, so the DDL each produces must still agree
+// once canonicalized. A live task carrying stale error text from a failure it
+// already recovered from must not perturb the match either.
+func TestApplyAdoptsALiveMultiTableApplyThatFinishedOneTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	const tableCount = 10
+	desired := make(map[string]string, tableCount)
+	names := make([]string, 0, tableCount)
+	for i := range tableCount {
+		name := fmt.Sprintf("widgets_%02d", i+1)
+		names = append(names, name)
+		_, err := f.db.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY, owner_id BIGINT)", name))
+		require.NoError(t, err)
+		desired[name] = fmt.Sprintf(
+			"CREATE TABLE %s (id INT PRIMARY KEY, owner_id BIGINT NOT NULL)", name)
+	}
+
+	first := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-batch-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	tasks, err := f.stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, tableCount, "the live apply must own every table's change")
+
+	// The first table finishes: its change lands on the target and its task
+	// completes. The rest are still in flight and still hold the database.
+	finished := names[0]
+	_, err = f.db.ExecContext(t.Context(),
+		fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN owner_id BIGINT NOT NULL", finished))
+	require.NoError(t, err)
+	res, err := f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Completed, apply.ID, finished)
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "exactly one table's task must be completed")
+
+	// A copy that recovered from a transient failure keeps running while still
+	// carrying the error text of the failure it survived.
+	res, err = f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ?, error_message = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Running, "schema change failed: failed to execute chunklet insert",
+		apply.ID, names[1])
+	require.NoError(t, err)
+	affected, err = res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "one table's copy must be running with stale error text")
+
+	// Re-planned against the target as it now stands, only the nine unfinished
+	// tables still differ.
+	secondPlan := f.planFor(t, desired)
+	second := f.dispatchPlan(t, secondPlan, "schemabot:v1:adopt-batch-second")
+	require.True(t, second.Accepted,
+		"a dispatch for the work still in flight must be adopted: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId,
+		"the dispatch must resolve into the live apply rather than starting a second one")
+	assert.Equal(t, first.ApplyOperationId, second.ApplyOperationId,
+		"the adopted dispatch must address the live apply's own operation")
+
+	var applies int
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	assert.Equal(t, 1, applies, "adoption must not create a second apply")
+
+	tasksAfter, err := f.stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, tasksAfter, tableCount, "adoption must not duplicate the live apply's work")
+}
+
+// Excluding a completed table from the live side rests on the target really
+// having that change: the planner reads the target, so a table wrongly marked
+// finished is still planned, lands on the dispatch side alone, and unbalances the
+// comparison. A dispatch is then refused rather than resolved into an apply that
+// is not running the operator's change — the boundary that makes the exclusion
+// safe to make at all.
+func TestApplyRefusesAdoptionWhenACompletedTaskChangeNeverLanded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	desired := map[string]string{
+		"users":  "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+		"orders": "CREATE TABLE orders (id INT PRIMARY KEY, total INT)",
+	}
+	f := newAdoptTestFixture(t, desired)
+	_, err := f.db.ExecContext(t.Context(), "CREATE TABLE orders (id INT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	first := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-lying-first")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+
+	// `users` is marked finished, but its ALTER is deliberately never run, so the
+	// target still lacks the column and the planner still asks for it.
+	res, err := f.db.ExecContext(t.Context(),
+		"UPDATE tasks SET state = ? WHERE apply_id = ? AND table_name = ?",
+		state.Task.Completed, apply.ID, "users")
+	require.NoError(t, err)
+	affected, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), affected, "exactly one table's task must be marked completed")
+
+	second := f.dispatchPlan(t, f.planFor(t, desired), "schemabot:v1:adopt-lying-second")
+	assert.False(t, second.Accepted,
+		"a dispatch carrying work the live apply is not running must not be adopted")
+
+	var applies int
+	require.NoError(t, f.db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM applies").Scan(&applies))
+	assert.Equal(t, 1, applies, "a refused dispatch must not create a second apply")
 }

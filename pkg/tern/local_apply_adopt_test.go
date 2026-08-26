@@ -31,6 +31,12 @@ func alterTask(identifier, namespace, shard, table, ddl string) *storage.Task {
 	}
 }
 
+func alterTaskInState(identifier, namespace, shard, table, ddl, taskState string) *storage.Task {
+	task := alterTask(identifier, namespace, shard, table, ddl)
+	task.State = taskState
+	return task
+}
+
 func alterChange(namespace, table, ddl string) storage.TableChange {
 	return storage.TableChange{
 		Namespace: namespace,
@@ -124,6 +130,80 @@ func TestChangeSetReconstructionDetectsPartialOverlap(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Error(t, compareDriftMultisets(fromTasks, fromScope))
+}
+
+// An apply that finished copying one table before it lost its tracker is still
+// adoptable. The finished table's change is already on the target, so the differ
+// no longer emits it and no dispatch can carry it; counting it would refuse the
+// operator on behalf of work that is done, and would do so more certainly the
+// longer the apply had run.
+func TestChangeSetReconstructionExcludesCompletedTasks(t *testing.T) {
+	client := newMultisetClient("testdb", storage.DatabaseTypeMySQL)
+
+	fromTasks, err := client.driftMultisetFromTasks([]*storage.Task{
+		alterTaskInState("task-1", "", "", "amendments", "ALTER TABLE amendments MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Completed),
+		alterTaskInState("task-2", "", "", "balance_accounts", "ALTER TABLE balance_accounts MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Running),
+		alterTaskInState("task-3", "", "", "loans", "ALTER TABLE loans MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Pending),
+	}, "")
+	require.NoError(t, err)
+	require.Len(t, fromTasks, 2, "the completed table is not part of the work left to match")
+
+	fromScope, err := client.driftMultisetFromDispatchScope(dispatchScope{
+		ddlChanges: []storage.TableChange{
+			alterChange("testdb", "balance_accounts", "ALTER TABLE balance_accounts MODIFY COLUMN customer_id bigint NOT NULL"),
+			alterChange("testdb", "loans", "ALTER TABLE loans MODIFY COLUMN customer_id bigint NOT NULL"),
+		},
+	})
+	require.NoError(t, err)
+
+	assert.NoError(t, compareDriftMultisets(fromTasks, fromScope))
+}
+
+// Only a completed task's change is on the target. A task that failed, was
+// cancelled, or was reverted is terminal but its DDL never landed, and one that
+// failed retryably is not even terminal — it is a copy the apply is still
+// carrying. All of them remain part of the change set the apply admitted, so a
+// dispatch that omits one is asking for different work and must not adopt.
+func TestChangeSetReconstructionCountsTerminalTasksWhoseChangeNeverLanded(t *testing.T) {
+	for _, taskState := range []string{state.Task.Failed, state.Task.Cancelled, state.Task.Reverted, state.Task.FailedRetryable} {
+		t.Run(taskState, func(t *testing.T) {
+			client := newMultisetClient("testdb", storage.DatabaseTypeMySQL)
+
+			fromTasks, err := client.driftMultisetFromTasks([]*storage.Task{
+				alterTaskInState("task-1", "", "", "users", "ALTER TABLE users ADD COLUMN email VARCHAR(255)", taskState),
+				alterTaskInState("task-2", "", "", "orders", "ALTER TABLE orders ADD COLUMN total INT", state.Task.Running),
+			}, "")
+			require.NoError(t, err)
+			require.Len(t, fromTasks, 2, "a terminal task whose DDL never landed is still the apply's work")
+
+			fromScope, err := client.driftMultisetFromDispatchScope(dispatchScope{
+				ddlChanges: []storage.TableChange{
+					alterChange("testdb", "orders", "ALTER TABLE orders ADD COLUMN total INT"),
+				},
+			})
+			require.NoError(t, err)
+
+			assert.Error(t, compareDriftMultisets(fromTasks, fromScope))
+		})
+	}
+}
+
+// Completed rows are skipped before they are keyed, so an old apply whose
+// finished work carries DDL this build can no longer canonicalize is still
+// adoptable for the work that remains. This cannot undercount live work: only
+// completed rows take the early exit, and every row still in flight is keyed
+// under the same fail-closed rules as before.
+func TestChangeSetReconstructionSkipsCompletedTasksBeforeKeyingThem(t *testing.T) {
+	client := newMultisetClient("testdb", storage.DatabaseTypeMySQL)
+
+	unkeyable := alterTaskInState("task-1", "", "", "", "", state.Task.Completed)
+	fromTasks, err := client.driftMultisetFromTasks([]*storage.Task{
+		unkeyable,
+		alterTaskInState("task-2", "", "", "orders", "ALTER TABLE orders ADD COLUMN total INT", state.Task.Running),
+	}, "")
+
+	require.NoError(t, err)
+	assert.Len(t, fromTasks, 1)
 }
 
 // A sharded apply is dispatched one shard at a time, so a shard-scoped dispatch
@@ -418,4 +498,35 @@ func TestDispatchWithNoTableChangesNeverMatchesALiveApply(t *testing.T) {
 	matched := client.dispatchMatchesApplyChangeSet(t.Context(), apply, dispatchScope{}, blockingTask{taskIdentifier: "task-live"})
 
 	assert.False(t, matched, "a dispatch carrying no table changes has no change set to prove identical")
+}
+
+// A shard-scoped dispatch does not carry a freshly diffed plan: its change set is
+// rebuilt from task rows, which list every table the apply admitted including the
+// ones already finished. Both sides must therefore count completed rows alike, so
+// the live side keeps them whenever a shard is scoped — dropping them on one side
+// only would refuse every sharded apply that finished a table.
+func TestChangeSetReconstructionKeepsCompletedTasksForAShardScopedDispatch(t *testing.T) {
+	client := newMultisetClient("testdb", storage.DatabaseTypeMySQL)
+
+	tasks := []*storage.Task{
+		alterTaskInState("task-1", "orders", "-80", "amendments", "ALTER TABLE amendments MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Completed),
+		alterTaskInState("task-2", "orders", "-80", "loans", "ALTER TABLE loans MODIFY COLUMN customer_id bigint NOT NULL", state.Task.Running),
+	}
+
+	fromTasks, err := client.driftMultisetFromTasks(tasks, "-80")
+	require.NoError(t, err)
+	require.Len(t, fromTasks, 2, "a shard-scoped live side must still count the finished table")
+
+	// The dispatch is reconstructed from the same rows, so it lists the finished
+	// table too and the two sides agree.
+	fromScope, err := client.driftMultisetFromDispatchScope(dispatchScope{
+		shard: "-80",
+		ddlChanges: []storage.TableChange{
+			alterChange("orders", "amendments", "ALTER TABLE amendments MODIFY COLUMN customer_id bigint NOT NULL"),
+			alterChange("orders", "loans", "ALTER TABLE loans MODIFY COLUMN customer_id bigint NOT NULL"),
+		},
+	})
+	require.NoError(t, err)
+
+	assert.NoError(t, compareDriftMultisets(fromTasks, fromScope))
 }
