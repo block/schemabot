@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/checksum"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
@@ -1543,6 +1544,35 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateFailed, finalState, "expected StateFailed for invalid SQL")
+}
+
+// A UNIQUE index over duplicate values fails checksum consistently, so the
+// engine reports the runner failure as permanent instead of retrying it.
+func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE checksum_duplicates (
+		id INT NOT NULL AUTO_INCREMENT,
+		duplicate_value INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create checksum_duplicates table")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `checksum_duplicates` (`duplicate_value`) VALUES (1), (1)")
+	require.NoError(t, err, "insert duplicate values")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	eng := New(Config{Logger: discardLogger()})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	err = eng.executeSpiritMigration(ctx, host, username, password, database,
+		"ALTER TABLE `checksum_duplicates` ADD UNIQUE KEY `uq_duplicate_value` (`duplicate_value`)", false)
+
+	require.Error(t, err)
+	assert.False(t, engine.IsRetryable(err))
+	assert.ErrorIs(t, err, checksum.ErrDifferencesExhausted)
 }
 
 // TestEngine_Progress_FailingApplyNeverReportsCompleted verifies that a
