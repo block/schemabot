@@ -1051,9 +1051,20 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		c.controlSendGate.clear(controlReq.ID)
 		return true, nil
 	}
+	storedTasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return true, fmt.Errorf("load tasks to sync remote gRPC cancel for %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := c.syncStoredTasksFromRemoteTasks(ctx, apply, storedTasks, progress.Tables, now); err != nil {
+		return true, err
+	}
 	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC cancel"); err != nil {
 		return true, fmt.Errorf("sync nonterminal remote gRPC cancel state for %s: %w", apply.ApplyIdentifier, err)
 	}
+	logger.InfoContext(ctx, "remote gRPC cancel request accepted and remains pending for remote apply owner",
+		append(apply.MutableLogAttrs(),
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", remoteState)...)
 	return false, nil
 }
 

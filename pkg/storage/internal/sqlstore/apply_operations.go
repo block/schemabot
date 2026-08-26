@@ -854,10 +854,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
+	// A stopped operation is reclaimable for start and for cancel, but the two
+	// arms are separate because only one of them terminates itself. The start
+	// claim always resolves — it either moves the row to resuming or the parent
+	// claim fails the request — so it needs no rematch guard. The cancel claim
+	// leaves the row stopped when the parent apply refuses to be claimed (a
+	// stopped apply is terminal), so it carries the rematch guard to keep an
+	// undeliverable cancel from re-claiming a driver on every poll.
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
-		storage.ControlOperationStart, storage.ControlOperationCancel,
-		storage.ControlRequestPending)
+		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.Stopped,
+		storage.ControlOperationCancel, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -877,9 +886,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// neither carries a deployment-order gate, because both rows already ran —
 	// resuming them is recovering work they started, not starting a new deployment.
 	//
-	//   - A stopped operation whose parent apply has a pending start or cancel
-	//     request is reclaimable — for start so the operator can resume it, for
-	//     cancel so the drive can terminalize it.
+	//   - A stopped operation whose parent apply has a pending start request is
+	//     reclaimable so the operator can resume it, and one whose parent has a
+	//     pending cancel request is reclaimable so the drive can terminalize it.
+	//     The cancel arm carries the rematch guard because its claim can leave
+	//     the row stopped; see requestRematchGuardSQL.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -918,6 +929,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// requests resume eligible work; they do not reorder the rollout.
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+	// The two guarded arms differ in the equal-timestamp case for the same reason
+	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
+	// out of stopped atomically with its lease rotation, so no peer can match it
+	// in the same second and it can admit an equal timestamp; the
+	// waiting_for_deploy claim leaves the row where it is and must refuse one.
+	// See leaseRematchComparison.
+	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
+	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1011,8 +1030,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					SELECT 1
 					FROM apply_control_requests cr
 					WHERE cr.apply_id = apply_operations.apply_id
-						AND cr.operation IN (?, ?)
+						AND cr.operation = ?
 						AND cr.status = ?
+				)
+			)
+			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+						AND `+stoppedCancelGuard+`
 				)
 			)
 			OR (
@@ -1029,11 +1059,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					WHERE cr.apply_id = apply_operations.apply_id
 						AND cr.operation = ?
 						AND cr.status = ?
-						AND (
-							apply_operations.lease_acquired_at IS NULL
-							OR apply_operations.lease_acquired_at < cr.updated_at
-							OR apply_operations.updated_at < %s
-						)
+						AND `+deferredDeployGuard+`
 				)
 			)
 			OR (
@@ -1059,7 +1085,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -577,15 +577,28 @@ type ApplyStore interface {
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
 	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
-	// driver (pending with child rows, stale active state, retryable within
-	// budget, a pending start control request, or stopped with a pending
-	// cancel control request). On a
-	// successful claim it rotates the lease (owner, token, acquired_at) and
-	// refreshes the heartbeat so operator-owned writes can fail closed after
-	// ownership changes. Returns the claimed apply, or nil if the apply does not
-	// exist or is not currently claimable (e.g. another driver holds a fresh
-	// lease or the apply is terminal). Used by the operation-level claim loop to
-	// acquire the parent apply lease after claiming an apply_operations row.
+	// driver: pending with child rows, stale active state, retryable within
+	// budget, a pending start control request, or stopped with a pending cancel
+	// control request. On a successful claim it rotates the lease (owner, token,
+	// acquired_at) and refreshes the heartbeat so operator-owned writes can fail
+	// closed after ownership changes.
+	//
+	// Terminal state is not by itself a refusal: stopped is terminal, and a
+	// stopped apply is claimable both for a pending start (to resume it) and for
+	// a pending cancel (to terminalize it). Every other terminal state is
+	// refused. A claim for cancel leaves the apply stopped and rotates only the
+	// lease, so it is admitted at most once per request until the lease goes
+	// stale.
+	//
+	// Claiming a stopped apply settles a conflicting request as a side effect: a
+	// claim for cancel fails any pending start request on the same apply, so the
+	// cancel wins rather than racing a resume.
+	//
+	// Returns the claimed apply, or nil if the apply does not exist or is not
+	// currently claimable — another driver holds a fresh lease, the apply is
+	// terminal without a request that admits it, or the target's exclusion lock
+	// is held elsewhere. Used by the operation-level claim loop to acquire the
+	// parent apply lease after claiming an apply_operations row.
 	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
 
 	// FindNextApplyForStopReconciliation atomically claims one apply eligible for

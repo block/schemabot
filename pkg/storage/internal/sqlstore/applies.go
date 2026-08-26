@@ -1536,19 +1536,23 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	// transaction, so either proves the create committed fully; a VSchema-only
 	// apply carries an operation row but no tasks, so tasks alone would strand it.
 	//
-	// The stopped + pending cancel clause claims the apply so the drive can
-	// deliver the cancel. The claim rotates only the lease and leaves the state
-	// stopped (see persistApplyClaim), so the clause carries the lease-staleness
-	// rematch guard: without it, a cancel the drive could not finish this claim
-	// (e.g. the remote side has not settled yet) would be re-claimed on every
-	// poll. A lease acquired after the request blocks rematching until the
-	// request is re-issued (cr.updated_at moves past lease_acquired_at) or the
-	// lease goes stale. The comparison admits equal timestamps: some dialects
-	// store these columns no finer than one second, so a cancel issued close
-	// enough to the last lease rotation to share its stored timestamp (an
-	// operator stopping then immediately cancelling) must still claim now
-	// rather than wait out the staleness window; the claim's own lease
-	// rotation bounds any equal-timestamp rematch to that one tick.
+	// The deferred-deploy start clause and the stopped + pending cancel clause
+	// both carry the rematch guard, because neither claim moves the apply out of
+	// the state it matched on: the deferred deploy stays waiting_for_deploy until
+	// the drive advances it, and the cancel claim rotates only the lease and
+	// leaves the state stopped (see persistApplyClaim). Without the guard, a
+	// request the drive cannot finish on this claim would be re-claimed on every
+	// poll.
+	//
+	// They differ in the equal-timestamp case, and the difference is load-bearing
+	// (see leaseRematchComparison). The deferred deploy has no downstream
+	// exclusive claim — its operation row also stays waiting_for_deploy — so it
+	// must refuse the equal case or a same-second peer steals the lease. The
+	// cancel claim is reachable only after the operation-level claim moved that
+	// row stopped → resuming, which is what excludes peers, so it can admit the
+	// equal case and deliver a stop-then-cancel without a staleness-window wait.
+	deferredDeployGuard := requestRematchGuardSQL("a", rematchOnlyAfterLease, staleClaimCutoff)
+	stoppedCancelGuard := requestRematchGuardSQL("a", rematchAtOrAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1582,11 +1586,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						SELECT 1
 						FROM apply_control_requests cr
 						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
-						AND (
-							a.lease_acquired_at IS NULL
-							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < %s
-						)
+						AND `+deferredDeployGuard+`
 					)
 				)
 				OR (
@@ -1595,17 +1595,13 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						SELECT 1
 						FROM apply_control_requests cr
 						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
-						AND (
-							a.lease_acquired_at IS NULL
-							OR a.lease_acquired_at <= cr.updated_at
-							OR a.updated_at < %s
-						)
+						AND `+stoppedCancelGuard+`
 					)
 				)
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff, staleClaimCutoff), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1890,7 +1886,7 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
 	if state.IsState(apply.State, state.Apply.Stopped) {
-		cancelPending, err := hasPendingCancelControlRequestTx(ctx, tx, apply.ID)
+		cancelPending, err := hasPendingControlRequestTx(ctx, tx, apply.ID, storage.ControlOperationCancel)
 		if err != nil {
 			return claimLostRace, err
 		}
@@ -1927,7 +1923,24 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
 // re-check and the commit. The lock is released only after the commit.
+//
+// It first asserts in-transaction that the durable start request the claim
+// predicate matched on is still pending, so a stopped apply can never reach
+// resuming without an operator's request behind it. Under READ COMMITTED the
+// request can be settled between the claim SELECT and this read — by the cancel
+// routing above, or by another driver that already resumed the apply — and
+// backing off then is the correct outcome, not an error.
 func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+	startPending, err := hasPendingControlRequestTx(ctx, tx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return claimLostRace, err
+	}
+	if !startPending {
+		slog.WarnContext(ctx, "operator: refusing to resume a stopped apply whose start request is no longer pending; another writer settled it after the claim selected this row",
+			append(apply.LogAttrs(), "lease_owner", owner)...)
+		return claimLostRace, nil
+	}
+
 	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
 	if err != nil {
 		return claimLostRace, err
@@ -1990,22 +2003,22 @@ func claimStoppedApplyForCancel(ctx context.Context, tx *rebindTx, apply *storag
 	return claimAcquired, nil
 }
 
-// hasPendingCancelControlRequestTx reports whether a pending cancel control
-// request exists for the apply, read inside the claim transaction so the
-// claim's stopped-state routing (cancel delivery vs start resume) and the
-// lease rotation commit atomically.
-func hasPendingCancelControlRequestTx(ctx context.Context, tx *rebindTx, applyID int64) (bool, error) {
+// hasPendingControlRequestTx reports whether a pending control request for
+// operation exists on the apply, read inside the claim transaction so the
+// claim's stopped-state routing (cancel delivery vs start resume) and the lease
+// rotation commit atomically.
+func hasPendingControlRequestTx(ctx context.Context, tx *rebindTx, applyID int64, operation storage.ControlOperation) (bool, error) {
 	var exists int
 	err := tx.QueryRowContext(ctx, `
 		SELECT 1 FROM apply_control_requests
 		WHERE apply_id = ? AND operation = ? AND status = ?
 		LIMIT 1
-	`, applyID, storage.ControlOperationCancel, storage.ControlRequestPending).Scan(&exists)
+	`, applyID, operation, storage.ControlRequestPending).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check pending cancel control request for apply %d: %w", applyID, err)
+		return false, fmt.Errorf("check pending %s control request for apply %d: %w", operation, applyID, err)
 	}
 	return true, nil
 }

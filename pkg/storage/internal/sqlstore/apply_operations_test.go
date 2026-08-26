@@ -1488,6 +1488,85 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsStoppedWithPendingCanc
 	assert.Equal(t, state.ApplyOperation.Resuming, persisted.State, "claim transitions the stopped operation to resuming so a peer cannot re-claim it mid-drive")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_StoppedCancelRematchIsGated
+// verifies that a cancel the drive could not deliver does not occupy a driver on
+// every poll. When the parent apply refuses the claim, the operation row is
+// mirrored back to stopped with the cancel still pending — the exact shape the
+// stopped+cancel clause matches on. The rematch guard holds it off until the
+// operator re-issues the cancel or the row's own heartbeat goes stale, so a
+// handful of undeliverable cancels cannot starve the driver pool.
+func TestApplyOperationStore_FindNextApplyOperation_StoppedCancelRematchIsGated(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_cancel_rematch", 1, state.Apply.Stopped, "staging")
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Stopped,
+	})
+	require.NoError(t, err)
+
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationCancel)
+	// Age the request so the claim's lease rotation lands strictly after it.
+	// These columns are second-precision on MySQL, and this arm deliberately
+	// admits an equal timestamp so a stop-then-cancel is delivered promptly — so
+	// without the gap the mirrored-back row would share the request's stored
+	// second and be admitted for a reason unrelated to the churn under test.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET updated_at = NOW() - INTERVAL 5 SECOND
+		WHERE apply_id = ? AND operation = ?
+	`, apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the first delivery attempt must be admitted")
+	require.Equal(t, id, claimed.ID)
+
+	// The parent apply is stopped, so it refuses the claim and the operation row
+	// is mirrored back to stopped from the parent's state, keeping the lease the
+	// claim rotated onto it.
+	mirrorBackToStopped := func() {
+		_, execErr := testDB.ExecContext(ctx, `
+			UPDATE apply_operations SET state = ?, updated_at = NOW() WHERE id = ?
+		`, state.ApplyOperation.Stopped, id)
+		require.NoError(t, execErr)
+	}
+	mirrorBackToStopped()
+
+	rematch, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, rematch, "an undeliverable cancel must not re-claim a driver on the next poll")
+
+	// Re-issuing the cancel moves the request past the lease, which is how an
+	// operator asks for another delivery attempt.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_control_requests SET updated_at = NOW() + INTERVAL 1 SECOND
+		WHERE apply_id = ? AND operation = ?
+	`, apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+
+	reRequested, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, reRequested, "a re-issued cancel must be admitted again")
+	require.Equal(t, id, reRequested.ID)
+
+	// A row whose own heartbeat has gone stale is admitted without a re-request,
+	// so a cancel is retried once per staleness window rather than abandoned.
+	mirrorBackToStopped()
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	stale, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, stale, "a stale stopped row with a pending cancel must be retried")
+	assert.Equal(t, id, stale.ID)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaimsStoppedWithPendingStart
 // pins the exclusivity of resuming a stopped operation: when several drivers
 // race to claim the same stopped operation that has a pending start request,

@@ -3130,12 +3130,12 @@ func TestApplyStore_ClaimApplyByIDSkipsFailedStoppedStartUntilRerequested(t *tes
 // stopped apply carrying a pending cancel control request is claimable so a
 // drive can deliver the cancel. The claim rotates only the lease: the apply
 // keeps its stopped state (the drive, not the claim, terminalizes it) and the
-// cancel request stays pending for the drive to consume. A lease acquired
-// after the request blocks rematching, so a cancel the drive could not finish
-// is retried on lease staleness, not on every poll — but a request whose
-// stored timestamp equals the lease's (some dialects store them no finer than
-// one second) still claims, so a stop-then-cancel operator never waits out
-// the staleness window.
+// cancel request stays pending for the drive to consume. A lease acquired after
+// the request blocks rematching, so a cancel the drive could not finish is
+// retried on lease staleness, not on every poll — but a request whose stored
+// timestamp equals the lease's (these columns are second-precision on MySQL)
+// still claims, so an operator who stops then immediately cancels does not wait
+// out the staleness window.
 func TestApplyStore_ClaimApplyByIDClaimsStoppedWithPendingCancel(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3265,7 +3265,11 @@ func TestApplyStore_ClaimStoppedCancelWinsOverPendingStart(t *testing.T) {
 // TestApplyStore_ClaimStoppedCancelAllowedWhileTargetActive verifies that a
 // newer active apply on the same target does not block cancelling an older
 // stopped apply: the cancel claim performs no active-target re-check because
-// delivering a cancel cannot add active work to the target. This is the shape
+// delivering a cancel cannot add active work to the target at the apply level —
+// the apply stays stopped, so the one-active-apply-per-target invariant the
+// re-check protects cannot be violated. (The operation row does move to
+// resuming so the drive can terminalize it; that is not an apply the
+// active-target check counts.) This is the shape
 // an operator hits when a stopped apply must be discarded so its retry — often
 // already running on the same database — can proceed cleanly.
 func TestApplyStore_ClaimStoppedCancelAllowedWhileTargetActive(t *testing.T) {
