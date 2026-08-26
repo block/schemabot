@@ -16,7 +16,6 @@ import (
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/postgresconn"
 )
 
 const (
@@ -206,11 +205,11 @@ func classifyRefusal(err error, table string) *refusal {
 }
 
 func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply) error {
-	dsn, err := postgresconn.ConnectionDSN(conn.dsn)
+	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
-		return fmt.Errorf("normalize PostgreSQL DSN for apply: %w", err)
+		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
 	}
-	pool, err := dbconn.NewPool(ctx, dbconn.Config{URL: dsn, CACertPath: conn.caCertPath})
+	pool, err := dbconn.NewPool(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("open pg-sprite apply pool: %w", err)
 	}

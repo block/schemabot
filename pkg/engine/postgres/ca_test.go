@@ -20,11 +20,13 @@ import (
 
 // TestCACertPath pins the CA-reference contract: an absent reference and the
 // embedded RDS bundle both rely on the automatic RDS trust (no path), a file
-// reference resolves to the named bundle, and anything else is refused so an
-// unrecognized CA can never silently downgrade verification.
+// reference resolves to the named bundle only when the DSN verifies the
+// server certificate, and anything else is refused so an unrecognized or
+// unenforceable CA can never silently downgrade verification.
 func TestCACertPath(t *testing.T) {
 	tests := []struct {
 		name     string
+		dsn      string
 		metadata map[string]string
 		want     string
 		wantErr  string
@@ -35,9 +37,34 @@ func TestCACertPath(t *testing.T) {
 			metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal},
 		},
 		{
-			name:     "file reference resolves to its path",
+			name:     "file reference with a verify-full DSN resolves to its path",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=verify-full",
 			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
 			want:     "/etc/ssl/rds.pem",
+		},
+		{
+			name:     "file reference with a verify-ca DSN resolves to its path",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=verify-ca",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			want:     "/etc/ssl/rds.pem",
+		},
+		{
+			name:     "file reference with sslmode=require is refused",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=require",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			wantErr:  "would never be consulted",
+		},
+		{
+			name:     "file reference with sslmode=prefer is refused",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=prefer",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			wantErr:  "would never be consulted",
+		},
+		{
+			name:     "file reference with sslmode=disable is refused",
+			dsn:      "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=disable",
+			metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"},
+			wantErr:  "would never be consulted",
 		},
 		{
 			name:     "file reference with no path is refused",
@@ -57,7 +84,7 @@ func TestCACertPath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := caCertPath(&engine.Credentials{Metadata: tt.metadata})
+			got, err := caCertPath(&engine.Credentials{DSN: tt.dsn, Metadata: tt.metadata})
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -67,6 +94,40 @@ func TestCACertPath(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestSpritePoolConfig pins the trust wiring the plan and apply dial sites
+// share: a file reference's bundle path rides into the pg-sprite pool
+// configuration alongside the normalized DSN, and the embedded RDS reference
+// leaves the path empty so pg-sprite's own RDS auto-trust applies.
+func TestSpritePoolConfig(t *testing.T) {
+	dsn := "postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full"
+
+	t.Run("file reference carries its bundle path into the pool config", func(t *testing.T) {
+		creds := &engine.Credentials{DSN: dsn, Metadata: map[string]string{metadataCARef: "file:/etc/ssl/rds.pem"}}
+		caPath, err := caCertPath(creds)
+		require.NoError(t, err)
+		cfg, err := spritePoolConfig(creds.DSN, caPath)
+		require.NoError(t, err)
+		assert.Equal(t, "/etc/ssl/rds.pem", cfg.CACertPath)
+		assert.Equal(t, dsn, cfg.URL)
+	})
+
+	t.Run("embedded reference leaves the pool config path empty", func(t *testing.T) {
+		creds := &engine.Credentials{DSN: dsn, Metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal}}
+		caPath, err := caCertPath(creds)
+		require.NoError(t, err)
+		cfg, err := spritePoolConfig(creds.DSN, caPath)
+		require.NoError(t, err)
+		assert.Empty(t, cfg.CACertPath)
+		assert.Equal(t, dsn, cfg.URL)
+	})
+
+	t.Run("unparseable DSN is refused", func(t *testing.T) {
+		_, err := spritePoolConfig("postgres://schemabot@:not-a-port/app", "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "normalize PostgreSQL DSN for pg-sprite pool")
+	})
 }
 
 // A bundle the validation connection cannot trust is refused before any dial:
@@ -148,7 +209,7 @@ func TestApplyRefusesUnreadableCABundleAtAcceptance(t *testing.T) {
 			}},
 		}},
 		Credentials: &engine.Credentials{
-			DSN:      "postgres://localhost/app",
+			DSN:      "postgres://localhost/app?sslmode=verify-full",
 			Metadata: map[string]string{metadataCARef: "file:" + filepath.Join(t.TempDir(), "absent.pem")},
 		},
 	})

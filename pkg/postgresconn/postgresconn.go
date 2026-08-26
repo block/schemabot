@@ -54,13 +54,22 @@ func WithConnectTimeout(d time.Duration) Option {
 // RDS default would otherwise install. The caller parses the bundle, so a
 // missing or malformed bundle fails closed where it is resolved rather than
 // inside a later dial. A DSN that does not negotiate TLS carries no trust to
-// pin, so the option leaves it untouched.
+// pin, so the option leaves it untouched. Pinning also removes pgx's
+// parse-time fallbacks (a plaintext retry under sslmode=prefer, a weaker TLS
+// retry under allow): a fallback would bypass the pinned bundle entirely, so
+// the connection either verifies against it or fails. The pin only takes
+// effect when the DSN verifies the server certificate (sslmode=verify-full or
+// verify-ca): require and prefer negotiate TLS without verification, so roots
+// pinned onto those modes are never consulted, just as a disable DSN
+// negotiates no TLS at all. Callers that must enforce the pin should gate on
+// VerifiesServerCertificate and refuse the other modes.
 func WithRootCAs(roots *x509.CertPool) Option {
 	return func(cfg *pgx.ConnConfig) {
 		if cfg.TLSConfig == nil {
 			return
 		}
 		cfg.TLSConfig.RootCAs = roots
+		cfg.Fallbacks = nil
 	}
 }
 
@@ -378,6 +387,27 @@ var rdsRootPool = sync.OnceValues(func() (*x509.CertPool, error) {
 	}
 	return pool, nil
 })
+
+// VerifiesServerCertificate reports whether the DSN's transport settings
+// authenticate the server certificate: sslmode=verify-full checks the chain
+// and hostname, and sslmode=verify-ca checks the chain through pgx's custom
+// verification callback (which pgx also applies to sslmode=require when the
+// DSN names an sslrootcert, matching libpq). require and prefer otherwise
+// encrypt without authenticating, allow's first attempt and disable carry no
+// TLS at all — trust pinned onto any of those modes is never consulted. The
+// DSN is normalized the same way Open normalizes it, so an RDS host with no
+// explicit sslmode is judged by the injected mode.
+func VerifiesServerCertificate(dsn string) (bool, error) {
+	cfg, err := connectionConfig(dsn)
+	if err != nil {
+		return false, err
+	}
+	tc := cfg.TLSConfig
+	if tc == nil {
+		return false, nil
+	}
+	return !tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil, nil
+}
 
 // hasRuntimeParam reports whether params carries key under PostgreSQL's
 // case-insensitive GUC name matching, so TimeZone and timezone are the same

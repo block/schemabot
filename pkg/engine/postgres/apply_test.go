@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -163,4 +164,20 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
+}
+
+// The apply pool inherits the CA bundle the acceptance path resolved; a
+// bundle that disappears between acceptance and execution fails the pool
+// build closed, before any statement is attempted.
+func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
+	conn := targetConn{
+		dsn:        "postgres://schemabot:secret@localhost:5432/app?sslmode=verify-full",
+		caCertPath: filepath.Join(t.TempDir(), "missing.pem"),
+	}
+
+	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "open pg-sprite apply pool")
+	assert.Contains(t, err.Error(), "read CA bundle")
 }
