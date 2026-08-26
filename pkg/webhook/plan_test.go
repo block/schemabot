@@ -344,8 +344,8 @@ func TestRenderPlanComment_UnsafeWarningSummaryCountsChanges(t *testing.T) {
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "⚠️ **Issues**: 2 unsafe changes detected")
-	assert.Contains(t, rendered, "- `orders`: DROP INDEX without making invisible first")
-	assert.Contains(t, rendered, "- `customers`: DROP COLUMN is destructive")
+	assert.Contains(t, rendered, "1. `orders`: DROP INDEX without making invisible first")
+	assert.Contains(t, rendered, "2. `customers`: DROP COLUMN is destructive")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -917,10 +917,9 @@ func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T)
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 3 unsafe changes detected")
-	assert.Contains(t, rendered, "- `uploads`:\n")
-	assert.Contains(t, rendered, "  - Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
-	assert.Contains(t, rendered, "  - Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
-	assert.Contains(t, rendered, "  - Primary key column `uid` has type `varchar`\n")
+	assert.Contains(t, rendered, "1. `uploads`: Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "2. `uploads`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `uploads`: Primary key column `uid` has type `varchar`\n")
 	assert.NotContains(t, rendered, "instead.; ")
 }
 
@@ -949,10 +948,9 @@ func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "3 unsafe changes detected")
-	assert.Contains(t, rendered, "- `orders`:\n")
-	assert.Contains(t, rendered, "  - DROP COLUMN removes data\n")
-	assert.Contains(t, rendered, "  - Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
-	assert.Contains(t, rendered, "- `users`: DROP TABLE removes all data\n")
+	assert.Contains(t, rendered, "1. `orders`: DROP COLUMN removes data\n")
+	assert.Contains(t, rendered, "2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `users`: DROP TABLE removes all data\n")
 	assert.NotContains(t, rendered, "data; ")
 }
 
@@ -978,9 +976,9 @@ func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *te
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 2 unsafe changes detected")
-	assert.Contains(t, rendered, "- `users`\n")
-	assert.NotContains(t, rendered, "- `users`:")
-	assert.Contains(t, rendered, "- `orders`: DROP TABLE removes all data\n")
+	assert.Contains(t, rendered, "1. `users`\n")
+	assert.NotContains(t, rendered, "1. `users`:")
+	assert.Contains(t, rendered, "2. `orders`: DROP TABLE removes all data\n")
 }
 
 // The plan comment's unsafe-issues section handles a reasonless change the
@@ -1001,8 +999,8 @@ func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testi
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "1 unsafe change detected")
-	assert.Contains(t, rendered, "- `users`\n")
-	assert.NotContains(t, rendered, "- `users`:")
+	assert.Contains(t, rendered, "1. `users`\n")
+	assert.NotContains(t, rendered, "1. `users`:")
 }
 
 func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {

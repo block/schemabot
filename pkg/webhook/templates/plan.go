@@ -1060,35 +1060,32 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
+	item := 0
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		writeUnsafeChangeItem(sb, table, c.Reason)
+		writeUnsafeChangeItem(sb, &item, table, c.Reason)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, isMySQL)
 }
 
-// writeUnsafeChangeItem writes one table's unsafe findings as a list item:
-// a single "- table: reason" line for one finding, or a nested list when the
-// engine joined several, so each finding reads on its own line.
-func writeUnsafeChangeItem(sb *strings.Builder, table, reason string) {
+// writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
+// per finding, so the rendered list is exactly as long as the heading's count
+// and operators can reference a finding by its number. n carries the running
+// number across tables; a change with no parseable reason still gets a line.
+func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason string) {
 	reasons := ui.LintReasons(reason)
-	for i, r := range reasons {
-		reasons[i] = ui.CodeQuoteIdentifiers(r)
+	if len(reasons) == 0 {
+		*n++
+		fmt.Fprintf(sb, "%d. %s\n", *n, table)
+		return
 	}
-	switch len(reasons) {
-	case 0:
-		fmt.Fprintf(sb, "- %s\n", table)
-	case 1:
-		fmt.Fprintf(sb, "- %s: %s\n", table, reasons[0])
-	default:
-		fmt.Fprintf(sb, "- %s:\n", table)
-		for _, r := range reasons {
-			fmt.Fprintf(sb, "  - %s\n", r)
-		}
+	for _, r := range reasons {
+		*n++
+		fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, ui.CodeQuoteIdentifiers(r))
 	}
 }
 
