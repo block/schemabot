@@ -85,6 +85,8 @@ func TestDeploymentRemoteApplyID(t *testing.T) {
 		assert.Contains(t, err.Error(), "apply-remote-1")
 		assert.Contains(t, err.Error(), "apply-remote-2")
 		assert.Contains(t, err.Error(), `deployment "west"`)
+		assert.Contains(t, err.Error(), "apply_operation 2",
+			"the error must pin the offending row even when its operation key is empty")
 	})
 }
 
@@ -120,6 +122,8 @@ func TestDeploymentExternalID(t *testing.T) {
 		assert.Empty(t, id)
 		assert.Contains(t, err.Error(), "apply-remote-1")
 		assert.Contains(t, err.Error(), "apply-remote-2")
+		assert.Contains(t, err.Error(), "apply_operation 2",
+			"the error must pin the offending row even when its operation key is empty")
 	})
 
 	t.Run("sibling deployments keep their own ids", func(t *testing.T) {
