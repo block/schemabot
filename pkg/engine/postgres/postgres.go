@@ -54,9 +54,18 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan PostgreSQL database %q: DSN credentials are required", req.Database)
 	}
 
+	caPath, err := caCertPath(req.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+	}
+	validationOpts, err := validationRootCAs(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+	}
+
 	// Validate the SchemaBot-managed connection path, including its transport
 	// policy, before adapting the same normalized DSN to pg-sprite's pool API.
-	db, err := postgresconn.Open(req.Credentials.DSN)
+	db, err := postgresconn.Open(req.Credentials.DSN, validationOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("open PostgreSQL database %q for planning: %w", req.Database, err)
 	}
@@ -65,11 +74,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, err)
 	}
 
-	dsn, err := postgresconn.ConnectionDSN(req.Credentials.DSN)
+	poolCfg, err := spritePoolConfig(req.Credentials.DSN, caPath)
 	if err != nil {
-		return nil, fmt.Errorf("normalize PostgreSQL database %q DSN for planning: %w", req.Database, err)
+		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
 	}
-	pool, err := dbconn.NewPool(ctx, dbconn.Config{URL: dsn})
+	pool, err := dbconn.NewPool(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
 	}
