@@ -145,9 +145,10 @@ const postgresSSLModeVerifyFull = "verify-full"
 // — the embedded RDS bundle by default for RDS endpoints, a mounted file by
 // configuration, and an error for a non-RDS endpoint with no configured CA.
 // The data plane does not read the reference yet: the connection layer
-// verifies RDS endpoints against its own embedded RDS bundle, and a file:
-// reference fails the TLS handshake rather than falling back to the ambient
-// trust store, until the engine adapter consumes it in a follow-up.
+// verifies RDS endpoints against its own embedded RDS bundle, while a file:
+// reference is recorded but not yet enforced — verification of such an
+// endpoint falls back to the ambient trust store until the engine adapter
+// consumes the reference in a follow-up.
 type PostgresConnectionAssembler struct {
 	// DefaultPort is appended to the host when it has no port.
 	DefaultPort string
@@ -175,6 +176,11 @@ func (PostgresConnectionAssembler) DatabaseType() string { return "postgres" }
 // Assemble builds a PostgreSQL libpq URL from the host, the "dbname" endpoint
 // attribute, and credentials, and emits the resolved CA reference in Metadata.
 func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]string, creds *Credentials) (string, map[string]string, error) {
+	// Hosts are DNS names or IP literals, so trimming stray whitespace and
+	// lowercasing preserve identity. Normalizing here keeps the emitted DSN,
+	// the CA-reference decision, and the data plane's own case-sensitive RDS
+	// check on the DSN host all in agreement.
+	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" {
 		return "", nil, fmt.Errorf("postgres connection requires a host")
 	}
@@ -190,6 +196,13 @@ func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]stri
 	// by a host that is dialed last or never.
 	if strings.Contains(host, ",") {
 		return "", nil, fmt.Errorf("postgres connection requires a single host, got %q", host)
+	}
+	// Characters that are structural in a URL authority — or embedded
+	// whitespace — cannot appear in a real host, and would otherwise surface
+	// downstream as a misleading CA or DSN parse error instead of naming the
+	// malformed host.
+	if strings.ContainsAny(host, " \t\r\n@/?#") {
+		return "", nil, fmt.Errorf("postgres host contains invalid characters, got %q", host)
 	}
 	dbname := strings.TrimSpace(attrs[PostgresDBNameAttribute])
 	if dbname == "" {
@@ -240,9 +253,9 @@ func (a PostgresConnectionAssembler) resolveCARef(host string) (string, error) {
 		}
 		return a.CARef, nil
 	}
-	// DNS names are case-insensitive, so an uppercase RDS endpoint gets the
-	// same default rather than a misleading not-an-RDS-endpoint error.
-	if dbconn.IsRDSHost(strings.ToLower(host)) {
+	// Assemble normalized the host to lowercase, so this case-sensitive
+	// suffix check also covers uppercase-configured RDS endpoints.
+	if dbconn.IsRDSHost(host) {
 		return PostgresCARefEmbeddedRDSGlobal, nil
 	}
 	return "", fmt.Errorf("a verified CA is required: host %q is not an RDS endpoint and no ca_ref is configured", host)

@@ -6,6 +6,7 @@
 
 - [Local Mode](#local-mode)
   - [Building DSNs from separate secrets](#building-dsns-from-separate-secrets)
+  - [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)
 - [gRPC Mode](#grpc-mode)
 - [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
   - [Deployment Order](#deployment-order)
@@ -127,6 +128,51 @@ With the `config_paths` example above, SchemaBot reads:
 
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
+
+### PostgreSQL `dsn_from` targets
+
+`dsn_from` on a `target_resolver` target supports `type: postgres` in addition
+to `mysql`. The assembled DSN is a libpq URL that always names one database and
+always carries `sslmode=verify-full`.
+
+```yaml
+target_resolver:
+  targets:
+    orders-pg:
+      type: postgres
+      dsn_from:
+        config_ref: "secretsmanager:orders-pg-config"
+        username: "schemabot"
+        password_ref: "secretsmanager:orders-pg-password"
+        ca_ref: "embedded:rds-global"   # optional; see below
+```
+
+The referenced config document is JSON with top-level `host`, `port`, and
+`dbname` fields by default; set `config_paths` to read other keys:
+
+```json
+{"host": "orders.cluster-abc.us-east-1.rds.amazonaws.com", "port": 5432, "dbname": "orders"}
+```
+
+The PostgreSQL shape differs from MySQL in three ways:
+
+- **`config_paths.dbname` (PostgreSQL only).** A PostgreSQL connection is made
+  to one database, so the config document must carry the database name and the
+  assembled DSN includes it; the request namespace selects a schema within that
+  database. MySQL is the opposite — the DSN stays namespace-free and each
+  request supplies the schema — so `dbname` is rejected for MySQL targets.
+- **`params` allowlist.** Only `sslmode: "verify-full"` is accepted — the value
+  every assembled DSN carries regardless — so the field is validate-only.
+  Weaker modes (`require`, `prefer`, `verify-ca`, `disable`) prove at most
+  encryption, not server identity, and are rejected at config load. TLS trust
+  material is configured via `ca_ref`, never via raw libpq parameters.
+- **`ca_ref` (PostgreSQL only).** Selects the CA bundle the server certificate
+  is verified against: `embedded:rds-global` (the embedded AWS RDS global
+  bundle) or `file:<absolute-path>` (a read-only mounted PEM bundle, for
+  private proxies and test endpoints whose chain is not in the RDS bundle).
+  When omitted, an RDS endpoint defaults to the embedded bundle and a non-RDS
+  endpoint fails resolution: a verified CA is required, and the ambient trust
+  store is never an implicit fallback.
 
 ## gRPC Mode
 

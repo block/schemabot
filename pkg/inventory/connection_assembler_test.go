@@ -350,17 +350,46 @@ func TestPostgresConnectionAssemblerBuildsLibpqURL(t *testing.T) {
 }
 
 // DNS names are case-insensitive: an uppercase RDS endpoint resolves the same
-// embedded-bundle default instead of failing as a non-RDS host.
+// embedded-bundle default instead of failing as a non-RDS host, and the
+// assembled DSN carries the lowercased host so the data plane's own
+// case-sensitive RDS check agrees with the CA decision made here.
 func TestPostgresConnectionAssemblerRDSHostCaseInsensitive(t *testing.T) {
 	a := PostgresConnectionAssembler{DefaultPort: "5432"}
 
-	_, meta, err := a.Assemble(
+	dsn, meta, err := a.Assemble(
 		"ORDERS.CLUSTER-ABC.US-EAST-1.RDS.AMAZONAWS.COM",
 		map[string]string{PostgresDBNameAttribute: "orders"},
 		&Credentials{Username: "ddl", Password: "secret"},
 	)
 	require.NoError(t, err)
 	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, meta[MetadataPostgresCARef])
+	assert.Contains(t, dsn, "@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/")
+}
+
+// Stray surrounding whitespace on a host is a config typo, not a different
+// host: it is trimmed rather than surfacing later as a misleading CA or DSN
+// parse error. Embedded structural characters, by contrast, can never be part
+// of a real host and are rejected with an error that names the malformed host.
+func TestPostgresConnectionAssemblerNormalizesAndRejectsMalformedHost(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+	dbname := map[string]string{PostgresDBNameAttribute: "orders"}
+
+	_, meta, err := a.Assemble("  db.example.rds.amazonaws.com \n", dbname, creds)
+	require.NoError(t, err)
+	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, meta[MetadataPostgresCARef])
+
+	for _, host := range []string{
+		"evil.example@db.example.rds.amazonaws.com",
+		"db.example .rds.amazonaws.com",
+		"db.example.rds.amazonaws.com/extra",
+		"db.example.rds.amazonaws.com?sslmode=disable",
+		"db.example.rds.amazonaws.com#frag",
+	} {
+		_, _, err := a.Assemble(host, dbname, creds)
+		require.Error(t, err, "host %q must be rejected", host)
+		assert.Contains(t, err.Error(), "invalid characters")
+	}
 }
 
 // A comma in the host would smuggle a multi-host libpq DSN through single-host
