@@ -70,10 +70,12 @@ func TestSplitExistingCopiesSeparatesRunningWork(t *testing.T) {
 
 	require.Len(t, adopted, 1)
 	assert.Equal(t, "products_ks", adopted[0].Namespace)
+	assert.False(t, adopted[0].Running, "a copy that stopped renders dated by its staleness")
 
 	require.Len(t, running, 1)
 	assert.Equal(t, "orders_ks", running[0].Namespace)
 	assert.Equal(t, []string{"orders", "order_items"}, running[0].Tables)
+	assert.True(t, running[0].Running, "the entry itself carries the marker its rendering reads")
 }
 
 // A copy the deployment reports as running is only ever reassuring when it also
@@ -94,6 +96,8 @@ func TestSplitExistingCopiesKeepsARunningDiscardAsADiscard(t *testing.T) {
 	assert.Empty(t, running)
 	require.Len(t, discarded, 1)
 	assert.Equal(t, "orders_ks", discarded[0].Namespace)
+	assert.True(t, discarded[0].Running,
+		"the entry keeps the marker inside the warning, reading \"(still copying)\" rather than dating live work as stale")
 }
 
 // The two sections are opposite promises about the operator's work, so only an

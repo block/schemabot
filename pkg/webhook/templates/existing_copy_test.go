@@ -448,6 +448,58 @@ func TestRenderMultiEnvPlanComment_AdoptAndDiscardNeverShareASection(t *testing.
 	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**")
 }
 
+// A copy still being made sits on one environment's target, so identical DDL is
+// not identical disclosure: an environment whose target holds live work must
+// say so in its own section. Folding the two under a combined header would both
+// drop the join promise and let one section speak for a target it was never
+// read from.
+func TestRenderMultiEnvPlanComment_IdenticalDDLStillDisclosesOneEnvironmentsRunningCopy(t *testing.T) {
+	alterOrders := []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+	}}
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans: map[string]*PlanCommentData{
+			"staging": {Environment: "staging", IsMySQL: true, Changes: alterOrders},
+			"production": {
+				Environment: "production", IsMySQL: true, Changes: alterOrders,
+				RunningCopies: []ExistingCopyData{
+					{Namespace: "testapp", Tables: []string{"orders"}, Running: true},
+				},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "### Staging\n", "the environment holding no copy keeps its own section")
+	assert.Contains(t, out, "### Production\n", "the environment holding the running copy keeps its own section")
+	assert.NotContains(t, out, "### Staging & Production",
+		"one section cannot speak for two targets when only one of them holds live work")
+	assert.Contains(t, out, "♻️ **Work already in progress**: **1** unfinished copy still running on the target")
+	assert.Contains(t, out, "- `orders` in `testapp` (still copying)")
+}
+
+// A running copy discarded because its checkpoint expired is both live and
+// unresumable: rows are still being made while the checkpoint has aged past the
+// engine's resume bound. The age is that reason's own evidence, so this one
+// entry renders it alongside the running marker instead of suppressing it —
+// dropping either half would hide the wedge from the operator deciding on it.
+func TestWriteDiscardedCopies_RunningCheckpointExpiredKeepsItsAge(t *testing.T) {
+	var sb strings.Builder
+	writeDiscardedCopies(&sb, []ExistingCopyData{{
+		Namespace: "testapp",
+		Tables:    []string{"orders"},
+		Reason:    engine.DiscardCheckpointExpired,
+		Age:       "4d 2h",
+		Running:   true,
+	}}, false)
+
+	assert.Contains(t, sb.String(),
+		"- `orders` in `testapp` (still copying, last checkpoint 4d 2h ago): it is too old to resume")
+}
+
 // A plan against a clean target renders exactly as it always has: no copy
 // disclosure at all, which is the ordinary case.
 func TestRenderPlanComment_NoCopySectionOnCleanTarget(t *testing.T) {

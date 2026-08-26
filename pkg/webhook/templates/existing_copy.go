@@ -128,7 +128,8 @@ func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 // an age, which each entry decides for itself: the number behind an age is the
 // interval between a live copy's checkpoints, so rendering it as how long ago
 // the copy last progressed reports healthy work as nearly stalled — wherever
-// the entry lands, including the destructive section.
+// the entry lands, including the destructive section, save the one entry whose
+// age is its discard reason's own evidence (see writeExistingCopyEntries).
 func writeRunningCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
 	subject := "Applying joins"
@@ -151,12 +152,18 @@ func copyNoun(count int) string {
 // where they live, whether it is still being made or how stale it is, and why
 // it cannot be resumed.
 //
-// running selects between the two things the copy's timing can mean. A copy
-// that is over is dated by how long ago it last progressed, which is what an
-// operator weighs when deciding whether it is worth keeping. A copy still being
-// made has no such number to give — its last checkpoint is seconds old however
-// many hours of rows it holds — so it says it is running and leaves the timing
-// to the progress comment, which reports the copy's actual position.
+// Each entry's Running field selects between the two things the copy's timing
+// can mean. A copy that is over is dated by how long ago it last progressed,
+// which is what an operator weighs when deciding whether it is worth keeping. A
+// copy still being made has no such number to give — its last checkpoint is
+// seconds old however many hours of rows it holds — so it says it is running
+// and leaves the timing to the progress comment, which reports the copy's
+// actual position.
+//
+// The one exception is a running copy discarded because its checkpoint expired:
+// live but unresumable, wedged past the engine's resume bound. There the age is
+// not a heartbeat misread as staleness, it is the reason's own justification —
+// how far behind the checkpoint has fallen — so the entry renders both.
 func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
@@ -164,6 +171,8 @@ func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
 			line += " in " + markdownInlineCode(c.Namespace)
 		}
 		switch {
+		case c.Running && c.Age != "" && c.Reason == engine.DiscardCheckpointExpired:
+			line += fmt.Sprintf(" (still copying, last checkpoint %s ago)", c.Age)
 		case c.Running:
 			line += " (still copying)"
 		case c.Age != "":

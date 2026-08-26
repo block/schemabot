@@ -1433,7 +1433,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Changes:        changes,
 		LintViolations: violations,
 		Shards:         protoShards,
-		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment)),
+		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
 	}, nil
 }
 
