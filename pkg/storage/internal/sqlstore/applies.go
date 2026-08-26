@@ -27,13 +27,13 @@ const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, dat
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, expected_operation_keys, engine,
 	state, error_message, options, attempt,
 	lease_owner, lease_token, lease_acquired_at,
-	created_at, started_at, completed_at, updated_at, revert_skipped_at`
+	created_at, started_at, completed_at, updated_at, revert_skipped_at, superseded_by`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
 	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.idempotency_key, a.expected_operation_keys, a.engine,
 	a.state, a.error_message, a.options, a.attempt,
 	a.lease_owner, a.lease_token, a.lease_acquired_at,
-	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
+	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at, a.superseded_by`
 
 const (
 	// maxRecoveryAttempts is the retry budget for failed_retryable applies,
@@ -1848,6 +1848,11 @@ const (
 	// request was failed and committed inside persistApplyClaim, so the caller
 	// must not claim and must not commit again.
 	claimRefusedActiveTarget
+	// claimRefusedSuperseded means a stopped→running claim was refused because
+	// another apply already took over this one's unfinished work. Like
+	// claimRefusedActiveTarget, the pending start control request was failed and
+	// committed inside persistApplyClaim.
+	claimRefusedSuperseded
 )
 
 // claimedAndComplete reports whether the outcome both acquired the claim and
@@ -1947,6 +1952,15 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker 
 	}
 	if !hasApplyTarget(database, dbType, environment) {
 		return claimLostRace, fmt.Errorf("stopped apply %d (%s) is missing target metadata for claim re-check", apply.ID, apply.ApplyIdentifier)
+	}
+
+	// The handoff marker is checked before the target lock because it is a fact
+	// about this row alone, which the claim already holds FOR UPDATE. It also
+	// outlives the successor: once that apply settles, the target is free again
+	// and the one-active-apply re-check below would let this claim through even
+	// though its work was already taken over.
+	if apply.SupersededBy != "" {
+		return refuseStoppedClaimForSupersededApply(ctx, tx, apply, owner, database, dbType, environment)
 	}
 
 	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
@@ -2088,6 +2102,31 @@ func refuseStoppedClaimForActiveTarget(ctx context.Context, tx *rebindTx, apply 
 	return claimRefusedActiveTarget, nil
 }
 
+// refuseStoppedClaimForSupersededApply fails the pending start control request
+// for a stopped apply whose unfinished work another apply already took over, and
+// commits that failure inside tx. Resuming it would replay its statements
+// against a target where that work already happened, so the refusal is
+// unconditional — there is no state of the successor that makes the replay safe
+// again. Returns claimRefusedSuperseded.
+func refuseStoppedClaimForSupersededApply(ctx context.Context, tx *rebindTx, apply *storage.Apply, owner, database, dbType, environment string) (claimOutcome, error) {
+	reason := fmt.Sprintf("start refused: this schema change was superseded by %s", apply.SupersededBy)
+	if err := failPendingStartControlRequestTx(ctx, tx, apply.ID, reason); err != nil {
+		return claimLostRace, fmt.Errorf("fail pending start control request for superseded apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return claimLostRace, fmt.Errorf("commit refused superseded claim for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	slog.WarnContext(ctx, "claim refused: this apply's work was taken over by another apply; failing pending start control request",
+		"apply_id", apply.ApplyIdentifier,
+		"superseded_by", apply.SupersededBy,
+		"database", database,
+		"database_type", dbType,
+		"environment", environment,
+		"lease_owner", owner,
+		"reason", reason)
+	return claimRefusedSuperseded, nil
+}
+
 // failPendingStartControlRequestTx marks the pending 'start' control request for
 // an apply failed inside the supplied claim transaction so the refusal and the
 // failed request commit atomically. Mirrors controlRequestStore.FailPending's
@@ -2123,6 +2162,43 @@ func (s *applyStore) SetRevertSkipped(ctx context.Context, applyID int64, at tim
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE applies SET revert_skipped_at = ?, updated_at = updated_at WHERE id = ?`, at, applyID); err != nil {
 		return fmt.Errorf("set revert_skipped_at for apply %d: %w", applyID, err)
+	}
+	return nil
+}
+
+// MarkSuperseded records the apply that took over this one's unfinished work. It
+// is a targeted write of superseded_by only, with updated_at pinned for the same
+// reason SetRevertSkipped pins it: the caller holds no lease on the apply it is
+// marking, and bumping the heartbeat would delay a recovery claim.
+//
+// The write is conditional on the marker still being unset, so the first
+// successor to record the handoff owns it. The stored value is then read back to
+// decide the outcome, rather than trusting rows-affected, which does not
+// distinguish "another successor holds the marker" from "this successor wrote
+// the same value again" on every dialect.
+func (s *applyStore) MarkSuperseded(ctx context.Context, applyID int64, successor string) error {
+	if successor == "" {
+		return fmt.Errorf("mark apply %d superseded: successor apply identifier is required", applyID)
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE applies SET superseded_by = ?, updated_at = updated_at WHERE id = ? AND superseded_by = ''`,
+		successor, applyID); err != nil {
+		return fmt.Errorf("mark apply %d superseded by %s: %w", applyID, successor, err)
+	}
+
+	var stored string
+	err := s.db.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, applyID).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("mark apply %d superseded by %s: %w", applyID, successor, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("read superseded_by for apply %d: %w", applyID, err)
+	}
+	if stored == "" {
+		return fmt.Errorf("mark apply %d superseded by %s: the marker is still unset after the write", applyID, successor)
+	}
+	if stored != successor {
+		return fmt.Errorf("mark apply %d superseded by %s (marker holds %q): %w", applyID, successor, stored, storage.ErrApplyAlreadySuperseded)
 	}
 	return nil
 }
@@ -2543,7 +2619,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &idempotencyKey, &expectedOperationKeys, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
-		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt,
+		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt, &apply.SupersededBy,
 	)
 	if err != nil {
 		return nil, err
