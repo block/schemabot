@@ -154,9 +154,12 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NotNil(t, claimed)
 
 		var reclaimed *storage.WebhookEvent
-		require.Eventually(t, func() bool {
+		require.EventuallyWithT(t, func(collect *assert.CollectT) {
 			reclaimed, err = store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
-			return err == nil && reclaimed != nil
+			if !assert.NoError(collect, err) {
+				return
+			}
+			assert.NotNil(collect, reclaimed)
 		}, 5*time.Second, 10*time.Millisecond)
 		assert.Equal(t, claimed.ID, reclaimed.ID)
 		assert.Equal(t, 2, reclaimed.Attempts)
@@ -178,9 +181,12 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 		redelivery := newEvent("delivery-reopen-stuck")
 		redelivery.Payload = []byte(`{"redelivered":true}`)
-		require.Eventually(t, func() bool {
+		require.EventuallyWithT(t, func(collect *assert.CollectT) {
 			inserted, err = store.WebhookEvents().Create(ctx, redelivery)
-			return err == nil && inserted
+			if !assert.NoError(collect, err) {
+				return
+			}
+			assert.True(collect, inserted, "the redelivery must reopen the expired processing row")
 		}, 5*time.Second, 10*time.Millisecond)
 
 		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-reopen-stuck")
