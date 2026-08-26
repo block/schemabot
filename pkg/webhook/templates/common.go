@@ -300,7 +300,7 @@ func quoteBlockLines(msg string) string {
 	return strings.ReplaceAll(msg, "\n", "\n> ")
 }
 
-// writeErrorBlock writes an error message as a blockquote with warning emoji.
+// writeErrorBlock writes an error message as a blockquote marked with the failure glyph.
 // The message is sanitized before rendering; a message that sanitizes to
 // empty writes nothing.
 func writeErrorBlock(sb *strings.Builder, msg string) {

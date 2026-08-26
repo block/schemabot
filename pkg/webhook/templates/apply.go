@@ -804,11 +804,11 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 		// at all, so its failure label does not mention one.
 		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
 		case pct > 0:
-			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
+			fmt.Fprintf(sb, "**`%s`**: %s "+glyph.Failed+" Failed\n", table.TableName, ui.ProgressBarFailed(pct))
 		case table.IsInstant:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed\n", table.TableName)
 		default:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed (before row copy started)\n", table.TableName)
 		}
 		writeDDLLine(sb, table.DDL)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
