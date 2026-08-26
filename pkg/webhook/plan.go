@@ -773,12 +773,18 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 }
 
 // splitExistingCopies sorts the target's unfinished copies by what the apply
-// will do to them. The two sections are opposite promises to the operator —
-// one says the work survives, the other says it is destroyed — so a
-// disposition this build does not recognize is shown as a discard: warning
-// about work that in fact survives costs a second look, while promising
-// survival to work that is destroyed costs the copy.
-func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, adopted []templates.ExistingCopyData) {
+// will do to them. The sections are opposite promises to the operator — one
+// says the work survives, the other says it is destroyed — so a disposition
+// this build does not recognize is shown as a discard: warning about work that
+// in fact survives costs a second look, while promising survival to work that
+// is destroyed costs the copy.
+//
+// Surviving work splits again by whether it is still being made. Both are kept,
+// but only one of them stopped, and a copy still running is the one an operator
+// can watch progressing while they read the comment — telling them it will be
+// picked up where it stopped invites them to go looking for a stall that is not
+// there.
+func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, adopted, running []templates.ExistingCopyData) {
 	for _, c := range copies {
 		if c == nil {
 			continue
@@ -788,14 +794,23 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 			Tables:    c.Tables,
 			Reason:    c.Reason,
 			Statement: c.Statement,
+			Running:   c.Running,
 		}
 		if c.AgeSeconds > 0 {
 			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
 		}
 		switch c.Disposition {
 		case apitypes.ExistingCopyAdopt:
+			if c.Running {
+				running = append(running, entry)
+				continue
+			}
 			adopted = append(adopted, entry)
 		case apitypes.ExistingCopyDiscard:
+			// A running copy still lands in the destructive section: the work is
+			// destroyed whether or not it is live, and moving it out would hide a
+			// discard behind a reassuring heading. The entry carries Running so it
+			// reads "(still copying)" rather than dating live work as stale.
 			discarded = append(discarded, entry)
 		default:
 			// Reaching here means a deployment reported a disposition this build
@@ -807,7 +822,7 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 			discarded = append(discarded, entry)
 		}
 	}
-	return discarded, adopted
+	return discarded, adopted, running
 }
 
 // buildPlanCommentData converts plan results into template data.
@@ -958,7 +973,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 	}
 
-	data.DiscardedCopies, data.AdoptedCopies = splitExistingCopies(planResp.ExistingCopies)
+	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {

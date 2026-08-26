@@ -343,6 +343,39 @@ func PreviewCommentPlanCopyAdopted() string {
 	})
 }
 
+// PreviewCommentPlanCopyRunning renders a sample plan comment for a plan whose
+// apply will join a copy still being made on the target. Nothing stopped, so
+// there is nothing to pick back up: the apply resolves the operator onto work
+// already in flight and keeps every row of it.
+func PreviewCommentPlanCopyRunning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		RunningCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "4s",
+				Running:   true,
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
 // plan containing statements the engine refuses.
 func PreviewCommentApplyBlockedRejected() string {

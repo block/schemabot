@@ -356,6 +356,7 @@ func TestPlanResponseFromProto_CarriesEveryExistingCopy(t *testing.T) {
 				Disposition: "adopt",
 				Tables:      []string{"products"},
 				AgeSeconds:  60,
+				Running:     true,
 			},
 		},
 	}
@@ -370,8 +371,12 @@ func TestPlanResponseFromProto_CarriesEveryExistingCopy(t *testing.T) {
 	assert.Equal(t, int64(11520), result.ExistingCopies[0].AgeSeconds)
 	assert.Equal(t, "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)", result.ExistingCopies[0].Statement,
 		"the statement the copy was started for is what a discard disclosure compares the plan against")
+	assert.False(t, result.ExistingCopies[0].Running,
+		"a copy the deployment did not mark as running stays unmarked")
 	assert.Equal(t, "products_ks", result.ExistingCopies[1].Namespace)
 	assert.Equal(t, "adopt", result.ExistingCopies[1].Disposition)
+	assert.True(t, result.ExistingCopies[1].Running,
+		"whether the copy is still being made survives the wire, or every disclosure reads as left behind")
 }
 
 // A plan against a clean target carries no copy disclosure, so the plan

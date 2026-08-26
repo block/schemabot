@@ -128,7 +128,7 @@ func TestPlanMySQLNamespacesKeepsEveryNamespacesExistingCopies(t *testing.T) {
 // warning that either understates what applying destroys or omits the cause the
 // operator needs to keep the work.
 func TestProtoExistingCopiesCarriesEveryDisclosureField(t *testing.T) {
-	copies := protoExistingCopies(&engine.PlanResult{ExistingCopies: []*engine.ExistingCopy{
+	copies := newMultisetClient("orders", storage.DatabaseTypeMySQL).protoExistingCopies(&engine.PlanResult{ExistingCopies: []*engine.ExistingCopy{
 		{
 			Namespace:   "orders",
 			Disposition: engine.CopyDiscard,
@@ -143,7 +143,7 @@ func TestProtoExistingCopiesCarriesEveryDisclosureField(t *testing.T) {
 			Tables:      []string{"charges"},
 			Age:         45 * time.Second,
 		},
-	}})
+	}}, nil)
 
 	require.Len(t, copies, 2)
 	assert.Equal(t, "orders", copies[0].Namespace)
@@ -165,5 +165,5 @@ func TestProtoExistingCopiesCarriesEveryDisclosureField(t *testing.T) {
 // target holding no unfinished work sends no copy disclosure, so the control
 // plane renders no section rather than an empty one.
 func TestProtoExistingCopiesOmitsAnEmptyDisclosure(t *testing.T) {
-	assert.Nil(t, protoExistingCopies(&engine.PlanResult{}))
+	assert.Nil(t, newMultisetClient("orders", storage.DatabaseTypeMySQL).protoExistingCopies(&engine.PlanResult{}, nil))
 }

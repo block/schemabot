@@ -487,6 +487,17 @@ type ExistingCopyResponse struct {
 	Tables      []string `json:"tables,omitempty"`
 	AgeSeconds  int64    `json:"age_seconds,omitempty"`
 	Statement   string   `json:"statement,omitempty"`
+	// Running reports that the copy is still being made right now rather than
+	// left behind by an apply that is over. It changes both what applying does
+	// — joins the copy instead of resuming it — and what AgeSeconds means, which
+	// for a running copy is the interval between checkpoints rather than how
+	// stale the work is.
+	//
+	// It reports stored state rather than a live probe, so a task row left in
+	// flight by a crashed server reads as running until recovery clears it.
+	// Treat it as how to describe the copy, never as proof that work is live:
+	// what applying does to the copy is carried by Disposition.
+	Running bool `json:"running,omitempty"`
 }
 
 // ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and

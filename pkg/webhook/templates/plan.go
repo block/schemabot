@@ -116,8 +116,13 @@ type PlanCommentData struct {
 	// and copy again from the start.
 	DiscardedCopies []ExistingCopyData
 
-	// Unfinished copies already on the target that the apply will resume.
+	// Unfinished copies already on the target, left behind by an apply that is
+	// over, that the apply will resume.
 	AdoptedCopies []ExistingCopyData
+
+	// Unfinished copies still being made on the target right now, that the
+	// apply will join rather than resume or restart.
+	RunningCopies []ExistingCopyData
 
 	// Tables carrying a destructive change that another pull request owns, or
 	// whose ownership could not be established.
@@ -305,6 +310,9 @@ func RenderPlanComment(data PlanCommentData) string {
 	}
 	if len(data.AdoptedCopies) > 0 {
 		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.RunningCopies) > 0 {
+		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
 	}
 
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
@@ -1411,6 +1419,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	}
 	if len(plan.AdoptedCopies) > 0 {
 		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
+	}
+	if len(plan.RunningCopies) > 0 {
+		writeRunningCopies(sb, plan.RunningCopies, plan.applyingWithoutConfirmation())
 	}
 
 	// Unsafe changes warning
