@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // spiritProgressPattern matches the row-copy prefix of a Spirit progress
@@ -210,7 +211,9 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		for _, sh := range tbl.Shards {
 			pct := int(sh.PercentComplete)
 			if pct == 0 && sh.RowsTotal > 0 {
-				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
+				// Row totals are estimates, so a nearly finished copy can
+				// exceed them; clamp so the derived percent stays honest.
+				pct = ui.ClampPercent(int(sh.RowsCopied * 100 / sh.RowsTotal))
 			}
 			tp.Shards = append(tp.Shards, ShardProgress{
 				Shard:           sh.Shard,

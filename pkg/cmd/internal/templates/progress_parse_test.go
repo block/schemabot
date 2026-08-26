@@ -167,7 +167,8 @@ func TestParseProgressResponseCarriesTableAndShardETA(t *testing.T) {
 }
 
 // A sharded table without its own estimate takes the slowest shard's ETA, and
-// a shard reporting rows but no percent gets its percent derived from them.
+// a shard reporting rows but no percent gets its percent derived from them —
+// clamped to 100, since row totals are estimates a copy can exceed.
 func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *testing.T) {
 	result := &apitypes.ProgressResponse{
 		State: state.Apply.Running,
@@ -179,6 +180,7 @@ func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *t
 				Shards: []*apitypes.ShardProgressResponse{
 					{Shard: "-80", Status: state.Task.Running, RowsCopied: 125000, RowsTotal: 250000, ETASeconds: 480},
 					{Shard: "80-", Status: state.Task.Running, RowsCopied: 60000, RowsTotal: 240000, ETASeconds: 900},
+					{Shard: "c0-", Status: state.Task.Running, RowsCopied: 300000, RowsTotal: 250000, ETASeconds: 120},
 				},
 			},
 		},
@@ -188,9 +190,10 @@ func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *t
 
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, int64(900), data.Tables[0].ETASeconds)
-	require.Len(t, data.Tables[0].Shards, 2)
+	require.Len(t, data.Tables[0].Shards, 3)
 	assert.Equal(t, 50, data.Tables[0].Shards[0].PercentComplete)
 	assert.Equal(t, 25, data.Tables[0].Shards[1].PercentComplete)
+	assert.Equal(t, 100, data.Tables[0].Shards[2].PercentComplete)
 }
 
 // Spirit internal tables (shadow, checkpoint, sentinel) are working artifacts
