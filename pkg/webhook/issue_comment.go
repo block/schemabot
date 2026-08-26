@@ -92,7 +92,7 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	if !result.Found {
 		return issueCommentGateCommandNotFound
 	}
-	if result.Action != action.Apply && parser.HasAutoConfirmFlag(commentBody) {
+	if parser.HasAutoConfirmFlag(commentBody) {
 		return issueCommentGateAutoConfirm
 	}
 	if result.Action == action.Rollback && parser.HasDeferCutoverFlag(commentBody) {
@@ -390,7 +390,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
-	// Reject -y/--yes on commands that don't support it
+	// Reject -y/--yes: it is a CLI flag, and no comment command takes it
 	if gateReason == issueCommentGateAutoConfirm {
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping unsupported auto-confirm flag reply for unscoped fan-out; the leader posts it once",

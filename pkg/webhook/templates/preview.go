@@ -194,10 +194,54 @@ func PreviewCommentPlanCopyDiscarded() string {
 	})
 }
 
-// PreviewCommentPlanCopyDiscardedApplying renders the same discard on the
-// comment of an apply that is already running. Nothing is being asked of the
-// reader and the copy is already gone, so the section is a record of what the
-// apply threw away rather than a warning with a remedy.
+// PreviewCommentPlanCopyDiscardedPaused renders the discard on the locked
+// comment of an automatic apply that stopped for confirmation because of it.
+// The copy is still on the target and confirming is what destroys it, so the
+// section warns and names the remedy.
+func PreviewCommentPlanCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on a
+// comment that announces an apply already under way rather than asking for
+// confirmation. Nothing is being asked of the reader and the copy is already
+// gone, so the section is a record of what the apply threw away rather than a
+// warning with a remedy.
+//
+// The copy-discard gate stops every automatic apply that would discard, so it
+// is the paused rendering above that an operator meets in practice. This one is
+// the shape the section takes on any locked comment carrying no confirmation
+// request, and it is here so that shape stays correct: a comment posted after
+// the copy is destroyed must not offer the remedy for saving it.
 func PreviewCommentPlanCopyDiscardedApplying() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",

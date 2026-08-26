@@ -145,6 +145,29 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// The copy on the target is read fresh on every plan, so this re-plan can
+	// discover a discard the reviewed comment never showed: another apply can
+	// start a copy, or an adopted copy's checkpoint can age out, between the
+	// operator's review and this moment. Downgrade so the operator confirms
+	// against a comment that discloses the copy actually at stake. A stored
+	// plan is what marks this as the automatic path; the confirm path arrives
+	// here with none and deliberately does not stop again. That exemption is
+	// only as good as the comment the operator confirmed: the disposition can
+	// flip to a discard that comment never disclosed (a checkpoint ages past
+	// its resume bound, or apply-time routing changes the batch), and this
+	// path does not know what the confirmed comment showed, so it cannot tell
+	// an acknowledged discard from an unseen one.
+	if storedPlan != nil {
+		if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
+			h.logger.Info("automatic apply downgraded: re-plan discards an existing copy",
+				"repo", repo, "pr", pr, "database", database, "environment", environment,
+				"discarded_copies", len(discarded))
+			h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				msgCopyDiscardDowngrade)
+			return
+		}
+	}
+
 	// --defer-cutover only affects engine-driven statements; an all-direct
 	// plan has no cutover to defer, so reject the flag instead of silently
 	// ignoring it. Only apply-confirm reaches this gate (the apply command
