@@ -510,8 +510,17 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
+			// The completed state must durably land before the task counts as
+			// settled: the caller derives parent apply state from this
+			// partition, so proceeding past a refused write — e.g. a
+			// lease-guarded update that lost to a peer driver — would
+			// terminalize the apply while the task row durably stays
+			// non-terminal. Failing the re-plan releases the drive for a later
+			// claim to redo this settlement under a current lease.
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier)); err != nil {
+				return nil, fmt.Errorf("persist completed state for task %s whose table left the resume re-plan diff: %w", task.TaskIdentifier, err)
+			}
 			completedCount++
 		} else {
 			// Fail closed if the re-plan would apply DDL this task was not

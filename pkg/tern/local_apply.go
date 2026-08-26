@@ -494,7 +494,23 @@ func (c *LocalClient) spiritApplyLogFunc(ctx context.Context, apply *storage.App
 
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
 // Fields like CompletedAt, StartedAt, ErrorMessage, or progress must be set on the task BEFORE calling this.
+// A persistence failure is logged, not returned: callers on best-effort
+// progress paths keep driving and the next poll retries the write. Callers
+// whose control flow depends on the write durably landing use
+// persistTaskStateTransition directly and fail closed on its error.
 func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) {
+	if err := c.persistTaskStateTransition(ctx, task, applyID, newState, logMsg); err != nil {
+		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+	}
+}
+
+// persistTaskStateTransition updates a task's state, persists it, and — once the
+// write has landed — optionally records the transition in the apply's durable
+// log. A storage failure (including a lease-guarded write refused because the
+// drive's lease was lost to a peer) is returned without recording the log
+// event, so the durable log never claims a transition the task row does not
+// carry.
+func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
@@ -510,13 +526,14 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 		task.ThrottleReason = ""
 	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
-		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+		return fmt.Errorf("update task %s state %s -> %s: %w", task.TaskIdentifier, oldState, newState, err)
 	}
 	if logMsg != "" && applyID > 0 {
 		taskID := task.ID
 		c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			logMsg, oldState, newState)
 	}
+	return nil
 }
 
 // markTasksRunning sets DDL tasks to running state with a start timestamp.

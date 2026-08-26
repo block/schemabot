@@ -468,6 +468,69 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 		"observer must see the settled verdict, got %s", observer.terminal[0].State)
 }
 
+// A task whose table no longer appears in the resume re-plan diff has no
+// remaining work: the live schema already matches the reviewed target (the
+// engine finished the change before the previous drive lost the apply). The
+// re-plan settles it — the task row is durably marked completed with full
+// progress — and reports it in CompletedCount so the caller can terminalize
+// the apply from settled rows.
+func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	c.storage = &exactProgressStorage{plans: store, tasks: &exactProgressTaskStore{}}
+
+	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-settle", Database: "testapp"}
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.NoError(t, err)
+	assert.Empty(t, rp.ActiveTasks)
+	assert.Equal(t, int64(1), rp.CompletedCount)
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Completed),
+		"a task whose table left the diff is settled completed, got %s", tasks[0].State)
+	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
+	assert.NotNil(t, tasks[0].CompletedAt)
+}
+
+// Settling a no-remaining-work task is only real once its completed state
+// durably lands. When the task store refuses the write — here a lease-guarded
+// update that lost the drive's lease to a peer driver — the re-plan must fail
+// closed instead of counting the task settled: the caller terminalizes the
+// parent apply from this partition, and completing the apply over a task row
+// that durably stays non-terminal would strand the pair in contradictory
+// states. The returned error aborts the resume so a later claim redoes the
+// settlement under a current lease.
+func TestReplanAndFilterTasks_FailsClosedWhenCompletedWriteRefused(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	c.storage = &exactProgressStorage{
+		plans: store,
+		tasks: &exactProgressTaskStore{err: storage.ErrApplyLeaseLost},
+	}
+
+	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-lease-lost", Database: "testapp"}
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.ErrorContains(t, err, "task_1")
+	assert.Nil(t, rp, "a refused settlement write must not yield a partition the caller could terminalize from")
+}
+
 // A reverted task is terminal: the revert already landed for it, so the resume
 // re-plan leaves it untouched instead of re-activating it. It contributes no
 // remaining resume work, and its state must survive the re-plan so the apply's
