@@ -1,10 +1,13 @@
 package postgres
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -178,6 +181,92 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 	_, err = tableChanges(report, parser)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
+}
+
+// TestPrivilegeBlockReason pins the boundary between typed preflight refusals
+// (rendered as blocked plan verdicts with provisioning detail) and
+// operational failures (the plan must fail instead of blocking the change).
+func TestPrivilegeBlockReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		refused    bool
+		wantReason []string
+	}{
+		{
+			name: "privilege error blocks with grant, check, and hint",
+			err: fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{
+				Tier:  preflight.TierAlterInPlace,
+				Check: "pg_has_role(limited, app_owner, 'USAGE')",
+				Grant: `GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
+				Hint:  "membership must be inheritable",
+			}),
+			refused: true,
+			wantReason: []string{
+				"in-place ALTER TABLE",
+				`GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
+				"pg_has_role(limited, app_owner, 'USAGE')",
+				"membership must be inheritable",
+			},
+		},
+		{
+			name:       "missing table blocks with a re-plan instruction",
+			err:        fmt.Errorf("check privileges: %w", preflight.ErrTableNotFound),
+			refused:    true,
+			wantReason: []string{"re-plan against the current schema"},
+		},
+		{
+			name:       "non-table relation blocks with the relation kind cause",
+			err:        fmt.Errorf("check privileges: %w", preflight.ErrNotTable),
+			refused:    true,
+			wantReason: []string{"not an ordinary or partitioned table"},
+		},
+		{
+			name: "untyped error is operational, not a refusal",
+			err:  errors.New("dial tcp: connection refused"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, refused := privilegeBlockReason(tt.err, "users")
+			assert.Equal(t, tt.refused, refused)
+			for _, want := range tt.wantReason {
+				assert.Contains(t, reason, want)
+			}
+		})
+	}
+}
+
+// TestBlockMissingPrivilegesSkipsFullyBlockedPlans proves the privilege check
+// never touches the target when the plan carries no executable steps: a
+// blocked verdict already withholds apply, so there is no access to verify.
+func TestBlockMissingPrivilegesSkipsFullyBlockedPlans(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+		ExecutionMode: engine.ExecutionModeBlocked,
+	}}
+
+	require.NoError(t, blockMissingPrivileges(t.Context(), nil, report, changes))
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+}
+
+// TestBlockMissingPrivilegesRequiresTargetTable proves a report that carries
+// executable steps without naming its target fails the plan closed: the
+// privilege check cannot answer for an unnamed table, and an executable plan
+// must never be produced while the answer is unknown.
+func TestBlockMissingPrivilegesRequiresTargetTable(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
+	}}
+
+	err := blockMissingPrivileges(t.Context(), nil, report, changes)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "names no target table")
 }
 
 func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {

@@ -46,6 +46,42 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Equal(t, `statement for table "users" is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible`, change.ModeReason)
 }
 
+// TestEnginePlanPrivilegeRefusal proves a role that cannot alter the target
+// gets a blocked plan naming the exact provisioning statement, instead of an
+// executable plan that deterministically fails at apply. The plan itself
+// still succeeds: the operator needs the review surface to carry the grant.
+func TestEnginePlanPrivilegeRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_privilege_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE ROLE plan_limited LOGIN PASSWORD 'plan_limited';
+		GRANT CONNECT, CREATE ON DATABASE plan_privilege_test TO plan_limited;
+		GRANT USAGE ON SCHEMA public TO plan_limited`)
+	require.NoError(t, err)
+
+	limitedDSN, err := url.Parse(dsn)
+	require.NoError(t, err)
+	limitedDSN.User = url.UserPassword("plan_limited", "plan_limited")
+	req := &engine.PlanRequest{
+		Database: "plan_privilege_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, "GRANT")
+	assert.Contains(t, change.ModeReason, "plan_limited")
+}
+
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
 // pg-sprite's preflight and bounded optimistic executor.
 func TestEngineApplyNativeSafe(t *testing.T) {

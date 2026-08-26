@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -105,6 +106,9 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
+			if err := blockMissingPrivileges(ctx, pool, report, changes); err != nil {
+				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
+			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
 		if len(schemaChange.TableChanges) > 0 {
@@ -157,6 +161,76 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 		}
 	}
 	return changes, nil
+}
+
+// blockMissingPrivileges verifies the connected role holds the access the
+// report's executable steps need, at the most demanding step's tier, so a
+// missing grant surfaces on the plan the operator reviews — with the exact
+// provisioning statement — instead of failing only after apply is requested.
+// The apply path re-runs the same check before executing, so a grant revoked
+// between plan and apply still fails closed there. A typed refusal blocks the
+// table's executable steps; any other failure fails the plan — an executable
+// plan must never be produced while the check's answer is unknown. Every
+// blocked reason here is built from typed error fields and identifiers, never
+// from wrapped server output, so it is safe to render on operator-facing
+// surfaces.
+func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange) error {
+	var executable []string
+	for _, change := range changes {
+		if change.ExecutionMode == "" {
+			executable = append(executable, change.DDL)
+		}
+	}
+	if len(executable) == 0 {
+		return nil
+	}
+	if report.Table == "" {
+		return fmt.Errorf("plan report carries executable steps but names no target table")
+	}
+	tier, err := preflight.RequiredTier(executable)
+	if err != nil {
+		return fmt.Errorf("derive privilege tier for table %q: %w", report.Table, err)
+	}
+	_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+	if err == nil {
+		return nil
+	}
+	reason, refused := privilegeBlockReason(err, report.Table)
+	if !refused {
+		return fmt.Errorf("check privileges for table %q: %w", report.Table, err)
+	}
+	for i := range changes {
+		if changes[i].ExecutionMode == "" {
+			changes[i].ExecutionMode = engine.ExecutionModeBlocked
+			changes[i].ModeReason = reason
+		}
+	}
+	return nil
+}
+
+// privilegeBlockReason maps a typed preflight refusal to an operator-facing
+// blocked reason. A PrivilegeError carries the exact grant that provisions
+// the missing access — the Grant field is Sanitize()-quoted by pg-sprite and
+// safe to echo as executable SQL, while the Check predicate is display prose.
+// A false second return means the failure is operational, not a refusal, and
+// the caller must fail the plan instead of blocking the change.
+func privilegeBlockReason(err error, table string) (string, bool) {
+	var privilegeErr *preflight.PrivilegeError
+	if errors.As(err, &privilegeErr) {
+		reason := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
+			privilegeErr.Tier, table, privilegeErr.Grant, privilegeErr.Check)
+		if privilegeErr.Hint != "" {
+			reason += "; " + privilegeErr.Hint
+		}
+		return reason, true
+	}
+	if errors.Is(err, preflight.ErrTableNotFound) {
+		return fmt.Sprintf("table %q was not found while verifying privileges; re-plan against the current schema", table), true
+	}
+	if errors.Is(err, preflight.ErrNotTable) {
+		return fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table), true
+	}
+	return "", false
 }
 
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string) (string, string) {
