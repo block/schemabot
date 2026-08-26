@@ -239,6 +239,41 @@ func TestE2EDiscardingCopyDowngradesToConfirm(t *testing.T) {
 	assert.Equal(t, "webhook_copy_discard_gate", plan.Database)
 }
 
+// The lock is acquired before the comment that discloses the copy is posted, and
+// it records what that comment tells the operator. A disclosure GitHub rejects
+// therefore leaves no confirmation behind at all: consent for a comment nobody
+// saw would let the next confirm destroy the copy unasked, and a confirmation
+// with no comment to act on is one the operator could only clear by unlocking
+// the database by hand.
+func TestE2EDiscardingCopyLeavesNoConfirmationWhenTheDisclosureCannotBePosted(t *testing.T) {
+	const dbName = "webhook_copy_discard_downgrade_post_fails"
+	f := setupDiscardGate(t, dbName)
+	f.result.FailCommentPost.Store(true)
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	// The disclosure was attempted — GitHub rejected it.
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the disclosure post attempt")
+	}
+
+	require.Eventually(t, func() bool {
+		lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
+		"a pending confirmation whose comment never landed must not be left holding the database")
+
+	requireCopyIntact(t, dbName)
+}
+
 // The copy on the target is read fresh on every plan, so a copy can appear
 // between the plan the automatic apply stored and the re-plan its dispatch
 // runs: another apply starts one, or an adopted copy's checkpoint ages out.

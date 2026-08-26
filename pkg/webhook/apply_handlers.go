@@ -415,7 +415,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
+			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
+			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
+		}
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkRunErr != nil {
 			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
@@ -458,7 +461,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		}
 		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
+			templates.RenderPlanComment(commentData), "copy-discard downgrade disclosure post failure"); postErr != nil {
+			return true, fmt.Errorf("apply command copy-discard downgrade disclosure %s#%d: %w", repo, pr, postErr)
+		}
 		return false, nil
 	}
 
@@ -493,6 +499,33 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
+}
+
+// postPendingConfirmation posts the plan comment a pending confirmation is meant
+// to be confirmed against, and releases the confirmation when the comment does
+// not land. The lock is acquired before this comment exists and already records
+// what the comment discloses about an unfinished copy, so a post that fails
+// would leave consent behind for a disclosure nobody was shown. A confirmation
+// whose comment never appeared is also one no operator can act on: they were
+// told nothing to confirm, and the lock would sit until someone unlocked it by
+// hand.
+//
+// The release is keyed on this plan's intent, so a lock that has since changed
+// hands or been re-pinned is preserved. Callers stay retryable — the re-drive
+// re-plans from the top, reacquires the lock, and asks again — and do not post a
+// command error, because posting is the operation that just failed.
+func (h *Handler) postPendingConfirmation(
+	ctx context.Context, repo string, pr int, installationID int64,
+	database, dbType, environment, planID, body, reason string,
+) error {
+	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+		h.logger.Error("failed to post the comment the pending confirmation is confirmed against, so the confirmation was released rather than left recording consent for a disclosure that was never shown",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planID, "reason", reason, "error", err)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planID, reason)
+		return err
+	}
+	return nil
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
