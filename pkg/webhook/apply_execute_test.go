@@ -217,3 +217,53 @@ func TestDDLMatchesStoredPlan(t *testing.T) {
 		})
 	}
 }
+
+// The consent recorded on a pending confirmation only speaks for the apply the
+// operator was actually shown. The lock carries no environment, so a disclosure
+// earned confirming one environment must not disarm the copy gate in another,
+// and a confirmation whose plan cannot be loaded must count as no disclosure at
+// all rather than as consent.
+func TestDisclosureDescribesThisApply(t *testing.T) {
+	tests := []struct {
+		name        string
+		lock        *storage.Lock
+		plan        *storage.Plan
+		environment string
+		want        bool
+	}{
+		{
+			name:        "disclosure shown for this environment is consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+			want:        true,
+		},
+		{
+			name:        "disclosure shown for another environment is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "production",
+			want:        false,
+		},
+		{
+			name:        "no disclosure is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: false, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+			want:        false,
+		},
+		{
+			name:        "a disclosure whose plan did not load is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        nil,
+			environment: "staging",
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, disclosureDescribesThisApply(tt.lock, tt.plan, tt.environment))
+		})
+	}
+}

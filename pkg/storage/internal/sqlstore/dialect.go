@@ -31,7 +31,8 @@ type Dialect interface {
 	UpsertClause(conflictColumns []string, assignments []UpsertAssignment) string
 	// ExcludedValue references the value from the row that failed to insert, for
 	// use inside an UpsertAssignment expression (MySQL: VALUES(col); Postgres:
-	// EXCLUDED.col).
+	// EXCLUDED.col). Custom expressions must table-qualify references to the
+	// target row because Postgres also has the EXCLUDED row in scope.
 	ExcludedValue(column string) string
 	// CurrentTimestamp returns the expression for the current time at the given
 	// fractional-second precision (MySQL: NOW() / NOW(6)).

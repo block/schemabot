@@ -231,6 +231,44 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 	})
 }
 
+// PreviewCommentPlanCopyDiscardedStopped renders the same discard on the
+// comment that stops an apply the operator confirmed themselves, when a copy
+// appeared after the comment they confirmed was posted. Nothing automatic was
+// in flight, so the notice names their own apply as what stopped.
+func PreviewCommentPlanCopyDiscardedStopped() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+		StoppedConfirmedApply:      true,
+	})
+}
+
 // PreviewCommentPlanCopyDiscardedApplying renders the same discard on a
 // comment that announces an apply already under way rather than asking for
 // confirmation. Nothing is being asked of the reader and the copy is already

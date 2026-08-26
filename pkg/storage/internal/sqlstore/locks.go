@@ -14,7 +14,7 @@ import (
 
 // lockColumns lists all columns for SELECT queries.
 const lockColumns = `id, database_name, database_type, repository, pull_request, owner,
-	pending_plan_id, created_at, updated_at`
+	pending_plan_id, disclosed_copy_discard, created_at, updated_at`
 
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
@@ -28,8 +28,8 @@ type lockStore struct {
 // apply-confirms) share the same owner and lock key, so both must succeed. A
 // non-empty lock.PendingPlanID then overwrites the stored one — the latest apply
 // or rollback attempt's confirmation plan must be the one the corresponding
-// confirm command loads. A re-acquire that passes an empty PendingPlanID (CLI)
-// leaves the existing value intact.
+// confirm command loads, and its disclosure record travels with it. A re-acquire
+// that passes an empty PendingPlanID (CLI) leaves the existing values intact.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	op := fmt.Sprintf("acquire lock for %s/%s owner=%s", lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	return withLockRetry(ctx, s.classifier, op, func() error {
@@ -50,7 +50,7 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 		if existing.Owner != lock.Owner {
 			return storage.ErrLockHeld
 		}
-		return s.refreshPendingPlanID(ctx, lock, existing)
+		return s.refreshPendingConfirmation(ctx, lock, existing)
 	}
 
 	// No lock yet — try to claim it. The UNIQUE(database_name, database_type)
@@ -58,9 +58,9 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 	// Get above. The INSERT loser sees a duplicate-key error, not a held lock:
 	// re-read and treat a same-owner winner as success.
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID)
+		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, lock.DisclosedCopyDiscard)
 	if err == nil {
 		return nil
 	}
@@ -82,13 +82,19 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 	if winner.Owner != lock.Owner {
 		return storage.ErrLockHeld
 	}
-	return s.refreshPendingPlanID(ctx, lock, winner)
+	return s.refreshPendingConfirmation(ctx, lock, winner)
 }
 
-// refreshPendingPlanID overwrites the stored confirmation plan reference when the
-// caller supplied a new one (an apply re-run posts a new confirmation plan).
-// The UPDATE is owner-scoped: it only changes the row while this owner still holds
-// the lock.
+// refreshPendingConfirmation overwrites the stored confirmation plan reference,
+// and the disclosure record that describes it, when the caller supplied a new
+// plan (an apply re-run posts a new confirmation plan). Both move in one
+// statement so the flag can never describe a plan other than the one the confirm
+// command will load. A caller supplying the same plan has nothing to change:
+// DisclosedCopyDiscard is a property of that plan's comment, so re-deriving it
+// cannot produce a different answer.
+//
+// The UPDATE is owner-scoped: it only changes the row while this owner still
+// holds the lock.
 //
 // RowsAffected==0 is ambiguous and must not be read as "the owner predicate no
 // longer matched". Under MySQL's default changed-rows semantics, a matched row
@@ -97,22 +103,22 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 // between this caller's read and its write. The owner still holds the lock in that
 // case, so the refresh has succeeded. To distinguish that from a genuine ownership
 // change, re-read the lock and branch on its actual state.
-func (s *lockStore) refreshPendingPlanID(ctx context.Context, lock, existing *storage.Lock) error {
+func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existing *storage.Lock) error {
 	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
 		return nil
 	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
-		SET pending_plan_id = ?, updated_at = NOW()
+		SET pending_plan_id = ?, disclosed_copy_discard = ?, updated_at = NOW()
 		WHERE database_name = ? AND database_type = ? AND owner = ?
-	`, lock.PendingPlanID, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+	`, lock.PendingPlanID, lock.DisclosedCopyDiscard, lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	if err != nil {
-		return fmt.Errorf("refresh pending_plan_id for %s/%s owner=%s: %w",
+		return fmt.Errorf("refresh pending confirmation for %s/%s owner=%s: %w",
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read rows affected refreshing pending_plan_id for %s/%s owner=%s: %w",
+		return fmt.Errorf("read rows affected refreshing pending confirmation for %s/%s owner=%s: %w",
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
 	}
 	if rowsAffected > 0 {
@@ -121,7 +127,7 @@ func (s *lockStore) refreshPendingPlanID(ctx context.Context, lock, existing *st
 
 	current, getErr := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if getErr != nil {
-		return fmt.Errorf("read lock after pending_plan_id refresh affected no rows for %s/%s owner=%s: %w",
+		return fmt.Errorf("read lock after pending confirmation refresh affected no rows for %s/%s owner=%s: %w",
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, getErr)
 	}
 	if current == nil {
@@ -309,7 +315,7 @@ func scanLockInto(s scanner) (*storage.Lock, error) {
 	err := s.Scan(
 		&lock.ID, &lock.DatabaseName, &lock.DatabaseType,
 		&lock.Repository, &lock.PullRequest, &lock.Owner,
-		&lock.PendingPlanID, &lock.CreatedAt, &lock.UpdatedAt,
+		&lock.PendingPlanID, &lock.DisclosedCopyDiscard, &lock.CreatedAt, &lock.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

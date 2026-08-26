@@ -8,6 +8,7 @@ package postgresconn
 
 import (
 	"context"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -48,9 +49,36 @@ func WithConnectTimeout(d time.Duration) Option {
 	}
 }
 
+// WithRootCAs pins the certificate authorities the connection trusts when the
+// DSN requests certificate verification, replacing the trust the DSN or the
+// RDS default would otherwise install. The caller parses the bundle, so a
+// missing or malformed bundle fails closed where it is resolved rather than
+// inside a later dial. A DSN that does not negotiate TLS carries no trust to
+// pin, so the option leaves it untouched. Pinning also removes pgx's
+// parse-time fallbacks (a plaintext retry under sslmode=prefer, a weaker TLS
+// retry under allow): a fallback would bypass the pinned bundle entirely, so
+// the connection either verifies against it or fails. The pin only takes
+// effect when the DSN verifies the server certificate (sslmode=verify-full or
+// verify-ca): require and prefer negotiate TLS without verification, so roots
+// pinned onto those modes are never consulted, just as a disable DSN
+// negotiates no TLS at all. Callers that must enforce the pin should gate on
+// VerifiesServerCertificate and refuse the other modes.
+func WithRootCAs(roots *x509.CertPool) Option {
+	return func(cfg *pgx.ConnConfig) {
+		if cfg.TLSConfig == nil {
+			return
+		}
+		cfg.TLSConfig.RootCAs = roots
+		cfg.Fallbacks = nil
+	}
+}
+
 // Open returns a PostgreSQL connection pool with SchemaBot's required
-// transport settings applied (see ConnectionDSN). Options customize the
-// parsed config (for example WithConnectTimeout) before the pool is opened.
+// transport settings applied (see ConnectionDSN). A DSN that requests
+// certificate verification against an RDS host without naming a root bundle
+// (sslmode=verify-full, no sslrootcert) verifies against the embedded RDS
+// global CA bundle. Options customize the parsed config (for example
+// WithConnectTimeout) before the pool is opened.
 func Open(dsn string, opts ...Option) (*sql.DB, error) {
 	cfg, err := connectionConfig(dsn, opts...)
 	if err != nil {
@@ -326,10 +354,59 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	if !hasRuntimeParam(cfg.RuntimeParams, "timezone") {
 		cfg.RuntimeParams["timezone"] = "UTC"
 	}
+	// A verifying TLS config (sslmode=verify-full) against an RDS host with no
+	// explicit sslrootcert would fall back to the ambient system trust store,
+	// which does not carry the private Amazon RDS roots — every handshake would
+	// fail with an unknown-authority error. Verify against the embedded RDS
+	// global bundle instead, matching the root pool pg-sprite's data-plane
+	// pools use, so both layers trust the same roots. sslmode=require is left
+	// untouched: pgx marks it InsecureSkipVerify (encrypted, unauthenticated),
+	// and injecting roots there would not change what it proves.
+	if tc := cfg.TLSConfig; tc != nil && !tc.InsecureSkipVerify && tc.RootCAs == nil && dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
+		roots, err := rdsRootPool()
+		if err != nil {
+			return nil, err
+		}
+		tc.RootCAs = roots
+	}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	return cfg, nil
+}
+
+// rdsRootPool returns the certificate pool holding the embedded AWS RDS global
+// CA bundle. RDS server certificates chain to private Amazon roots that no
+// system trust store carries, so verifying an RDS connection requires this
+// pool explicitly. The pool is built once and shared: it is read-only after
+// construction.
+var rdsRootPool = sync.OnceValues(func() (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(dbconn.GetEmbeddedRDSBundle()) {
+		return nil, fmt.Errorf("embedded RDS global CA bundle contains no usable certificates")
+	}
+	return pool, nil
+})
+
+// VerifiesServerCertificate reports whether the DSN's transport settings
+// authenticate the server certificate: sslmode=verify-full checks the chain
+// and hostname, and sslmode=verify-ca checks the chain through pgx's custom
+// verification callback (which pgx also applies to sslmode=require when the
+// DSN names an sslrootcert, matching libpq). require and prefer otherwise
+// encrypt without authenticating, allow's first attempt and disable carry no
+// TLS at all — trust pinned onto any of those modes is never consulted. The
+// DSN is normalized the same way Open normalizes it, so an RDS host with no
+// explicit sslmode is judged by the injected mode.
+func VerifiesServerCertificate(dsn string) (bool, error) {
+	cfg, err := connectionConfig(dsn)
+	if err != nil {
+		return false, err
+	}
+	tc := cfg.TLSConfig
+	if tc == nil {
+		return false, nil
+	}
+	return !tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil, nil
 }
 
 // hasRuntimeParam reports whether params carries key under PostgreSQL's
@@ -358,7 +435,9 @@ func ConnectionDSN(dsn string) (string, error) {
 	if err != nil {
 		return "", dsnParseError(err)
 	}
-	if !dbconn.IsRDSHost(cfg.Host) {
+	// DNS names are case-insensitive, so an uppercase RDS endpoint must get
+	// the same injection.
+	if !dbconn.IsRDSHost(strings.ToLower(cfg.Host)) {
 		return dsn, nil
 	}
 	if isURLForm(dsn) {

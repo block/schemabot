@@ -55,7 +55,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			{Column: "conclusion"},
 			{Column: "blocking_reason"},
 			{Column: "error_message"},
-			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
+			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), checks.change_summary)"},
 			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
 	)
@@ -122,6 +122,12 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 		// run id so the current-head aggregate stays aligned, but it must not clear
 		// the block's conclusion, blocking reason, or summary. Only a write that
 		// re-ran the rollup (clean or blocked) rewrites those columns.
+		// Every CASE predicate reads the stored blocking_reason: preservation
+		// keys on the existing block, never on the incoming write. MySQL
+		// evaluates SET assignments left to right and later expressions see
+		// already-assigned values, while PostgreSQL evaluates every right-hand
+		// side against the old row — so blocking_reason is assigned after every
+		// CASE that reads it, keeping both dialects reading the stored value.
 		if drift == storage.PlanDriftNotEvaluated {
 			_, err = s.db.ExecContext(ctx, `
 				UPDATE checks
@@ -131,9 +137,9 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
 				    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
 				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
-				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
 				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
 				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
+				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
 				    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 				WHERE repository = ? AND pull_request = ?
 				  AND environment = ? AND database_type = ? AND database_name = ?
@@ -143,9 +149,9 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
 				storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
 				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 				checkStatusInProgress)
 			return err

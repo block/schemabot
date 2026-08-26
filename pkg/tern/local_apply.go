@@ -28,18 +28,22 @@ import (
 // dispatch's siblings, not conflicts: the apply already holds the database's
 // reservation and the driver orders sibling work, so only other applies'
 // active work blocks the attach.
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string, attachApplyID int64) error {
+//
+// The conflict that refused the dispatch is returned alongside the error, so a
+// caller that can resolve into the holding apply rather than be refused by it
+// has the apply in hand without repeating the scan.
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string, attachApplyID int64) (blockingTask, error) {
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
 		if err != nil {
-			return fmt.Errorf("check existing tasks: %w", err)
+			return blockingTask{}, fmt.Errorf("check existing tasks: %w", err)
 		}
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
 		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard, attachApplyID)
 		if !blocking.blocks() {
-			return nil
+			return blockingTask{}, nil
 		}
 
 		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
@@ -47,7 +51,7 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 		if attempt < 9 {
 			c.logger.Debug("found potentially stale active task, retrying",
 				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
-				"apply_id", blocking.applyIdentifier, "apply_state", blocking.applyState,
+				"apply_id", blocking.applyIdentifier(), "apply_state", blocking.applyStateName(),
 				"attempt", attempt)
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -56,10 +60,10 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 		// The refusal is what the operator sees when an apply dies on arrival, so
 		// it names the apply holding the database rather than only the task, which
 		// on its own gives them nothing to act on.
-		return fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
+		return blocking, fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
 			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
-	return nil
+	return blockingTask{}, nil
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.
@@ -120,46 +124,58 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 
 // blockingTask names the active work that refuses a new apply on a database,
 // in the terms an operator needs to clear it: what is being changed, which task
-// tracks it, which apply owns that task, and what that apply is doing.
+// tracks it, and the apply that owns that task.
 //
-// applyIdentifier and applyState are empty when the apply could not be loaded.
-// That task still blocks — the conflict check fails closed — so the conflict is
-// reported by task alone rather than being suppressed.
+// apply is nil when it could not be loaded. That task still blocks — the
+// conflict check fails closed — so the conflict is reported by task alone
+// rather than being suppressed.
 type blockingTask struct {
-	taskIdentifier  string
-	table           string
-	shard           string
-	applyIdentifier string
-	applyState      string
+	taskIdentifier string
+	table          string
+	shard          string
+	apply          *storage.Apply
 }
 
 // newBlockingTask records the conflicting task, and the apply that owns it when
 // that apply could be loaded.
 func newBlockingTask(t *storage.Task, apply *storage.Apply) blockingTask {
-	b := blockingTask{
+	return blockingTask{
 		taskIdentifier: t.TaskIdentifier,
 		table:          t.TableName,
 		shard:          t.Shard,
+		apply:          apply,
 	}
-	if apply != nil {
-		b.applyIdentifier = apply.ApplyIdentifier
-		b.applyState = apply.State
-	}
-	return b
 }
 
 // blocks reports whether a conflicting task was found.
 func (b blockingTask) blocks() bool { return b.taskIdentifier != "" }
 
+// applyIdentifier and applyStateName name the holding apply for logs, empty
+// when it could not be loaded, so a triage line reports the conflict by task
+// alone rather than dropping the log or dereferencing a missing apply.
+func (b blockingTask) applyIdentifier() string {
+	if b.apply == nil {
+		return ""
+	}
+	return b.apply.ApplyIdentifier
+}
+
+func (b blockingTask) applyStateName() string {
+	if b.apply == nil {
+		return ""
+	}
+	return b.apply.State
+}
+
 // describe renders the conflict for an operator: what holds the database, and
 // where to go to clear it.
 func (b blockingTask) describe() string {
-	if b.applyIdentifier == "" {
+	if b.apply == nil {
 		return b.subject() + " is held by an apply that could not be loaded"
 	}
 
 	described := fmt.Sprintf("%s is held by apply %s (%s)",
-		b.subject(), b.applyIdentifier, b.applyState)
+		b.subject(), b.apply.ApplyIdentifier, b.apply.State)
 	if resolution := b.resolution(); resolution != "" {
 		return described + "; " + resolution
 	}
@@ -207,18 +223,21 @@ func (b blockingTask) subject() string {
 // guess — the state is still named, and inventing an action for a state whose
 // next move is not certain would send an operator the wrong way.
 func (b blockingTask) resolution() string {
+	if b.apply == nil {
+		return ""
+	}
 	switch {
-	case state.IsState(b.applyState, state.Apply.Stopped):
+	case state.IsState(b.apply.State, state.Apply.Stopped):
 		return "it holds the database until it is started or cancelled"
-	case state.IsState(b.applyState, state.Apply.FailedRetryable):
+	case state.IsState(b.apply.State, state.Apply.FailedRetryable):
 		return "it holds the database until it is retried or cancelled"
-	case state.IsState(b.applyState, state.Apply.WaitingForCutover):
+	case state.IsState(b.apply.State, state.Apply.WaitingForCutover):
 		return "it holds the database until it is cut over or cancelled"
-	case state.IsState(b.applyState, state.Apply.RevertWindow):
+	case state.IsState(b.apply.State, state.Apply.RevertWindow):
 		return "it holds the database until it is reverted or skip-reverted"
-	case state.IsState(b.applyState, state.Apply.Reverting, state.Apply.SkippingRevert):
+	case state.IsState(b.apply.State, state.Apply.Reverting, state.Apply.SkippingRevert):
 		return "it releases the database when the revert finishes, which it does on its own"
-	case state.IsRunningApplyState(b.applyState):
+	case state.IsRunningApplyState(b.apply.State):
 		return "it releases the database when it finishes, unless it parks for cutover first"
 	default:
 		return ""
