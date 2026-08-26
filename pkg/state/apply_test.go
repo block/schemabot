@@ -104,9 +104,10 @@ func TestDeriveApplyState_AnyRunning(t *testing.T) {
 }
 
 // The post-copy phases surface at the apply level as the least-advanced
-// active phase: while any table is still copying rows the apply is Running;
-// once every active table is draining or verifying, the apply names that
-// phase. Any table still copying dominates a more-advanced sibling's phase.
+// active phase, and only once every table has started: while any table is
+// still copying rows — or still queued with its whole copy ahead of it — the
+// apply is Running. Any table still copying dominates a more-advanced
+// sibling's phase.
 func TestDeriveApplyState_PostCopyPhases(t *testing.T) {
 	testCases := []struct {
 		states   []string
@@ -125,12 +126,22 @@ func TestDeriveApplyState_PostCopyPhases(t *testing.T) {
 		// The least-advanced phase wins across mixed drains.
 		{[]string{"catching_up", "checksumming"}, Apply.CatchingUp},
 		{[]string{"checksumming", "post_checksum"}, Apply.Checksumming},
-		// Completed and pending siblings do not mask the active phase.
-		{[]string{"COMPLETED", "checksumming", "PENDING"}, Apply.Checksumming},
-		{[]string{"COMPLETED", "catching_up", "PENDING"}, Apply.CatchingUp},
-		{[]string{"COMPLETED", "post_checksum", "PENDING"}, Apply.PostChecksum},
+		// A queued sibling keeps the apply Running: its whole copy is still
+		// ahead, so naming a sibling's drain phase would overstate progress.
+		{[]string{"checksumming", "PENDING"}, Apply.Running},
+		{[]string{"catching_up", "PENDING"}, Apply.Running},
+		{[]string{"post_checksum", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "checksumming", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "catching_up", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "post_checksum", "PENDING"}, Apply.Running},
+		// A completed sibling alone does not mask the active phase.
+		{[]string{"COMPLETED", "checksumming"}, Apply.Checksumming},
+		{[]string{"COMPLETED", "catching_up"}, Apply.CatchingUp},
+		{[]string{"COMPLETED", "post_checksum"}, Apply.PostChecksum},
 		// A table already cutting over outranks a sibling's drain.
 		{[]string{"CUTTING_OVER", "post_checksum"}, Apply.CuttingOver},
+		// Pending tasks with no active sibling stay Pending, not Running.
+		{[]string{"PENDING", "PENDING"}, Apply.Pending},
 	}
 
 	for _, tc := range testCases {
