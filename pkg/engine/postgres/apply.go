@@ -64,6 +64,15 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
 	}
+	// The bundle itself is held to the same bar: an unreadable or
+	// certificate-free bundle can never dial, so it refuses the apply here
+	// rather than failing the background drive. This proves the reference is
+	// honorable at acceptance; the pool re-reads the path when it dials.
+	if caPath != "" {
+		if _, err := loadCABundle(caPath); err != nil {
+			return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
+		}
+	}
 
 	started := time.Now()
 	key := progressIdentity(req.ResumeState)

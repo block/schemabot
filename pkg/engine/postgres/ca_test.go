@@ -45,6 +45,11 @@ func TestCACertPath(t *testing.T) {
 			wantErr:  "names no path",
 		},
 		{
+			name:     "relative file reference is refused",
+			metadata: map[string]string{metadataCARef: "file:ca.pem"},
+			wantErr:  "requires an absolute path",
+		},
+		{
 			name:     "unknown reference is refused",
 			metadata: map[string]string{metadataCARef: "vault:some-ca"},
 			wantErr:  "unsupported reference",
@@ -127,6 +132,28 @@ func TestApplyRefusesUnknownCAReferenceAtAcceptance(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported reference")
+}
+
+// A file-referenced bundle the pool could never trust — missing here — refuses
+// the apply at acceptance instead of failing later inside the background
+// drive.
+func TestApplyRefusesUnreadableCABundleAtAcceptance(t *testing.T) {
+	eng := New()
+	_, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{
+			Namespace: "public",
+			TableChanges: []engine.TableChange{{
+				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
+			}},
+		}},
+		Credentials: &engine.Credentials{
+			DSN:      "postgres://localhost/app",
+			Metadata: map[string]string{metadataCARef: "file:" + filepath.Join(t.TempDir(), "absent.pem")},
+		},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read PostgreSQL CA bundle")
 }
 
 // testCAPEM returns a self-signed CA certificate in PEM form.
