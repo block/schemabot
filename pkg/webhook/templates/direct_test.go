@@ -24,7 +24,7 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚙️ **Direct execution**: **1** change will run as native MySQL DDL")
+	assert.Contains(t, plan, "⚙️ **Direct execution**: 1 change will run as native MySQL DDL")
 	assert.Contains(t, plan, "`users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows")
 	assert.Contains(t, plan, "the change is **not revertible**")
 	assert.Contains(t, plan, "`--defer-cutover` does not apply")
@@ -121,7 +121,7 @@ func TestRenderBlockedChangesApplyRejected(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "**⛔ Apply rejected**: **1** planned change the schema-change engine refuses to execute")
+	assert.Contains(t, out, "**⛔ Apply rejected**: 1 planned change the schema-change engine refuses to execute")
 	assert.Contains(t, out, "`users`: dropping primary key is not supported")
 	assert.Contains(t, out, "above the configured limit of 1,000,000")
 	assert.Contains(t, out, "Fix what each reason names")

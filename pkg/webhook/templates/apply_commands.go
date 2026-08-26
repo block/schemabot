@@ -176,7 +176,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
-	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: **%d** unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
+	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	for _, c := range data.UnsafeChanges {
 		writeUnsafeChangeItem(&sb, "`"+c.Table+"`", c.Reason)
 	}
@@ -226,7 +226,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
-	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: **%d** planned %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {

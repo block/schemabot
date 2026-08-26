@@ -82,7 +82,7 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alread
 	if alreadyApplying {
 		marker, subject = glyph.Info, "This apply"
 	}
-	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target\n",
+	fmt.Fprintf(sb, "%s **%s destroys work in progress**: %d unfinished %s on the target\n",
 		marker, subject, n, copyNoun(n))
 	writeExistingCopyEntries(sb, copies)
 	if alreadyApplying {
@@ -110,7 +110,7 @@ func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 	if alreadyApplying {
 		subject = "This apply picks"
 	}
-	fmt.Fprintf(sb, "♻️ **Resuming work in progress**: **%d** unfinished %s on the target will be continued\n",
+	fmt.Fprintf(sb, "♻️ **Resuming work in progress**: %d unfinished %s on the target will be continued\n",
 		n, copyNoun(n))
 	writeExistingCopyEntries(sb, copies)
 	fmt.Fprintf(sb, "\n%s up where the existing %s stopped rather than starting over.\n\n", subject, copyNoun(n))
@@ -137,7 +137,7 @@ func writeRunningCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 	if alreadyApplying {
 		subject = "This apply joined"
 	}
-	fmt.Fprintf(sb, "♻️ **Work already in progress**: **%d** unfinished %s still running on the target\n",
+	fmt.Fprintf(sb, "♻️ **Work already in progress**: %d unfinished %s still running on the target\n",
 		n, copyNoun(n))
 	writeExistingCopyEntries(sb, copies)
 	fmt.Fprintf(sb, "\n%s the %s already running rather than starting %s: every row copied so far is kept, and no second %s is made.\n\n",

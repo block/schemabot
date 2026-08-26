@@ -423,7 +423,7 @@ func attributionStillActionable(data PlanCommentData) bool {
 // that last changed it, never the specific column or index.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	fmt.Fprintf(sb, "🛑 **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
 	for _, d := range changes {
 		if d.Unresolved {
 			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
@@ -909,7 +909,7 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 // unsupported shape needs a rewrite, a missing grant needs provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: **%d** %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -952,7 +952,7 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
 	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
 	n := len(changes)
-	fmt.Fprintf(sb, "⚙️ **Direct execution**: **%d** %s will run as %s\n", n, pluralize("change", n), headerNoun)
+	fmt.Fprintf(sb, "⚙️ **Direct execution**: %d %s will run as %s\n", n, pluralize("change", n), headerNoun)
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -969,7 +969,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := countUnsafeFindings(changes)
-	fmt.Fprintf(sb, glyph.Attention+" **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -1103,7 +1103,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	n := len(warnings)
 
 	if n <= lintWarningsFoldThreshold {
-		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: **%d** advisory %s\n", n, pluralize("finding", n))
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %d advisory %s\n", n, pluralize("finding", n))
 		for _, w := range warnings {
 			message := ui.CodeQuoteIdentifiers(w.Message)
 			if w.Table != "" {
@@ -1118,7 +1118,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: <b>%d</b> advisory %s</summary>\n\n", n, pluralize("finding", n))
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %d advisory %s</summary>\n\n", n, pluralize("finding", n))
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**`%s`**\n", group.table)
