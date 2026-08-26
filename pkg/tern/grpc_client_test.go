@@ -918,7 +918,9 @@ func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationI
 	if m.getByOperationIDErr != nil {
 		return nil, m.getByOperationIDErr
 	}
-	var scoped []*storage.Task
+	// The real store returns a non-nil empty slice when an operation owns no
+	// tasks, and callers are entitled to rely on that.
+	scoped := make([]*storage.Task, 0, len(m.tasks))
 	for _, task := range m.tasks {
 		if task.ApplyOperationID != nil && *task.ApplyOperationID == applyOperationID {
 			scoped = append(scoped, task)
@@ -1411,8 +1413,15 @@ func TestGRPCClient_ResumeApplyOperationDispatchesScopedTasks(t *testing.T) {
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-op-scoped",
 		}},
+		// The real task query joins a work operation to its tasks on
+		// operation_key = namespace/shard/table_name, so the operation carries the
+		// key its task derives — a keyless operation owns no task rows.
 		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
-			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "testdb-deployment", State: state.ApplyOperation.Pending},
+			operationID: {
+				ID: operationID, ApplyID: apply.ID, Deployment: "testdb-deployment",
+				OperationKind: storage.ApplyOperationKindWork, OperationKey: "default/-80/users",
+				State: state.ApplyOperation.Pending,
+			},
 		}},
 	}
 
@@ -1483,16 +1492,23 @@ func TestGRPCClient_SiblingShardOperationsRecordOneRemoteApply(t *testing.T) {
 		operations: operationStore,
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
+	// Each dispatch is poll-driven and costs at least one progress tick, so
+	// give every drive its own deadline rather than sharing one across both.
+	driveCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(t.Context(), 2*time.Second)
+	}
 
-	require.NoError(t, client.ResumeApplyOperation(ctx, apply, opA))
+	firstCtx, cancelFirst := driveCtx()
+	defer cancelFirst()
+	require.NoError(t, client.ResumeApplyOperation(firstCtx, apply, opA))
 	firstReq := server.getApplyRequest()
 	require.NotNil(t, firstReq, "the first shard operation must dispatch to the data plane")
 	assert.Equal(t, []string{"-80"}, firstReq.TargetShards)
 	assert.Equal(t, "remote-shared-1", operationStore.ops[opA].ExternalID)
 
-	require.NoError(t, client.ResumeApplyOperation(ctx, apply, opB))
+	secondCtx, cancelSecond := driveCtx()
+	defer cancelSecond()
+	require.NoError(t, client.ResumeApplyOperation(secondCtx, apply, opB))
 	secondReq := server.getApplyRequest()
 	require.NotNil(t, secondReq, "the sibling shard operation must dispatch to the data plane")
 	assert.Equal(t, []string{"80-"}, secondReq.TargetShards)
@@ -1500,6 +1516,15 @@ func TestGRPCClient_SiblingShardOperationsRecordOneRemoteApply(t *testing.T) {
 	require.NotEmpty(t, firstReq.IdempotencyKey)
 	assert.Equal(t, firstReq.IdempotencyKey, secondReq.IdempotencyKey,
 		"sibling dispatches must carry the deployment-keyed idempotency key so the data plane attaches them into one apply")
+
+	// The idempotency key routes a sibling into the shared apply; the generation
+	// manifest is what makes that apply wait for the siblings still to come, so
+	// both dispatches must declare the deployment's whole operation set.
+	expectedManifest := []string{"commerce/-80/users", "commerce/80-/users"}
+	assert.Equal(t, expectedManifest, firstReq.GenerationOperationKeys,
+		"the dispatch that creates the shared apply must declare every sibling it will wait for")
+	assert.Equal(t, expectedManifest, secondReq.GenerationOperationKeys,
+		"an attaching sibling must declare the same generation manifest so the data plane can verify agreement")
 
 	assert.Equal(t, "remote-shared-1", operationStore.ops[opA].ExternalID)
 	assert.Equal(t, "remote-shared-1", operationStore.ops[opB].ExternalID,
