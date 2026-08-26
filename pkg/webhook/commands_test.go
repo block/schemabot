@@ -109,6 +109,24 @@ func TestHasDatabaseFlag(t *testing.T) {
 	p := NewCommandParser()
 	assert.True(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging -d users"))
 	assert.False(t, p.HasDatabaseFlag("schemabot rollback apply_abc123 -e staging"))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasDatabaseFlag("schemabot stop apply_abc123 -e production\n\nthe plan only touches -d accounts"))
+	assert.False(t, p.HasDatabaseFlag("schemabot stop apply_abc123 -e production\n\n```\nschemabot unlock -d accounts\n```\n"))
+	assert.False(t, p.HasDatabaseFlag("try passing -d accounts next time"))
+}
+
+func TestHasDeferCutoverFlag(t *testing.T) {
+	p := NewCommandParser()
+	assert.True(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging --defer-cutover"))
+	assert.False(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging"))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging\n\nlast time we used --defer-cutover here"))
+	assert.False(t, p.HasDeferCutoverFlag("schemabot rollback apply_abc123 -e staging\n\n```\nschemabot rollback-confirm -e staging --defer-cutover\n```\n"))
+	assert.False(t, p.HasDeferCutoverFlag("we could pass --defer-cutover here"))
 }
 
 func TestParseTenantFlag(t *testing.T) {

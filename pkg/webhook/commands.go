@@ -372,14 +372,26 @@ func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 	return p.autoConfirmRegex.MatchString(directive)
 }
 
-// HasDatabaseFlag reports whether the body contains a `-d <database>` flag,
-// regardless of which command it accompanies.
+// HasDatabaseFlag reports whether the command carries a `-d <database>` flag,
+// regardless of which command it accompanies. Like HasAutoConfirmFlag, the
+// answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from: prose or a fenced CLI example
+// mentioning the flag describes it, not passes it.
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
-	return p.databaseRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.databaseRegex.MatchString(directive)
 }
 
-// HasDeferCutoverFlag reports whether the body contains `--defer-cutover`,
-// regardless of which command it accompanies.
+// HasDeferCutoverFlag reports whether the command carries `--defer-cutover`,
+// regardless of which command it accompanies. Read off the directive line for
+// the same reason as HasDatabaseFlag.
 func (p *CommandParser) HasDeferCutoverFlag(body string) bool {
-	return p.deferCutoverRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.deferCutoverRegex.MatchString(directive)
 }
