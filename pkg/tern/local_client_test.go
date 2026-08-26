@@ -17,6 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -3766,12 +3767,14 @@ func TestNewLocalClientUsesPostgresEngine(t *testing.T) {
 
 func TestNewLocalClientConfiguresPostgresTableSizeLimit(t *testing.T) {
 	c, err := NewLocalClient(LocalConfig{
-		Database:                         "orders",
-		Type:                             storage.DatabaseTypePostgres,
-		PostgresNativeSafeTableSizeLimit: 4 << 30,
+		Database:                              "orders",
+		Type:                                  storage.DatabaseTypePostgres,
+		PostgresNativeSafeTableSizeLimitBytes: 4 << 30,
 	}, nil, slog.Default())
 	require.NoError(t, err)
-	assert.Equal(t, storage.EnginePostgres, c.getEngine().Name())
+	eng, ok := c.getEngine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, int64(4<<30), eng.TableSizeLimit())
 }
 
 // A type with no built-in engine and no registered factory fails closed.

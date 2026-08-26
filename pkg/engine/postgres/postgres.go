@@ -54,6 +54,11 @@ func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
 	return &Engine{tableSizeLimit: tableSizeLimit}
 }
 
+// TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.
+func (e *Engine) TableSizeLimit() int64 {
+	return e.tableSizeLimit
+}
+
 // Name returns the engine identifier.
 func (e *Engine) Name() string {
 	return "postgres"

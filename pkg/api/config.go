@@ -1107,7 +1107,8 @@ type PlanetScaleMTLSConfig struct {
 // PostgresConfig holds process-wide settings for the PostgreSQL engine.
 type PostgresConfig struct {
 	// NativeSafeTableSizeLimitBytes is the largest table on which the engine
-	// will execute native-safe DDL. When unset, the limit is 1 GiB.
+	// will execute native-safe DDL. When unset,
+	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
 	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
 }
 

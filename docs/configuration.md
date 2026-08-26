@@ -20,6 +20,7 @@
 - [Storage Dialect](#storage-dialect)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
+- [Postgres](#postgres)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -580,6 +581,24 @@ A database can override the server-level value by setting the same key
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+## Postgres
+
+The `postgres:` block sets the largest table on which the PostgreSQL engine
+will execute native-safe DDL. The limit is expressed in bytes and defaults to
+1 GiB:
+
+```yaml
+postgres:
+  native_safe_table_size_limit_bytes: 4294967296
+```
+
+The server fails startup validation when
+`native_safe_table_size_limit_bytes` is zero or negative.
+
+These settings only apply where this server constructs the PostgreSQL engine
+itself — local-mode PostgreSQL databases. Databases routed to a remote
+deployment over gRPC run with that deployment's engine settings.
 
 ## PlanetScale mTLS
 

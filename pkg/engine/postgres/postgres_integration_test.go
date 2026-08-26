@@ -110,6 +110,23 @@ func TestEngineApplyTableNotFoundRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "missing_users")
 }
 
+// TestEngineApplyTableSizeRefusal proves the configured native-safe ceiling
+// reaches preflight and permanently refuses an ALTER when the table exceeds it.
+func TestEngineApplyTableSizeRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "size_limit_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := NewWithTableSizeLimit(1)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+}
+
 // TestEngineApplyOperationalFailure proves an execution-path error — here an
 // unreachable target — remains a failed operation rather than being
 // misclassified as a safety refusal.

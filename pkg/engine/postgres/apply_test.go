@@ -76,17 +76,6 @@ func TestClassifyRefusal(t *testing.T) {
 	}
 }
 
-func TestConfiguredTableSizeLimitIsReportedInRefusal(t *testing.T) {
-	const limit = int64(4 << 30)
-	eng := NewWithTableSizeLimit(limit)
-	assert.Equal(t, limit, eng.tableSizeLimit)
-
-	r := classifyRefusal(&preflight.SizeError{TotalBytes: limit + 1, LimitBytes: eng.tableSizeLimit}, "users")
-	require.NotNil(t, r)
-	assert.Equal(t, "table-too-large", r.reason)
-	assert.Contains(t, r.detail, "4294967296-byte threshold")
-}
-
 // TestProgressIsKeyedToTheRequestingApply proves the engine answers Progress
 // for the apply the caller identifies, not for whichever apply wrote last:
 // one engine is shared for a target's lifetime, so a mismatched identity must
@@ -186,7 +175,7 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 		caCertPath: filepath.Join(t.TempDir(), "missing.pem"),
 	}
 
-	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"})
+	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")
