@@ -243,14 +243,22 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 				"reason", r.reason,
 				"ddl", r.change.DDL,
 			}
-			if r.splitFrom != "" {
+			switch {
+			case r.splitErr != nil:
+				logger.Warn("refusing an unsafe storage-schema ALTER whole because its clauses could not be partitioned; no clause of it will run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
+					append(attrs, "split_error", r.splitErr)...)
+			case r.splitFrom != "":
 				logger.Warn("refusing destructive clauses of a mixed storage-schema ALTER; the destructive clauses will not run, the safe clauses still execute, and startup continues — set storage.allow_destructive_schema_changes: true to allow them",
 					append(attrs, "split_from_ddl", r.splitFrom)...)
-			} else {
+			default:
 				logger.Warn("refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
 					attrs...)
 			}
-			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation))
+			scope := metrics.StorageSchemaRefusalWhole
+			if r.splitFrom != "" {
+				scope = metrics.StorageSchemaRefusalSplit
+			}
+			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation), scope)
 		}
 		if len(allowed) == 0 {
 			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
@@ -357,6 +365,10 @@ type refusedStorageChange struct {
 	// splitFrom is the combined ALTER TABLE statement the refused clauses
 	// were split out of; empty when the whole statement was refused.
 	splitFrom string
+	// splitErr is the error that prevented partitioning an unsafe ALTER into
+	// safe and destructive clauses; when set, the statement was refused whole
+	// so no clause of it executed.
+	splitErr error
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
@@ -378,9 +390,11 @@ type refusedStorageChange struct {
 // still execute, and only the destructive clauses are refused. Clauses that
 // cannot run without a refused clause (the ADD PRIMARY KEY half of a
 // primary-key change) are refused with it, so the executed remainder is
-// always independently runnable. A split that cannot be performed fails
-// startup — classification or partitioning uncertainty must never widen what
-// the bootstrap will execute.
+// always independently runnable. A split that cannot be performed falls back
+// to refusing the statement whole: that executes strictly less than any
+// split would, so partitioning uncertainty never widens what the bootstrap
+// will execute — and startup survives it, where failing would crash-loop
+// every pod whose pending ALTER the splitter cannot partition.
 func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
 	for _, sc := range changes {
 		kept := sc
@@ -395,9 +409,15 @@ func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engin
 				continue
 			}
 			if tc.Operation == ddl.StatementAlterTable {
-				safeDDL, unsafeDDL, err := ddl.SplitUnsafeAlter(tc.DDL)
-				if err != nil {
-					return nil, nil, fmt.Errorf("split unsafe storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
+				safeDDL, unsafeDDL, splitErr := ddl.SplitUnsafeAlter(tc.DDL)
+				if splitErr != nil {
+					// Refusing the statement whole executes strictly less
+					// than any split would, so the failed split cannot widen
+					// what the bootstrap executes — and startup proceeds,
+					// which is the reason this path exists. The caller logs
+					// the fallback with the split error.
+					refused = append(refused, refusedStorageChange{change: tc, reason: reason, splitErr: splitErr})
+					continue
 				}
 				if safeDDL != "" {
 					// A mixed ALTER: execute the clauses that lose nothing and
