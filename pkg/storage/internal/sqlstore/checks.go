@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -54,7 +55,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 			{Column: "conclusion"},
 			{Column: "blocking_reason"},
 			{Column: "error_message"},
-			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), change_summary)"},
+			{Column: "change_summary", Expr: "COALESCE(NULLIF(" + s.dialect.ExcludedValue("change_summary") + ", ''), checks.change_summary)"},
 			{Column: "updated_at", Expr: s.dialect.CurrentTimestamp(TimestampPrecisionDefault)},
 		},
 	)
@@ -121,6 +122,12 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 		// run id so the current-head aggregate stays aligned, but it must not clear
 		// the block's conclusion, blocking reason, or summary. Only a write that
 		// re-ran the rollup (clean or blocked) rewrites those columns.
+		// Every CASE predicate reads the stored blocking_reason: preservation
+		// keys on the existing block, never on the incoming write. MySQL
+		// evaluates SET assignments left to right and later expressions see
+		// already-assigned values, while PostgreSQL evaluates every right-hand
+		// side against the old row — so blocking_reason is assigned after every
+		// CASE that reads it, keeping both dialects reading the stored value.
 		if drift == storage.PlanDriftNotEvaluated {
 			_, err = s.db.ExecContext(ctx, `
 				UPDATE checks
@@ -130,9 +137,9 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
 				    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
 				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
-				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
 				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
 				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
+				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
 				    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 				WHERE repository = ? AND pull_request = ?
 				  AND environment = ? AND database_type = ? AND database_name = ?
@@ -142,9 +149,9 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
 				storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
+				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
 				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 				checkStatusInProgress)
 			return err
@@ -390,23 +397,29 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 	return rows > 0, nil
 }
 
-// MarkActionRequiredForApply marks stored check state action_required after a
-// rollback only if no apply newer than the rollback exists for the same
-// PR/environment/database. Unlike CompleteForApply, the write does not require
-// the row to be owned by the rollback apply: a rollback that never claimed the
-// row (its claim failed or the driver crashed before it landed) must still be
-// able to block a stale successful check left over from the apply it reverted.
-// Rows owned by an older apply or with no owner qualify; the newer-apply guard
-// is what protects a re-apply that started after the rollback.
+// MarkActionRequiredForApply marks stored check state action_required for a
+// terminal apply only if no newer apply exists for the same target. Unlike
+// CompleteForApply, the write does not require the row to be owned by this
+// apply: a completed rollback whose claim never landed must still block stale
+// success, while a safely cancelled forward apply must release retained
+// ownership. Rows owned by an older apply or with no owner qualify; the
+// newer-apply guard protects work that started after this terminal outcome.
+// Cancelled forward applies additionally require that no completed forward
+// task exists under this or an earlier apply for the target.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
 	leasePredicate := ""
+	completedTaskPredicate := ""
 	args := []any{check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 		apply.ID, apply.ID}
+	if state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback() {
+		completedTaskPredicate = s.completedForwardTaskPredicate(false)
+		args = append(args, apply.ID, state.Task.Completed)
+	}
 	lease := apply.Lease()
 	if lease.Valid() {
 		leasePredicate = `
@@ -442,7 +455,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		      AND newer.database_type = checks.database_type
 		      AND newer.database_name = checks.database_name
 		      AND newer.id > ?
-		  )`+leasePredicate+`
+		  )`+completedTaskPredicate+leasePredicate+`
 	`, args...)
 	if err != nil {
 		return false, err
@@ -458,6 +471,99 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 		}
 	}
 	return rows > 0, nil
+}
+
+// MarkCancelledApplyFailed records the terminal blocked state for a cancelled
+// forward apply when completed task history proves that the target may have
+// changed, and claims the row for that apply. Like MarkActionRequiredForApply
+// the write does not require the row to already be owned by this apply: a
+// cancelled apply whose claim never landed still has to block the stale check
+// left behind by the apply that owns the row. Rows owned by an older apply or
+// with no owner qualify; the newer-apply guard protects work that started
+// after the cancellation, and the completed-task predicate keeps a
+// cancellation that is safe to release from being retained here.
+func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	var checkRunID any
+	if check.CheckRunID != 0 {
+		checkRunID = check.CheckRunID
+	}
+	leasePredicate := ""
+	args := []any{check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary,
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		apply.ID, apply.ID, apply.ID, state.Task.Completed}
+	lease := apply.Lease()
+	if lease.Valid() {
+		leasePredicate = `
+		  AND EXISTS (
+		    SELECT 1
+		    FROM applies lease_apply
+		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
+		  )`
+		args = append(args, lease.ApplyID, lease.Token)
+	}
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET head_sha = ?,
+		    check_run_id = ?,
+		    apply_id = ?,
+		    has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?,
+		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND (apply_id IS NULL OR apply_id <= ?)
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM applies newer
+		    WHERE newer.repository = checks.repository
+		      AND newer.pull_request = checks.pull_request
+		      AND newer.environment = checks.environment
+		      AND newer.database_type = checks.database_type
+		      AND newer.database_name = checks.database_name
+		      AND newer.id > ?
+		  )`+s.completedForwardTaskPredicate(true)+leasePredicate+`
+	`, args...)
+	if err != nil {
+		return false, err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows == 0 && lease.Valid() {
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return false, err
+		}
+	}
+	return rows > 0, nil
+}
+
+func (s *checkStore) completedForwardTaskPredicate(required bool) string {
+	exists := "NOT EXISTS"
+	if required {
+		exists = "EXISTS"
+	}
+	rollbackApply := s.dialect.JSONBooleanIsTrue("task_apply.options", []string{"rollback"})
+	return `
+		  AND ` + exists + ` (
+		    SELECT 1
+		    FROM tasks completed_task
+		    JOIN applies task_apply ON task_apply.id = completed_task.apply_id
+		    WHERE task_apply.repository = checks.repository
+		      AND task_apply.pull_request = checks.pull_request
+		      AND task_apply.environment = checks.environment
+		      AND task_apply.database_type = checks.database_type
+		      AND task_apply.database_name = checks.database_name
+		      AND task_apply.id <= ?
+		      AND completed_task.state = ?
+		      AND NOT ` + rollbackApply + `
+		  )`
 }
 
 // Get returns a check by its unique key (PR + env + database), or nil if not found.

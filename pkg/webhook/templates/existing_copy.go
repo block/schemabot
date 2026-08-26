@@ -74,9 +74,8 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alread
 		sb.WriteString("\n")
 		return
 	}
-	fmt.Fprintf(sb, "\nApplying copies the tables above again from zero rows, so it runs as long as a first copy would; "+
-		"the work already done is lost and cannot be recovered. "+
-		"To continue the existing %s instead, apply the same schema %s that started %s.\n\n",
+	fmt.Fprintf(sb, "\nApplying restarts the %s from zero rows. To keep the work already done, "+
+		"apply the schema %s that started %s.\n\n",
 		copyNoun(n), ui.PluralizeLabel("change", "changes", n), ui.PluralizeLabel("it", "them", n))
 }
 

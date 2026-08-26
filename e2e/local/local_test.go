@@ -330,7 +330,7 @@ CREATE TABLE %s (
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan", "-e", "staging", "--endpoint", endpoint)
 	e2eutil.AssertContains(t, out, "DROP COLUMN")
 	e2eutil.AssertContains(t, out, "legacy_field")
-	// Unsafe changes should be shown with ⛔ (not ⚠️ lint warning)
+	// Unsafe changes at plan time await consent, shown with ⚠️
 	e2eutil.AssertContains(t, out, "Unsafe Changes Detected")
 }
 
@@ -575,7 +575,8 @@ CREATE TABLE %s (
 	require.Error(t, err, "expected apply to fail without --allow-unsafe for DROP INDEX")
 
 	// Verify the output contains expected messages
-	e2eutil.AssertContains(t, out, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, out, "Apply blocked")
+	e2eutil.AssertContains(t, out, "unsafe change(s) detected")
 	e2eutil.AssertContains(t, out, "DROP INDEX")
 	e2eutil.AssertContains(t, out, "--allow-unsafe")
 	// Should also show the plan
@@ -680,7 +681,8 @@ CREATE TABLE %s (
 	require.Error(t, err, "expected apply to fail without --allow-unsafe for DROP TABLE")
 
 	// Verify the output contains expected messages
-	e2eutil.AssertContains(t, out, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, out, "Apply blocked")
+	e2eutil.AssertContains(t, out, "unsafe change(s) detected")
 	e2eutil.AssertContains(t, out, "DROP TABLE")
 	e2eutil.AssertContains(t, out, "--allow-unsafe")
 }

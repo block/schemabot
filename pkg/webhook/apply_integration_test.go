@@ -2825,7 +2825,7 @@ func TestE2EApplyAutoConfirmReGatesAgainstFreshHEADBeforeApply(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
+		comment: "schemabot apply -e staging",
 		isPR:    true,
 	}, nil)
 
@@ -2937,7 +2937,7 @@ func TestE2EApplyAutoConfirmFreshHEADBlockPreservesOtherPRLock(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
+		comment: "schemabot apply -e staging",
 		isPR:    true,
 	}, nil)
 

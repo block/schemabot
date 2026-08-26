@@ -1157,7 +1157,8 @@ func TestVitess_Apply_DropIndex_BlockedWithoutFlag(t *testing.T) {
 		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "-o", "log")
 	t.Logf("DROP INDEX apply output:\n%s", out)
 	require.Error(t, err, "expected apply to fail without --allow-unsafe")
-	assert.Contains(t, out, "Unsafe Changes Detected")
+	assert.Contains(t, out, "Apply blocked")
+	assert.Contains(t, out, "unsafe change(s) detected")
 }
 
 // TestVitess_Apply_VSchemaVindexRemoval_BlockedWithoutFlag exercises the
@@ -1199,7 +1200,8 @@ func TestVitess_Apply_VSchemaVindexRemoval_BlockedWithoutFlag(t *testing.T) {
 		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "-o", "log")
 	t.Logf("VSchema vindex removal apply output:\n%s", out)
 	require.Error(t, err, "expected apply to fail without --allow-unsafe")
-	assert.Contains(t, out, "Unsafe Changes Detected")
+	assert.Contains(t, out, "Apply blocked")
+	assert.Contains(t, out, "unsafe change(s) detected")
 
 	// Acknowledging the removal with --allow-unsafe lets the apply proceed.
 	clearSchemaBotState(t)
@@ -1250,7 +1252,8 @@ func TestVitess_Apply_VSchemaVindexTypeChange_BlockedWithoutFlag(t *testing.T) {
 		"-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "-o", "log")
 	t.Logf("VSchema vindex type-change apply output:\n%s", out)
 	require.Error(t, err, "expected apply to fail without --allow-unsafe")
-	assert.Contains(t, out, "Unsafe Changes Detected")
+	assert.Contains(t, out, "Apply blocked")
+	assert.Contains(t, out, "unsafe change(s) detected")
 
 	// Acknowledging the mutation with --allow-unsafe lets the apply proceed.
 	clearSchemaBotState(t)

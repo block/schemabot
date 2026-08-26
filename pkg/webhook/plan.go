@@ -10,7 +10,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -52,9 +51,9 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, tenant, err) {
-			h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+			h.logger.Debug("unscoped fan-out plan resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
 		}
@@ -257,12 +256,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
+					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
+				return
+			}
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
 			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
-			if h.skipUnownedUnscopedCommand(repo, tenant, unownedErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, unownedErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
@@ -274,7 +278,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	} else {
 		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
 		if findErr != nil {
-			if h.skipUnownedUnscopedCommand(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "error", findErr)
 				return
@@ -687,6 +691,15 @@ const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: 
 // The format verb takes the environment for the coached command.
 const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
 
+// msgCopyDiscardDowngrade explains why an apply that would throw away an
+// unfinished copy stopped for confirmation. It states the cause only: the
+// comment already renders the confirm command copy-pasteably on the next line,
+// and the section above already says what is destroyed. It deliberately does
+// not name the flag that skips the stop — the point of stopping is that the
+// operator reads the disclosure first, so the bypass does not belong next to
+// it.
+const msgCopyDiscardDowngrade = "Applying destroys work in progress on the target"
+
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
 // rather than repeating. Returns nil when the plan carries no per-shard
@@ -779,10 +792,10 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 		if c.AgeSeconds > 0 {
 			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
 		}
-		switch engine.CopyDisposition(c.Disposition) {
-		case engine.CopyAdopt:
+		switch c.Disposition {
+		case apitypes.ExistingCopyAdopt:
 			adopted = append(adopted, entry)
-		case engine.CopyDiscard:
+		case apitypes.ExistingCopyDiscard:
 			discarded = append(discarded, entry)
 		default:
 			// Reaching here means a deployment reported a disposition this build

@@ -111,7 +111,7 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 	// This caller's refresh targets the same value. The UPDATE matches the row but
 	// changes nothing, so RowsAffected is 0 under changed-rows semantics. The caller
 	// still owns the lock, so the refresh must succeed.
-	err = store.refreshPendingPlanID(ctx,
+	err = store.refreshPendingConfirmation(ctx,
 		&storage.Lock{
 			DatabaseName:  "testdb",
 			DatabaseType:  "vitess",
@@ -170,7 +170,7 @@ func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 	`, "org/repo#999", "testdb", "vitess")
 	require.NoError(t, err)
 
-	err = store.refreshPendingPlanID(ctx,
+	err = store.refreshPendingConfirmation(ctx,
 		&storage.Lock{
 			DatabaseName:  "testdb",
 			DatabaseType:  "vitess",
@@ -195,7 +195,7 @@ func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 	// The lock is released outright. A refresh against the gone lock must report
 	// ErrLockNotFound rather than silently succeeding.
 	require.NoError(t, store.ForceRelease(ctx, "testdb", "vitess"))
-	err = store.refreshPendingPlanID(ctx,
+	err = store.refreshPendingConfirmation(ctx,
 		&storage.Lock{
 			DatabaseName:  "testdb",
 			DatabaseType:  "vitess",
