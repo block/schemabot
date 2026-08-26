@@ -37,6 +37,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		apply := CreateApply(t, store, lock, "apply_operation_order", 901)
 		firstID := createOperation(t, store, apply.ID, "region-a", "schema")
 		secondID := createOperation(t, store, apply.ID, "region-b", "schema")
+		thirdID := createOperation(t, store, apply.ID, "region-c", "schema")
 
 		first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 		require.NoError(t, err)
@@ -63,6 +64,17 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, persisted)
 		assert.Equal(t, state.ApplyOperation.Running, persisted.State)
 		assert.NotNil(t, persisted.StartedAt)
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, secondID))
+		third, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		require.NotNil(t, third)
+		assert.Equal(t, thirdID, third.ID)
+		assert.Equal(t, "region-c", third.Deployment)
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, thirdID))
+		done, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-d")
+		require.NoError(t, err)
+		assert.Nil(t, done)
 	})
 
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
@@ -93,6 +105,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, operation)
 		assert.Equal(t, state.ApplyOperation.Pending, operation.State)
 		require.NoError(t, store.ApplyOperations().UpdateState(ownedOpCtx, opID, state.ApplyOperation.Running))
+		operation, err = store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State)
 
 		applyLock := CreateLock(t, store, "apply_lease_operation_db", storage.DatabaseTypeMySQL)
 		apply := CreateClaimedApply(t, store, applyLock, "apply_joined_lease", 903, "current-driver")
@@ -128,8 +144,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		pendingID := createOperation(t, store, apply.ID, "region-a", "pending")
 		runningID := createOperation(t, store, apply.ID, "region-b", "running")
 		completedID := createOperation(t, store, apply.ID, "region-c", "completed")
+		failedID := createOperation(t, store, apply.ID, "region-d", "failed")
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, runningID, state.ApplyOperation.Running))
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, failedID, state.ApplyOperation.Failed))
 
 		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "old-driver", Token: "stale-token"})
 		_, err := store.ApplyOperations().MarkPendingStoppedByApply(staleCtx, apply.ID)
@@ -156,6 +174,60 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, completed)
 		assert.Equal(t, state.ApplyOperation.Completed, completed.State)
+		failed, err := store.ApplyOperations().Get(ctx, failedID)
+		require.NoError(t, err)
+		require.NotNil(t, failed)
+		assert.Equal(t, state.ApplyOperation.Failed, failed.State)
+	})
+
+	// MarkPendingStoppedByApply_OperationLease verifies a fan-out driver can
+	// stop pending siblings through its live operation lease, while stale or
+	// cross-apply lease claims fail closed.
+	t.Run("MarkPendingStoppedByApply_OperationLease", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_stop_fanout_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_stop_fanout", 907)
+		ownerID := createOperation(t, store, apply.ID, "region-a", "owner")
+		pendingID := createOperation(t, store, apply.ID, "region-b", "pending")
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, ownerID, claimed.ID)
+		operationCtx := func(applyID int64, token string) storage.OperationLease {
+			return storage.OperationLease{
+				ApplyID: applyID, OperationID: ownerID, Owner: claimed.LeaseOwner, Token: token,
+			}
+		}
+
+		_, err = store.ApplyOperations().MarkPendingStoppedByApply(
+			storage.WithOperationLease(ctx, operationCtx(apply.ID, "stale-token")), apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		pending, err := store.ApplyOperations().Get(ctx, pendingID)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		assert.Equal(t, state.ApplyOperation.Pending, pending.State)
+
+		_, err = store.ApplyOperations().MarkPendingStoppedByApply(
+			storage.WithOperationLease(ctx, operationCtx(apply.ID+1, claimed.LeaseToken)), apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+
+		ownedCtx := storage.WithOperationLease(ctx, operationCtx(apply.ID, claimed.LeaseToken))
+		changed, err := store.ApplyOperations().MarkPendingStoppedByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), changed)
+		pending, err = store.ApplyOperations().Get(ctx, pendingID)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		assert.Equal(t, state.ApplyOperation.Stopped, pending.State)
+		owner, err := store.ApplyOperations().Get(ctx, ownerID)
+		require.NoError(t, err)
+		require.NotNil(t, owner)
+		assert.Equal(t, state.ApplyOperation.Running, owner.State)
+		again, err := store.ApplyOperations().MarkPendingStoppedByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, again)
 	})
 
 	// SaveExternalID_EnforcesDeploymentInvariant verifies sibling operations
