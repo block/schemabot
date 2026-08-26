@@ -55,6 +55,7 @@ func previewCommentAllOutput() {
 			fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscardedStopped())
 		}},
 		{"PLAN COMMENT (EXISTING COPY ADOPTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyAdopted()) }},
+		{"PLAN COMMENT (EXISTING COPY RUNNING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyRunning()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"PLAN COMMENT (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
@@ -163,6 +164,7 @@ func previewCommentPlanAllOutput() {
 			fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscardedStopped())
 		}},
 		{"MYSQL PLAN (EXISTING COPY ADOPTED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyAdopted()) }},
+		{"MYSQL PLAN (EXISTING COPY RUNNING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyRunning()) }},
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"MYSQL PLAN (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},

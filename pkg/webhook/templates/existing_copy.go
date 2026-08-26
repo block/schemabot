@@ -25,6 +25,11 @@ type ExistingCopyData struct {
 	// many hours of work it holds. It is rendered as staleness for that reason,
 	// and never as the cost of discarding.
 	//
+	// It is rendered only for a copy that is over. On a running copy the same
+	// number means the opposite thing — the interval between checkpoints, so
+	// small is healthy — and there is no reading of "last progress 4 seconds
+	// ago" that carries that.
+	//
 	// Empty for a copy with no recorded progress to date it by.
 	Age string
 	// Statement is the schema change the copy was started for. Empty when the
@@ -69,7 +74,7 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alread
 	}
 	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target\n",
 		marker, subject, n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies)
+	writeExistingCopyEntries(sb, copies, false)
 	if alreadyApplying {
 		sb.WriteString("\n")
 		return
@@ -80,9 +85,10 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alread
 }
 
 // writeAdoptedCopies writes the section for unfinished copies the apply
-// resumes. It reassures rather than warns: nothing is destroyed and the copy
-// picks up where it stopped, which is why an operator seeing a long-running
-// apply reappear should not expect it to restart.
+// resumes: work an apply that is over left behind on the target. It reassures
+// rather than warns: nothing is destroyed and the copy picks up where it
+// stopped, which is why an operator seeing a long-running apply reappear should
+// not expect it to restart.
 //
 // alreadyApplying moves the closing line from what applying would do to what
 // the apply already under way is doing, matching the discard section on the
@@ -96,8 +102,34 @@ func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 	}
 	fmt.Fprintf(sb, "♻️ **Resuming work in progress**: **%d** unfinished %s on the target will be continued\n",
 		n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies)
+	writeExistingCopyEntries(sb, copies, false)
 	fmt.Fprintf(sb, "\n%s up where the existing %s stopped rather than starting over.\n\n", subject, copyNoun(n))
+}
+
+// writeRunningCopies writes the section for copies that are still being made on
+// the target right now. It is separate from the resumed section because the
+// promise is a different one: there is nothing to pick back up, because nothing
+// stopped. Applying resolves the operator to the copy already in flight, which
+// keeps every row of it and does not start a second one.
+//
+// Saying "resumes" here would misdescribe both ends of it — a copy that was
+// never interrupted, and an apply that starts nothing — and it is the sentence
+// an operator reads before deciding whether a copy they can see progressing is
+// about to be disturbed. This is also why the entries carry no age: the number
+// behind it is the interval between a live copy's checkpoints, so rendering it
+// as how long ago the copy last progressed reports healthy work as nearly
+// stalled.
+func writeRunningCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
+	n := len(copies)
+	subject := "Applying joins"
+	if alreadyApplying {
+		subject = "This apply joined"
+	}
+	fmt.Fprintf(sb, "♻️ **Work already in progress**: **%d** unfinished %s still running on the target\n",
+		n, copyNoun(n))
+	writeExistingCopyEntries(sb, copies, true)
+	fmt.Fprintf(sb, "\n%s the %s already running rather than starting %s: every row copied so far is kept, and no second %s is made.\n\n",
+		subject, copyNoun(n), ui.PluralizeLabel("a new one", "new ones", n), copyNoun(1))
 }
 
 // copyNoun is the count-appropriate noun for a row copy.
@@ -106,14 +138,25 @@ func copyNoun(count int) string {
 }
 
 // writeExistingCopyEntries writes one entry per copy: the tables it covers,
-// where they live, how stale it is, and why it cannot be resumed.
-func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
+// where they live, whether it is still being made or how stale it is, and why
+// it cannot be resumed.
+//
+// running selects between the two things the copy's timing can mean. A copy
+// that is over is dated by how long ago it last progressed, which is what an
+// operator weighs when deciding whether it is worth keeping. A copy still being
+// made has no such number to give — its last checkpoint is seconds old however
+// many hours of rows it holds — so it says it is running and leaves the timing
+// to the progress comment, which reports the copy's actual position.
+func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, running bool) {
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
 		if c.Namespace != "" {
 			line += " in " + markdownInlineCode(c.Namespace)
 		}
-		if c.Age != "" {
+		switch {
+		case running:
+			line += " (still copying)"
+		case c.Age != "":
 			line += fmt.Sprintf(" (last progress %s ago)", c.Age)
 		}
 		if reason := existingCopyReason(c); reason != "" {

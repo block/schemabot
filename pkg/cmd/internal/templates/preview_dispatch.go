@@ -140,6 +140,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscardedStopped())
 	case PreviewCommentPlanCopyAdopted:
 		fmt.Print(webhooktemplates.PreviewCommentPlanCopyAdopted())
+	case PreviewCommentPlanCopyRunning:
+		fmt.Print(webhooktemplates.PreviewCommentPlanCopyRunning())
 	case PreviewCommentApplyBlockedRejected:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected())
 	case PreviewCommentPlanTenant:

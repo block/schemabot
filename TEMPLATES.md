@@ -447,6 +447,39 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-existing-copy-running"></a><strong>MySQL Plan (Existing Copy Running)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+
+ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
+```
+
+♻️ **Work already in progress**: **1** unfinished copy still running on the target
+- `orders`, `products` in `testapp` (still copying)
+
+Applying joins the copy already running rather than starting a new one: every row copied so far is kept, and no second copy is made.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
 
 

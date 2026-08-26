@@ -218,6 +218,69 @@ func TestRenderPlanComment_AdoptedCopyReadsAsAnEventOnceApplying(t *testing.T) {
 		"the hypothetical subject belongs to a comment where applying is still a choice")
 }
 
+// A copy still being made on the target is disclosed as work the apply joins,
+// not work it picks back up. Nothing stopped, so nothing is resumed: the apply
+// resolves the operator onto the copy already in flight and keeps every row of
+// it. The entry says the copy is running instead of dating its last progress,
+// because a live copy checkpoints continuously and "last progress 4s ago"
+// reports healthy work as nearly stalled.
+func TestRenderPlanComment_RunningCopyReadsAsJoiningWorkInFlight(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+		RunningCopies: []ExistingCopyData{
+			{Namespace: "testapp", Tables: []string{"orders", "products"}, Age: "4s"},
+		},
+	})
+
+	assert.Contains(t, out, "♻️ **Work already in progress**: **1** unfinished copy still running on the target")
+	assert.Equal(t, "- `orders`, `products` in `testapp` (still copying)", entryLine(t, out, "- `orders`"))
+	assert.Contains(t, out, "Applying joins the copy already running rather than starting a new one: "+
+		"every row copied so far is kept, and no second copy is made.")
+
+	assert.NotContains(t, out, "4s", "a running copy's checkpoint interval is not its staleness")
+	assert.NotContains(t, out, "stopped rather than starting over",
+		"nothing stopped, so there is nothing to pick back up")
+	assert.NotContains(t, out, "destroys work in progress", "a running copy is not a discard warning")
+}
+
+// Work that stopped and work still being made are separate promises, so a
+// comment holding both discloses each in its own section rather than
+// describing one as the other. On an apply already under way each states what
+// the apply did rather than what applying would do, matching the discard
+// section on the same comment.
+func TestRenderPlanComment_RunningAndStoppedCopiesAreDisclosedApart(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
+		LockOwner: "block/schemabot#42",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+		AdoptedCopies: []ExistingCopyData{
+			{Namespace: "orders_a", Tables: []string{"orders"}, Age: "3h 12m"},
+		},
+		RunningCopies: []ExistingCopyData{
+			{Namespace: "orders_b", Tables: []string{"products"}, Age: "4s"},
+			{Namespace: "orders_c", Tables: []string{"shipments"}, Age: "2s"},
+		},
+	})
+
+	assert.Contains(t, out, "♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued")
+	assert.Equal(t, "- `orders` in `orders_a` (last progress 3h 12m ago)", entryLine(t, out, "- `orders` in"),
+		"a copy that stopped is still dated by how stale it is")
+
+	assert.Contains(t, out, "♻️ **Work already in progress**: **2** unfinished copies still running on the target")
+	assert.Equal(t, "- `products` in `orders_b` (still copying)", entryLine(t, out, "- `products`"))
+	assert.Contains(t, out, "This apply joined the copies already running rather than starting new ones",
+		"an apply under way describes what it did, not what applying would do")
+	assert.Contains(t, out, "This apply picks up where the existing copy stopped",
+		"the resumed section keeps its own promise on the same comment")
+}
+
 // An expired checkpoint is a different cause from a changed statement, and the
 // remedy differs, so the section names which one applies. Its age is what
 // expired it, so the entry reads as the staleness the cause describes rather

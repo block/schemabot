@@ -257,6 +257,7 @@ func existingCopiesFromProto(copies []*ternv1.ExistingCopy) []*apitypes.Existing
 			Tables:      c.Tables,
 			AgeSeconds:  c.AgeSeconds,
 			Statement:   c.Statement,
+			Running:     c.Running,
 		})
 	}
 	return result

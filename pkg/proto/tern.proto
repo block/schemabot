@@ -521,6 +521,12 @@ message ExistingCopy {
   // a surface show what a drifted schema change differs *from*, rather than
   // only that it differs; for an adopt it repeats the plan.
   string statement = 6;
+  // Whether the work is still running right now rather than left behind by an
+  // apply that is over. A running copy is checkpointing continuously, so its
+  // age_seconds is a heartbeat rather than staleness, and applying joins it
+  // instead of restarting it. Set from the deployment's own apply records, so
+  // it is engine-agnostic.
+  bool running = 7;
 }
 
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing

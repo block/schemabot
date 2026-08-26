@@ -123,6 +123,7 @@ const (
 	PreviewCommentPlanCopyDiscardedPaused      PreviewType = "comment_plan_copy_discarded_paused"      // Automatic apply paused because applying would throw away an unfinished copy
 	PreviewCommentPlanCopyDiscardedStopped     PreviewType = "comment_plan_copy_discarded_stopped"     // A confirmed apply stopped because a copy appeared after the comment it confirmed
 	PreviewCommentPlanCopyAdopted              PreviewType = "comment_plan_copy_adopted"               // Plan whose apply resumes an unfinished copy on the target
+	PreviewCommentPlanCopyRunning              PreviewType = "comment_plan_copy_running"               // Plan whose apply joins a copy still being made on the target
 	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes

@@ -1433,7 +1433,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Changes:        changes,
 		LintViolations: violations,
 		Shards:         protoShards,
-		ExistingCopies: protoExistingCopies(result),
+		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result)),
 	}, nil
 }
 
@@ -1565,29 +1565,6 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 	}
 
 	return changes, violations, shards
-}
-
-// protoExistingCopies converts the plan's copy disclosures for the wire. It is
-// separate from planResultToProtoChanges because a disclosure describes the
-// target rather than the change set: it exists whether or not the plan's
-// statements differ from what a copy was made for, and that is precisely the
-// case it warns about.
-func protoExistingCopies(result *engine.PlanResult) []*ternv1.ExistingCopy {
-	if len(result.ExistingCopies) == 0 {
-		return nil
-	}
-	copies := make([]*ternv1.ExistingCopy, len(result.ExistingCopies))
-	for i, c := range result.ExistingCopies {
-		copies[i] = &ternv1.ExistingCopy{
-			Namespace:   c.Namespace,
-			Disposition: string(c.Disposition),
-			Reason:      c.Reason,
-			Tables:      c.Tables,
-			AgeSeconds:  int64(c.Age.Seconds()),
-			Statement:   c.Statement,
-		}
-	}
-	return copies
 }
 
 func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
