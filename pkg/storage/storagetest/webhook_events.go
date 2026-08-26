@@ -81,7 +81,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 	// row in the stuck-processing shape a hard-killed driver produces. The
 	// target must be the only claimable row while this runs, or the loop
 	// claims a bystander.
-	driveToCapExhausted := func(t *testing.T, store storage.Storage, deliveryID string, finalLease time.Duration) *storage.WebhookEvent {
+	driveToCapExhausted := func(t *testing.T, store storage.Storage, deliveryID string, finalLease time.Duration) {
 		t.Helper()
 		ctx := t.Context()
 		createEvent(t, store, newEvent(deliveryID))
@@ -95,7 +95,16 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NotNil(t, claimed)
 		require.Equal(t, deliveryID, claimed.DeliveryID)
 		require.Equal(t, storage.MaxWebhookEventAttempts, claimed.Attempts)
-		return claimed
+	}
+
+	// claimOldAgainstSuccessor seeds the coalescing shape the supersede tests
+	// start from: an older delivery "old" and the given newer successor for
+	// the same coalescing key, returning the live claim on the older row.
+	claimOldAgainstSuccessor := func(t *testing.T, store storage.Storage, successor *storage.WebhookEvent) *storage.WebhookEvent {
+		t.Helper()
+		createEvent(t, store, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute)))
+		createEvent(t, store, successor)
+		return claimExpecting(t, store, "old")
 	}
 
 	t.Run("Create_DeduplicatesDeliveryID", func(t *testing.T) {
@@ -130,6 +139,30 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		inserted, err = store.WebhookEvents().Create(ctx, otherProvider)
 		require.NoError(t, err)
 		assert.True(t, inserted, "delivery IDs are unique within a provider")
+
+		// An empty provider defaults to GitHub and finds the same row.
+		defaulted, err := store.WebhookEvents().GetByDeliveryID(ctx, "", "delivery-dedup")
+		require.NoError(t, err)
+		require.NotNil(t, defaulted)
+		assert.Equal(t, event.ID, defaulted.ID)
+	})
+
+	// Create rejects rows missing identity fields before touching storage: the
+	// delivery GUID is the dedup key and the event type routes processing.
+	t.Run("Create_RequiresDeliveryIDAndEvent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		missingDelivery := newEvent("")
+		inserted, err := store.WebhookEvents().Create(ctx, missingDelivery)
+		require.ErrorContains(t, err, "webhook delivery ID is required")
+		require.False(t, inserted)
+
+		missingEvent := newEvent("delivery-no-event")
+		missingEvent.Event = ""
+		inserted, err = store.WebhookEvents().Create(ctx, missingEvent)
+		require.ErrorContains(t, err, "webhook event type is required")
+		require.False(t, inserted)
 	})
 
 	t.Run("FindNext_OrdersOldestEligibleFirst", func(t *testing.T) {
@@ -530,7 +563,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 				return
 			}
 			assert.NotNil(collect, reclaimed)
-		}, 5*time.Second, 10*time.Millisecond)
+		}, pollDeadline, pollInterval)
 		assert.Equal(t, claimed.ID, reclaimed.ID)
 		assert.NotEqual(t, claimed.LeaseToken, reclaimed.LeaseToken)
 
@@ -584,6 +617,8 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		released, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-release-later")
 		require.NoError(t, err)
 		require.NotNil(t, released)
+		assert.Equal(t, storage.WebhookEventPending, released.State, "release must requeue the row regardless of which attempt it undoes")
+		assert.Empty(t, released.LeaseToken)
 		assert.Equal(t, 1, released.Attempts, "release must refund only the second attempt")
 		assert.Nil(t, released.RetryAfter)
 		require.NotNil(t, released.StartedAt, "releasing a later claim must preserve the original started_at")
@@ -636,6 +671,8 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.Equal(t, 0, reopened.Attempts)
 		assert.Empty(t, reopened.LeaseToken)
 		assert.Nil(t, reopened.CompletedAt)
+		assert.JSONEq(t, `{"redelivered":true}`, string(reopened.Payload),
+			"the reopen must store the redelivery's payload, not keep the dead-lettered one")
 
 		revived := claimExpecting(t, store, "delivery-deadletter")
 		assert.Equal(t, 1, revived.Attempts, "a redelivered dead-lettered row must be claimable again")
@@ -661,6 +698,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			{"reopened plans the head", "pull_request", "reopened", true},
 			{"closed does not plan the head", "pull_request", "closed", false},
 			{"check_run does not plan the head", "check_run", "rerequested", false},
+			{"check_run with an auto-plan action does not plan the head", "check_run", "synchronize", false},
 			{"issue_comment does not plan the head", "issue_comment", "created", false},
 		} {
 			headSHA := fmt.Sprintf("event-head-%d", i)
@@ -694,7 +732,11 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		}
 
 		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "", 7, "event-head-0")
-		require.Error(t, err, "missing repository must be rejected")
+		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing repository must be rejected")
+		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 0, "event-head-0")
+		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing pull request must be rejected")
+		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, "")
+		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing head SHA must be rejected")
 	})
 
 	// A terminally failed row's coverage depends on its origin: a failed
@@ -757,10 +799,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		createEvent(t, store, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute)))
-		createEvent(t, store, newPullRequestEvent("new", "synchronize", 7, "new-head", time.Now().UTC()))
-
-		claimed := claimExpecting(t, store, "old")
+		claimed := claimOldAgainstSuccessor(t, store, newPullRequestEvent("new", "synchronize", 7, "new-head", time.Now().UTC()))
 		covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
 		require.NoError(t, err)
 		assert.True(t, covered, "the advisory probe must agree with the guarded write's predicate")
@@ -841,12 +880,9 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 				ctx := t.Context()
 				store := h.NewStorage(t)
 
-				createEvent(t, store, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute)))
 				successor := newPullRequestEvent("new", "synchronize", tc.pr, tc.headSHA, time.Now().UTC())
 				successor.Repository = tc.repo
-				createEvent(t, store, successor)
-
-				claimed := claimExpecting(t, store, "old")
+				claimed := claimOldAgainstSuccessor(t, store, successor)
 				covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
 				require.NoError(t, err)
 				assert.Equal(t, tc.covers, covered, "the advisory probe must agree with the guarded write's predicate")
@@ -889,10 +925,12 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		// Terminalize the closed claim so the next claim lands on the
 		// non-pull_request row under test.
 		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
-		claimExpectingCompleted := claimExpecting(t, store, "reopened-new")
-		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimExpectingCompleted.ID, claimExpectingCompleted.LeaseToken))
+		reopenedClaim := claimExpecting(t, store, "reopened-new")
+		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, reopenedClaim.ID, reopenedClaim.LeaseToken))
 
-		checkRun := newPullRequestEvent("check-run-old", "created", 7, "old-head", time.Now().UTC().Add(-time.Minute))
+		// The action would auto-plan on a pull_request row, so only the
+		// event-type guard protects this claim from being superseded.
+		checkRun := newPullRequestEvent("check-run-old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute))
 		checkRun.Event = "check_run"
 		createEvent(t, store, checkRun)
 		createEvent(t, store, newPullRequestEvent("plan-new", "synchronize", 7, "newer-head", time.Now().UTC()))
@@ -915,10 +953,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		createEvent(t, store, newPullRequestEvent("old", "synchronize", 7, "old-head", time.Now().UTC().Add(-time.Minute)))
-		createEvent(t, store, newPullRequestEvent("new", "synchronize", 7, "new-head", time.Now().UTC()))
-
-		claimed := claimExpecting(t, store, "old")
+		claimed := claimOldAgainstSuccessor(t, store, newPullRequestEvent("new", "synchronize", 7, "new-head", time.Now().UTC()))
 
 		missingToken := *claimed
 		missingToken.LeaseToken = ""
@@ -1039,9 +1074,12 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
 
 		// A deferred row counts as pending but not as backlog: its not-before
-		// time has not elapsed, so no driver would claim it.
+		// time has not elapsed, so no driver would claim it. Its receipt is
+		// well in the past so measuring the age from received_at instead of
+		// the not-before time would inflate the backlog age past the bound.
 		future := time.Now().UTC().Add(time.Hour)
 		deferred := newEvent("pending-deferred")
+		deferred.ReceivedAt = time.Now().UTC().Add(-10 * time.Minute)
 		deferred.RetryAfter = &future
 		createEvent(t, store, deferred)
 
@@ -1082,7 +1120,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 				return
 			}
 			assert.Equal(collect, int64(1), stats.StuckProcessing)
-		}, 5*time.Second, 10*time.Millisecond)
+		}, pollDeadline, pollInterval)
 
 		terminated, err := store.WebhookEvents().TerminateStuckProcessing(ctx, "reconciler sweep")
 		require.NoError(t, err)

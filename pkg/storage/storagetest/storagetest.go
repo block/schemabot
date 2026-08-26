@@ -4,6 +4,12 @@
 // errors, ordering, and state transitions — never on an implementation's SQL
 // text or dialect-specific behavior.
 //
+// Test placement follows one rule: a behavior reachable through the public
+// storage interface belongs in this package, where every dialect runs it.
+// An implementation's own test files (for example pkg/storage/internal/
+// sqlstore) cover only behaviors that require raw SQL or database-specific
+// conditions to set up or observe.
+//
 // An implementation package wires itself in by implementing Harness against
 // its own test fixture (container, schema bootstrap, table clearing) and
 // calling Run from its integration tests. Per-family Test functions are also
