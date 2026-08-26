@@ -125,6 +125,7 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, state.Apply.Running, persisted.State)
 		assert.Equal(t, 1, persisted.Attempt)
 		assert.Empty(t, persisted.ErrorMessage)
+		assert.NotNil(t, persisted.LeaseAcquiredAt, "a claim records when the lease was acquired")
 
 		claimed, err = store.Applies().ClaimApplyByID(ctx, retryable.ID, "driver-b")
 		require.NoError(t, err)
@@ -132,6 +133,45 @@ func TestApplies(t *testing.T, h Harness) {
 
 		_, err = store.Applies().ClaimApplyByID(ctx, retryable.ID, "")
 		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	})
+
+	t.Run("RetryableClaim_ExhaustsAttemptBudget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_attempt_budget_db", storage.DatabaseTypeMySQL)
+		retryable := CreateApplyWithStateAndEnv(t, store, lock, "apply_attempt_budget", 908, state.Apply.FailedRetryable, "production")
+
+		// Each recovery cycle charges one attempt: a driver claims the
+		// retryable apply, records another retryable failure, and releases
+		// the lease back to the pool. The budget bounds how many such cycles
+		// may run before the apply stops being claimable.
+		for i := 1; i <= storage.MaxRecoveryAttempts; i++ {
+			claimed, err := store.Applies().ClaimApplyByID(ctx, retryable.ID, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			require.Equal(t, i, claimed.Attempt)
+
+			failed, err := store.Applies().Get(ctx, retryable.ID)
+			require.NoError(t, err)
+			require.NotNil(t, failed)
+			failed.State = state.Apply.FailedRetryable
+			failed.ErrorMessage = "transient failure"
+			require.NoError(t, store.Applies().Update(storage.WithApplyLease(ctx, claimed.Lease()), failed))
+
+			released, err := store.Applies().ReleaseClaim(ctx, claimed.Lease())
+			require.NoError(t, err)
+			require.True(t, released)
+		}
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, retryable.ID, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "an exhausted attempt budget stops recovery claims")
+
+		persisted, err := store.Applies().Get(ctx, retryable.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+		assert.Equal(t, storage.MaxRecoveryAttempts, persisted.Attempt)
 	})
 
 	t.Run("LeaseRotation_And_Staleness", func(t *testing.T) {
