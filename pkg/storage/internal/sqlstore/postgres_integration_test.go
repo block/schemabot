@@ -482,16 +482,11 @@ func TestPGXStdlibValueContracts(t *testing.T) {
 	assert.Equal(t, int64(1), affected, "PostgreSQL reports matched rows even when values are unchanged")
 }
 
-// TestPostgresApplyOperationLeaseGuards exercises every guarded write shape of
-// the apply-operation store against PostgreSQL: the single-table UPDATE under
-// an operation lease, the joined UPDATE under a parent apply lease, the bulk
-// pending-stop self-join, and the joined DELETE. Each shape must succeed with
-// the owning lease token and fail closed (ErrApplyLeaseLost, row untouched)
-// when the token already mismatches at execution time. The joined shapes must
-// also fail closed when a lease steal commits concurrently with the guarded
-// write: the lease-token fence locks the joined applies row, so the guarded
-// write waits out the steal and re-checks the token against the stolen value
-// (see PostgresDialect.LeaseTokenFence).
+// TestPostgresApplyOperationLeaseGuards covers PostgreSQL-specific details the
+// cross-dialect suite cannot express: operation-lease heartbeat timestamps,
+// joined deletes, and a lease steal committed concurrently with a guarded
+// write. The lease-token fence must lock the joined applies row, wait out the
+// steal, and re-check the token against the stolen value.
 func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_guards")
 	db, err := postgresconn.Open(dsn)
@@ -531,24 +526,6 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 		return got
 	}
 
-	t.Run("apply lease guards the joined update", func(t *testing.T) {
-		applyID := seedApply(t, "apply-guard-join", "tok-apply")
-		opID := seedOperation(t, applyID, "op-1", "pending", "")
-
-		staleCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "stale"})
-		err := ops.MarkStarted(staleCtx, opID)
-		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-		assert.Equal(t, "pending", operationState(t, opID))
-
-		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
-		require.NoError(t, ops.MarkStarted(ownerCtx, opID))
-		assert.Equal(t, "running", operationState(t, opID))
-		var startedAt sql.NullTime
-		require.NoError(t, db.QueryRowContext(t.Context(),
-			`SELECT started_at FROM apply_operations WHERE id = $1`, opID).Scan(&startedAt))
-		assert.True(t, startedAt.Valid, "MarkStarted must stamp started_at")
-	})
-
 	t.Run("operation lease guards the single-table update", func(t *testing.T) {
 		applyID := seedApply(t, "apply-guard-op", "tok-apply")
 		opID := seedOperation(t, applyID, "op-1", "running", "tok-op")
@@ -569,41 +546,6 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 		require.NoError(t, db.QueryRowContext(t.Context(),
 			`SELECT updated_at FROM apply_operations WHERE id = $1`, opID).Scan(&after))
 		assert.True(t, after.After(before), "heartbeat must advance updated_at (before=%v after=%v)", before, after)
-	})
-
-	t.Run("apply lease guards the bulk pending stop", func(t *testing.T) {
-		applyID := seedApply(t, "apply-guard-stop", "tok-apply")
-		pendingID := seedOperation(t, applyID, "op-pending", "pending", "")
-		runningID := seedOperation(t, applyID, "op-running", "running", "")
-
-		staleCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "stale"})
-		_, err := ops.MarkPendingStoppedByApply(staleCtx, applyID)
-		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-		assert.Equal(t, "pending", operationState(t, pendingID))
-
-		ownerCtx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: applyID, Owner: "owner", Token: "tok-apply"})
-		stopped, err := ops.MarkPendingStoppedByApply(ownerCtx, applyID)
-		require.NoError(t, err)
-		assert.Equal(t, int64(1), stopped)
-		assert.Equal(t, "stopped", operationState(t, pendingID))
-		assert.Equal(t, "running", operationState(t, runningID), "in-flight operations are left for their own driver")
-	})
-
-	t.Run("operation lease guards the bulk pending stop", func(t *testing.T) {
-		applyID := seedApply(t, "apply-guard-stop-op", "tok-apply")
-		ownerOpID := seedOperation(t, applyID, "op-owner", "running", "tok-op")
-		pendingID := seedOperation(t, applyID, "op-pending", "pending", "")
-
-		staleCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: ownerOpID, Owner: "owner", Token: "stale"})
-		_, err := ops.MarkPendingStoppedByApply(staleCtx, applyID)
-		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-		assert.Equal(t, "pending", operationState(t, pendingID))
-
-		ownerCtx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: applyID, OperationID: ownerOpID, Owner: "owner", Token: "tok-op"})
-		stopped, err := ops.MarkPendingStoppedByApply(ownerCtx, applyID)
-		require.NoError(t, err)
-		assert.Equal(t, int64(1), stopped)
-		assert.Equal(t, "stopped", operationState(t, pendingID))
 	})
 
 	t.Run("apply lease guards the joined delete", func(t *testing.T) {
@@ -669,55 +611,6 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 		}
 		assert.Equal(t, "pending", operationState(t, opID))
 	})
-}
-
-// TestPostgresSaveExternalIDDeploymentInvariant pins the atomic remote apply
-// id write against a real PostgreSQL server: the store must lock the apply's
-// operation rows and verify the operation's deployment records no other
-// remote apply id inside the writing transaction, so a dispatch whose id
-// disagrees with a sibling's is refused fail-closed while the deployment's
-// shared id persists cleanly.
-func TestPostgresSaveExternalIDDeploymentInvariant(t *testing.T) {
-	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_extid")
-	db, err := postgresconn.Open(dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, db.PingContext(t.Context()))
-	applyPostgresTestSchema(t, fixtureDB)
-
-	h := postgresHarness{db: db, dsn: dsn}
-	store := h.NewStorage(t)
-	ops := store.ApplyOperations()
-
-	var applyID int64
-	require.NoError(t, db.QueryRowContext(t.Context(), `
-		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
-			repository, pull_request, environment, engine, state, options)
-		VALUES ('apply-extid-invariant', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', 'running', '{}')
-		RETURNING id`).Scan(&applyID))
-	seedOperation := func(t *testing.T, key, externalID string) int64 {
-		t.Helper()
-		var id int64
-		require.NoError(t, db.QueryRowContext(t.Context(), `
-			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, external_id)
-			VALUES ($1, 'dep-1', $2, 'running', NULLIF($3, ''))
-			RETURNING id`, applyID, key, externalID).Scan(&id))
-		return id
-	}
-	_ = seedOperation(t, "op-sibling", "remote-apply-a")
-	opID := seedOperation(t, "op-current", "")
-
-	err = ops.SaveExternalID(t.Context(), applyID, opID, "remote-apply-other")
-	require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
-	var stored sql.NullString
-	require.NoError(t, db.QueryRowContext(t.Context(),
-		`SELECT external_id FROM apply_operations WHERE id = $1`, opID).Scan(&stored))
-	assert.False(t, stored.Valid, "a refused remote apply id must not be persisted")
-
-	require.NoError(t, ops.SaveExternalID(t.Context(), applyID, opID, "remote-apply-a"))
-	require.NoError(t, db.QueryRowContext(t.Context(),
-		`SELECT external_id FROM apply_operations WHERE id = $1`, opID).Scan(&stored))
-	assert.Equal(t, "remote-apply-a", stored.String)
 }
 
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
