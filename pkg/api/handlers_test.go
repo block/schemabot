@@ -103,8 +103,13 @@ type mockStorageWithApplyStores struct {
 	operations storage.ApplyOperationStore
 }
 
-func (m *mockStorageWithApplyStores) Plans() storage.PlanStore         { return m.plans }
-func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore      { return m.applies }
+func (m *mockStorageWithApplyStores) Plans() storage.PlanStore { return m.plans }
+func (m *mockStorageWithApplyStores) Applies() storage.ApplyStore {
+	if m.applies == nil {
+		return &staticApplyStore{}
+	}
+	return m.applies
+}
 func (m *mockStorageWithApplyStores) Tasks() storage.TaskStore         { return m.tasks }
 func (m *mockStorageWithApplyStores) Locks() storage.LockStore         { return m.locks }
 func (m *mockStorageWithApplyStores) ApplyLogs() storage.ApplyLogStore { return m.applyLogs }
@@ -223,6 +228,12 @@ func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 }
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
+}
+
+// FindAbandonedStoppedApplies reports an empty scan, so the reaper's
+// abandoned-stopped sweep is a no-op for every fixture that does not opt into it.
+func (s *staticApplyStore) FindAbandonedStoppedApplies(context.Context, time.Duration, int) ([]*storage.Apply, error) {
+	return nil, s.err
 }
 func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
@@ -422,6 +433,12 @@ func (s *capturingApplyStore) Create(_ context.Context, apply *storage.Apply) (i
 		return 0, s.err
 	}
 	return 123, nil
+}
+
+// FindAbandonedStoppedApplies reports an empty scan, so a reaper pass running
+// alongside the operator under test never reaps the fixture's apply.
+func (s *capturingApplyStore) FindAbandonedStoppedApplies(context.Context, time.Duration, int) ([]*storage.Apply, error) {
+	return nil, nil
 }
 
 func (s *capturingApplyStore) CreateWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (int64, error) {

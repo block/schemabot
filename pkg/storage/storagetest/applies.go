@@ -337,6 +337,28 @@ func TestApplies(t *testing.T, h Harness) {
 			"the failed start request names the apply that took the work over")
 	})
 
+	// A stop is resumable, so the reaper's scan for stopped applies nobody came
+	// back for must leave a freshly stopped one alone: resuming it is still the
+	// expected next step. Staleness is measured from the last write to the row,
+	// which for a resumable stop is the only record of when it was last touched.
+	// (Which stopped applies an aged scan surfaces needs backdated timestamps,
+	// which the storage interface cannot express — see the dialect suites.)
+	t.Run("AbandonedStoppedScan_SkipsAFreshlyStoppedApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_abandoned_scan_db", storage.DatabaseTypeMySQL)
+		stopped := CreateApplyWithStateAndEnv(t, store, lock, "apply_abandoned_scan", 911, state.Apply.Stopped, "staging")
+
+		abandoned, err := store.Applies().FindAbandonedStoppedApplies(ctx, time.Hour, 10)
+		require.NoError(t, err)
+		assert.Empty(t, abandoned, "a stopped apply is only abandoned once it has sat untouched past the age")
+
+		persisted, err := store.Applies().Get(ctx, stopped.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Stopped, persisted.State, "the scan is read-only")
+	})
+
 	t.Run("ConcurrentClaim_SingleWinner", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -446,6 +468,10 @@ func TestApplies(t *testing.T, h Harness) {
 		},
 		"FindStuckPendingApplies_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.FindStuckPendingApplies(t.Context(), time.Minute, 1)
+			return err
+		},
+		"FindAbandonedStoppedApplies_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindAbandonedStoppedApplies(t.Context(), time.Minute, 1)
 			return err
 		},
 		"ClaimApplyByID_DBError": func(t *testing.T, store storage.ApplyStore) error {

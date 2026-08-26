@@ -1266,6 +1266,57 @@ func (s *applyStore) FindStuckPendingApplies(ctx context.Context, olderThan time
 	return scanApplies(rows)
 }
 
+// FindAbandonedStoppedApplies returns stopped applies that nothing is coming
+// back for: stopped longer than olderThan, with no successor recorded in
+// superseded_by and no control request still pending. It is a read-only scan (no
+// lease, no FOR UPDATE) — the caller resolves each row through the ordinary
+// cancel path, which re-reads the apply and takes its own guards.
+//
+// Staleness is measured from updated_at, not created_at: a resumable stop leaves
+// completed_at NULL and updated_at is when the apply last moved, so an apply
+// stopped and restarted repeatedly is only abandoned once it has been left alone
+// for the whole window.
+//
+// Each of the three predicates excludes a row somebody still needs:
+//
+//	superseded_by set ─▶ a successor is using this apply's artifacts
+//	control request pending ─▶ an operator's command is mid-flight
+//	updated_at recent ─▶ the copy may still be resumable
+//
+// Ordered oldest first (with an id tiebreak so same-second rows are stable) and
+// capped at limit; a non-positive limit means no cap.
+func (s *applyStore) FindAbandonedStoppedApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*storage.Apply, error) {
+	cutoffMicros := max(olderThan.Microseconds(), 0)
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(cutoffMicros)), IntervalMicrosecond)
+
+	// The column list and cutoff are trusted internal fragments; concatenate
+	// them directly rather than through a format string so a stray % can never
+	// corrupt the SQL.
+	query := `
+		SELECT ` + applyColumnsForApplyAlias + `
+		FROM applies a
+		WHERE a.state = ?
+			AND a.superseded_by = ''
+			AND a.updated_at < ` + cutoff + `
+			AND NOT EXISTS (
+				SELECT 1
+				FROM apply_control_requests cr
+				WHERE cr.apply_id = a.id AND cr.status = ?
+			)
+		ORDER BY a.updated_at, a.id`
+	if limit > 0 {
+		query += fmt.Sprintf("\n\t\tLIMIT %d", limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, state.Apply.Stopped, storage.ControlRequestPending)
+	if err != nil {
+		return nil, fmt.Errorf("query abandoned stopped applies older than %s: %w", olderThan, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplies(rows)
+}
+
 // recentAppliesWhere builds the WHERE predicates and args shared by the
 // recent-apply list and count queries, so both views agree on which applies a
 // filter selects.

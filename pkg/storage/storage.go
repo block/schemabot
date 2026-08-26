@@ -587,6 +587,19 @@ type ApplyStore interface {
 	// nothing is stuck. A non-positive limit means no cap.
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
+	// FindAbandonedStoppedApplies returns stopped applies that nothing is coming
+	// back for: stopped (by updated_at, since a resumable stop leaves
+	// completed_at NULL) longer than olderThan, with nothing recorded in
+	// superseded_by and no control request still pending. Ordered oldest first
+	// and capped at limit; a non-positive limit means no cap.
+	//
+	// Nothing ages a stopped apply out of stopped on its own, so without this
+	// scan an apply nobody is resuming holds its target indefinitely. It is a
+	// read-only scan: the caller cancels each row through the ordinary cancel
+	// path so the reap inherits that path's guards, task handling, and
+	// operator-facing outcome rather than writing a terminal state directly.
+	FindAbandonedStoppedApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
+
 	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
 	// driver (pending with child rows, stale active state, retryable within
 	// budget, or a pending start control request). On a

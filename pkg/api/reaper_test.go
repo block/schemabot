@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -13,8 +15,10 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // reaperMetricReader points the global meter provider at a manual reader for the
@@ -280,4 +284,94 @@ func TestRunStrandedReaperPassReportsTaskSettlementsThatLandedBeforeAFailure(t *
 
 	assert.Equal(t, []string{"stranded_task_reaper_error"}, claimFailureReasons(t, reader),
 		"the failure is still recorded after the committed settlements are reported")
+}
+
+// abandonedScanApplyStore serves the abandoned-stopped sweep a canned scan
+// result and delegates everything the cancel it issues needs to the embedded
+// store, so the sweep runs against the same fixture the cancel handler tests use.
+type abandonedScanApplyStore struct {
+	storage.ApplyStore
+	abandoned []*storage.Apply
+	scanErr   error
+}
+
+func (s *abandonedScanApplyStore) FindAbandonedStoppedApplies(context.Context, time.Duration, int) ([]*storage.Apply, error) {
+	return s.abandoned, s.scanErr
+}
+
+// abandonedStoppedReaperService builds a service whose abandoned-stopped scan
+// returns the given applies and whose cancel path is fully wired: the applies
+// the cancel can resolve are the resolvable ones, and the tern client and
+// control-request store are the ones the assertions read.
+func abandonedStoppedReaperService(client tern.Client, scanned, resolvable []*storage.Apply, scanErr error) (*Service, *memoryControlRequestStore) {
+	controls := &memoryControlRequestStore{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		applies: &abandonedScanApplyStore{
+			ApplyStore: &staticApplyStore{applies: resolvable},
+			abandoned:  scanned,
+			scanErr:    scanErr,
+		},
+		tasks:    &capturingTaskStore{},
+		controls: controls,
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": client,
+	}, logger)
+	return svc, controls
+}
+
+// A stopped apply nobody came back for is resolved through the ordinary cancel
+// path, not by writing a terminal state onto the apply row: the durable request
+// is recorded, attributed to the reaper rather than to an operator, and the
+// immediate cancel is relayed to the data plane.
+func TestReapAbandonedStoppedAppliesCancelsThroughTheControlPath(t *testing.T) {
+	mock := &mockTernClient{cancelResp: &ternv1.CancelResponse{Accepted: true, CancelledCount: 1}}
+	abandoned := stoppedTestApply("apply-abandoned-stopped")
+	svc, controls := abandonedStoppedReaperService(mock, []*storage.Apply{abandoned}, []*storage.Apply{abandoned}, nil)
+
+	svc.reapAbandonedStoppedApplies(t.Context())
+
+	require.NotNil(t, mock.cancelReq, "the sweep must relay the cancel to the data plane, not just record intent")
+	assert.Equal(t, abandoned.ApplyIdentifier, mock.cancelReq.ApplyId)
+	assert.Equal(t, abandoned.Environment, mock.cancelReq.Environment)
+
+	controlReq, err := controls.GetPending(t.Context(), abandoned.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq, "the cancel must be durable, so a restart mid-reap does not lose it")
+	assert.Equal(t, abandonedStoppedReaperCaller, controlReq.RequestedBy,
+		"an operator reading the apply must see that the reaper cancelled it, not a person")
+}
+
+// Each apply the sweep resolves is independent: one whose cancel cannot be
+// issued — an unreachable target, or an apply an operator resolved between the
+// scan and the cancel — must not strand the rest of the batch stopped.
+func TestReapAbandonedStoppedAppliesContinuesPastAnApplyItCannotCancel(t *testing.T) {
+	mock := &mockTernClient{cancelResp: &ternv1.CancelResponse{Accepted: true, CancelledCount: 1}}
+	unresolvable := stoppedTestApply("apply-abandoned-vanished")
+	resolvable := stoppedTestApply("apply-abandoned-reachable")
+	resolvable.ID = 2
+	svc, controls := abandonedStoppedReaperService(mock,
+		[]*storage.Apply{unresolvable, resolvable},
+		[]*storage.Apply{resolvable}, nil)
+
+	svc.reapAbandonedStoppedApplies(t.Context())
+
+	require.NotNil(t, mock.cancelReq, "the sweep must go on to the next apply after one it could not cancel")
+	assert.Equal(t, resolvable.ApplyIdentifier, mock.cancelReq.ApplyId)
+	controlReq, err := controls.GetPending(t.Context(), resolvable.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq)
+}
+
+// The sweep runs without an election, so a scan failure is always a real fault:
+// it is recorded under the sweep's own reason so an operator can tell which
+// sweep stopped finding work.
+func TestReapAbandonedStoppedAppliesRecordsAScanFailureUnderItsOwnReason(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := abandonedStoppedReaperService(&mockTernClient{}, nil, nil, errors.New("applies table unavailable"))
+
+	svc.reapAbandonedStoppedApplies(t.Context())
+
+	assert.Equal(t, []string{"abandoned_stopped_reaper_error"}, claimFailureReasons(t, reader),
+		"a failed scan is attributable to the abandoned-stopped sweep")
 }

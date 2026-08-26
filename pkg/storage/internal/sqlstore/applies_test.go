@@ -2677,6 +2677,111 @@ func TestApplyStore_FindStuckPendingApplies(t *testing.T) {
 	})
 }
 
+// FindAbandonedStoppedApplies is the reaper's scan for stopped applies nobody is
+// coming back for. A stop is resumable, so the scan must leave alone every
+// stopped apply that someone or something still owns: one whose work another
+// apply took over, one with an operator command already in flight, and one that
+// stopped recently enough that resuming it is still the expected next step. Only
+// a stopped apply untouched past the given age qualifies, oldest first, because
+// staleness is measured from the last write to the row — a resumable stop leaves
+// completed_at NULL, so updated_at is the only record of when it was last
+// touched.
+func TestApplyStore_FindAbandonedStoppedApplies(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	// Each apply needs a distinct target: apply creation rejects a second apply
+	// for a database/type/environment that already has one it considers active.
+	seedStopped := func(t *testing.T, applyID string, planID int64) *storage.Apply {
+		t.Helper()
+		lock := createTestLock(t, store, "db_"+applyID, storage.DatabaseTypeMySQL)
+		return createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Stopped, "staging")
+	}
+	// updated_at, not created_at: the scan measures how long the row has sat
+	// untouched. Setting it explicitly overrides the column's ON UPDATE clause.
+	backdate := func(t *testing.T, id int64, age time.Duration) {
+		t.Helper()
+		_, err := testDB.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET updated_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			id)
+		require.NoError(t, err)
+	}
+	requestCancel := func(t *testing.T, apply *storage.Apply) {
+		t.Helper()
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   apply.ID,
+			Operation: storage.ControlOperationCancel,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+	}
+
+	// Stopped and untouched past the age → abandoned, oldest first.
+	oldest := seedStopped(t, "apply_abandoned_oldest", 9101)
+	backdate(t, oldest.ID, 96*time.Hour)
+	newer := seedStopped(t, "apply_abandoned_newer", 9102)
+	backdate(t, newer.ID, 80*time.Hour)
+
+	// A settled command is spent history, not work in flight, so the apply it
+	// was issued against is still abandoned.
+	settledCommand := seedStopped(t, "apply_abandoned_settled_command", 9103)
+	requestCancel(t, settledCommand)
+	require.NoError(t, store.ControlRequests().FailPending(ctx, settledCommand.ID, storage.ControlOperationCancel, "target unreachable"))
+	backdate(t, settledCommand.ID, 90*time.Hour)
+
+	// Stopped but recently touched → resuming it is still the expected next
+	// step, so it is left alone.
+	seedStopped(t, "apply_stopped_recent", 9104)
+
+	// Stopped with its work taken over → the successor owns the outcome, and
+	// cancelling this apply would report a verdict on work it no longer holds.
+	superseded := seedStopped(t, "apply_stopped_superseded", 9105)
+	require.NoError(t, store.Applies().MarkSuperseded(ctx, superseded.ID, "apply_abandoned_newer"))
+	backdate(t, superseded.ID, 96*time.Hour)
+
+	// Stopped with an operator command in flight → that command decides the
+	// outcome. This exclusion is also what makes the sweep safe without an
+	// election: a second instance sees the request the first one recorded.
+	commanded := seedStopped(t, "apply_stopped_commanded", 9106)
+	requestCancel(t, commanded)
+	backdate(t, commanded.ID, 96*time.Hour)
+
+	// Not stopped → whatever state it is in owns it, terminal or live.
+	completedLock := createTestLock(t, store, "db_abandoned_completed", storage.DatabaseTypeMySQL)
+	completed := createTestApplyWithStateAndEnv(t, store, completedLock, "apply_abandoned_completed", 9107, state.Apply.Completed, "staging")
+	backdate(t, completed.ID, 96*time.Hour)
+
+	age := 72 * time.Hour
+
+	t.Run("returns aged stopped applies oldest first", func(t *testing.T) {
+		abandoned, err := store.Applies().FindAbandonedStoppedApplies(ctx, age, 0)
+		require.NoError(t, err)
+		require.Len(t, abandoned, 3)
+		assert.Equal(t, oldest.ApplyIdentifier, abandoned[0].ApplyIdentifier)
+		assert.Equal(t, settledCommand.ApplyIdentifier, abandoned[1].ApplyIdentifier,
+			"a spent control request does not own the apply")
+		assert.Equal(t, newer.ApplyIdentifier, abandoned[2].ApplyIdentifier)
+		assert.Equal(t, state.Apply.Stopped, abandoned[0].State)
+		assert.Empty(t, abandoned[0].SupersededBy)
+	})
+
+	t.Run("limit caps the result to the oldest rows", func(t *testing.T) {
+		abandoned, err := store.Applies().FindAbandonedStoppedApplies(ctx, age, 1)
+		require.NoError(t, err)
+		require.Len(t, abandoned, 1)
+		assert.Equal(t, oldest.ApplyIdentifier, abandoned[0].ApplyIdentifier)
+	})
+
+	t.Run("an age above every row surfaces nothing", func(t *testing.T) {
+		abandoned, err := store.Applies().FindAbandonedStoppedApplies(ctx, 30*24*time.Hour, 0)
+		require.NoError(t, err)
+		assert.Empty(t, abandoned)
+	})
+}
+
 // A VSchema-only apply carries an apply_operations row but no tasks — the
 // VSchema application is the whole apply. Its dual-written operation row proves
 // the create committed fully, so the pending claim must accept it; gating the
