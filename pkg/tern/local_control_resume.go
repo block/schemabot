@@ -1483,6 +1483,26 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); handled || err != nil {
 		return err
 	}
+	// A stopped apply is claimed only to deliver a pending control request. A
+	// pending start means the operator asked to resume, and the drive below
+	// consumes it (completing it once the engine accepts). No pending start
+	// means the request that admitted the claim was a cancel that was declined
+	// or could not finish this claim — exit without resuming, since a stopped
+	// copy must never resume without an operator start. The durable request is
+	// the authority here, not the in-memory state: a start claim transitions
+	// the stored row to resuming but the drive still holds the claim-time
+	// snapshot.
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		startReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
+		if err != nil {
+			return fmt.Errorf("check pending start before resuming stopped apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if startReq == nil {
+			logger.Info("stopped apply has no pending start request; drive exits without resuming",
+				apply.MutableLogAttrs()...)
+			return nil
+		}
+	}
 
 	// Get the plan to retrieve original DDLs. A storage read failure says
 	// nothing about whether the plan row exists, so it must not become terminal
