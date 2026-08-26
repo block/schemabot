@@ -77,6 +77,56 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Nil(t, done)
 	})
 
+	// FindNextApplyOperation_ShardFanOutClaimOrder verifies claim ordering
+	// when several rows are claimable at once. A deployment's per-shard work
+	// rows fan out — a later shard is claimable while an earlier one is still
+	// running — so with two claimable siblings the claim must hand them out in
+	// insertion order (created_at, id). The group_finalizer stays blocked
+	// until every work sibling completes.
+	t.Run("FindNextApplyOperation_ShardFanOutClaimOrder", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_shard_order_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_shard_order", 908)
+
+		shardA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork,
+		})
+		require.NoError(t, err)
+		shardB, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork,
+		})
+		require.NoError(t, err)
+		finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		})
+		require.NoError(t, err)
+
+		first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, first)
+		assert.Equal(t, shardA, first.ID, "concurrently claimable siblings are handed out in insertion order")
+
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second, "a sibling shard is claimable while the first still runs")
+		assert.Equal(t, shardB, second.ID)
+		assert.NotEqual(t, first.LeaseToken, second.LeaseToken, "each shard claim rotates its own lease")
+
+		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, blocked, "the group finalizer waits for every work sibling")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardA))
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardB))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, finalizerID, claimed.ID)
+		assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+	})
+
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
 	// operation lease fences a single-row write on the child token, while an
 	// apply lease fences a joined child/parent write; stale holders lose
