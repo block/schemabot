@@ -291,7 +291,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
 - `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
-Applying copies the tables above again from zero rows, so it runs as long as a first copy would; the work already done is lost and cannot be recovered. To continue the existing copy instead, apply the same schema change that started it.
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
 📋 **Plan**: **1** table to alter
 
@@ -330,6 +330,86 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ---
 
 **Applying automatically**
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-paused"></a><strong>MySQL Plan (Existing Copy Discarded, Paused)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Applying destroys work in progress on the target
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-confirm-stopped"></a><strong>MySQL Plan (Existing Copy Discarded, Confirm Stopped)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+⚠️ **Apply stopped**: Applying destroys work in progress on the target
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
 
 </details>
 

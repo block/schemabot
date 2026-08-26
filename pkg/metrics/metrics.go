@@ -602,8 +602,9 @@ func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{
-	"apply_finished":    true,
-	"rollback_finished": true,
+	"apply_finished":           true,
+	"apply_cancelled_finished": true,
+	"rollback_finished":        true,
 }
 
 // RecordCheckOwnershipMiss increments the counter for guarded check updates
@@ -956,6 +957,7 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 	"attach_race":      true,
 	"terminal_refused": true,
 	"manifest_refused": true,
+	"adopted":          true,
 }
 
 // RecordRemoteApplyAttach increments the counter for dispatches that resolved
@@ -975,6 +977,10 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 //     two planes disagree about the generation's operation set (version or
 //     data skew), so compare the dispatcher's operation rows against the
 //     stored manifest before retrying.
+//   - "adopted": a dispatch resolved into the live apply already running its
+//     exact change set instead of being refused by it. A steady rate means
+//     applies are routinely outliving the identity that started them —
+//     investigate what is terminalizing them while their work continues.
 func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome string) {
 	if !knownRemoteApplyAttachOutcomes[outcome] {
 		outcome = "unknown"
@@ -2031,6 +2037,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,
 	"apply_finished":                       true,
+	"apply_cancelled_finished":             true,
 	"rollback_finished":                    true,
 	"aggregate_check_sync":                 true,
 	"stale_check_cleanup":                  true,

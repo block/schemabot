@@ -65,8 +65,13 @@ func Run(t *testing.T, h Harness) {
 	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
 	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
 	t.Run("Locks", func(t *testing.T) { TestLocks(t, h) })
+	t.Run("Applies", func(t *testing.T) { TestApplies(t, h) })
+	t.Run("ApplyOperations", func(t *testing.T) { TestApplyOperations(t, h) })
 	t.Run("ApplyComments", func(t *testing.T) { TestApplyComments(t, h) })
 	t.Run("ControlRequests", func(t *testing.T) { TestControlRequests(t, h) })
+	t.Run("Tasks", func(t *testing.T) { TestTasks(t, h) })
+	t.Run("WebhookEvents", func(t *testing.T) { TestWebhookEvents(t, h) })
+	t.Run("Checks", func(t *testing.T) { TestChecks(t, h) })
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the
@@ -157,31 +162,22 @@ func CreateClaimedApply(t *testing.T, store storage.Storage, lock *storage.Lock,
 	t.Helper()
 	ctx := t.Context()
 
-	apply := CreateApply(t, store, lock, applyID, planID)
-
-	now := time.Now().UTC().Truncate(time.Second)
-	_, err := store.Tasks().Create(ctx, &storage.Task{
-		TaskIdentifier: "task_" + applyID,
-		ApplyID:        apply.ID,
-		PlanID:         apply.PlanID,
-		Database:       apply.Database,
-		DatabaseType:   apply.DatabaseType,
-		Engine:         apply.Engine,
-		Repository:     apply.Repository,
-		PullRequest:    apply.PullRequest,
-		Environment:    apply.Environment,
-		State:          state.Task.Pending,
-		Namespace:      apply.Database,
-		TableName:      "users",
-		DDL:            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
-		DDLAction:      "create",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
-	require.NoError(t, err)
-
+	apply := CreateApplyWithTask(t, store, lock, applyID, planID)
 	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, owner)
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "an apply with a persisted task must be claimable")
 	return claimed
+}
+
+// CreateApplyWithTask creates a pending apply and its canonical task fixture.
+func CreateApplyWithTask(t *testing.T, store storage.Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {
+	t.Helper()
+	apply := CreateApply(t, store, lock, applyID, planID)
+	now := time.Now().UTC().Truncate(time.Second)
+	task := newTask(apply, "task_"+applyID, "users", now)
+	task.DDL = "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)"
+	task.DDLAction = "create"
+	_, err := store.Tasks().Create(t.Context(), task)
+	require.NoError(t, err)
+	return apply
 }

@@ -151,14 +151,25 @@ type CheckStore interface {
 	// the stored state first.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
-	// MarkActionRequiredForApply marks stored check state action_required after
-	// a rollback only if no apply newer than the rollback exists for the same
-	// PR/environment/database. Rows owned by the rollback, by an older apply, or
-	// unowned all qualify: a rollback that never claimed the row must still be
-	// able to block the stale successful check left over from the apply it
-	// reverted. Returns false when any apply newer than the rollback exists for
-	// the target, whether or not it has claimed the row.
+	// MarkActionRequiredForApply marks stored check state action_required for a
+	// terminal apply only if no newer apply exists for the same target. The row
+	// may be owned by this apply, an older apply, or no apply: completed rollbacks
+	// must block stale success even when their claim never landed, and safely
+	// cancelled forward applies must be able to release retained ownership.
+	// Returns false when any newer apply exists for the target or a cancelled
+	// forward apply has completed task history, whether or not a newer apply has
+	// claimed the row.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
+
+	// MarkCancelledApplyFailed marks stored check state as a terminal failure
+	// owned by a cancelled apply when a completed forward task proves that apply
+	// may have changed the target. The row may be owned by this apply, an older
+	// apply, or no apply, so a cancelled apply whose claim never landed can still
+	// block the stale check the owning apply left behind. It also accepts an
+	// already-completed owned row so stale reconciliation can durably record the
+	// decision. Returns false when the task evidence is absent or a newer apply
+	// exists for the target.
+	MarkCancelledApplyFailed(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
 	Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*Check, error)

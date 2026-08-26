@@ -469,6 +469,14 @@ type PlanResponse struct {
 	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
 }
 
+// Dispositions an ExistingCopyResponse can carry. These mirror the engine's
+// own vocabulary on the wire; this package holds its own copy because it is
+// dependency-free by design. A test pins the two together.
+const (
+	ExistingCopyAdopt   = "adopt"
+	ExistingCopyDiscard = "discard"
+)
+
 // ExistingCopyResponse is an unfinished copy sitting on the target and what
 // applying the plan will do to it: adopt it and resume, or discard it and copy
 // again from the start.
@@ -606,6 +614,30 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 		}
 	}
 	return false
+}
+
+// DiscardedCopies returns the unfinished copies on the target that applying
+// this plan will throw away and re-copy from the start.
+//
+// A copy whose disposition this build does not recognize counts as discarded:
+// the caller uses this to decide whether an operator must confirm before work
+// already done is destroyed, and an unrecognized verdict is not a reason to
+// skip that confirmation.
+func (r *PlanResponse) DiscardedCopies() []*ExistingCopyResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*ExistingCopyResponse
+	for _, c := range r.ExistingCopies {
+		if c == nil {
+			continue
+		}
+		if c.Disposition == ExistingCopyAdopt {
+			continue
+		}
+		result = append(result, c)
+	}
+	return result
 }
 
 // DirectChanges returns all table changes the planner routed to direct

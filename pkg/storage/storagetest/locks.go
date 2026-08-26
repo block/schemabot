@@ -116,6 +116,69 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, "owner-a", stored.Owner)
 	})
 
+	// The disclosure record says what the comment behind the pending
+	// confirmation told the operator about an unfinished copy on the target,
+	// so it is only ever true of the plan it was stored with. It therefore
+	// moves with the plan on every refresh — including back to false when the
+	// newer comment discloses nothing — and stays put when a caller supplies
+	// no plan at all.
+	t.Run("Acquire_DisclosureTravelsWithPendingPlan", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName:         "disclosure_db",
+			DatabaseType:         storage.DatabaseTypeMySQL,
+			Repository:           "org/repo",
+			PullRequest:          123,
+			Owner:                "owner-a",
+			PendingPlanID:        "plan-1",
+			DisclosedCopyDiscard: true,
+		}))
+
+		stored, err := store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "plan-1", stored.PendingPlanID)
+		assert.True(t, stored.DisclosedCopyDiscard)
+
+		// A later apply re-plans against a target whose copy is gone and posts
+		// a comment that discloses nothing. The record must follow that
+		// comment, or the gate stays disarmed against a disclosure the
+		// operator was never shown.
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName:  "disclosure_db",
+			DatabaseType:  storage.DatabaseTypeMySQL,
+			Repository:    "org/repo",
+			PullRequest:   123,
+			Owner:         "owner-a",
+			PendingPlanID: "plan-2",
+		}))
+
+		stored, err = store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "plan-2", stored.PendingPlanID)
+		assert.False(t, stored.DisclosedCopyDiscard,
+			"the disclosure must describe the plan apply-confirm loads, not an older one")
+
+		// A re-acquire with no plan (rollback, CLI) changes neither.
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName:         "disclosure_db",
+			DatabaseType:         storage.DatabaseTypeMySQL,
+			Repository:           "org/repo",
+			PullRequest:          123,
+			Owner:                "owner-a",
+			DisclosedCopyDiscard: true,
+		}))
+
+		stored, err = store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "plan-2", stored.PendingPlanID)
+		assert.False(t, stored.DisclosedCopyDiscard)
+	})
+
 	t.Run("Release", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

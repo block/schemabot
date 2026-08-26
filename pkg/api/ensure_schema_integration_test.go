@@ -336,6 +336,87 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 	assert.True(t, testutil.TableExists(t, db, "schemabot", surplusTable))
 }
 
+// When the live storage database drifts from the embedded schema on the same
+// table in both directions — it misses a column the starting binary requires
+// and holds a surplus column a newer binary wrote — Spirit's diff emits one
+// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. EnsureSchema must
+// split that statement: the required column is added so the binary can run,
+// while the destructive clause is refused and the surplus column survives.
+func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// Same-table drift in both directions: `tasks` misses an embedded column
+	// the binary requires and holds a surplus column it does not declare.
+	const missingColumn = "throttle_reason"
+	surplusColumn, _ := seedSurplusStorageState(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with a mixed additive/destructive ALTER must not fail startup")
+
+	// The required column was added; the surplus column survived.
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn),
+		"missing embedded column must be added even when the same ALTER carries destructive clauses")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+		"surplus column from the newer schema must not be dropped by default")
+
+	// The refusal names only the destructive clauses, not the additive ones,
+	// and carries the combined ALTER it was split from.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "refusing destructive clauses of a mixed storage-schema ALTER")
+	assert.Contains(t, logs, "split_from_ddl")
+	assert.Contains(t, logs, surplusColumn)
+
+	// A repeat run converges: the additive work is done, the destructive
+	// remainder keeps being refused without error.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
+	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn))
+}
+
+// A live storage table whose primary key is wider than the embedded schema's
+// makes the Spirit diff emit a combined DROP PRIMARY KEY, ADD PRIMARY KEY
+// statement. The ADD half cannot run without the refused DROP, so the change
+// is refused whole: startup succeeds and the wider primary key survives.
+func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	container, dsn, db := startEnsureSchemaContainer(t, ctx)
+	defer func() { _ = container.Terminate(t.Context()) }()
+	defer utils.CloseAndLog(db)
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// Widen the primary key beyond the embedded schema's declaration. The
+	// AUTO_INCREMENT column stays leftmost so the live table remains valid.
+	_, err := db.ExecContext(ctx, "ALTER TABLE `tasks` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `apply_id`)")
+	require.NoError(t, err)
+
+	primaryKeyColumns := func() int {
+		var n int
+		require.NoError(t, db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'schemabot' AND TABLE_NAME = 'tasks' AND INDEX_NAME = 'PRIMARY'").Scan(&n))
+		return n
+	}
+	require.Equal(t, 2, primaryKeyColumns())
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with a refused primary-key change must not fail startup")
+	assert.Equal(t, 2, primaryKeyColumns(),
+		"the wider live primary key must survive: an ADD PRIMARY KEY cannot execute without the refused DROP PRIMARY KEY")
+}
+
 // An operator who intentionally removed a storage table and column opts in to
 // destructive storage-schema changes; EnsureSchema then executes the DROP
 // statements and converges the database to the embedded schema.

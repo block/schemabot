@@ -35,7 +35,7 @@
   - [Manual plan](#manual-plan)
   - [Apply requested](#apply-requested)
   - [Apply confirmed](#apply-confirmed)
-  - [Auto-confirm apply](#auto-confirm-apply)
+  - [Automatic apply](#automatic-apply)
   - [Rollback requested](#rollback-requested)
   - [Rollback confirmed](#rollback-confirmed)
   - [Unlock](#unlock)
@@ -901,11 +901,14 @@ Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same
 PR/environment/database.
 
-### Auto-confirm apply
+### Automatic apply
 
-`schemabot apply -y` still verifies that the stored plan is current. If the PR
-head changed or the re-plan DDL differs from the stored plan, SchemaBot
-downgrades to manual confirmation and leaves the check in `action_required`.
+An automatic apply verifies that the stored plan is still current before it
+runs. If the PR head changed, the re-plan DDL differs from the stored plan, or
+the plan would discard an unfinished copy on the target, SchemaBot downgrades to
+manual confirmation and leaves the check in `action_required`. There is no
+comment flag that skips this: `-y` belongs to the CLI, where it skips an
+interactive prompt.
 
 ### Rollback requested
 
