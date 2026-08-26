@@ -1,13 +1,10 @@
 package postgres
 
 import (
-	"errors"
-	"fmt"
 	"testing"
 
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
-	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -183,73 +180,34 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 }
 
-// TestPrivilegeBlockReason pins the boundary between typed preflight refusals
-// (rendered as blocked plan verdicts with provisioning detail) and
-// operational failures (the plan must fail instead of blocking the change).
-func TestPrivilegeBlockReason(t *testing.T) {
-	tests := []struct {
-		name       string
-		err        error
-		refused    bool
-		wantReason []string
-	}{
+// TestBlockMissingPrivilegesSkipsMissingTable proves that executable steps on
+// a table the target provably does not have are blocked with the dependency
+// as the reason — the table's creation is itself blocked — never with a
+// privilege probe's "table not found", which reads as a re-plan instruction
+// no re-plan can satisfy. The nil pool proves no probe runs.
+func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	exists := false
+	report.TableExists = &exists
+	changes := []engine.TableChange{
 		{
-			name: "privilege error blocks with grant, check, and hint",
-			err: fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{
-				Tier:  preflight.TierAlterInPlace,
-				Check: "pg_has_role(limited, app_owner, 'USAGE')",
-				Grant: `GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
-				Hint:  "membership must be inheritable",
-			}),
-			refused: true,
-			wantReason: []string{
-				"in-place ALTER TABLE",
-				`GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
-				"pg_has_role(limited, app_owner, 'USAGE')",
-				"membership must be inheritable",
-			},
+			Table:         "users",
+			DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    "creation shape verdict",
 		},
 		{
-			name: "database-sourced identifiers are sanitized for Markdown",
-			err: fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{
-				Tier:  preflight.TierAlterInPlace,
-				Check: "pg_has_role(evil\nrole, app|owner, 'USAGE')",
-				Grant: "GRANT \"app|owner\" TO \"evil\nrole\"\x1b[31m",
-				Hint:  "membership\tmust be inheritable",
-			}),
-			refused: true,
-			wantReason: []string{
-				`GRANT "app/owner" TO "evil role"`,
-				"pg_has_role(evil role, app/owner, 'USAGE')",
-				"membership must be inheritable",
-			},
-		},
-		{
-			name:       "missing table blocks with a re-plan instruction",
-			err:        fmt.Errorf("check privileges: %w", preflight.ErrTableNotFound),
-			refused:    true,
-			wantReason: []string{"re-plan against the current schema"},
-		},
-		{
-			name:       "non-table relation blocks with the relation kind cause",
-			err:        fmt.Errorf("check privileges: %w", preflight.ErrNotTable),
-			refused:    true,
-			wantReason: []string{"not an ordinary or partitioned table"},
-		},
-		{
-			name: "untyped error is operational, not a refusal",
-			err:  errors.New("dial tcp: connection refused"),
+			Table: "users",
+			DDL:   "CREATE INDEX CONCURRENTLY idx_users_email ON public.users (email)",
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			reason, refused := privilegeBlockReason(tt.err, "users")
-			assert.Equal(t, tt.refused, refused)
-			for _, want := range tt.wantReason {
-				assert.Contains(t, reason, want)
-			}
-		})
-	}
+
+	require.NoError(t, blockMissingPrivileges(t.Context(), nil, report, changes))
+	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Contains(t, changes[1].ModeReason, `table "users" does not exist on the target`)
+	assert.Contains(t, changes[1].ModeReason, "the statement that would create it is blocked")
 }
 
 // TestBlockMissingPrivilegesSkipsFullyBlockedPlans proves the privilege check

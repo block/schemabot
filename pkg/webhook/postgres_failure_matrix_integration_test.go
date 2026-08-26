@@ -251,8 +251,10 @@ func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	task := tasks[0]
 	assert.True(t, state.IsState(task.State, state.Task.Failed),
 		"a refusal is permanent and must not be marked retryable, state=%s", task.State)
-	assert.Contains(t, task.ErrorMessage, "insufficient privileges; provision with:",
+	assert.Contains(t, task.ErrorMessage, "lacks access for",
 		"the stored error must be the classified refusal detail built from typed error fields, never wrapped server output")
+	assert.Contains(t, task.ErrorMessage, "provision with:",
+		"the stored error must carry the provisioning instruction")
 	assert.Contains(t, task.ErrorMessage, "GRANT",
 		"the stored error must carry the exact provisioning statement")
 	assert.NotNil(t, task.CompletedAt, "a permanently failed task is settled, not awaiting retry")

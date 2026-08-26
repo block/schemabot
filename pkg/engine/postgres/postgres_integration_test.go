@@ -78,8 +78,11 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, "in-place ALTER TABLE",
+		"the reason must name the tier whose access is missing")
 	assert.Contains(t, change.ModeReason, "GRANT")
-	assert.Contains(t, change.ModeReason, "plan_limited")
+	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
+		"the reason must carry the exact failed catalog check")
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through

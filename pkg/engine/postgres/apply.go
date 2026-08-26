@@ -166,20 +166,24 @@ type refusal struct {
 }
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
-// refusals. A nil result means the failure is operational — a retry may
+// refusals, for both the plan-time privilege check and the apply path — one
+// classifier so the same underlying failure reads identically on both
+// surfaces. A nil result means the failure is operational — a retry may
 // succeed once conditions change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
 // with concurrent lock holders. Every detail string here is built from typed
-// error fields and identifiers, never from wrapped server output, so it is
-// safe to render on operator-facing surfaces.
+// error fields and identifiers, never from wrapped server output; fields
+// that embed database-sourced identifiers are sanitized before they leave,
+// so a detail is safe to render on operator-facing surfaces.
 func classifyRefusal(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		detail := fmt.Sprintf("insufficient privileges; provision with: %s", privilegeErr.Grant)
+		detail := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
+			privilegeErr.Tier, table, privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
 			detail += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: detail}
+		return &refusal{reason: "insufficient-privileges", detail: sanitizeReasonText(detail)}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {

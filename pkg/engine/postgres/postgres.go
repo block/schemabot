@@ -3,7 +3,6 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -181,10 +180,9 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 // The apply path re-runs the same check before executing, so a grant revoked
 // between plan and apply still fails closed there. A typed refusal blocks the
 // table's executable steps; any other failure fails the plan — an executable
-// plan must never be produced while the check's answer is unknown. Every
-// blocked reason here is built from typed error fields and identifiers, never
-// from wrapped server output, so it is safe to render on operator-facing
-// surfaces.
+// plan must never be produced while the check's answer is unknown. Reasons
+// come from classifyRefusal, so the same failure reads identically at plan
+// and apply time.
 func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange) error {
 	var executable []string
 	for _, change := range changes {
@@ -198,6 +196,17 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if report.Table == "" {
 		return fmt.Errorf("plan report carries executable steps but names no target table")
 	}
+	if report.TableExists != nil && !*report.TableExists {
+		// A privilege probe against a table that provably does not exist can
+		// only answer "table not found" — a dead end for the operator. The
+		// executable steps here depend on the table's creation, and the
+		// CREATE TABLE statement itself is blocked by the per-statement
+		// verdict, so the accurate reason is that dependency, not a re-plan
+		// instruction that no re-plan can satisfy.
+		blockExecutableChanges(changes, fmt.Sprintf(
+			"table %q does not exist on the target; the statement that would create it is blocked, so this statement cannot run", report.Table))
+		return nil
+	}
 	tier, err := preflight.RequiredTier(executable)
 	if err != nil {
 		return fmt.Errorf("derive privilege tier for table %q: %w", report.Table, err)
@@ -206,44 +215,22 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if err == nil {
 		return nil
 	}
-	reason, refused := privilegeBlockReason(err, report.Table)
-	if !refused {
-		return fmt.Errorf("check privileges for table %q: %w", report.Table, err)
+	if r := classifyRefusal(err, report.Table); r != nil {
+		blockExecutableChanges(changes, r.detail)
+		return nil
 	}
+	return fmt.Errorf("check privileges for table %q: %w", report.Table, err)
+}
+
+// blockExecutableChanges marks every still-executable change blocked with the
+// given reason, leaving changes that already carry a verdict untouched.
+func blockExecutableChanges(changes []engine.TableChange, reason string) {
 	for i := range changes {
 		if changes[i].ExecutionMode == "" {
 			changes[i].ExecutionMode = engine.ExecutionModeBlocked
 			changes[i].ModeReason = reason
 		}
 	}
-	return nil
-}
-
-// privilegeBlockReason maps a typed preflight refusal to an operator-facing
-// blocked reason. A PrivilegeError carries the exact grant that provisions
-// the missing access; the Grant and Check fields embed database-sourced
-// identifiers (role, schema, owner names), so the composed reason is
-// sanitized before it leaves the engine — a blocked reason renders verbatim
-// in PR Markdown. A false second return means the failure is operational,
-// not a refusal, and the caller must fail the plan instead of blocking the
-// change.
-func privilegeBlockReason(err error, table string) (string, bool) {
-	var privilegeErr *preflight.PrivilegeError
-	if errors.As(err, &privilegeErr) {
-		reason := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
-			privilegeErr.Tier, table, privilegeErr.Grant, privilegeErr.Check)
-		if privilegeErr.Hint != "" {
-			reason += "; " + privilegeErr.Hint
-		}
-		return sanitizeReasonText(reason), true
-	}
-	if errors.Is(err, preflight.ErrTableNotFound) {
-		return fmt.Sprintf("table %q was not found while verifying privileges; re-plan against the current schema", table), true
-	}
-	if errors.Is(err, preflight.ErrNotTable) {
-		return fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table), true
-	}
-	return "", false
 }
 
 // sanitizeReasonText makes text that embeds database-sourced identifiers safe
