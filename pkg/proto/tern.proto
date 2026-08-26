@@ -526,6 +526,14 @@ message ExistingCopy {
   // age_seconds is a heartbeat rather than staleness, and applying joins it
   // instead of restarting it. Set from the deployment's own apply records, so
   // it is engine-agnostic.
+  //
+  // It reports stored state, not a live probe of the engine: a producer sets it
+  // from its own task rows without reconciling them, because a plan decides
+  // nothing and must not rewrite the records it reads. A row left in flight by
+  // a crashed server therefore reads as running until recovery clears it, so a
+  // consumer must not treat this as proof that work is live — it is why the
+  // copy's disposition, never this field, decides whether applying destroys
+  // anything.
   bool running = 7;
 }
 

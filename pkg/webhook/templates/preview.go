@@ -370,6 +370,7 @@ func PreviewCommentPlanCopyRunning() string {
 				Namespace: "testapp",
 				Tables:    []string{"orders", "products"},
 				Age:       "4s",
+				Running:   true,
 			},
 		},
 	})

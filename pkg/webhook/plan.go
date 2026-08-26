@@ -794,6 +794,7 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 			Tables:    c.Tables,
 			Reason:    c.Reason,
 			Statement: c.Statement,
+			Running:   c.Running,
 		}
 		if c.AgeSeconds > 0 {
 			entry.Age = ui.FormatHumanDuration(time.Duration(c.AgeSeconds) * time.Second)
@@ -806,6 +807,10 @@ func splitExistingCopies(copies []*apitypes.ExistingCopyResponse) (discarded, ad
 			}
 			adopted = append(adopted, entry)
 		case apitypes.ExistingCopyDiscard:
+			// A running copy still lands in the destructive section: the work is
+			// destroyed whether or not it is live, and moving it out would hide a
+			// discard behind a reassuring heading. The entry carries Running so it
+			// reads "(still copying)" rather than dating live work as stale.
 			discarded = append(discarded, entry)
 		default:
 			// Reaching here means a deployment reported a disposition this build

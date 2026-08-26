@@ -32,6 +32,15 @@ type ExistingCopyData struct {
 	//
 	// Empty for a copy with no recorded progress to date it by.
 	Age string
+	// Running reports that the copy is still being made right now. It travels
+	// with the entry rather than with the section holding it, because a copy
+	// can be running and still be one applying throws away: another PR's copy
+	// of the same table, live this second, is discarded by a plan whose
+	// statement differs from the one that started it. That entry belongs in the
+	// destructive warning — the work really is destroyed — but its Age is a
+	// heartbeat rather than staleness, so rendering it there would report the
+	// liveliest copy on the target as the most abandoned.
+	Running bool
 	// Statement is the schema change the copy was started for. Empty when the
 	// engine has no record of it, which is itself a reason it cannot be
 	// resumed. Rendered only where it explains the cause: told the schema
@@ -74,7 +83,7 @@ func writeDiscardedCopies(sb *strings.Builder, copies []ExistingCopyData, alread
 	}
 	fmt.Fprintf(sb, "%s **%s destroys work in progress**: **%d** unfinished %s on the target\n",
 		marker, subject, n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies, false)
+	writeExistingCopyEntries(sb, copies)
 	if alreadyApplying {
 		sb.WriteString("\n")
 		return
@@ -102,7 +111,7 @@ func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 	}
 	fmt.Fprintf(sb, "♻️ **Resuming work in progress**: **%d** unfinished %s on the target will be continued\n",
 		n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies, false)
+	writeExistingCopyEntries(sb, copies)
 	fmt.Fprintf(sb, "\n%s up where the existing %s stopped rather than starting over.\n\n", subject, copyNoun(n))
 }
 
@@ -115,10 +124,11 @@ func writeAdoptedCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 // Saying "resumes" here would misdescribe both ends of it — a copy that was
 // never interrupted, and an apply that starts nothing — and it is the sentence
 // an operator reads before deciding whether a copy they can see progressing is
-// about to be disturbed. This is also why the entries carry no age: the number
-// behind it is the interval between a live copy's checkpoints, so rendering it
-// as how long ago the copy last progressed reports healthy work as nearly
-// stalled.
+// about to be disturbed. Every entry here reads "(still copying)" rather than
+// an age, which each entry decides for itself: the number behind an age is the
+// interval between a live copy's checkpoints, so rendering it as how long ago
+// the copy last progressed reports healthy work as nearly stalled — wherever
+// the entry lands, including the destructive section.
 func writeRunningCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyApplying bool) {
 	n := len(copies)
 	subject := "Applying joins"
@@ -127,7 +137,7 @@ func writeRunningCopies(sb *strings.Builder, copies []ExistingCopyData, alreadyA
 	}
 	fmt.Fprintf(sb, "♻️ **Work already in progress**: **%d** unfinished %s still running on the target\n",
 		n, copyNoun(n))
-	writeExistingCopyEntries(sb, copies, true)
+	writeExistingCopyEntries(sb, copies)
 	fmt.Fprintf(sb, "\n%s the %s already running rather than starting %s: every row copied so far is kept, and no second %s is made.\n\n",
 		subject, copyNoun(n), ui.PluralizeLabel("a new one", "new ones", n), copyNoun(1))
 }
@@ -147,14 +157,14 @@ func copyNoun(count int) string {
 // made has no such number to give — its last checkpoint is seconds old however
 // many hours of rows it holds — so it says it is running and leaves the timing
 // to the progress comment, which reports the copy's actual position.
-func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData, running bool) {
+func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
 		if c.Namespace != "" {
 			line += " in " + markdownInlineCode(c.Namespace)
 		}
 		switch {
-		case running:
+		case c.Running:
 			line += " (still copying)"
 		case c.Age != "":
 			line += fmt.Sprintf(" (last progress %s ago)", c.Age)

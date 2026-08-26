@@ -492,6 +492,11 @@ type ExistingCopyResponse struct {
 	// — joins the copy instead of resuming it — and what AgeSeconds means, which
 	// for a running copy is the interval between checkpoints rather than how
 	// stale the work is.
+	//
+	// It reports stored state rather than a live probe, so a task row left in
+	// flight by a crashed server reads as running until recovery clears it.
+	// Treat it as how to describe the copy, never as proof that work is live:
+	// what applying does to the copy is carried by Disposition.
 	Running bool `json:"running,omitempty"`
 }
 

@@ -232,7 +232,7 @@ func TestRenderPlanComment_RunningCopyReadsAsJoiningWorkInFlight(t *testing.T) {
 			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
 		}},
 		RunningCopies: []ExistingCopyData{
-			{Namespace: "testapp", Tables: []string{"orders", "products"}, Age: "4s"},
+			{Namespace: "testapp", Tables: []string{"orders", "products"}, Age: "4s", Running: true},
 		},
 	})
 
@@ -264,8 +264,8 @@ func TestRenderPlanComment_RunningAndStoppedCopiesAreDisclosedApart(t *testing.T
 			{Namespace: "orders_a", Tables: []string{"orders"}, Age: "3h 12m"},
 		},
 		RunningCopies: []ExistingCopyData{
-			{Namespace: "orders_b", Tables: []string{"products"}, Age: "4s"},
-			{Namespace: "orders_c", Tables: []string{"shipments"}, Age: "2s"},
+			{Namespace: "orders_b", Tables: []string{"products"}, Age: "4s", Running: true},
+			{Namespace: "orders_c", Tables: []string{"shipments"}, Age: "2s", Running: true},
 		},
 	})
 
@@ -279,6 +279,36 @@ func TestRenderPlanComment_RunningAndStoppedCopiesAreDisclosedApart(t *testing.T
 		"an apply under way describes what it did, not what applying would do")
 	assert.Contains(t, out, "This apply picks up where the existing copy stopped",
 		"the resumed section keeps its own promise on the same comment")
+}
+
+// A copy can be live and still be one the apply destroys: another PR's copy of
+// the same table, progressing this second, is thrown away by a plan whose
+// statement differs from the one that started it. The destructive warning keeps
+// it — the work really is lost — but dates it as the running copy it is, since
+// a live copy's checkpoint interval read as staleness would show the liveliest
+// work on the target as the most abandoned.
+func TestRenderPlanComment_RunningCopyKeepsItsHeartbeatOutOfTheDiscardWarning(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+		DiscardedCopies: []ExistingCopyData{
+			{Namespace: "orders_a", Tables: []string{"orders"}, Age: "3h 12m", Reason: "statement_differs"},
+			{Namespace: "orders_b", Tables: []string{"products"}, Age: "4s", Reason: "statement_differs", Running: true},
+		},
+	})
+
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **2** unfinished copies on the target",
+		"a running copy the apply throws away is still a discard")
+	assert.Equal(t, "- `orders` in `orders_a` (last progress 3h 12m ago): the schema change differs from the one that started it",
+		entryLine(t, out, "- `orders` in"),
+		"a copy that stopped is dated by how stale it is")
+	assert.Equal(t, "- `products` in `orders_b` (still copying): the schema change differs from the one that started it",
+		entryLine(t, out, "- `products`"),
+		"a copy still being made reports that rather than its checkpoint interval")
+	assert.NotContains(t, out, "4s", "a running copy's checkpoint interval is not its staleness")
 }
 
 // An expired checkpoint is a different cause from a changed statement, and the

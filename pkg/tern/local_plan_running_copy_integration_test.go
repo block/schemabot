@@ -44,9 +44,60 @@ func TestRunningCopyTablesReportsOnlyWorkInFlight(t *testing.T) {
 			_, err := f.db.ExecContext(t.Context(), "UPDATE tasks SET state = ?", tc.taskState)
 			require.NoError(t, err)
 
-			running, err := f.client.runningCopyTables(t.Context(), "testdb")
+			running, err := f.client.runningCopyTables(t.Context(), "testdb", localClientTestEnvironment)
 			require.NoError(t, err)
 			assert.Equal(t, tc.running, running[inFlight], tc.why)
 		})
 	}
+}
+
+// Task rows are keyed by database name, which is not a target: the same logical
+// name can belong to this deployment's staging and production databases. A plan
+// only describes the target it was asked about, so a copy running in one
+// environment must never be reported as live work on another's.
+func TestRunningCopyTablesReportsOnlyThePlannedTarget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	first := f.dispatch(t, "schemabot:v1:running-copy-target")
+	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
+	_, err := f.db.ExecContext(t.Context(), "UPDATE tasks SET state = ?", state.Task.Running)
+	require.NoError(t, err)
+
+	inFlight := runningCopyKey{"testdb", "users"}
+
+	running, err := f.client.runningCopyTables(t.Context(), "testdb", localClientTestEnvironment)
+	require.NoError(t, err)
+	require.True(t, running[inFlight], "the copy is running on the environment that was planned")
+
+	for _, tc := range []struct {
+		name        string
+		environment string
+		why         string
+	}{
+		{"other environment", "some-other-environment",
+			"a copy running in one environment is not work on another's target"},
+		{"unnamed environment", "",
+			"a request naming no environment marks nothing rather than borrowing another's"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			running, err := f.client.runningCopyTables(t.Context(), "testdb", tc.environment)
+			require.NoError(t, err)
+			assert.False(t, running[inFlight], tc.why)
+		})
+	}
+
+	t.Run("other database type", func(t *testing.T) {
+		_, err := f.db.ExecContext(t.Context(), "UPDATE tasks SET database_type = ?", "vitess")
+		require.NoError(t, err)
+
+		running, err := f.client.runningCopyTables(t.Context(), "testdb", localClientTestEnvironment)
+		require.NoError(t, err)
+		assert.False(t, running[inFlight],
+			"a namesake of another database type is not this target")
+	})
 }

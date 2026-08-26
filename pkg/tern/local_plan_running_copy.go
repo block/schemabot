@@ -7,6 +7,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // runningCopyKey identifies one table whose row copy is in flight, namespaced
@@ -79,14 +80,14 @@ func (c *LocalClient) copyIsRunning(ec *engine.ExistingCopy, running map[running
 // A plan is a read: it describes the target and must never fail because of it.
 // A failed read is logged and marks nothing, which leaves the plan exactly as
 // it reads without this check.
-func (c *LocalClient) runningCopiesForPlan(ctx context.Context, result *engine.PlanResult) map[runningCopyKey]bool {
+func (c *LocalClient) runningCopiesForPlan(ctx context.Context, result *engine.PlanResult, environment string) map[runningCopyKey]bool {
 	if len(result.ExistingCopies) == 0 {
 		return nil
 	}
-	running, err := c.runningCopyTables(ctx, c.config.Database)
+	running, err := c.runningCopyTables(ctx, c.config.Database, environment)
 	if err != nil {
 		c.logger.Warn("cannot tell whether an existing copy is still running; the plan discloses every copy as left behind",
-			"database", c.config.Database, "error", err)
+			"database", c.config.Database, "environment", environment, "error", err)
 		return nil
 	}
 	return running
@@ -102,10 +103,21 @@ func (c *LocalClient) runningCopiesForPlan(ctx context.Context, result *engine.P
 // copying — a stopped copy is one applying really does pick up where it
 // stopped.
 //
+// Task rows are keyed by database name alone, which is not a target: a name can
+// be shared by this deployment's staging and production databases, and by both
+// database types. A row is only evidence about the target being planned when it
+// names that same target, so the scan matches the plan's database type and
+// environment the way the conflict check matches type before it blocks. An
+// empty environment matches nothing rather than everything, so a request that
+// does not name one marks no copy instead of borrowing another environment's.
+//
 // It is a read with no side effects. The conflict check resolves stale tasks
 // against the engine as it scans; a plan must not, since it decides nothing and
-// an operator planning twice would otherwise change the target's records.
-func (c *LocalClient) runningCopyTables(ctx context.Context, database string) (map[runningCopyKey]bool, error) {
+// an operator planning twice would otherwise change the target's records. What
+// that costs is stated on Running in the proto: the marker trusts stored state,
+// so a row left in flight by a crashed server marks a stopped copy as running
+// until recovery clears it.
+func (c *LocalClient) runningCopyTables(ctx context.Context, database, environment string) (map[runningCopyKey]bool, error) {
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, database)
 	if err != nil {
 		return nil, fmt.Errorf("load tasks for database %q: %w", database, err)
@@ -118,9 +130,12 @@ func (c *LocalClient) runningCopyTables(ctx context.Context, database string) (m
 		if !state.IsInFlightTaskState(t.State) {
 			continue
 		}
+		if !c.taskDescribesPlanTarget(t, environment) {
+			continue
+		}
 		if t.TableName == "" {
-			// A task with no table names no copy to attribute, so it cannot mark
-			// a disclosure. Every other task still counts.
+			// A task with no table name has no copy to attribute, so it cannot
+			// mark a disclosure. Every other task still counts.
 			c.logger.Warn("task in flight records no table, so no existing copy can be marked as running from it",
 				append(t.LogAttrs(), "database", database)...)
 			continue
@@ -128,4 +143,19 @@ func (c *LocalClient) runningCopyTables(ctx context.Context, database string) (m
 		running[runningCopyKey{c.planNamespace(t.Namespace), t.TableName}] = true
 	}
 	return running, nil
+}
+
+// taskDescribesPlanTarget reports whether a task row is work on the same target
+// the plan describes, rather than a namesake sharing its database name. Both
+// halves fail toward "not this target": an unset environment on either side
+// matches nothing, so an unattributable row leaves the copy disclosed as left
+// behind rather than claiming live work that may belong elsewhere.
+func (c *LocalClient) taskDescribesPlanTarget(t *storage.Task, environment string) bool {
+	if t.DatabaseType != c.config.Type {
+		return false
+	}
+	if environment == "" || t.Environment != environment {
+		return false
+	}
+	return true
 }
