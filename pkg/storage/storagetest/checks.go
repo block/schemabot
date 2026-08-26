@@ -2,6 +2,7 @@ package storagetest
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -353,6 +354,143 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Equal(t, "success", stored.Conclusion)
 	})
 
+	// A completed task under the cancelled apply is durable evidence that the
+	// target may have changed, so the ownership-releasing write must fail closed.
+	t.Run("MarkActionRequiredSkipsCancelledApplyWithCompletedTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "cancel_guard_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "cancel-partial", 707, state.Apply.Cancelled, "staging")
+		createCompletedTask(t, store, apply, "task-completed-before-cancel")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		check.Status = "completed"
+		check.Conclusion = "action_required"
+		updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, apply)
+		require.NoError(t, err)
+		assert.False(t, updated, "an ownership release must fail closed while completed forward work exists")
+
+		stored, err := store.Checks().Get(ctx, lock.Repository, lock.PullRequest, "staging", lock.DatabaseType, lock.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+		assert.Equal(t, "in_progress", stored.Status)
+	})
+
+	// Retained cancellation state requires completed forward-task evidence and
+	// remains owned by the cancelled apply, including when reconciliation
+	// repairs an older completed failure row.
+	t.Run("MarkCancelledApplyFailedRetainsOwnership", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "cancel_retain_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "cancel-retained", 708, state.Apply.Cancelled, "staging")
+		createCompletedTask(t, store, apply, "task-completed-retained")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "completed", Conclusion: "failure",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		check.BlockingReason = "apply_cancelled_after_task_completed"
+		check.ErrorMessage = "reconciliation required"
+		updated, err := store.Checks().MarkCancelledApplyFailed(ctx, check, apply)
+		require.NoError(t, err)
+		assert.True(t, updated)
+
+		stored, err := store.Checks().Get(ctx, lock.Repository, lock.PullRequest, "staging", lock.DatabaseType, lock.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+		assert.Equal(t, "completed", stored.Status)
+		assert.Equal(t, "failure", stored.Conclusion)
+		assert.Equal(t, check.BlockingReason, stored.BlockingReason)
+		assert.Equal(t, check.ErrorMessage, stored.ErrorMessage)
+	})
+
+	// A cancelled apply's claim on stored check state can fail to land — the
+	// claim write errored, or the driver died before it. The cancelled apply is
+	// still the newest one for the target, so its terminal blocked state must
+	// take the row from the older apply that owns it rather than leaving that
+	// apply's stale state in place with nothing able to repair it.
+	t.Run("MarkCancelledApplyFailedClaimsRowOwnedByOlderApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "cancel_claim_db", storage.DatabaseTypeMySQL)
+		earlier := CreateApplyWithStateAndEnv(t, store, lock, "cancel-earlier-failed", 709, state.Apply.Failed, "staging")
+		createCompletedTask(t, store, earlier, "task-completed-before-cancel")
+		cancelled := CreateApplyWithStateAndEnv(t, store, lock, "cancel-unclaimed", 710, state.Apply.Cancelled, "staging")
+		require.Greater(t, cancelled.ID, earlier.ID)
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: earlier.ID, HasChanges: true, Status: "completed", Conclusion: "failure",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		check.BlockingReason = "apply_cancelled_after_task_completed"
+		check.ErrorMessage = "reconciliation required"
+		updated, err := store.Checks().MarkCancelledApplyFailed(ctx, check, cancelled)
+		require.NoError(t, err)
+		assert.True(t, updated, "the newest apply's terminal outcome must repair a row owned by an older apply")
+
+		stored, err := store.Checks().Get(ctx, lock.Repository, lock.PullRequest, "staging", lock.DatabaseType, lock.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, cancelled.ID, stored.ApplyID)
+		assert.Equal(t, "failure", stored.Conclusion)
+		assert.Equal(t, check.BlockingReason, stored.BlockingReason)
+	})
+
+	// Completed rollback tasks do not prove that a later cancelled forward
+	// apply changed the target, so they must not prevent the safe ownership
+	// release.
+	t.Run("MarkActionRequiredIgnoresCompletedRollbackTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "cancel_rollback_db", storage.DatabaseTypeMySQL)
+		rollback := &storage.Apply{
+			ApplyIdentifier: "cancel-rollback-prior", LockID: lock.ID, PlanID: 711,
+			Database: lock.DatabaseName, DatabaseType: lock.DatabaseType,
+			Repository: lock.Repository, PullRequest: lock.PullRequest,
+			Environment: "staging", Engine: storage.EngineForType(lock.DatabaseType),
+			State:   state.Apply.Completed,
+			Options: storage.MarshalApplyOptions(storage.ApplyOptions{Rollback: true}),
+		}
+		rollbackID, err := store.Applies().Create(ctx, rollback)
+		require.NoError(t, err)
+		rollback.ID = rollbackID
+		createCompletedTask(t, store, rollback, "task-rollback-completed")
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "cancel-after-rollback", 712, state.Apply.Cancelled, "staging")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		check.Status = "completed"
+		check.Conclusion = "action_required"
+		updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, apply)
+		require.NoError(t, err)
+		assert.True(t, updated)
+
+		stored, err := store.Checks().Get(ctx, lock.Repository, lock.PullRequest, "staging", lock.DatabaseType, lock.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Zero(t, stored.ApplyID)
+	})
+
 	t.Run("PlanDriftDisposition", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -609,4 +747,30 @@ func TestChecks(t *testing.T, h Harness) {
 	t.Run("DeleteByPRRetainingBlockingApplyOwned_DBError", func(t *testing.T) {
 		require.Error(t, h.NewUnreachableStorage(t).Checks().DeleteByPRRetainingBlockingApplyOwned(t.Context(), "org/repo", 123, false))
 	})
+}
+
+// createCompletedTask persists a completed forward task under the given apply,
+// the durable evidence the check store's ownership-release guards key on.
+func createCompletedTask(t *testing.T, store storage.Storage, apply *storage.Apply, identifier string) {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Second)
+	_, err := store.Tasks().Create(t.Context(), &storage.Task{
+		TaskIdentifier: identifier,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Repository:     apply.Repository,
+		PullRequest:    apply.PullRequest,
+		Environment:    apply.Environment,
+		State:          state.Task.Completed,
+		Namespace:      apply.Database,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255)",
+		DDLAction:      "alter",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
 }
