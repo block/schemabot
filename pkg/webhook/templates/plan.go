@@ -135,6 +135,11 @@ type PlanCommentData struct {
 	// Automatic apply state
 	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
 
+	// StoppedConfirmedApply marks a downgrade that stopped an apply the
+	// operator confirmed themselves rather than pausing an automatic one, so
+	// the comment names what actually stopped.
+	StoppedConfirmedApply bool
+
 	RecoveredApplyOwnedCheckState bool
 
 	// DeploymentDrift is the review-time rollup of how every configured
@@ -178,6 +183,17 @@ type DeploymentDriftEntry struct {
 // disagree about whether the reader still has a decision to make.
 func (d PlanCommentData) applyingWithoutConfirmation() bool {
 	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
+}
+
+// downgradeHeading names what the comment stopped. An operator who issued
+// apply-confirm themselves paused nothing automatic, so telling them an
+// automatic apply was paused would describe a schema change that was never in
+// flight.
+func (d PlanCommentData) downgradeHeading() string {
+	if d.StoppedConfirmedApply {
+		return "Apply stopped"
+	}
+	return "Automatic apply paused"
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -336,7 +352,7 @@ func RenderPlanComment(data PlanCommentData) string {
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, "⚠️ **Automatic apply paused**: %s\n\n", data.AutoConfirmDowngradeReason)
+			fmt.Fprintf(&sb, "⚠️ **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
