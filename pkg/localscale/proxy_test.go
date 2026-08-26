@@ -73,9 +73,8 @@ func TestBranchProxyRejectsNewClientConnectionsAfterCloseStarts(t *testing.T) {
 }
 
 func TestTrackProxyDoesNotReleaseOldPortBeforeCloseCompletes(t *testing.T) {
-	port1 := freeTCPPort(t)
-	port2 := freeTCPPort(t)
-	require.NotEqual(t, port1, port2)
+	ports := freeTCPPorts(t, 2)
+	port1, port2 := ports[0], ports[1]
 
 	s := &Server{
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -111,9 +110,8 @@ func TestTrackProxyDoesNotReleaseOldPortBeforeCloseCompletes(t *testing.T) {
 }
 
 func TestPortAllocatorIgnoresDuplicateRelease(t *testing.T) {
-	port1 := freeTCPPort(t)
-	port2 := freeTCPPort(t)
-	require.NotEqual(t, port1, port2)
+	ports := freeTCPPorts(t, 2)
+	port1, port2 := ports[0], ports[1]
 
 	alloc := newTestPortAllocator(port1, port2)
 	acquired, err := alloc.acquire()
@@ -134,13 +132,14 @@ func TestPortAllocatorIgnoresDuplicateRelease(t *testing.T) {
 }
 
 func TestNewBranchProxyWithRetrySkipsOccupiedPort(t *testing.T) {
-	port1 := freeTCPPort(t)
-	port2 := freeTCPPort(t)
-	require.NotEqual(t, port1, port2)
-
-	held, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port1)))
+	// The occupied port stays bound by this listener for the whole test, so
+	// the allocator's first candidate is guaranteed to collide and the free
+	// port reserved afterwards is guaranteed to be a different port.
+	held, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer utils.CloseAndLog(held)
+	port1 := tcpListenerPort(t, held)
+	port2 := freeTCPPorts(t, 1)[0]
 
 	s := &Server{
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -187,12 +186,32 @@ func newTestBranchProxyAtAddr(t *testing.T, listenAddr string) *branchProxy {
 	return p
 }
 
-func freeTCPPort(t *testing.T) int {
+// freeTCPPorts reserves n distinct loopback TCP ports. Every listener is held
+// open until all n ports have been captured — releasing one before binding the
+// next would let the kernel hand the same ephemeral port out again — and only
+// then are they released together for the test to bind.
+func freeTCPPorts(t *testing.T, n int) []int {
 	t.Helper()
-	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer utils.CloseAndLog(ln)
+	listeners := make([]net.Listener, 0, n)
+	defer func() {
+		for _, ln := range listeners {
+			utils.CloseAndLog(ln)
+		}
+	}()
 
+	ports := make([]int, 0, n)
+	for range n {
+		ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		listeners = append(listeners, ln)
+		ports = append(ports, tcpListenerPort(t, ln))
+	}
+	return ports
+}
+
+// tcpListenerPort returns the local port a TCP listener is bound to.
+func tcpListenerPort(t *testing.T, ln net.Listener) int {
+	t.Helper()
 	_, portStr, err := net.SplitHostPort(ln.Addr().String())
 	require.NoError(t, err)
 	port, err := strconv.Atoi(portStr)
