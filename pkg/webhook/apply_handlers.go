@@ -95,9 +95,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
-			h.logger.Debug("unscoped fan-out apply touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
@@ -536,9 +536,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
-			h.logger.Debug("unscoped fan-out apply-confirm touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply-confirm resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {

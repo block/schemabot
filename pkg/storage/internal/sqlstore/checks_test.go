@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"database/sql"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
@@ -1761,6 +1762,152 @@ func TestCheckStore_MarkActionRequiredForApplySkipsNewerTerminalApply(t *testing
 	require.Equal(t, "success", retrieved.Conclusion)
 	require.False(t, retrieved.HasChanges)
 	require.Equal(t, rollbackApply.ID, retrieved.ApplyID)
+}
+
+// A completed task under the cancelled apply is durable evidence that the
+// target may have changed, so the ownership-releasing write must fail closed.
+func TestCheckStore_MarkActionRequiredForApplySkipsCancelledApplyWithCompletedTask(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-cancelled-partial", state.Apply.Cancelled)
+	createCheckStoreTask(t, store, apply, "task-completed-before-cancel", state.Task.Completed)
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "abc123",
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "testdb",
+		ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, apply)
+	require.NoError(t, err)
+	assert.False(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, apply.ID, retrieved.ApplyID)
+	assert.Equal(t, "in_progress", retrieved.Status)
+}
+
+// Retained cancellation state requires completed forward-task evidence and
+// remains owned by the cancelled apply, including when reconciliation repairs
+// an older completed failure row.
+func TestCheckStore_MarkCancelledApplyFailedRetainsOwnership(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	apply := createCheckStoreApply(t, store, "apply-cancelled-retained", state.Apply.Cancelled)
+	createCheckStoreTask(t, store, apply, "task-completed-retained", state.Task.Completed)
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "abc123",
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "testdb",
+		ApplyID: apply.ID, HasChanges: true, Status: "completed", Conclusion: "failure",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.BlockingReason = "apply_cancelled_after_task_completed"
+	check.ErrorMessage = "reconciliation required"
+	updated, err := store.Checks().MarkCancelledApplyFailed(ctx, check, apply)
+	require.NoError(t, err)
+	assert.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, apply.ID, retrieved.ApplyID)
+	assert.Equal(t, "completed", retrieved.Status)
+	assert.Equal(t, "failure", retrieved.Conclusion)
+	assert.Equal(t, check.BlockingReason, retrieved.BlockingReason)
+	assert.Equal(t, check.ErrorMessage, retrieved.ErrorMessage)
+}
+
+// A cancelled apply's claim on stored check state can fail to land — the claim
+// write errored, or the driver died before it. The cancelled apply is still
+// the newest one for the target, so its terminal blocked state must take the
+// row from the older apply that owns it rather than leaving that apply's stale
+// state in place with nothing able to repair it.
+func TestCheckStore_MarkCancelledApplyFailedClaimsRowOwnedByOlderApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	earlier := createCheckStoreApply(t, store, "apply-earlier-failed", state.Apply.Failed)
+	createCheckStoreTask(t, store, earlier, "task-completed-before-cancel", state.Task.Completed)
+	cancelled := createCheckStoreApply(t, store, "apply-cancelled-unclaimed", state.Apply.Cancelled)
+	require.Greater(t, cancelled.ID, earlier.ID)
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "abc123",
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "testdb",
+		ApplyID: earlier.ID, HasChanges: true, Status: "completed", Conclusion: "failure",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.BlockingReason = "apply_cancelled_after_task_completed"
+	check.ErrorMessage = "reconciliation required"
+	updated, err := store.Checks().MarkCancelledApplyFailed(ctx, check, cancelled)
+	require.NoError(t, err)
+	assert.True(t, updated, "the newest apply's terminal outcome must repair a row owned by an older apply")
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Equal(t, cancelled.ID, retrieved.ApplyID)
+	assert.Equal(t, "failure", retrieved.Conclusion)
+	assert.Equal(t, check.BlockingReason, retrieved.BlockingReason)
+}
+
+// Completed rollback tasks do not prove that a later cancelled forward apply
+// changed the target, so they must not prevent the safe ownership release.
+func TestCheckStore_MarkActionRequiredForApplyIgnoresCompletedRollbackTask(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	rollback := &storage.Apply{
+		ApplyIdentifier: "rollback-completed-task", Database: "testdb", DatabaseType: "mysql",
+		Repository: "org/repo", PullRequest: 123, Environment: "staging", Engine: storage.EngineSpirit,
+		State: state.Apply.Completed, Options: storage.MarshalApplyOptions(storage.ApplyOptions{Rollback: true}),
+	}
+	rollbackID, err := store.Applies().Create(ctx, rollback)
+	require.NoError(t, err)
+	rollback.ID = rollbackID
+	createCheckStoreTask(t, store, rollback, "task-rollback-completed", state.Task.Completed)
+	apply := createCheckStoreApply(t, store, "apply-cancelled-after-rollback", state.Apply.Cancelled)
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "abc123",
+		Environment: "staging", DatabaseType: "mysql", DatabaseName: "testdb",
+		ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+	}
+	require.NoError(t, store.Checks().Upsert(ctx, check))
+
+	check.Status = "completed"
+	check.Conclusion = "action_required"
+	updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, apply)
+	require.NoError(t, err)
+	assert.True(t, updated)
+
+	retrieved, err := store.Checks().Get(ctx, "org/repo", 123, "staging", "mysql", "testdb")
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	assert.Zero(t, retrieved.ApplyID)
+}
+
+func createCheckStoreTask(t *testing.T, store storage.Storage, apply *storage.Apply, identifier, taskState string) {
+	t.Helper()
+	now := time.Now()
+	_, err := store.Tasks().Create(t.Context(), &storage.Task{
+		TaskIdentifier: identifier, ApplyID: apply.ID, PlanID: apply.PlanID,
+		Database: apply.Database, DatabaseType: apply.DatabaseType, Engine: apply.Engine,
+		Repository: apply.Repository, PullRequest: apply.PullRequest, Environment: apply.Environment,
+		State: taskState, TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+		DDLAction: "ALTER", CreatedAt: now, UpdatedAt: now,
+	})
+	require.NoError(t, err)
 }
 
 func createCheckStoreApply(t *testing.T, store storage.Storage, applyIdentifier, applyState string) *storage.Apply {
