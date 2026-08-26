@@ -21,6 +21,11 @@ import (
 	"github.com/block/schemabot/pkg/storage/storagetest"
 )
 
+// The behavioral suite for ApplyStore lives in pkg/storage/storagetest and
+// runs against every dialect via parity_test.go. The tests here cover only
+// scenarios that require MySQL-specific SQL, connection semantics, or fixtures
+// that the storage interface cannot express.
+
 func TestApplyStore_Create(t *testing.T) {
 	clearTables(t)
 	store := NewMySQL(testDB)
@@ -2339,62 +2344,6 @@ func TestApplyStore_ClaimApplyByIDSkipsFreshRunningUntilStale(t *testing.T) {
 	assert.NotEmpty(t, claimed.LeaseToken)
 }
 
-// ClaimApplyByID returns nil for applies that are not claimable (terminal) or
-// do not exist, so the operation loop fails closed instead of driving work.
-func TestApplyStore_ClaimApplyByIDReturnsNilForTerminalAndMissing(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
-	completed := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_done", 602, state.Apply.Completed, "staging")
-
-	claimed, err := store.Applies().ClaimApplyByID(ctx, completed.ID, "operator-a")
-	require.NoError(t, err)
-	assert.Nil(t, claimed, "terminal applies are never claimable")
-
-	missing, err := store.Applies().ClaimApplyByID(ctx, 9_999_999, "operator-a")
-	require.NoError(t, err)
-	assert.Nil(t, missing, "a non-existent apply id yields no claim")
-}
-
-// Claiming a failed_retryable apply within budget performs the retryable
-// recovery bookkeeping: the claim charges one recovery attempt, clears the
-// stored error, and leases the row as running so the redispatched drive starts
-// from a clean failure record. The caller sees the pre-claim state with the
-// charged attempt, and a repeat claim is refused while the lease is fresh.
-func TestApplyStore_ClaimApplyByIDClaimsRetryable(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_claim_by_id_retryable", 603, state.Apply.FailedRetryable, "staging")
-	apply.ErrorMessage = "transient engine failure"
-	require.NoError(t, store.Applies().Update(ctx, apply))
-
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
-	assert.Equal(t, state.Apply.FailedRetryable, claimed.State, "caller sees the pre-claim state")
-	assert.Equal(t, 1, claimed.Attempt, "the claim charges one recovery attempt")
-	assert.Empty(t, claimed.ErrorMessage)
-	assert.Equal(t, "operator-a", claimed.LeaseOwner)
-	assert.NotEmpty(t, claimed.LeaseToken)
-
-	persisted, err := store.Applies().Get(ctx, apply.ID)
-	require.NoError(t, err)
-	require.NotNil(t, persisted)
-	assert.Equal(t, state.Apply.Running, persisted.State)
-	assert.Equal(t, 1, persisted.Attempt)
-	assert.Empty(t, persisted.ErrorMessage)
-
-	again, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-b")
-	require.NoError(t, err)
-	assert.Nil(t, again, "a freshly claimed apply is owned by its current driver")
-}
-
 // ClaimApplyByID must refuse a failed_retryable apply whose recovery budget is
 // exhausted or whose failure is outside the redispatch freshness window. The
 // stale-active operation claim arm can hand such a parent to the operation
@@ -2592,17 +2541,6 @@ func TestApplyStore_ClaimApplyByIDClaimsStaleWaitingForCutover(t *testing.T) {
 	assert.Nil(t, again, "the reclaimed apply's fresh lease is not stolen by a peer")
 }
 
-// ClaimApplyByID requires an owner so a lease can never be acquired without an
-// identity that lease-guarded writes can fail closed against.
-func TestApplyStore_ClaimApplyByIDRequiresOwner(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	_, err := store.Applies().ClaimApplyByID(ctx, 1, "")
-	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
-}
-
 func addClaimByIDTask(t *testing.T, store *Storage, apply *storage.Apply, taskID string) {
 	t.Helper()
 	task := &storage.Task{
@@ -2624,133 +2562,6 @@ func addClaimByIDTask(t *testing.T, store *Storage, apply *storage.Apply, taskID
 	id, err := store.Tasks().Create(t.Context(), task)
 	require.NoError(t, err)
 	task.ID = id
-}
-
-func TestApplyStore_LeaseGuardsOwnedWrites(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_lease", 507, state.Apply.Pending, "staging")
-	task := &storage.Task{
-		TaskIdentifier: "task_lease_users",
-		ApplyID:        apply.ID,
-		PlanID:         apply.PlanID,
-		Database:       apply.Database,
-		DatabaseType:   apply.DatabaseType,
-		Engine:         storage.EngineSpirit,
-		Environment:    apply.Environment,
-		State:          state.Task.Pending,
-		TableName:      "users",
-		DDL:            "ALTER TABLE `users` ADD COLUMN `lease_note` varchar(255)",
-		DDLAction:      "alter",
-		Options:        []byte("{}"),
-		CreatedAt:      time.Now(),
-		UpdatedAt:      time.Now(),
-	}
-	taskID, err := store.Tasks().Create(ctx, task)
-	require.NoError(t, err)
-	task.ID = taskID
-
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-a")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	require.Equal(t, "driver-a", claimed.LeaseOwner)
-	require.NotEmpty(t, claimed.LeaseToken)
-	require.NotNil(t, claimed.LeaseAcquiredAt)
-
-	staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-old", Token: "stale-token"})
-	claimed.State = state.Apply.Failed
-	claimed.ErrorMessage = "stale driver failure"
-	require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
-	require.ErrorIs(t, store.Applies().Heartbeat(staleCtx, apply.ID), storage.ErrApplyLeaseLost)
-
-	task.State = state.Task.Completed
-	require.ErrorIs(t, store.Tasks().Update(staleCtx, task), storage.ErrApplyLeaseLost)
-	require.ErrorIs(t, store.ApplyLogs().Append(staleCtx, &storage.ApplyLog{
-		ApplyID:   apply.ID,
-		Level:     storage.LogLevelInfo,
-		EventType: storage.LogEventStateTransition,
-		Source:    storage.LogSourceSchemaBot,
-		Message:   "stale driver log",
-	}), storage.ErrApplyLeaseLost)
-
-	persistedApply, err := store.Applies().Get(ctx, apply.ID)
-	require.NoError(t, err)
-	require.NotNil(t, persistedApply)
-	assert.Equal(t, state.Apply.Running, persistedApply.State)
-	assert.Empty(t, persistedApply.ErrorMessage)
-
-	persistedTask, err := store.Tasks().Get(ctx, task.TaskIdentifier)
-	require.NoError(t, err)
-	require.NotNil(t, persistedTask)
-	assert.Equal(t, state.Task.Pending, persistedTask.State)
-
-	logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
-	require.NoError(t, err)
-	assert.Empty(t, logs)
-
-	ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
-	claimed.State = state.Apply.Completed
-	claimed.ErrorMessage = ""
-	require.NoError(t, store.Applies().Update(ownedCtx, claimed))
-	task.State = state.Task.Completed
-	require.NoError(t, store.Tasks().Update(ownedCtx, task))
-	require.NoError(t, store.ApplyLogs().Append(ownedCtx, &storage.ApplyLog{
-		ApplyID:   apply.ID,
-		Level:     storage.LogLevelInfo,
-		EventType: storage.LogEventStateTransition,
-		Source:    storage.LogSourceSchemaBot,
-		Message:   "owned driver log",
-	}))
-}
-
-func TestApplyStore_ClaimApplyByIDRequiresTasksForPendingApply(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_pending_claim", 502, state.Apply.Pending, "staging")
-
-	// A pending apply record can be visible before its task rows are written.
-	// The operator must wait for the task list so dispatch has concrete table
-	// work to run.
-	claimedBeforeTasks, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "test-owner")
-	require.NoError(t, err)
-	assert.Nil(t, claimedBeforeTasks, "pending applies are not ready for operator dispatch until their tasks are persisted")
-
-	now := time.Now()
-	_, err = store.Tasks().Create(ctx, &storage.Task{
-		TaskIdentifier: "task_pending_claim",
-		ApplyID:        apply.ID,
-		PlanID:         apply.PlanID,
-		Database:       apply.Database,
-		DatabaseType:   apply.DatabaseType,
-		Engine:         storage.EngineSpirit,
-		Environment:    apply.Environment,
-		State:          state.Task.Pending,
-		TableName:      "users",
-		DDL:            "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
-		DDLAction:      "CREATE",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	})
-	require.NoError(t, err)
-
-	// Once at least one task exists, the pending apply is ready to claim. The
-	// caller sees the state it claimed, and the stored row is leased as running.
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "test-owner")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, apply.ApplyIdentifier, claimed.ApplyIdentifier)
-	assert.Equal(t, state.Apply.Pending, claimed.State)
-
-	persisted, err := store.Applies().Get(ctx, apply.ID)
-	require.NoError(t, err)
-	require.NotNil(t, persisted)
-	assert.Equal(t, state.Apply.Running, persisted.State)
 }
 
 // FindStuckPendingApplies is the operator's stuck-pending observability probe.
@@ -4576,79 +4387,6 @@ func TestApplyStore_SetRevertSkipped(t *testing.T) {
 	require.NotNil(t, got.RevertSkippedAt, "revert_skipped_at round-trips through Get")
 	assert.Equal(t, apply.State, got.State, "SetRevertSkipped must not change other apply fields")
 	assert.Equal(t, before.UpdatedAt, got.UpdatedAt, "SetRevertSkipped preserves the lease heartbeat (updated_at)")
-}
-
-// A process shutting down hands back the applies its drivers were driving, so
-// a peer driver picks the work up on its next poll instead of waiting out the
-// staleness window on a claim that will never be used again. The release clears
-// the lease, leaves the apply's state alone, and makes the row immediately
-// re-claimable through the same path that recovers a crashed driver's work.
-func TestApplyStore_ReleaseClaim_ReleasedApplyIsImmediatelyReclaimable(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_release_claim", 701, state.Apply.Running, "staging")
-
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?`, apply.ID)
-	require.NoError(t, err)
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "departing-driver")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-
-	released, err := store.Applies().ReleaseClaim(ctx, claimed.Lease())
-	require.NoError(t, err)
-	assert.True(t, released, "release guarded on the held token must succeed")
-
-	persisted, err := store.Applies().Get(ctx, apply.ID)
-	require.NoError(t, err)
-	require.NotNil(t, persisted)
-	assert.Empty(t, persisted.LeaseOwner, "release must clear the lease owner")
-	assert.Empty(t, persisted.LeaseToken, "release must clear the lease token")
-	assert.Nil(t, persisted.LeaseAcquiredAt, "release must clear lease_acquired_at")
-	assert.Equal(t, state.Apply.Running, persisted.State, "release must not change the apply's state")
-
-	reclaimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "next-driver")
-	require.NoError(t, err)
-	require.NotNil(t, reclaimed, "a released apply must be re-claimable on the next poll without aging")
-	assert.Equal(t, "next-driver", reclaimed.LeaseOwner)
-	assert.Equal(t, state.Apply.Running, reclaimed.State, "re-claim recovers the apply without changing its state")
-}
-
-// Once another driver has taken the lease, the previous holder's release must
-// not clear the new owner's claim or perturb its heartbeat — a departing
-// process must never hand back work that already moved on.
-func TestApplyStore_ReleaseClaim_MismatchedTokenIsNoOp(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_release_stale_token", 702, state.Apply.Running, "staging")
-
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?`, apply.ID)
-	require.NoError(t, err)
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "current-owner")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-
-	staleLease := claimed.Lease()
-	staleLease.Token = "rotated-away-" + staleLease.Token
-
-	released, err := store.Applies().ReleaseClaim(ctx, staleLease)
-	require.NoError(t, err)
-	assert.False(t, released, "a mismatched token must not release another owner's lease")
-
-	persisted, err := store.Applies().Get(ctx, apply.ID)
-	require.NoError(t, err)
-	require.NotNil(t, persisted)
-	assert.Equal(t, "current-owner", persisted.LeaseOwner, "the current owner's lease must be untouched")
-	assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken)
-
-	refused, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "another-driver")
-	require.NoError(t, err)
-	assert.Nil(t, refused, "the apply must stay leased to the current owner after a mismatched release")
 }
 
 // A lease with no token authorizes no write, so a release attempted with one is

@@ -158,10 +158,19 @@ func CreateClaimedApply(t *testing.T, store storage.Storage, lock *storage.Lock,
 	t.Helper()
 	ctx := t.Context()
 
-	apply := CreateApply(t, store, lock, applyID, planID)
+	apply := CreateApplyWithTask(t, store, lock, applyID, planID)
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, owner)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "an apply with a persisted task must be claimable")
+	return claimed
+}
 
+// CreateApplyWithTask creates a pending apply and its canonical task fixture.
+func CreateApplyWithTask(t *testing.T, store storage.Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {
+	t.Helper()
+	apply := CreateApply(t, store, lock, applyID, planID)
 	now := time.Now().UTC().Truncate(time.Second)
-	_, err := store.Tasks().Create(ctx, &storage.Task{
+	_, err := store.Tasks().Create(t.Context(), &storage.Task{
 		TaskIdentifier: "task_" + applyID,
 		ApplyID:        apply.ID,
 		PlanID:         apply.PlanID,
@@ -180,9 +189,5 @@ func CreateClaimedApply(t *testing.T, store storage.Storage, lock *storage.Lock,
 		UpdatedAt:      now,
 	})
 	require.NoError(t, err)
-
-	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, owner)
-	require.NoError(t, err)
-	require.NotNil(t, claimed, "an apply with a persisted task must be claimable")
-	return claimed
+	return apply
 }

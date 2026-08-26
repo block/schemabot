@@ -20,7 +20,6 @@ func TestApplies(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_round_trip_db", storage.DatabaseTypeMySQL)
-		created := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 		apply := &storage.Apply{
 			ApplyIdentifier: "apply_round_trip",
 			LockID:          lock.ID,
@@ -36,9 +35,8 @@ func TestApplies(t *testing.T, h Harness) {
 			Engine:          storage.EngineSpirit,
 			State:           state.Apply.Pending,
 			Options:         []byte(`{"defer_cutover":true}`),
-			CreatedAt:       created,
-			UpdatedAt:       created,
 		}
+		// Create owns these timestamps through the schema clock defaults.
 		id, err := store.Applies().Create(ctx, apply)
 		require.NoError(t, err)
 		require.Positive(t, id)
@@ -67,7 +65,7 @@ func TestApplies(t *testing.T, h Harness) {
 		got.ErrorMessage = "engine failed"
 		got.ExternalID = "remote-apply-1"
 		got.Options = []byte(`{"defer_cutover":false}`)
-		started := created.Add(time.Minute)
+		started := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 		completed := started.Add(time.Minute)
 		got.StartedAt = &started
 		got.CompletedAt = &completed
@@ -126,6 +124,7 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NotNil(t, persisted)
 		assert.Equal(t, state.Apply.Running, persisted.State)
 		assert.Equal(t, 1, persisted.Attempt)
+		assert.Empty(t, persisted.ErrorMessage)
 
 		claimed, err = store.Applies().ClaimApplyByID(ctx, retryable.ID, "driver-b")
 		require.NoError(t, err)
@@ -148,7 +147,11 @@ func TestApplies(t *testing.T, h Harness) {
 		stale, err := store.Applies().Get(ctx, first.ID)
 		require.NoError(t, err)
 		require.NotNil(t, stale)
-		assert.False(t, stale.HasFreshLease(time.Now()), "release backdates the heartbeat beyond ApplyLeaseStaleAfter")
+		assert.False(t, stale.HasFreshLease(time.Now()), "release clears the lease owner")
+		assert.True(t, stale.UpdatedAt.Before(time.Now().Add(-storage.ApplyLeaseStaleAfter)), "release backdates the heartbeat beyond ApplyLeaseStaleAfter")
+		assert.Empty(t, stale.LeaseToken)
+		assert.Nil(t, stale.LeaseAcquiredAt)
+		assert.Equal(t, state.Apply.Running, stale.State)
 
 		second, err := store.Applies().ClaimApplyByID(ctx, first.ID, "driver-b")
 		require.NoError(t, err)
@@ -164,6 +167,14 @@ func TestApplies(t *testing.T, h Harness) {
 		released, err = store.Applies().ReleaseClaim(ctx, first.Lease())
 		require.NoError(t, err)
 		assert.False(t, released, "a stale token cannot release the rotated lease")
+		persisted, err = store.Applies().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, "driver-b", persisted.LeaseOwner)
+		assert.Equal(t, second.LeaseToken, persisted.LeaseToken)
+		third, err := store.Applies().ClaimApplyByID(ctx, first.ID, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, third, "a mismatched release leaves the current lease fresh")
 	})
 
 	t.Run("LeaseGuardsWrites", func(t *testing.T) {
@@ -171,24 +182,46 @@ func TestApplies(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_lease_guard_db", storage.DatabaseTypeMySQL)
 		claimed := CreateClaimedApply(t, store, lock, "apply_lease_guard", 906, "driver-a")
+		task, err := store.Tasks().Get(ctx, "task_apply_lease_guard")
+		require.NoError(t, err)
+		require.NotNil(t, task)
 
 		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: claimed.ID, Owner: "old-driver", Token: "stale-token"})
 		claimed.State = state.Apply.Failed
 		claimed.ErrorMessage = "stale failure"
 		require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
 		require.ErrorIs(t, store.Applies().Heartbeat(staleCtx, claimed.ID), storage.ErrApplyLeaseLost)
+		task.State = state.Task.Completed
+		require.ErrorIs(t, store.Tasks().Update(staleCtx, task), storage.ErrApplyLeaseLost)
+		require.ErrorIs(t, store.ApplyLogs().Append(staleCtx, &storage.ApplyLog{
+			ApplyID: claimed.ID, Level: storage.LogLevelInfo, EventType: storage.LogEventStateTransition,
+			Source: storage.LogSourceSchemaBot, Message: "stale driver log",
+		}), storage.ErrApplyLeaseLost)
 
 		persisted, err := store.Applies().Get(ctx, claimed.ID)
 		require.NoError(t, err)
 		require.NotNil(t, persisted)
 		assert.Equal(t, state.Apply.Running, persisted.State)
 		assert.Empty(t, persisted.ErrorMessage)
+		persistedTask, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, persistedTask)
+		assert.Equal(t, state.Task.Pending, persistedTask.State)
+		logs, err := store.ApplyLogs().GetByApply(ctx, claimed.ID)
+		require.NoError(t, err)
+		assert.Empty(t, logs)
 
 		ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
 		claimed.State = state.Apply.Completed
 		claimed.ErrorMessage = ""
 		require.NoError(t, store.Applies().Update(ownedCtx, claimed))
 		require.NoError(t, store.Applies().Heartbeat(ownedCtx, claimed.ID))
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(ownedCtx, task))
+		require.NoError(t, store.ApplyLogs().Append(ownedCtx, &storage.ApplyLog{
+			ApplyID: claimed.ID, Level: storage.LogLevelInfo, EventType: storage.LogEventStateTransition,
+			Source: storage.LogSourceSchemaBot, Message: "owned driver log",
+		}))
 
 		persisted, err = store.Applies().Get(ctx, claimed.ID)
 		require.NoError(t, err)
@@ -200,17 +233,7 @@ func TestApplies(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_concurrent_claim_db", storage.DatabaseTypeMySQL)
-		apply := CreateApply(t, store, lock, "apply_concurrent_claim", 907)
-		now := time.Now().UTC().Truncate(time.Second)
-		_, err := store.Tasks().Create(ctx, &storage.Task{
-			TaskIdentifier: "task_apply_concurrent_claim", ApplyID: apply.ID, PlanID: apply.PlanID,
-			Database: apply.Database, DatabaseType: apply.DatabaseType, Engine: apply.Engine,
-			Repository: apply.Repository, PullRequest: apply.PullRequest, Environment: apply.Environment,
-			State: state.Task.Pending, Namespace: apply.Database, TableName: "users",
-			DDL: "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)", DDLAction: "create",
-			CreatedAt: now, UpdatedAt: now,
-		})
-		require.NoError(t, err)
+		apply := CreateApplyWithTask(t, store, lock, "apply_concurrent_claim", 907)
 
 		const drivers = 16
 		start := make(chan struct{})
@@ -244,5 +267,130 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, apply.ApplyIdentifier, winners[0].ApplyIdentifier)
 		assert.Equal(t, state.Apply.Pending, winners[0].State)
 		assert.NotEmpty(t, winners[0].LeaseToken)
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Running, persisted.State)
 	})
+
+	dbErrorTests := map[string]func(t *testing.T, store storage.ApplyStore) error{
+		"Create_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.Create(t.Context(), &storage.Apply{})
+			return err
+		},
+		"CreateWithTasks_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.CreateWithTasks(t.Context(), &storage.Apply{}, []*storage.Task{{}})
+			return err
+		},
+		"CreateWithTasksAndOperations_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.CreateWithTasksAndOperations(t.Context(), &storage.Apply{}, []*storage.Task{{}}, []*storage.ApplyOperation{{}})
+			return err
+		},
+		"CreateWithGroupedOperations_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.CreateWithGroupedOperations(t.Context(), &storage.Apply{}, []*storage.ApplyOperationWithTasks{{Operation: &storage.ApplyOperation{}}})
+			return err
+		},
+		"AttachOperationWithTasks_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.AttachOperationWithTasks(t.Context(), &storage.Apply{ID: 1}, &storage.ApplyOperation{}, []*storage.Task{{}})
+		},
+		"Get_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.Get(t.Context(), 1)
+			return err
+		},
+		"GetByApplyIdentifier_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetByApplyIdentifier(t.Context(), "apply")
+			return err
+		},
+		"GetByIdempotencyKey_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetByIdempotencyKey(t.Context(), "key")
+			return err
+		},
+		"GetByPlan_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetByPlan(t.Context(), 1)
+			return err
+		},
+		"GetByLock_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetByLock(t.Context(), 1)
+			return err
+		},
+		"GetByDatabase_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetByDatabase(t.Context(), "db", storage.DatabaseTypeMySQL, "staging")
+			return err
+		},
+		"Update_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.Update(t.Context(), &storage.Apply{ID: 1})
+		},
+		"UpdateDerivedState_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.UpdateDerivedState(t.Context(), 1, state.Apply.Pending, state.Apply.Running, "", nil, nil)
+			return err
+		},
+		"GetRecent_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetRecent(t.Context(), storage.RecentAppliesFilter{Limit: 1})
+			return err
+		},
+		"CountRecentByState_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.CountRecentByState(t.Context(), storage.RecentAppliesFilter{})
+			return err
+		},
+		"GetInProgress_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetInProgress(t.Context())
+			return err
+		},
+		"FindStuckPendingApplies_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindStuckPendingApplies(t.Context(), time.Minute, 1)
+			return err
+		},
+		"ClaimApplyByID_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ClaimApplyByID(t.Context(), 1, "driver")
+			return err
+		},
+		"FindNextApplyForStopReconciliation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindNextApplyForStopReconciliation(t.Context(), "driver")
+			return err
+		},
+		"FindNextApplyForOperationProjection_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindNextApplyForOperationProjection(t.Context(), "driver")
+			return err
+		},
+		"Heartbeat_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.Heartbeat(t.Context(), 1)
+		},
+		"ReleaseClaim_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ReleaseClaim(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
+			return err
+		},
+		"SetRevertSkipped_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.SetRevertSkipped(t.Context(), 1, time.Now())
+		},
+		"CheckLease_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.CheckLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
+		},
+		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ExpireRetryable(t.Context())
+			return err
+		},
+		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindMissingSummaryComment(t.Context())
+			return err
+		},
+		"GetByPR_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetByPR(t.Context(), "org/repo", 1)
+			return err
+		},
+		"ExistsForDatabaseHead_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ExistsForDatabaseHead(t.Context(), "org/repo", 1, "db", storage.DatabaseTypeMySQL, "head")
+			return err
+		},
+		"Delete_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.Delete(t.Context(), 1)
+		},
+		"DeleteByPR_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.DeleteByPR(t.Context(), "org/repo", 1)
+		},
+	}
+	for name, test := range dbErrorTests {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, test(t, h.NewUnreachableStorage(t).Applies()))
+		})
+	}
 }
