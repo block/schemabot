@@ -317,7 +317,9 @@ type TableChange struct {
 const (
 	// ExecutionModeBlocked marks a statement the engine deterministically
 	// refuses. An apply containing it will fail, and retrying cannot succeed
-	// until the statement changes.
+	// until whatever the reason names changes: the statement itself for an
+	// unsupported shape, or the target's provisioning for a refusal such as
+	// a missing grant.
 	ExecutionModeBlocked = "blocked"
 
 	// ExecutionModeDirect marks a statement the engine refuses but that the

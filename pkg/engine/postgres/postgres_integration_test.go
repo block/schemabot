@@ -46,6 +46,95 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Equal(t, `statement for table "users" is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible`, change.ModeReason)
 }
 
+// TestEnginePlanPrivilegeRefusal proves a role that cannot alter the target
+// gets a blocked plan naming the exact provisioning statement, instead of an
+// executable plan that deterministically fails at apply. The plan itself
+// still succeeds: the operator needs the review surface to carry the grant.
+func TestEnginePlanPrivilegeRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_privilege_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE ROLE plan_limited LOGIN PASSWORD 'plan_limited';
+		GRANT CONNECT, CREATE ON DATABASE plan_privilege_test TO plan_limited;
+		GRANT USAGE ON SCHEMA public TO plan_limited`)
+	require.NoError(t, err)
+
+	limitedDSN, err := url.Parse(dsn)
+	require.NoError(t, err)
+	limitedDSN.User = url.UserPassword("plan_limited", "plan_limited")
+	req := &engine.PlanRequest{
+		Database: "plan_privilege_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, "in-place ALTER TABLE",
+		"the reason must name the tier whose access is missing")
+	assert.Contains(t, change.ModeReason, "provision with: GRANT",
+		"the reason must carry the exact provisioning statement")
+	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
+		"the reason must carry the exact failed catalog check")
+}
+
+// TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
+// the plan steps that need the missing tier: a role with owner membership but
+// no index-build access gets an executable ALTER step alongside a blocked
+// CREATE INDEX step whose reason names the index-build tier's grant, so an
+// operator fixes exactly the access the failing step needs.
+func TestEnginePlanPrivilegeRefusalPerTier(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_tier_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE ROLE mixed_owner NOLOGIN;
+		ALTER TABLE public.users OWNER TO mixed_owner;
+		CREATE ROLE mixed_limited LOGIN PASSWORD 'mixed_limited';
+		GRANT mixed_owner TO mixed_limited;
+		GRANT CONNECT, CREATE ON DATABASE plan_tier_test TO mixed_limited;
+		GRANT USAGE ON SCHEMA public TO mixed_limited`)
+	require.NoError(t, err)
+
+	limitedDSN, err := url.Parse(dsn)
+	require.NoError(t, err)
+	limitedDSN.User = url.UserPassword("mixed_limited", "mixed_limited")
+	req := &engine.PlanRequest{
+		Database: "plan_tier_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text);\nCREATE INDEX idx_users_email ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 2)
+
+	alter := result.Changes[0].TableChanges[0]
+	assert.Contains(t, alter.DDL, "ADD COLUMN")
+	assert.NotEqual(t, engine.ExecutionModeBlocked, alter.ExecutionMode,
+		"owner membership satisfies the in-place ALTER tier; that step must stay executable")
+
+	index := result.Changes[0].TableChanges[1]
+	assert.Contains(t, index.DDL, "CREATE INDEX")
+	assert.Equal(t, engine.ExecutionModeBlocked, index.ExecutionMode)
+	assert.Contains(t, index.ModeReason, "index builds",
+		"the reason must name the tier whose access is missing")
+	assert.Contains(t, index.ModeReason, "provision with: GRANT",
+		"the reason must carry the exact provisioning statement")
+}
+
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
 // pg-sprite's preflight and bounded optimistic executor.
 func TestEngineApplyNativeSafe(t *testing.T) {
