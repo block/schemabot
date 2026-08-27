@@ -447,6 +447,17 @@ message PlanRequest {
   // MySQL DSN), where a withheld namespace's live tables would otherwise be
   // planned as drops.
   repeated string ignored_namespaces = 11;
+  // Whether an apply of this plan hands the engine every ALTER at once or one
+  // table at a time. An engine that predicts what applying will do to work
+  // already on the target needs the same statement grouping the apply will use,
+  // because that grouping is what decides which stored progress it can resume.
+  //
+  // Optional so that a caller that predates statement grouping in this contract
+  // is distinguishable from one that chose the ungrouped shape: when the field
+  // is absent, the engine predicts the joined batch, which errs toward
+  // disclosing a discard rather than promising a resume the apply will not
+  // perform.
+  optional bool grouped_execution = 12;
 }
 
 // TableChange represents a DDL change to a table.

@@ -562,21 +562,23 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 	fn()
 }
 
-// groupedApplyMode classifies the grouped-apply strategy for a drive. It reads
-// DeferCutover from the effective options map (which may carry an automatic
-// barrier-park decision, see effectiveCopyDriveOptions) rather than from
-// apply.GetOptions(), so an operation-scoped copy drive that must park at the
-// cutover barrier takes the atomic-cutover path.
+// groupedApplyMode classifies the grouped-apply strategy for a drive, for logs
+// and operator-facing descriptions. It reads DeferCutover from the effective
+// options map (which may carry an automatic barrier-park decision, see
+// effectiveCopyDriveOptions) rather than from apply.GetOptions(), so an
+// operation-scoped copy drive that must park at the cutover barrier takes the
+// atomic-cutover label. Whether a drive groups at all is
+// storage.GroupsEngineExecution's call; this only names the engine-specific
+// strategy behind a grouping it selected.
 func groupedApplyMode(apply *storage.Apply, options map[string]string) string {
 	opts := storage.ApplyOptionsFromMap(options)
-	switch {
-	case apply.DatabaseType == storage.DatabaseTypeMySQL && opts.DeferCutover:
-		return "spirit_atomic_cutover"
-	case apply.DatabaseType == storage.DatabaseTypeVitess:
-		return "vitess_deploy_request"
-	default:
+	if !storage.GroupsEngineExecution(apply.DatabaseType, opts.DeferCutover) {
 		return "grouped_engine_apply"
 	}
+	if apply.DatabaseType == storage.DatabaseTypeVitess {
+		return "vitess_deploy_request"
+	}
+	return "spirit_atomic_cutover"
 }
 
 func groupedApplyModeDescription(apply *storage.Apply, options map[string]string) string {
@@ -591,10 +593,7 @@ func groupedApplyModeDescription(apply *storage.Apply, options map[string]string
 }
 
 func (c *LocalClient) usesGroupedApply(apply *storage.Apply, options map[string]string) bool {
-	if apply.DatabaseType == storage.DatabaseTypeVitess {
-		return true
-	}
-	return apply.DatabaseType == storage.DatabaseTypeMySQL && storage.ApplyOptionsFromMap(options).DeferCutover
+	return storage.GroupsEngineExecution(apply.DatabaseType, storage.ApplyOptionsFromMap(options).DeferCutover)
 }
 
 func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {

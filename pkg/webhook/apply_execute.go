@@ -51,6 +51,10 @@ func (h *Handler) executeApply(
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
 		SourceTrusted:     true,
+		// This re-plan is what the copy-discard gate below reads, so it has to
+		// predict the apply that is about to run, not the default shape. The
+		// command carrying that decision is already resolved here.
+		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
 	}
 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)

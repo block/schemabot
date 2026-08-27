@@ -1057,8 +1057,19 @@ type PlanRequest struct {
 	// MySQL DSN), where a withheld namespace's live tables would otherwise be
 	// planned as drops.
 	IgnoredNamespaces []string `protobuf:"bytes,11,rep,name=ignored_namespaces,json=ignoredNamespaces,proto3" json:"ignored_namespaces,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Whether an apply of this plan hands the engine every ALTER at once or one
+	// table at a time. An engine that predicts what applying will do to work
+	// already on the target needs the same statement grouping the apply will use,
+	// because that grouping is what decides which stored progress it can resume.
+	//
+	// Optional so that a caller that predates statement grouping in this contract
+	// is distinguishable from one that chose the ungrouped shape: when the field
+	// is absent, the engine predicts the joined batch, which errs toward
+	// disclosing a discard rather than promising a resume the apply will not
+	// perform.
+	GroupedExecution *bool `protobuf:"varint,12,opt,name=grouped_execution,json=groupedExecution,proto3,oneof" json:"grouped_execution,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1159,6 +1170,13 @@ func (x *PlanRequest) GetIgnoredNamespaces() []string {
 		return x.IgnoredNamespaces
 	}
 	return nil
+}
+
+func (x *PlanRequest) GetGroupedExecution() bool {
+	if x != nil && x.GroupedExecution != nil {
+		return *x.GroupedExecution
+	}
+	return false
 }
 
 // TableChange represents a DDL change to a table.
@@ -3926,7 +3944,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xcb\x03\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\x93\x04\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -3941,10 +3959,12 @@ const file_tern_proto_rawDesc = "" +
 	"\vschema_path\x18\n" +
 	" \x01(\tR\n" +
 	"schemaPath\x12-\n" +
-	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x1aT\n" +
+	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x120\n" +
+	"\x11grouped_execution\x18\f \x01(\bH\x00R\x10groupedExecution\x88\x01\x01\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
-	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\x99\x03\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
+	"\x12_grouped_executionJ\x04\b\a\x10\b\"\x99\x03\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -4406,6 +4426,7 @@ func file_tern_proto_init() {
 	if File_tern_proto != nil {
 		return
 	}
+	file_tern_proto_msgTypes[9].OneofWrappers = []any{}
 	file_tern_proto_msgTypes[21].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

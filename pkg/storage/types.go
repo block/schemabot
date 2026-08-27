@@ -1209,6 +1209,33 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 	return opts
 }
 
+// GroupsEngineExecution reports whether an apply against databaseType hands the
+// engine every ALTER at once rather than driving one table at a time, given
+// whether its cutover is deferred.
+//
+// Two things depend on the answer and must agree. The drive uses it to pick how
+// it executes, and an engine predicting what an apply will do to unfinished
+// work already on the target uses it to know which stored progress that apply
+// could continue — progress is kept per batch, so the two shapes look in
+// different places. A prediction made for the shape the apply does not use
+// reports work as lost that would in fact be resumed.
+//
+// Grouping is opted into: Vitess groups because a deploy request covers the
+// whole change, and MySQL groups only when the caller asked to defer cutover so
+// every table can swap together. Everything else runs a table at a time.
+//
+// deferCutover must be the decision the drive will act on, not merely the
+// option the operator typed: a drive can defer cutover on its own (an
+// operation parked at a cutover barrier, see effectiveCopyDriveOptions in
+// pkg/tern), and a caller predicting for such an apply has to pass that
+// effective decision or its prediction describes the wrong shape.
+func GroupsEngineExecution(databaseType string, deferCutover bool) bool {
+	if databaseType == DatabaseTypeVitess {
+		return true
+	}
+	return databaseType == DatabaseTypeMySQL && deferCutover
+}
+
 // Map converts typed storage options back into API/proto option strings.
 func (opts ApplyOptions) Map() map[string]string {
 	options := make(map[string]string)

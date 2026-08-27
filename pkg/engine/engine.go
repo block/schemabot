@@ -181,6 +181,23 @@ type PlanRequest struct {
 	Repository   string             // GitHub repo for context (optional)
 	PullRequest  int                // PR number for context (optional)
 	Credentials  *Credentials       // Resolved credentials (from discovery)
+
+	// GroupedExecution reports whether an apply of this plan will hand the
+	// engine every ALTER at once or one table at a time.
+	//
+	// It exists for predictions an engine makes about work already on the
+	// target. Progress an unfinished change left behind is stored per batch, so
+	// what a later apply can resume depends on the grouping it runs under, not
+	// only on the statements. A prediction made for the wrong grouping looks for
+	// progress under a key the apply will never use, and reports work as lost
+	// that the apply would in fact continue.
+	//
+	// A caller that does not yet know the grouping leaves this false, which is
+	// the ungrouped default every engine falls back to. Grouping is opted into,
+	// so a plan made before that choice predicts the shape it would get today,
+	// and the re-plan an apply runs predicts the shape it is actually about to
+	// use.
+	GroupedExecution bool
 }
 
 // PlanResult contains the computed schema change plan.

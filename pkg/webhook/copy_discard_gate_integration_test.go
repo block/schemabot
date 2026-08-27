@@ -195,6 +195,135 @@ func setupDiscardGate(t *testing.T, dbName string) discardGateFixture {
 	return discardGateFixture{handler: newE2EHandler(t, svc, client), result: result, svc: svc, client: client, dbName: dbName}
 }
 
+// auditsColumnAddSchema declares a column the target's `audits` table does not
+// have, so a two-file schema plans as one ALTER per table.
+const auditsColumnAddSchema = "CREATE TABLE `audits` (\n" +
+	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+	"  `note` varchar(64) DEFAULT NULL,\n" +
+	"  PRIMARY KEY (`id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+// seedTwoTableTargetWithOneCopy stands up a target whose plan is two ALTERs but
+// whose unfinished copy covers only `events`. The verdict on that copy depends
+// on the statement grouping the apply will use: a joined batch reads the shadow
+// table of both its tables and finds one missing (the copy is incomplete for
+// the batch), while a per-table batch meets the copy alone and fails only the
+// statement comparison. The two verdicts render differently, which is what lets
+// a test see which shape the prediction actually ran.
+func seedTwoTableTargetWithOneCopy(t *testing.T, dbName string) {
+	t.Helper()
+	seedPreChangeEvents(t, dbName)
+
+	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()), "connect to target")
+
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `audits` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "seed pre-change audits table")
+
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf(
+		"CREATE TABLE `%s` (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)", utils.NewTableName("events")))
+	require.NoError(t, err, "seed shadow table for events")
+}
+
+func setupGroupedDiscardGate(t *testing.T, dbName string) discardGateFixture {
+	t.Helper()
+
+	svc := setupE2EService(t, dbName)
+	seedTwoTableTargetWithOneCopy(t, dbName)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux,
+		map[string]string{"events.sql": indexAddSchema, "audits.sql": auditsColumnAddSchema},
+		schemabotConfig, dbName)
+
+	return discardGateFixture{handler: newE2EHandler(t, svc, client), result: result, svc: svc, client: client, dbName: dbName}
+}
+
+// A --defer-cutover apply hands the engine every ALTER as one batch, and the
+// engine reads the shadow table of every table in that batch before it can
+// resume. A copy covering only one of the plan's tables is therefore
+// destroyed, and the paused comment must give the joined batch's verdict —
+// the copy is incomplete for the batch — not the per-table verdict of a shape
+// this apply will not run. The grouping decision crosses the webhook, the API
+// server, and the plan client to reach the engine, and this rendered verdict
+// is only reachable when every one of those hops delivers it.
+func TestE2EDeferCutoverApplyDisclosesTheJoinedBatchVerdict(t *testing.T) {
+	f := setupGroupedDiscardGate(t, "webhook_copy_grouped_gate")
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging --defer-cutover",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
+			"the locked comment discloses the copy the apply would destroy")
+		assert.Contains(t, body, "`events`")
+		assert.Contains(t, body, "it covers only some of the tables this schema change alters",
+			"the verdict is the joined batch's: the copy is incomplete for the batch")
+		assert.NotContains(t, body, "the schema change differs from the one that started it",
+			"a per-table verdict here means the prediction ran the shape this apply will not use")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the downgraded plan comment")
+	}
+}
+
+// The consent gate re-plans when the operator confirms, and a --defer-cutover
+// confirm is about to run the joined batch, so the re-plan must predict that
+// shape. The operator here is confirming a comment that disclosed no copy, so
+// the gate stops the apply — and its disclosure must carry the joined batch's
+// verdict on the copy that appeared since.
+func TestE2EDeferCutoverConfirmRechecksAgainstTheJoinedBatch(t *testing.T) {
+	const dbName = "webhook_copy_grouped_recheck"
+	f := setupGroupedDiscardGate(t, dbName)
+
+	require.NoError(t, f.svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: "plan-disclosing-no-copy",
+	}))
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging --defer-cutover",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
+			"the confirm stops and discloses the copy instead of dispatching over it")
+		assert.Contains(t, body, "it covers only some of the tables this schema change alters",
+			"the verdict is the joined batch's: the copy is incomplete for the batch")
+		assert.NotContains(t, body, "the schema change differs from the one that started it",
+			"a per-table verdict here means the re-plan ran the shape this confirm will not use")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the stopped apply-confirm comment")
+	}
+}
+
 // An apply that would throw away an unfinished copy on the target never runs
 // in one step on its own. The locked comment discloses the copy and pauses the
 // automatic apply, so the operator decides whether hours of copied rows are

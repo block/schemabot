@@ -407,7 +407,7 @@ func verifyOnboardPlan(endpoint, database, environment string, plan *onboardWrit
 	var planResult *apitypes.PlanResponse
 	err := withLoading("Verifying pulled schema...", true, func() error {
 		var planErr error
-		planResult, _, planErr = client.CallPlanAPI(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.ignoreNamespaces)
+		planResult, _, planErr = client.CallPlanAPI(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.ignoreNamespaces, false)
 		return planErr
 	})
 	if err != nil {
