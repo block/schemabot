@@ -675,6 +675,15 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	}
 	c.cancelApplyHandle(applyCancel)
 
+	if targetApply != nil {
+		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
+			c.logSkippedArtifactRelease(ctx, targetApply, err)
+		}
+	} else {
+		c.logger.Warn("cancel resolved no apply, so any artifacts its schema change left stay on the target",
+			"database", c.config.Database, "type", c.config.Type)
+	}
+
 	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, StatementIndex[engine.TableProgress]{}, state.Task.Cancelled)
 	if err != nil {
 		// Same reasoning as the stop: an apply recorded as cancelled over task

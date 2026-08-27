@@ -779,6 +779,25 @@ type ApplyStore interface {
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error
 
+	// WithExclusiveTarget runs fn while holding the apply target's advisory
+	// lock, and only when no active apply other than this one owns that target.
+	//
+	// It is for work that touches the target database rather than storage, and
+	// that would destroy another apply's live work if it ran alongside one —
+	// reclaiming what a cancelled schema change left on the target, say, where
+	// the leftovers are named after the target's own tables and so are
+	// indistinguishable from a running apply's. The advisory lock plus the
+	// active-apply re-check under it is the authority for that decision; task
+	// rows are not, because they see only one deployment's work and fail toward
+	// "nothing is running", the wrong direction for a destructive one.
+	//
+	// Returns ErrActiveApplyExists without running fn when another active apply
+	// owns the target, so the caller can report the skip rather than proceed.
+	//
+	// The lock is held for as long as fn runs, so fn must be bounded: every
+	// apply competing for this target waits behind it.
+	WithExclusiveTarget(ctx context.Context, apply *Apply, fn func(context.Context) error) error
+
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed. Returns the
 	// applies updated.
