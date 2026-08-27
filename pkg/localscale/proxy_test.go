@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -110,8 +111,9 @@ func TestTrackProxyDoesNotReleaseOldPortBeforeCloseCompletes(t *testing.T) {
 }
 
 func TestPortAllocatorIgnoresDuplicateRelease(t *testing.T) {
-	ports := freeTCPPorts(t, 2)
-	port1, port2 := ports[0], ports[1]
+	// portAllocator is pure bookkeeping — acquire and release never bind — so
+	// plain constants exercise the FIFO contract without touching the network.
+	const port1, port2 = 1, 2
 
 	alloc := newTestPortAllocator(port1, port2)
 	acquired, err := alloc.acquire()
@@ -206,6 +208,8 @@ func freeTCPPorts(t *testing.T, n int) []int {
 		listeners = append(listeners, ln)
 		ports = append(ports, tcpListenerPort(t, ln))
 	}
+	require.Len(t, slices.Compact(slices.Sorted(slices.Values(ports))), n,
+		"reserved ports must be distinct")
 	return ports
 }
 
