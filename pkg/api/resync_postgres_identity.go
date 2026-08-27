@@ -60,7 +60,7 @@ func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *sl
 		switch outcome {
 		case sequenceAdvanced:
 			advanced++
-			logger.Debug("advanced identity sequence past stored maximum",
+			logger.Info("advanced identity sequence past stored maximum",
 				"table", col.table, "column", col.column, "sequence_value", newValue)
 		case sequenceSkippedEmptyTable:
 			skipped++

@@ -139,7 +139,7 @@ func TestResyncPostgresIdentitySequences_UnblocksDefaultInsertsAfterExplicitIDLo
 
 	records := logs.recordsForTable("settings")
 	require.Len(t, records, 1, "the resync logs exactly one outcome per identity column")
-	assert.Equal(t, slog.LevelDebug, records[0].level)
+	assert.Equal(t, slog.LevelInfo, records[0].level)
 	assert.Equal(t, "advanced identity sequence past stored maximum", records[0].message)
 	assert.Equal(t, int64(3), records[0].attrs["sequence_value"], "the sequence is set to the stored maximum")
 

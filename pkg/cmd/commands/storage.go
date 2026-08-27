@@ -44,6 +44,10 @@ type ResyncIdentitySequencesCmd struct {
 const storagePingTimeout = 10 * time.Second
 
 func (cmd *ResyncIdentitySequencesCmd) Run(ctx context.Context, g *Globals) error {
+	// A text handler, deliberately: this is a one-shot operator command read
+	// at a terminal during a maintenance window, not a long-running server
+	// whose stdout feeds a JSON log collector. Diagnostics go to stderr so
+	// stdout stays free for machine-readable output.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel(),
 	})).With("schemabot_version", g.Version)
