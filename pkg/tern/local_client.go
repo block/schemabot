@@ -2427,7 +2427,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.
-	if _, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
+	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID)
+	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -2467,7 +2468,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
-	err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	err = c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
 		// A concurrent same-operation attach won the insert; the winner's row
@@ -2490,6 +2491,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
+
+	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
@@ -2570,12 +2573,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if blocking, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
+	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0)
+	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
 		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
-			return nil, errors.Join(err, lookupErr)
+			return nil, errors.Join(conflictErr, lookupErr)
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
 				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
@@ -2595,7 +2599,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
-			ErrorMessage: err.Error(),
+			ErrorMessage: conflictErr.Error(),
 		}, nil
 	}
 
@@ -2738,6 +2742,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
 	}
 	apply.ID = applyID
+
+	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
 
 	// Record the queue event in the apply's durable log; the drive itself starts
 	// when an operator claims the apply, which the timeline records separately.

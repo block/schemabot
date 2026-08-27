@@ -242,9 +242,10 @@ func TestApplyRefusesToAdoptADifferentChangeSet(t *testing.T) {
 }
 
 // A terminal apply is not running anything to rejoin, so a dispatch is never
-// resolved into it even while its task still holds the database. The operator
-// keeps the refusal, which names the apply and what clears it.
-func TestApplyRefusesToAdoptATerminalApply(t *testing.T) {
+// resolved into it, however its own work is recorded. Its stopped task rests
+// with no driver coming for it, so it holds nothing either: the dispatch gets
+// an apply of its own rather than joining a settled one or being refused by it.
+func TestApplyDoesNotAdoptATerminalApply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -266,8 +267,9 @@ func TestApplyRefusesToAdoptATerminalApply(t *testing.T) {
 	require.NoError(t, err)
 
 	resp := f.dispatch(t, "schemabot:v1:adopt-terminal-second")
-	assert.False(t, resp.Accepted, "a terminal apply has no live work to adopt")
-	assert.Contains(t, resp.ErrorMessage, "schema change already in progress")
+	require.True(t, resp.Accepted, "a resting task of a terminal apply holds nothing: %s", resp.ErrorMessage)
+	assert.NotEqual(t, first.ApplyId, resp.ApplyId,
+		"a terminal apply has no live work to adopt, so the dispatch gets its own apply")
 }
 
 // An apply that is reverting is live, but it is running the change backwards.
