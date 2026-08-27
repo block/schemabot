@@ -495,6 +495,14 @@ func (c *LocalClient) spiritApplyLogFunc(ctx context.Context, apply *storage.App
 // transitionTaskState updates a task's state, persists it, and optionally logs a state transition.
 // Fields like CompletedAt, StartedAt, ErrorMessage, or progress must be set on the task BEFORE calling this.
 func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) {
+	if err := c.transitionTaskStateStrict(ctx, task, applyID, newState, logMsg); err != nil {
+		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+	}
+}
+
+// transitionTaskStateStrict is the fail-closed form used when a later parent
+// transition depends on this task write being durable.
+func (c *LocalClient) transitionTaskStateStrict(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
@@ -510,13 +518,14 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 		task.ThrottleReason = ""
 	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
-		c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+		return fmt.Errorf("persist task %s state %s: %w", task.TaskIdentifier, newState, err)
 	}
 	if logMsg != "" && applyID > 0 {
 		taskID := task.ID
 		c.logApplyEvent(ctx, applyID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			logMsg, oldState, newState)
 	}
+	return nil
 }
 
 // markTasksRunning sets DDL tasks to running state with a start timestamp.

@@ -56,6 +56,37 @@ func TestReplanShardTableDDLNonShardedDegradesToTable(t *testing.T) {
 	assert.Equal(t, ddl, got[shardTableKey{namespace: "commerce", table: "mutes"}])
 }
 
+// A resume re-plan can prove from live schema that retryable work already
+// completed in the data plane. The task's terminal write must land before the
+// caller is allowed to settle the parent apply.
+func TestReplanAndFilterTasksFailsClosedWhenCompletedTaskWriteFails(t *testing.T) {
+	writeErr := errors.New("task write rejected")
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        42,
+		TaskIdentifier: "task_users",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+	}
+	c := &LocalClient{
+		config:  LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL, TargetDSN: "user:pass@tcp(127.0.0.1:3306)/testapp"},
+		storage: &exactProgressStorage{tasks: &exactProgressTaskStore{err: writeErr}},
+		logger:  slog.Default(),
+		spiritEngine: fakePlanEngine{planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+			return &engine.PlanResult{}, nil
+		}},
+	}
+	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply_retry", Database: "testdb", State: state.Apply.FailedRetryable}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{})
+
+	require.ErrorIs(t, err, writeErr)
+	assert.Nil(t, rp)
+}
+
 // On resume, replanAndFilterTasks recomputes each deployment's delta against its
 // live schema and overwrites task.DDL with it. verifyReplannedTaskDDL is the
 // gate that keeps a drifted deployment from silently applying that recomputed

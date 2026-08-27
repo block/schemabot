@@ -509,8 +509,10 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
+			if err := c.transitionTaskStateStrict(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier)); err != nil {
+				return nil, fmt.Errorf("reconcile completed task before resuming apply %s: %w", apply.ApplyIdentifier, err)
+			}
 			completedCount++
 		} else {
 			// Fail closed if the re-plan would apply DDL this task was not
