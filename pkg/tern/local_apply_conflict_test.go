@@ -58,8 +58,9 @@ func unleasedRunningApply(database string) *storage.Apply {
 // A stopped task keeps its Spirit checkpoint and is resumable via Start. When an
 // unrelated Apply runs on the same database, the engine reports no active work
 // for that database — but the stopped task must stay stopped so its checkpoint
-// and the operator's ability to resume are preserved, and the new apply must be
-// refused rather than running over paused work.
+// and the operator's ability to resume are preserved. Its apply is still
+// claimable here, so a driver will reach the task on its own and the new apply
+// is refused rather than running over work someone is about to drive.
 func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	stopped := &storage.Task{
 		ID:             1,
@@ -750,12 +751,11 @@ func TestBlockingTaskOffersNoCancelInsideTheRevertWindow(t *testing.T) {
 	}
 }
 
-// A stopped apply keeps its task and its database so it stays resumable. A new
-// apply on that database is refused, and the refusal must carry the table being
-// changed and the stopped apply's identifier so an operator can see what is held
-// and start or cancel it, rather than being left with a task identifier alone.
-func TestConflictCheckReportsTheStoppedApplyHoldingTheDatabase(t *testing.T) {
-	stopped := &storage.Task{
+// restingStoppedTask builds a stopped task and the stopped apply that owns it —
+// a copy left resting on the target, with its checkpoint intact and no driver
+// on its way.
+func restingStoppedTask() (*storage.Task, *storage.Apply) {
+	task := &storage.Task{
 		ID:             1,
 		TaskIdentifier: "task-stopped",
 		Database:       "testdb",
@@ -763,37 +763,124 @@ func TestConflictCheckReportsTheStoppedApplyHoldingTheDatabase(t *testing.T) {
 		TableName:      "users",
 		State:          state.Task.Stopped,
 	}
-	holdingApply := &storage.Apply{
+	apply := &storage.Apply{
 		ID:              1,
 		ApplyIdentifier: "apply-holding-testdb",
 		Database:        "testdb",
 		DatabaseType:    storage.DatabaseTypeMySQL,
 		State:           state.Apply.Stopped,
 	}
-	client := &LocalClient{
+	return task, apply
+}
+
+// restingTaskClient builds a client whose only task is the given resting one,
+// with the control requests the store should report against its apply.
+func restingTaskClient(task *storage.Task, apply *storage.Apply, controlRequests storage.ControlRequestStore) *LocalClient {
+	return &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
 		storage: &exactProgressStorage{
-			applies: &mockApplyStore{apply: holdingApply},
-			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{stopped}},
-			logs:    &mockApplyLogStore{},
+			applies:         &mockApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
 		},
 		spiritEngine: &fakeControlEngine{
 			progressResult: &engine.ProgressResult{State: engine.StateRunning, Message: "Copying rows"},
 		},
 		logger: slog.Default(),
 	}
+}
+
+// unreadableControlRequestStore fails every pending-request read, standing in
+// for a storage outage while the conflict check is deciding.
+type unreadableControlRequestStore struct {
+	storage.ControlRequestStore
+}
+
+func (s *unreadableControlRequestStore) GetPending(context.Context, int64, storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	return nil, errors.New("control request read failed")
+}
+
+// A stopped apply's task rests on the target with its checkpoint intact, and no
+// driver claims it until a person asks. It therefore stops holding the database
+// at the moment of the stop, so an unrelated apply proceeds instead of being
+// refused for as long as the stopped copy sits there. The resting task itself is
+// left exactly as it was, so starting it later still resumes from its
+// checkpoint.
+func TestConflictCheckReleasesRestingStoppedTask(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", 0)
+	assert.False(t, blocking.blocks(), "a resting stopped task no longer holds the database")
+
+	_, err := client.checkActiveTaskConflict(t.Context(), plan, "", 0)
+	require.NoError(t, err, "a new apply proceeds past a resting stopped task")
+
+	assert.Equal(t, state.Task.Stopped, stopped.State, "the resting task stays resumable")
+	assert.Empty(t, stopped.ErrorMessage, "releasing the hold must not write a failure onto the task")
+	assert.Nil(t, stopped.CompletedAt)
+}
+
+// An operator command that a driver has not delivered yet means a driver is
+// still on its way to the stopped apply: a start resumes its copy and a cancel
+// reclaims it. Either way the database stays held until the command lands, and
+// the refusal names the apply an operator acts on rather than the task alone.
+func TestConflictCheckKeepsRestingTaskAwaitingAnOperatorCommand(t *testing.T) {
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel} {
+		t.Run(string(operation), func(t *testing.T) {
+			stopped, holdingApply := restingStoppedTask()
+			client := restingTaskClient(stopped, holdingApply, &testControlRequestStore{
+				requests: []*storage.ApplyControlRequest{{
+					ID:        1,
+					ApplyID:   holdingApply.ID,
+					Operation: operation,
+					Status:    storage.ControlRequestPending,
+				}},
+			})
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+			blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", 0)
+
+			require.True(t, blocking.blocks(), "a %s a driver has not delivered keeps the database held", operation)
+			assert.Equal(t, "task-stopped", blocking.taskIdentifier)
+			assert.Equal(t, "users", blocking.table, "the refusal names the table being changed")
+			assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier(),
+				"the refusal names the apply an operator acts on, not only the task")
+			assert.Equal(t, state.Apply.Stopped, blocking.applyStateName())
+			assert.Contains(t, blocking.describe(), "table users",
+				"the table an operator recognizes leads the refusal")
+		})
+	}
+}
+
+// A stopped apply whose lease is still fresh is being settled by a live driver
+// right now, so its task keeps holding the database until that driver is done
+// with it.
+func TestConflictCheckKeepsRestingTaskUnderAFreshLease(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	holdingApply.LeaseOwner = "driver-settling-the-stop"
+	holdingApply.UpdatedAt = time.Now()
+	client := restingTaskClient(stopped, holdingApply, nil)
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
 
 	blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", 0)
 
-	require.True(t, blocking.blocks(), "a stopped task holds the database and refuses a new apply")
-	assert.Equal(t, "task-stopped", blocking.taskIdentifier)
-	assert.Equal(t, "users", blocking.table, "the refusal names the table being changed")
-	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier(),
-		"the refusal names the apply an operator acts on, not only the task")
-	assert.Equal(t, state.Apply.Stopped, blocking.applyStateName())
-	assert.Contains(t, blocking.describe(), "table users",
-		"the table an operator recognizes leads the refusal")
-	assert.Contains(t, blocking.describe(), "started or cancelled",
-		"a stopped apply owes the operator a decision, so the refusal says so")
+	require.True(t, blocking.blocks(), "a live driver's stopped apply keeps holding the database")
+	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
+}
+
+// Releasing the hold requires proving no driver is coming. When the apply's
+// control requests cannot be read that proof is unavailable, so the task keeps
+// blocking rather than admitting a new apply on an unverified assumption.
+func TestConflictCheckKeepsRestingTaskWhenControlRequestsAreUnreadable(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, &unreadableControlRequestStore{})
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", 0)
+
+	require.True(t, blocking.blocks(), "an unreadable control request keeps the database held")
+	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
 }

@@ -899,6 +899,14 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
 //     investigate if the same task repeats here without converging.
+//   - "pending_control_request": a stopped task's apply carries an operator
+//     command a driver has not delivered yet, so the task still holds its
+//     database. A sustained rate means commands are queued but not being
+//     drained — check that drivers are claiming on this deployment.
+//   - "control_request_unreadable": the control requests of a stopped task's
+//     apply could not be read, so the task kept blocking rather than being
+//     released on an unproven assumption. Any sustained rate is a storage
+//     problem, not a workload one.
 func RecordConflictCheckOwnershipBlock(ctx context.Context, database, databaseType, reason string) {
 	addCounter(ctx, "schemabot.conflict_check.ownership_blocks_total",
 		"Total conflict-check decisions that kept a task blocking because the apply lease denies local engine authority", "{block}",

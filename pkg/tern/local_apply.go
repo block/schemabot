@@ -110,6 +110,12 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			continue
 		}
 
+		// A stopped task rests without ending. Nothing reaches for it until a
+		// person asks, so it does not hold the database.
+		if c.restingTaskReleasesDatabase(ctx, t, apply) {
+			continue
+		}
+
 		// Storage says non-terminal — verify with engine before blocking.
 		if c.tryResolveStaleTask(ctx, t, apply, plan.Database) {
 			continue // Task was stale; engine confirmed it's done.
@@ -306,6 +312,83 @@ func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *stor
 		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
 		previousState, state.Task.Cancelled)
 	return true
+}
+
+// restingTaskReleasesDatabase reports whether a stopped task has stopped
+// holding its database.
+//
+// A task holds the database only while a driver will pick it up on its own:
+// running work is being driven now, and pending or failed_retryable work is
+// claimed unprompted. Stopped is the one state where a task still exists and
+// nothing reaches for it until a person asks. That is what makes it safe to
+// ignore, and it is exactly what a terminal-task test cannot express, because
+// the same fact that makes it inert also makes it resumable.
+//
+// Three conditions must hold, each closing off a way a driver could still
+// arrive:
+//
+//	apply is terminal        a claimable apply is work someone will drive
+//	no fresh lease           a live driver is mid-settlement of this apply
+//	no pending start/cancel  an operator already asked, and the claim
+//	                         predicate admits a stopped apply for either
+//
+// Uncertainty keeps the hold: a control-request read that fails cannot prove no
+// driver is coming, so the task keeps blocking.
+func (c *LocalClient) restingTaskReleasesDatabase(ctx context.Context, t *storage.Task, apply *storage.Apply) bool {
+	if !state.IsState(t.State, state.Task.Stopped) {
+		// Every other non-terminal task state is either being driven now or
+		// waiting for a driver, so it stays with the engine-backed checks.
+		return false
+	}
+
+	if !state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("conflict check: stopped task's apply is still claimable; the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return false
+	}
+
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Info("conflict check: stopped task's apply still holds a fresh lease; the task keeps blocking until its lease owner settles it",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "fresh_lease")
+		return false
+	}
+
+	operation, err := c.pendingDriverRequest(ctx, apply)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to read the stopped apply's control requests; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "control_request_unreadable")
+		return false
+	}
+	if operation != "" {
+		c.logger.Info("conflict check: stopped task's apply has an operator command waiting for a driver; the task keeps blocking until that command is delivered",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "pending_operation", string(operation))...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "pending_control_request")
+		return false
+	}
+
+	c.logger.Info("conflict check: stopped task rests with no driver coming for it; it no longer holds the database",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+	return true
+}
+
+// pendingDriverRequest names the operator command that will bring a driver back
+// to a stopped apply, empty when none is pending. Start and cancel are the two
+// the apply claim predicate admits on a stopped apply: a start resumes it and a
+// cancel is delivered by a drive, so either one means a driver arrives without
+// anyone asking again.
+func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.Apply) (storage.ControlOperation, error) {
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel} {
+		request, err := c.storage.ControlRequests().GetPending(ctx, apply.ID, operation)
+		if err != nil {
+			return "", fmt.Errorf("read pending %s request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+		}
+		if request != nil {
+			return operation, nil
+		}
+	}
+	return "", nil
 }
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
