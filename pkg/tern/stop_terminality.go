@@ -18,6 +18,11 @@ import "github.com/block/schemabot/pkg/storage"
 // must decide it for undispatched applies, where no engine instance — local or
 // remote — exists to query. Keep it consistent with each engine's Stop
 // implementation in pkg/engine.
+//
+// Unlike the LocalConfig-driven dispositions (usesPerNamespaceCredentials,
+// recoveryResumesFromCheckpoint), the input here is a persisted apply row
+// value, so an unknown value must take the conservative default — resumable —
+// rather than treating stale or hand-edited storage data as fatal.
 func stopTerminatesChange(databaseType string) bool {
 	return databaseType == storage.DatabaseTypeVitess
 }

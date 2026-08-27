@@ -39,3 +39,25 @@ func TestShouldRetryEngineErrorByDatabaseType(t *testing.T) {
 		})
 	}
 }
+
+func TestEngineDispositionsByDatabaseType(t *testing.T) {
+	cases := []struct {
+		name                        string
+		databaseType                string
+		wantNamespaceCredentials    bool
+		wantCheckpointBasedRecovery bool
+	}{
+		{"mysql", storage.DatabaseTypeMySQL, true, true},
+		{"vitess", storage.DatabaseTypeVitess, false, false},
+		{"strata", storage.DatabaseTypeStrata, false, true},
+		{"postgres", storage.DatabaseTypePostgres, false, false},
+		{"unset", "", false, false},
+		{"embedder-registered type gets conservative defaults", "customengine", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.wantNamespaceCredentials, usesPerNamespaceCredentials(tc.databaseType))
+			assert.Equal(t, tc.wantCheckpointBasedRecovery, recoveryResumesFromCheckpoint(tc.databaseType))
+		})
+	}
+}

@@ -121,10 +121,10 @@ func TestRenderBlockedChangesApplyRejected(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "**⛔ Apply rejected**: **1** planned change not supported by the schema-change engine")
+	assert.Contains(t, out, "**⛔ Apply rejected**: **1** planned change the schema-change engine refuses to execute")
 	assert.Contains(t, out, "`users`: dropping primary key is not supported")
 	assert.Contains(t, out, "above the configured limit of 1,000,000")
-	assert.Contains(t, out, "Rewrite these statements as a supported schema change")
+	assert.Contains(t, out, "Fix what each reason names")
 	assert.NotContains(t, out, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	assert.NotContains(t, out, "retry", "no retry of this command can succeed")
 }

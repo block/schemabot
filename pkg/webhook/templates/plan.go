@@ -904,10 +904,11 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 
 // writeBlockedChanges writes the section for statements the engine refuses,
 // naming each table and the engine's reason verbatim. There is no opt-in flag
-// that lets these through — the guidance is to rewrite the change, not retry.
+// that lets these through — the remedy is whatever each reason names: an
+// unsupported shape needs a rewrite, a missing grant needs provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -919,7 +920,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
+	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
 // directConsentCopy returns the header noun and consent footer for the

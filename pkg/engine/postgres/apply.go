@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	optimisticTableSizeLimit = int64(1 << 30)
 	optimisticLockTimeout    = 3 * time.Second
 	optimisticStatementLimit = 30 * time.Second
 
@@ -122,7 +121,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
-	err := executeOptimistic(ctx, conn, change)
+	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit)
 	if err == nil {
 		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
 		return
@@ -166,20 +165,24 @@ type refusal struct {
 }
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
-// refusals. A nil result means the failure is operational — a retry may
+// refusals, for both the plan-time privilege check and the apply path — one
+// classifier so the same underlying failure reads identically on both
+// surfaces. A nil result means the failure is operational — a retry may
 // succeed once conditions change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
 // with concurrent lock holders. Every detail string here is built from typed
-// error fields and identifiers, never from wrapped server output, so it is
-// safe to render on operator-facing surfaces.
+// error fields and identifiers, never from wrapped server output; fields
+// that embed database-sourced identifiers are sanitized before they leave,
+// so a detail is safe to render on operator-facing surfaces.
 func classifyRefusal(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		detail := fmt.Sprintf("insufficient privileges; provision with: %s", privilegeErr.Grant)
+		detail := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
+			privilegeErr.Tier, table, privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
 			detail += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: detail}
+		return &refusal{reason: "insufficient-privileges", detail: sanitizeReasonText(detail)}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
@@ -204,7 +207,7 @@ func classifyRefusal(err error, table string) *refusal {
 	return nil
 }
 
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply) error {
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -226,7 +229,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply)
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, optimisticTableSizeLimit)
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
 	}

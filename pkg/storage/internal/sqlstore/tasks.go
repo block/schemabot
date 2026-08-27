@@ -380,8 +380,12 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 				t.shard = ''
 				OR (
 					ao.operation_kind = ?
-					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table format.
-					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
+					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table
+					-- format. table_name is stored as NULL when empty, and MySQL's CONCAT
+					-- returns NULL when any operand is NULL (Postgres's concat() ignores
+					-- NULLs), so COALESCE keeps the key equal to the Go construction on
+					-- both dialects.
+					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', COALESCE(t.table_name, ''))
 				)
 			)
 		ORDER BY t.created_at, t.id
@@ -431,8 +435,12 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 				t.shard = ''
 				OR (
 					ao.operation_kind = ?
-					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table format.
-					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
+					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table
+					-- format. table_name is stored as NULL when empty, and MySQL's CONCAT
+					-- returns NULL when any operand is NULL (Postgres's concat() ignores
+					-- NULLs), so COALESCE keeps the key equal to the Go construction on
+					-- both dialects.
+					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', COALESCE(t.table_name, ''))
 				)
 			)
 		ORDER BY t.created_at, t.id

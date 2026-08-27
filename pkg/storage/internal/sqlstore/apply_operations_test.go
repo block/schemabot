@@ -2491,61 +2491,6 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFinalizerAfterSlashles
 	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_ClaimsSameDeploymentShardWorkConcurrently
-// verifies that the per-shard work operations of one deployment fan out: a
-// later shard is claimable while an earlier shard of the same deployment is
-// still running, so multiple drivers drive a deployment's shards in parallel.
-// The group_finalizer still waits until every shard work sibling completes.
-func TestApplyOperationStore_FindNextApplyOperation_ClaimsSameDeploymentShardWorkConcurrently(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_op_parallel_shards", 1)
-
-	shardA, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork,
-	})
-	require.NoError(t, err)
-	shardB, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork,
-	})
-	require.NoError(t, err)
-	finalizer, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer,
-	})
-	require.NoError(t, err)
-
-	// First claim takes the lowest-ordered shard and leaves it running.
-	first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-1")
-	require.NoError(t, err)
-	require.NotNil(t, first)
-	assert.Equal(t, shardA, first.ID)
-
-	// The sibling shard is claimable while shardA is still running — they are
-	// not serialized within the deployment.
-	second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-2")
-	require.NoError(t, err)
-	require.NotNil(t, second, "sibling shard must be claimable while the first shard is still running")
-	assert.Equal(t, shardB, second.ID)
-
-	// With both shards running (neither completed), the finalizer is not yet
-	// claimable, so a third claim yields nothing.
-	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-3")
-	require.NoError(t, err)
-	assert.Nil(t, blocked, "group_finalizer must wait until every shard work sibling completes")
-
-	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardA))
-	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardB))
-
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-1")
-	require.NoError(t, err)
-	require.NotNil(t, claimed)
-	assert.Equal(t, finalizer, claimed.ID)
-	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
-}
-
 // TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistinctShardWork
 // verifies the multi-driver safety of parallel shard claiming: many drivers
 // poll the same deployment's pending shard work operations at once, mirroring

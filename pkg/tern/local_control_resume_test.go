@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -468,6 +469,131 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 		"observer must see the settled verdict, got %s", observer.terminal[0].State)
 }
 
+// A task whose table no longer appears in the resume re-plan diff has no
+// remaining work: the live schema already matches the reviewed target (the
+// engine finished the change before the previous drive lost the apply). The
+// re-plan settles it — the task row is durably marked completed with full
+// progress — and reports it in CompletedCount so the caller can terminalize
+// the apply from settled rows.
+func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{plans: store, tasks: &exactProgressTaskStore{}, logs: logs}
+
+	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-settle", Database: "testapp"}
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.NoError(t, err)
+	assert.Empty(t, rp.ActiveTasks)
+	assert.Equal(t, int64(1), rp.CompletedCount)
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Completed),
+		"a task whose table left the diff is settled completed, got %s", tasks[0].State)
+	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
+	assert.NotNil(t, tasks[0].CompletedAt)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_1 already completed (live schema matches the reviewed target)"),
+		"a landed settlement records its transition in the apply's durable log")
+}
+
+// Settling a no-remaining-work task is only real once its completed state
+// durably lands. When the task store refuses the write — here a lease-guarded
+// update that lost the drive's lease to a peer driver — the re-plan must fail
+// closed instead of counting the task settled: the caller terminalizes the
+// parent apply from this partition, and completing the apply over a task row
+// that durably stays non-terminal would strand the pair in contradictory
+// states. The returned error aborts the resume so a later claim redoes the
+// settlement under a current lease.
+func TestReplanAndFilterTasks_FailsClosedWhenCompletedWriteRefused(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{
+		plans: store,
+		tasks: &exactProgressTaskStore{err: storage.ErrApplyLeaseLost},
+		logs:  logs,
+	}
+
+	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-lease-lost", Database: "testapp"}
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.ErrorContains(t, err, "task_1")
+	assert.Nil(t, rp, "a refused settlement write must not yield a partition the caller could terminalize from")
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
+}
+
+// The sequential resume loop settles a task whose table already has the
+// desired schema (its cutover raced the re-plan) by writing the task row
+// completed. That settlement is only real once the write durably lands: the
+// loop's finalization derives the apply's terminal state from these task rows,
+// so a refused write — here a lease-guarded update that lost the drive's lease
+// to a peer driver — must abort the resume without finalizing. The apply stays
+// active for a later claim to redo the settlement under a current lease, and
+// the durable log records no transition the task row does not carry.
+func TestResumeApplySequential_AbortsWhenRacedCutoverSettlementRefused(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	c.heartbeatInterval = time.Hour
+
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-sequential-settle-refused",
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task_1",
+		Database:       "testapp",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.Running,
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{
+		plans:   store,
+		applies: applies,
+		tasks: &updateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			updateErr:              storage.ErrApplyLeaseLost,
+		},
+		controlRequests: &testControlRequestStore{},
+		logs:            logs,
+	}
+
+	c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil)
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Running),
+		"a refused settlement write must abort the resume before finalization, leaving the apply claimable; stored state was %q", stored.State)
+	assert.False(t, state.IsTerminalApplyState(stored.State),
+		"the apply must not terminalize over a task row that durably stays non-terminal")
+	assert.Nil(t, stored.CompletedAt)
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
+}
+
 // A reverted task is terminal: the revert already landed for it, so the resume
 // re-plan leaves it untouched instead of re-activating it. It contributes no
 // remaining resume work, and its state must survive the re-plan so the apply's
@@ -584,4 +710,41 @@ func TestPersistReattachedResumeStates_ProjectsForwardStates(t *testing.T) {
 			assert.Equal(t, tc.wantTask, tasks[0].State)
 		})
 	}
+}
+
+// deferredDeployGuardEngine satisfies the engine presence check in
+// startDeferredDeploy; the mixed-namespace guard must reject the deploy
+// before any engine method is reached, so none are implemented.
+type deferredDeployGuardEngine struct{ engine.Engine }
+
+// A deferred deploy resolves credentials once from tasks[0] and drives every
+// task with them. On an engine that resolves credentials per namespace, tasks
+// spanning multiple namespaces must fail closed before the engine is asked to
+// start — proceeding would silently run every task against tasks[0]'s schema.
+func TestStartDeferredDeployRejectsMixedNamespaces(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              11,
+		ApplyIdentifier: "apply-mixed-namespaces",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		State:           state.Apply.WaitingForDeploy,
+	}
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-orders", Namespace: "orders", TableName: "users"},
+		{ID: 2, ApplyID: apply.ID, TaskIdentifier: "task-billing", Namespace: "billing", TableName: "invoices"},
+	}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: deferredDeployGuardEngine{},
+		storage: &controlTestStorage{
+			tasks: &controlTestTaskStore{tasks: tasks},
+		},
+		logger: slog.Default(),
+	}
+
+	_, err := client.startDeferredDeploy(t.Context(), apply, "")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "tasks span multiple namespaces")
+	assert.ErrorContains(t, err, apply.ApplyIdentifier)
 }
