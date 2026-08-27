@@ -1090,6 +1090,38 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.Less(t, stats.OldestClaimableAge, time.Minute, "a deferred pending row is not claimable backlog")
 	})
 
+	// A row that spent time deferred measures its backlog age and dispatch-lag
+	// basis from when it became claimable, not from receipt: the deferral's
+	// grace period is by design, and reporting it as backlog would spike the
+	// gauge to the full grace duration the instant the row becomes due.
+	t.Run("InboxStats_DeferredRowAgeMeasuredFromDueTime", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// Received 60s ago with a not-before time that elapsed 10s ago: only
+		// the 10s spent claimable is backlog, not the 50s grace period.
+		due := time.Now().UTC().Add(-10 * time.Second)
+		wasDeferred := newEvent("delivery-was-deferred")
+		wasDeferred.ReceivedAt = time.Now().UTC().Add(-time.Minute)
+		wasDeferred.RetryAfter = &due
+		createEvent(t, store, wasDeferred)
+
+		stats, err := store.WebhookEvents().InboxStats(ctx)
+		require.NoError(t, err)
+		assert.Greater(t, stats.OldestClaimableAge, 5*time.Second, "age must count the time spent claimable")
+		assert.Less(t, stats.OldestClaimableAge, 40*time.Second, "age must not count the deferral's grace period since receipt")
+
+		claimed := claimExpecting(t, store, "delivery-was-deferred")
+		assert.WithinDuration(t, due, claimed.ClaimableSince, 5*time.Second,
+			"the claimed event carries when it became dispatchable, not its receipt time")
+
+		// A row that was never deferred is dispatchable from receipt.
+		createEvent(t, store, newEvent("delivery-never-deferred"))
+		prompt := claimExpecting(t, store, "delivery-never-deferred")
+		assert.WithinDuration(t, prompt.ReceivedAt, prompt.ClaimableSince, 2*time.Second,
+			"an undeferred row is dispatchable from receipt")
+	})
+
 	// TerminateStuckProcessing sweeps out rows a hard-killed driver left
 	// parked in processing at the attempt cap with an expired lease — FindNext
 	// never reclaims those, so the reconciler must terminalize them. Rows

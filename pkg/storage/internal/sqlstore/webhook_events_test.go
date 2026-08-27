@@ -254,55 +254,45 @@ func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
 	assert.Nil(t, persisted.RetryAfter, "the claim consumes the persisted not-before time, not just the returned mirror")
 }
 
-// A row that spent time deferred measures its backlog age and dispatch-lag
-// basis from when it became claimable, not from receipt: the deferral's grace
-// period is by design, and reporting it as backlog would spike the gauge to
-// the full grace duration the instant the row becomes due.
-func TestWebhookEventStore_DeferredRowAgeMeasuredFromDueTime(t *testing.T) {
+// A retryable failure's retry window is advisory, not structural: the claim
+// predicate treats a missing window as immediately due, so a retryable row
+// whose retry_after was cleared by a manual operator repair is claimed like
+// any other due row rather than staying invisible forever. The lifecycle
+// never produces this shape itself — MarkFailed persists the state and the
+// window together — so raw SQL is required to set it up.
+func TestWebhookEventStore_FindNextClaimsRetryableRowWithoutRetryWindow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
-	future := time.Now().Add(time.Hour)
 	inserted, err := store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
-		DeliveryID: "was-deferred", Event: "check_suite", Payload: []byte(`{}`), RetryAfter: &future,
+		DeliveryID: "repaired", Event: "check_suite", Payload: []byte(`{}`),
 	})
 	require.NoError(t, err)
 	require.True(t, inserted)
-
-	// The row was received 60s ago and its not-before time elapsed 10s ago:
-	// only the 10s spent claimable is backlog, not the 50s grace period.
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE webhook_events
-		SET received_at = NOW() - INTERVAL 60 SECOND, retry_after = NOW() - INTERVAL 10 SECOND
-		WHERE provider = ? AND delivery_id = ?
-	`, storage.WebhookProviderGitHub, "was-deferred")
-	require.NoError(t, err)
-
-	stats, err := store.WebhookEvents().InboxStats(ctx)
-	require.NoError(t, err)
-	assert.Greater(t, stats.OldestClaimableAge, 5*time.Second, "age must count the time spent claimable")
-	assert.Less(t, stats.OldestClaimableAge, 40*time.Second, "age must not count the deferral's grace period since receipt")
 
 	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
-	assert.WithinDuration(t, time.Now().Add(-10*time.Second), claimed.ClaimableSince, 5*time.Second,
-		"the claimed event carries when it became dispatchable, not its receipt time")
 
-	// A row that was never deferred is dispatchable from receipt.
-	inserted, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
-		DeliveryID: "never-deferred", Event: "check_suite", Payload: []byte(`{}`),
-	})
-	require.NoError(t, err)
-	require.True(t, inserted)
+	future := time.Now().Add(time.Hour)
+	require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "temporary failure", &future))
 
-	prompt, err := store.WebhookEvents().FindNext(ctx, "driver-a", time.Minute)
+	none, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
 	require.NoError(t, err)
-	require.NotNil(t, prompt)
-	require.Equal(t, "never-deferred", prompt.DeliveryID)
-	assert.WithinDuration(t, prompt.ReceivedAt, prompt.ClaimableSince, 2*time.Second,
-		"an undeferred row is dispatchable from receipt")
+	require.Nil(t, none, "a retryable row with an open retry window is not claimable")
+
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE webhook_events SET retry_after = NULL
+		WHERE provider = ? AND delivery_id = ?
+	`, storage.WebhookProviderGitHub, "repaired")
+	require.NoError(t, err)
+
+	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a retryable row without a retry window is immediately due")
+	assert.Equal(t, "repaired", reclaimed.DeliveryID)
+	assert.Equal(t, 2, reclaimed.Attempts)
 }
 
 // A delivery's claimability must not depend on its payload width. Ordering the
