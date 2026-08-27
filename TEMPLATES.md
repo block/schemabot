@@ -6792,8 +6792,8 @@ No recent schema changes
 
 1 active schema change
 
-  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        SOURCE
-  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
+  APPLY ID                  EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        SOURCE
+  remote-apply-us-east-001  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
 
 APPLY ID is the deployment's data-plane apply id when one is recorded. 'schemabot status <apply_id>' takes the control-plane apply id — list without --deployment to see it
 
@@ -6801,8 +6801,17 @@ Multiple matching operations:
 
 1 active schema change
 
-  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        SOURCE
-  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  https://github.com/acme/shop/pull/412
+  APPLY ID                  EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        SOURCE
+  remote-apply-us-east-002  -               inventory-db  production  us-east     Running  4 minutes ago  https://github.com/acme/shop/pull/412
+
+APPLY ID is the deployment's data-plane apply id when one is recorded. 'schemabot status <apply_id>' takes the control-plane apply id — list without --deployment to see it
+
+No data-plane apply id recorded:
+
+1 active schema change
+
+  APPLY ID                EXTERNAL OP ID  DATABASE     ENV         DEPLOYMENT  STATE    STARTED       SOURCE
+  apply-pending-l3m4n5o6  -               payments-db  production  us-east     Pending  1 minute ago  https://github.com/acme/shop/pull/412
 
 APPLY ID is the deployment's data-plane apply id when one is recorded. 'schemabot status <apply_id>' takes the control-plane apply id — list without --deployment to see it
 
