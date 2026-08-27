@@ -170,11 +170,11 @@ ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REF
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⛔ **Cannot apply**: **2** changes not supported by the schema-change engine
+⛔ **Cannot apply**: **2** changes the schema-change engine refuses to execute
 - `users`: dropping primary key is not supported
 - `orders`: adding foreign key constraints is not supported
 
-An apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.
+An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
 📋 **Plan**: **3** tables to alter
 
@@ -468,10 +468,10 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 
 ---
 
-**⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
+**⛔ Apply rejected**: **1** planned change the schema-change engine refuses to execute
 - `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
 
-Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
+Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
 </details>
 

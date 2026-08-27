@@ -3,7 +3,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -112,11 +115,12 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
 			}
-			changes, err := tableChanges(report, parser)
+			changes, tiers, err := tableChanges(report, parser)
 			if err != nil {
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
-			if err := blockMissingPrivileges(ctx, pool, report, changes); err != nil {
+			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
+			if err != nil {
 				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
@@ -130,8 +134,14 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	return result, nil
 }
 
-func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, error) {
+// tableChanges renders the report's statements as planned table changes and
+// derives each executable step's privilege tier alongside them. The returned
+// slices are parallel: tiers[i] is the access changes[i] needs from the
+// engine role, and is meaningful only while changes[i] carries no verdict —
+// a blocked step never reaches a privilege check.
+func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, error) {
 	changes := make([]engine.TableChange, 0, len(report.Statements))
+	tiers := make([]preflight.Tier, 0, len(report.Statements))
 	for _, statement := range report.Statements {
 		mode, reason := executionVerdict(report.FormatVersion, statement, report.Table)
 		rendered := statement.ExecSQL
@@ -141,12 +151,13 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 		for _, sql := range rendered {
 			operation, table, err := parser.Classify(sql)
 			if err != nil {
-				return nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
+				return nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
 			}
 			if table == "" {
 				table = report.Table
 			}
 			stepMode, stepReason := mode, reason
+			var stepTier preflight.Tier
 			if stepMode == "" {
 				// The apply path derives a privilege tier for every statement
 				// it executes, and that derivation refuses shapes outside the
@@ -154,9 +165,12 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				// the operator reviews matches what the engine will do,
 				// instead of emitting an executable plan that deterministically
 				// fails at apply.
-				if _, tierErr := preflight.RequiredTier([]string{sql}); tierErr != nil {
+				tier, tierErr := preflight.RequiredTier([]string{sql})
+				if tierErr != nil {
 					stepMode = engine.ExecutionModeBlocked
 					stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
+				} else {
+					stepTier = tier
 				}
 			}
 			changes = append(changes, engine.TableChange{
@@ -168,33 +182,41 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				ExecutionMode: stepMode,
 				ModeReason:    stepReason,
 			})
+			tiers = append(tiers, stepTier)
 		}
 	}
-	return changes, nil
+	return changes, tiers, nil
 }
 
-// blockMissingPrivileges verifies the connected role holds the access the
-// report's executable steps need, at the most demanding step's tier, so a
-// missing grant surfaces on the plan the operator reviews — with the exact
-// provisioning statement — instead of failing only after apply is requested.
-// The apply path re-runs the same check before executing, so a grant revoked
-// between plan and apply still fails closed there. A typed refusal blocks the
-// table's executable steps; any other failure fails the plan — an executable
-// plan must never be produced while the check's answer is unknown. Reasons
-// come from classifyRefusal, so the same failure reads identically at plan
-// and apply time.
-func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange) error {
-	var executable []string
-	for _, change := range changes {
+// blockMissingPrivileges verifies the connected role holds the access each
+// executable step needs, at that step's own tier, so a missing grant surfaces
+// on the plan the operator reviews — with the exact provisioning statement —
+// instead of failing only after apply is requested. Tiers are checked
+// per-step rather than aggregated so a refusal's remediation names only the
+// access the blocked step actually needs: an index build's missing schema
+// CREATE must not mislabel an in-place ALTER the role can already run. The
+// apply path re-runs the same per-statement check before executing, so a
+// grant revoked between plan and apply still fails closed there. A privilege
+// refusal blocks the steps at its tier; a table-scoped refusal blocks every
+// executable step; any other failure fails the plan — an executable plan
+// must never be produced while the check's answer is unknown. Reasons come
+// from classifyRefusal, so the same failure reads identically at plan and
+// apply time. The returned slice is the input with verdicts marked.
+func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier) ([]engine.TableChange, error) {
+	if len(changes) != len(tiers) {
+		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
+	}
+	required := make(map[preflight.Tier]bool)
+	for i, change := range changes {
 		if change.ExecutionMode == "" {
-			executable = append(executable, change.DDL)
+			required[tiers[i]] = true
 		}
 	}
-	if len(executable) == 0 {
-		return nil
+	if len(required) == 0 {
+		return changes, nil
 	}
 	if report.Table == "" {
-		return fmt.Errorf("plan report carries executable steps but names no target table")
+		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
 	if report.TableExists != nil && !*report.TableExists {
 		// A privilege probe against a table that provably does not exist can
@@ -205,21 +227,30 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 		// instruction that no re-plan can satisfy.
 		blockExecutableChanges(changes, fmt.Sprintf(
 			"table %q does not exist on the target; the statement that would create it is blocked, so this statement cannot run", report.Table))
-		return nil
+		return changes, nil
 	}
-	tier, err := preflight.RequiredTier(executable)
-	if err != nil {
-		return fmt.Errorf("derive privilege tier for table %q: %w", report.Table, err)
-	}
-	_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
-	if err == nil {
-		return nil
-	}
-	if r := classifyRefusal(err, report.Table); r != nil {
+	for _, tier := range slices.Sorted(maps.Keys(required)) {
+		_, err := preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		if err == nil {
+			continue
+		}
+		r := classifyRefusal(err, report.Table)
+		if r == nil {
+			return nil, fmt.Errorf("check privileges for table %q: %w", report.Table, err)
+		}
+		var privilegeErr *preflight.PrivilegeError
+		if errors.As(err, &privilegeErr) {
+			// Missing access is a property of this tier alone: steps at the
+			// other tiers keep their own verdicts, from their own checks.
+			blockChangesAtTier(changes, tiers, tier, r.detail)
+			continue
+		}
+		// Any other refusal is a property of the table itself — vanished, or
+		// not an ordinary table — so it holds for every executable step.
 		blockExecutableChanges(changes, r.detail)
-		return nil
+		return changes, nil
 	}
-	return fmt.Errorf("check privileges for table %q: %w", report.Table, err)
+	return changes, nil
 }
 
 // blockExecutableChanges marks every still-executable change blocked with the
@@ -227,6 +258,18 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 func blockExecutableChanges(changes []engine.TableChange, reason string) {
 	for i := range changes {
 		if changes[i].ExecutionMode == "" {
+			changes[i].ExecutionMode = engine.ExecutionModeBlocked
+			changes[i].ModeReason = reason
+		}
+	}
+}
+
+// blockChangesAtTier marks every still-executable change whose step requires
+// the given tier blocked with the reason, leaving every other change — steps
+// at other tiers and steps already carrying a verdict — untouched.
+func blockChangesAtTier(changes []engine.TableChange, tiers []preflight.Tier, tier preflight.Tier, reason string) {
+	for i := range changes {
+		if changes[i].ExecutionMode == "" && tiers[i] == tier {
 			changes[i].ExecutionMode = engine.ExecutionModeBlocked
 			changes[i].ModeReason = reason
 		}

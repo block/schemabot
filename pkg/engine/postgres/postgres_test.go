@@ -5,6 +5,7 @@ import (
 
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
+	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -111,7 +112,7 @@ func TestTableChangesMapsDestructiveSafety(t *testing.T) {
 		},
 	}
 
-	changes, err := tableChanges(report, parser)
+	changes, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.True(t, changes[0].IsUnsafe)
@@ -136,7 +137,7 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 		},
 	}}
 
-	changes, err := tableChanges(report, parser)
+	changes, tiers, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", changes[0].DDL)
@@ -145,6 +146,10 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 	assert.Equal(t, ddl.StatementCreateIndex, changes[1].Operation)
 	assert.Empty(t, changes[0].ExecutionMode)
 	assert.Empty(t, changes[1].ExecutionMode)
+	require.Len(t, tiers, 2)
+	assert.Equal(t, preflight.TierAlterInPlace, tiers[0],
+		"an in-place ALTER needs only owner membership, never the index tier's schema CREATE")
+	assert.Equal(t, preflight.TierIndexBuild, tiers[1])
 }
 
 func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
@@ -160,7 +165,7 @@ func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
 			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, err := tableChanges(report, parser)
+	changes, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Empty(t, changes[0].ExecutionMode)
@@ -175,7 +180,7 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 	report.Table = "users"
 	report.Statements = []pgplan.Statement{{SQL: "not ddl", Disposition: router.DispositionRefuse}}
 
-	_, err = tableChanges(report, parser)
+	_, _, err = tableChanges(report, parser)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 }
@@ -203,7 +208,8 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, blockMissingPrivileges(t.Context(), nil, report, changes))
+	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild})
+	require.NoError(t, err)
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Contains(t, changes[1].ModeReason, `table "users" does not exist on the target`)
@@ -222,7 +228,8 @@ func TestBlockMissingPrivilegesSkipsFullyBlockedPlans(t *testing.T) {
 		ExecutionMode: engine.ExecutionModeBlocked,
 	}}
 
-	require.NoError(t, blockMissingPrivileges(t.Context(), nil, report, changes))
+	changes, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0})
+	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
 }
 
@@ -237,9 +244,46 @@ func TestBlockMissingPrivilegesRequiresTargetTable(t *testing.T) {
 		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
 	}}
 
-	err := blockMissingPrivileges(t.Context(), nil, report, changes)
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{preflight.TierAlterInPlace})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
+}
+
+// TestBlockMissingPrivilegesRequiresMatchingTiers proves a tier slice that
+// does not pair one-to-one with the planned changes fails the plan closed
+// instead of guessing which step needs which access.
+func TestBlockMissingPrivilegesRequiresMatchingTiers(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
+	}}
+
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "privilege tiers")
+}
+
+// TestBlockChangesAtTier proves a privilege refusal lands only on the steps
+// that need the refused tier: steps at other tiers and steps already carrying
+// a verdict keep their own reasons.
+func TestBlockChangesAtTier(t *testing.T) {
+	changes := []engine.TableChange{
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"},
+		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY idx_users_email ON public.users (email)"},
+		{Table: "users", DDL: "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "creation shape verdict"},
+	}
+	tiers := []preflight.Tier{preflight.TierAlterInPlace, preflight.TierIndexBuild, 0}
+
+	blockChangesAtTier(changes, tiers, preflight.TierIndexBuild, "index tier refused")
+
+	assert.Empty(t, changes[0].ExecutionMode, "a step at another tier must keep its own verdict")
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, "index tier refused", changes[1].ModeReason)
+	assert.Equal(t, "creation shape verdict", changes[2].ModeReason,
+		"an existing verdict must never be overwritten")
 }
 
 func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
