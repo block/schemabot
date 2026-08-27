@@ -158,13 +158,18 @@ jobs:
           # own runner rather than setting the wall time for everything else.
           - shard: ./integration
             match: "-E"
+            selector: "^github\\.com/block/schemabot/integration(/|$)"
+          - shard: tern-webhook
+            match: "-E"
+            selector: "^github\\.com/block/schemabot/pkg/(tern|webhook)$"
           # Every other integration-tagged package: tests that live beside the
           # code they cover, spread across ./pkg, ./cmd and ./e2e. Selected as
-          # the exact inverse of the grep above, so every package lands in
-          # exactly one shard and a newly added package is picked up here
-          # without touching this file.
+          # the exact inverse of the dedicated shards above, so every package
+          # lands in exactly one shard and a newly added package is picked up
+          # here without touching this file.
           - shard: per-package
             match: "-vE"
+            selector: "^github\\.com/block/schemabot/(integration(/|$)|pkg/(tern|webhook)$)"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -205,16 +210,13 @@ jobs:
         # one starting late in a long shard can still be cancelled without one.
         env:
           MATCH: ${{ matrix.match }}
+          SELECTOR: ${{ matrix.selector }}
           SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          # Anchored at the module root so only the top-level cross-package
-          # suite takes that shard. A future nested package named `integration`
-          # belongs beside the code it covers, in the per-package shard.
-          selector='^github\.com/block/schemabot/integration(/|$)'
           all=$(go list -tags=integration ./...)
           set +e
-          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$MATCH" "$selector")
+          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$MATCH" "$SELECTOR")
           selector_status=$?
           set -e
           # grep exits 1 when a shard matches nothing and 2 when the selector
@@ -222,7 +224,7 @@ jobs:
           # bare exit status, so both are absorbed and reported apart: a broken
           # selector says so rather than being described as an empty shard.
           if [ "$selector_status" -gt 1 ]; then
-            echo "::error::shard '$SHARD' selector $selector is unusable (grep exited $selector_status)"
+            echo "::error::shard '$SHARD' selector $SELECTOR is unusable (grep exited $selector_status)"
             exit 1
           fi
           # An empty shard would hand `go test` no packages and silently test the
