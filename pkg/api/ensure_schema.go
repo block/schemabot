@@ -236,21 +236,9 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			return fmt.Errorf("classify storage schema changes: %w", err)
 		}
 		for _, r := range refused {
-			attrs := []any{
-				"database", "schemabot",
-				"table", r.change.Table,
-				"operation", ddl.StatementTypeToOp(r.change.Operation),
-				"reason", r.reason,
-				"ddl", r.change.DDL,
-			}
-			if r.splitFrom != "" {
-				logger.Warn("refusing destructive clauses of a mixed storage-schema ALTER; the destructive clauses will not run, the safe clauses still execute, and startup continues — set storage.allow_destructive_schema_changes: true to allow them",
-					append(attrs, "split_from_ddl", r.splitFrom)...)
-			} else {
-				logger.Warn("refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
-					attrs...)
-			}
-			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation))
+			scope, message, attrs := r.refusalTelemetry()
+			logger.Warn(message, attrs...)
+			metrics.RecordStorageSchemaDestructiveRefusal(ctx, r.change.Table, ddl.StatementTypeToOp(r.change.Operation), scope)
 		}
 		if len(allowed) == 0 {
 			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
@@ -357,6 +345,39 @@ type refusedStorageChange struct {
 	// splitFrom is the combined ALTER TABLE statement the refused clauses
 	// were split out of; empty when the whole statement was refused.
 	splitFrom string
+	// splitErr is the error that prevented partitioning an unsafe ALTER into
+	// safe and destructive clauses; when set, the statement was refused whole
+	// so no clause of it executed.
+	splitErr error
+}
+
+// refusalTelemetry returns the operator-facing telemetry for one refusal: the
+// metrics scope saying whether any of the statement still ran, the warning to
+// log, and its structured attributes. A split refusal carries the combined
+// ALTER its destructive clauses were split out of; a whole refusal of an
+// unsplittable ALTER carries the error that prevented the split.
+func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs []any) {
+	attrs = []any{
+		"database", "schemabot",
+		"table", r.change.Table,
+		"operation", ddl.StatementTypeToOp(r.change.Operation),
+		"reason", r.reason,
+		"ddl", r.change.DDL,
+	}
+	switch {
+	case r.splitErr != nil:
+		return metrics.StorageSchemaRefusalWhole,
+			"refusing an unsafe storage-schema ALTER whole because its clauses could not be partitioned; no clause of it will run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
+			append(attrs, "split_error", r.splitErr)
+	case r.splitFrom != "":
+		return metrics.StorageSchemaRefusalSplit,
+			"refusing destructive clauses of a mixed storage-schema ALTER; the destructive clauses will not run, the safe clauses still execute, and startup continues — set storage.allow_destructive_schema_changes: true to allow them",
+			append(attrs, "split_from_ddl", r.splitFrom)
+	default:
+		return metrics.StorageSchemaRefusalWhole,
+			"refusing destructive storage-schema change; the statement will not run and startup continues — set storage.allow_destructive_schema_changes: true to allow it",
+			attrs
+	}
 }
 
 // partitionDestructiveChanges splits planned storage-schema changes into the
@@ -367,8 +388,10 @@ type refusedStorageChange struct {
 // truncating or coalescing partitions, discarding a tablespace — is refused,
 // while structural statements that lose nothing (DROP INDEX, renames) are
 // allowed. A statement Spirit's parser cannot classify fails startup rather
-// than executing unclassified — classification uncertainty must never widen
-// what the bootstrap will execute. The Spirit diff emits an
+// than executing unclassified: a classification failure can land on a
+// statement the starting binary needs — an additive ALTER in a syntax a
+// bumped parser trips on — and skipping it would trade a loud startup
+// failure for a missing column at query time. The Spirit diff emits an
 // unsafe statement when the live storage database holds a table or column the
 // starting binary's embedded schema does not declare — during a rolling
 // deploy or rollback that surplus state usually belongs to a newer binary,
@@ -378,9 +401,15 @@ type refusedStorageChange struct {
 // still execute, and only the destructive clauses are refused. Clauses that
 // cannot run without a refused clause (the ADD PRIMARY KEY half of a
 // primary-key change) are refused with it, so the executed remainder is
-// always independently runnable. A split that cannot be performed fails
-// startup — classification or partitioning uncertainty must never widen what
-// the bootstrap will execute.
+// always independently runnable. A split that cannot be performed falls back
+// to refusing the statement whole rather than failing startup — the opposite
+// disposition from a classification failure, because a split failure only
+// ever happens on a statement already classified unsafe: the starting binary
+// demonstrably does not need it, so refusing it whole is the established
+// answer, and it executes strictly less than any split would, so the failed
+// split cannot widen what the bootstrap executes. Startup survives it, where
+// failing would crash-loop every pod whose pending ALTER the splitter cannot
+// partition.
 func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engine.SchemaChange, refused []refusedStorageChange, err error) {
 	for _, sc := range changes {
 		kept := sc
@@ -395,9 +424,15 @@ func partitionDestructiveChanges(changes []engine.SchemaChange) (allowed []engin
 				continue
 			}
 			if tc.Operation == ddl.StatementAlterTable {
-				safeDDL, unsafeDDL, err := ddl.SplitUnsafeAlter(tc.DDL)
-				if err != nil {
-					return nil, nil, fmt.Errorf("split unsafe storage schema change for table %q (%s): %w", tc.Table, tc.DDL, err)
+				safeDDL, unsafeDDL, splitErr := ddl.SplitUnsafeAlter(tc.DDL)
+				if splitErr != nil {
+					// Refusing the statement whole executes strictly less
+					// than any split would, so the failed split cannot widen
+					// what the bootstrap executes — and startup proceeds,
+					// which is the reason this path exists. The caller logs
+					// the fallback with the split error.
+					refused = append(refused, refusedStorageChange{change: tc, reason: reason, splitErr: splitErr})
+					continue
 				}
 				if safeDDL != "" {
 					// A mixed ALTER: execute the clauses that lose nothing and
