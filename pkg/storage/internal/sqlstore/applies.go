@@ -2093,12 +2093,7 @@ func refuseStoppedClaimForActiveTarget(ctx context.Context, tx *rebindTx, apply 
 		return claimLostRace, fmt.Errorf("commit refused stopped claim for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
 	}
 	slog.WarnContext(ctx, "claim refused: another active apply exists for target; failing pending start control request",
-		"apply_id", apply.ApplyIdentifier,
-		"database", database,
-		"database_type", dbType,
-		"environment", environment,
-		"lease_owner", owner,
-		"reason", reason)
+		append(apply.LogAttrs(), "lease_owner", owner, "reason", reason)...)
 	return claimRefusedActiveTarget, nil
 }
 
@@ -2117,13 +2112,7 @@ func refuseStoppedClaimForSupersededApply(ctx context.Context, tx *rebindTx, app
 		return claimLostRace, fmt.Errorf("commit refused superseded claim for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
 	}
 	slog.WarnContext(ctx, "claim refused: this apply's work was taken over by another apply; failing pending start control request",
-		"apply_id", apply.ApplyIdentifier,
-		"superseded_by", apply.SupersededBy,
-		"database", database,
-		"database_type", dbType,
-		"environment", environment,
-		"lease_owner", owner,
-		"reason", reason)
+		append(apply.LogAttrs(), "superseded_by", apply.SupersededBy, "lease_owner", owner, "reason", reason)...)
 	return claimRefusedSuperseded, nil
 }
 
