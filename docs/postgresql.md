@@ -84,8 +84,11 @@ This includes changes that require copy-and-swap, require a rewrite before
 they can be planned safely, are refused by pg-sprite, or carry an unrecognized
 planner contract or verdict. A native verdict is also blocked when its
 statement shape is outside the `ALTER TABLE` and `CREATE INDEX` set accepted
-by the apply path's shape check. That shape check admits `CREATE INDEX`, so
-an index build is not blocked at plan time even though it fails at apply
+by the apply path's shape check. The admitted set is defined by the pinned
+pg-sprite version, not by SchemaBot: when a pg-sprite upgrade widens the
+shapes its engine executes, SchemaBot's plan and apply gates widen with the
+pin, with no SchemaBot code change. That shape check admits `CREATE INDEX`,
+so an index build is not blocked at plan time even though it fails at apply
 time, as described above.
 
 The plan comment lists the table and SchemaBot's reason for the refusal. For a
