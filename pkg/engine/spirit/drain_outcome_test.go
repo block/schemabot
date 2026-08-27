@@ -73,6 +73,90 @@ func TestDrainRetainsFailedOutcomeWithError(t *testing.T) {
 	assert.Equal(t, string(engine.StateFailed), result.Tables[0].State)
 }
 
+// A failed schema change's last-known copy position is the operator's only
+// remaining measure of how far it got before failing — the runners are gone by
+// the time the drained outcome is read. The outcome must carry the counters
+// from the last live poll so a sync after the drain records that position
+// instead of overwriting it with zeroes, while live-pacing fields (ETA,
+// throttle) that describe nothing terminal are cleared.
+func TestDrainedFailureKeepsLastObservedCopyPosition(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateFailed
+	rm.errorMessage = "schema change failed: checksum mismatch"
+	rm.tables = []string{"orders"}
+	rm.ddls = []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(255) NULL"}
+	rm.tableNamespace = map[string]string{"orders": "testdb"}
+	rm.lastLiveTables = []engine.TableProgress{{
+		Namespace:      "testdb",
+		Table:          "orders",
+		DDL:            "ALTER TABLE `orders` ADD COLUMN `note` varchar(255) NULL",
+		State:          "copyRows",
+		RowsCopied:     42000,
+		RowsTotal:      50000,
+		Progress:       84,
+		ProgressDetail: "42000/50000 84% copyRows",
+		ETASeconds:     12,
+		Throttled:      true,
+		ThrottleReason: "replica lag",
+	}}
+	eng.mu.Unlock()
+
+	eng.Drain()
+
+	result := pollProgress(t, eng)
+	assert.Equal(t, engine.StateFailed, result.State)
+	require.Len(t, result.Tables, 1)
+	tp := result.Tables[0]
+	assert.Equal(t, "orders", tp.Table)
+	assert.Equal(t, string(engine.StateFailed), tp.State)
+	assert.Equal(t, int64(42000), tp.RowsCopied)
+	assert.Equal(t, int64(50000), tp.RowsTotal)
+	assert.Equal(t, 84, tp.Progress)
+	assert.Equal(t, "42000/50000 84% copyRows", tp.ProgressDetail)
+	assert.Zero(t, tp.ETASeconds)
+	assert.False(t, tp.Throttled)
+	assert.Empty(t, tp.ThrottleReason)
+}
+
+// A completed schema change copied everything, so the drained outcome reports
+// a full bar while keeping the last observed row counters. The mid-copy detail
+// line is dropped: its stale percentage would contradict the completed state.
+func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateCompleted
+	rm.tables = []string{"users"}
+	rm.ddls = []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL"}
+	rm.tableNamespace = map[string]string{"users": "testdb"}
+	rm.lastLiveTables = []engine.TableProgress{{
+		Namespace:      "testdb",
+		Table:          "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL",
+		State:          "copyRows",
+		RowsCopied:     49000,
+		RowsTotal:      50000,
+		Progress:       98,
+		ProgressDetail: "49000/50000 98% copyRows",
+	}}
+	eng.mu.Unlock()
+
+	eng.Drain()
+
+	result := pollProgress(t, eng)
+	assert.Equal(t, engine.StateCompleted, result.State)
+	require.Len(t, result.Tables, 1)
+	tp := result.Tables[0]
+	assert.Equal(t, "users", tp.Table)
+	assert.Equal(t, string(engine.StateCompleted), tp.State)
+	assert.Equal(t, 100, tp.Progress)
+	assert.Equal(t, int64(49000), tp.RowsCopied)
+	assert.Equal(t, int64(50000), tp.RowsTotal)
+	assert.Empty(t, tp.ProgressDetail)
+}
+
 // Draining an engine that is not tracking any schema change changes nothing:
 // there is no outcome to retain, so progress keeps reporting that nothing is
 // active.

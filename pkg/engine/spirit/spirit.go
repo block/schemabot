@@ -112,6 +112,12 @@ type runningSchemaChange struct {
 	deferCutover            bool // Whether to defer cutover until manual trigger
 	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
 
+	// lastLiveTables is the most recent per-table progress built from a live
+	// runner poll. The runners are closed by the time a drained outcome is
+	// served, so this snapshot is how the outcome keeps the change's last
+	// observed row counters instead of reporting zeroes.
+	lastLiveTables []engine.TableProgress
+
 	// directPolicy is the direct execution policy snapshotted at Apply, so a
 	// resumed schema change routes with the same policy the apply started
 	// with. directStatements tracks each direct-routed statement's lifecycle
@@ -352,23 +358,46 @@ func retainsDrainedOutcome(s engine.State) bool {
 
 // newDrainedOutcome snapshots the terminal result of a drained schema change.
 // The runners are closed by the time the snapshot is served, so each table
-// carries its identity, DDL, and final state rather than live copy counters.
-// The caller must hold e.mu.
+// keeps the counters from the last live poll — a failure's last-known copy
+// position is the operator's only remaining measure of how far it got, and a
+// later sync must not overwrite the recorded position with zeroes. A change
+// drained before any live poll observed per-table counters falls back to
+// identity, DDL, and final state alone. The caller must hold e.mu.
 func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
-	tables := make([]engine.TableProgress, 0, len(rm.tables)+len(rm.directStatements))
-	for i, tableName := range rm.tables {
-		tp := engine.TableProgress{
-			Namespace: rm.tableNamespace[tableName],
-			Table:     tableName,
-			State:     string(rm.state),
+	var tables []engine.TableProgress
+	if len(rm.lastLiveTables) > 0 {
+		tables = make([]engine.TableProgress, 0, len(rm.lastLiveTables)+len(rm.directStatements))
+		for _, tp := range rm.lastLiveTables {
+			tp.State = string(rm.state)
+			// ETA and throttle describe live pacing; a terminal outcome has
+			// neither.
+			tp.ETASeconds = 0
+			tp.Throttled = false
+			tp.ThrottleReason = ""
+			if rm.state == engine.StateCompleted {
+				tp.Progress = 100
+				// The detail line carries a mid-copy percentage that would
+				// contradict the completed bar.
+				tp.ProgressDetail = ""
+			}
+			tables = append(tables, tp)
 		}
-		if i < len(rm.ddls) {
-			tp.DDL = rm.ddls[i]
+	} else {
+		tables = make([]engine.TableProgress, 0, len(rm.tables)+len(rm.directStatements))
+		for i, tableName := range rm.tables {
+			tp := engine.TableProgress{
+				Namespace: rm.tableNamespace[tableName],
+				Table:     tableName,
+				State:     string(rm.state),
+			}
+			if i < len(rm.ddls) {
+				tp.DDL = rm.ddls[i]
+			}
+			if rm.state == engine.StateCompleted {
+				tp.Progress = 100
+			}
+			tables = append(tables, tp)
 		}
-		if rm.state == engine.StateCompleted {
-			tp.Progress = 100
-		}
-		tables = append(tables, tp)
 	}
 	tables = append(tables, directStatementTableProgress(rm)...)
 	return &drainedOutcome{
@@ -825,6 +854,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	// If Spirit provides per-table progress, use it
 	if len(spiritProgress.Tables) > 0 {
 		tableProgress = buildSpiritTableProgress(spiritProgress, spiritState, ddlByTable, rm.tableNamespace)
+		rm.lastLiveTables = slices.Clone(tableProgress)
 	} else {
 		// Fallback: no per-table progress available
 		for i, tableName := range rm.tables {
