@@ -81,7 +81,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// when several rows are claimable at once. A deployment's per-shard work
 	// rows fan out — a later shard is claimable while an earlier one is still
 	// running — so with two claimable siblings the claim must hand them out in
-	// insertion order (created_at, id). The group_finalizer stays blocked
+	// insertion order. The group_finalizer stays blocked
 	// until every work sibling completes.
 	t.Run("FindNextApplyOperation_ShardFanOutClaimOrder", func(t *testing.T) {
 		ctx := t.Context()
@@ -118,6 +118,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Nil(t, blocked, "the group finalizer waits for every work sibling")
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardA))
+
+		stillBlocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, stillBlocked, "the finalizer waits for EVERY sibling, not just one")
+
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardB))
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
