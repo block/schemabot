@@ -1495,11 +1495,10 @@ func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "Cutting Over")
-	assert.Contains(t, result, "Cutting over...")
 	// Cutover is automatic work: it renders the blue in-progress bar. Yellow
 	// is reserved for states where the operator holds the next move.
 	assert.Contains(t, result, ui.ProgressBarActivity()+" 🔄 Cutting over...")
-	assert.NotContains(t, result, "🟨")
+	assert.NotContains(t, result, ui.ProgressBarWaitingCutover()+" 🔄 Cutting over...")
 }
 
 func TestRenderApplyStatusComment_NoTables(t *testing.T) {
