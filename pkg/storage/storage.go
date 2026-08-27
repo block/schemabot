@@ -603,13 +603,18 @@ type ApplyStore interface {
 	//
 	// Claiming a stopped apply settles a conflicting request as a side effect: a
 	// claim for cancel fails any pending start request on the same apply, so the
-	// cancel wins rather than racing a resume.
+	// cancel wins rather than racing a resume. A stopped claim refused because
+	// the apply was superseded (see MarkSuperseded) or because another active
+	// apply owns the target likewise fails the pending start request, with the
+	// reason, instead of stranding it.
 	//
 	// Returns the claimed apply, or nil if the apply does not exist or is not
 	// currently claimable — another driver holds a fresh lease, the apply is
-	// terminal without a request that admits it, or the target's exclusion lock
-	// is held elsewhere. Used by the operation-level claim loop to acquire the
-	// parent apply lease after claiming an apply_operations row.
+	// terminal without a request that admits it, the target's exclusion lock
+	// is held elsewhere, a stopped claim was refused as above, or the apply is
+	// failed_retryable but superseded, which excludes it from automatic retry.
+	// Used by the operation-level claim loop to acquire the parent apply lease
+	// after claiming an apply_operations row.
 	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
 
 	// FindNextApplyForStopReconciliation atomically claims one apply eligible for
@@ -671,6 +676,28 @@ type ApplyStore interface {
 	// control-plane skip-revert handler (no lease) and the data-plane finalizer
 	// call it without disturbing recovery-claim staleness.
 	SetRevertSkipped(ctx context.Context, applyID int64, at time.Time) error
+
+	// MarkSuperseded records that successor took over the apply's unfinished
+	// work, by ApplyIdentifier. It is a targeted write of superseded_by that
+	// preserves the apply's updated_at lease heartbeat and touches no other
+	// fields, so the apply that handed off keeps whatever terminal state it
+	// settled in.
+	//
+	// The marker is write-once: it must outlive the successor, so it is never
+	// cleared and never reassigned. Marking again with the same successor
+	// succeeds, since a redelivered handoff records the same fact. Marking with
+	// a different successor returns ErrApplyAlreadySuperseded — two applies
+	// claiming the same handoff means the takeover decision is ambiguous, and an
+	// ambiguous decision must not be resolved by overwriting. A successor equal
+	// to the apply's own identifier is rejected: the marker is never cleared, so
+	// a self-referential handoff would refuse the apply forever while pointing
+	// the operator back at the refused apply itself.
+	//
+	// Callers recording a takeover must mark before committing the takeover's
+	// own effects: a crash after marking leaves an apply that refuses to start,
+	// which fails closed, while the reverse order leaves a window in which the
+	// handed-off work can be started again.
+	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.

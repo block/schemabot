@@ -732,6 +732,28 @@ type Apply struct {
 	// control-plane skip-revert handler and the data-plane finalizer.
 	RevertSkippedAt *time.Time
 
+	// SupersededBy names the apply that took over this one's unfinished work,
+	// by ApplyIdentifier. Empty means nothing took over.
+	//
+	// It records a handoff that the apply's own state cannot express: a stopped
+	// apply whose copy a later apply adopted or discarded is still stopped, and
+	// once the successor settles nothing else distinguishes it from a stopped
+	// apply nobody touched. Starting it would replay its statements against a
+	// target where that work already happened, so an apply carrying this marker
+	// can never be started — the marker outlives the successor and is never
+	// cleared.
+	//
+	// The refusal is enforced at every surface that can begin the work again:
+	// the control plane rejects a start request up front, a stopped-apply claim
+	// refuses to resume and fails the pending start request with the reason,
+	// and the claim predicate excludes a marked failed_retryable apply from
+	// automatic retry. The remaining claim paths cannot encounter the marker: a
+	// pending dispatch starts work that has never run, and work must have run
+	// before a successor can take it over; an active apply (including one
+	// waiting for a deploy) cannot gain a successor at all, because creation
+	// refuses a second apply for a target that already has a non-terminal one.
+	SupersededBy string
+
 	// UpdatedAt is when the apply was last updated.
 	UpdatedAt time.Time
 }
