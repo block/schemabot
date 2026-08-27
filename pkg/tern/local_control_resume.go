@@ -187,7 +187,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	// selects the connection schema (per-target overrides can remap it to a
 	// different physical schema), so with mixed namespaces every task would
 	// silently run against tasks[0]'s schema.
-	if c.config.Type == storage.DatabaseTypeMySQL {
+	if usesPerNamespaceCredentials(c.config.Type) {
 		if _, err := singleTaskNamespace(applyTasks); err != nil {
 			return nil, fmt.Errorf("deferred deploy for apply %s: %w", apply.ApplyIdentifier, err)
 		}
@@ -306,7 +306,6 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// reaching the apply log stream the moment an apply changes hands, and the
 	// stream goes quiet for exactly the drive an operator is trying to read.
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
-	creds := c.credentials()
 	eng := c.getEngine()
 	// Bind the apply's identity once so every line of this sequential resume is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
@@ -379,7 +378,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			break
 		}
 
-		action = c.runEngineTask(ctx, apply, task, options, creds)
+		action = c.runEngineTask(ctx, apply, task, options)
 
 		taskID := task.ID
 		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,

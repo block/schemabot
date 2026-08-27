@@ -441,7 +441,7 @@ func (c *LocalClient) credentials() *engine.Credentials {
 }
 
 func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	hasDatabase, err := mysqlDSNHasDatabase(c.config.TargetDSN)
@@ -498,7 +498,7 @@ func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
 }
 
 func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	if task == nil {
@@ -507,13 +507,32 @@ func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credential
 	return c.credentialsForMySQLNamespace(task.Namespace)
 }
 
+// usesPerNamespaceCredentials reports whether the database type's engine needs
+// credentials resolved per namespace instead of sharing the target-level
+// credentials. MySQL resolves a namespace-specific DSN so each task connects
+// to its own schema (per-target overrides can remap a namespace to a different
+// physical schema).
+func usesPerNamespaceCredentials(databaseType string) bool {
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return true
+	case storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
+		return false
+	default:
+		// LocalConfig.Type is open-world: embedder-registered engine types
+		// (EngineFactories) and the zero-value type used by tests land here
+		// and get the conservative disposition — shared target credentials.
+		return false
+	}
+}
+
 // credentialsForGroupedApply resolves the single-namespace credentials for a
 // grouped/atomic MySQL apply. A grouped apply runs one Spirit execution against
 // one schema, so the plan must carry exactly one namespace. Fail closed rather
 // than pick a namespace by map iteration order (or silently use a namespace-free
 // DSN) if that invariant is ever violated.
 func (c *LocalClient) credentialsForGroupedApply(plan *storage.Plan) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	if len(plan.Namespaces) != 1 {

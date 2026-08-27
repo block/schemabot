@@ -585,3 +585,40 @@ func TestPersistReattachedResumeStates_ProjectsForwardStates(t *testing.T) {
 		})
 	}
 }
+
+// deferredDeployGuardEngine satisfies the engine presence check in
+// startDeferredDeploy; the mixed-namespace guard must reject the deploy
+// before any engine method is reached, so none are implemented.
+type deferredDeployGuardEngine struct{ engine.Engine }
+
+// A deferred deploy resolves credentials once from tasks[0] and drives every
+// task with them. On an engine that resolves credentials per namespace, tasks
+// spanning multiple namespaces must fail closed before the engine is asked to
+// start — proceeding would silently run every task against tasks[0]'s schema.
+func TestStartDeferredDeployRejectsMixedNamespaces(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              11,
+		ApplyIdentifier: "apply-mixed-namespaces",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		State:           state.Apply.WaitingForDeploy,
+	}
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-orders", Namespace: "orders", TableName: "users"},
+		{ID: 2, ApplyID: apply.ID, TaskIdentifier: "task-billing", Namespace: "billing", TableName: "invoices"},
+	}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: deferredDeployGuardEngine{},
+		storage: &controlTestStorage{
+			tasks: &controlTestTaskStore{tasks: tasks},
+		},
+		logger: slog.Default(),
+	}
+
+	_, err := client.startDeferredDeploy(t.Context(), apply, "")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "tasks span multiple namespaces")
+	assert.ErrorContains(t, err, apply.ApplyIdentifier)
+}
