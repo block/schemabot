@@ -413,6 +413,11 @@ type PlanRequest struct {
 	// target as one unit (a database-scoped MySQL DSN), where a withheld
 	// namespace's live tables would otherwise be planned as drops.
 	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// GroupedExecution reports whether an apply of this plan will hand the
+	// engine every ALTER at once or one table at a time. Engines predicting what
+	// an apply will do to unfinished work already on the target need the
+	// grouping the apply will actually run under.
+	GroupedExecution bool `json:"grouped_execution,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.

@@ -1641,6 +1641,10 @@ func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.En
 		Repository:   req.Repository,
 		PullRequest:  int(req.PullRequest),
 		Credentials:  creds,
+		// The grouping the apply will run under decides which stored progress
+		// it can continue, so a prediction made here has to use the caller's,
+		// not this engine's default.
+		GroupedExecution: req.GetGroupedExecution(),
 	})
 }
 

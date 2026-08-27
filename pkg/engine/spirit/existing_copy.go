@@ -74,8 +74,9 @@ type existingCopy struct {
 }
 
 // Disposition reports what Spirit will do with c when it runs statement, and
-// why. statement must be the exact string the apply will hand Spirit: the
-// joined batch, not the statement for any one table.
+// why. statement must be the exact string the apply will hand Spirit for this
+// batch — every ALTER joined when the apply groups them, the one table's ALTER
+// when it drives a table at a time.
 //
 // Adopt is the narrow case. It requires that every table in the batch already
 // has a copy, that the checkpoint this batch reads exists, that its statement
@@ -130,8 +131,10 @@ func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration
 
 // plannedExistingCopies predicts what applying these planned changes will do
 // with a row copy already on the target, for the plan to disclose before anyone
-// confirms it. Spirit plans one database at a time, so this reports at most one
-// copy; a caller planning several databases concatenates their results.
+// confirms it. Spirit plans one database at a time and reports one disclosure
+// per batch the apply will run, so a grouped apply yields at most one and an
+// ungrouped one at most a copy per table; a caller planning several databases
+// concatenates their results.
 //
 // A plan is a read: it must describe the target, never fail because of it. A
 // target that cannot be read is logged and the plan carries no disclosure,
@@ -146,32 +149,57 @@ func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration
 // time against the routing the apply actually took, and Spirit decides for
 // itself regardless, so a plan that discloses nothing is never the last word on
 // whether a copy survives.
-func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB, database string, changes []engine.TableChange) []*engine.ExistingCopy {
-	batch, tables, ok := plannedSpiritBatch(changes)
+func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB, database string, changes []engine.TableChange, grouped bool) []*engine.ExistingCopy {
+	batches, ok := plannedSpiritBatches(changes, grouped)
 	if !ok {
 		e.logger.Debug("plan has no statements that reach the engine's copy path, so no existing copy is at stake",
-			"database", database)
+			"database", database, "grouped_execution", grouped)
 		return nil
 	}
 
-	found, err := findExistingCopy(ctx, target, tables)
-	if err != nil {
-		// The raw error carries target infrastructure detail and a plan is
-		// rendered into a PR comment, so it stays in the logs.
-		e.logger.Warn("cannot tell whether applying this plan continues or discards an existing copy; the plan discloses nothing",
-			"database", database, "tables", tables, "error", err)
-		return nil
+	var copies []*engine.ExistingCopy
+	for _, batch := range batches {
+		found, err := findExistingCopy(ctx, target, batch.Tables)
+		if err != nil {
+			// The raw error carries target infrastructure detail and a plan is
+			// rendered into a PR comment, so it stays in the logs. One batch
+			// failing says nothing about the others: an apply runs them
+			// independently, so the rest are still worth disclosing.
+			e.logger.Warn("cannot tell whether applying this plan continues or discards an existing copy; this batch discloses nothing",
+				"database", database, "tables", batch.Tables, "error", err)
+			continue
+		}
+		copies = append(copies, found.planned(database, batch.Statement, e.checkpointMaxAge)...)
 	}
-	return found.planned(database, batch, e.checkpointMaxAge)
+	return copies
 }
 
-// plannedSpiritBatch returns the ALTER batch the apply will hand Spirit for
-// these planned changes and the tables it covers, in plan order. It reports
-// ok=false when the plan reaches no copy at all, either because it has no
-// engine-run ALTER or because it carries a statement the engine refuses and the
-// database's policy will not route directly — that apply fails during routing,
-// before Spirit sees a checkpoint, so nothing on the target is at stake.
-func plannedSpiritBatch(changes []engine.TableChange) (string, []string, bool) {
+// spiritBatch is one unit of work an apply hands Spirit: the statement Spirit
+// executes and the tables that statement alters. A checkpoint belongs to a
+// batch, so batches are what an existing copy has to be predicted against.
+type spiritBatch struct {
+	Statement string
+	Tables    []string
+}
+
+// plannedSpiritBatches returns the ALTER batches the apply will hand Spirit for
+// these planned changes, in plan order. A grouped apply gives Spirit every
+// ALTER at once, so it is one batch covering every table; an ungrouped apply
+// drives one table at a time, so it is one single-table batch each.
+//
+// Which shape runs decides both halves of the prediction: the checkpoint name
+// Spirit reads, and how much of the batch must already be copied for the copy
+// to be resumable. Predicting the grouped shape for an ungrouped apply looks
+// under a checkpoint that apply never reads and calls a whole batch incomplete
+// whenever fewer than all its tables have been copied, which is the ordinary
+// state of an ungrouped apply partway through.
+//
+// It reports ok=false when the plan reaches no copy at all, either because it
+// has no engine-run ALTER or because it carries a statement the engine refuses
+// and the database's policy will not route directly — that apply fails during
+// routing, before Spirit sees a checkpoint, so nothing on the target is at
+// stake.
+func plannedSpiritBatches(changes []engine.TableChange, grouped bool) ([]spiritBatch, bool) {
 	var alters, tables []string
 	for _, change := range changes {
 		if change.Operation != ddl.StatementAlterTable {
@@ -179,7 +207,7 @@ func plannedSpiritBatch(changes []engine.TableChange) (string, []string, bool) {
 		}
 		switch change.ExecutionMode {
 		case engine.ExecutionModeBlocked:
-			return "", nil, false
+			return nil, false
 		case engine.ExecutionModeDirect:
 			continue
 		}
@@ -187,9 +215,16 @@ func plannedSpiritBatch(changes []engine.TableChange) (string, []string, bool) {
 		tables = append(tables, change.Table)
 	}
 	if len(alters) == 0 {
-		return "", nil, false
+		return nil, false
 	}
-	return strings.Join(alters, "; "), tables, true
+	if grouped {
+		return []spiritBatch{{Statement: strings.Join(alters, "; "), Tables: tables}}, true
+	}
+	batches := make([]spiritBatch, len(alters))
+	for i, alter := range alters {
+		batches[i] = spiritBatch{Statement: alter, Tables: []string{tables[i]}}
+	}
+	return batches, true
 }
 
 // reportExistingCopy records what this batch is about to do with a row copy

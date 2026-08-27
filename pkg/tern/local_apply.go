@@ -591,10 +591,7 @@ func groupedApplyModeDescription(apply *storage.Apply, options map[string]string
 }
 
 func (c *LocalClient) usesGroupedApply(apply *storage.Apply, options map[string]string) bool {
-	if apply.DatabaseType == storage.DatabaseTypeVitess {
-		return true
-	}
-	return apply.DatabaseType == storage.DatabaseTypeMySQL && storage.ApplyOptionsFromMap(options).DeferCutover
+	return storage.GroupsEngineExecution(apply.DatabaseType, storage.ApplyOptionsFromMap(options).DeferCutover)
 }
 
 func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {

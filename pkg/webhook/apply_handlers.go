@@ -271,6 +271,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
 		SourceTrusted:     true,
+		// The copy disclosure in the comment this plan becomes is what the
+		// operator confirms, and the apply re-checks its own re-plan against
+		// that consent, so both have to predict the same apply. The command
+		// carrying the decision is already parsed here.
+		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
 	}
 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)

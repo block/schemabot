@@ -1057,8 +1057,13 @@ type PlanRequest struct {
 	// MySQL DSN), where a withheld namespace's live tables would otherwise be
 	// planned as drops.
 	IgnoredNamespaces []string `protobuf:"bytes,11,rep,name=ignored_namespaces,json=ignoredNamespaces,proto3" json:"ignored_namespaces,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Whether an apply of this plan hands the engine every ALTER at once or one
+	// table at a time. An engine that predicts what applying will do to work
+	// already on the target needs the same statement grouping the apply will use,
+	// because that grouping is what decides which stored progress it can resume.
+	GroupedExecution bool `protobuf:"varint,12,opt,name=grouped_execution,json=groupedExecution,proto3" json:"grouped_execution,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *PlanRequest) Reset() {
@@ -1159,6 +1164,13 @@ func (x *PlanRequest) GetIgnoredNamespaces() []string {
 		return x.IgnoredNamespaces
 	}
 	return nil
+}
+
+func (x *PlanRequest) GetGroupedExecution() bool {
+	if x != nil {
+		return x.GroupedExecution
+	}
+	return false
 }
 
 // TableChange represents a DDL change to a table.
@@ -3926,7 +3938,7 @@ const file_tern_proto_rawDesc = "" +
 	"tableCount\x1aW\n" +
 	"\x0fNamespacesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12.\n" +
-	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xcb\x03\n" +
+	"\x05value\x18\x02 \x01(\v2\x18.tern.v1.PulledNamespaceR\x05value:\x028\x01\"\xf8\x03\n" +
 	"\vPlanRequest\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12H\n" +
@@ -3941,7 +3953,8 @@ const file_tern_proto_rawDesc = "" +
 	"\vschema_path\x18\n" +
 	" \x01(\tR\n" +
 	"schemaPath\x12-\n" +
-	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x1aT\n" +
+	"\x12ignored_namespaces\x18\v \x03(\tR\x11ignoredNamespaces\x12+\n" +
+	"\x11grouped_execution\x18\f \x01(\bR\x10groupedExecution\x1aT\n" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01J\x04\b\a\x10\b\"\x99\x03\n" +
