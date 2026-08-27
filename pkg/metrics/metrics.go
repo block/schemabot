@@ -1267,6 +1267,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"operator_tick":          true,
 	"summary_reconciliation": true,
 	"observer_poll":          true,
+	"grpc_handler":           true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background
