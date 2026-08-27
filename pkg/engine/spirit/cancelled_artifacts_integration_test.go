@@ -215,3 +215,38 @@ func TestEngine_ReleaseCancelledArtifacts_NothingToRelease(t *testing.T) {
 	assert.False(t, quarantineDatabaseExists(t, db),
 		"a release with nothing to preserve must not create the quarantine database")
 }
+
+// A caller that names the same table twice reclaims its artifacts once. The
+// quarantine move is a single atomic RENAME, so a source repeated within it
+// would fail the whole release and leave every artifact on the target.
+func TestEngine_ReleaseCancelledArtifacts_RepeatedTableReleasedOnce(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "receipts"
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 1)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 5)
+	seedArtifact(t, db, utils.CheckpointTableName(baseTable), 1)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable, baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+	require.NotNil(t, result)
+
+	require.Len(t, result.Preserved, 1, "the copy must be preserved exactly once")
+	assert.Equal(t, "testdb."+utils.NewTableName(baseTable), result.Preserved[0].Source)
+	assert.Equal(t, []string{utils.CheckpointTableName(baseTable)}, result.Discarded)
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table must leave the target")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1)
+	assert.Equal(t, 5, quarantinedRowCount(t, db, quarantined[0]), "the copied rows must survive")
+}

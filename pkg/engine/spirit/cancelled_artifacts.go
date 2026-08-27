@@ -214,9 +214,13 @@ func existingTables(ctx context.Context, db *sql.DB, database string, candidates
 		return nil, fmt.Errorf("read table names for %v: %w", candidates, err)
 	}
 
+	// A caller may name the same table more than once. The quarantine move is a
+	// single atomic RENAME, so a source repeated within it fails the whole
+	// release; each present table is therefore taken exactly once.
 	found := make([]string, 0, len(present))
 	for _, name := range candidates {
 		if present[name] {
+			present[name] = false
 			found = append(found, name)
 		}
 	}
