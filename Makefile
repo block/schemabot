@@ -288,8 +288,9 @@ seed-testapp:
 # Run all e2e tests (MySQL + Vitess + gRPC) in isolated docker-compose environments.
 test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 
+# Disable Buildx Bake until Compose's subprocess stdio handling is reliable.
 # E2E local environment shorthand
-E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
+E2E_DC = COMPOSE_BAKE=false docker compose -f deploy/e2e/docker-compose.yml
 
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
 # Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
@@ -364,7 +365,8 @@ test-e2e-local-down: ## Tear down e2e local environment
 # This spins up SchemaBot + separate Tern services (gRPC mode), runs tests, then tears down.
 # Ports: SchemaBot=15370, SchemaBot-MySQL=15371, Tern-Staging-MySQL=15372, Tern-Production-MySQL=15373
 #        Tern-Staging-HTTP=15380, Tern-Staging-gRPC=15390, Tern-Production-HTTP=15382, Tern-Production-gRPC=15392
-E2E_GRPC_ENV := SCHEMABOT_PORT=15370 \
+E2E_GRPC_ENV := COMPOSE_BAKE=false \
+	SCHEMABOT_PORT=15370 \
 	SCHEMABOT_MYSQL_PORT=15371 \
 	SCHEMABOT_METRICS_PORT=15376 \
 	TERN_STAGING_MYSQL_PORT=15372 \
@@ -420,7 +422,8 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 # deployments maps with more than one entry. Run manually once that lands.
 # Ports: SchemaBot=15370, SchemaBot-MySQL=15371, EU-MySQL=15372, US-MySQL=15373
 #        EU-HTTP=15380, EU-gRPC=15390, US-HTTP=15382, US-gRPC=15392
-E2E_GRPC_MD_ENV := SCHEMABOT_PORT=15370 \
+E2E_GRPC_MD_ENV := COMPOSE_BAKE=false \
+	SCHEMABOT_PORT=15370 \
 	SCHEMABOT_MYSQL_PORT=15371 \
 	SCHEMABOT_METRICS_PORT=15376 \
 	TERN_EU_MYSQL_PORT=15372 \
