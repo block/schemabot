@@ -112,6 +112,7 @@ var optionalCapabilityDecisions = map[reflect.Type]string{
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): "routing policy is outside the conformance suite",
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     "registration timing is outside the conformance suite",
 	reflect.TypeFor[engine.ControlResumeValidator]():          "resume metadata is engine-specific",
+	reflect.TypeFor[engine.CancelledArtifactReleaser]():       "artifact naming and disposal are engine-specific",
 }
 
 func TestOptionalCapabilityCoverage(t *testing.T) {
