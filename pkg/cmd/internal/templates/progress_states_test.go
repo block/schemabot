@@ -470,6 +470,94 @@ func TestFormatTableProgress_InstantDDL(t *testing.T) {
 	assert.Contains(t, output, "Applied instantly")
 }
 
+// An instant-flagged table still renders its phase states — cutover, revert
+// window, waiting — and its shard breakdown; the instant label describes only
+// the generic in-progress moment, never a phase the operator is watching for.
+func TestFormatTableProgress_InstantTableShowsPhaseStates(t *testing.T) {
+	tp := TableProgress{
+		TableName:  "users",
+		ChangeType: "drop",
+		DDL:        "DROP TABLE `users`;",
+		Status:     state.Apply.CuttingOver,
+		IsInstant:  true,
+		Shards: []ShardProgress{
+			{Shard: "-80", Status: state.Task.CuttingOver},
+			{Shard: "80-", Status: state.Task.WaitingForCutover},
+		},
+	}
+	output := FormatTableProgress(tp)
+	assert.Contains(t, output, "Applying...")
+	assert.NotContains(t, output, "Applying instantly")
+	assert.Contains(t, output, "Shards: 2")
+
+	tp.Status = state.Apply.RevertWindow
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Complete (revert window open)")
+	assert.NotContains(t, output, "Applying instantly")
+
+	tp.Status = state.Task.WaitingForCutover
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Waiting for cutover")
+	assert.NotContains(t, output, "Applying instantly")
+}
+
+// CREATE and DROP are not instant DDL even when the engine flags them as
+// skipping the row copy: they keep the generic applying/complete labels, while
+// an instant ALTER keeps its lightning label.
+func TestFormatTableProgress_InstantLabelIsAlterOnly(t *testing.T) {
+	for _, changeType := range []string{"create", "drop"} {
+		tp := TableProgress{
+			TableName:  "users",
+			ChangeType: changeType,
+			Status:     state.Apply.Running,
+			IsInstant:  true,
+		}
+		output := FormatTableProgress(tp)
+		assert.Contains(t, output, "Applying...", "%s renders the generic applying label", changeType)
+		assert.NotContains(t, output, "Applying instantly", "%s is not instant DDL", changeType)
+
+		tp.Status = state.Apply.Completed
+		output = FormatTableProgress(tp)
+		assert.Contains(t, output, "✓ Complete", "%s completes with the generic label", changeType)
+		assert.NotContains(t, output, "Applied instantly", "%s is not instant DDL", changeType)
+	}
+}
+
+// An engine can flag a whole apply instant while one of its ALTERs still row
+// copies (the flag is apply-scoped, the copy is table-scoped). The copying
+// table must show its real progress — the instant label is reserved for
+// tables with no row copy to report.
+func TestFormatTableProgress_InstantAlterRendering(t *testing.T) {
+	copying := TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255);",
+		Status:          state.Apply.Running,
+		IsInstant:       true,
+		RowsCopied:      250,
+		RowsTotal:       1000,
+		PercentComplete: 25,
+	}
+	output := FormatTableProgress(copying)
+	assert.Contains(t, output, "25%", "a copying instant-flagged ALTER shows its real percent")
+	assert.NotContains(t, output, "Applying instantly", "the instant label must not mask copy progress")
+
+	instant := TableProgress{
+		TableName:  "users",
+		ChangeType: "alter",
+		Status:     state.Apply.Running,
+		IsInstant:  true,
+	}
+	output = FormatTableProgress(instant)
+	assert.Contains(t, output, "Applying instantly...", "an instant ALTER with no row copy keeps the instant label")
+
+	plain := instant
+	plain.IsInstant = false
+	output = FormatTableProgress(plain)
+	assert.Contains(t, output, "Running...", "a non-instant ALTER with no row data gets the generic label")
+	assert.NotContains(t, output, "Applying instantly", "the instant label requires the engine flag")
+}
+
 func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	for _, changeType := range []string{"create", "drop"} {
 		tp := TableProgress{

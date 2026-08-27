@@ -440,22 +440,21 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
+// isInstantAlter reports whether the table should be described as applying
+// instantly: the engine flagged it instant and it is an ALTER. Other
+// operations may complete without a row copy, but they are not instant DDL,
+// so they keep their generic applying labels. ChangeType is populated for
+// every stored DDL change (storage rejects a blank operation), so an empty
+// value here means an unknown operation, not a missing field.
+func isInstantAlter(t TableProgress) bool {
+	return t.IsInstant && ddl.OpToStatementType(t.ChangeType) == ddl.StatementAlterTable
+}
+
 // FormatTableProgressWithActivity returns progress for a single table using the
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
 	var b strings.Builder
-
-	// Instant DDL: show "Applying instantly" for any non-terminal state.
-	if t.IsInstant && !state.IsTerminalApplyState(state.NormalizeTaskStatus(t.Status)) {
-		bar := ui.ProgressBarRowCopy(100)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
-		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
-		}
-		b.WriteString("\n")
-		return b.String()
-	}
 
 	// Handle special states first - all use format: tablename: [bar] [status]
 	switch t.Status {
@@ -471,7 +470,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
 		label := "✓ Complete"
-		if t.IsInstant {
+		if isInstantAlter(t) {
 			label = "⚡ Applied instantly"
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
@@ -743,7 +742,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarRowCopy(100)
 		op := ddl.OpToStatementType(t.ChangeType)
 		switch {
-		case t.IsInstant:
+		case isInstantAlter(t):
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...%s\n", t.TableName, bar, throttledSuffix(t))
 		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...%s\n", t.TableName, bar, throttledSuffix(t))
