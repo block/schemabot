@@ -55,6 +55,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
 | `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
 | `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
+| `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, scope, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. `scope` says whether the safe clauses of the statement still ran. A nonzero rate means a starting binary's embedded schema no longer declares a table or column that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema-change environment |
 | `schemabot.drop_table.already_absent_total` | Counter | database, environment | DROP TABLE targets that were already absent when the apply reached them |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |
@@ -134,6 +135,10 @@ available, such as `repository`, `github_app`, and `installation_id`.
 **reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_lease_release_error`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
+
+**operation** (storage schema refusals): `alter`, `drop` — the statement types Spirit's unsafe vocabulary can flag
+
+**scope** (storage schema refusals): `split` (a mixed ALTER executed its safe clauses and refused only the destructive remainder), `whole` (nothing in the statement ran — either the whole statement was destructive or its clauses could not be partitioned)
 
 ### Webhook Ownership Rejections
 
