@@ -249,3 +249,10 @@ func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
 		})
 	}
 }
+
+// A zero ceiling means unset and adopts the default, so a zero-valued client
+// config preserves the stock ceiling instead of disabling the size guard.
+func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {
+	assert.Equal(t, DefaultNativeSafeTableSizeLimitBytes, NewWithTableSizeLimit(0).TableSizeLimit())
+	assert.Equal(t, int64(42), NewWithTableSizeLimit(42).TableSizeLimit())
+}

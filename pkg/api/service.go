@@ -600,12 +600,13 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	}
 	maps.Copy(metadata, directMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:        database,
-		Type:            dbType,
-		TargetDSN:       targetDSN,
-		Metadata:        metadata,
-		WakeOperator:    s.wakeOperator,
-		EngineFactories: s.engineFactories,
+		Database:                              database,
+		Type:                                  dbType,
+		TargetDSN:                             targetDSN,
+		Metadata:                              metadata,
+		PostgresNativeSafeTableSizeLimitBytes: s.config.Postgres.NativeSafeTableSizeLimit(),
+		WakeOperator:                          s.wakeOperator,
+		EngineFactories:                       s.engineFactories,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)

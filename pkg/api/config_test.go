@@ -4238,3 +4238,62 @@ planetscale:
 		ClientKey:  "/etc/secrets/pca/tls.key",
 	}, cfg.PlanetScale.MTLS)
 }
+
+func TestLoadServerConfigPostgresNativeSafeTableSizeLimit(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		cfg := PostgresConfig{}
+		assert.Equal(t, int64(1<<30), cfg.NativeSafeTableSizeLimit())
+	})
+
+	t.Run("configured bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  native_safe_table_size_limit_bytes: 4294967296
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4<<30), cfg.Postgres.NativeSafeTableSizeLimit())
+	})
+
+	t.Run("non-positive fails validation", func(t *testing.T) {
+		limit := int64(0)
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.NativeSafeTableSizeLimitBytes = &limit
+
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.native_safe_table_size_limit_bytes must be positive")
+	})
+
+	t.Run("unparseable fails config load", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  native_safe_table_size_limit_bytes: 4GiB
+`), 0o600))
+
+		_, err := LoadServerConfigFromFile(path)
+		require.ErrorContains(t, err, "parse config file")
+		require.ErrorContains(t, err, "cannot unmarshal")
+	})
+}

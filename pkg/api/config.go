@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -185,6 +186,10 @@ type ServerConfig struct {
 	// Vitess database this server drives, unlike the per-database tls block,
 	// which only covers statically registered databases.
 	PlanetScale PlanetScaleConfig `yaml:"planetscale,omitempty"`
+
+	// Postgres configures process-wide behavior for every PostgreSQL database
+	// this server drives directly.
+	Postgres PostgresConfig `yaml:"postgres,omitempty"`
 }
 
 // PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
@@ -1099,6 +1104,29 @@ type PlanetScaleMTLSConfig struct {
 	ClientKey string `yaml:"client_key"`
 }
 
+// PostgresConfig holds process-wide settings for the PostgreSQL engine.
+type PostgresConfig struct {
+	// NativeSafeTableSizeLimitBytes is the largest table on which the engine
+	// will execute native-safe DDL. When unset,
+	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
+	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
+}
+
+// NativeSafeTableSizeLimit returns the configured limit or its default.
+func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
+	if c.NativeSafeTableSizeLimitBytes == nil {
+		return postgresengine.DefaultNativeSafeTableSizeLimitBytes
+	}
+	return *c.NativeSafeTableSizeLimitBytes
+}
+
+func (c PostgresConfig) validate() error {
+	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
+		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	return nil
+}
+
 // validate checks that an mtls block, when present, names all three
 // certificate paths. File readability is checked at startup registration, not
 // here, so config validation stays filesystem-independent.
@@ -1329,6 +1357,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.PlanetScale.validate(); err != nil {
+		return err
+	}
+	if err := c.Postgres.validate(); err != nil {
 		return err
 	}
 	if err := c.validateRequiredChecksNotAggregate(); err != nil {

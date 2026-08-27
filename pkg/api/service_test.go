@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -467,4 +468,23 @@ func TestNewLocalTernClient_AcceptsWellFormedTokenReference(t *testing.T) {
 	client, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
 	require.NoError(t, err)
 	assert.NotNil(t, client)
+}
+
+// The server-level postgres ceiling reaches the engine of every local client
+// the control plane builds, so a configured value governs native-safe DDL
+// instead of silently reverting to the default.
+func TestNewLocalTernClient_ConfiguresPostgresTableSizeLimit(t *testing.T) {
+	limit := int64(4 << 30)
+	cfg := &ServerConfig{Postgres: PostgresConfig{NativeSafeTableSizeLimitBytes: &limit}}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	envConfig := EnvironmentConfig{DSN: "postgres://localhost:5432/orders"}
+	client, err := service.newLocalTernClient("orders-staging", "orders", storage.DatabaseTypePostgres, envConfig)
+	require.NoError(t, err)
+
+	lc, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	eng, ok := lc.Engine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, limit, eng.TableSizeLimit())
 }

@@ -10,6 +10,8 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -79,6 +81,29 @@ func TestGRPCLocalClientFactoryMergesIntoExistingFactories(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "sentinel: embedder factory invoked",
 		"a non-nil per-config factory map must not drop the embedder registry")
+}
+
+// The data-plane client factory applies the server-level postgres ceiling to
+// every LocalClient it builds, so a configured value governs native-safe DDL
+// on the gRPC/router path instead of silently reverting to the default.
+func TestGRPCLocalClientFactoryConfiguresPostgresTableSizeLimit(t *testing.T) {
+	limit := int64(4 << 30)
+	factory := grpcLocalClientFactory(&api.ServerConfig{
+		Postgres: api.PostgresConfig{NativeSafeTableSizeLimitBytes: &limit},
+	}, nil, nil)
+
+	client, err := factory(tern.LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypePostgres,
+		TargetDSN: "postgres://localhost:5432/orders",
+	}, mysqlstore.New(nil), slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+
+	lc, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	eng, ok := lc.Engine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, limit, eng.TableSizeLimit())
 }
 
 // Without a registered engine, the data-plane client factory fails closed for a

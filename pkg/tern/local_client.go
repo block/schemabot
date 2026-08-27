@@ -135,6 +135,10 @@ type LocalConfig struct {
 	// TargetDSN is the connection string to the target database for schema changes.
 	TargetDSN string
 
+	// PostgresNativeSafeTableSizeLimitBytes is the maximum table size in bytes
+	// for PostgreSQL native-safe execution. Zero uses the engine default.
+	PostgresNativeSafeTableSizeLimitBytes int64
+
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
@@ -308,7 +312,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine:    postgres.New(),
+		postgresEngine:    postgres.NewWithTableSizeLimit(cfg.PostgresNativeSafeTableSizeLimitBytes),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -2758,6 +2762,13 @@ func (c *LocalClient) getEngine() engine.Engine {
 		// A registered engine for a non-built-in type (nil if none registered).
 		return c.customEngine
 	}
+}
+
+// Engine returns the engine that drives this client's database type, exposed
+// so callers that assemble a LocalClient can verify the engine settings they
+// configured actually reached it.
+func (c *LocalClient) Engine() engine.Engine {
+	return c.getEngine()
 }
 
 // Progress returns detailed progress for an active schema change.
