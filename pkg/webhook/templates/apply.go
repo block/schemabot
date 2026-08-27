@@ -786,12 +786,14 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 			writeRowsAndETA(sb, table)
 			break
 		}
-		bar := ui.ProgressBarWaitingCutover()
+		// Blue: the engine is working on its own — yellow is reserved for
+		// states where the operator holds the next move.
+		bar := ui.ProgressBarRowCopy(100)
 		fmt.Fprintf(sb, "**`%s`**: %s Recovering state...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
-		bar := ui.ProgressBarWaitingCutover()
+		bar := ui.ProgressBarRowCopy(100) // blue — automatic work, no operator action
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Cutting over...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
