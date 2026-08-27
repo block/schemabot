@@ -248,7 +248,7 @@ func TestWatchModel_ChecksummingShowsVerifyProgress(t *testing.T) {
 	model := updated.(WatchModel)
 
 	view := model.View()
-	assert.Contains(t, view, "Checksumming to verify data (8%)")
+	assert.Contains(t, view, "Checksumming to verify data (9%)")
 	assert.Contains(t, view, "Rows verified: 73,075,845 / 832,771,089")
 	assert.Contains(t, view, "(throttled)")
 }

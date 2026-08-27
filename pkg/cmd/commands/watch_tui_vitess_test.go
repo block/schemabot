@@ -42,7 +42,7 @@ func TestTUIShardRendering(t *testing.T) {
 				{TableName: "users", Keyspace: "app", Status: "completed"},
 				{TableName: "orders", Keyspace: "app_sharded", Status: "pending"},
 			},
-			contains: []string{"app", "app_sharded"},
+			contains: []string{"── app ──", "── app_sharded ──"},
 		},
 		{
 			name: "shard progress rendered via shared templates",
@@ -50,12 +50,14 @@ func TestTUIShardRendering(t *testing.T) {
 				{
 					TableName: "users", Keyspace: "myapp", Status: "running",
 					Shards: []*apitypes.ShardProgressResponse{
-						{Shard: "-80", Status: "running", RowsCopied: 500, RowsTotal: 1000},
+						{Shard: "-80", Status: "running", RowsCopied: 500, RowsTotal: 1000, ETASeconds: 150},
 						{Shard: "80-", Status: "running", RowsCopied: 300, RowsTotal: 1000},
 					},
 				},
 			},
-			contains: []string{"Shards:", "2 copying"},
+			// The ETA pins the shard-field plumbing end to end: unlike the
+			// percent, formatShardLine cannot re-derive it from row counts.
+			contains: []string{"Shards:", "2 copying", "ETA 2m 30s"},
 		},
 		{
 			name: "uppercase and prefixed statuses normalized for rendering",

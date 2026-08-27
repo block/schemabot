@@ -200,9 +200,12 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			IsInstant:           tbl.IsInstant,
 			ProgressDetail:      tbl.ProgressDetail,
 		}
-		// Spirit's progress string is the freshest copy signal; when it
-		// parses, prefer it over the stored copy fields so the percent, the
-		// rows line, and anything aggregated from them agree.
+		// When a table carries an engine progress string, it is fresher than
+		// the stored copy fields, so prefer it and keep the percent, the rows
+		// line, and anything aggregated from them in agreement. The live
+		// progress API sends ProgressDetail empty (the drive loop does not
+		// persist it to the task record), so this override only takes effect
+		// for responses that populate the field, such as log preview fixtures.
 		if info := ParseSpiritProgress(tp.ProgressDetail); info != nil {
 			tp.PercentComplete = info.Percent
 			tp.RowsCopied = info.RowsCopied
@@ -211,10 +214,12 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		for _, sh := range tbl.Shards {
 			pct := int(sh.PercentComplete)
 			if pct == 0 && sh.RowsTotal > 0 {
-				// Row totals are estimates, so a nearly finished copy can
-				// exceed them; clamp so the derived percent stays honest.
-				pct = ui.ClampPercent(int(sh.RowsCopied * 100 / sh.RowsTotal))
+				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
 			}
+			// Row totals are estimates, so a nearly finished copy can exceed
+			// them whether the percent arrived from the server or was derived
+			// above; clamp so the rendered percent stays honest.
+			pct = ui.ClampPercent(pct)
 			tp.Shards = append(tp.Shards, ShardProgress{
 				Shard:           sh.Shard,
 				Status:          state.NormalizeShardStatus(sh.Status),

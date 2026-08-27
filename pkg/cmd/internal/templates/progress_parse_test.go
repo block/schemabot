@@ -181,6 +181,7 @@ func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *t
 					{Shard: "-80", Status: state.Task.Running, RowsCopied: 125000, RowsTotal: 250000, ETASeconds: 480},
 					{Shard: "80-", Status: state.Task.Running, RowsCopied: 60000, RowsTotal: 240000, ETASeconds: 900},
 					{Shard: "c0-", Status: state.Task.Running, RowsCopied: 300000, RowsTotal: 250000, ETASeconds: 120},
+					{Shard: "40-80", Status: state.Task.Running, RowsCopied: 300000, RowsTotal: 250000, PercentComplete: 120, ETASeconds: 60},
 				},
 			},
 		},
@@ -190,10 +191,13 @@ func TestParseProgressResponsePromotesSlowestShardETAAndDerivesShardPercent(t *t
 
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, int64(900), data.Tables[0].ETASeconds)
-	require.Len(t, data.Tables[0].Shards, 3)
+	require.Len(t, data.Tables[0].Shards, 4)
 	assert.Equal(t, 50, data.Tables[0].Shards[0].PercentComplete)
 	assert.Equal(t, 25, data.Tables[0].Shards[1].PercentComplete)
 	assert.Equal(t, 100, data.Tables[0].Shards[2].PercentComplete)
+	// A server-sent percent that exceeds 100 is clamped the same way as a
+	// derived one.
+	assert.Equal(t, 100, data.Tables[0].Shards[3].PercentComplete)
 }
 
 // Spirit internal tables (shadow, checkpoint, sentinel) are working artifacts

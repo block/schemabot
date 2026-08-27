@@ -25,7 +25,6 @@ type WatchModel struct {
 	environment         string
 	applyID             string // When set, fetches progress by apply ID instead of database/environment
 	allowControlActions bool
-	maxTableNameLen     int
 	deployTriggered     bool
 	cutoverTriggered    bool
 	skipRevertTriggered bool
@@ -262,13 +261,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.metadata != nil && m.metadata["is_instant"] == "true" {
 			for i := range m.tables {
 				m.tables[i].IsInstant = true
-			}
-		}
-
-		// Calculate max table name length for alignment
-		for _, t := range m.tables {
-			if len(t.TableName) > m.maxTableNameLen {
-				m.maxTableNameLen = len(t.TableName)
 			}
 		}
 
