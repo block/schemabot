@@ -198,11 +198,12 @@ func TestWriteStatusListExternalID(t *testing.T) {
 	assert.Contains(t, output, "apply-complete")
 }
 
-// A deployment-filtered list is the deployment's view of each apply: the
-// APPLY ID column carries the deployment's data-plane apply id — the handle
-// its operator greps in the data plane's own storage and logs — and the
-// EXTERNAL OP ID column carries the per-operation remote row id.
-func TestWriteStatusListDeploymentRendersDataPlaneApplyID(t *testing.T) {
+// A deployment-filtered list names each remote handle in its own column, the
+// way the detail views do: the deployment's shared data-plane apply id and the
+// per-operation remote row id. APPLY ID stays the control-plane id the status
+// drill-down resolves, and DEPLOYMENT is dropped because every row repeats it
+// back to the operator who named it.
+func TestWriteStatusListDeploymentNamesBothRemoteHandles(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{
 			ActiveCount:    1,
@@ -226,27 +227,29 @@ func TestWriteStatusListDeploymentRendersDataPlaneApplyID(t *testing.T) {
 		})
 	})
 
+	assert.Contains(t, output, "EXTERNAL APPLY ID")
 	assert.Contains(t, output, "EXTERNAL OP ID")
-	assert.Contains(t, output, "DEPLOYMENT")
-	assert.Contains(t, output, "remote-operation-a")
 	assert.Contains(t, output, "apply-remote-a")
-	assert.NotContains(t, output, "apply-running",
-		"the deployment view renders the data-plane apply id in place of the control-plane one")
-	assert.Contains(t, output, "deploy-a")
-	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details — drop --deployment for the ids it accepts",
-		"the footer must say where the ids the drill-down accepts are listed, since this column doesn't carry them")
+	assert.Contains(t, output, "remote-operation-a")
+	assert.Contains(t, output, "apply-running",
+		"APPLY ID stays the control-plane id the status drill-down resolves")
+	assert.NotContains(t, output, "DEPLOYMENT",
+		"a list filtered to one deployment repeats it on every row, so the column carries nothing")
+	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details",
+		"every id in the APPLY ID column feeds the drill-down, so the footer needs no qualifier")
 }
 
-// A deployment row without a recorded data-plane apply id — not yet
-// dispatched, locally driven, or omitted after divergence — keeps the
-// control-plane apply id, so every row carries a usable handle.
-func TestWriteStatusListDeploymentFallsBackToControlPlaneApplyID(t *testing.T) {
+// A deployment that drives its applies locally records no remote handles, so
+// the remote-id columns are left out rather than rendered as a column of
+// dashes. The same holds for an apply not yet dispatched to a data plane.
+func TestWriteStatusListDeploymentOmitsUnpopulatedRemoteColumns(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{
-			ActiveCount: 1,
-			Limit:       20,
-			MaxLimit:    1000,
-			Deployment:  "deploy-a",
+			ActiveCount:    1,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Deployment:     "deploy-a",
 			Applies: []ActiveApplyData{
 				{
 					ApplyID:     "apply-pending",
@@ -261,6 +264,38 @@ func TestWriteStatusListDeploymentFallsBackToControlPlaneApplyID(t *testing.T) {
 	})
 
 	assert.Contains(t, output, "apply-pending")
+	assert.NotContains(t, output, "EXTERNAL APPLY ID")
+	assert.NotContains(t, output, "EXTERNAL OP ID")
+}
+
+// A deployment whose operations fold into one shared data-plane apply has no
+// per-operation remote row id, so only the shared handle gets a column.
+func TestWriteStatusListDeploymentOmitsOperationColumnWhenOnlyTheSharedApplyIsRecorded(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    1,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Deployment:     "deploy-a",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-sharded",
+					ExternalID:  "apply-remote-shared",
+					Database:    "inventory",
+					Environment: "staging",
+					Deployment:  "deploy-a",
+					State:       state.Apply.Running,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL APPLY ID")
+	assert.Contains(t, output, "apply-remote-shared")
+	assert.NotContains(t, output, "EXTERNAL OP ID")
 }
 
 func TestWriteStatusListFailedOnly(t *testing.T) {
