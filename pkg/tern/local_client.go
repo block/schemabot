@@ -2787,6 +2787,13 @@ func (c *LocalClient) getEngine() engine.Engine {
 	}
 }
 
+// Engine returns the engine that drives this client's database type, exposed
+// so callers that assemble a LocalClient can verify the engine settings they
+// configured actually reached it.
+func (c *LocalClient) Engine() engine.Engine {
+	return c.getEngine()
+}
+
 // Progress returns detailed progress for an active schema change.
 // Returns ALL tasks for the current apply: completed, running, and pending.
 // req.ApplyId is required so progress is always scoped to a single apply.

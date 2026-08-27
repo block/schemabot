@@ -301,6 +301,14 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		return nil, err
 	}
 
+	// The postgres ceiling only surfaces at apply time (a refusal names it;
+	// an attempt below it names nothing), so state the effective value once
+	// at startup where operators can correlate it across pods and config
+	// revisions.
+	logger.Info("PostgreSQL engine native-safe table size ceiling in effect",
+		"limit_bytes", cfg.Postgres.NativeSafeTableSizeLimit(),
+		"configured", cfg.Postgres.NativeSafeTableSizeLimitBytes != nil)
+
 	// Get storage DSN from config (with fallback to the STORAGE_DSN env var,
 	// then MYSQL_DSN)
 	dsn, err := cfg.StorageDSN()

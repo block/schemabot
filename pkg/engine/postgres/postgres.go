@@ -46,9 +46,13 @@ func New() *Engine {
 }
 
 // NewWithTableSizeLimit creates a PostgreSQL engine with the native-safe
-// table size ceiling expressed in bytes.
+// table size ceiling expressed in bytes. Zero means unset and adopts
+// DefaultNativeSafeTableSizeLimitBytes. A negative value is kept as-is
+// rather than silently replaced with a ceiling the caller did not choose:
+// the preflight check rejects a non-positive limit loudly at apply time,
+// and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
-	if tableSizeLimit <= 0 {
+	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
 	return &Engine{tableSizeLimit: tableSizeLimit}

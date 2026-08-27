@@ -593,9 +593,22 @@ postgres:
   native_safe_table_size_limit_bytes: 4294967296
 ```
 
+The ceiling is SchemaBot's own conservatism about how much work to attempt
+under an exclusive lock, not a PostgreSQL limit. A native-safe `ALTER` that
+rewrites a table rebuilds its heap, its indexes, and its TOAST data while
+holding `ACCESS EXCLUSIVE`, and the size compared against the ceiling is the
+total relation size summed across the table's partition tree — indexes and
+TOAST included — so an index-heavy table cannot slip under it. Raising the
+ceiling converts an up-front refusal into a bounded attempt, not an unbounded
+lock: every apply still runs under short `lock_timeout` and
+`statement_timeout` budgets, so above the ceiling it is the statement
+timeout, not the ceiling, that stops a runaway rewrite.
+
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
 
+The ceiling is process-wide: every PostgreSQL database this server drives
+shares the same value, and a database cannot override it in its own metadata.
 These settings only apply where this server constructs the PostgreSQL engine
 itself — local-mode PostgreSQL databases. Databases routed to a remote
 deployment over gRPC run with that deployment's engine settings.
