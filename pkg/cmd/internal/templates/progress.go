@@ -1189,6 +1189,14 @@ func writeStatusListFooter(data StatusListData) {
 		}
 		writeStatusListTruncation(data, item)
 	}
+	// A deployment-filtered APPLY ID column carries data-plane apply ids,
+	// which the status detail command cannot look up — it resolves
+	// control-plane apply ids only. Point the operator at the list that
+	// shows them instead of promising a drill-down this column can't feed.
+	if data.Deployment != "" {
+		fmt.Printf("%sAPPLY ID is the deployment's data-plane apply id when one is recorded. '%s status <apply_id>' takes the control-plane apply id — list without --deployment to see it%s\n", ANSIDim, cliname.Name(), ANSIReset)
+		return
+	}
 	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
 }
 
