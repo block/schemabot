@@ -441,15 +441,11 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 }
 
 // isInstantAlter reports whether the table should be described as applying
-// instantly: the engine flagged it instant and it is an ALTER. CREATE and DROP
-// also skip the row-copy phase, but they are not instant DDL, so they keep
-// their generic applying labels.
+// instantly: the engine flagged it instant and it is an ALTER. Other
+// operations may complete without a row copy, but they are not instant DDL,
+// so they keep their generic applying labels.
 func isInstantAlter(t TableProgress) bool {
-	if !t.IsInstant {
-		return false
-	}
-	op := ddl.OpToStatementType(t.ChangeType)
-	return op != ddl.StatementCreateTable && op != ddl.StatementDropTable
+	return t.IsInstant && ddl.OpToStatementType(t.ChangeType) == ddl.StatementAlterTable
 }
 
 // FormatTableProgressWithActivity returns progress for a single table using the
