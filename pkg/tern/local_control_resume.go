@@ -364,8 +364,19 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			now := time.Now()
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier))
+			// The completed state must durably land before the loop moves on:
+			// finalization derives the apply's terminal state from these task
+			// rows, so proceeding past a refused write — e.g. a lease-guarded
+			// update that lost to a peer driver — could terminalize the apply
+			// while the task row durably stays non-terminal. Aborting the
+			// resume without finalizing leaves the apply claimable, so a later
+			// drive redoes this settlement under a current lease.
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
+				logger.Error("resume aborting: persisting a raced-cutover task settlement failed; the apply stays active for a later drive to redo the settlement",
+					"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
+				return
+			}
 			continue
 		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
 			// Live schema drifted since resume began: the DDL this shard now
@@ -509,8 +520,17 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
+			// The completed state must durably land before the task counts as
+			// settled: the caller derives parent apply state from this
+			// partition, so proceeding past a refused write — e.g. a
+			// lease-guarded update that lost to a peer driver — would
+			// terminalize the apply while the task row durably stays
+			// non-terminal. Failing the re-plan releases the drive for a later
+			// claim to redo this settlement under a current lease.
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier)); err != nil {
+				return nil, fmt.Errorf("persist completed state for task %s whose table left the resume re-plan diff: %w", task.TaskIdentifier, err)
+			}
 			completedCount++
 		} else {
 			// Fail closed if the re-plan would apply DDL this task was not

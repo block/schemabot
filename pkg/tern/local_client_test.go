@@ -1529,6 +1529,73 @@ func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
 }
 
+// Settling a completed-on-engine control operation is only real once the
+// task's completed state durably lands. When the task store refuses the write
+// — here a lease-guarded update that lost the drive's lease to a peer driver —
+// the settle must fail closed instead of resolving the durable cancel request
+// and terminalizing the apply over a task row that durably stays non-terminal.
+// The request stays pending so a later claim redoes the settle under a current
+// lease, and the durable log records no transition the task row does not carry.
+func TestLocalClient_ProcessPendingCancelFailsClosedWhenSettleWriteRefused(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              323,
+		ApplyIdentifier: "apply-cancel-settle-refused",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             656,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-settle-refused",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		cancelErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks: &updateFailingTaskStore{
+				exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+				updateErr:              storage.ErrApplyLeaseLost,
+			},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	_, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.ErrorContains(t, err, task.TaskIdentifier)
+	assert.False(t, state.IsState(apply.State, state.Apply.Completed),
+		"the apply must not settle completed over a refused task write, got %s", apply.State)
+	assert.Nil(t, apply.CompletedAt)
+	controlReq, reqErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, reqErr)
+	require.NotNil(t, controlReq, "the durable cancel request must stay pending so a later claim redoes the settle")
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
+}
+
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
 	// A stop and a start can race into the same operator claim: the apply is
 	// already stopped while a stop request is still pending, and a start request
