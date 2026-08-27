@@ -36,33 +36,48 @@ import (
 func ResyncPostgresIdentitySequences(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
 	tables, _, err := readEmbeddedPostgresSchemaFiles()
 	if err != nil {
-		return err
+		return fmt.Errorf("read embedded PostgreSQL storage schema: %w", err)
+	}
+	missing, err := missingPostgresTables(ctx, db, tables)
+	if err != nil {
+		return fmt.Errorf("check target for storage tables: %w", err)
+	}
+	if len(missing) == len(tables) {
+		return fmt.Errorf("none of the %d storage tables exist in the target database; it does not look like SchemaBot's storage database", len(tables))
 	}
 	columns, err := postgresIdentityColumns(ctx, db, tables)
 	if err != nil {
-		return err
+		return fmt.Errorf("find identity columns on storage tables: %w", err)
 	}
 
+	advanced := 0
+	skipped := 0
 	for _, col := range columns {
 		newValue, outcome, err := advancePostgresIdentitySequence(ctx, db, col)
 		if err != nil {
-			return err
+			return fmt.Errorf("resync identity column %s.%s: %w", col.table, col.column, err)
 		}
 		switch outcome {
 		case sequenceAdvanced:
+			advanced++
 			logger.Info("advanced identity sequence past stored maximum",
 				"table", col.table, "column", col.column, "sequence_value", newValue)
 		case sequenceSkippedEmptyTable:
+			skipped++
 			logger.Debug("identity column has no stored rows; sequence left untouched",
 				"table", col.table, "column", col.column)
 		case sequenceSkippedAlreadyAhead:
+			skipped++
 			logger.Debug("identity sequence already at or past stored maximum; left untouched",
 				"table", col.table, "column", col.column)
 		case sequenceSkippedDescending:
+			skipped++
 			logger.Warn("identity sequence is descending; resync skipped it — a stored-maximum resync only applies to ascending sequences",
 				"table", col.table, "column", col.column)
 		}
 	}
+	logger.Info("identity sequence resync summary",
+		"tables", len(tables), "examined", len(columns), "advanced", advanced, "skipped", skipped)
 	return nil
 }
 
