@@ -32,18 +32,22 @@ import (
 // The conflict that refused the dispatch is returned alongside the error, so a
 // caller that can resolve into the holding apply rather than be refused by it
 // has the apply in hand without repeating the scan.
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string, attachApplyID int64) (blockingTask, error) {
+//
+// The stopped applies whose resting tasks the check released are returned with
+// it: their work is what a dispatch for the same table takes over, and the scan
+// that frees the database is the one place that already knows who they are.
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
 		if err != nil {
-			return blockingTask{}, fmt.Errorf("check existing tasks: %w", err)
+			return blockingTask{}, nil, fmt.Errorf("check existing tasks: %w", err)
 		}
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard, attachApplyID)
+		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard, attachApplyID)
 		if !blocking.blocks() {
-			return blockingTask{}, nil
+			return blockingTask{}, released, nil
 		}
 
 		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
@@ -60,21 +64,23 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 		// The refusal is what the operator sees when an apply dies on arrival, so
 		// it names the apply holding the database rather than only the task, which
 		// on its own gives them nothing to act on.
-		return blocking, fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
+		return blocking, nil, fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
 			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
-	return blockingTask{}, nil
+	return blockingTask{}, nil, nil
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.
-// Returns the conflict, or a zero blockingTask when no conflict exists.
+// Returns the conflict, or a zero blockingTask when no conflict exists, along
+// with the stopped applies whose resting tasks it released along the way.
 // As a side effect, resolves stale tasks by checking engine state.
 //
 // dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
 // when both the candidate apply and an existing task target a non-empty shard,
 // a different shard does not conflict, so a sharded fan-out runs its shards
 // concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string, attachApplyID int64) blockingTask {
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder) {
+	var released []supersededHolder
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
@@ -101,7 +107,7 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		// keeps blocking (fail closed).
 		apply, ok := c.applyForConflictCheck(ctx, t)
 		if !ok {
-			return newBlockingTask(t, nil)
+			return newBlockingTask(t, nil), nil
 		}
 
 		// A pending task of a terminal apply can never start; cancel it so it
@@ -111,8 +117,15 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		}
 
 		// A stopped task rests without ending. Nothing reaches for it until a
-		// person asks, so it does not hold the database.
+		// person asks, so it does not hold the database — and its apply's work
+		// is what a dispatch for the same table takes over.
 		if c.restingTaskReleasesDatabase(ctx, t, apply) {
+			released = append(released, supersededHolder{
+				applyID:         apply.ID,
+				applyIdentifier: apply.ApplyIdentifier,
+				namespace:       t.Namespace,
+				table:           t.TableName,
+			})
 			continue
 		}
 
@@ -123,9 +136,9 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 
 		c.logger.Debug("conflict check: task is active", append(t.LogAttrs(),
 			"apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
-		return newBlockingTask(t, apply)
+		return newBlockingTask(t, apply), nil
 	}
-	return blockingTask{}
+	return blockingTask{}, released
 }
 
 // blockingTask names the active work that refuses a new apply on a database,
