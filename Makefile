@@ -288,7 +288,12 @@ seed-testapp:
 # Run all e2e tests (MySQL + Vitess + gRPC) in isolated docker-compose environments.
 test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 
-# Disable Buildx Bake until Compose's subprocess stdio handling is reliable.
+# Disable Buildx Bake: Compose 2.34–2.x delegates `up --build` to a bake
+# subprocess that can lose its stdio pipe (docker/compose#13243), failing the
+# build with `read |0: file already closed`. The variable only exists in that
+# window — Compose v5 removed it because bake became the fixed, sole build
+# path — so on newer Compose this prefix is an inert no-op and the whole
+# workaround can be dropped once CI runners ship Compose ≥5.
 # E2E local environment shorthand
 E2E_DC = COMPOSE_BAKE=false docker compose -f deploy/e2e/docker-compose.yml
 
