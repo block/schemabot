@@ -152,24 +152,22 @@ jobs:
         include:
           # Shard names are the answer to "which shard ran my test?", so they
           # name the packages they select rather than describing the split.
+          # Each name maps to a selector in the "Test" step below; per-package
+          # is derived there as the exact inverse of the dedicated selectors,
+          # so the partition cannot drift and an unmapped shard fails loudly.
           #
           # The cross-package suite under ./integration is the longest single
           # shard and cannot be shortened by package parallelism, so it gets its
           # own runner rather than setting the wall time for everything else.
           - shard: ./integration
-            match: "-E"
-            selector: "^github\\.com/block/schemabot/integration(/|$)"
+          # The two dominant per-package binaries (~2 min and ~1.7 min), peeled
+          # onto their own runner so the long tail keeps headroom under the job
+          # budget.
           - shard: tern-webhook
-            match: "-E"
-            selector: "^github\\.com/block/schemabot/pkg/(tern|webhook)$"
           # Every other integration-tagged package: tests that live beside the
-          # code they cover, spread across ./pkg, ./cmd and ./e2e. Selected as
-          # the exact inverse of the dedicated shards above, so every package
-          # lands in exactly one shard and a newly added package is picked up
-          # here without touching this file.
+          # code they cover, spread across ./pkg, ./cmd and ./e2e. A newly
+          # added package is picked up here without touching this file.
           - shard: per-package
-            match: "-vE"
-            selector: "^github\\.com/block/schemabot/(integration(/|$)|pkg/(tern|webhook)$)"
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -209,14 +207,34 @@ jobs:
         # guaranteed only where a binary's own deadline lands inside the job's:
         # one starting late in a long shard can still be cancelled without one.
         env:
-          MATCH: ${{ matrix.match }}
-          SELECTOR: ${{ matrix.selector }}
           SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
+          # Selectors are defined once here, keyed by shard name; per-package
+          # greps with the inverse of the dedicated selectors' union, so every
+          # integration-tagged package lands in exactly one shard by
+          # construction — narrowing or widening a dedicated selector moves
+          # packages between shards, it can never drop one from all of them.
+          #
+          # ./integration is anchored at the module root so only the top-level
+          # cross-package suite takes that shard. A future nested package named
+          # `integration` belongs beside the code it covers, in per-package.
+          # pkg/tern and pkg/webhook are `$`-anchored so their subpackages stay
+          # in per-package.
+          integration_re='^github\.com/block/schemabot/integration(/|$)'
+          tern_webhook_re='^github\.com/block/schemabot/pkg/(tern|webhook)$'
+          case "$SHARD" in
+            ./integration) match="-E";  selector="$integration_re" ;;
+            tern-webhook)  match="-E";  selector="$tern_webhook_re" ;;
+            per-package)   match="-vE"; selector="($integration_re|$tern_webhook_re)" ;;
+            *)
+              echo "::error::shard '$SHARD' has no selector mapping; add one here"
+              exit 1
+              ;;
+          esac
           all=$(go list -tags=integration ./...)
           set +e
-          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$MATCH" "$SELECTOR")
+          pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$match" "$selector")
           selector_status=$?
           set -e
           # grep exits 1 when a shard matches nothing and 2 when the selector
@@ -224,7 +242,7 @@ jobs:
           # bare exit status, so both are absorbed and reported apart: a broken
           # selector says so rather than being described as an empty shard.
           if [ "$selector_status" -gt 1 ]; then
-            echo "::error::shard '$SHARD' selector $SELECTOR is unusable (grep exited $selector_status)"
+            echo "::error::shard '$SHARD' selector $selector is unusable (grep exited $selector_status)"
             exit 1
           fi
           # An empty shard would hand `go test` no packages and silently test the
