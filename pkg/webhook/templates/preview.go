@@ -1650,11 +1650,12 @@ func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
 
 // PreviewCommentApplyShardProgress renders a sharded apply where one table is
 // copying across a handful of shards, exercising the inline per-shard summary
-// (each shard listed, a percent only on the actively-copying shards).
+// (each shard listed, a percent on the actively-copying shards and a status
+// word on the glyphs that need one).
 func PreviewCommentApplyShardProgress() string {
 	shards := []ShardProgressData{
 		{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100},
-		{Shard: "40-80", Status: state.Task.Running, PercentComplete: 62},
+		{Shard: "40-80", Status: state.Task.WaitingForCutover, PercentComplete: 100},
 		{Shard: "80-c0", Status: state.Task.Running, PercentComplete: 31},
 		{Shard: "c0-", Status: state.Task.Pending},
 	}
