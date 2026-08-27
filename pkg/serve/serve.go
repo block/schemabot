@@ -147,10 +147,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// Optionally start a gRPC server for the Tern proto (used by
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
 	if grpcPort != "" {
-		grpcServer := grpc.NewServer(
-			grpc.ChainUnaryInterceptor(RecoveryUnaryInterceptor(srv.logger)),
-			grpc.ChainStreamInterceptor(RecoveryStreamInterceptor(srv.logger)),
-		)
+		grpcServer := newTernGRPCServer(srv.logger)
 		if err := srv.RegisterGRPC(ctx, grpcServer); err != nil {
 			return fmt.Errorf("register grpc tern service: %w", err)
 		}

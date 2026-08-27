@@ -2,7 +2,6 @@ package serve
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -20,46 +19,62 @@ import (
 // Internal error; panic text never crosses the wire because it can carry
 // internal detail (DSN fragments, hostnames, driver internals). Embedders that
 // register the Tern service on their own server should install this
-// interceptor for the same containment.
+// interceptor for the same containment. Install it first in
+// grpc.ChainUnaryInterceptor: the first chained interceptor is the outermost,
+// so a panic in any interceptor ahead of this one escapes containment and
+// kills the process. Do not combine it with the non-chained
+// grpc.UnaryInterceptor option — grpc-go runs that interceptor before the
+// entire chain, ahead of recovery.
 func RecoveryUnaryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
-		err = panicsafe.Call(func() error {
-			var handlerErr error
-			resp, handlerErr = handler(ctx, req)
-			return handlerErr
+		handlerPanic, handlerErr := panicsafe.Catch(func() error {
+			var innerErr error
+			resp, innerErr = handler(ctx, req)
+			return innerErr
 		})
-		if contained := containedPanicError(ctx, logger, info.FullMethod, err); contained != nil {
-			return nil, contained
+		if handlerPanic != nil {
+			return nil, containedPanicError(ctx, logger, info.FullMethod, handlerPanic)
 		}
-		return resp, err
+		return resp, handlerErr
 	}
 }
 
 // RecoveryStreamInterceptor is the streaming counterpart of
 // RecoveryUnaryInterceptor. The Tern service is unary-only today; this exists
 // so a future streaming method is contained by construction rather than
-// remembering to add it then.
+// remembering to add it then. The same installation rules apply: first in
+// grpc.ChainStreamInterceptor, never combined with the non-chained
+// grpc.StreamInterceptor option.
 func RecoveryStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		err := panicsafe.Call(func() error {
+		handlerPanic, handlerErr := panicsafe.Catch(func() error {
 			return handler(srv, ss)
 		})
-		if contained := containedPanicError(ss.Context(), logger, info.FullMethod, err); contained != nil {
-			return contained
+		if handlerPanic != nil {
+			return containedPanicError(ss.Context(), logger, info.FullMethod, handlerPanic)
 		}
-		return err
+		return handlerErr
 	}
+}
+
+// newTernGRPCServer constructs the gRPC server Run serves the Tern service
+// on, with the recovery interceptors installed as the outermost link of each
+// chain so a handler panic fails only that RPC instead of killing the process
+// that drives applies.
+func newTernGRPCServer(logger *slog.Logger) *grpc.Server {
+	return grpc.NewServer(
+		grpc.ChainUnaryInterceptor(RecoveryUnaryInterceptor(logger)),
+		grpc.ChainStreamInterceptor(RecoveryStreamInterceptor(logger)),
+	)
 }
 
 // containedPanicError returns the sanitized status error for a contained
 // handler panic, logging the panic value and stack with the RPC method so the
-// fault is triageable from logs alone. A nil return means err was not a
-// contained panic and must be propagated as-is.
-func containedPanicError(ctx context.Context, logger *slog.Logger, fullMethod string, err error) error {
-	var handlerPanic *panicsafe.Error
-	if !errors.As(err, &handlerPanic) {
-		return nil
-	}
+// fault is triageable from logs alone. Provenance is structural: the caller
+// passes the *panicsafe.Error its own Catch call produced, so a handler error
+// that merely wraps a *panicsafe.Error is never mistaken for a recovered panic
+// and propagates untouched with its cause chain and status code intact.
+func containedPanicError(ctx context.Context, logger *slog.Logger, fullMethod string, handlerPanic *panicsafe.Error) error {
 	logger.Error("gRPC handler panicked; the RPC failed with Internal and the server kept serving",
 		"method", fullMethod,
 		"panic", fmt.Sprint(handlerPanic.Value),

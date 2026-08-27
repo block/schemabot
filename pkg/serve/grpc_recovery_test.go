@@ -4,15 +4,23 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	"github.com/block/schemabot/pkg/panicsafe"
 )
 
 // A handler panic must fail only that RPC: the client sees a fixed Internal
@@ -33,7 +41,6 @@ func TestRecoveryUnaryInterceptorContainsHandlerPanic(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, codes.Internal, st.Code())
 	assert.Equal(t, "internal error; see server logs", st.Message())
-	assert.NotContains(t, st.Message(), "10.0.0.5")
 
 	logged := logs.String()
 	assert.Contains(t, logged, "/tern.v1.Tern/Cutover")
@@ -73,6 +80,28 @@ func TestRecoveryUnaryInterceptorPassesThroughHandlerError(t *testing.T) {
 	assert.Equal(t, codes.FailedPrecondition, st.Code())
 }
 
+// A handler error that wraps a *panicsafe.Error is still the handler's own
+// error, not a panic this interceptor recovered: it must reach the client
+// unchanged with its cause chain intact, nothing logged, and no recovered-panic
+// metric recorded. Only the identical *panicsafe.Error that panicsafe.Call
+// constructed marks a contained panic.
+func TestRecoveryUnaryInterceptorPassesThroughWrappedPanicsafeError(t *testing.T) {
+	var logs bytes.Buffer
+	interceptor := RecoveryUnaryInterceptor(slog.New(slog.NewTextHandler(&logs, nil)))
+	handlerErr := fmt.Errorf("apply already terminal: %w", &panicsafe.Error{Value: "poisoned row"})
+
+	resp, err := interceptor(t.Context(), "req", &grpc.UnaryServerInfo{FullMethod: "/tern.v1.Tern/Apply"},
+		func(ctx context.Context, req any) (any, error) {
+			return nil, handlerErr
+		})
+
+	assert.Nil(t, resp)
+	require.Error(t, err)
+	assert.Equal(t, handlerErr, err)
+	assert.True(t, errors.Is(err, handlerErr))
+	assert.Empty(t, logs.String())
+}
+
 // The streaming interceptor applies the same containment: a stream handler
 // panic fails the stream with a fixed Internal error instead of killing the
 // process.
@@ -106,6 +135,60 @@ func TestRecoveryStreamInterceptorPassesThroughHandlerError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, handlerErr))
+}
+
+// The server Run constructs must contain a handler panic end-to-end over a
+// real gRPC connection: the client sees the fixed Internal error and the
+// server keeps serving. This pins the interceptor wiring in newTernGRPCServer,
+// not just the interceptor logic — building the server without the recovery
+// chain would crash this test's server goroutine instead of failing the RPC.
+func TestNewTernGRPCServerContainsHandlerPanicOverWire(t *testing.T) {
+	var logs bytes.Buffer
+	server := newTernGRPCServer(slog.New(slog.NewTextHandler(&logs, nil)))
+	server.RegisterService(&grpc.ServiceDesc{
+		ServiceName: "test.Panicker",
+		HandlerType: (*any)(nil),
+		Methods: []grpc.MethodDesc{{
+			MethodName: "Boom",
+			Handler: func(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+				boom := func(ctx context.Context, req any) (any, error) {
+					panic("dial tcp 10.0.0.5:5432: connect: connection refused")
+				}
+				if interceptor == nil {
+					return boom(ctx, nil)
+				}
+				return interceptor(ctx, nil, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/test.Panicker/Boom"}, boom)
+			},
+		}},
+	}, struct{}{})
+
+	listener := bufconn.Listen(1024 * 1024)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		require.NoError(t, <-serveErr)
+	})
+
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return listener.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	err = conn.Invoke(ctx, "/test.Panicker/Boom", &emptypb.Empty{}, &emptypb.Empty{})
+
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.Internal, st.Code())
+	assert.Equal(t, "internal error; see server logs", st.Message())
+	assert.Contains(t, logs.String(), "connection refused")
+	assert.Contains(t, logs.String(), "/test.Panicker/Boom")
 }
 
 type testServerStream struct {
