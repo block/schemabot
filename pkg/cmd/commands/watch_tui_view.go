@@ -54,7 +54,7 @@ func (m WatchModel) progressView() string {
 	var b strings.Builder
 
 	// Sort tables by status priority (running first, then pending, then completed)
-	tables := make([]tableProgress, len(m.tables))
+	tables := make([]templates.TableProgress, len(m.tables))
 	copy(tables, m.tables)
 	sortTablesByProgress(tables)
 
@@ -286,67 +286,24 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-func recoveringCopyPercent(tables []tableProgress) (int, bool) {
+func recoveringCopyPercent(tables []templates.TableProgress) (int, bool) {
 	percent := 100
 	found := false
 	for _, table := range tables {
-		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.Percent >= 100 {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.PercentComplete >= 100 {
 			continue
 		}
-		percent = min(percent, ui.ClampPercent(table.Percent))
+		percent = min(percent, ui.ClampPercent(table.PercentComplete))
 		found = true
 	}
 	return percent, found
 }
 
-// toTemplateTables converts TUI tableProgress slices to template TableProgress
-// so the shared rendering functions can be used.
-func toTemplateTables(tables []tableProgress) []templates.TableProgress {
-	result := make([]templates.TableProgress, len(tables))
-	for i, t := range tables {
-		// Table-level ETA: the table's own estimate (MySQL/Spirit), or the
-		// slowest shard's for a sharded (Vitess) table.
-		etaSeconds := t.ETASeconds
-		for _, sh := range t.Shards {
-			if sh.ETASeconds > etaSeconds {
-				etaSeconds = sh.ETASeconds
-			}
-		}
-		tp := templates.TableProgress{
-			TableName:       t.Name,
-			Deployment:      t.Deployment,
-			Namespace:       t.Keyspace,
-			DDL:             t.DDL,
-			ChangeType:      t.ChangeType,
-			Status:          state.NormalizeTaskStatus(t.Status),
-			RowsCopied:      t.RowsCopied,
-			RowsTotal:       t.RowsTotal,
-			PercentComplete: t.Percent,
-			ETASeconds:      etaSeconds,
-			ProgressDetail:  t.ProgressDetail,
-			IsInstant:       t.IsInstant,
-		}
-		for _, sh := range t.Shards {
-			tp.Shards = append(tp.Shards, templates.ShardProgress{
-				Shard:      sh.Shard,
-				Status:     state.NormalizeShardStatus(sh.Status),
-				RowsCopied: sh.RowsCopied,
-				RowsTotal:  sh.RowsTotal,
-				ETASeconds: sh.ETASeconds,
-			})
-		}
-		result[i] = tp
-	}
-	return result
-}
-
-// renderTables converts TUI tables to template types and uses the shared
-// FormatNamespacedTables / FormatTableProgress rendering from the CLI templates.
-func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
-	tplTables := toTemplateTables(tables)
-
+// renderTables renders tables with the shared FormatNamespacedTables /
+// FormatTableProgress rendering from the CLI templates.
+func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TableProgress) {
 	hasNamespaces := false
-	for _, t := range tplTables {
+	for _, t := range tables {
 		if t.Namespace != "" {
 			hasNamespaces = true
 			break
@@ -357,10 +314,10 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
 	activityLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	activityLabel := activityLabelStyle.Render("Finalizing copy " + activityLabelFrames[m.activityLabelFrame%len(activityLabelFrames)])
 	if hasNamespaces {
-		b.WriteString(templates.FormatNamespacedTablesWithActivity(tplTables, activityBar, activityLabel))
+		b.WriteString(templates.FormatNamespacedTablesWithActivity(tables, activityBar, activityLabel))
 	} else {
 		b.WriteString("\n")
-		for _, t := range tplTables {
+		for _, t := range tables {
 			b.WriteString(templates.FormatTableProgressWithActivity(t, activityBar, activityLabel))
 		}
 	}

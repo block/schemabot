@@ -25,7 +25,6 @@ type WatchModel struct {
 	environment         string
 	applyID             string // When set, fetches progress by apply ID instead of database/environment
 	allowControlActions bool
-	maxTableNameLen     int
 	deployTriggered     bool
 	cutoverTriggered    bool
 	skipRevertTriggered bool
@@ -34,7 +33,7 @@ type WatchModel struct {
 
 	// State from API
 	state         string
-	tables        []tableProgress
+	tables        []templates.TableProgress
 	operations    []templates.ProgressOperation
 	released      bool // apply-level release latch: a released pause runs degraded, not paused
 	errorMsg      string
@@ -57,33 +56,6 @@ type WatchModel struct {
 	volumePending      int  // Pending volume change (0 = none)
 	volumeChanging     bool // True while volume change is in progress
 	consecutiveErrors  int  // Consecutive fetch failures (drives backoff)
-}
-
-// tableProgress represents progress for a single table.
-type tableProgress struct {
-	Name           string
-	Deployment     string
-	Keyspace       string
-	DDL            string
-	ChangeType     string
-	Status         string
-	RowsCopied     int64
-	RowsTotal      int64
-	Percent        int
-	ETASeconds     int64
-	ProgressDetail string
-	IsInstant      bool
-	Shards         []shardProgress
-}
-
-type shardProgress struct {
-	Shard           string
-	Status          string
-	RowsCopied      int64
-	RowsTotal       int64
-	Percent         int
-	ETASeconds      int64
-	CutoverAttempts int
 }
 
 var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -110,7 +82,7 @@ func isRetryableFetchError(err error) bool {
 
 type progressMsg struct {
 	state       string
-	tables      []tableProgress
+	tables      []templates.TableProgress
 	operations  []templates.ProgressOperation
 	released    bool   // apply-level release latch: a released pause runs degraded, not paused
 	errorMsg    string // Human-readable error message
@@ -289,13 +261,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.metadata != nil && m.metadata["is_instant"] == "true" {
 			for i := range m.tables {
 				m.tables[i].IsInstant = true
-			}
-		}
-
-		// Calculate max table name length for alignment
-		for _, t := range m.tables {
-			if len(t.Name) > m.maxTableNameLen {
-				m.maxTableNameLen = len(t.Name)
 			}
 		}
 

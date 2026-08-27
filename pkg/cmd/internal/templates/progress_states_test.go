@@ -395,8 +395,18 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 	})
-	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (22%)")
 	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
+
+	// A verify that has only just begun still renders as visibly started: a
+	// non-zero checked count floors the display at 1% instead of showing an
+	// empty "not started" bar while verification is actively running.
+	justStarted := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
+		ChecksumRowsChecked: 1, ChecksumRowsTotal: 1000000,
+	})
+	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (1%)")
+	assert.Contains(t, justStarted, "🟦")
 }
 
 // A table slowed by the engine's throttler carries a "(throttled)" annotation
@@ -437,7 +447,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 		Throttled: true, ThrottleReason: "threads-running 21 > 18",
 	})
-	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21%) (throttled)")
+	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (22%) (throttled)")
 	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
 
 	notThrottled := FormatTableProgress(TableProgress{
