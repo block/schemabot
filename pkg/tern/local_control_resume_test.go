@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -477,7 +478,8 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
-	c.storage = &exactProgressStorage{plans: store, tasks: &exactProgressTaskStore{}}
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{plans: store, tasks: &exactProgressTaskStore{}, logs: logs}
 
 	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-settle", Database: "testapp"}
 	tasks := []*storage.Task{{
@@ -497,6 +499,8 @@ func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
 		"a task whose table left the diff is settled completed, got %s", tasks[0].State)
 	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
 	assert.NotNil(t, tasks[0].CompletedAt)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_1 already completed (live schema matches the reviewed target)"),
+		"a landed settlement records its transition in the apply's durable log")
 }
 
 // Settling a no-remaining-work task is only real once its completed state
@@ -510,9 +514,11 @@ func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
 func TestReplanAndFilterTasks_FailsClosedWhenCompletedWriteRefused(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	logs := &mockApplyLogStore{}
 	c.storage = &exactProgressStorage{
 		plans: store,
 		tasks: &exactProgressTaskStore{err: storage.ErrApplyLeaseLost},
+		logs:  logs,
 	}
 
 	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-lease-lost", Database: "testapp"}
@@ -529,6 +535,63 @@ func TestReplanAndFilterTasks_FailsClosedWhenCompletedWriteRefused(t *testing.T)
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 	assert.ErrorContains(t, err, "task_1")
 	assert.Nil(t, rp, "a refused settlement write must not yield a partition the caller could terminalize from")
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
+}
+
+// The sequential resume loop settles a task whose table already has the
+// desired schema (its cutover raced the re-plan) by writing the task row
+// completed. That settlement is only real once the write durably lands: the
+// loop's finalization derives the apply's terminal state from these task rows,
+// so a refused write — here a lease-guarded update that lost the drive's lease
+// to a peer driver — must abort the resume without finalizing. The apply stays
+// active for a later claim to redo the settlement under a current lease, and
+// the durable log records no transition the task row does not carry.
+func TestResumeApplySequential_AbortsWhenRacedCutoverSettlementRefused(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{})
+	c.heartbeatInterval = time.Hour
+
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-sequential-settle-refused",
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task_1",
+		Database:       "testapp",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.Running,
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{
+		plans:   store,
+		applies: applies,
+		tasks: &updateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			updateErr:              storage.ErrApplyLeaseLost,
+		},
+		controlRequests: &testControlRequestStore{},
+		logs:            logs,
+	}
+
+	c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil)
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Running),
+		"a refused settlement write must abort the resume before finalization, leaving the apply claimable; stored state was %q", stored.State)
+	assert.False(t, state.IsTerminalApplyState(stored.State),
+		"the apply must not terminalize over a task row that durably stays non-terminal")
+	assert.Nil(t, stored.CompletedAt)
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
 }
 
 // A reverted task is terminal: the revert already landed for it, so the resume

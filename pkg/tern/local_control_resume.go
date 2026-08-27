@@ -365,8 +365,19 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			now := time.Now()
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier))
+			// The completed state must durably land before the loop moves on:
+			// finalization derives the apply's terminal state from these task
+			// rows, so proceeding past a refused write — e.g. a lease-guarded
+			// update that lost to a peer driver — could terminalize the apply
+			// while the task row durably stays non-terminal. Aborting the
+			// resume without finalizing leaves the apply claimable, so a later
+			// drive redoes this settlement under a current lease.
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
+				logger.Error("resume aborting: persisting a raced-cutover task settlement failed; the apply stays active for a later drive to redo the settlement",
+					"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
+				return
+			}
 			continue
 		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
 			// Live schema drifted since resume began: the DDL this shard now
