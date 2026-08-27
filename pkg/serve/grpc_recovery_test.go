@@ -102,6 +102,29 @@ func TestRecoveryUnaryInterceptorPassesThroughWrappedPanicsafeError(t *testing.T
 	assert.Empty(t, logs.String())
 }
 
+// An embedder passing a nil logger must still get containment: the interceptor
+// falls back to slog.Default() instead of panicking on the logging path, so
+// the containment boundary can never itself kill the process.
+func TestRecoveryUnaryInterceptorNilLoggerStillContains(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	interceptor := RecoveryUnaryInterceptor(nil)
+	resp, err := interceptor(t.Context(), "req", &grpc.UnaryServerInfo{FullMethod: "/tern.v1.Tern/Stop"},
+		func(ctx context.Context, req any) (any, error) {
+			panic("poisoned row")
+		})
+
+	assert.Nil(t, resp)
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.Internal, st.Code())
+	assert.Contains(t, logs.String(), "poisoned row")
+}
+
 // The streaming interceptor applies the same containment: a stream handler
 // panic fails the stream with a fixed Internal error instead of killing the
 // process.

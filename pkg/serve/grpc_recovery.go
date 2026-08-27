@@ -24,8 +24,12 @@ import (
 // so a panic in any interceptor ahead of this one escapes containment and
 // kills the process. Do not combine it with the non-chained
 // grpc.UnaryInterceptor option — grpc-go runs that interceptor before the
-// entire chain, ahead of recovery.
+// entire chain, ahead of recovery. A nil logger falls back to slog.Default()
+// so the containment path can never itself panic.
 func RecoveryUnaryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 		handlerPanic, handlerErr := panicsafe.Catch(func() error {
 			var innerErr error
@@ -44,8 +48,11 @@ func RecoveryUnaryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 // so a future streaming method is contained by construction rather than
 // remembering to add it then. The same installation rules apply: first in
 // grpc.ChainStreamInterceptor, never combined with the non-chained
-// grpc.StreamInterceptor option.
+// grpc.StreamInterceptor option. A nil logger falls back to slog.Default().
 func RecoveryStreamInterceptor(logger *slog.Logger) grpc.StreamServerInterceptor {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		handlerPanic, handlerErr := panicsafe.Catch(func() error {
 			return handler(srv, ss)
