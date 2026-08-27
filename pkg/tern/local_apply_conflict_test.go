@@ -791,6 +791,14 @@ func restingTaskClient(task *storage.Task, apply *storage.Apply, controlRequests
 	}
 }
 
+// storageWithoutControlRequests is a storage that has no control request store
+// at all, the way a partially-wired storage implementation reports one.
+type storageWithoutControlRequests struct {
+	*exactProgressStorage
+}
+
+func (s *storageWithoutControlRequests) ControlRequests() storage.ControlRequestStore { return nil }
+
 // unreadableControlRequestStore fails every pending-request read, standing in
 // for a storage outage while the conflict check is deciding.
 type unreadableControlRequestStore struct {
@@ -883,4 +891,20 @@ func TestConflictCheckKeepsRestingTaskWhenControlRequestsAreUnreadable(t *testin
 
 	require.True(t, blocking.blocks(), "an unreadable control request keeps the database held")
 	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
+}
+
+// A storage with no control request store cannot say whether a command is
+// waiting for a driver, and an unanswerable question is not a "no". The task
+// keeps blocking rather than being released on a check that never ran.
+func TestConflictCheckKeepsRestingTaskWhenControlRequestsAreUnconfigured(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	client.storage = &storageWithoutControlRequests{exactProgressStorage: client.storage.(*exactProgressStorage)}
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	require.NotPanics(t, func() {
+		blocking := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", 0)
+		require.True(t, blocking.blocks(), "an unconfigured control request store keeps the database held")
+		assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
+	})
 }

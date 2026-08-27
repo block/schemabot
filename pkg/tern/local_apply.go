@@ -379,8 +379,15 @@ func (c *LocalClient) restingTaskReleasesDatabase(ctx context.Context, t *storag
 // cancel is delivered by a drive, so either one means a driver arrives without
 // anyone asking again.
 func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.Apply) (storage.ControlOperation, error) {
+	requests := c.storage.ControlRequests()
+	if requests == nil {
+		// A storage without a control request store cannot answer whether a
+		// command is waiting, and an unanswerable question is not a "no".
+		return "", fmt.Errorf("read pending requests for apply %s: control request store is not configured", apply.ApplyIdentifier)
+	}
+
 	for _, operation := range []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel} {
-		request, err := c.storage.ControlRequests().GetPending(ctx, apply.ID, operation)
+		request, err := requests.GetPending(ctx, apply.ID, operation)
 		if err != nil {
 			return "", fmt.Errorf("read pending %s request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 		}

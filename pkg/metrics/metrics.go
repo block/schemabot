@@ -887,9 +887,10 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 }
 
 // RecordConflictCheckOwnershipBlock counts conflict-check decisions that kept
-// a non-terminal task blocking its database because the task's parent apply
-// lease says this process's engine memory is not authoritative for it.
-// Reasons:
+// a non-terminal task blocking its database because this process could not
+// establish that no driver will reach the task on its own — either the apply's
+// lease says this process's engine memory is not authoritative for it, or a
+// driver is still on its way to it. Reasons:
 //   - "fresh_lease": a live driver holds the apply's lease, so the local
 //     engine probe was skipped and the live drive stays authoritative. A
 //     sustained rate means new applies are repeatedly dispatched against a
@@ -909,7 +910,7 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     problem, not a workload one.
 func RecordConflictCheckOwnershipBlock(ctx context.Context, database, databaseType, reason string) {
 	addCounter(ctx, "schemabot.conflict_check.ownership_blocks_total",
-		"Total conflict-check decisions that kept a task blocking because the apply lease denies local engine authority", "{block}",
+		"Total conflict-check decisions that kept a task blocking because no driver could be ruled out for it", "{block}",
 		attribute.String("database", database),
 		attribute.String("database_type", databaseType),
 		attribute.String("reason", reason),
