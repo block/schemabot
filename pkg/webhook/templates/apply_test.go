@@ -1452,7 +1452,7 @@ func TestRenderApplyStatusComment_Recovering(t *testing.T) {
 	assert.Contains(t, result, "1 recovering")
 	// Recovery runs on its own — blue in-progress bar, not the yellow
 	// operator-attention bar.
-	assert.Contains(t, result, "🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Recovering state...")
+	assert.Contains(t, result, ui.ProgressBarActivity()+" Recovering state...")
 	assert.Contains(t, result, "Cutover will be available once recovery completes")
 	assert.NotContains(t, result, "schemabot cutover")
 }
@@ -1498,7 +1498,7 @@ func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	assert.Contains(t, result, "Cutting over...")
 	// Cutover is automatic work: it renders the blue in-progress bar. Yellow
 	// is reserved for states where the operator holds the next move.
-	assert.Contains(t, result, "🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...")
+	assert.Contains(t, result, ui.ProgressBarActivity()+" 🔄 Cutting over...")
 	assert.NotContains(t, result, "🟨")
 }
 
