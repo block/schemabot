@@ -470,6 +470,59 @@ func TestFormatTableProgress_InstantDDL(t *testing.T) {
 	assert.Contains(t, output, "Applied instantly")
 }
 
+// An instant-flagged table still renders its phase states — cutover, revert
+// window, waiting — and its shard breakdown; the instant label describes only
+// the generic in-progress moment, never a phase the operator is watching for.
+func TestFormatTableProgress_InstantTableShowsPhaseStates(t *testing.T) {
+	tp := TableProgress{
+		TableName:  "users",
+		ChangeType: "drop",
+		DDL:        "DROP TABLE `users`;",
+		Status:     state.Apply.CuttingOver,
+		IsInstant:  true,
+		Shards: []ShardProgress{
+			{Shard: "-80", Status: state.Task.CuttingOver},
+			{Shard: "80-", Status: state.Task.WaitingForCutover},
+		},
+	}
+	output := FormatTableProgress(tp)
+	assert.Contains(t, output, "Applying...")
+	assert.NotContains(t, output, "Applying instantly")
+	assert.Contains(t, output, "Shards: 2")
+
+	tp.Status = state.Apply.RevertWindow
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Complete (revert window open)")
+	assert.NotContains(t, output, "Applying instantly")
+
+	tp.Status = state.Task.WaitingForCutover
+	output = FormatTableProgress(tp)
+	assert.Contains(t, output, "Waiting for cutover")
+	assert.NotContains(t, output, "Applying instantly")
+}
+
+// CREATE and DROP are not instant DDL even when the engine flags them as
+// skipping the row copy: they keep the generic applying/complete labels, while
+// an instant ALTER keeps its lightning label.
+func TestFormatTableProgress_InstantLabelIsAlterOnly(t *testing.T) {
+	for _, changeType := range []string{"create", "drop"} {
+		tp := TableProgress{
+			TableName:  "users",
+			ChangeType: changeType,
+			Status:     state.Apply.Running,
+			IsInstant:  true,
+		}
+		output := FormatTableProgress(tp)
+		assert.Contains(t, output, "Applying...", "%s renders the generic applying label", changeType)
+		assert.NotContains(t, output, "Applying instantly", "%s is not instant DDL", changeType)
+
+		tp.Status = state.Apply.Completed
+		output = FormatTableProgress(tp)
+		assert.Contains(t, output, "✓ Complete", "%s completes with the generic label", changeType)
+		assert.NotContains(t, output, "Applied instantly", "%s is not instant DDL", changeType)
+	}
+}
+
 func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	for _, changeType := range []string{"create", "drop"} {
 		tp := TableProgress{
