@@ -747,9 +747,11 @@ type Apply struct {
 	// the control plane rejects a start request up front, a stopped-apply claim
 	// refuses to resume and fails the pending start request with the reason,
 	// and the claim predicate excludes a marked failed_retryable apply from
-	// automatic retry. The remaining claim paths start work that has never run
-	// (a pending dispatch), and work must have run before a successor can take
-	// it over, so they cannot encounter the marker.
+	// automatic retry. The remaining claim paths cannot encounter the marker: a
+	// pending dispatch starts work that has never run, and work must have run
+	// before a successor can take it over; an active apply (including one
+	// waiting for a deploy) cannot gain a successor at all, because creation
+	// refuses a second apply for a target that already has a non-terminal one.
 	SupersededBy string
 
 	// UpdatedAt is when the apply was last updated.
