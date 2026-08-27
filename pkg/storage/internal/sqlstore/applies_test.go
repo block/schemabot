@@ -4575,6 +4575,37 @@ func TestApplyStore_SetRevertSkipped(t *testing.T) {
 	assert.Equal(t, before.UpdatedAt, got.UpdatedAt, "SetRevertSkipped preserves the lease heartbeat (updated_at)")
 }
 
+// MarkSuperseded records the handoff without renewing the apply's lease
+// heartbeat: the caller holds no lease on the apply it is marking, and bumping
+// updated_at would delay another driver's recovery claim. It is a targeted
+// write that leaves other fields (here, state) untouched.
+func TestApplyStore_MarkSuperseded_PreservesHeartbeat(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_superseded_heartbeat", 1)
+
+	// Age updated_at so a heartbeat bump would be observable: updated_at is the
+	// apply's lease heartbeat (the staleness gate in the claim predicate), and
+	// MarkSuperseded must not renew it from a non-lease caller.
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?`, apply.ID)
+	require.NoError(t, err)
+	before, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+
+	require.NoError(t, store.Applies().MarkSuperseded(ctx, apply.ID, "apply_superseded_heartbeat_successor"))
+
+	got, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "apply_superseded_heartbeat_successor", got.SupersededBy)
+	assert.Equal(t, apply.State, got.State, "MarkSuperseded must not change other apply fields")
+	assert.Equal(t, before.UpdatedAt, got.UpdatedAt, "MarkSuperseded preserves the lease heartbeat (updated_at)")
+}
+
 // A lease with no token authorizes no write, so a release attempted with one is
 // refused rather than silently clearing whatever lease the row currently holds.
 func TestApplyStore_ReleaseClaim_InvalidLeaseIsRefused(t *testing.T) {

@@ -742,6 +742,14 @@ type Apply struct {
 	// target where that work already happened, so an apply carrying this marker
 	// can never be started — the marker outlives the successor and is never
 	// cleared.
+	//
+	// The refusal is enforced at every surface that can begin the work again:
+	// the control plane rejects a start request up front, a stopped-apply claim
+	// refuses to resume and fails the pending start request with the reason,
+	// and the claim predicate excludes a marked failed_retryable apply from
+	// automatic retry. The remaining claim paths start work that has never run
+	// (a pending dispatch), and work must have run before a successor can take
+	// it over, so they cannot encounter the marker.
 	SupersededBy string
 
 	// UpdatedAt is when the apply was last updated.

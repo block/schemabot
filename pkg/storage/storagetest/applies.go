@@ -293,8 +293,6 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NotNil(t, marked)
 		assert.Equal(t, successor.ApplyIdentifier, marked.SupersededBy)
 		assert.Equal(t, state.Apply.Stopped, marked.State, "the handoff does not change the apply's own state")
-		assert.WithinDuration(t, beforeMark.UpdatedAt, marked.UpdatedAt, time.Second,
-			"marking preserves the lease heartbeat so a recovery claim is not delayed")
 
 		// Recording the same handoff again is the same fact, so a redelivery is
 		// not an error. A different successor is an ambiguous takeover and must
@@ -306,6 +304,17 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stillMarked)
 		assert.Equal(t, successor.ApplyIdentifier, stillMarked.SupersededBy)
+
+		// A marker that names nothing helps no operator: a row that does not
+		// exist is an error, and an apply cannot take over its own work — the
+		// marker is never cleared, so a self-referential handoff would refuse
+		// the apply forever while pointing back at itself.
+		require.ErrorIs(t, store.Applies().MarkSuperseded(ctx, holder.ID+100000, successor.ApplyIdentifier), storage.ErrApplyNotFound)
+		require.Error(t, store.Applies().MarkSuperseded(ctx, successor.ID, successor.ApplyIdentifier))
+		unmarked, err := store.Applies().Get(ctx, successor.ID)
+		require.NoError(t, err)
+		require.NotNil(t, unmarked)
+		assert.Empty(t, unmarked.SupersededBy, "a rejected self-referential handoff writes nothing")
 
 		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 			ApplyID:   holder.ID,
@@ -335,6 +344,38 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, storage.ControlRequestFailed, settled.Status)
 		assert.Contains(t, settled.ErrorMessage, successor.ApplyIdentifier,
 			"the failed start request names the apply that took the work over")
+	})
+
+	// Automatic retry is the one start surface with no operator request behind
+	// it: a fresh failed_retryable apply within budget is claimed and re-driven
+	// on the next poll, with nobody in the loop. Once another apply has taken
+	// over its unfinished work, that retry would replay statements against a
+	// target where the work already happened, so a superseded apply must never
+	// be selected for recovery — it stays failed_retryable for an operator to
+	// reconcile.
+	t.Run("SupersededMarker_ExcludesRetryableRecovery", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_retry_db", storage.DatabaseTypeMySQL)
+		// One target holds one active apply, so the unmarked baseline and the
+		// marked apply live in sibling environments; the retry claim arm keys on
+		// the row alone, not the target.
+		retryable := CreateApplyWithStateAndEnv(t, store, lock, "apply_retryable_unmarked", 911, state.Apply.FailedRetryable, "staging")
+		superseded := CreateApplyWithStateAndEnv(t, store, lock, "apply_retryable_superseded", 912, state.Apply.FailedRetryable, "production")
+		require.NoError(t, store.Applies().MarkSuperseded(ctx, superseded.ID, "apply_superseded_retry_successor"))
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, retryable.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "an unmarked fresh failed_retryable apply is claimable for automatic retry")
+
+		refused, err := store.Applies().ClaimApplyByID(ctx, superseded.ID, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, refused, "an apply whose work was taken over must not be selected for automatic retry")
+
+		final, err := store.Applies().Get(ctx, superseded.ID)
+		require.NoError(t, err)
+		require.NotNil(t, final)
+		assert.Equal(t, state.Apply.FailedRetryable, final.State, "the excluded apply keeps its state for an operator to reconcile")
 	})
 
 	t.Run("ConcurrentClaim_SingleWinner", func(t *testing.T) {
