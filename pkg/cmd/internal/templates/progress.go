@@ -443,7 +443,9 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 // isInstantAlter reports whether the table should be described as applying
 // instantly: the engine flagged it instant and it is an ALTER. Other
 // operations may complete without a row copy, but they are not instant DDL,
-// so they keep their generic applying labels.
+// so they keep their generic applying labels. ChangeType is populated for
+// every stored DDL change (storage rejects a blank operation), so an empty
+// value here means an unknown operation, not a missing field.
 func isInstantAlter(t TableProgress) bool {
 	return t.IsInstant && ddl.OpToStatementType(t.ChangeType) == ddl.StatementAlterTable
 }

@@ -523,6 +523,41 @@ func TestFormatTableProgress_InstantLabelIsAlterOnly(t *testing.T) {
 	}
 }
 
+// An engine can flag a whole apply instant while one of its ALTERs still row
+// copies (the flag is apply-scoped, the copy is table-scoped). The copying
+// table must show its real progress — the instant label is reserved for
+// tables with no row copy to report.
+func TestFormatTableProgress_InstantAlterRendering(t *testing.T) {
+	copying := TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255);",
+		Status:          state.Apply.Running,
+		IsInstant:       true,
+		RowsCopied:      250,
+		RowsTotal:       1000,
+		PercentComplete: 25,
+	}
+	output := FormatTableProgress(copying)
+	assert.Contains(t, output, "25%", "a copying instant-flagged ALTER shows its real percent")
+	assert.NotContains(t, output, "Applying instantly", "the instant label must not mask copy progress")
+
+	instant := TableProgress{
+		TableName:  "users",
+		ChangeType: "alter",
+		Status:     state.Apply.Running,
+		IsInstant:  true,
+	}
+	output = FormatTableProgress(instant)
+	assert.Contains(t, output, "Applying instantly...", "an instant ALTER with no row copy keeps the instant label")
+
+	plain := instant
+	plain.IsInstant = false
+	output = FormatTableProgress(plain)
+	assert.Contains(t, output, "Running...", "a non-instant ALTER with no row data gets the generic label")
+	assert.NotContains(t, output, "Applying instantly", "the instant label requires the engine flag")
+}
+
 func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	for _, changeType := range []string{"create", "drop"} {
 		tp := TableProgress{
