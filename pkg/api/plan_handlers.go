@@ -684,7 +684,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
-		GroupedExecution:  req.GroupedExecution,
+		// Always stated, never left absent: absence tells the data plane the
+		// caller predates the grouping choice, and this caller has made one.
+		GroupedExecution: new(req.GroupedExecution),
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest

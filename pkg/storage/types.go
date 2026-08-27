@@ -1201,6 +1201,12 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 // Grouping is opted into: Vitess groups because a deploy request covers the
 // whole change, and MySQL groups only when the caller asked to defer cutover so
 // every table can swap together. Everything else runs a table at a time.
+//
+// deferCutover must be the decision the drive will act on, not merely the
+// option the operator typed: a drive can defer cutover on its own (an
+// operation parked at a cutover barrier, see effectiveCopyDriveOptions in
+// pkg/tern), and a caller predicting for such an apply has to pass that
+// effective decision or its prediction describes the wrong shape.
 func GroupsEngineExecution(databaseType string, deferCutover bool) bool {
 	if databaseType == DatabaseTypeVitess {
 		return true

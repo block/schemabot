@@ -40,10 +40,12 @@ import (
 // this batch will never read.
 const sharedCheckpointTable = "_spirit_checkpoint"
 
-// copyDetectionTimeout bounds one existing-copy lookup: two small reads against
-// a target that is already being used for the plan or apply around it. Generous
-// enough that a loaded target still answers, short enough that an unresponsive
-// one costs a log line instead of a stalled apply.
+// copyDetectionTimeout bounds one existing-copy lookup — two small reads
+// against a target that is already being used for the plan or apply around it
+// — and equally the whole plan-side prediction across every batch it covers.
+// Generous enough that a loaded target still answers, short enough that an
+// unresponsive one costs a log line instead of a stalled plan or apply, no
+// matter how many batches the plan predicts.
 const copyDetectionTimeout = 10 * time.Second
 
 // existingCopy is a Spirit row copy found on a target: the shadow tables that
@@ -157,8 +159,29 @@ func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB
 		return nil
 	}
 
+	// One deadline covers the whole prediction: the per-lookup bound inside
+	// findExistingCopy cannot extend past it, so an unresponsive target costs
+	// the plan one timeout regardless of how many batches it runs.
+	ctx, cancel := context.WithTimeout(ctx, copyDetectionTimeout)
+	defer cancel()
+
 	var copies []*engine.ExistingCopy
+	evaluated := make(map[string]bool, len(batches))
 	for _, batch := range batches {
+		// An apply drives these batches in order, and the first batch that
+		// touches a table consumes whatever copy is there — it either resumes
+		// it through cutover or discards it before copying. A later batch on
+		// the same table therefore meets a target with nothing at stake, so
+		// only a table's first batch has a disposition worth disclosing.
+		if allTablesEvaluated(batch.Tables, evaluated) {
+			e.logger.Debug("an earlier batch of this plan consumes any copy of these tables, so this batch discloses nothing",
+				"database", database, "tables", batch.Tables)
+			continue
+		}
+		for _, table := range batch.Tables {
+			evaluated[table] = true
+		}
+
 		found, err := findExistingCopy(ctx, target, batch.Tables)
 		if err != nil {
 			// The raw error carries target infrastructure detail and a plan is
@@ -172,6 +195,17 @@ func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB
 		copies = append(copies, found.planned(database, batch.Statement, e.checkpointMaxAge)...)
 	}
 	return copies
+}
+
+// allTablesEvaluated reports whether every table in tables has already been
+// covered by an earlier batch of the same prediction.
+func allTablesEvaluated(tables []string, evaluated map[string]bool) bool {
+	for _, table := range tables {
+		if !evaluated[table] {
+			return false
+		}
+	}
+	return true
 }
 
 // spiritBatch is one unit of work an apply hands Spirit: the statement Spirit
@@ -316,11 +350,12 @@ func findExistingCopy(ctx context.Context, target *lazyTargetDB, tables []string
 	}
 
 	// The lookup describes an apply and decides nothing, so it must never be
-	// what holds one up. Neither caller's context carries a deadline: a plan
-	// serves an interactive comment, and an apply runs in the background for
-	// hours. Without a bound of its own, a target that accepts a connection and
-	// then stops answering would stall the fresh pool's dial or either query for
-	// as long as the operating system allows.
+	// what holds one up. An apply's context carries no deadline — it runs in
+	// the background for hours — so without a bound of its own, a target that
+	// accepts a connection and then stops answering would stall the fresh
+	// pool's dial or either query for as long as the operating system allows.
+	// A plan bounds its whole prediction with the same constant, and this
+	// nested deadline cannot extend that one.
 	ctx, cancel := context.WithTimeout(ctx, copyDetectionTimeout)
 	defer cancel()
 
@@ -380,8 +415,8 @@ func openCheckpointReader(ctx context.Context, dsn string) (*sql.DB, error) {
 
 // copiedTables returns the subset of tables that already have a Spirit shadow
 // table on the target, in the order they were given. The whole batch is asked
-// for in one query so that a plan against a clean target — the ordinary case —
-// costs the same whether the batch covers one table or fifty.
+// for in one query so that checking a batch against a clean target — the
+// ordinary case — costs one query whether it covers one table or fifty.
 func copiedTables(ctx context.Context, db *sql.DB, tables []string) ([]string, error) {
 	shadowOf := make(map[string]string, len(tables))
 	placeholders := make([]string, len(tables))

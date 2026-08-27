@@ -1634,17 +1634,24 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 }
 
 func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles, creds *engine.Credentials) (*engine.PlanResult, error) {
+	// The grouping the apply will run under decides which stored progress it
+	// can continue, so a prediction made here has to use the caller's, not
+	// this engine's default. A caller that leaves the field absent predates
+	// the choice and cannot state one; predicting the joined batch for it errs
+	// toward disclosing a discard rather than promising a resume the apply
+	// will not perform.
+	groupedExecution := true
+	if req.GroupedExecution != nil {
+		groupedExecution = req.GetGroupedExecution()
+	}
 	return eng.Plan(ctx, &engine.PlanRequest{
-		Database:     database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  schemaFiles,
-		Repository:   req.Repository,
-		PullRequest:  int(req.PullRequest),
-		Credentials:  creds,
-		// The grouping the apply will run under decides which stored progress
-		// it can continue, so a prediction made here has to use the caller's,
-		// not this engine's default.
-		GroupedExecution: req.GetGroupedExecution(),
+		Database:         database,
+		DatabaseType:     c.config.Type,
+		SchemaFiles:      schemaFiles,
+		Repository:       req.Repository,
+		PullRequest:      int(req.PullRequest),
+		Credentials:      creds,
+		GroupedExecution: groupedExecution,
 	})
 }
 
