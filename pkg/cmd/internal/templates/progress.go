@@ -1194,7 +1194,7 @@ func writeStatusListFooter(data StatusListData) {
 	// control-plane apply ids only. Point the operator at the list that
 	// shows them instead of promising a drill-down this column can't feed.
 	if data.Deployment != "" {
-		fmt.Printf("%sAPPLY ID is the deployment's data-plane apply id when one is recorded. '%s status <apply_id>' takes the control-plane apply id — list without --deployment to see it%s\n", ANSIDim, cliname.Name(), ANSIReset)
+		fmt.Printf("%sUse '%s status <apply_id>' to view details — drop --deployment for the ids it accepts%s\n", ANSIDim, cliname.Name(), ANSIReset)
 		return
 	}
 	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)

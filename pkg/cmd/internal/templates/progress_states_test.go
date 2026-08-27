@@ -233,9 +233,8 @@ func TestWriteStatusListDeploymentRendersDataPlaneApplyID(t *testing.T) {
 	assert.NotContains(t, output, "apply-running",
 		"the deployment view renders the data-plane apply id in place of the control-plane one")
 	assert.Contains(t, output, "deploy-a")
-	assert.Contains(t, output, "APPLY ID is the deployment's data-plane apply id when one is recorded",
-		"the footer must not promise a status drill-down with an id the column doesn't carry")
-	assert.NotContains(t, output, "Use 'schemabot status <apply_id>' to view details")
+	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details — drop --deployment for the ids it accepts",
+		"the footer must say where the ids the drill-down accepts are listed, since this column doesn't carry them")
 }
 
 // A deployment row without a recorded data-plane apply id — not yet
