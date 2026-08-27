@@ -258,6 +258,32 @@ func (s *staticApplyStore) Update(_ context.Context, apply *storage.Apply) error
 	return s.err
 }
 
+// UpdateDerivedState compare-and-swaps against the stored row like the real
+// store: the write lands only when the row still holds expectedState, so tests
+// can advance the row independently of the snapshot a handler is working from.
+func (s *staticApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
+	if s.err != nil {
+		return false, s.err
+	}
+	apply := s.apply
+	for _, candidate := range s.applies {
+		if candidate.ID == applyID {
+			apply = candidate
+			break
+		}
+	}
+	if apply == nil || !state.IsState(apply.State, expectedState) {
+		return false, nil
+	}
+	apply.State = newState
+	apply.ErrorMessage = errorMessage
+	if apply.StartedAt == nil {
+		apply.StartedAt = startedAt
+	}
+	apply.CompletedAt = completedAt
+	return true, nil
+}
+
 type recentApplyStore struct {
 	storage.ApplyStore
 	filters []storage.RecentAppliesFilter

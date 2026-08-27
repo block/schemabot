@@ -1920,7 +1920,9 @@ func TestApplyStore_UpdateBlocksActiveApplyForSameTarget(t *testing.T) {
 
 	active.State = state.Apply.Completed
 	require.NoError(t, store.Applies().Update(ctx, active))
-	require.NoError(t, store.Applies().Update(ctx, completed))
+	// With the target free, the terminal row is still not resurrectable through
+	// a general update: only the dedicated transitions reopen a settled apply.
+	require.ErrorIs(t, store.Applies().Update(ctx, completed), storage.ErrApplyTerminalStateImmutable)
 }
 
 func TestApplyStore_UpdateNonExistent(t *testing.T) {
@@ -1933,9 +1935,88 @@ func TestApplyStore_UpdateNonExistent(t *testing.T) {
 		State: state.Apply.Running,
 	}
 
-	// Update on a non-existent row is a no-op (0 rows affected), not an error.
-	// MySQL UPDATE with WHERE id=? succeeds even when no row matches.
-	require.NoError(t, store.Applies().Update(ctx, apply))
+	// An update to an active state re-reads the row when nothing matched, so a
+	// missing row surfaces as ErrApplyNotFound instead of a silent no-op.
+	require.ErrorIs(t, store.Applies().Update(ctx, apply), storage.ErrApplyNotFound)
+}
+
+// TestApplyStore_UpdateRefusesTerminalToActive verifies that a settled apply is
+// immutable through a general update: a caller writing an active state from a
+// stale in-memory snapshot must not resurrect a completed, failed, or stopped
+// apply. A settled apply re-enters the active lifecycle only through the
+// dedicated guarded transition of claiming a stopped apply.
+func TestApplyStore_UpdateRefusesTerminalToActive(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+
+	cases := []struct {
+		name          string
+		applyID       string
+		planID        int64
+		terminalState string
+		activeState   string
+	}{
+		{"completed to running", "apply_guard_completed", 401, state.Apply.Completed, state.Apply.Running},
+		{"failed to failed_retryable", "apply_guard_failed", 402, state.Apply.Failed, state.Apply.FailedRetryable},
+		{"stopped to resuming", "apply_guard_stopped", 403, state.Apply.Stopped, state.Apply.Resuming},
+		{"cancelled to pending", "apply_guard_cancelled", 404, state.Apply.Cancelled, state.Apply.Pending},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A driver's stale snapshot: taken while the apply was active, used
+			// for a write after another writer settled the row.
+			apply := createTestApply(t, store, lock, tc.applyID, tc.planID)
+			snapshot := *apply
+
+			now := time.Now()
+			apply.State = tc.terminalState
+			apply.CompletedAt = &now
+			require.NoError(t, store.Applies().Update(ctx, apply))
+
+			snapshot.State = tc.activeState
+			require.ErrorIs(t, store.Applies().Update(ctx, &snapshot), storage.ErrApplyTerminalStateImmutable)
+
+			stored, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.terminalState, stored.State)
+			assert.NotNil(t, stored.CompletedAt)
+		})
+	}
+}
+
+// TestApplyStore_UpdateTerminalToTerminalAllowed verifies that terminal rows
+// stay writable for terminal outcomes: a failed apply can refresh its error
+// message, and a stopped apply can be corrected to another terminal verdict,
+// without reopening the apply.
+func TestApplyStore_UpdateTerminalToTerminalAllowed(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := New(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql", "staging")
+
+	failed := createTestApplyWithStateAndEnv(t, store, lock, "apply_terminal_refresh", 405, state.Apply.Failed, "staging")
+	failed.ErrorMessage = "engine failure: table copy interrupted"
+	require.NoError(t, store.Applies().Update(ctx, failed))
+
+	stored, err := store.Applies().Get(ctx, failed.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, stored.State)
+	assert.Equal(t, "engine failure: table copy interrupted", stored.ErrorMessage)
+
+	stopped := createTestApplyWithStateAndEnv(t, store, lock, "apply_terminal_correct", 406, state.Apply.Stopped, "staging")
+	now := time.Now()
+	stopped.State = state.Apply.Cancelled
+	stopped.CompletedAt = &now
+	require.NoError(t, store.Applies().Update(ctx, stopped))
+
+	stored, err = store.Applies().Get(ctx, stopped.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Cancelled, stored.State)
+	assert.NotNil(t, stored.CompletedAt)
 }
 
 // TestApplyStore_UpdateDerivedState verifies the rollout-projection compare-and-
@@ -3767,7 +3848,7 @@ func TestApplyStore_UpdateOptions(t *testing.T) {
 		PullRequest:     123,
 		Environment:     "staging",
 		Engine:          "spirit",
-		State:           state.Apply.Stopped,
+		State:           state.Apply.Pending,
 	}
 	apply.SetOptions(storage.ApplyOptions{Target: "testdb"})
 
@@ -3776,7 +3857,7 @@ func TestApplyStore_UpdateOptions(t *testing.T) {
 
 	retrieved, err := store.Applies().Get(ctx, id)
 	require.NoError(t, err)
-	retrieved.State = state.Apply.Pending
+	retrieved.State = state.Apply.Running
 
 	require.NoError(t, store.Applies().Update(ctx, retrieved))
 
