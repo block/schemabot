@@ -653,7 +653,8 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		Tables: []TableProgressData{{
 			TableName: "users", Status: "running", PercentComplete: 50,
 			Shards: []ShardProgressData{
-				{Shard: "-80", Status: "completed", PercentComplete: 100},
+				{Shard: "-40", Status: "completed", PercentComplete: 100},
+				{Shard: "40-80", Status: "running"},
 				{Shard: "80-c0", Status: "running", PercentComplete: 45},
 				{Shard: "c0-e0", Status: "failed"},
 				{Shard: "e0-", Status: "waiting_for_cutover", PercentComplete: 100},
@@ -661,8 +662,14 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		}},
 	})
 	assert.Contains(t, inline, "shards:")
-	assert.Contains(t, inline, "✓ -80")
+	// A completed shard's glyph is self-evident — bare, no word before the
+	// separator.
+	assert.Contains(t, inline, "✓ -40 ·")
 	assert.Contains(t, inline, "◐ 80-c0 45%")
+	// A copying shard that has not reported progress yet reads "copying"
+	// instead of a misleading 0%.
+	assert.Contains(t, inline, "◐ 40-80 copying")
+	assert.NotContains(t, inline, "◐ 40-80 0%")
 	assert.Contains(t, inline, "✗ c0-e0 failed")
 	// A shard waiting for cutover reads "ready" with no percent (it is no
 	// longer copying).

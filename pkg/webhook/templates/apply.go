@@ -969,8 +969,9 @@ func shardGlyph(status string) string {
 
 // shardStatusWord returns the word the bucketed summary pairs with a shard's
 // glyph, for glyphs a reader can't decode on sight. Self-evident glyphs
-// (✓ complete, ⏳ queued) return ""; copying shards return "copying", which
-// the caller replaces with a percent when one is available.
+// (✓ complete, ⏳ queued) return "", and so does the unknown-status catch-all
+// — the bucketed form keeps its "…" bucket bare too. Copying shards return
+// "copying", which the caller replaces with a percent when one is available.
 func shardStatusWord(status string) string {
 	switch state.NormalizeShardStatus(status) {
 	case state.Task.WaitingForCutover:
