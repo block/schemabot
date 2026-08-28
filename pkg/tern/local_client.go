@@ -2032,6 +2032,10 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 // change). Attaching it unconditionally would create spurious vschema_update
 // tasks on DDL-only plans, since Vitess always ships a vschema.json schema file.
 func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
 	namespaces := map[string]*storage.NamespacePlanData{}
 	vschemaChangedNamespaces := map[string]bool{}
 	ensure := func(ns string) *storage.NamespacePlanData {
@@ -2063,7 +2067,7 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			}
 			continue
 		}
-		op, err := materializedTableChangeOperation(ch)
+		op, err := materializedTableChangeOperation(parser, ch)
 		if err != nil {
 			return nil, err
 		}
@@ -2093,20 +2097,20 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 // materializedTableChangeOperation recovers the storage operation for a
 // materialized table change. The proto change type is authoritative when it maps
 // to a known DDL action; otherwise the operation is classified from the request's
-// authoritative DDL so an unmapped change type does not persist an "unknown"
-// action that would resume as a no-op.
-func materializedTableChangeOperation(ch *ternv1.TableChange) (string, error) {
+// authoritative DDL with the target dialect's parser so an unmapped change type
+// does not persist an "unknown" action that would resume as a no-op.
+func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.TableChange) (string, error) {
 	if op := protoChangeTypeToDDLAction(ch.ChangeType); op != "unknown" {
 		return op, nil
 	}
 	if strings.TrimSpace(ch.Ddl) == "" {
 		return "", fmt.Errorf("table change for %q has an unrecognized change type and no DDL to classify", ch.TableName)
 	}
-	op, _, err := ddl.ClassifyStatementOp(ch.Ddl)
+	statementType, _, err := parser.Classify(ch.Ddl)
 	if err != nil {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
 	}
-	return op, nil
+	return ddl.StatementTypeToOp(statementType), nil
 }
 
 func rejectUnsafeDDLChangesWithoutOptIn(planIdentifier string, changes []storage.TableChange, applyOpts storage.ApplyOptions) error {

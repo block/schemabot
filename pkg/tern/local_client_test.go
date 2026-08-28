@@ -37,6 +37,53 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
 }
 
+func TestMaterializedTableChangeOperation(t *testing.T) {
+	t.Run("Postgres fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE t (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), created_at timestamptz)",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "create", op)
+	})
+
+	t.Run("MySQL fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE `t` (`id` bigint NOT NULL) ENGINE=InnoDB",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "create", op)
+	})
+
+	t.Run("proto change type is authoritative", func(t *testing.T) {
+		op, err := materializedTableChangeOperation(nil, &ternv1.TableChange{
+			TableName:  "t",
+			Ddl:        "not valid SQL",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "truncate", op)
+	})
+
+	t.Run("empty DDL with unrecognized type", func(t *testing.T) {
+		op, err := materializedTableChangeOperation(nil, &ternv1.TableChange{TableName: "t"})
+
+		require.Error(t, err)
+		assert.Empty(t, op)
+		assert.ErrorContains(t, err, "unrecognized change type and no DDL to classify")
+	})
+}
+
 func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 	logs := &mockApplyLogStore{}
 	client := &LocalClient{storage: &mockStorage{applies: &mockApplyStore{}, logs: logs}}

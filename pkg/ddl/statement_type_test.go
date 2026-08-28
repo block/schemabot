@@ -53,3 +53,20 @@ func TestIndexStatementOperationRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+func TestTableStatementOperationRoundTrip(t *testing.T) {
+	tests := []struct {
+		statement StatementType
+		op        string
+	}{
+		{statement: StatementTruncateTable, op: "truncate"},
+		{statement: StatementCreateView, op: "create_view"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.op, func(t *testing.T) {
+			assert.Equal(t, tt.op, StatementTypeToOp(tt.statement))
+			assert.Equal(t, tt.statement, OpToStatementType(tt.op))
+		})
+	}
+}
