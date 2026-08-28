@@ -4968,6 +4968,11 @@ func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
 // planner sorts the full candidate set, and under FOR UPDATE that locks every
 // claimable row before LIMIT 1 applies — turning SKIP LOCKED into a serializer
 // that makes drivers contend instead of claiming distinct rows in parallel.
+//
+// This asserts the index the bootstrapper actually created on the live MySQL
+// store, under the name MySQL's table-scoped naming gives it. The PostgreSQL
+// counterpart carries a different name because its index names are schema-wide;
+// the schema parity tests pin it by shape rather than by name.
 func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
 	ctx := t.Context()
 
