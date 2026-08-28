@@ -96,8 +96,10 @@ func TestRunFollowLoop(t *testing.T) {
 	fetch, limits := scriptedFetch(script)
 
 	printed := make(chan *client.LogEntry, 64)
+	initials := make(chan bool, 64)
 	state := &followState{}
-	emit := func(logs []*client.LogEntry) {
+	emit := func(logs []*client.LogEntry, initial bool) {
+		initials <- initial
 		for _, log := range state.advance(logs) {
 			printed <- log
 		}
@@ -146,13 +148,26 @@ func TestRunFollowLoop(t *testing.T) {
 	for _, limit := range seen[1:] {
 		assert.Equal(t, followFetchLimit, limit, "follow polls use the bounded fetch window")
 	}
+
+	// Only the first render is the operator's own window, so only it may report
+	// that history precedes the tail.
+	close(initials)
+	var renders []bool
+	for initial := range initials {
+		renders = append(renders, initial)
+	}
+	require.NotEmpty(t, renders)
+	assert.True(t, renders[0], "the first render is the initial window")
+	for _, initial := range renders[1:] {
+		assert.False(t, initial, "later renders are polls, not the initial window")
+	}
 }
 
 // TestRunFollowLoopInitialFetchFails verifies that a broken endpoint fails the
 // command immediately rather than tailing nothing.
 func TestRunFollowLoopInitialFetchFails(t *testing.T) {
 	fetch, _ := scriptedFetch([]followFetchResult{{err: fmt.Errorf("endpoint unreachable")}})
-	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry) {}, 3, time.Millisecond)
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, time.Millisecond)
 	require.ErrorContains(t, err, "fetch initial log window")
 	require.ErrorContains(t, err, "endpoint unreachable")
 }
@@ -226,6 +241,28 @@ func TestDeploymentFollowStateAdvance(t *testing.T) {
 	})
 	assert.Empty(t, batches)
 	assert.Empty(t, warnings)
+}
+
+// TestDeploymentFollowStateCarriesPerSourceTruncation verifies that each
+// source's window signal rides its own batch: a fan-out where one target has
+// more history than the window holds must not make the other target's complete
+// tail look partial, or vice versa.
+func TestDeploymentFollowStateCarriesPerSourceTruncation(t *testing.T) {
+	state := newDeploymentFollowState()
+
+	truncated := deploymentFollowSource("target-a", "remote-1", 1, 2)
+	truncated.Truncated = true
+	batches, _ := state.advance(&apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{
+			truncated,
+			deploymentFollowSource("target-b", "remote-2", 1),
+		},
+	})
+	require.Len(t, batches, 2)
+	assert.Equal(t, "target-a / spirit (remote-1)", batches[0].label)
+	assert.True(t, batches[0].truncated, "the source with older entries reports its window is partial")
+	assert.Equal(t, "target-b / spirit (remote-2)", batches[1].label)
+	assert.False(t, batches[1].truncated, "a complete source is not marked partial by a sibling")
 }
 
 // TestDeploymentFollowStateWarnings verifies that a persistently failing

@@ -107,13 +107,14 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 
 	logs, err := s.storage.ApplyLogs().List(r.Context(), storage.ApplyLogFilter{
 		ApplyID: apply.ID,
-		Limit:   limit,
+		Limit:   logFetchLimit(limit),
 	})
 	if err != nil {
 		s.logger.Error("failed to get logs", append(apply.LogAttrs(), "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to get logs")
 		return
 	}
+	logs, truncated := clampLogWindow(logs, limit)
 
 	// Convert to response format
 	logEntries := make([]map[string]any, len(logs))
@@ -139,9 +140,33 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"logs":     logEntries,
-		"apply_id": apply.ApplyIdentifier,
+		"logs":      logEntries,
+		"apply_id":  apply.ApplyIdentifier,
+		"truncated": truncated,
 	})
+}
+
+// logFetchLimit is how many entries to read for a requested window of limit
+// entries. Reads take one extra entry so a full window can report that older
+// entries exist beyond it: an operator triaging an apply needs to know the
+// lifecycle they are looking at is partial, not that nothing else happened.
+// A window at the edge of the wire limit cannot be over-fetched, and is
+// reported untruncated rather than approximated.
+func logFetchLimit(limit int) int {
+	if limit <= 0 || limit >= math.MaxInt32 {
+		return limit
+	}
+	return limit + 1
+}
+
+// clampLogWindow trims an over-fetched read down to limit and reports whether
+// older entries were left behind. Reads are ordered oldest to newest, so the
+// entries beyond the window are at the front.
+func clampLogWindow[T any](logs []T, limit int) ([]T, bool) {
+	if limit <= 0 || len(logs) <= limit {
+		return logs, false
+	}
+	return logs[len(logs)-limit:], true
 }
 
 type deploymentLogFetch struct {
@@ -222,7 +247,7 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	requestLimit := int32(min(int64(limit), math.MaxInt32))
+	requestLimit := int32(min(int64(logFetchLimit(limit)), math.MaxInt32))
 	for _, key := range keys {
 		fetch := fetches[key]
 		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: requestLimit})
@@ -231,8 +256,9 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
 			continue
 		}
-		source := &apitypes.DeploymentLogSource{ExternalID: fetch.externalID, Operations: fetch.operations, Logs: []*apitypes.LogEntry{}}
-		for _, log := range resp.Logs {
+		remoteLogs, truncated := clampLogWindow(resp.Logs, limit)
+		source := &apitypes.DeploymentLogSource{ExternalID: fetch.externalID, Operations: fetch.operations, Logs: []*apitypes.LogEntry{}, Truncated: truncated}
+		for _, log := range remoteLogs {
 			entry, convertErr := deploymentLogEntry(fetch.externalID, log)
 			if convertErr != nil {
 				s.recordDeploymentLogFailure(apply, deployment, fetch, convertErr)
