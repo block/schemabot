@@ -18,21 +18,6 @@ import (
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 )
 
-// levelCapturingLogger records both info and error logs so tests can assert
-// that a skipped GitHub side effect was logged with triage identifiers.
-type levelCapturingLogger struct {
-	infos  []capturedLog
-	errors []capturedLog
-}
-
-func (l *levelCapturingLogger) Info(msg string, args ...any) {
-	l.infos = append(l.infos, capturedLog{msg: msg, args: args})
-}
-
-func (l *levelCapturingLogger) Error(msg string, args ...any) {
-	l.errors = append(l.errors, capturedLog{msg: msg, args: args})
-}
-
 // operationScopedApplyFixture is one seeded apply whose work runs under
 // operation leases: two keyed non-terminal operation rows, no lease on the
 // parent applies row, and a tracked progress comment ready to edit.
@@ -193,7 +178,7 @@ func TestObserverEditsProgressCommentForOperationScopedApply(t *testing.T) {
 		PR:             fx.apply.PullRequest,
 		InstallationID: fx.apply.InstallationID,
 		ApplyID:        fx.apply.ID,
-		Logger:         &levelCapturingLogger{},
+		Logger:         &capturingLogger{},
 	})
 
 	obs.OnProgress(fx.apply, fx.tasks)
@@ -224,7 +209,7 @@ func TestConcurrentObserversShareOneProgressCommentAuthority(t *testing.T) {
 	installClient, capture := setupFakeGitHubForComments(t)
 	capture.setBody(fx.progressCommentID, "seed progress body")
 
-	newObserver := func(owner string, logger *levelCapturingLogger) *CommentObserver {
+	newObserver := func(owner string, logger *capturingLogger) *CommentObserver {
 		obs := NewCommentObserver(CommentObserverConfig{
 			GHClient:       &fakeClientFactory{client: installClient},
 			Storage:        fx.st,
@@ -238,7 +223,7 @@ func TestConcurrentObserversShareOneProgressCommentAuthority(t *testing.T) {
 		return obs
 	}
 
-	winner := newObserver("pod-a/1/comment-observer", &levelCapturingLogger{})
+	winner := newObserver("pod-a/1/comment-observer", &capturingLogger{})
 	winner.OnProgress(fx.apply, fx.tasks)
 
 	select {
@@ -248,7 +233,7 @@ func TestConcurrentObserversShareOneProgressCommentAuthority(t *testing.T) {
 		t.Fatal("timed out waiting for the winner's progress comment edit")
 	}
 
-	loserLogger := &levelCapturingLogger{}
+	loserLogger := &capturingLogger{}
 	loser := newObserver("pod-b/2/comment-observer", loserLogger)
 	loser.OnProgress(fx.apply, fx.tasks)
 
@@ -259,7 +244,7 @@ func TestConcurrentObserversShareOneProgressCommentAuthority(t *testing.T) {
 	assert.Equal(t, "pod-a/1/comment-observer", owner.String, "the loser must not take the authority over")
 
 	var loggedSkip bool
-	for _, entry := range loserLogger.infos {
+	for _, entry := range loserLogger.debugs {
 		if entry.msg != "observer: progress-comment authority not won (held by another observer, or no tracked comment row yet); skipping GitHub side effect" {
 			continue
 		}
@@ -295,7 +280,7 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 	installClient, capture := setupFakeGitHubForComments(t)
 	capture.setBody(fx.progressCommentID, "seed progress body")
 
-	newObserver := func(lease storage.ApplyLease, logger *levelCapturingLogger) *CommentObserver {
+	newObserver := func(lease storage.ApplyLease, logger *capturingLogger) *CommentObserver {
 		return NewCommentObserver(CommentObserverConfig{
 			GHClient:       &fakeClientFactory{client: installClient},
 			Storage:        fx.st,
@@ -308,7 +293,7 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 		})
 	}
 
-	holder := newObserver(apply.Lease(), &levelCapturingLogger{})
+	holder := newObserver(apply.Lease(), &capturingLogger{})
 	holder.OnProgress(apply, fx.tasks)
 
 	select {
@@ -323,7 +308,7 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 
 	// A stale observer whose captured lease was rotated away must skip while
 	// the row is held by another driver — the lease stays authoritative.
-	staleLogger := &levelCapturingLogger{}
+	staleLogger := &capturingLogger{}
 	stale := newObserver(storage.ApplyLease{ApplyID: apply.ID, Owner: "old-driver", Token: "rotated-away"}, staleLogger)
 	stale.OnProgress(apply, fx.tasks)
 
@@ -335,4 +320,41 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 		}
 	}
 	assert.True(t, loggedSkip, "the stale observer must log its skipped edit")
+}
+
+// The observer's tick works from a poller snapshot that can predate a
+// dispatch wave re-claiming the parent apply lease. The authority gate
+// re-reads the apply row before claiming, so an observer holding a stale
+// no-lease snapshot skips every GitHub side effect while the wave's lease
+// holder owns the comment — and never records a durable authority alongside
+// the live lease.
+func TestParentLeaseReclaimAfterSnapshotDeniesAuthority(t *testing.T) {
+	fx := seedOperationScopedApply(t, "org/authority-reclaim", "authority_reclaim_db")
+	ctx := t.Context()
+
+	installClient, capture := setupFakeGitHubForComments(t)
+	capture.setBody(fx.progressCommentID, "seed progress body")
+
+	obs := NewCommentObserver(CommentObserverConfig{
+		GHClient:       &fakeClientFactory{client: installClient},
+		Storage:        fx.st,
+		Repo:           fx.apply.Repository,
+		PR:             fx.apply.PullRequest,
+		InstallationID: fx.apply.InstallationID,
+		ApplyID:        fx.apply.ID,
+		Logger:         &capturingLogger{},
+	})
+
+	// A dispatch wave claims the parent apply after the observer's snapshot
+	// (fx.apply) was taken, so the snapshot still records no lease.
+	_, err := fx.db.ExecContext(ctx, `
+		UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = ? WHERE id = ?
+	`, "driver-host/9/dispatch", "wave-token", time.Now(), fx.apply.ID)
+	require.NoError(t, err)
+
+	obs.OnProgress(fx.apply, fx.tasks)
+
+	requireNoGitHubCalls(t, capture)
+	owner := progressObserverOwner(t, fx.db, fx.apply.ID)
+	assert.False(t, owner.Valid, "no durable authority may be recorded while a driver holds the parent lease")
 }

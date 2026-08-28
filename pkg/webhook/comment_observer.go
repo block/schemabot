@@ -33,6 +33,7 @@ type CommentObserver struct {
 	supportChannel api.SupportChannelConfig
 	tenant         string
 	logger         interface {
+		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
@@ -107,6 +108,18 @@ type CommentObserver struct {
 	// but whose tracking write failed, so later ticks adopt it (retry the write
 	// with the known comment ID) instead of posting a duplicate.
 	pendingRotation *pendingProgressRotation
+
+	// authorityMu guards the per-callback memo of the durable progress-comment
+	// authority decision below. It is separate from mu because OnProgress holds
+	// mu for its entire tick while OnTerminal runs without it, and the gate is
+	// reached from inside both.
+	authorityMu sync.Mutex
+	// authorityDecided marks that the authority decision was already made
+	// during the current observer callback, so the gate's later invocations on
+	// the same callback reuse authorityHeld instead of re-reading storage and
+	// re-writing the claim row. Each callback starts with a fresh decision.
+	authorityDecided bool
+	authorityHeld    bool
 }
 
 // pendingProgressRotation identifies a rotation progress comment that was
@@ -155,6 +168,7 @@ type CommentObserverConfig struct {
 	Tenant string
 
 	Logger interface {
+		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
@@ -250,6 +264,7 @@ func NewAggregateTerminalCommentObserver(cfg CommentObserverConfig) *CommentObse
 func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "progress") {
 		return
 	}
@@ -408,6 +423,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 // Edits the active comment to final state, posts summary comment,
 // and updates check runs.
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return
 	}
@@ -773,17 +789,60 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 // so the progress comment would otherwise go silent for the whole rollout and
 // operators would read a live apply as dead. The authority granted here is
 // durable and cross-pod safe: a compare-and-swap ownership recorded on the
-// tracked progress comment row (see ClaimProgressCommentAuthority), renewed on
-// every admitted side effect, so exactly one observer at a time edits the
-// comment and a crashed holder hands over only after its heartbeat goes stale.
-// It is granted only while operation-scoped work is in flight — an apply that
-// holds (or should hold) a parent lease stays governed by the lease checks.
+// tracked progress comment row (see ClaimProgressCommentAuthority), so among
+// authority-path observers at most one at a time edits the comment and a
+// crashed holder hands over only after its heartbeat goes stale. A
+// lease-admitted observer is governed by the lease checks instead and never
+// touches the recorded authority. It is granted only while operation-scoped
+// work is in flight — an apply that holds (or should hold) a parent lease
+// stays governed by the lease checks.
+//
+// The decision is made once per observer callback against freshly read
+// storage rows — including a re-read of the parent lease columns, so a
+// dispatch wave that re-claimed the parent since the poller's snapshot denies
+// the authority — then reused by the callback's remaining side-effect checks.
+// Claiming once per callback also renews the holder's heartbeat well inside
+// its staleness window.
 func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Apply, operation string) bool {
 	if apply == nil {
 		o.logError(apply, "observer: apply lease unavailable and no apply loaded to resolve progress-comment authority; skipping GitHub side effect",
 			"operation", operation)
 		return false
 	}
+	o.authorityMu.Lock()
+	if o.authorityDecided {
+		held := o.authorityHeld
+		o.authorityMu.Unlock()
+		if !held {
+			o.logger.Debug("observer: progress-comment authority already denied this callback; skipping GitHub side effect",
+				append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner)...)
+		}
+		return held
+	}
+	o.authorityMu.Unlock()
+
+	held := o.decideProgressCommentAuthority(apply, operation)
+	o.authorityMu.Lock()
+	o.authorityDecided, o.authorityHeld = true, held
+	o.authorityMu.Unlock()
+	return held
+}
+
+// resetProgressCommentAuthorityDecision discards the previous callback's
+// authority decision so the next gate invocation decides afresh.
+func (o *CommentObserver) resetProgressCommentAuthorityDecision() {
+	o.authorityMu.Lock()
+	o.authorityDecided = false
+	o.authorityHeld = false
+	o.authorityMu.Unlock()
+}
+
+// decideProgressCommentAuthority performs the storage reads and the claim
+// behind progressCommentAuthorityOwnsObserver, in fail-closed order: no
+// operation-scoped work in flight denies, a fresh parent-lease re-read
+// showing a holder or a terminal apply denies, and only then is the durable
+// claim attempted.
+func (o *CommentObserver) decideProgressCommentAuthority(apply *storage.Apply, operation string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -799,6 +858,33 @@ func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Ap
 		return false
 	}
 
+	// The apply passed in is the poller's snapshot, up to a tick old. Re-read
+	// the row before claiming: a dispatch wave may have re-claimed the parent
+	// lease since the snapshot — its holder is governed by the lease checks
+	// and owns the comment while the lease lasts — or the projection may have
+	// settled the apply terminal, handing the comment to the terminal publish.
+	fresh, err := o.stor.Applies().Get(ctx, o.applyID)
+	if err != nil {
+		o.logger.Error("observer: failed to re-read the apply for the progress-comment authority; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "error", err)...)
+		return false
+	}
+	if fresh == nil {
+		o.logger.Error("observer: apply row no longer exists for the progress-comment authority; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation)...)
+		return false
+	}
+	if fresh.Lease().Valid() {
+		o.logger.Debug("observer: parent apply lease re-claimed since the poller snapshot; the lease holder owns the comment, skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "lease_owner", fresh.LeaseOwner)...)
+		return false
+	}
+	if state.IsTerminalApplyState(fresh.State) {
+		o.logger.Debug("observer: apply settled terminal since the poller snapshot; the terminal publish owns the comment, skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "fresh_state", fresh.State)...)
+		return false
+	}
+
 	held, err := o.stor.ApplyComments().ClaimProgressCommentAuthority(ctx, o.applyID, o.authorityOwner)
 	if err != nil {
 		o.logger.Error("observer: failed to claim progress-comment authority; skipping GitHub side effect",
@@ -809,8 +895,8 @@ func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Ap
 		// The claim was not won: either another observer holds a fresh
 		// authority (its edits carry the PR), or no tracked progress comment
 		// row exists yet to claim (nothing to edit either way). Expected on
-		// every peer pod polling the same apply, hence Info.
-		o.logger.Info("observer: progress-comment authority not won (held by another observer, or no tracked comment row yet); skipping GitHub side effect",
+		// every peer pod polling the same apply, hence Debug.
+		o.logger.Debug("observer: progress-comment authority not won (held by another observer, or no tracked comment row yet); skipping GitHub side effect",
 			append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner)...)
 		return false
 	}
@@ -821,11 +907,16 @@ func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Ap
 // is still in flight under operation-scoped dispatch — the one shape whose
 // parent apply lease is legitimately unheld mid-apply. True when the apply is
 // non-terminal and either its generation manifest still lists keys with no
-// attached operation (the dispatcher owes more dispatch waves) or an attached
-// operation-keyed row has not reached a terminal state. Whole-deployment
-// operations (empty key) are deliberately not counted: their drives hold the
-// parent apply lease, so for them an unheld lease means no driver, and the
-// lease checks stay authoritative.
+// attached operation (the dispatcher owes more dispatch waves) or the apply
+// has multiple attached operations with a keyed row not yet terminal. A
+// single attached operation is deliberately not counted, matching the
+// operator's drive-mode split: that shape drives under the parent apply
+// lease, so an unheld lease there means no driver and the lease checks stay
+// authoritative. (The one single-operation drive that runs under the
+// operation lease — a task-less operation — fails closed here too; it has no
+// task progress to report and its terminal comment is published by the
+// aggregate projection winner.) Whole-deployment operations (empty key) are
+// likewise not counted, whatever their number.
 func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply *storage.Apply) (bool, error) {
 	if state.IsTerminalApplyState(apply.State) {
 		return false, nil
@@ -837,8 +928,11 @@ func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply
 	if len(apply.MissingExpectedOperationKeys(ops)) > 0 {
 		return true, nil
 	}
+	if len(ops) <= 1 {
+		return false, nil
+	}
 	for _, op := range ops {
-		if op.OperationKey != "" && !state.IsTerminalApplyState(op.State) {
+		if op.OperationKey != "" && !state.IsApplyOperationTerminal(op.State) {
 			return true, nil
 		}
 	}
