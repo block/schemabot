@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -177,9 +178,17 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// per-table task (a VSchema-only apply has no tables at all).
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
-	// Error message for apply states that need operator triage.
-	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
-		writeErrorBlock(&sb, data.ErrorMessage)
+	// Error message for apply states that need operator attention. A failed
+	// apply gets the failure glyph — the system stopped and triage is due; a
+	// stopped apply gets the attention glyph — the heading already says the
+	// operator paused it, and the error is context, not a fresh failure.
+	if data.ErrorMessage != "" {
+		switch {
+		case state.IsState(data.State, state.Apply.Failed):
+			writeErrorBlock(&sb, glyph.Failed, data.ErrorMessage)
+		case state.IsState(data.State, state.Apply.Stopped):
+			writeErrorBlock(&sb, glyph.Attention, data.ErrorMessage)
+		}
 	}
 
 	// Footer with next actions
@@ -220,7 +229,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Schema Change Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
@@ -242,7 +251,7 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Rollback Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
@@ -806,15 +815,15 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 		// at all, so its failure label does not mention one.
 		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
 		case pct > 0:
-			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
+			fmt.Fprintf(sb, "**`%s`**: %s "+glyph.Failed+" Failed\n", table.TableName, ui.ProgressBarFailed(pct))
 		case table.IsInstant:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed\n", table.TableName)
 		default:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed (before row copy started)\n", table.TableName)
 		}
 		writeDDLLine(sb, table.DDL)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			writeTableErrorLine(sb, glyph.Failed, table.ErrorMessage)
 		}
 
 	case state.Task.FailedRetryable:
@@ -831,7 +840,9 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 		}
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			// The row above says SchemaBot is retrying on its own, so the
+			// error is context for the operator, not a failure to triage.
+			writeTableErrorLine(sb, glyph.Attention, table.ErrorMessage)
 		}
 
 	case state.Task.Cancelled:
@@ -1007,7 +1018,7 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", table.TableName, ui.ProgressBarActivity(), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
-			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
 			return
 		}
 
@@ -1058,10 +1069,10 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
 		return
 	}
-	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -1276,7 +1287,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	writeSummaryMetadata(sb, data)
 
 	if data.ErrorMessage != "" {
-		writeErrorBlock(sb, data.ErrorMessage)
+		writeErrorBlock(sb, glyph.Failed, data.ErrorMessage)
 	}
 
 	if completedCount > 0 {
@@ -1609,7 +1620,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 	}
 
 	if states[state.Task.Failed] {
-		return "❌"
+		return glyph.Failed
 	}
 	if states["reverted"] {
 		return "↩️"

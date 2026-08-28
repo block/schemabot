@@ -54,7 +54,7 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 		rendered := RenderApplyBlockedByPriorEnv("testapp", "production", "staging", "has pending changes", "Apply staging first")
 		firstLine, _, _ := strings.Cut(rendered, "\n")
 
-		assert.Equal(t, "## ❌ Apply Blocked — Production", firstLine)
+		assert.Equal(t, "## ⛔ Apply Blocked — Production", firstLine)
 	})
 }
 
@@ -963,7 +963,7 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Failed")
-	assert.Contains(t, result, "⚠️ **Error:**")
+	assert.Contains(t, result, "❌ **Error:**")
 	assert.Contains(t, result, "lock wait timeout exceeded")
 	assert.Contains(t, result, "🟥") // red bar for failed table
 	assert.Contains(t, result, "❌ Failed")
@@ -1117,36 +1117,36 @@ func TestRenderApplyStatusComment_FailedTableErrorLine(t *testing.T) {
 
 	t.Run("table error distinct from apply error renders below the row", func(t *testing.T) {
 		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 35)
-		assert.Contains(t, result, "> ⚠️ **Error:** 1 of 2 tables failed")
-		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+		assert.Contains(t, result, "> ❌ **Error:** 1 of 2 tables failed")
+		assert.Contains(t, result, "> ❌ Last error: preflight enumReorder check failed")
 	})
 
 	t.Run("table error identical to apply error is not repeated", func(t *testing.T) {
 		result := render("preflight enumReorder check failed", "preflight enumReorder check failed", 35)
-		assert.Contains(t, result, "> ⚠️ **Error:** preflight enumReorder check failed")
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.Contains(t, result, "> ❌ **Error:** preflight enumReorder check failed")
+		assert.NotContains(t, result, "> ❌ Last error:")
 		assert.Equal(t, 1, strings.Count(result, "preflight enumReorder check failed"))
 	})
 
 	t.Run("table without an error renders no error line", func(t *testing.T) {
 		result := render("apply-level failure", "", 35)
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.NotContains(t, result, "> ❌ Last error:")
 	})
 
 	t.Run("table error differing only by whitespace is not repeated", func(t *testing.T) {
 		result := render("preflight enumReorder check failed", "preflight enumReorder check failed\n", 35)
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.NotContains(t, result, "> ❌ Last error:")
 	})
 
 	t.Run("all-whitespace table error renders no error line", func(t *testing.T) {
 		result := render("apply-level failure", "  \n", 35)
-		assert.NotContains(t, result, "> ⚠️ Last error:")
+		assert.NotContains(t, result, "> ❌ Last error:")
 	})
 
 	t.Run("pre-copy failure renders error line without a progress bar", func(t *testing.T) {
 		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 0)
 		assert.Contains(t, result, "**`users`**: ❌ Failed (before row copy started)")
-		assert.Contains(t, result, "> ⚠️ Last error: preflight enumReorder check failed")
+		assert.Contains(t, result, "> ❌ Last error: preflight enumReorder check failed")
 		assert.NotContains(t, result, "0%")
 	})
 }
@@ -1344,7 +1344,10 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	// Progress summary
 	assert.Contains(t, result, "📊 1/2 complete")
 	assert.Contains(t, result, "1 stopped")
-	assert.Contains(t, result, "remote apply remote-123 remained stopped after start grace period 30s")
+	// The heading already says the apply is stopped, so the error is context
+	// with the attention glyph, not a fresh failure.
+	assert.Contains(t, result, "> ⚠️ **Error:** remote apply remote-123 remained stopped after start grace period 30s")
+	assert.NotContains(t, result, "❌")
 	assert.Contains(t, result, "schemabot start")
 }
 
@@ -2011,7 +2014,7 @@ func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {
 
 	result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "— Staging")
 	assert.Contains(t, result, "Cannot apply while PR checks are not passing")
 	assert.Contains(t, result, "| Check | Status |")
@@ -2040,7 +2043,7 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 	for _, notPassing := range [][]BlockingCheck{nil, {}} {
 		result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Cannot apply while PR checks are not passing.")
 		assert.Contains(t, result, "Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n```\nschemabot apply -e staging\n```",
@@ -2141,7 +2144,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByMissingPriorEnvCheck("staging")
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "could not find a completed `staging` check")
 	assert.Contains(t, result, "schemabot plan -e staging")
 	assert.Contains(t, result, "apply `staging`")
@@ -2151,13 +2154,34 @@ func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 func TestRenderApplyBlockedByUntrustedPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"schemabot-staging"})
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "`SchemaBot (staging)`")
 	assert.Contains(t, result, "- `schemabot-staging`")
 	assert.Contains(t, result, "does not trust")
 	assert.Contains(t, result, "trusted-check-app-slugs")
 	assert.Contains(t, result, "Re-running `schemabot plan -e staging` will not resolve this")
 	assert.NotContains(t, result, "could not find a completed")
+}
+
+// An environment missing from the promotion order is a configuration refusal:
+// SchemaBot cannot place it in the staging-first sequence, and retrying
+// unchanged refuses again, so the heading carries the refusal glyph and the
+// body names the fix (add the environment to environment_order).
+func TestRenderApplyBlockedByUnlistedEnvironment(t *testing.T) {
+	result := RenderApplyBlockedByUnlistedEnvironment("canary", []string{"staging", "production"})
+
+	assert.Contains(t, result, "## ⛔ Apply Blocked — Canary")
+	assert.Contains(t, result, "`canary` is not in the configured promotion order")
+	assert.Contains(t, result, "Configured promotion order: `staging` → `production`")
+	assert.Contains(t, result, "Add `canary` to `environment_order`")
+
+	t.Run("empty promotion order omits the order line", func(t *testing.T) {
+		result := RenderApplyBlockedByUnlistedEnvironment("canary", nil)
+
+		assert.Contains(t, result, "## ⛔ Apply Blocked — Canary")
+		assert.NotContains(t, result, "Configured promotion order")
+		assert.Contains(t, result, "Add `canary` to `environment_order`")
+	})
 }
 
 func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {

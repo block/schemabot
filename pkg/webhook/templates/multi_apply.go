@@ -5,6 +5,7 @@ import (
 	"html"
 	"strings"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -163,10 +164,10 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 	name := html.EscapeString(failure.Deployment)
 	msg := SanitizeInlineError(failure.Error)
 	if msg == "" {
-		fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code>\n", name)
+		fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code>\n", name)
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
+	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived
