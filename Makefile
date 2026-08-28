@@ -22,6 +22,16 @@ E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
 E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 
+# Disable Buildx Bake: Compose delegates `up --build` and `compose build` to a
+# bake subprocess that can lose its stdio pipe (docker/compose#13243), failing
+# the build with `read |0: file already closed`. Every image composed here is
+# COPY-only over prebuilt binaries, so the classic builder costs nothing.
+# Exported so it reaches every compose recipe in this file — e2e, dev and demo
+# targets alike. Scripts invoked directly (not via make) carry their own
+# export. Drop this once that issue is fixed upstream and the flake stops
+# reproducing on CI runners.
+export COMPOSE_BAKE := false
+
 .PHONY: help lint lint-fix setup test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
@@ -288,14 +298,8 @@ seed-testapp:
 # Run all e2e tests (MySQL + Vitess + gRPC) in isolated docker-compose environments.
 test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 
-# Disable Buildx Bake: Compose 2.34–2.x delegates `up --build` to a bake
-# subprocess that can lose its stdio pipe (docker/compose#13243), failing the
-# build with `read |0: file already closed`. The variable only exists in that
-# window — Compose v5 removed it because bake became the fixed, sole build
-# path — so on newer Compose this prefix is an inert no-op and the whole
-# workaround can be dropped once CI runners ship Compose ≥5.
 # E2E local environment shorthand
-E2E_DC = COMPOSE_BAKE=false docker compose -f deploy/e2e/docker-compose.yml
+E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
 
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
 # Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
@@ -370,8 +374,7 @@ test-e2e-local-down: ## Tear down e2e local environment
 # This spins up SchemaBot + separate Tern services (gRPC mode), runs tests, then tears down.
 # Ports: SchemaBot=15370, SchemaBot-MySQL=15371, Tern-Staging-MySQL=15372, Tern-Production-MySQL=15373
 #        Tern-Staging-HTTP=15380, Tern-Staging-gRPC=15390, Tern-Production-HTTP=15382, Tern-Production-gRPC=15392
-E2E_GRPC_ENV := COMPOSE_BAKE=false \
-	SCHEMABOT_PORT=15370 \
+E2E_GRPC_ENV := SCHEMABOT_PORT=15370 \
 	SCHEMABOT_MYSQL_PORT=15371 \
 	SCHEMABOT_METRICS_PORT=15376 \
 	TERN_STAGING_MYSQL_PORT=15372 \
@@ -427,8 +430,7 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 # deployments maps with more than one entry. Run manually once that lands.
 # Ports: SchemaBot=15370, SchemaBot-MySQL=15371, EU-MySQL=15372, US-MySQL=15373
 #        EU-HTTP=15380, EU-gRPC=15390, US-HTTP=15382, US-gRPC=15392
-E2E_GRPC_MD_ENV := COMPOSE_BAKE=false \
-	SCHEMABOT_PORT=15370 \
+E2E_GRPC_MD_ENV := SCHEMABOT_PORT=15370 \
 	SCHEMABOT_MYSQL_PORT=15371 \
 	SCHEMABOT_METRICS_PORT=15376 \
 	TERN_EU_MYSQL_PORT=15372 \
