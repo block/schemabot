@@ -96,10 +96,15 @@ func TestRunFollowLoop(t *testing.T) {
 	fetch, limits := scriptedFetch(script)
 
 	printed := make(chan *client.LogEntry, 64)
-	initials := make(chan bool, 64)
+	// The loop polls until cancellation, so the render record is unbounded and
+	// must never be what blocks it.
+	var rendersMu sync.Mutex
+	var renders []bool
 	state := &followState{}
 	emit := func(logs []*client.LogEntry, initial bool) {
-		initials <- initial
+		rendersMu.Lock()
+		renders = append(renders, initial)
+		rendersMu.Unlock()
 		for _, log := range state.advance(logs) {
 			printed <- log
 		}
@@ -151,11 +156,8 @@ func TestRunFollowLoop(t *testing.T) {
 
 	// Only the first render is the operator's own window, so only it may report
 	// that history precedes the tail.
-	close(initials)
-	var renders []bool
-	for initial := range initials {
-		renders = append(renders, initial)
-	}
+	rendersMu.Lock()
+	defer rendersMu.Unlock()
 	require.NotEmpty(t, renders)
 	assert.True(t, renders[0], "the first render is the initial window")
 	for _, initial := range renders[1:] {

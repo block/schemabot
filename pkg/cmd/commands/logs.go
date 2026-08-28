@@ -263,10 +263,12 @@ func newDeploymentFollowState() *deploymentFollowState {
 type deploymentFollowBatch struct {
 	label string
 	logs  []*client.LogEntry
-	// truncated carries the source's window signal. It only means history
-	// precedes the tail on the initial window; on a later poll it would mean
-	// the source outran the poll fetch limit, which the tail cannot recover
-	// either way.
+	// truncated carries the source's window signal, which reports only that the
+	// read hit its own bound. That answers the operator's question on the
+	// initial window, where the bound is the window they asked for. On a later
+	// poll the bound is the loop's fetch limit and the entries beyond it are
+	// usually ones already printed, so the signal says nothing about whether
+	// the tail missed anything and is not rendered.
 	truncated bool
 }
 
