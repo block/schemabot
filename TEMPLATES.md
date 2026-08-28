@@ -4765,7 +4765,7 @@ ALTER TABLE `users`
     ADD UNIQUE `idx_email`(`email`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -4815,7 +4815,7 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -4842,7 +4842,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 1 of 2 tables completed before cancellation.
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -5006,22 +5006,22 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 ALTER TABLE `addresses` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**
+**`users`** — Completed
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**
+**`products`** — Completed
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-**`payments`**
+**`payments`** — Completed
 ```sql
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
@@ -5086,7 +5086,7 @@ schemabot apply -e staging
 ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 ```
 
-**`users`**
+**`users`** — Completed
 ```sql
 ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 ```
@@ -5094,12 +5094,12 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 ### ✅ commerce
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`payments`**
+**`payments`** — Completed
 ```sql
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
@@ -7432,7 +7432,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```

@@ -1564,6 +1564,9 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// On an unsuccessful apply, each completed table is labeled so the reader
+	// can tell which tables made it before the failure/stop/cancellation.
+	labelCompleted := !state.IsState(data.State, state.Apply.Completed)
 	// Per-namespace status emojis only carry information when outcomes differ
 	// across namespaces (some failed, some succeeded). When every namespace
 	// succeeded, the repeated ✅ is noise, so the headers omit the emoji.
@@ -1603,7 +1606,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		}
 
 		for _, t := range g.tables {
-			writeSummaryTableEntry(sb, t)
+			writeSummaryTableEntry(sb, t, labelCompleted)
 		}
 
 		if groupCollapsed {
@@ -1634,14 +1637,22 @@ func groupStateEmoji(tables []TableProgressData) string {
 	return "✅"
 }
 
-// writeSummaryTableEntry writes a single table with DDL block.
-// No emoji — the header carries the group state. Non-success tables get a text label.
-func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
+// writeSummaryTableEntry writes a single table with a text outcome label and
+// DDL block. No emoji — the header carries the group state. labelCompleted
+// controls whether completed tables get a label too: on a summary for an
+// unsuccessful apply, each row must answer "did this table make it?", so
+// completed tables are labeled explicitly. On a successful apply the header
+// already says every table completed, so the label would be noise.
+func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompleted bool) {
 	normalized := state.NormalizeTaskStatus(t.Status)
 
 	switch normalized {
 	case state.Task.Completed:
-		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		if labelCompleted {
+			fmt.Fprintf(sb, "**`%s`** — Completed\n", t.TableName)
+		} else {
+			fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		}
 	case state.Task.Failed:
 		label := "Failed"
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
@@ -1659,7 +1670,10 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 	case state.Task.Cancelled:
 		fmt.Fprintf(sb, "**`%s`** — Cancelled\n", t.TableName)
 	default:
-		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		// Unknown or in-flight statuses still get a visible label — a bare
+		// table name reads as success, which is wrong for anything but
+		// completed.
+		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, taskOutcomeLabel(normalized))
 	}
 
 	if t.DDL != "" {
@@ -1667,6 +1681,24 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 	} else {
 		sb.WriteString("\n")
 	}
+}
+
+// taskOutcomeLabel says where a table was left when the apply stopped running.
+// Most states read correctly once humanized, but three do not: two are internal
+// vocabulary the operator never sees elsewhere, and revert_window hides the fact
+// an operator most needs from a terminal record, that the change is already
+// applied and only the window is still open. Those get an explicit label; every
+// other state keeps the humanized constant this file uses by default.
+func taskOutcomeLabel(normalized string) string {
+	switch normalized {
+	case state.Task.RevertWindow:
+		return "Completed (revert window open)"
+	case state.Task.PostChecksum:
+		return "Data verified, not cut over"
+	case state.Task.FailedRetryable:
+		return "Interrupted"
+	}
+	return humanizeState(normalized)
 }
 
 // ApplyStatusFromProgress converts a ProgressResponse to ApplyStatusCommentData.

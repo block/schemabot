@@ -1791,6 +1791,9 @@ func TestPreviewCommentSummaryCompleted(t *testing.T) {
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "```sql")
+	// On a successful apply the header already says every table completed —
+	// per-table Completed labels would be noise.
+	assert.NotContains(t, result, "— Completed")
 }
 
 func TestPreviewCommentSummaryFailed(t *testing.T) {
@@ -1802,7 +1805,7 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	// Single namespace — no header, but table entries present
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`users`** — Failed at 30%")
-	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
 }
 
@@ -1814,7 +1817,7 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	// Single namespace — no header
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`users`** — Stopped at 72%")
-	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "**`orders`** — Completed", "on a stopped apply, the reader must be able to tell which tables made it")
 	// A stopped change is resumable.
 	assert.Contains(t, result, "schemabot start")
 }
@@ -1824,8 +1827,68 @@ func TestPreviewCommentSummaryCancelled(t *testing.T) {
 
 	assert.Contains(t, result, "🚫 Schema Change Cancelled")
 	assert.Contains(t, result, "cannot be resumed")
+	assert.Contains(t, result, "**`orders`** — Completed", "on a cancelled apply, the reader must be able to tell which tables made it")
+	assert.Contains(t, result, "**`users`** — Cancelled")
 	// A cancelled change is permanent — no resume affordance.
 	assert.NotContains(t, result, "schemabot start")
+}
+
+// A terminal summary can carry a table whose task never reached a terminal
+// status (e.g. the driver died mid-copy). The row must still show a visible
+// outcome label — a bare table name reads as success.
+func TestRenderApplySummaryComment_NonTerminalTableStatusLabeled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Failed},
+			{TableName: "sessions", DDL: "ALTER TABLE `sessions` ADD INDEX `idx_expires_at` (`expires_at`)", Status: state.Task.Running},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "**`orders`** — Completed")
+	assert.Contains(t, result, "**`users`** — Failed")
+	assert.Contains(t, result, "**`sessions`** — Running")
+}
+
+// A table left mid-apply is named by where it was left, not by the internal
+// state constant. The revert-window case matters most: the change is already
+// applied and only the window is still open, which an operator reading a
+// terminal record must not have to infer.
+func TestRenderApplySummaryComment_NonTerminalTableOutcomeVocabulary(t *testing.T) {
+	cases := []struct {
+		status string
+		label  string
+	}{
+		{state.Task.RevertWindow, "**`orders`** — Completed (revert window open)"},
+		{state.Task.PostChecksum, "**`orders`** — Data verified, not cut over"},
+		{state.Task.FailedRetryable, "**`orders`** — Interrupted"},
+		{state.Task.CuttingOver, "**`orders`** — Cutting over"},
+		{state.Task.Pending, "**`orders`** — Pending"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			result := RenderApplySummaryComment(ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				RequestedBy: "aparajon",
+				State:       state.Apply.Failed,
+				Engine:      "Spirit",
+				Tables: []TableProgressData{
+					{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: tc.status},
+				},
+			})
+
+			assert.Contains(t, result, tc.label)
+		})
+	}
 }
 
 // The terminal summary for a cancelled (permanent) change must not offer resume
