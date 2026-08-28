@@ -1553,6 +1553,9 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// On an unsuccessful apply, each completed table is labeled so the reader
+	// can tell which tables made it before the failure/stop/cancellation.
+	labelCompleted := !state.IsState(data.State, state.Apply.Completed)
 	// Per-namespace status emojis only carry information when outcomes differ
 	// across namespaces (some failed, some succeeded). When every namespace
 	// succeeded, the repeated ✅ is noise, so the headers omit the emoji.
@@ -1592,7 +1595,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		}
 
 		for _, t := range g.tables {
-			writeSummaryTableEntry(sb, t)
+			writeSummaryTableEntry(sb, t, labelCompleted)
 		}
 
 		if groupCollapsed {
@@ -1625,12 +1628,20 @@ func groupStateEmoji(tables []TableProgressData) string {
 
 // writeSummaryTableEntry writes a single table with DDL block.
 // No emoji — the header carries the group state. Non-success tables get a text label.
-func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
+// labelCompleted controls whether completed tables also get one: on a summary
+// for an unsuccessful apply, each row must answer "did this table make it?",
+// so completed tables are labeled explicitly. On a successful apply the header
+// already says every table completed, so the label would be noise.
+func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompleted bool) {
 	normalized := state.NormalizeTaskStatus(t.Status)
 
 	switch normalized {
 	case state.Task.Completed:
-		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		if labelCompleted {
+			fmt.Fprintf(sb, "**`%s`** — Completed\n", t.TableName)
+		} else {
+			fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		}
 	case state.Task.Failed:
 		label := "Failed"
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
@@ -1648,7 +1659,14 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 	case state.Task.Cancelled:
 		fmt.Fprintf(sb, "**`%s`** — Cancelled\n", t.TableName)
 	default:
-		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		// Unknown or in-flight statuses still get a visible label — a bare
+		// table name reads as success, which is wrong for anything but
+		// completed.
+		if label := taskStatusLabel(normalized); label != "" {
+			fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
+		} else {
+			fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		}
 	}
 
 	if t.DDL != "" {
@@ -1656,6 +1674,16 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData) {
 	} else {
 		sb.WriteString("\n")
 	}
+}
+
+// taskStatusLabel renders a normalized task status as a display label,
+// e.g. "running" → "Running", "failed_retryable" → "Failed retryable".
+func taskStatusLabel(normalized string) string {
+	label := strings.ReplaceAll(normalized, "_", " ")
+	if label == "" {
+		return ""
+	}
+	return strings.ToUpper(label[:1]) + label[1:]
 }
 
 // ApplyStatusFromProgress converts a ProgressResponse to ApplyStatusCommentData.
