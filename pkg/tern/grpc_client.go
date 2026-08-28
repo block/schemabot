@@ -1052,20 +1052,25 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 // settleUndispatchedControlRequest settles a pending stop or cancel for an apply
 // that carries no remote apply id.
 //
-// Nothing remote exists to address exactly when the dispatch path would treat
-// this drive as a first dispatch. That is the same predicate dispatch itself
-// trusts to mean no remote apply was ever created, so the request is satisfied
-// in control-plane storage alone and the operator's command completes: there is
-// nothing to orphan.
+// Nothing remote exists to address exactly when
+// undispatchedControlRequestSettlesLocally holds: either the dispatch path
+// would treat this drive as a first dispatch — the same predicate dispatch
+// itself trusts to mean no remote apply was ever created — or the dispatch
+// state is stopped, which with no recorded remote apply id proves the work was
+// stopped before it was ever dispatched. In both shapes the request is
+// satisfied in control-plane storage alone and the operator's command
+// completes: there is nothing to orphan.
 //
 // Every other shape is the ambiguous one — a dispatch may have created a remote
 // apply whose response was lost. Settling locally would report the change
 // stopped or cancelled while it kept running on the target, and because that
 // leaves the apply terminal, nothing would ever revisit it to find out. So this
 // reports the request unhandled and lets the drive continue to the dispatch
-// ambiguity guard, which fails the apply closed; the request then completes
-// against the terminal apply on the next claim. The guard is where this apply
-// was headed regardless — a pending request must not be what routes around it.
+// ambiguity guard, which fails the apply closed and fails the pending stop and
+// cancel requests with the same ambiguity message, so the operator sees the
+// rejection rather than a command no later claim would ever answer. The guard
+// is where this apply was headed regardless — a pending request must not be
+// what routes around it.
 //
 // The request must never be answered with an error here: it stays pending across
 // the error, so every later claim would abort at this same point and the apply
@@ -1073,7 +1078,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 func (c *GRPCClient) settleUndispatchedControlRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope, terminalization undispatchedTerminalization, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
 	logger := c.applyLogger(apply)
 	caller := controlRequestCaller(controlReq)
-	if !shouldDispatchQueuedRemoteApply(apply, scope) {
+	if !undispatchedControlRequestSettlesLocally(apply, scope) {
 		logger.WarnContext(ctx, "leaving pending gRPC control request to the dispatch ambiguity guard; remote dispatch state is ambiguous so the request cannot be satisfied locally",
 			append(apply.MutableLogAttrs(),
 				"control_operation", terminalization.controlOperation,
@@ -2586,6 +2591,20 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
 			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
 		}
+		// A failed apply is never claimed again, so a stop or cancel left
+		// pending here would stay unanswered forever and a re-issued command
+		// would be refused as already requested. Fail the requests with the
+		// same ambiguity message the apply carries. An operation-only drive
+		// leaves the shared apply-level requests pending: sibling deployments
+		// still need to observe them, and the operator projection settles them
+		// once the parent apply derives terminal.
+		if !scope.suppressesDirectParentApplyWrites() {
+			for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+				if err := failPendingControlRequests(ctx, c.storage, apply, operation, errMsg); err != nil {
+					return fmt.Errorf("%s; fail pending %s control request: %w", errMsg, operation, err)
+				}
+			}
+		}
 		return errors.New(errMsg)
 	}
 
@@ -2975,6 +2994,21 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	// against, where a shared external_id could have been lost after a real
 	// dispatch.
 	return scope.usesOperationRemoteResume() && state.IsState(dispatchState, state.Apply.Running)
+}
+
+// undispatchedControlRequestSettlesLocally reports whether a pending stop or
+// cancel that addresses no remote apply id can be satisfied in control-plane
+// storage alone. Two shapes qualify. When the dispatch path would treat this
+// drive as a first dispatch, nothing remote was ever created. When the
+// dispatch state is stopped, the same fact is proven from the other side: a
+// remote apply id is persisted before an apply or operation can be recorded
+// stopped and is never cleared, so a stopped one without an id was stopped
+// before dispatch and has no remote work to address.
+func undispatchedControlRequestSettlesLocally(apply *storage.Apply, scope applyTaskScope) bool {
+	if shouldDispatchQueuedRemoteApply(apply, scope) {
+		return true
+	}
+	return scope.remoteApplyID(apply) == "" && state.IsState(scope.dispatchState(apply), state.Apply.Stopped)
 }
 
 func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope) bool {
