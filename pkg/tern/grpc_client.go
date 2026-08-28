@@ -1291,6 +1291,10 @@ type undispatchedTerminalization struct {
 	logEvent       string
 	// verb reads in "Remote apply <verb> before dispatch".
 	verb string
+	// controlOperation names the durable request being settled. It is the
+	// noun, so operator text reads "pending apply <controlOperation> request"
+	// where the verb would read as a state.
+	controlOperation storage.ControlOperation
 }
 
 // stopUndispatchedTerminalization is how a stop settles undispatched work. A
@@ -1298,11 +1302,12 @@ type undispatchedTerminalization struct {
 // those that cannot, so the states follow stopTerminatesChange.
 func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
 	terminalization := undispatchedTerminalization{
-		taskState:      state.Task.Stopped,
-		applyState:     state.Apply.Stopped,
-		operationState: state.ApplyOperation.Stopped,
-		logEvent:       storage.LogEventStopRequested,
-		verb:           "stopped",
+		taskState:        state.Task.Stopped,
+		applyState:       state.Apply.Stopped,
+		operationState:   state.ApplyOperation.Stopped,
+		logEvent:         storage.LogEventStopRequested,
+		verb:             "stopped",
+		controlOperation: storage.ControlOperationStop,
 	}
 	if stopTerminatesChange(databaseType) {
 		terminalization.taskState = state.Task.Cancelled
@@ -1316,11 +1321,12 @@ func stopUndispatchedTerminalization(databaseType string) undispatchedTerminaliz
 // A cancel is terminal on every database type, so it does not vary.
 func cancelUndispatchedTerminalization() undispatchedTerminalization {
 	return undispatchedTerminalization{
-		taskState:      state.Task.Cancelled,
-		applyState:     state.Apply.Cancelled,
-		operationState: state.ApplyOperation.Cancelled,
-		logEvent:       storage.LogEventCancelRequested,
-		verb:           "cancelled",
+		taskState:        state.Task.Cancelled,
+		applyState:       state.Apply.Cancelled,
+		operationState:   state.ApplyOperation.Cancelled,
+		logEvent:         storage.LogEventCancelRequested,
+		verb:             "cancelled",
+		controlOperation: storage.ControlOperationCancel,
 	}
 }
 
@@ -1332,16 +1338,16 @@ func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *st
 	now := time.Now()
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		return fmt.Errorf("load tasks for undispatched %s %s: %w", terminalization.verb, apply.ApplyIdentifier, err)
+		return fmt.Errorf("load tasks for undispatched %s %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
 	logger := c.applyLogger(apply)
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged during undispatched control operation",
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched control request",
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
 				"task_state", task.State,
-				"control_operation", terminalization.verb)
+				"control_operation", terminalization.controlOperation)
 			continue
 		}
 		task.State = terminalization.taskState
@@ -1350,7 +1356,7 @@ func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *st
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched %s %s: %w", task.TaskIdentifier, terminalization.verb, apply.ApplyIdentifier, err)
+			return fmt.Errorf("update task %s for undispatched %s %s: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, err)
 		}
 	}
 	oldState := apply.State
@@ -1361,7 +1367,7 @@ func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *st
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("update undispatched %s gRPC apply %s: %w", terminalization.verb, apply.ApplyIdentifier, err)
+		return fmt.Errorf("update undispatched %s gRPC apply %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
 	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply %s before dispatch: %s%s", terminalization.verb, apply.State, callerApplyLogSuffix(caller)), oldState)
 	return nil
@@ -1375,24 +1381,24 @@ func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *st
 // still observe it.
 func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope, terminalization undispatchedTerminalization) error {
 	if !scope.usesOperationRemoteResume() {
-		return fmt.Errorf("undispatched operation %s for apply %s requires multi-operation scope", terminalization.verb, apply.ApplyIdentifier)
+		return fmt.Errorf("undispatched operation %s for apply %s requires multi-operation scope", terminalization.controlOperation, apply.ApplyIdentifier)
 	}
 	op := scope.operation
 	now := time.Now()
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		return fmt.Errorf("load tasks for undispatched operation %s %s apply_operation %d: %w", terminalization.verb, apply.ApplyIdentifier, op.ID, err)
+		return fmt.Errorf("load tasks for undispatched operation %s %s apply_operation %d: %w", terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
 	}
 	logger := c.applyLogger(apply)
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged during undispatched operation control operation",
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched operation's control request",
 				"apply_operation_id", op.ID,
 				"deployment", op.Deployment,
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
 				"task_state", task.State,
-				"control_operation", terminalization.verb)
+				"control_operation", terminalization.controlOperation)
 			continue
 		}
 		task.State = terminalization.taskState
@@ -1401,7 +1407,7 @@ func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, 
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched operation %s %s apply_operation %d: %w", task.TaskIdentifier, terminalization.verb, apply.ApplyIdentifier, op.ID, err)
+			return fmt.Errorf("update task %s for undispatched operation %s %s apply_operation %d: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
 		}
 	}
 	oldState := op.State
@@ -1412,7 +1418,7 @@ func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, 
 		op.CompletedAt = &now
 	} else {
 		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, terminalization.operationState); err != nil {
-			return fmt.Errorf("mark undispatched gRPC apply_operation %d %s for apply %s: %w", op.ID, terminalization.verb, apply.ApplyIdentifier, err)
+			return fmt.Errorf("mark undispatched gRPC apply_operation %d %s for apply %s: %w", op.ID, terminalization.controlOperation, apply.ApplyIdentifier, err)
 		}
 		op.CompletedAt = nil
 	}
@@ -1422,11 +1428,11 @@ func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, 
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
 		"requested_by", caller,
-		"control_operation", terminalization.verb,
+		"control_operation", terminalization.controlOperation,
 		"old_operation_state", oldState,
 		"new_operation_state", terminalization.operationState)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, terminalization.logEvent,
-		fmt.Sprintf("Remote apply operation %d (deployment %s) %s before dispatch: %s%s; pending apply %s request remains for sibling operations", op.ID, op.Deployment, terminalization.verb, terminalization.operationState, callerApplyLogSuffix(caller), terminalization.verb), "", "")
+		fmt.Sprintf("Remote apply operation %d (deployment %s) %s before dispatch: %s%s; pending apply %s request remains for sibling operations", op.ID, op.Deployment, terminalization.verb, terminalization.operationState, callerApplyLogSuffix(caller), terminalization.controlOperation), "", "")
 	return nil
 }
 
