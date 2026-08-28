@@ -118,6 +118,12 @@ const (
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
+	PreviewCommentPlanCopyDiscarded            PreviewType = "comment_plan_copy_discarded"             // Plan whose apply would throw away an unfinished copy on the target
+	PreviewCommentPlanCopyDiscardedApplying    PreviewType = "comment_plan_copy_discarded_applying"    // Running apply recording the unfinished copy it threw away
+	PreviewCommentPlanCopyDiscardedPaused      PreviewType = "comment_plan_copy_discarded_paused"      // Automatic apply paused because applying would throw away an unfinished copy
+	PreviewCommentPlanCopyDiscardedStopped     PreviewType = "comment_plan_copy_discarded_stopped"     // A confirmed apply stopped because a copy appeared after the comment it confirmed
+	PreviewCommentPlanCopyAdopted              PreviewType = "comment_plan_copy_adopted"               // Plan whose apply resumes an unfinished copy on the target
+	PreviewCommentPlanCopyRunning              PreviewType = "comment_plan_copy_running"               // Plan whose apply joins a copy still being made on the target
 	PreviewCommentApplyBlockedRejected         PreviewType = "comment_apply_blocked_rejected"          // Apply rejected: plan contains engine-blocked statements
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes

@@ -413,6 +413,11 @@ type PlanRequest struct {
 	// target as one unit (a database-scoped MySQL DSN), where a withheld
 	// namespace's live tables would otherwise be planned as drops.
 	IgnoredNamespaces []string `json:"ignored_namespaces,omitempty"`
+	// GroupedExecution reports whether an apply of this plan will hand the
+	// engine every ALTER at once or one table at a time. Engines predicting what
+	// an apply will do to unfinished work already on the target need the
+	// grouping the apply will actually run under.
+	GroupedExecution bool `json:"grouped_execution,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -463,6 +468,41 @@ type PlanResponse struct {
 	// keyspace to one entry, so a keyspace whose shards diverge is represented
 	// faithfully only here. Empty for non-sharded plans.
 	Shards []*ShardPlanResponse `json:"shards,omitempty"`
+	// ExistingCopies carries the unfinished copies already on the target that
+	// applying this plan will adopt or discard, one entry per namespace holding
+	// any. Empty when the target is clean, which is the ordinary case.
+	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
+}
+
+// Dispositions an ExistingCopyResponse can carry. These mirror the engine's
+// own vocabulary on the wire; this package holds its own copy because it is
+// dependency-free by design. A test pins the two together.
+const (
+	ExistingCopyAdopt   = "adopt"
+	ExistingCopyDiscard = "discard"
+)
+
+// ExistingCopyResponse is an unfinished copy sitting on the target and what
+// applying the plan will do to it: adopt it and resume, or discard it and copy
+// again from the start.
+type ExistingCopyResponse struct {
+	Namespace   string   `json:"namespace,omitempty"`
+	Disposition string   `json:"disposition"`
+	Reason      string   `json:"reason,omitempty"`
+	Tables      []string `json:"tables,omitempty"`
+	AgeSeconds  int64    `json:"age_seconds,omitempty"`
+	Statement   string   `json:"statement,omitempty"`
+	// Running reports that the copy is still being made right now rather than
+	// left behind by an apply that is over. It changes both what applying does
+	// — joins the copy instead of resuming it — and what AgeSeconds means, which
+	// for a running copy is the interval between checkpoints rather than how
+	// stale the work is.
+	//
+	// It reports stored state rather than a live probe, so a task row left in
+	// flight by a crashed server reads as running until recovery clears it.
+	// Treat it as how to describe the copy, never as proof that work is live:
+	// what applying does to the copy is carried by Disposition.
+	Running bool `json:"running,omitempty"`
 }
 
 // ShardPlanResponse is one changing shard's plan: the keyspace it belongs to and
@@ -590,6 +630,30 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 		}
 	}
 	return false
+}
+
+// DiscardedCopies returns the unfinished copies on the target that applying
+// this plan will throw away and re-copy from the start.
+//
+// A copy whose disposition this build does not recognize counts as discarded:
+// the caller uses this to decide whether an operator must confirm before work
+// already done is destroyed, and an unrecognized verdict is not a reason to
+// skip that confirmation.
+func (r *PlanResponse) DiscardedCopies() []*ExistingCopyResponse {
+	if r == nil {
+		return nil
+	}
+	var result []*ExistingCopyResponse
+	for _, c := range r.ExistingCopies {
+		if c == nil {
+			continue
+		}
+		if c.Disposition == ExistingCopyAdopt {
+			continue
+		}
+		result = append(result, c)
+	}
+	return result
 }
 
 // DirectChanges returns all table changes the planner routed to direct

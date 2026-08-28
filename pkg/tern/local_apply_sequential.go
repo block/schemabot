@@ -20,7 +20,6 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
 	seqStart := time.Now()
-	creds := c.credentials()
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
 	// Bind the apply's identity once so every line of this sequential drive is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
@@ -73,7 +72,7 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 			"elapsed_ms", time.Since(seqStart).Milliseconds(),
 		)
 
-		action = c.runEngineTask(ctx, apply, task, options, creds)
+		action = c.runEngineTask(ctx, apply, task, options)
 
 		// Notify observer after each task completes
 		if obs := c.getObserver(apply.ID); obs != nil {
@@ -186,7 +185,7 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
 // Returns the outcome: taskContinue (completed), taskFailed, taskStopped, taskAbort, or taskHandover.
-func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string, creds *engine.Credentials) taskAction {
+func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
@@ -195,16 +194,12 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	} else if handled {
 		return taskStopped
 	}
-	taskCreds := creds
-	if c.config.Type == storage.DatabaseTypeMySQL {
-		var err error
-		taskCreds, err = c.credentialsForMySQLNamespace(task.Namespace)
-		if err != nil {
-			c.markTaskFailed(ctx, task, err.Error())
-			logger.Error("task failed to resolve namespace credentials",
-				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "namespace", task.Namespace, "error", err)
-			return taskFailed
-		}
+	taskCreds, err := c.credentialsForTask(task)
+	if err != nil {
+		c.markTaskFailed(ctx, task, err.Error())
+		logger.Error("task failed to resolve namespace credentials",
+			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "namespace", task.Namespace, "error", err)
+		return taskFailed
 	}
 
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
@@ -523,6 +518,11 @@ func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Durati
 }
 
 // pollTaskToCompletion polls a single task to completion (sequential mode).
+// Each poll tick persists the task row, even when no field moved: the operator
+// reads tasks.updated_at as the drive's liveness signal (ApplyDriveStallAfter)
+// and cancels a drive whose rows stop advancing, so the write must stay
+// unconditional — including through parked states such as deferred cutovers
+// and revert windows, where nothing changes tick to tick.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
 	ticker := time.NewTicker(c.taskPollInterval())
@@ -937,7 +937,20 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 // out because its engine classifies transient versus permanent failures in its
 // progress results, not through errors.
 func recoveryResumesFromCheckpoint(databaseType string) bool {
-	return databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata
+	switch databaseType {
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata:
+		return true
+	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres:
+		return false
+	default:
+		// LocalConfig.Type is open-world: embedder-registered engine types
+		// (EngineFactories) and the zero-value type used by tests land here
+		// and get the conservative disposition — no checkpoint resume, so a
+		// failed attempt fails the apply instead of pausing it for a retry
+		// that could dispatch duplicate work. Nothing pins the checkpoint
+		// contract on those registrations.
+		return false
+	}
 }
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.

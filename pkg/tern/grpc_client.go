@@ -1029,7 +1029,14 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
 	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
 	apply.UpdatedAt = now
-	if remoteProgressIsTerminal(progress.State, progress.Tables) {
+	// A stopped remote is not a cancel outcome: the data plane accepts Cancel
+	// for stopped applies and its own driver consumes the durable request, so
+	// completing here would consume a deliverable cancel while the remote is
+	// merely stopped — the stored apply would freeze at stopped after the
+	// remote cancels. Keep the request pending and sync the stopped snapshot
+	// below; a later drive reconciles once the remote settles. (Mirrors
+	// completeRemoteCancelFromTerminalProgress.)
+	if remoteProgressIsTerminal(progress.State, progress.Tables) && progress.State != ternv1.State_STATE_STOPPED {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
@@ -1044,9 +1051,20 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		c.controlSendGate.clear(controlReq.ID)
 		return true, nil
 	}
+	storedTasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return true, fmt.Errorf("load tasks to sync remote gRPC cancel for %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := c.syncStoredTasksFromRemoteTasks(ctx, apply, storedTasks, progress.Tables, now); err != nil {
+		return true, err
+	}
 	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC cancel"); err != nil {
 		return true, fmt.Errorf("sync nonterminal remote gRPC cancel state for %s: %w", apply.ApplyIdentifier, err)
 	}
+	logger.InfoContext(ctx, "remote gRPC cancel request accepted and remains pending for remote apply owner",
+		append(apply.MutableLogAttrs(),
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", remoteState)...)
 	return false, nil
 }
 
@@ -2625,6 +2643,18 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
+			// A stopped apply with no pending start was claimed only to
+			// deliver a pending control request (see ClaimApplyByID), and the
+			// remote confirming stopped means that request has not taken
+			// effect there yet. Exit without starting — a remote start here
+			// would resume a copy the operator asked to discard. A later
+			// claim re-checks once the lease goes stale or the request is
+			// re-issued.
+			if !startRequested {
+				logger.Info("stopped gRPC apply has no pending start request; drive exits without requesting a remote start",
+					apply.MutableLogAttrs()...)
+				return nil
+			}
 			if deferred, err := c.completePendingStopBeforeRemoteStart(ctx, apply, scope); err != nil || deferred {
 				return err
 			}
@@ -3720,6 +3750,12 @@ func remoteTaskResumedFromRetryablePause(remoteTaskState string) bool {
 // syncStoredTasksFromRemoteTasks mirrors the per-task table progress fields
 // returned by remote Tern. It only copies the remote task snapshot; terminal
 // remote applies are persisted only after those copied task states are resolved.
+//
+// Every stored task row is written on every call, even when no field moved:
+// the operator reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing, so
+// the write must stay unconditional — including through parked states such as
+// deferred cutovers and revert windows, where nothing changes tick to tick.
 func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	ctx context.Context,
 	storedApply *storage.Apply,

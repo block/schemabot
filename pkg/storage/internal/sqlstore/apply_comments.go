@@ -143,7 +143,9 @@ func (s *applyCommentStore) IncrementEditCount(ctx context.Context, applyID int6
 	return err
 }
 
-// DeleteByApply removes all comment records for an apply.
+// DeleteByApply removes all comment records for an apply. It is deliberately
+// lease-agnostic: it serves per-apply teardown where the apply row itself is
+// being removed, so no live drive holds a lease that could fence it.
 func (s *applyCommentStore) DeleteByApply(ctx context.Context, applyID int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM apply_comments WHERE apply_id = ?`, applyID)
 	return err

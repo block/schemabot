@@ -56,6 +56,22 @@ func (t StatementType) String() string {
 	}
 }
 
+// IsDDL reports whether the statement type is a schema-changing (DDL)
+// statement, as opposed to DML or an unclassified statement. StatementUnknown
+// is not DDL: a parser that classified a statement outside the shared
+// vocabulary reports it as unknown, and callers gating on IsDDL must treat it
+// as unverifiable rather than assume it changes schema.
+func (t StatementType) IsDDL() bool {
+	switch t {
+	case StatementAlterTable, StatementCreateTable, StatementDropTable,
+		StatementRenameTable, StatementTruncateTable, StatementCreateIndex,
+		StatementDropIndex, StatementCreateView:
+		return true
+	default:
+		return false
+	}
+}
+
 // StatementTypeToOp converts a StatementType to the lowercase operation
 // string used in storage and API layers.
 func StatementTypeToOp(t StatementType) string {

@@ -891,6 +891,7 @@ type mockTaskStore struct {
 	getByOperationIDErr error
 	updateErr           error
 	lastOperationID     int64
+	updated             []*storage.Task
 	upsertedShards      []*storage.Task
 	upsertShardErr      error
 }
@@ -920,7 +921,14 @@ func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationI
 	}
 	return m.tasks, nil
 }
-func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return m.updateErr }
+func (m *mockTaskStore) Update(_ context.Context, task *storage.Task) error {
+	if m.updateErr != nil {
+		return m.updateErr
+	}
+	stored := *task
+	m.updated = append(m.updated, &stored)
+	return nil
+}
 
 func (m *mockTaskStore) UpsertShardProgress(_ context.Context, task *storage.Task) error {
 	if m.upsertShardErr != nil {
@@ -2895,6 +2903,185 @@ func TestGRPCClient_ProcessPendingCancelKeepsRequestWhenRemoteStopped(t *testing
 	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, getErr)
 	assert.NotNil(t, cancelReq)
+}
+
+func TestGRPCClient_ProcessPendingCancelStaysPendingWhileAcceptedRemoteStillStopped(t *testing.T) {
+	// The success-path counterpart of the stopped-remote guard: the remote
+	// accepts the Cancel and stores it durably, but its progress still reads
+	// stopped — the cancel has not taken effect there yet. The request must
+	// stay pending (handled=false) so a later drive reconciles once the
+	// remote's own driver consumes the cancel; completing it here would
+	// freeze the stored apply at stopped after the remote cancels.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Stopped,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-stopped-remote",
+		ExternalID:      "remote-grpc-cancel-stopped-remote",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.False(t, handled, "a stopped remote keeps the accepted cancel pending; the drive must not complete it")
+	assert.Equal(t, 1, server.getCancelCalls(), "the cancel must be forwarded to the remote")
+	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State)
+	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, getErr)
+	assert.NotNil(t, cancelReq, "the durable cancel request must remain pending until the remote settles")
+}
+
+// TestGRPCClient_ProcessPendingCancelSyncsTasksWhenCancelStepObservesRemoteStop
+// verifies the cancel step is a full observer when it is the first to see the
+// remote go stopped: the stored apply still reads running with a running task,
+// the remote reports stopped, and the cancel stays pending. The stored task
+// rows must be synced along with the parent — persisting only the applies row
+// would leave the progress surfaces showing a stopped apply with its tasks
+// still running until the next poll.
+func TestGRPCClient_ProcessPendingCancelSyncsTasksWhenCancelStepObservesRemoteStop(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Stopped,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-first-observer",
+		ExternalID:      "remote-grpc-cancel-first-observer",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		Namespace:      "default",
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.False(t, handled, "a stopped remote keeps the accepted cancel pending; the drive must not complete it")
+	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State, "the parent apply must be persisted with the stopped snapshot")
+	assert.Equal(t, state.Task.Stopped, task.State, "the stored task must be synced to the remote's stopped state alongside the parent")
+	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, getErr)
+	assert.NotNil(t, cancelReq, "the durable cancel request must remain pending until the remote settles")
+}
+
+func TestGRPCClient_ResumeApplyStoppedWithPendingCancelNeverStartsRemote(t *testing.T) {
+	// A stopped apply claimed to deliver a pending cancel, with the remote
+	// still stopped after the forward: the drive must exit without requesting
+	// a remote start — starting would resume a copy the operator asked to
+	// discard — leaving the apply stopped and the cancel pending for a later
+	// drive to reconcile once the remote's own driver consumes it.
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_STOPPED,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "users",
+			Status:    state.Task.Stopped,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stopped-cancel-gate",
+		ExternalID:      "remote-grpc-stopped-cancel-gate",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-grpc-stopped-cancel-gate",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	storedApply := *apply
+	applyStore := &mockApplyStore{apply: &storedApply}
+	client.storage = &mockStorage{
+		applies:         applyStore,
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	err := client.ResumeApply(t.Context(), apply)
+	require.NoError(t, err)
+
+	assert.False(t, server.startWasCalled(), "a stopped apply without a pending start must never receive a remote start")
+	assert.Equal(t, 1, server.getCancelCalls(), "the pending cancel must be forwarded to the remote")
+	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State, "the stored apply stays stopped until the remote settles")
+	assert.Equal(t, state.Task.Stopped, task.State, "the stopped task must not be requeued for a start")
+	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, getErr)
+	assert.NotNil(t, cancelReq, "the durable cancel request must remain pending for retry")
 }
 
 func TestGRPCClient_ProcessPendingCancelReconcilesCompletedRemote(t *testing.T) {
@@ -5614,6 +5801,42 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 	})
 }
 
+func TestGRPCClient_SyncUnchangedProgressAdvancesUpdatedAt(t *testing.T) {
+	// Every mirror tick stamps tasks.updated_at with the sync time, even when
+	// the remote progress is byte-for-byte identical to what is already stored.
+	// The operator consumes that timestamp as the drive's liveness signal
+	// (ApplyDriveStallAfter): long-running phases such as checksums legitimately
+	// hold row counts flat, so a poll over unchanged progress must still count
+	// as liveness rather than letting the task row age into a stall verdict.
+	now := time.Now()
+	staleUpdatedAt := now.Add(-time.Hour)
+	apply := &storage.Apply{ID: 51, ApplyIdentifier: "apply-liveness-stamp", State: state.Apply.Running}
+	storedTask := &storage.Task{
+		ID: 52, TaskIdentifier: "task-liveness-stamp", ApplyID: apply.ID,
+		Namespace: "commerce", TableName: "users",
+		State:      state.Task.Running,
+		RowsCopied: 150, RowsTotal: 300, ProgressPercent: 50,
+		UpdatedAt: staleUpdatedAt,
+	}
+	tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+	client := &GRPCClient{storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}}}
+
+	require.NoError(t, client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{storedTask}, []*ternv1.TableProgress{{
+		Namespace:       "commerce",
+		TableName:       "users",
+		Status:          state.Task.Running,
+		RowsCopied:      150,
+		RowsTotal:       300,
+		PercentComplete: 50,
+	}}, now))
+
+	require.Len(t, tasks.updated, 1)
+	assert.True(t, tasks.updated[0].UpdatedAt.Equal(now), "unchanged progress must still stamp updated_at with the sync time")
+	assert.Equal(t, state.Task.Running, tasks.updated[0].State)
+	assert.Equal(t, int64(150), tasks.updated[0].RowsCopied)
+	assert.Equal(t, 50, tasks.updated[0].ProgressPercent)
+}
+
 func TestGRPCClient_SyncRemoteProgressByNamespace(t *testing.T) {
 	// Multi-keyspace Vitess applies can report the same table name from more
 	// than one namespace. The control plane must update each stored task from
@@ -6563,8 +6786,9 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 
 func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	// Progress returns STOPPED initially so ResumeApply checks remote state,
-	// confirms the apply is stopped, and calls Start. After Start, the mock
-	// transitions to COMPLETED so the poller exits.
+	// confirms the apply is stopped, and — with the operator's start request
+	// pending — calls Start. After Start, the mock transitions to COMPLETED so
+	// the poller exits.
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_STOPPED,
 		progressStateSet: true,
@@ -6582,13 +6806,6 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err, "failed to dial")
 
-	client := &GRPCClient{
-		conn:    conn,
-		client:  ternv1.NewTernClient(conn),
-		storage: &mockStorage{},
-	}
-	defer utils.CloseAndLog(client)
-
 	apply := &storage.Apply{
 		ID:          1,
 		Database:    "testdb",
@@ -6596,6 +6813,23 @@ func TestGRPCClient_ResumeApply_ThreadsExternalID(t *testing.T) {
 		ExternalID:  "remote_tern_xyz",
 		State:       state.Apply.Stopped,
 	}
+	storedApply := *apply
+	client := &GRPCClient{
+		conn:   conn,
+		client: ternv1.NewTernClient(conn),
+		storage: &mockStorage{
+			applies: &mockApplyStore{apply: &storedApply},
+			tasks:   &mockTaskStore{},
+			logs:    &mockApplyLogStore{},
+			controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationStart,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			}}},
+		},
+	}
+	defer utils.CloseAndLog(client)
 
 	err = client.ResumeApply(t.Context(), apply)
 	require.NoError(t, err)

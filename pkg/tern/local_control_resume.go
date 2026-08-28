@@ -187,7 +187,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	// selects the connection schema (per-target overrides can remap it to a
 	// different physical schema), so with mixed namespaces every task would
 	// silently run against tasks[0]'s schema.
-	if c.config.Type == storage.DatabaseTypeMySQL {
+	if usesPerNamespaceCredentials(c.config.Type) {
 		if _, err := singleTaskNamespace(applyTasks); err != nil {
 			return nil, fmt.Errorf("deferred deploy for apply %s: %w", apply.ApplyIdentifier, err)
 		}
@@ -306,7 +306,6 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// reaching the apply log stream the moment an apply changes hands, and the
 	// stream goes quiet for exactly the drive an operator is trying to read.
 	defer c.setupSpiritLogging(ctx, apply, tasks)()
-	creds := c.credentials()
 	eng := c.getEngine()
 	// Bind the apply's identity once so every line of this sequential resume is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
@@ -365,10 +364,21 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			now := time.Now()
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier))
+			// The completed state must durably land before the loop moves on:
+			// finalization derives the apply's terminal state from these task
+			// rows, so proceeding past a refused write — e.g. a lease-guarded
+			// update that lost to a peer driver — could terminalize the apply
+			// while the task row durably stays non-terminal. Aborting the
+			// resume without finalizing leaves the apply claimable, so a later
+			// drive redoes this settlement under a current lease.
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
+				logger.Error("resume aborting: persisting a raced-cutover task settlement failed; the apply stays active for a later drive to redo the settlement",
+					"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
+				return
+			}
 			continue
-		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
+		} else if err := c.verifyReplannedTaskDDL(task, replannedDDL); err != nil {
 			// Live schema drifted since resume began: the DDL this shard now
 			// needs no longer matches what was reviewed. Fail closed rather than
 			// apply unreviewed DDL.
@@ -379,7 +389,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			break
 		}
 
-		action = c.runEngineTask(ctx, apply, task, options, creds)
+		action = c.runEngineTask(ctx, apply, task, options)
 
 		taskID := task.ID
 		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
@@ -510,15 +520,24 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// resume work for it — treat it as completed rather than drifted.
 			task.ProgressPercent = 100
 			task.CompletedAt = &now
-			c.transitionTaskState(ctx, task, apply.ID, state.Task.Completed,
-				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier))
+			// The completed state must durably land before the task counts as
+			// settled: the caller derives parent apply state from this
+			// partition, so proceeding past a refused write — e.g. a
+			// lease-guarded update that lost to a peer driver — would
+			// terminalize the apply while the task row durably stays
+			// non-terminal. Failing the re-plan releases the drive for a later
+			// claim to redo this settlement under a current lease.
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (live schema matches the reviewed target)", task.TaskIdentifier)); err != nil {
+				return nil, fmt.Errorf("persist completed state for task %s whose table left the resume re-plan diff: %w", task.TaskIdentifier, err)
+			}
 			completedCount++
 		} else {
 			// Fail closed if the re-plan would apply DDL this task was not
 			// reviewed with: the re-plan recomputes the delta against live
 			// schema, so on a drifted deployment it can produce unreviewed DDL
 			// that overwriting task.DDL would silently apply.
-			if err := verifyReplannedTaskDDL(task, ddl); err != nil {
+			if err := c.verifyReplannedTaskDDL(task, ddl); err != nil {
 				return nil, err
 			}
 			task.DDL = ddl
@@ -558,15 +577,19 @@ func applyInRevertPhase(apply *storage.Apply) bool {
 // semantic divergence trips the guard. A task with no reviewed DDL carries no
 // reference to compare against (only the legacy synthetic VSchema tasks, which
 // the engine-change builder already skips), so it is left to existing handling.
-func verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
+func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
 	if task.DDL == "" {
 		return nil
 	}
-	reviewedCanon, err := canonicalDDLForDrift(task.DDL)
+	parser, err := c.statementParser()
+	if err != nil {
+		return fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
+	}
+	reviewedCanon, err := canonicalDDLForDrift(parser, task.DDL)
 	if err != nil {
 		return fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
 	}
-	replannedCanon, err := canonicalDDLForDrift(replannedDDL)
+	replannedCanon, err := canonicalDDLForDrift(parser, replannedDDL)
 	if err != nil {
 		return fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
 	}
@@ -1482,6 +1505,26 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); handled || err != nil {
 		return err
+	}
+	// A stopped apply is claimed only to deliver a pending control request. A
+	// pending start means the operator asked to resume, and the drive below
+	// consumes it (completing it once the engine accepts). No pending start
+	// means the request that admitted the claim was a cancel that was declined
+	// or could not finish this claim — exit without resuming, since a stopped
+	// copy must never resume without an operator start. The durable request is
+	// the authority here, not the in-memory state: a start claim transitions
+	// the stored row to resuming but the drive still holds the claim-time
+	// snapshot.
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		startReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
+		if err != nil {
+			return fmt.Errorf("check pending start before resuming stopped apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		if startReq == nil {
+			logger.Info("stopped apply has no pending start request; drive exits without resuming",
+				apply.MutableLogAttrs()...)
+			return nil
+		}
 	}
 
 	// Get the plan to retrieve original DDLs. A storage read failure says

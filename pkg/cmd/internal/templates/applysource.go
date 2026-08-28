@@ -31,7 +31,7 @@ func PullRequestLink(repo string, pr int) string {
 // pullRequestRef renders a PR as the display-text / URL pair a link is built
 // from, so the short form and the canonical URL are written in one place.
 func pullRequestRef(repo string, pr int) (text, url string) {
-	return fmt.Sprintf("%s#%d", repo, pr), fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr)
+	return fmt.Sprintf("%s#%d", repo, pr), caller.PullRequestURL(repo, pr)
 }
 
 // callerAndSourceBoxRows renders an apply's attribution for detail boxes.

@@ -3,23 +3,20 @@ package api
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
-
 	"github.com/block/schemabot/pkg/clock"
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -311,12 +308,23 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 //
 // It validates its inputs so a misconfiguration fails fast at setup rather than
 // as a confusing downstream error (or a panic on a nil factory).
+//
+// A registered type must also map to a registered SQL dialect
+// (schema.DialectForDatabaseType): drift comparison classifies and
+// canonicalizes DDL with the dialect's parser and fails closed on a type
+// whose dialect has no parser, so an engine registered without a dialect
+// mapping could plan but never pass the drift gate. Registration rejects
+// such a type here, at setup, rather than surfacing it as a blocked drift
+// gate on every schema change against that database.
 func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory) error {
 	if databaseType == "" {
 		return fmt.Errorf("register engine: database type must not be empty")
 	}
 	if factory == nil {
 		return fmt.Errorf("register engine for database type %q: factory must not be nil", databaseType)
+	}
+	if _, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType)); err != nil {
+		return fmt.Errorf("register engine for database type %q: %w", databaseType, err)
 	}
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
@@ -553,15 +561,6 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		}
 	}
 
-	// Register TLS config for PlanetScale MySQL connections if configured
-	var tlsName string
-	if envConfig.TLS != nil {
-		tlsName, err = registerTLSConfig(key, envConfig.TLS)
-		if err != nil {
-			return nil, fmt.Errorf("register TLS for %s: %w", key, err)
-		}
-	}
-
 	// LocalClient uses SchemaBot's storage directly. ServerConfig.Validate
 	// rejects an unparseable or non-positive revert_window_duration at config
 	// load; parsing here fails closed rather than silently falling back to the
@@ -592,9 +591,6 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.Database != "" {
 		metadata["database"] = envConfig.Database
 	}
-	if tlsName != "" {
-		metadata["tls_name"] = tlsName
-	}
 	if revertWindow > 0 {
 		metadata["revert_window_duration"] = revertWindow.String()
 	}
@@ -617,12 +613,13 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	}
 	maps.Copy(metadata, directMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:        database,
-		Type:            dbType,
-		TargetDSN:       targetDSN,
-		Metadata:        metadata,
-		WakeOperator:    s.wakeOperator,
-		EngineFactories: s.engineFactories,
+		Database:                              database,
+		Type:                                  dbType,
+		TargetDSN:                             targetDSN,
+		Metadata:                              metadata,
+		PostgresNativeSafeTableSizeLimitBytes: s.config.Postgres.NativeSafeTableSizeLimit(),
+		WakeOperator:                          s.wakeOperator,
+		EngineFactories:                       s.engineFactories,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
@@ -857,41 +854,4 @@ func (s *Service) Close() error {
 		return fmt.Errorf("close errors: %v", errs)
 	}
 	return nil
-}
-
-// registerTLSConfig registers a named TLS config with the Go MySQL driver.
-// Returns the config name to use in DSN parameters (tls=<name>).
-func registerTLSConfig(name string, cfg *TLSConfig) (string, error) {
-	if cfg.CABundle == "" {
-		return "", fmt.Errorf("tls.ca_bundle is required")
-	}
-
-	caPEM, err := os.ReadFile(cfg.CABundle)
-	if err != nil {
-		return "", fmt.Errorf("read CA bundle %s: %w", cfg.CABundle, err)
-	}
-	rootPool := x509.NewCertPool()
-	if !rootPool.AppendCertsFromPEM(caPEM) {
-		return "", fmt.Errorf("failed to parse CA bundle %s", cfg.CABundle)
-	}
-
-	tlsCfg := &tls.Config{
-		RootCAs:    rootPool,
-		MinVersion: tls.VersionTLS12,
-	}
-
-	// Client certificate is optional (mTLS).
-	if cfg.ClientCert != "" && cfg.ClientKey != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
-		if err != nil {
-			return "", fmt.Errorf("load client cert/key: %w", err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	tlsName := "schemabot-" + name
-	if err := gomysql.RegisterTLSConfig(tlsName, tlsCfg); err != nil {
-		return "", fmt.Errorf("register TLS config %s: %w", tlsName, err)
-	}
-	return tlsName, nil
 }

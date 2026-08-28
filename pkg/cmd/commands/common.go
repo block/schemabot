@@ -502,7 +502,7 @@ type applyChangeCounts struct {
 	vschemaUpdates int
 }
 
-func countTableProgressChanges(tables []tableProgress) applyChangeCounts {
+func countTableProgressChanges(tables []templates.TableProgress) applyChangeCounts {
 	var counts applyChangeCounts
 	for _, table := range tables {
 		counts.add(table.ChangeType)

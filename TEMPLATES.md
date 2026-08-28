@@ -170,11 +170,11 @@ ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REF
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⛔ **Cannot apply**: **2** changes not supported by the schema-change engine
+⛔ **Cannot apply**: **2** changes the schema-change engine refuses to execute
 - `users`: dropping primary key is not supported
 - `orders`: adding foreign key constraints is not supported
 
-An apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.
+An apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
 📋 **Plan**: **3** tables to alter
 
@@ -275,6 +275,211 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-existing-copy-discarded"></a><strong>MySQL Plan (Existing Copy Discarded)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-applying"></a><strong>MySQL Plan (Existing Copy Discarded, Applying)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+**Applying automatically**
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-paused"></a><strong>MySQL Plan (Existing Copy Discarded, Paused)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+⚠️ **Automatic apply paused**: Applying destroys work in progress on the target
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-discarded-confirm-stopped"></a><strong>MySQL Plan (Existing Copy Discarded, Confirm Stopped)</strong></summary>
+
+
+## Schema Change Apply — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+⚠️ **Apply stopped**: Applying destroys work in progress on the target
+
+Review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e staging
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-adopted"></a><strong>MySQL Plan (Existing Copy Adopted)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+
+ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
+```
+
+♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued
+- `orders`, `products` in `testapp` (last progress 3h 12m ago)
+
+Applying picks up where the existing copy stopped rather than starting over.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-copy-running"></a><strong>MySQL Plan (Existing Copy Running)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+
+ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
+```
+
+♻️ **Work already in progress**: **1** unfinished copy still running on the target
+- `orders`, `products` in `testapp` (still copying)
+
+Applying joins the copy already running rather than starting a new one: every row copied so far is kept, and no second copy is made.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="apply-rejected-engineblocked-changes"></a><strong>Apply Rejected (Engine-blocked Changes)</strong></summary>
 
 
@@ -296,10 +501,10 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 
 ---
 
-**⛔ Apply rejected**: **1** planned change not supported by the schema-change engine
+**⛔ Apply rejected**: **1** planned change the schema-change engine refuses to execute
 - `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
 
-Rewrite these statements as a supported schema change, or contact your SchemaBot operators for help.
+Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
 
 </details>
 
@@ -1929,7 +2134,7 @@ schemabot apply -e staging
 ```
 
 
-❌ Apply Blocked: Database Locked
+⛔ Apply blocked: database locked
 
 ┌───────────────────────────────────┐
 │  Database:   testapp (mysql)      │
@@ -1955,7 +2160,7 @@ Options:
 ```
 
 
-❌ Apply Blocked: Database Locked
+⛔ Apply blocked: database locked
 
 ┌────────────────────────────────────────────────┐
 │  Database:   testapp (mysql)                   │
@@ -3355,7 +3560,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ETA: 3m 15s
-  └ shards: ✓ -40 · ◐ 40-80 62% · ◐ 80-c0 31% · ⏳ c0-
+  └ shards: ✓ -40 · ● 40-80 ready · ◐ 80-c0 31% · ⏳ c0-
 
 
 ---
@@ -4001,19 +4206,19 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
+**`products`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -7616,7 +7821,7 @@ schemabot apply -e production
 │  Deployments:  1 completed · 1 halted · 1 failed      │
 └───────────────────────────────────────────────────────┘
 
-  ⚠ First failure: eu-west — duplicate key name 'idx_orders_source'
+  ❌ First failure: eu-west — duplicate key name 'idx_orders_source'
 
   Next: review failure in eu-west
 
@@ -8151,7 +8356,7 @@ Lint violations: Non-blocking warnings during plan/apply
 
 Unsafe blocked: Destructive changes require --allow-unsafe
 
-⛔ Unsafe Changes Detected:
+⛔ Apply blocked: 3 unsafe change(s) detected
   • users: DROP COLUMN email
   • orders: DROP TABLE
   • products:

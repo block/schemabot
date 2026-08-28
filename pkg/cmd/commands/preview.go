@@ -75,6 +75,10 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
 		templates.PreviewCommentPlanDirect,
+		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
+		templates.PreviewCommentPlanCopyDiscardedPaused,
+		templates.PreviewCommentPlanCopyDiscardedStopped,
+		templates.PreviewCommentPlanCopyAdopted, templates.PreviewCommentPlanCopyRunning,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
@@ -264,6 +268,12 @@ Comment Templates (GitHub PR comments):
   comment_no_managed_schema     No managed schema changes in current PR
   comment_reconcile_in_progress Empty diff with an in-progress apply
   comment_reconcile_completed   Empty diff with a completed apply
+  comment_plan_copy_discarded   Plan whose apply would throw away an unfinished copy
+  comment_plan_copy_discarded_applying Running apply recording the unfinished copy it threw away
+  comment_plan_copy_discarded_paused Automatic apply paused because applying would discard a copy
+  comment_plan_copy_discarded_stopped Confirmed apply stopped because a copy appeared after the comment
+  comment_plan_copy_adopted     Plan whose apply resumes an unfinished copy
+  comment_plan_copy_running     Plan whose apply joins a copy still being made
   comment_multi_env             Multi-env plan (identical plans, deduplicated)
   comment_multi_env_diff        Multi-env plan (different plans per environment)
   comment_multi_env_lint        Multi-env plan with lint violations

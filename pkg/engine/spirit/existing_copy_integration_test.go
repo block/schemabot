@@ -409,3 +409,158 @@ func TestExistingCopyWithoutCheckpointDiscards(t *testing.T) {
 	assert.Equal(t, engine.CopyDiscard, disposition)
 	assert.Equal(t, engine.DiscardStatementDiffers, reason)
 }
+
+// An ungrouped apply drives one table at a time, so a plan covering several
+// tables meets each table's copy on its own terms: the table being copied
+// resumes from its own checkpoint, and the tables that have not started yet
+// have nothing at stake. This is the ordinary mid-flight shape of a multi-table
+// schema change, and reading it as one all-or-nothing batch would tell the
+// operator that confirming the apply destroys a copy that it in fact continues.
+func TestPlannedExistingCopiesFollowsTheGroupingTheApplyWillUse(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const xfersAlter = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	const ledgerAlter = "ALTER TABLE `ledger_entries` ADD COLUMN note VARCHAR(64)"
+	// One table of the plan is partway through its own copy; the other has not
+	// been touched.
+	seedCopy(t, db, []string{"xfers"}, utils.CheckpointTableName("xfers"), xfersAlter)
+
+	changes := []engine.TableChange{
+		engineRun("xfers", xfersAlter),
+		engineRun("ledger_entries", ledgerAlter),
+	}
+
+	logger, _ := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	t.Run("ungrouped continues the table already copying and says nothing of the rest", func(t *testing.T) {
+		target := &lazyTargetDB{dsn: dsn}
+		defer target.close()
+
+		copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+		require.Len(t, copies, 1, "only the table with a copy has anything at stake")
+		assert.Equal(t, engine.CopyAdopt, copies[0].Disposition,
+			"the apply hands Spirit this table's own ALTER, which is what its checkpoint records")
+		assert.Empty(t, copies[0].Reason)
+		assert.Equal(t, []string{"xfers"}, copies[0].Tables)
+		assert.Equal(t, xfersAlter, copies[0].Statement)
+	})
+
+	t.Run("grouped destroys the copy because the batch covers a table with none", func(t *testing.T) {
+		target := &lazyTargetDB{dsn: dsn}
+		defer target.close()
+
+		copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, true)
+		require.Len(t, copies, 1, "the batch is one unit, so its copy is one disclosure")
+		assert.Equal(t, engine.CopyDiscard, copies[0].Disposition,
+			"Spirit rebuilds every table in the batch when one of them has no shadow table")
+		assert.Equal(t, engine.DiscardCopyIncomplete, copies[0].Reason)
+		assert.Equal(t, []string{"xfers"}, copies[0].Tables)
+	})
+}
+
+// Each ungrouped batch is measured against its own statement and its own
+// checkpoint, so which table of the plan holds the copy must not matter: a
+// copy on the plan's second table is continued on that table's terms, exactly
+// as a copy on its first would be.
+func TestPlannedExistingCopiesMeetsEachTableOnItsOwnTerms(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const xfersAlter = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	const ledgerAlter = "ALTER TABLE `ledger_entries` ADD COLUMN note VARCHAR(64)"
+	seedCopy(t, db, []string{"ledger_entries"}, utils.CheckpointTableName("ledger_entries"), ledgerAlter)
+
+	changes := []engine.TableChange{
+		engineRun("xfers", xfersAlter),
+		engineRun("ledger_entries", ledgerAlter),
+	}
+
+	logger, _ := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	target := &lazyTargetDB{dsn: dsn}
+	defer target.close()
+
+	copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	require.Len(t, copies, 1, "only the table with a copy has anything at stake")
+	assert.Equal(t, engine.CopyAdopt, copies[0].Disposition,
+		"the copy matches its own table's ALTER, not the plan's first")
+	assert.Empty(t, copies[0].Reason)
+	assert.Equal(t, []string{"ledger_entries"}, copies[0].Tables)
+	assert.Equal(t, ledgerAlter, copies[0].Statement)
+}
+
+// An ungrouped plan can have work at stake on several tables at once, and
+// every one of them is disclosed: a copy silently left out of the comment is a
+// copy the operator consents to destroying without knowing it exists.
+func TestPlannedExistingCopiesDisclosesEveryTableWithACopy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const xfersAlter = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	const ledgerAlter = "ALTER TABLE `ledger_entries` ADD COLUMN note VARCHAR(64)"
+	seedCopy(t, db, []string{"xfers"}, utils.CheckpointTableName("xfers"), xfersAlter)
+	// The second table's copy was made for a different change, so its
+	// disposition differs from the first's — pinning that each disclosure is
+	// the verdict for its own table, not a repeat of the first.
+	seedCopy(t, db, []string{"ledger_entries"}, utils.CheckpointTableName("ledger_entries"),
+		"ALTER TABLE `ledger_entries` ADD COLUMN memo VARCHAR(64)")
+
+	changes := []engine.TableChange{
+		engineRun("xfers", xfersAlter),
+		engineRun("ledger_entries", ledgerAlter),
+	}
+
+	logger, _ := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	target := &lazyTargetDB{dsn: dsn}
+	defer target.close()
+
+	copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	require.Len(t, copies, 2, "every table with a copy is disclosed")
+	assert.Equal(t, engine.CopyAdopt, copies[0].Disposition)
+	assert.Equal(t, []string{"xfers"}, copies[0].Tables)
+	assert.Equal(t, engine.CopyDiscard, copies[1].Disposition)
+	assert.Equal(t, engine.DiscardStatementDiffers, copies[1].Reason)
+	assert.Equal(t, []string{"ledger_entries"}, copies[1].Tables)
+}
+
+// Spirit's declarative diff can emit several ALTERs for one table, and an
+// ungrouped apply runs them one at a time. The first of them consumes the
+// table's copy — resuming or discarding it — so the ones after it meet a table
+// with nothing at stake. The plan discloses the copy once, as the first batch
+// will treat it, rather than rendering the same table under contradictory
+// verdicts.
+func TestPlannedExistingCopiesDisclosesATableOnceAcrossItsBatches(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	const addIndex = "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"
+	const addColumn = "ALTER TABLE `xfers` ADD COLUMN note VARCHAR(64)"
+	seedCopy(t, db, []string{"xfers"}, utils.CheckpointTableName("xfers"), addIndex)
+
+	changes := []engine.TableChange{
+		engineRun("xfers", addIndex),
+		engineRun("xfers", addColumn),
+	}
+
+	logger, _ := capturingLogger()
+	eng := New(Config{Logger: logger})
+	defer eng.Drain()
+
+	target := &lazyTargetDB{dsn: dsn}
+	defer target.close()
+
+	copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	require.Len(t, copies, 1, "one table, one verdict, however many batches alter it")
+	assert.Equal(t, engine.CopyAdopt, copies[0].Disposition,
+		"the first batch is the one that meets the copy, and its statement matches")
+	assert.Equal(t, []string{"xfers"}, copies[0].Tables)
+	assert.Equal(t, addIndex, copies[0].Statement)
+}

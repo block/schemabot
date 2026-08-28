@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -339,7 +340,7 @@ func TestServiceRegisterEngineSuppliesLocalClientEngine(t *testing.T) {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"customdb": {
-				Type: "customengine",
+				Type: "strata",
 				Environments: map[string]EnvironmentConfig{
 					"staging": {DSN: "root@tcp(localhost:3306)/customdb"},
 				},
@@ -352,7 +353,7 @@ func TestServiceRegisterEngineSuppliesLocalClientEngine(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no engine registered")
 
-	require.NoError(t, service.RegisterEngine("customengine", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+	require.NoError(t, service.RegisterEngine("strata", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
 		return &fakeRegisteredEngine{}, nil
 	}))
 	client, err := service.TernClient("customdb", "staging")
@@ -367,7 +368,17 @@ func TestServiceRegisterEngineValidates(t *testing.T) {
 	require.Error(t, service.RegisterEngine("", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
 		return &fakeRegisteredEngine{}, nil
 	}))
-	require.Error(t, service.RegisterEngine("customengine", nil))
+	require.Error(t, service.RegisterEngine("strata", nil))
+
+	// A type whose dialect has no statement parser could plan but never pass
+	// the drift gate, so registration rejects it at setup rather than letting
+	// every schema change against it block downstream.
+	err := service.RegisterEngine("customengine", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no statement parser registered for dialect")
+	assert.Contains(t, err.Error(), "customengine")
 }
 
 // A PlanetScale token configured as a literal (the secrets resolver returns
@@ -467,4 +478,23 @@ func TestNewLocalTernClient_AcceptsWellFormedTokenReference(t *testing.T) {
 	client, err := service.newLocalTernClient("vitessdb-staging", "vitessdb", "vitess", envConfig)
 	require.NoError(t, err)
 	assert.NotNil(t, client)
+}
+
+// The server-level postgres ceiling reaches the engine of every local client
+// the control plane builds, so a configured value governs native-safe DDL
+// instead of silently reverting to the default.
+func TestNewLocalTernClient_ConfiguresPostgresTableSizeLimit(t *testing.T) {
+	limit := int64(4 << 30)
+	cfg := &ServerConfig{Postgres: PostgresConfig{NativeSafeTableSizeLimitBytes: &limit}}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	envConfig := EnvironmentConfig{DSN: "postgres://localhost:5432/orders"}
+	client, err := service.newLocalTernClient("orders-staging", "orders", storage.DatabaseTypePostgres, envConfig)
+	require.NoError(t, err)
+
+	lc, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	eng, ok := lc.Engine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, limit, eng.TableSizeLimit())
 }

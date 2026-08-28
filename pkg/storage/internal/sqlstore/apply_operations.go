@@ -854,9 +854,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
+	// A stopped operation is reclaimable for start and for cancel, but the two
+	// arms are separate because only one of them terminates itself. The start
+	// claim always resolves — it either moves the row to resuming or the parent
+	// claim fails the request — so it needs no rematch guard. The cancel claim
+	// leaves the row stopped when the parent apply refuses to be claimed (a
+	// stopped apply is terminal), so it carries the rematch guard to keep an
+	// undeliverable cancel from re-claiming a driver on every poll.
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.Stopped,
+		storage.ControlOperationCancel, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -877,7 +887,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// resuming them is recovering work they started, not starting a new deployment.
 	//
 	//   - A stopped operation whose parent apply has a pending start request is
-	//     reclaimable so the operator can resume it.
+	//     reclaimable so the operator can resume it, and one whose parent has a
+	//     pending cancel request is reclaimable so the drive can terminalize it.
+	//     The cancel arm carries the rematch guard because its claim can leave
+	//     the row stopped; see requestRematchGuardSQL.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -916,6 +929,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// requests resume eligible work; they do not reorder the rollout.
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+	// The two guarded arms differ in the equal-timestamp case for the same reason
+	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
+	// out of stopped atomically with its lease rotation, so no peer can match it
+	// in the same second and it can admit an equal timestamp; the
+	// waiting_for_deploy claim leaves the row where it is and must refuse one.
+	// See leaseRematchComparison.
+	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
+	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1014,6 +1035,17 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				)
 			)
 			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+						AND `+stoppedCancelGuard+`
+				)
+			)
+			OR (
 				state IN (%s)
 				AND EXISTS (
 					SELECT 1
@@ -1027,11 +1059,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					WHERE cr.apply_id = apply_operations.apply_id
 						AND cr.operation = ?
 						AND cr.status = ?
-						AND (
-							apply_operations.lease_acquired_at IS NULL
-							OR apply_operations.lease_acquired_at < cr.updated_at
-							OR apply_operations.updated_at < %s
-						)
+						AND `+deferredDeployGuard+`
 				)
 			)
 			OR (
@@ -1057,7 +1085,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1106,13 +1134,20 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		}
 	case state.ApplyOperation.Stopped:
 		// Stopped → resuming: a stopped operation whose parent apply has a
-		// pending start request is a resumable claim, mirroring the apply-level
-		// stopped claim (transitionClaimToState). The claim must move the row out
-		// of stopped atomically with the lease rotation because the stopped-row
-		// predicate is request-gated, not heartbeat-gated: while the row stays
-		// stopped it keeps matching that predicate and a peer could re-lease it
-		// mid-drive. As resuming (an active state) it is re-leasable only by the
+		// pending start or cancel request is claimable, mirroring the
+		// apply-level stopped claim. The claim must move the row out of stopped
+		// atomically with the lease rotation because the stopped-row predicate
+		// is request-gated, not heartbeat-gated: while the row stays stopped it
+		// keeps matching that predicate and a peer could re-lease it mid-drive.
+		// As resuming (an active state) it is re-leasable only by the
 		// heartbeat-guarded stale-active clause, which recovers a crashed drive.
+		// A cancel drive holds resuming only transiently: after the drive the
+		// row is re-derived from its own tasks — cancelled tasks terminalize
+		// it, and a drive that delivered nothing settles it back to stopped.
+		// A crashed drive's leftover resuming row is recovered by the
+		// stale-active clause, whose next drive re-derives it the same way or,
+		// when the parent already terminalized, mirrors the terminal parent
+		// down (reconcileUnclaimableParent).
 		// WHERE state = ? guards a concurrent transition landing between the
 		// SELECT and this UPDATE; RowsAffected == 0 means another writer moved it.
 		result, err := tx.ExecContext(ctx, `

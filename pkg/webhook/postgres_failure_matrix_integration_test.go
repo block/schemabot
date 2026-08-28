@@ -183,22 +183,28 @@ func TestPostgresConfigFixtureStopDeclineIsTerminalAndApplyCompletes(t *testing.
 		"the apply must land its planned column after the stop is declined")
 }
 
-// A native-safe plan whose apply is refused at execution time — here a target
-// role without ALTER rights — lands as a permanent failure, not a retryable
-// one: the task is Failed (never FailedRetryable), the stored error carries
-// the exact provisioning GRANT, and no DDL reaches the target. Retrying
-// cannot succeed until the role is provisioned, so the drive must not retry.
+// A native-safe plan whose privileges are revoked between plan and apply is
+// refused at execution time and lands as a permanent failure, not a retryable
+// one: the plan passed its privilege check, so only the apply-time re-check
+// can catch the revocation. The task is Failed (never FailedRetryable), the
+// stored error carries the exact provisioning GRANT, and no DDL reaches the
+// target. Retrying cannot succeed until the role is re-provisioned, so the
+// drive must not retry.
 func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	fixture := loadPostgresConfigFixture(t, "postgres")
 	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
 	createFixtureUsersTable(t, db)
 	// The limited role can plan (CONNECT, USAGE, and CREATE for the diff
-	// planner's scratch schema) but does not own public.users, so the apply's
-	// privilege preflight must refuse the ALTER.
+	// planner's scratch schema) and holds inheritable membership in the
+	// owning role, so the plan is executable; the membership is revoked
+	// before apply.
 	_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
+		CREATE ROLE app_owner;
+		ALTER TABLE public.users OWNER TO app_owner;
 		CREATE ROLE limited LOGIN PASSWORD 'limited';
 		GRANT CONNECT, CREATE ON DATABASE %s TO limited;
-		GRANT USAGE ON SCHEMA public TO limited`, fixture.config.Database))
+		GRANT USAGE ON SCHEMA public TO limited;
+		GRANT app_owner TO limited`, fixture.config.Database))
 	require.NoError(t, err)
 
 	limitedDSN, err := url.Parse(dsn)
@@ -212,7 +218,10 @@ func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	plan, err := svc.ExecutePlan(t.Context(), fixture.planRequest())
 	require.NoError(t, err)
 	require.False(t, plan.HasBlockedChanges(),
-		"the statement shape is native-safe; only the role's privileges are insufficient")
+		"the role held every privilege the change needs at plan time")
+
+	_, err = db.ExecContext(t.Context(), "REVOKE app_owner FROM limited")
+	require.NoError(t, err)
 
 	_, _, err = svc.ExecuteApply(t.Context(), api.ApplyRequest{
 		PlanID:      plan.PlanID,
@@ -242,8 +251,10 @@ func TestPostgresConfigFixtureApplyPrivilegeRefusalIsPermanent(t *testing.T) {
 	task := tasks[0]
 	assert.True(t, state.IsState(task.State, state.Task.Failed),
 		"a refusal is permanent and must not be marked retryable, state=%s", task.State)
-	assert.Contains(t, task.ErrorMessage, "insufficient privileges; provision with:",
+	assert.Contains(t, task.ErrorMessage, "lacks access for",
 		"the stored error must be the classified refusal detail built from typed error fields, never wrapped server output")
+	assert.Contains(t, task.ErrorMessage, "provision with:",
+		"the stored error must carry the provisioning instruction")
 	assert.Contains(t, task.ErrorMessage, "GRANT",
 		"the stored error must carry the exact provisioning statement")
 	assert.NotNil(t, task.CompletedAt, "a permanently failed task is settled, not awaiting retry")

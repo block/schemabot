@@ -25,6 +25,7 @@ CREATE TABLE `applies` (
   `started_at` datetime DEFAULT NULL,
   `completed_at` datetime DEFAULT NULL,
   `revert_skipped_at` datetime DEFAULT NULL,
+  `superseded_by` varchar(255) NOT NULL DEFAULT '',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

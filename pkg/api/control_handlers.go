@@ -1631,6 +1631,14 @@ func storedApplyMayHaveStoppedTasksForStart(storedApplyState string) bool {
 }
 
 func validateStartRequestState(apply *storage.Apply) error {
+	// A superseded apply is refused before its state is consulted: the marker
+	// records that another apply took over this one's unfinished work, which no
+	// state on this row can express. The driver refuses the claim too, so this
+	// only decides whether the operator is told now or after a queued start
+	// fails.
+	if apply.SupersededBy != "" {
+		return controlConflictf("schema change was superseded by %s and cannot be started; check that apply for the outcome of this work", apply.SupersededBy)
+	}
 	if !isStartRequestAllowedState(apply.State) {
 		return startNotAllowedForState(apply)
 	}

@@ -10,7 +10,6 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // driftChangeKey identifies a single table DDL change for drift comparison. Two
@@ -119,6 +118,10 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 // covers only the non-sharded changes. VSchema changes carry no table DDL and
 // are compared separately, so they are excluded here.
 func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, shardScoped bool, targetShard string) (driftChangeMultiset, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
 	ms := driftChangeMultiset{}
 	for _, sc := range result.Changes {
 		shard := sc.Shard.Name
@@ -131,7 +134,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 		}
 		ns := c.planNamespace(sc.Namespace)
 		for _, tc := range sc.TableChanges {
-			canon, err := canonicalDDLForDrift(tc.DDL)
+			canon, err := canonicalDDLForDrift(parser, tc.DDL)
 			if err != nil {
 				return nil, fmt.Errorf("table %q: %w", tc.Table, err)
 			}
@@ -148,6 +151,10 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 // changes are compared separately and excluded here. Nil entries are corrupt
 // input and fail closed.
 func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChange, targetShard string) (driftChangeMultiset, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
 	ms := driftChangeMultiset{}
 	for _, ch := range changes {
 		if ch == nil {
@@ -160,7 +167,7 @@ func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChang
 		if err != nil {
 			return nil, err
 		}
-		canon, err := canonicalDDLForDrift(ch.Ddl)
+		canon, err := canonicalDDLForDrift(parser, ch.Ddl)
 		if err != nil {
 			return nil, fmt.Errorf("table %q: %w", ch.TableName, err)
 		}
@@ -169,51 +176,76 @@ func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChang
 	return ms, nil
 }
 
+// statementParser returns the DDL parser for this deployment's database type,
+// so drift comparisons classify and canonicalize DDL with the target's own
+// grammar rather than assuming every target speaks MySQL. An unregistered
+// dialect is an error the drift guard fails closed on.
+func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
+	p, err := ddl.ParserForDialect(schema.DialectForDatabaseType(c.config.Type))
+	if err != nil {
+		return nil, fmt.Errorf("resolve statement parser for database type %q: %w", c.config.Type, err)
+	}
+	return p, nil
+}
+
 // canonicalDDLForDrift normalizes a single DDL statement for comparison and
 // fails closed if it cannot be parsed, carries more than one statement, or is
-// not actually DDL. ddl.Canonicalize returns the input unchanged on a parse
-// failure or multi-statement payload, so such input would otherwise compare by
-// raw text and could mask drift — reject anything that is not exactly one
-// parseable statement. statement.Classify also accepts non-DDL (e.g. SELECT,
-// INSERT), which has no place in a schema-change drift comparison, so reject
-// anything that is not a DDL statement.
-func canonicalDDLForDrift(raw string) (string, error) {
+// not actually DDL. The parser's Canonicalize returns the input unchanged on a
+// parse failure, so such input would otherwise compare by raw text and could
+// mask drift — Classify errors reject it first. Classify also rejects
+// multi-statement input. Of what classifies cleanly, two rejection causes get
+// distinct messages because they call for different remedies: DML (e.g.
+// INSERT) has no place in a schema change and should be removed from it, while
+// a statement outside the shared DDL vocabulary is SQL the comparison has no
+// name for and cannot verify.
+func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
-	results, err := statement.Classify(raw)
+	stmtType, _, err := p.Classify(raw)
 	if err != nil {
-		return "", fmt.Errorf("unparseable DDL: %w", err)
+		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
 	}
-	if len(results) != 1 {
-		return "", fmt.Errorf("expected exactly one DDL statement, got %d", len(results))
+	if stmtType == ddl.StatementUnknown {
+		return "", fmt.Errorf("statement classified outside the shared DDL vocabulary; drift cannot verify it")
 	}
-	if !results[0].Type.IsDDL() {
-		return "", fmt.Errorf("expected a DDL statement, got %s", results[0].Type)
+	if !stmtType.IsDDL() {
+		return "", fmt.Errorf("expected a DDL statement, got %s", stmtType)
 	}
-	return ddl.Canonicalize(raw), nil
+	return p.Canonicalize(raw), nil
+}
+
+// diffDriftMultisets returns the changes each side of a comparison holds that
+// the other does not, rendered and sorted for a message. Both are empty exactly
+// when the two multisets are equal.
+//
+// The set arithmetic is shared, the vocabulary is not: what a difference means
+// depends on what is being compared, and a caller comparing two dispatches has
+// no "reviewed" side to name. Callers phrase their own message from these.
+func diffDriftMultisets(recomputed, dispatched driftChangeMultiset) (onlyInDispatched, onlyInRecomputed []string) {
+	for key, want := range dispatched {
+		if recomputed[key] < want {
+			onlyInDispatched = append(onlyInDispatched, formatDriftKey(key))
+		}
+	}
+	for key, have := range recomputed {
+		if have > dispatched[key] {
+			onlyInRecomputed = append(onlyInRecomputed, formatDriftKey(key))
+		}
+	}
+	sort.Strings(onlyInDispatched)
+	sort.Strings(onlyInRecomputed)
+	return onlyInDispatched, onlyInRecomputed
 }
 
 // compareDriftMultisets reports drift unless the recomputed and dispatched table
 // DDL multisets are exactly equal.
 func compareDriftMultisets(recomputed, dispatched driftChangeMultiset) error {
-	var missing, unexpected []string
-	for key, want := range dispatched {
-		if recomputed[key] < want {
-			missing = append(missing, formatDriftKey(key))
-		}
-	}
-	for key, have := range recomputed {
-		if have > dispatched[key] {
-			unexpected = append(unexpected, formatDriftKey(key))
-		}
-	}
+	missing, unexpected := diffDriftMultisets(recomputed, dispatched)
 	if len(missing) == 0 && len(unexpected) == 0 {
 		return nil
 	}
-	sort.Strings(missing)
-	sort.Strings(unexpected)
 	return fmt.Errorf("reviewed changes this deployment would not plan: %v; changes this deployment would plan that were not reviewed: %v", missing, unexpected)
 }
 

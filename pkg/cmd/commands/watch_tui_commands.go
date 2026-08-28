@@ -10,7 +10,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -223,8 +222,9 @@ func (m WatchModel) triggerVolumeChange(volume int) tea.Cmd {
 func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 	data := templates.ParseProgressResponse(result)
 
-	msg := progressMsg{
+	return progressMsg{
 		state:       data.State,
+		tables:      data.Tables,
 		operations:  data.Operations,
 		released:    data.Released,
 		errorMsg:    data.ErrorMessage,
@@ -235,53 +235,9 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		engine:      result.Engine,
 		metadata:    result.Metadata,
 	}
-
-	// Convert tables with internal table filtering and Spirit progress parsing
-	filtered := ddl.FilterInternalTablesTyped(result.Tables)
-	for _, tbl := range filtered {
-		tp := tableProgress{
-			Name:           tbl.TableName,
-			Deployment:     tbl.Deployment,
-			Keyspace:       tbl.Keyspace,
-			DDL:            tbl.DDL,
-			ChangeType:     tbl.ChangeType,
-			Status:         tbl.Status,
-			RowsCopied:     tbl.RowsCopied,
-			RowsTotal:      tbl.RowsTotal,
-			Percent:        int(tbl.PercentComplete),
-			ETASeconds:     tbl.ETASeconds,
-			ProgressDetail: tbl.ProgressDetail,
-			IsInstant:      tbl.IsInstant,
-		}
-		if tp.ProgressDetail != "" {
-			if info := templates.ParseSpiritProgress(tp.ProgressDetail); info != nil {
-				tp.Percent = info.Percent
-				tp.RowsCopied = info.RowsCopied
-				tp.RowsTotal = info.RowsTotal
-			}
-		}
-		for _, sh := range tbl.Shards {
-			pct := int(sh.PercentComplete)
-			if pct == 0 && sh.RowsTotal > 0 {
-				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
-			}
-			tp.Shards = append(tp.Shards, shardProgress{
-				Shard:           sh.Shard,
-				Status:          sh.Status,
-				RowsCopied:      sh.RowsCopied,
-				RowsTotal:       sh.RowsTotal,
-				Percent:         pct,
-				ETASeconds:      sh.ETASeconds,
-				CutoverAttempts: int(sh.CutoverAttempts),
-			})
-		}
-		msg.tables = append(msg.tables, tp)
-	}
-
-	return msg
 }
 
-func sortTablesByProgress(tables []tableProgress) {
+func sortTablesByProgress(tables []templates.TableProgress) {
 	sort.SliceStable(tables, func(i, j int) bool {
 		return ui.TableStatePriority(state.NormalizeTaskStatus(tables[i].Status)) <
 			ui.TableStatePriority(state.NormalizeTaskStatus(tables[j].Status))
@@ -289,11 +245,11 @@ func sortTablesByProgress(tables []tableProgress) {
 }
 
 // sortStoppedByProgress sorts stopped tables so the one with progress shows first.
-func sortStoppedByProgress(tables []tableProgress) {
+func sortStoppedByProgress(tables []templates.TableProgress) {
 	sort.SliceStable(tables, func(i, j int) bool {
 		// Tables with progress (were actively running) come first
-		if tables[i].Percent != tables[j].Percent {
-			return tables[i].Percent > tables[j].Percent
+		if tables[i].PercentComplete != tables[j].PercentComplete {
+			return tables[i].PercentComplete > tables[j].PercentComplete
 		}
 		return false
 	})

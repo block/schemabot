@@ -225,7 +225,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
-	fmt.Fprintf(&sb, "**⛔ Apply rejected**: **%d** planned %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(&sb, "**⛔ Apply rejected**: **%d** planned %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -237,7 +237,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 			fmt.Fprintf(&sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nRewrite these statements as a supported schema change, or contact your SchemaBot operators for help.\n")
+	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
 
 	return appendAgentHint(sb.String(), data.AgentHint)
 }
@@ -308,8 +308,8 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	} else {
 		sb.WriteString("Another PR currently holds the lock for this database.\n\n")
 		if data.LockRepo != "" {
-			fmt.Fprintf(&sb, "**Locked by**: [%s#%d](https://github.com/%s/pull/%d)\n",
-				data.LockRepo, data.LockPR, data.LockRepo, data.LockPR)
+			fmt.Fprintf(&sb, "**Locked by**: %s\n",
+				caller.PullRequestMarkdownLink(data.LockRepo, data.LockPR))
 		} else {
 			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 		}

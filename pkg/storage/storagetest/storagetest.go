@@ -4,6 +4,12 @@
 // errors, ordering, and state transitions — never on an implementation's SQL
 // text or dialect-specific behavior.
 //
+// Test placement follows one rule: a behavior reachable through the public
+// storage interface belongs in this package, where every dialect runs it.
+// An implementation's own test files (for example pkg/storage/internal/
+// sqlstore) cover only behaviors that require raw SQL or database-specific
+// conditions to set up or observe.
+//
 // An implementation package wires itself in by implementing Harness against
 // its own test fixture (container, schema bootstrap, table clearing) and
 // calling Run from its integration tests. Per-family Test functions are also
@@ -27,6 +33,7 @@ package storagetest
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -59,8 +66,18 @@ type Harness interface {
 // opt out of part of the contract — each new family is added here as it
 // lands.
 func Run(t *testing.T, h Harness) {
+	t.Run("Plans", func(t *testing.T) { TestPlans(t, h) })
+	t.Run("PlanComments", func(t *testing.T) { TestPlanComments(t, h) })
 	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
 	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
+	t.Run("Locks", func(t *testing.T) { TestLocks(t, h) })
+	t.Run("Applies", func(t *testing.T) { TestApplies(t, h) })
+	t.Run("ApplyOperations", func(t *testing.T) { TestApplyOperations(t, h) })
+	t.Run("ApplyComments", func(t *testing.T) { TestApplyComments(t, h) })
+	t.Run("ControlRequests", func(t *testing.T) { TestControlRequests(t, h) })
+	t.Run("Tasks", func(t *testing.T) { TestTasks(t, h) })
+	t.Run("WebhookEvents", func(t *testing.T) { TestWebhookEvents(t, h) })
+	t.Run("Checks", func(t *testing.T) { TestChecks(t, h) })
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the
@@ -139,5 +156,34 @@ func CreateApplyWithStateEnvDeployment(t *testing.T, store storage.Storage, lock
 	id, err := store.Applies().Create(ctx, apply)
 	require.NoError(t, err)
 	apply.ID = id
+	return apply
+}
+
+// CreateClaimedApply creates a pending apply under the given lock, persists
+// one task for it so it is ready for driver dispatch, and claims it for the
+// given driver. The returned apply carries the live lease
+// (LeaseOwner / LeaseToken), so lease-guard scenarios can build owned and
+// stale lease contexts entirely through the storage interface.
+func CreateClaimedApply(t *testing.T, store storage.Storage, lock *storage.Lock, applyID string, planID int64, owner string) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+
+	apply := CreateApplyWithTask(t, store, lock, applyID, planID)
+	claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, owner)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "an apply with a persisted task must be claimable")
+	return claimed
+}
+
+// CreateApplyWithTask creates a pending apply and its canonical task fixture.
+func CreateApplyWithTask(t *testing.T, store storage.Storage, lock *storage.Lock, applyID string, planID int64) *storage.Apply {
+	t.Helper()
+	apply := CreateApply(t, store, lock, applyID, planID)
+	now := time.Now().UTC().Truncate(time.Second)
+	task := newTask(apply, "task_"+applyID, "users", now)
+	task.DDL = "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY)"
+	task.DDLAction = "create"
+	_, err := store.Tasks().Create(t.Context(), task)
+	require.NoError(t, err)
 	return apply
 }

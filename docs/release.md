@@ -205,7 +205,11 @@ live inside them.
 **Control plane first, normally.** The gRPC contract is additive only (new
 fields, never removed or renumbered), so a newer control plane and an older data
 plane interoperate: unknown fields are ignored on the way in, absent fields read
-as zero values on the way out.
+as zero values on the way out. That tolerance is the gRPC surface's alone — the
+control plane's HTTP JSON API rejects request fields it does not know, so a new
+request field the CLI sends needs the control plane upgraded before the CLI.
+The wrapper-last rule above already orders exactly that; this is why it is a
+rule rather than a convention.
 
 **Data plane first when the change is in the engine.** In gRPC mode the plan and
 its diff are computed by the data plane, not the control plane, so a release whose

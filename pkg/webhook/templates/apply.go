@@ -786,12 +786,15 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 			writeRowsAndETA(sb, table)
 			break
 		}
-		bar := ui.ProgressBarWaitingCutover()
+		// Blue activity bar: the engine is working on its own with no
+		// meaningful percentage — yellow is reserved for states where the
+		// operator holds the next move.
+		bar := ui.ProgressBarActivity()
 		fmt.Fprintf(sb, "**`%s`**: %s Recovering state...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
-		bar := ui.ProgressBarWaitingCutover()
+		bar := ui.ProgressBarActivity() // blue — automatic work, no operator action
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Cutting over...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
@@ -883,9 +886,15 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		for _, sh := range table.Shards {
 			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
 				parts = append(parts, fmt.Sprintf("%s %s %d%%", shardGlyph(sh.Status), sh.Shard, sh.PercentComplete))
-			} else {
-				parts = append(parts, fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard))
+				continue
 			}
+			part := fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard)
+			// Glyphs whose meaning isn't self-evident carry the same word the
+			// bucketed form uses, so the line reads without a legend.
+			if word := shardStatusWord(sh.Status); word != "" {
+				part += " " + word
+			}
+			parts = append(parts, part)
 		}
 		fmt.Fprintf(sb, "  └ shards: %s\n", strings.Join(parts, " · "))
 		return
@@ -958,6 +967,25 @@ func shardGlyph(status string) string {
 			return "◐" // ◐
 		}
 		return "•" // •
+	}
+}
+
+// shardStatusWord returns the word the bucketed summary pairs with a shard's
+// glyph, for glyphs a reader can't decode on sight. Self-evident glyphs
+// (✓ complete, ⏳ queued) return "", and so does the unknown-status catch-all
+// — the bucketed form keeps its "…" bucket bare too. Copying shards return
+// "copying", which the caller replaces with a percent when one is available.
+func shardStatusWord(status string) string {
+	switch state.NormalizeShardStatus(status) {
+	case state.Task.WaitingForCutover:
+		return "ready"
+	case state.Task.Failed, state.Task.FailedRetryable:
+		return "failed"
+	default:
+		if isCopyingShardStatus(status) {
+			return "copying"
+		}
+		return ""
 	}
 }
 

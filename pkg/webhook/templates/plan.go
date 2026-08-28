@@ -112,6 +112,18 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
+	// Unfinished copies already on the target that the apply will throw away
+	// and copy again from the start.
+	DiscardedCopies []ExistingCopyData
+
+	// Unfinished copies already on the target, left behind by an apply that is
+	// over, that the apply will resume.
+	AdoptedCopies []ExistingCopyData
+
+	// Unfinished copies still being made on the target right now, that the
+	// apply will join rather than resume or restart.
+	RunningCopies []ExistingCopyData
+
 	// Tables carrying a destructive change that another pull request owns, or
 	// whose ownership could not be established.
 	AttributedChanges []AttributedChangeData
@@ -127,6 +139,11 @@ type PlanCommentData struct {
 
 	// Automatic apply state
 	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
+
+	// StoppedConfirmedApply marks a downgrade that stopped an apply the
+	// operator confirmed themselves rather than pausing an automatic one, so
+	// the comment names what actually stopped.
+	StoppedConfirmedApply bool
 
 	RecoveredApplyOwnedCheckState bool
 
@@ -160,6 +177,28 @@ type DeploymentDriftEntry struct {
 	// Detail is a short human explanation for a diverged or errored deployment;
 	// empty for a match.
 	Detail string
+}
+
+// applyingWithoutConfirmation reports whether this comment announces an apply
+// that is already running rather than one waiting on the operator: a locked
+// comment with nothing pausing it. Nothing on such a comment is a question, so
+// the disclosures above the footer state what the apply is doing instead of
+// warning about what confirming would cost, and never offer a remedy that is
+// already out of reach. The footer reads the same predicate, so the two cannot
+// disagree about whether the reader still has a decision to make.
+func (d PlanCommentData) applyingWithoutConfirmation() bool {
+	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
+}
+
+// downgradeHeading names what the comment stopped. An operator who issued
+// apply-confirm themselves paused nothing automatic, so telling them an
+// automatic apply was paused would describe a schema change that was never in
+// flight.
+func (d PlanCommentData) downgradeHeading() string {
+	if d.StoppedConfirmedApply {
+		return "Apply stopped"
+	}
+	return "Automatic apply paused"
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -261,6 +300,21 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
 	}
 
+	// Copies already on the target. Shown on the locked apply comment too:
+	// discarding an unfinished copy destroys hours of work already done, so the
+	// disclosure must sit on the comment the confirmation acts on. The copy is
+	// read from the target at plan time, so it can appear on the apply comment
+	// without having been on the plan comment that preceded it.
+	if len(data.DiscardedCopies) > 0 {
+		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.AdoptedCopies) > 0 {
+		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.RunningCopies) > 0 {
+		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
+	}
+
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
@@ -304,9 +358,9 @@ func RenderPlanComment(data PlanCommentData) string {
 			applyConfirmCmd += " --skip-revert"
 		}
 
-		if data.AutoConfirmDowngradeReason != "" {
+		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, "⚠️ **Automatic apply paused**: %s\n\n", data.AutoConfirmDowngradeReason)
+			fmt.Fprintf(&sb, "⚠️ **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
@@ -378,8 +432,8 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 		// table, which is not necessarily the last one to change it: a later
 		// change from a pull request that has since closed leaves no open claim
 		// and is passed over.
-		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
-			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+		fmt.Fprintf(sb, "- `%s`: changed by %s, which is still open\n",
+			d.Table, caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
@@ -850,10 +904,11 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 
 // writeBlockedChanges writes the section for statements the engine refuses,
 // naming each table and the engine's reason verbatim. There is no opt-in flag
-// that lets these through — the guidance is to rewrite the change, not retry.
+// that lets these through — the remedy is whatever each reason names: an
+// unsupported shape needs a rewrite, a missing grant needs provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -865,7 +920,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
+	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
 // directConsentCopy returns the header noun and consent footer for the
@@ -1358,6 +1413,18 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
+	// Copies already on the target — read per environment, since each
+	// environment has its own target.
+	if len(plan.DiscardedCopies) > 0 {
+		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
+	}
+	if len(plan.AdoptedCopies) > 0 {
+		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
+	}
+	if len(plan.RunningCopies) > 0 {
+		writeRunningCopies(sb, plan.RunningCopies, plan.applyingWithoutConfirmation())
+	}
+
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
@@ -1482,51 +1549,24 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	return false
 }
 
-// driftIdentical reports whether two plans' deployment-drift rollups render the
-// same, so environments are only deduplicated when their drift is identical too.
-func driftIdentical(a, b *DeploymentDriftData) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.Computed != b.Computed || a.Clean != b.Clean || len(a.Deployments) != len(b.Deployments) {
-		return false
-	}
-	for i := range a.Deployments {
-		if a.Deployments[i] != b.Deployments[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// plansIdentical checks if two plans have the same DDL statements. Plans that
-// excluded different namespaces are never identical: deduplicating them into
-// one section would show one environment's exclusion disclosure for both.
+// plansIdentical reports whether two environments' plan sections are the same
+// section, so one may stand in for both under a combined header.
+//
+// It answers that by rendering both and comparing the bytes, because every
+// disclosure in a section is a promise about one environment's target and
+// standing in for the other means making that promise for a target it was never
+// read from. Identical DDL does not make those promises identical: execution
+// policy, the task history that attributes a change, and unfinished copies on
+// the target are all resolved per environment, so a section can differ on any of
+// them while the statements match. Comparing what the section says is the only
+// comparison that stays right as sections gain disclosures — a field-by-field
+// version silently drops each one added after it was written, and drops it from
+// the comment operators apply from.
 func plansIdentical(a, b *PlanCommentData) bool {
-	if !slices.Equal(a.IgnoredNamespaces, b.IgnoredNamespaces) {
-		return false
-	}
-	if len(a.Changes) != len(b.Changes) {
-		return false
-	}
-	for i, aChange := range a.Changes {
-		bChange := b.Changes[i]
-		if aChange.Keyspace != bChange.Keyspace {
-			return false
-		}
-		if len(aChange.Statements) != len(bChange.Statements) {
-			return false
-		}
-		for j, stmt := range aChange.Statements {
-			if stmt != bChange.Statements[j] {
-				return false
-			}
-		}
-		if aChange.VSchemaChanged != bChange.VSchemaChanged || aChange.VSchemaDiff != bChange.VSchemaDiff {
-			return false
-		}
-	}
-	return driftIdentical(a.DeploymentDrift, b.DeploymentDrift)
+	var renderedA, renderedB strings.Builder
+	writeEnvironmentPlanSection(&renderedA, a)
+	writeEnvironmentPlanSection(&renderedB, b)
+	return renderedA.String() == renderedB.String()
 }
 
 // capitalizeEnvNames joins environment names with " & " and capitalizes each.

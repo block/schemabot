@@ -162,6 +162,220 @@ func PreviewCommentPlanDirect() string {
 	})
 }
 
+// PreviewCommentPlanCopyDiscarded renders a sample plan comment for a plan
+// whose apply will throw away an unfinished copy already on the target, showing
+// what the operator would lose by applying while that decision is still theirs.
+func PreviewCommentPlanCopyDiscarded() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedPaused renders the discard on the locked
+// comment of an automatic apply that stopped for confirmation because of it.
+// The copy is still on the target and confirming is what destroys it, so the
+// section warns and names the remedy.
+func PreviewCommentPlanCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedStopped renders the same discard on the
+// comment that stops an apply the operator confirmed themselves, when a copy
+// appeared after the comment they confirmed was posted. Nothing automatic was
+// in flight, so the notice names their own apply as what stopped.
+func PreviewCommentPlanCopyDiscardedStopped() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+		StoppedConfirmedApply:      true,
+	})
+}
+
+// PreviewCommentPlanCopyDiscardedApplying renders the same discard on a
+// comment that announces an apply already under way rather than asking for
+// confirmation. Nothing is being asked of the reader and the copy is already
+// gone, so the section is a record of what the apply threw away rather than a
+// warning with a remedy.
+//
+// The copy-discard gate stops every automatic apply that would discard, so it
+// is the paused rendering above that an operator meets in practice. This one is
+// the shape the section takes on any locked comment carrying no confirmation
+// request, and it is here so that shape stays correct: a comment posted after
+// the copy is destroyed must not offer the remedy for saving it.
+func PreviewCommentPlanCopyDiscardedApplying() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+				},
+			},
+		},
+		DiscardedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders"},
+				Reason:    "statement_differs",
+				Age:       "3h 12m",
+				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyAdopted renders a sample plan comment for a plan whose
+// apply will resume an unfinished copy already on the target rather than
+// starting it over.
+func PreviewCommentPlanCopyAdopted() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		AdoptedCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "3h 12m",
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCopyRunning renders a sample plan comment for a plan whose
+// apply will join a copy still being made on the target. Nothing stopped, so
+// there is nothing to pick back up: the apply resolves the operator onto work
+// already in flight and keeps every row of it.
+func PreviewCommentPlanCopyRunning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		HeadSHA:     previewHeadSHA,
+		Repository:  previewRepository,
+		RequestedBy: previewRequestedBy,
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`);",
+					"ALTER TABLE `products` ADD COLUMN `sku` varchar(64);",
+				},
+			},
+		},
+		RunningCopies: []ExistingCopyData{
+			{
+				Namespace: "testapp",
+				Tables:    []string{"orders", "products"},
+				Age:       "4s",
+				Running:   true,
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyBlockedRejected renders a sample apply rejection for a
 // plan containing statements the engine refuses.
 func PreviewCommentApplyBlockedRejected() string {
@@ -1436,11 +1650,12 @@ func PreviewCommentApplyVitessMultiKeyspaceVSchema() string {
 
 // PreviewCommentApplyShardProgress renders a sharded apply where one table is
 // copying across a handful of shards, exercising the inline per-shard summary
-// (each shard listed, a percent only on the actively-copying shards).
+// (each shard listed, a percent on the actively-copying shards and a status
+// word on the glyphs that need one).
 func PreviewCommentApplyShardProgress() string {
 	shards := []ShardProgressData{
 		{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100},
-		{Shard: "40-80", Status: state.Task.Running, PercentComplete: 62},
+		{Shard: "40-80", Status: state.Task.WaitingForCutover, PercentComplete: 100},
 		{Shard: "80-c0", Status: state.Task.Running, PercentComplete: 31},
 		{Shard: "c0-", Status: state.Task.Pending},
 	}

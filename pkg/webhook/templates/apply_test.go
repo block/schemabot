@@ -646,24 +646,35 @@ func TestRenderApplyStatusComment_VSchema(t *testing.T) {
 func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
 
-	// Inline: ≤8 shards list each shard's status; only the copying shard shows a percent.
+	// Inline: ≤8 shards list each shard's status; only the copying shard shows a
+	// percent, and glyphs that aren't self-evident carry the bucketed form's word.
 	inline := RenderApplyStatusComment(ApplyStatusCommentData{
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{
 			TableName: "users", Status: "running", PercentComplete: 50,
 			Shards: []ShardProgressData{
-				{Shard: "-80", Status: "completed", PercentComplete: 100},
+				{Shard: "-40", Status: "completed", PercentComplete: 100},
+				{Shard: "40-80", Status: "running"},
 				{Shard: "80-c0", Status: "running", PercentComplete: 45},
-				{Shard: "c0-", Status: "waiting_for_cutover", PercentComplete: 100},
+				{Shard: "c0-e0", Status: "failed"},
+				{Shard: "e0-", Status: "waiting_for_cutover", PercentComplete: 100},
 			},
 		}},
 	})
 	assert.Contains(t, inline, "shards:")
-	assert.Contains(t, inline, "✓ -80")
+	// A completed shard's glyph is self-evident — bare, no word before the
+	// separator.
+	assert.Contains(t, inline, "✓ -40 ·")
 	assert.Contains(t, inline, "◐ 80-c0 45%")
-	// A shard waiting for cutover shows ● and no percent (it is no longer copying).
-	assert.Contains(t, inline, "● c0-")
-	assert.NotContains(t, inline, "● c0- 100%")
+	// A copying shard that has not reported progress yet reads "copying"
+	// instead of a misleading 0%.
+	assert.Contains(t, inline, "◐ 40-80 copying")
+	assert.NotContains(t, inline, "◐ 40-80 0%")
+	assert.Contains(t, inline, "✗ c0-e0 failed")
+	// A shard waiting for cutover reads "ready" with no percent (it is no
+	// longer copying).
+	assert.Contains(t, inline, "● e0- ready")
+	assert.NotContains(t, inline, "● e0- 100%")
 
 	// Collapsed: >8 shards bucket by state and name the slowest copier.
 	many := make([]ShardProgressData, 0, 12)
@@ -1450,7 +1461,9 @@ func TestRenderApplyStatusComment_Recovering(t *testing.T) {
 
 	assert.Contains(t, result, "Recovering")
 	assert.Contains(t, result, "1 recovering")
-	assert.Contains(t, result, "Recovering state...")
+	// Recovery runs on its own — blue in-progress bar, not the yellow
+	// operator-attention bar.
+	assert.Contains(t, result, ui.ProgressBarActivity()+" Recovering state...")
 	assert.Contains(t, result, "Cutover will be available once recovery completes")
 	assert.NotContains(t, result, "schemabot cutover")
 }
@@ -1493,7 +1506,10 @@ func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "Cutting Over")
-	assert.Contains(t, result, "Cutting over...")
+	// Cutover is automatic work: it renders the blue in-progress bar. Yellow
+	// is reserved for states where the operator holds the next move.
+	assert.Contains(t, result, ui.ProgressBarActivity()+" 🔄 Cutting over...")
+	assert.NotContains(t, result, ui.ProgressBarWaitingCutover()+" 🔄 Cutting over...")
 }
 
 func TestRenderApplyStatusComment_NoTables(t *testing.T) {

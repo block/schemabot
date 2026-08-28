@@ -335,3 +335,54 @@ func TestValidateSchemaFiles_MissingRejected(t *testing.T) {
 	assert.Empty(t, warning)
 	assert.Contains(t, err.Error(), "schema_files is required")
 }
+
+// Every namespace holding an unfinished copy is carried through to the plan
+// response. A plan spanning several namespaces reports one entry per
+// namespace, and dropping any of them would leave an operator consenting to
+// destroy work they were never shown.
+func TestPlanResponseFromProto_CarriesEveryExistingCopy(t *testing.T) {
+	resp := &ternv1.PlanResponse{
+		ExistingCopies: []*ternv1.ExistingCopy{
+			{
+				Namespace:   "orders_ks",
+				Disposition: "discard",
+				Reason:      "statement_differs",
+				Tables:      []string{"orders"},
+				AgeSeconds:  11520,
+				Statement:   "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)",
+			},
+			{
+				Namespace:   "products_ks",
+				Disposition: "adopt",
+				Tables:      []string{"products"},
+				AgeSeconds:  60,
+				Running:     true,
+			},
+		},
+	}
+
+	result := planResponseFromProto(resp)
+
+	require.Len(t, result.ExistingCopies, 2)
+	assert.Equal(t, "orders_ks", result.ExistingCopies[0].Namespace)
+	assert.Equal(t, "discard", result.ExistingCopies[0].Disposition)
+	assert.Equal(t, "statement_differs", result.ExistingCopies[0].Reason)
+	assert.Equal(t, []string{"orders"}, result.ExistingCopies[0].Tables)
+	assert.Equal(t, int64(11520), result.ExistingCopies[0].AgeSeconds)
+	assert.Equal(t, "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)", result.ExistingCopies[0].Statement,
+		"the statement the copy was started for is what a discard disclosure compares the plan against")
+	assert.False(t, result.ExistingCopies[0].Running,
+		"a copy the deployment did not mark as running stays unmarked")
+	assert.Equal(t, "products_ks", result.ExistingCopies[1].Namespace)
+	assert.Equal(t, "adopt", result.ExistingCopies[1].Disposition)
+	assert.True(t, result.ExistingCopies[1].Running,
+		"whether the copy is still being made survives the wire, or every disclosure reads as left behind")
+}
+
+// A plan against a clean target carries no copy disclosure, so the plan
+// response is unchanged from what it has always been.
+func TestPlanResponseFromProto_NoExistingCopiesOnCleanTarget(t *testing.T) {
+	result := planResponseFromProto(&ternv1.PlanResponse{})
+
+	assert.Empty(t, result.ExistingCopies)
+}

@@ -2,9 +2,18 @@ package postgresconn
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql/driver"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -106,6 +115,154 @@ func TestConnectionDSN(t *testing.T) {
 	}
 }
 
+// A verifying DSN (sslmode=verify-full) against an RDS host names no root
+// bundle of its own, so the connection verifies against the embedded RDS
+// global CA bundle — the ambient system trust store does not carry the
+// private Amazon RDS roots and would fail every handshake.
+func TestConnectionConfigVerifiesRDSHostsWithEmbeddedRoots(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	assert.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	// DNS names are case-insensitive: an uppercase RDS endpoint gets the same
+	// roots.
+	cfg, err = connectionConfig("postgres://schemabot:secret@DB.EXAMPLE.RDS.AMAZONAWS.COM:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	// sslmode=require encrypts without authenticating (pgx marks it
+	// InsecureSkipVerify); the RDS roots would prove nothing, so the config is
+	// left untouched.
+	cfg, err = connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=require")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.True(t, cfg.TLSConfig.InsecureSkipVerify)
+	assert.Nil(t, cfg.TLSConfig.RootCAs)
+
+	// The embedded bundle holds RDS roots only: a non-RDS host gets no
+	// implicit trust material.
+	cfg, err = connectionConfig("postgres://schemabot:secret@db.internal.example:5432/app?sslmode=verify-full")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Nil(t, cfg.TLSConfig.RootCAs)
+}
+
+// An explicit sslrootcert in the DSN is the operator's chosen trust root:
+// the connection verifies against the pool pgx built from that file, and the
+// embedded RDS bundle is not layered on top even for an RDS host.
+func TestConnectionConfigExplicitSSLRootCertWins(t *testing.T) {
+	caPath := writeSelfSignedCA(t)
+
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.example.rds.amazonaws.com:5432/app?sslmode=verify-full&sslrootcert=" + url.QueryEscape(caPath))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.False(t, cfg.TLSConfig.InsecureSkipVerify)
+	require.NotNil(t, cfg.TLSConfig.RootCAs)
+
+	pemBytes, err := os.ReadFile(caPath)
+	require.NoError(t, err)
+	fromFile := x509.NewCertPool()
+	require.True(t, fromFile.AppendCertsFromPEM(pemBytes))
+	assert.True(t, cfg.TLSConfig.RootCAs.Equal(fromFile))
+
+	rds, err := rdsRootPool()
+	require.NoError(t, err)
+	assert.False(t, cfg.TLSConfig.RootCAs.Equal(rds))
+}
+
+// writeSelfSignedCA generates a self-signed CA certificate, writes it in PEM
+// form to a temp file, and returns the file path.
+func writeSelfSignedCA(t *testing.T) string {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "postgresconn test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	return path
+}
+
+// A caller-supplied bundle always wins: WithRootCAs replaces whatever trust
+// the DSN installed, and a DSN that negotiates no TLS has nothing to pin.
+func TestWithRootCAsPinsVerificationTrust(t *testing.T) {
+	roots := x509.NewCertPool()
+	cfg, err := connectionConfig("postgres://schemabot:secret@db.cluster-abc123.eu-west-1.rds.amazonaws.com:5432/app?sslmode=verify-full", WithRootCAs(roots))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Same(t, roots, cfg.TLSConfig.RootCAs)
+}
+
+// Pinning trust removes pgx's parse-time fallbacks: under sslmode=prefer a
+// failed TLS handshake would otherwise retry in plaintext, silently bypassing
+// the bundle the caller named.
+func TestWithRootCAsClearsFallbacks(t *testing.T) {
+	roots := x509.NewCertPool()
+	cfg, err := connectionConfig("postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode=prefer", WithRootCAs(roots))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.TLSConfig)
+	assert.Same(t, roots, cfg.TLSConfig.RootCAs)
+	assert.Empty(t, cfg.Fallbacks)
+}
+
+// TestVerifiesServerCertificate pins which sslmodes actually authenticate the
+// server: verify-full and verify-ca consult the trust roots, require and
+// prefer encrypt without verifying, and disable negotiates no TLS — except
+// that require with an explicit sslrootcert is upgraded by pgx to verify-ca
+// semantics, matching libpq.
+func TestVerifiesServerCertificate(t *testing.T) {
+	base := "postgres://schemabot:secret@postgres.internal.example:5432/app?sslmode="
+	tests := []struct {
+		name string
+		dsn  string
+		want bool
+	}{
+		{name: "verify-full authenticates", dsn: base + "verify-full", want: true},
+		{name: "verify-ca authenticates", dsn: base + "verify-ca", want: true},
+		{name: "require encrypts without verifying", dsn: base + "require", want: false},
+		{name: "prefer encrypts without verifying", dsn: base + "prefer", want: false},
+		{name: "allow does not verify", dsn: base + "allow", want: false},
+		{name: "disable negotiates no TLS", dsn: base + "disable", want: false},
+		{name: "absent sslmode defaults to non-verifying", dsn: "postgres://schemabot:secret@postgres.internal.example:5432/app", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := VerifiesServerCertificate(tt.dsn)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("require with sslrootcert verifies like verify-ca", func(t *testing.T) {
+		caPath := writeSelfSignedCA(t)
+		got, err := VerifiesServerCertificate(base + "require&sslrootcert=" + url.QueryEscape(caPath))
+		require.NoError(t, err)
+		assert.True(t, got)
+	})
+
+	t.Run("unparseable DSN is refused", func(t *testing.T) {
+		_, err := VerifiesServerCertificate("postgres://schemabot@:not-a-port/app")
+		require.Error(t, err)
+	})
+}
+
+func TestWithRootCAsLeavesNonTLSConnectionsUntouched(t *testing.T) {
+	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app?sslmode=disable", WithRootCAs(x509.NewCertPool()))
+	require.NoError(t, err)
+	assert.Nil(t, cfg.TLSConfig)
+}
 func TestWithConnectTimeout(t *testing.T) {
 	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))
 	require.NoError(t, err)

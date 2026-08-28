@@ -596,7 +596,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		// Applying this plan can meet a copy an earlier schema change left on
 		// the target and continue it or destroy it. Disclose which, so that is
 		// known before anyone confirms rather than after the copy is gone.
-		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes),
+		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes, req.GroupedExecution),
 	}, nil
 }
 

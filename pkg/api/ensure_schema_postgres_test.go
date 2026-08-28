@@ -66,7 +66,7 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 		"repository", "pull_request", "environment", "deployment", "caller", "installation_id",
 		"external_id", "idempotency_key", "expected_operation_keys", "engine", "state", "error_message", "options", "attempt",
 		"lease_owner", "lease_token", "lease_acquired_at", "started_at", "completed_at",
-		"revert_skipped_at", "created_at", "updated_at",
+		"revert_skipped_at", "superseded_by", "created_at", "updated_at",
 	}, applies)
 
 	for table, content := range files {

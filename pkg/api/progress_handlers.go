@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -427,7 +428,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	httpResp.Environment = apply.Environment
 	httpResp.Caller = apply.Caller
 	if apply.Repository != "" && apply.PullRequest > 0 {
-		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
+		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
 	}
 
 	// Re-read the apply record — the tern client's Progress call may have
@@ -889,7 +890,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, apply := range applies {
 		var opSummary *storage.ApplyOperation
 		if filter.Deployment != "" {
-			opSummary = statusOperationForDeployment(apply, operationsByApply[apply.ID], filter.Deployment)
+			opSummary = s.statusOperationForDeployment(apply, operationsByApply[apply.ID], filter.Deployment)
 		}
 		active := activeApplyResponseFromStorage(apply, opSummary, filter.Deployment)
 		if !failuresOnly && !state.IsTerminalApplyState(active.State) {
@@ -901,7 +902,15 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-func statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
+// statusOperationForDeployment narrows an apply's operations to the requested
+// deployment for the status list. A single matching operation is returned
+// as-is. Multiple matches (a deployment applied per shard) fold into a
+// synthetic summary row: aggregated state and timestamps, plus the
+// deployment's one shared data-plane apply id as the external id — every
+// operation of a deployment attaches into the same data-plane apply, so the
+// deployment has exactly one. Per-operation external ids stay out of the
+// summary; they belong to the per-shard detail views.
+func (s *Service) statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
 	if apply == nil {
 		return nil
 	}
@@ -927,6 +936,13 @@ func statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOper
 		Deployment: deployment,
 		CreatedAt:  matches[0].CreatedAt,
 		UpdatedAt:  matches[0].UpdatedAt,
+	}
+	externalID, err := storage.DeploymentExternalID(matches, deployment)
+	if err != nil {
+		s.logger.Warn("deployment operations record more than one data-plane apply id; status omits the external id",
+			append(apply.LogAttrs(), "operation_deployment", deployment, "error", err)...)
+	} else {
+		summary.ExternalID = externalID
 	}
 	for _, op := range matches {
 		states = append(states, op.State)
@@ -1120,7 +1136,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		Caller:      apply.Caller,
 	}
 	if apply.Repository != "" && apply.PullRequest > 0 {
-		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
+		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
 	}
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)

@@ -48,6 +48,11 @@ func TestProgressBarActivity(t *testing.T) {
 
 	assert.Equal(t, 20, strings.Count(bar, ColorBlue))
 	assert.Zero(t, strings.Count(bar, ColorEmpty))
+
+	// Engine-driven phases (cutting over, recovering) render the activity bar in
+	// one surface and a full row-copy bar in another; the two must stay
+	// byte-identical so the same phase never shows two different bars.
+	assert.Equal(t, ProgressBarRowCopy(100), bar)
 }
 
 func TestFormatETA(t *testing.T) {

@@ -1695,8 +1695,16 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 		}
 		task.ProgressPercent = 100
 		task.CompletedAt = &now
-		c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Completed,
-			fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation))
+		// The completed state must durably land before the settle proceeds:
+		// resolving the durable control request and terminalizing the apply
+		// over a refused write — e.g. a lease-guarded update that lost to a
+		// peer driver — would record the settle as done while the task row
+		// durably stays non-terminal. Failing the settle keeps the request
+		// pending so a later claim redoes it under a current lease.
+		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, state.Task.Completed,
+			fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation)); err != nil {
+			return 0, fmt.Errorf("settle task %s completed after the engine rejected the %s as already completed: %w", task.TaskIdentifier, operation, err)
+		}
 		completedCount++
 	}
 	if applyID == 0 {

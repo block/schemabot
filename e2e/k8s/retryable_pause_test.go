@@ -12,7 +12,6 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,11 +31,6 @@ import (
 //     another attempt and both planes land completed with the DDL applied.
 func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testing.T) {
 	cleanupState(t)
-
-	// Earlier tests replace the control-plane pod, which kills the suite-level
-	// port-forward behind testutil.Endpoint. Forward the control-plane service
-	// fresh so this test reaches whichever pod is serving now.
-	endpoint := startControlPlanePortForward(t)
 
 	// Dial a data-plane pod and open the direct database handles before the
 	// apply starts: every second between the copy being observed running and
@@ -59,20 +53,25 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	// poll tick, so the table is seeded well past the suite's usual row count:
 	// the copy must still be running when the first kill lands, or the apply
 	// completes with no pause to observe.
-	fixture := startIndexAddApplyAtEndpoint(t, endpoint, "k8s_retry_pause", false, nil, 2000000)
+	fixture := startIndexAddApplyWithOptions(t, "k8s_retry_pause", false, nil, 2000000)
 	waitForPodApplyState(t, podClient, fixture.DataPlaneApplyID, ternv1.State_STATE_RUNNING, testutil.PollDeadline)
 
 	// Kill the data plane's target connections on every poll tick until the
-	// engine run fails and the data plane parks the apply for its own retry.
-	// Spirit may absorb a single kill mid-chunk, so the injection repeats until
-	// the pause is actually observed on the wire. Throughout, the control
-	// plane's stored apply must stay non-terminal: the data plane will retry,
-	// so any terminal state here is the split-brain this stack prevents.
+	// pause is visible on the wire. Spirit may absorb a single kill mid-chunk,
+	// so the injection repeats until the pause is actually observed. Each tick
+	// observes the wire before it injects: once the pause is visible, the data
+	// plane's own recovery attempt may already be re-driving the apply, and a
+	// kill landing on that attempt would sabotage the very recovery the rest
+	// of the test waits for. The wire trails the engine — the pause is stamped
+	// to storage before it renders on the wire — so a tick can still inject
+	// just after the engine run has already failed; observing first narrows
+	// that window rather than closing it. Throughout, the control plane's
+	// stored apply must stay non-terminal: the data plane will retry, so any
+	// terminal state here is the split-brain this stack prevents.
 	var lastWireState ternv1.State
+	kills := 0
 	testutil.Poll(t, 3*time.Minute, 250*time.Millisecond,
 		func() bool {
-			killDataPlaneTargetConnections(t, killer)
-
 			cpState := storedControlPlaneApplyState(t, controlPlaneDB, fixture.ApplyID)
 			require.False(t, state.IsTerminalApplyState(cpState),
 				"control plane terminalized the apply (%s) while the data plane was still retrying", cpState)
@@ -80,22 +79,40 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 			lastWireState = podProgress(t, podClient, fixture.DataPlaneApplyID).State
 			require.NotEqual(t, ternv1.State_STATE_FAILED, lastWireState,
 				"data plane settled failed: the retry budget was exhausted before the pause was observed")
-			return lastWireState == ternv1.State_STATE_FAILED_RETRYABLE
+			if lastWireState == ternv1.State_STATE_FAILED_RETRYABLE {
+				return true
+			}
+
+			killDataPlaneTargetConnections(t, killer)
+			kills++
+			return false
 		},
 		func() string {
 			return fmt.Sprintf("timeout waiting for the data-plane pause to cross the wire as STATE_FAILED_RETRYABLE, last wire state: %s", lastWireState)
 		})
+	require.Positive(t, kills,
+		"the pause must come from injected connection kills, not a failure the apply produced on its own")
 
 	// The pause is on the wire and the control plane is still holding. Stop
 	// injecting failures: the data plane's next recovery attempt must finish
 	// the schema change and reconcile both planes to completed.
 	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
 
-	dataPlaneApplyState, dataPlaneTaskState := storedK8sApplyAndTaskStates(t, storageDSNs(t)[0], fixture.DataPlaneApplyID)
-	assert.True(t, state.IsState(dataPlaneApplyState, state.Apply.Completed),
-		"data-plane apply should complete after recovery, got %s", dataPlaneApplyState)
-	assert.True(t, state.IsState(dataPlaneTaskState, state.Task.Completed),
-		"data-plane task should complete after recovery, got %s", dataPlaneTaskState)
+	// The data plane stamps its task rows terminal before its apply row, and
+	// the wire derives completion from the task rows, so the control plane
+	// can terminalize while the data-plane apply row is still converging.
+	// Poll the stored rows until both land completed.
+	var dataPlaneApplyState, dataPlaneTaskState string
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			dataPlaneApplyState, dataPlaneTaskState = storedK8sApplyAndTaskStates(t, storageDSNs(t)[0], fixture.DataPlaneApplyID)
+			return state.IsState(dataPlaneApplyState, state.Apply.Completed) &&
+				state.IsState(dataPlaneTaskState, state.Task.Completed)
+		},
+		func() string {
+			return fmt.Sprintf("data-plane apply and task should complete after recovery, got apply=%s task=%s",
+				dataPlaneApplyState, dataPlaneTaskState)
+		})
 	waitForIndex(t, fixture.TargetDSN, fixture.TableName, "idx_account_created", testutil.PollDeadline)
 }
 

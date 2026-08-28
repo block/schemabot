@@ -149,7 +149,12 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 // ignoreNamespaces are excluded from the plan request. The second return
 // value lists the namespaces actually removed by ignoreNamespaces so callers
 // can disclose the exclusion alongside the plan.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string) (*apitypes.PlanResponse, []string, error) {
+//
+// groupedExecution says whether the apply this plan is for hands the engine
+// every ALTER at once or one table at a time. It only affects what the plan
+// predicts about work already on the target; a caller that has not chosen yet
+// passes false, the shape an apply runs without asking for anything else.
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
 	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, ignoreNamespaces)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read schema files: %w", err)
@@ -160,7 +165,7 @@ func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored)
+	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, groupedExecution)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -169,13 +174,13 @@ func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string
 
 // CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
-	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil)
+	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, false)
 }
 
 // postPlanRequest posts a plan request. ignoredNamespaces names the
 // namespaces removed from schemaFiles before the call — the server needs
 // them to refuse engine shapes that cannot honor the exclusion.
-func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string) (*apitypes.PlanResponse, error) {
+func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -183,6 +188,7 @@ func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles
 		SchemaFiles:       schemaFiles,
 		Repository:        repo,
 		IgnoredNamespaces: ignoredNamespaces,
+		GroupedExecution:  groupedExecution,
 	}
 	if pr != 0 {
 		prVal := int32(pr)

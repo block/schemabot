@@ -27,13 +27,13 @@ const applyColumns = `id, apply_identifier, lock_id, plan_id, database_name, dat
 	repository, pull_request, environment, deployment, caller, installation_id, external_id, idempotency_key, expected_operation_keys, engine,
 	state, error_message, options, attempt,
 	lease_owner, lease_token, lease_acquired_at,
-	created_at, started_at, completed_at, updated_at, revert_skipped_at`
+	created_at, started_at, completed_at, updated_at, revert_skipped_at, superseded_by`
 
 const applyColumnsForApplyAlias = `a.id, a.apply_identifier, a.lock_id, a.plan_id, a.database_name, a.database_type,
 	a.repository, a.pull_request, a.environment, a.deployment, a.caller, a.installation_id, a.external_id, a.idempotency_key, a.expected_operation_keys, a.engine,
 	a.state, a.error_message, a.options, a.attempt,
 	a.lease_owner, a.lease_token, a.lease_acquired_at,
-	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at`
+	a.created_at, a.started_at, a.completed_at, a.updated_at, a.revert_skipped_at, a.superseded_by`
 
 const (
 	// maxRecoveryAttempts is the retry budget for failed_retryable applies,
@@ -1028,7 +1028,7 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 
 	optionsUpdate := ""
 	args := []any{
-		apply.State, apply.ErrorMessage, apply.Attempt,
+		apply.State, apply.ErrorMessage,
 		apply.ExternalID,
 	}
 	if len(apply.Options) > 0 {
@@ -1042,9 +1042,14 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		args = append(args, lease.Token)
 	}
 
+	// The recovery budget (attempt) is deliberately not written here. It is
+	// owned by the insert at create time and by the claim transition's atomic
+	// attempt + 1: a driver's in-memory copy goes stale the moment the stored
+	// budget is adjusted out-of-band mid-drive, and persisting it absolutely
+	// would silently reset that adjustment and re-open expired recovery.
 	result, err := writeTx.tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE applies
-		SET state = ?, error_message = ?, attempt = ?,
+		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
 		WHERE id = ?%s
 	`, optionsUpdate, leasePredicate), args...)
@@ -1478,16 +1483,21 @@ func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.Rece
 // ClaimApplyByID atomically claims one specific apply by ID: a claim selects
 // the row when it needs a driver — pending with persisted child rows; a stale
 // active state whose heartbeat expired beyond the lease staleness window;
-// recently failed_retryable with retry budget; or pending, stopped, or
-// waiting-for-deploy with a pending start control request — and rotates a
+// recently failed_retryable with retry budget; pending, stopped, or
+// waiting-for-deploy with a pending start control request; or stopped with a
+// pending cancel control request (the drive delivers the cancel; the apply
+// keeps its stopped state unless the cancel terminalizes it) — and rotates a
 // fresh lease onto it (owner, token, heartbeat) in the same transaction. The
 // operation-level claim loop calls this after claiming an apply_operations row
 // to acquire the parent apply lease that lease-guarded writes (ResumeApply,
 // MarkCompleted, Heartbeat) require. Returns nil when the apply does not
-// exist, is locked by a peer (SKIP LOCKED), is not currently claimable, or —
-// for a stopped apply with a pending start request — the claim was refused
-// because another active apply owns the target (the start request is failed in
-// that case; see persistApplyClaim).
+// exist, is locked by a peer (SKIP LOCKED), is not currently claimable —
+// which includes a failed_retryable apply whose work another apply took over
+// (superseded_by), excluded from automatic retry by the claim predicate — or,
+// for a stopped apply with a pending start request, when the claim was refused
+// because another active apply owns the target or because the apply was
+// superseded (the start request is failed in either case; see
+// persistApplyClaim).
 func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*storage.Apply, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply %d: %w", applyID, storage.ErrApplyLeaseLost)
@@ -1514,6 +1524,9 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	queryArgs = append(queryArgs,
 		state.Apply.WaitingForDeploy,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.Apply.Stopped,
+		storage.ControlOperationCancel, storage.ControlRequestPending)
 
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
@@ -1525,6 +1538,31 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 	// claimed. Creation dual-writes tasks and the apply_operations row in one
 	// transaction, so either proves the create committed fully; a VSchema-only
 	// apply carries an operation row but no tasks, so tasks alone would strand it.
+	//
+	// The retryable clause excludes an apply whose work another apply took over
+	// (superseded_by): an automatic retry has no operator request behind it, so
+	// there is nothing to refuse-and-fail inside the claim — the row must never
+	// be selected. The stopped + pending start clause deliberately has no such
+	// term: that claim must be admitted so it can fail the pending start request
+	// with the reason instead of stranding it (see persistApplyClaim).
+	//
+	// The deferred-deploy start clause and the stopped + pending cancel clause
+	// both carry the rematch guard, because neither claim moves the apply out of
+	// the state it matched on: the deferred deploy stays waiting_for_deploy until
+	// the drive advances it, and the cancel claim rotates only the lease and
+	// leaves the state stopped (see persistApplyClaim). Without the guard, a
+	// request the drive cannot finish on this claim would be re-claimed on every
+	// poll.
+	//
+	// They differ in the equal-timestamp case, and the difference is load-bearing
+	// (see leaseRematchComparison). The deferred deploy has no downstream
+	// exclusive claim — its operation row also stays waiting_for_deploy — so it
+	// must refuse the equal case or a same-second peer steals the lease. The
+	// cancel claim is reachable only after the operation-level claim moved that
+	// row stopped → resuming, which is what excludes peers, so it can admit the
+	// equal case and deliver a stop-then-cancel without a staleness-window wait.
+	deferredDeployGuard := requestRematchGuardSQL("a", rematchOnlyAfterLease, staleClaimCutoff)
+	stoppedCancelGuard := requestRematchGuardSQL("a", rematchAtOrAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM applies a
@@ -1535,7 +1573,7 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 					OR EXISTS (SELECT 1 FROM apply_operations ao WHERE ao.apply_id = a.id)
 				))
 				OR (a.state IN (%s) AND a.updated_at < %s)
-				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s)
+				OR (a.state = ? AND a.attempt < ? AND a.updated_at >= %s AND a.superseded_by = '')
 				OR (
 					a.state = ?
 					AND EXISTS (
@@ -1558,17 +1596,22 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 						SELECT 1
 						FROM apply_control_requests cr
 						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
-						AND (
-							a.lease_acquired_at IS NULL
-							OR a.lease_acquired_at < cr.updated_at
-							OR a.updated_at < %s
-						)
+						AND `+deferredDeployGuard+`
+					)
+				)
+				OR (
+					a.state = ?
+					AND EXISTS (
+						SELECT 1
+						FROM apply_control_requests cr
+						WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+						AND `+stoppedCancelGuard+`
 					)
 				)
 			)
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, staleClaimCutoff), queryArgs...)
+	`, applyColumns, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1815,6 +1858,11 @@ const (
 	// request was failed and committed inside persistApplyClaim, so the caller
 	// must not claim and must not commit again.
 	claimRefusedActiveTarget
+	// claimRefusedSuperseded means a stopped→running claim was refused because
+	// another apply already took over this one's unfinished work. Like
+	// claimRefusedActiveTarget, the pending start control request was failed and
+	// committed inside persistApplyClaim.
+	claimRefusedSuperseded
 )
 
 // claimedAndComplete reports whether the outcome both acquired the claim and
@@ -1838,7 +1886,16 @@ func (o claimOutcome) claimedAndComplete() bool {
 // concurrent create cannot slip a second active apply onto the target in the
 // window between the re-check and the commit. When another active apply owns the
 // target the claim is refused and the pending start control request is failed so
-// the operator sees why.
+// the operator sees why. A stopped apply whose unfinished work another apply
+// took over (superseded_by) is refused and its pending start request failed the
+// same way — but where the active-target refusal clears once the other apply
+// settles, the superseded refusal is permanent.
+//
+// A stopped apply with a pending cancel request is claimed to deliver the
+// cancel, not to resume: the pending cancel routes the claim to
+// claimStoppedApplyForCancel, which rotates only the lease. Cancel wins over a
+// simultaneously pending start — resuming a copy the operator asked to discard
+// is never the right answer.
 func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
@@ -1847,6 +1904,13 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 	apply.LeaseAcquiredAt = &leaseAcquiredAt
 
 	if state.IsState(apply.State, state.Apply.Stopped) {
+		cancelPending, err := hasPendingControlRequestTx(ctx, tx, apply.ID, storage.ControlOperationCancel)
+		if err != nil {
+			return claimLostRace, err
+		}
+		if cancelPending {
+			return claimStoppedApplyForCancel(ctx, tx, apply, owner, leaseToken)
+		}
 		return claimStoppedApplyUnderTargetLock(ctx, db, locker, dialect, tx, apply, owner, leaseToken)
 	}
 
@@ -1877,13 +1941,39 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
 // re-check and the commit. The lock is released only after the commit.
+//
+// It first asserts in-transaction that the durable start request the claim
+// predicate matched on is still pending, so a stopped apply can never reach
+// resuming without an operator's request behind it. Under READ COMMITTED the
+// request can be settled between the claim SELECT and this read — by the cancel
+// routing above, or by another driver that already resumed the apply — and
+// backing off then is the correct outcome, not an error.
 func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+	startPending, err := hasPendingControlRequestTx(ctx, tx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return claimLostRace, err
+	}
+	if !startPending {
+		slog.WarnContext(ctx, "operator: refusing to resume a stopped apply whose start request is no longer pending; another writer settled it after the claim selected this row",
+			append(apply.LogAttrs(), "lease_owner", owner)...)
+		return claimLostRace, nil
+	}
+
 	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
 	if err != nil {
 		return claimLostRace, err
 	}
 	if !hasApplyTarget(database, dbType, environment) {
 		return claimLostRace, fmt.Errorf("stopped apply %d (%s) is missing target metadata for claim re-check", apply.ID, apply.ApplyIdentifier)
+	}
+
+	// The handoff marker is checked before the target lock because it is a fact
+	// about this row alone, which the claim already holds FOR UPDATE. It also
+	// outlives the successor: once that apply settles, the target is free again
+	// and the one-active-apply re-check below would let this claim through even
+	// though its work was already taken over.
+	if apply.SupersededBy != "" {
+		return refuseStoppedClaimForSupersededApply(ctx, tx, apply, owner, database, dbType, environment)
 	}
 
 	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
@@ -1915,6 +2005,49 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker 
 		return claimLostRace, fmt.Errorf("commit claim stopped apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
 	}
 	return claimAcquiredCommitted, nil
+}
+
+// claimStoppedApplyForCancel rotates the lease onto a stopped apply that has a
+// pending cancel request, leaving the state stopped. The drive exists to
+// terminalize the apply, not to resume it, so there is no stopped→resuming
+// transition and no active-target re-check — delivering a cancel cannot add
+// active work to the target. A pending start request is failed in the same
+// transaction: the cancel supersedes it, and once the apply terminalizes to
+// cancelled nothing would ever consume the start, so leaving it pending would
+// silently strand it.
+func claimStoppedApplyForCancel(ctx context.Context, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+	if err := failPendingStartControlRequestTx(ctx, tx, apply.ID, "start refused: a cancel request is pending for this apply"); err != nil {
+		return claimLostRace, fmt.Errorf("fail pending start superseded by cancel for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE applies
+		SET updated_at = NOW(),
+		    lease_owner = ?, lease_token = ?, lease_acquired_at = NOW()
+		WHERE id = ?
+	`, owner, leaseToken, apply.ID); err != nil {
+		return claimLostRace, fmt.Errorf("rotate lease onto stopped apply %d (%s) for pending cancel: %w", apply.ID, apply.ApplyIdentifier, err)
+	}
+	return claimAcquired, nil
+}
+
+// hasPendingControlRequestTx reports whether a pending control request for
+// operation exists on the apply, read inside the claim transaction so the
+// claim's stopped-state routing (cancel delivery vs start resume) and the lease
+// rotation commit atomically.
+func hasPendingControlRequestTx(ctx context.Context, tx *rebindTx, applyID int64, operation storage.ControlOperation) (bool, error) {
+	var exists int
+	err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ? AND status = ?
+		LIMIT 1
+	`, applyID, operation, storage.ControlRequestPending).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check pending %s control request for apply %d: %w", operation, applyID, err)
+	}
+	return true, nil
 }
 
 // isStartingClaim reports whether a claim of an apply in this state transitions
@@ -1973,13 +2106,27 @@ func refuseStoppedClaimForActiveTarget(ctx context.Context, tx *rebindTx, apply 
 		return claimLostRace, fmt.Errorf("commit refused stopped claim for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
 	}
 	slog.WarnContext(ctx, "claim refused: another active apply exists for target; failing pending start control request",
-		"apply_id", apply.ApplyIdentifier,
-		"database", database,
-		"database_type", dbType,
-		"environment", environment,
-		"lease_owner", owner,
-		"reason", reason)
+		append(apply.LogAttrs(), "lease_owner", owner, "reason", reason)...)
 	return claimRefusedActiveTarget, nil
+}
+
+// refuseStoppedClaimForSupersededApply fails the pending start control request
+// for a stopped apply whose unfinished work another apply already took over, and
+// commits that failure inside tx. Resuming it would replay its statements
+// against a target where that work already happened, so the refusal is
+// unconditional — there is no state of the successor that makes the replay safe
+// again. Returns claimRefusedSuperseded.
+func refuseStoppedClaimForSupersededApply(ctx context.Context, tx *rebindTx, apply *storage.Apply, owner, database, dbType, environment string) (claimOutcome, error) {
+	reason := fmt.Sprintf("start refused: this schema change was superseded by %s", apply.SupersededBy)
+	if err := failPendingStartControlRequestTx(ctx, tx, apply.ID, reason); err != nil {
+		return claimLostRace, fmt.Errorf("fail pending start control request for superseded apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return claimLostRace, fmt.Errorf("commit refused superseded claim for apply %d (%s) on %s/%s/%s: %w", apply.ID, apply.ApplyIdentifier, database, dbType, environment, err)
+	}
+	slog.WarnContext(ctx, "claim refused: this apply's work was taken over by another apply; failing pending start control request",
+		append(apply.LogAttrs(), "superseded_by", apply.SupersededBy, "lease_owner", owner, "reason", reason)...)
+	return claimRefusedSuperseded, nil
 }
 
 // failPendingStartControlRequestTx marks the pending 'start' control request for
@@ -2017,6 +2164,60 @@ func (s *applyStore) SetRevertSkipped(ctx context.Context, applyID int64, at tim
 	if _, err := s.db.ExecContext(ctx,
 		`UPDATE applies SET revert_skipped_at = ?, updated_at = updated_at WHERE id = ?`, at, applyID); err != nil {
 		return fmt.Errorf("set revert_skipped_at for apply %d: %w", applyID, err)
+	}
+	return nil
+}
+
+// MarkSuperseded records the apply that took over this one's unfinished work. It
+// is a targeted write of superseded_by only, with updated_at pinned for the same
+// reason SetRevertSkipped pins it: the caller holds no lease on the apply it is
+// marking, and bumping the heartbeat would delay a recovery claim.
+//
+// The write is conditional on the marker still being unset, so the first
+// successor to record the handoff owns it. The stored value is then read back to
+// decide the outcome, rather than trusting rows-affected, which does not
+// distinguish "another successor holds the marker" from "this successor wrote
+// the same value again" on every dialect.
+//
+// A successor equal to the apply's own identifier is rejected before anything is
+// written: the marker is never cleared, so a self-referential handoff would
+// refuse the apply forever while pointing the operator back at the refused apply
+// itself.
+func (s *applyStore) MarkSuperseded(ctx context.Context, applyID int64, successor string) error {
+	if successor == "" {
+		return fmt.Errorf("mark apply %d superseded: successor apply identifier is required", applyID)
+	}
+	var identifier string
+	err := s.db.QueryRowContext(ctx, `SELECT apply_identifier FROM applies WHERE id = ?`, applyID).Scan(&identifier)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("mark apply %d superseded by %s: %w", applyID, successor, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("read apply identifier to mark apply %d superseded: %w", applyID, err)
+	}
+	if identifier == successor {
+		return fmt.Errorf("mark apply %d superseded: an apply cannot take over its own work (successor %s is this apply)", applyID, successor)
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE applies SET superseded_by = ?, updated_at = updated_at WHERE id = ? AND superseded_by = ''`,
+		successor, applyID); err != nil {
+		return fmt.Errorf("mark apply %d superseded by %s: %w", applyID, successor, err)
+	}
+
+	var stored string
+	err = s.db.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, applyID).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("mark apply %d superseded by %s: %w", applyID, successor, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("read superseded_by for apply %d: %w", applyID, err)
+	}
+	if stored == "" {
+		return fmt.Errorf("mark apply %d superseded by %s: the marker is still unset after the write", applyID, successor)
+	}
+	if stored != successor {
+		return fmt.Errorf("mark apply %d superseded by %s (marker holds %q): %w", applyID, successor, stored, storage.ErrApplyAlreadySuperseded)
 	}
 	return nil
 }
@@ -2437,7 +2638,7 @@ func scanApplyInto(s scanner) (*storage.Apply, error) {
 		&apply.Caller, &apply.InstallationID, &apply.ExternalID, &idempotencyKey, &expectedOperationKeys, &apply.Engine,
 		&apply.State, &apply.ErrorMessage, &options, &apply.Attempt,
 		&apply.LeaseOwner, &apply.LeaseToken, &leaseAcquiredAt,
-		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt,
+		&apply.CreatedAt, &startedAt, &completedAt, &apply.UpdatedAt, &revertSkippedAt, &apply.SupersededBy,
 	)
 	if err != nil {
 		return nil, err

@@ -215,6 +215,23 @@ type PlanRequest struct {
 	Repository   string             // GitHub repo for context (optional)
 	PullRequest  int                // PR number for context (optional)
 	Credentials  *Credentials       // Resolved credentials (from discovery)
+
+	// GroupedExecution reports whether an apply of this plan will hand the
+	// engine every ALTER at once or one table at a time.
+	//
+	// It exists for predictions an engine makes about work already on the
+	// target. Progress an unfinished change left behind is stored per batch, so
+	// what a later apply can resume depends on the grouping it runs under, not
+	// only on the statements. A prediction made for the wrong grouping looks for
+	// progress under a key the apply will never use, and reports work as lost
+	// that the apply would in fact continue.
+	//
+	// A caller that does not yet know the grouping leaves this false, which is
+	// the ungrouped default every engine falls back to. Grouping is opted into,
+	// so a plan made before that choice predicts the shape it would get today,
+	// and the re-plan an apply runs predicts the shape it is actually about to
+	// use.
+	GroupedExecution bool
 }
 
 // PlanResult contains the computed schema change plan.
@@ -351,7 +368,9 @@ type TableChange struct {
 const (
 	// ExecutionModeBlocked marks a statement the engine deterministically
 	// refuses. An apply containing it will fail, and retrying cannot succeed
-	// until the statement changes.
+	// until whatever the reason names changes: the statement itself for an
+	// unsupported shape, or the target's provisioning for a refusal such as
+	// a missing grant.
 	ExecutionModeBlocked = "blocked"
 
 	// ExecutionModeDirect marks a statement the engine refuses but that the
@@ -426,6 +445,17 @@ type ExistingCopy struct {
 	// Age is how long ago the engine last recorded progress on it. Zero when
 	// the engine has no record to resume from, which is itself a discard.
 	Age time.Duration
+	// Statement is the schema change this work was started for, verbatim as
+	// the engine recorded it. Empty when the engine has no record of it, which
+	// is itself a reason the work cannot be resumed.
+	//
+	// It is what makes a statement-drift discard answerable rather than just
+	// announced: a surface can say which change the work belongs to, so an
+	// operator told "the schema change differs from the one that started it"
+	// can see what it differs from and decide whether to restore it. For an
+	// adopt it repeats the plan and says nothing new, so a surface renders it
+	// only where the two disagree.
+	Statement string
 }
 
 // Engine metadata keys carrying the direct execution policy from config
