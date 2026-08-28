@@ -265,8 +265,10 @@ func TestWithRootCAsLeavesNonTLSConnectionsUntouched(t *testing.T) {
 }
 
 // Every SchemaBot-managed connection gets a bounded connect timeout so an
-// unreachable target surfaces as an error instead of a hung dial. A timeout
-// carried in the DSN or supplied as an option wins over the package default.
+// unreachable target surfaces as an error instead of a hung dial. A non-zero
+// timeout carried in the DSN or supplied as an option wins over the package
+// default, while a zero value — absent or explicit — is filled with the
+// default so no managed connection attempt is ever unbounded.
 func TestWithConnectTimeout(t *testing.T) {
 	t.Run("option overrides the default", func(t *testing.T) {
 		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))

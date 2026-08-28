@@ -121,9 +121,11 @@ func TestConnectionDSN_WithConnectTimeout(t *testing.T) {
 
 // Every SchemaBot-managed connection gets bounded connect and write timeouts
 // so a target that stops responding surfaces as an error instead of a hung
-// drive. A timeout carried in the DSN or supplied as an option wins over the
-// package default, and reads stay unbounded because long-running DDL can
-// legitimately stream no bytes for longer than any safe fixed window.
+// drive. A non-zero timeout carried in the DSN or supplied as an option wins
+// over the package default, while a zero value — absent or explicit — is
+// filled with the default so no managed connection is ever unbounded. Reads
+// stay unbounded because long-running DDL can legitimately stream no bytes
+// for longer than any safe fixed window.
 func TestConnectionDSN_TimeoutDefaults(t *testing.T) {
 	t.Run("plain DSN gets default connect and write timeouts", func(t *testing.T) {
 		got, err := ConnectionDSN("root:secret@tcp(localhost:3306)/app?parseTime=true")

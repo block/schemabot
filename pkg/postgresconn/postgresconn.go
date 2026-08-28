@@ -38,9 +38,11 @@ var connectConfig = func(ctx context.Context, cfg pgx.ConnConfig) (driver.Conn, 
 type Option func(*pgx.ConnConfig)
 
 // defaultConnectTimeout bounds a single connection attempt for every
-// SchemaBot-managed PostgreSQL connection whose DSN does not set its own
-// connect_timeout, so an attempt against an unreachable or half-open endpoint
-// fails and is retried instead of blocking its caller indefinitely.
+// SchemaBot-managed PostgreSQL connection whose parsed connect timeout is
+// zero — the DSN or an option must set a non-zero connect_timeout to override
+// it, and the zero "wait indefinitely" value is deliberately replaced — so an
+// attempt against an unreachable or half-open endpoint fails and is retried
+// instead of blocking its caller indefinitely.
 const defaultConnectTimeout = 30 * time.Second
 
 // WithConnectTimeout bounds a single connection attempt (TCP dial plus
@@ -378,8 +380,9 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	for _, opt := range opts {
 		opt(cfg)
 	}
-	// The default fills only an unset value, so a DSN connect_timeout or a
-	// WithConnectTimeout option wins.
+	// The default fills a zero value, so a non-zero DSN connect_timeout or a
+	// WithConnectTimeout option wins while the zero "wait indefinitely" value
+	// is replaced — a managed connection attempt is never unbounded.
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = defaultConnectTimeout
 	}

@@ -15,7 +15,9 @@ import (
 var openSQL = sql.Open
 
 // Default transport timeouts for SchemaBot-managed MySQL connections, applied
-// only when neither the DSN nor an option sets its own value. The connect
+// whenever the parsed value is zero — a DSN or option must set a non-zero
+// timeout to override them, and the zero "no timeout" value is deliberately
+// replaced so a managed connection can never be unbounded. The connect
 // timeout bounds the TCP dial plus handshake, so a connection attempt against
 // an unreachable or half-open endpoint fails and is retried instead of
 // blocking its caller indefinitely. The write timeout bounds a single network
@@ -164,8 +166,9 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 // transport timeouts for values still unset, then the settings every
 // SchemaBot-managed MySQL connection needs, and returns the reassembled DSN.
 // Required settings are applied after options so no option can override them;
-// the timeout defaults fill only zero values so a DSN or option that sets its
-// own timeout wins.
+// the timeout defaults fill zero values, so a non-zero DSN or option timeout
+// wins while the zero "no timeout" value is replaced — a managed connection is
+// never unbounded.
 func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	for _, opt := range opts {
 		opt(cfg)
