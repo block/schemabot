@@ -84,10 +84,14 @@ func StatementTypeToOp(t StatementType) string {
 		return "drop"
 	case StatementRenameTable:
 		return "rename"
+	case StatementTruncateTable:
+		return "truncate"
 	case StatementCreateIndex:
 		return "create_index"
 	case StatementDropIndex:
 		return "drop_index"
+	case StatementCreateView:
+		return "create_view"
 	default:
 		return "unknown"
 	}
@@ -105,10 +109,14 @@ func OpToStatementType(op string) StatementType {
 		return StatementDropTable
 	case "rename":
 		return StatementRenameTable
+	case "truncate":
+		return StatementTruncateTable
 	case "create_index":
 		return StatementCreateIndex
 	case "drop_index":
 		return StatementDropIndex
+	case "create_view":
+		return StatementCreateView
 	default:
 		return StatementUnknown
 	}

@@ -163,7 +163,7 @@ func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChang
 		if ch.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
 			continue
 		}
-		op, err := materializedTableChangeOperation(ch)
+		op, err := materializedTableChangeOperation(parser, ch)
 		if err != nil {
 			return nil, err
 		}
