@@ -21,10 +21,10 @@ import (
 // never re-verified, and an apply with no tasks has nothing to settle.
 func TestEngineReportsLostApplyWork(t *testing.T) {
 	cases := []struct {
-		name        string
-		engineState string
-		taskStates  []string
-		want        bool
+		name            string
+		engineTaskState string
+		taskStates      []string
+		want            bool
 	}{
 		{"running task with pending engine report is lost work", state.Task.Pending, []string{state.Task.Running, state.Task.Completed}, true},
 		{"cutting-over task with pending engine report is lost work", state.Task.Pending, []string{state.Task.CuttingOver}, true},
@@ -39,7 +39,7 @@ func TestEngineReportsLostApplyWork(t *testing.T) {
 			for i, s := range tc.taskStates {
 				tasks[i] = &storage.Task{State: s}
 			}
-			assert.Equal(t, tc.want, engineReportsLostApplyWork(tc.engineState, tasks))
+			assert.Equal(t, tc.want, engineReportsLostApplyWork(tc.engineTaskState, tasks))
 		})
 	}
 }
