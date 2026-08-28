@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -247,36 +248,48 @@ func TestDriftGuard_RecomputeErrorFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "recompute local plan")
 }
 
-// canonicalDDLForDrift must fail closed on DDL it cannot parse: ddl.Canonicalize
-// returns its input unchanged on a parse failure, so without this guard an
-// unparseable statement would silently compare by raw text and could mask drift.
+// driftParserForDialect resolves the statement parser drift tests classify and
+// canonicalize DDL with, failing the test if the dialect is unregistered.
+func driftParserForDialect(t *testing.T, dialect schema.Dialect) ddl.StatementParser {
+	t.Helper()
+	parser, err := ddl.ParserForDialect(dialect)
+	require.NoError(t, err)
+	return parser
+}
+
+// canonicalDDLForDrift must fail closed on DDL it cannot parse: the parser's
+// Canonicalize returns its input unchanged on a parse failure, so without this
+// guard an unparseable statement would silently compare by raw text and could
+// mask drift.
 func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
+	parser := driftParserForDialect(t, schema.DialectMySQL)
+
 	t.Run("unparseable DDL is rejected", func(t *testing.T) {
-		_, err := canonicalDDLForDrift("this is not valid sql")
+		_, err := canonicalDDLForDrift(parser, "this is not valid sql")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "unparseable DDL")
 	})
 
 	t.Run("empty DDL is rejected", func(t *testing.T) {
-		_, err := canonicalDDLForDrift("   ")
+		_, err := canonicalDDLForDrift(parser, "   ")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "empty DDL")
 	})
 
 	t.Run("multi-statement DDL is rejected", func(t *testing.T) {
-		// ddl.Canonicalize only canonicalizes the first statement, so a
+		// Canonicalize only canonicalizes the first statement, so a
 		// multi-statement payload would silently drop the trailing statements
 		// and mask drift on them. It must fail closed instead.
-		_, err := canonicalDDLForDrift("ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
+		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "exactly one DDL statement")
+		assert.Contains(t, err.Error(), "parsed as 2 statements")
 	})
 
 	t.Run("non-DDL statement is rejected", func(t *testing.T) {
-		// statement.Classify accepts non-DDL such as SELECT, which has no place
+		// The parser classifies non-DDL such as SELECT, which has no place
 		// in a schema-change drift comparison. It must fail closed instead of
 		// canonicalizing it as if it were DDL.
-		_, err := canonicalDDLForDrift("SELECT 1")
+		_, err := canonicalDDLForDrift(parser, "SELECT 1")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "expected a DDL statement")
 	})
@@ -284,11 +297,67 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	t.Run("parseable DDL is canonicalized", func(t *testing.T) {
 		// Whitespace and unquoted identifiers normalize to the same canonical form
 		// regardless of incidental formatting, so equivalent DDL compares equal.
-		spaced, err := canonicalDDLForDrift("ALTER TABLE   users   ADD COLUMN email varchar(255)")
+		spaced, err := canonicalDDLForDrift(parser, "ALTER TABLE   users   ADD COLUMN email varchar(255)")
 		require.NoError(t, err)
-		quoted, err := canonicalDDLForDrift("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		quoted, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 		require.NoError(t, err)
 		assert.Equal(t, quoted, spaced)
 		assert.NotEmpty(t, spaced)
 	})
+}
+
+// PostgreSQL DDL must be classified and canonicalized with the PostgreSQL
+// grammar: constructs like uuid/timestamptz columns, IDENTITY, and CREATE
+// INDEX CONCURRENTLY are not MySQL and would fail the MySQL parser, blocking
+// every PostgreSQL apply behind a false drift error.
+func TestCanonicalDDLForDrift_PostgresDialect(t *testing.T) {
+	parser := driftParserForDialect(t, schema.DialectPostgres)
+
+	t.Run("CREATE TABLE with PostgreSQL types is canonicalized", func(t *testing.T) {
+		spaced, err := canonicalDDLForDrift(parser, `CREATE TABLE  users (
+			id uuid PRIMARY KEY,
+			seq bigint GENERATED ALWAYS AS IDENTITY,
+			created_at timestamptz NOT NULL DEFAULT now()
+		)`)
+		require.NoError(t, err)
+		compact, err := canonicalDDLForDrift(parser, "CREATE TABLE users (id uuid PRIMARY KEY, seq bigint GENERATED ALWAYS AS IDENTITY, created_at timestamptz NOT NULL DEFAULT now())")
+		require.NoError(t, err)
+		assert.Equal(t, compact, spaced, "formatting-only differences canonicalize to the same form")
+	})
+
+	t.Run("CREATE INDEX CONCURRENTLY is DDL", func(t *testing.T) {
+		canon, err := canonicalDDLForDrift(parser, "CREATE INDEX CONCURRENTLY idx_users_email ON users (email)")
+		require.NoError(t, err)
+		assert.Contains(t, canon, "CONCURRENTLY")
+	})
+
+	t.Run("ALTER TABLE is canonicalized", func(t *testing.T) {
+		spaced, err := canonicalDDLForDrift(parser, "ALTER TABLE   users   ADD COLUMN email varchar(255)")
+		require.NoError(t, err)
+		quoted, err := canonicalDDLForDrift(parser, `ALTER TABLE "users" ADD COLUMN "email" varchar(255)`)
+		require.NoError(t, err)
+		assert.Equal(t, quoted, spaced)
+	})
+
+	t.Run("MySQL-quoted DDL is rejected by the PostgreSQL grammar", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unparseable DDL")
+	})
+
+	t.Run("non-DDL statement is rejected", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, "SELECT 1")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected a DDL statement")
+	})
+}
+
+// A deployment whose database type maps to no registered dialect has no grammar
+// to classify its DDL with, so the drift guard must fail closed rather than
+// judge it by another family's parser.
+func TestStatementParser_UnregisteredDialectFailsClosed(t *testing.T) {
+	c := &LocalClient{config: LocalConfig{Type: "oracle"}}
+	_, err := c.statementParser()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database type "oracle"`)
 }

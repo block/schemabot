@@ -157,6 +157,58 @@ func TestRollupDeploymentDiffs_MalformedSingleDeploymentBaselineBlocks(t *testin
 	require.Error(t, rollup.Entries[0].Err)
 }
 
+// rollupPostgresDeployment is rollupDeployment for a PostgreSQL deployment.
+func rollupPostgresDeployment(name string, changes ...*ternv1.SchemaChange) DeploymentPlanDiff {
+	d := rollupDeployment(name, changes...)
+	d.DatabaseType = "postgres"
+	return d
+}
+
+// A PostgreSQL database's deployments are compared under the PostgreSQL
+// grammar: DDL the MySQL parser cannot read still rolls up clean when every
+// deployment would plan the same changes.
+func TestRollupDeploymentDiffs_PostgresDialectClean(t *testing.T) {
+	change := func() *ternv1.SchemaChange {
+		return &ternv1.SchemaChange{
+			Namespace: "testapp",
+			TableChanges: []*ternv1.TableChange{{
+				TableName:  "users",
+				Ddl:        "CREATE TABLE users (id uuid PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now())",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
+				Namespace:  "testapp",
+			}},
+		}
+	}
+	diffs := []DeploymentPlanDiff{
+		rollupPostgresDeployment("eu", change()),
+		rollupPostgresDeployment("us", change()),
+	}
+	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	require.NoError(t, err)
+	assert.True(t, rollup.Clean)
+	require.Len(t, rollup.Entries, 2)
+	for _, e := range rollup.Entries {
+		assert.Equal(t, DeploymentMatch, e.Class, "deployment %q", e.Deployment)
+	}
+}
+
+// A deployment whose dialect differs from the reviewed primary's cannot be
+// compared meaningfully, so it classifies as errored and the rollup fails
+// closed rather than judging one dialect's DDL under another's grammar.
+func TestRollupDeploymentDiffs_MixedDialectBlocks(t *testing.T) {
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
+		rollupPostgresDeployment("us", rollupAlterUsers("ALTER TABLE users ADD COLUMN email varchar(255)")),
+	}
+	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	require.Error(t, rollup.Entries[1].Err)
+	assert.Contains(t, rollup.Entries[1].Err.Error(), "cannot compare change sets across dialects")
+}
+
 // The rollup enforces the producer contract positionally: a result whose
 // deployments do not match the expected rollout order (wrong primary, wrong
 // order, or a missing deployment) is rejected rather than risking a false clean.
