@@ -73,7 +73,8 @@ func (s *erroringTaskStore) GetByApplyOperationID(context.Context, int64) ([]*st
 // task rows is alive, while a drive that has mirrored nothing for the full
 // stall window is presumed wedged and must be cancelled — its fresh heartbeat
 // would otherwise hold the operation lease forever and no peer driver could
-// reclaim the work. Group finalizers mirror no tasks and are exempt, young
+// reclaim the work. Operations that carry no task rows by design — group
+// finalizers and VSchema-only work — mirror nothing and are exempt, young
 // drives get the full window before their first mirror write, and a failed
 // liveness read keeps the drive going.
 func TestOperationDriveStalled(t *testing.T) {
@@ -117,9 +118,9 @@ func TestOperationDriveStalled(t *testing.T) {
 		assert.True(t, svc.operationDriveStalled(t.Context(), 1, op, apply, stalledStart))
 	})
 
-	t.Run("a drive that never mirrored a task is judged from drive start", func(t *testing.T) {
+	t.Run("a task-less work operation mirrors nothing by design and is exempt", func(t *testing.T) {
 		svc := newStallService(&stubTaskStore{})
-		assert.True(t, svc.operationDriveStalled(t.Context(), 1, op, apply, stalledStart))
+		assert.False(t, svc.operationDriveStalled(t.Context(), 1, op, apply, stalledStart))
 	})
 
 	t.Run("group finalizers are exempt", func(t *testing.T) {

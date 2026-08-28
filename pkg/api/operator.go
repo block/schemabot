@@ -2104,10 +2104,13 @@ func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, drive
 //
 // The window is measured from the later of drive start and the newest task
 // mirror write, so a fresh drive is never judged by a predecessor's writes and
-// slow pre-poll phases get the full window before their first mirror. Group
-// finalizers carry no tasks to mirror, so they are exempt. A liveness read
-// failure keeps the drive going — the heartbeat failure path already stops the
-// drive when storage itself is unhealthy.
+// slow pre-poll phases get the full window before their first mirror. An
+// operation that carries no task rows by design gives the check no mirror
+// signal to judge, so it is exempt: group finalizers never carry tasks, and a
+// VSchema-only plan's work operation is the one task-less work shape (every
+// other task-less claim fails closed at dispatch, before a drive exists to
+// watch). A liveness read failure keeps the drive going — the heartbeat
+// failure path already stops the drive when storage itself is unhealthy.
 func (s *Service) operationDriveStalled(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, driveStart time.Time) bool {
 	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 		return false
@@ -2122,6 +2125,12 @@ func (s *Service) operationDriveStalled(ctx context.Context, driverID int, op *s
 	if err != nil {
 		s.logger.Warn("operator: failed to read task rows for the drive liveness check; the check will retry on the next heartbeat tick",
 			append(logAttrs, "error", err)...)
+		return false
+	}
+	// Task rows are inserted with the apply, so a work operation with none is
+	// the task-less VSchema-only shape: it mirrors nothing by design, and the
+	// check has no signal to judge it by.
+	if len(tasks) == 0 {
 		return false
 	}
 	lastMirror := driveStart
