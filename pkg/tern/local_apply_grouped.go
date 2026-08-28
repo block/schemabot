@@ -568,14 +568,18 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
 	eng := c.getEngine()
-	ticker := time.NewTicker(defaultTaskPollInterval)
+	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
 
 	// Seed revertSkipped from the durable signal so a driver that picks this apply
 	// up after a restart treats skip-revert as already accepted: it won't re-attempt
 	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
 	// flight rather than falling back to revert_window.
-	ps := &atomicPollState{lastProgressLog: time.Now(), revertSkipped: apply.RevertSkippedAt != nil}
+	ps := &atomicPollState{
+		lastProgressLog: time.Now(),
+		revertSkipped:   apply.RevertSkippedAt != nil,
+		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
+	}
 
 	for {
 		select {
@@ -671,6 +675,43 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		return false
 	}
+	now := time.Now()
+	newState := taskStateFromProgressResult(result)
+
+	if engineReportsLostApplyWork(newState, tasks) {
+		pendingFor, exhausted := ps.lostWork.observePending(now)
+		if exhausted {
+			if settleErr := c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
+				// Neither the engine nor the target has answered what happened
+				// to the work, so count the failed verification against the
+				// same bounded error budget as a failed poll — this must never
+				// become an unbounded loop. Return before the reset below so
+				// the healthy poll that carried the pending report cannot
+				// clear the count.
+				ps.consecutiveErrors++
+				logger.Warn("engine reports no active schema change for an in-flight apply and target verification failed; the drive re-verifies at the next poll",
+					append(apply.MutableLogAttrs(), "engine_state", result.State, "consecutive_errors", ps.consecutiveErrors, "error", settleErr)...)
+				if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
+					c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("engine reports no active schema change for an in-flight apply and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", ps.consecutiveErrors))
+					return true
+				}
+				return false
+			}
+			// The settled tasks are terminal or resting now. The no-backward
+			// sync guard keeps this tick's pending report from disturbing
+			// them, so the tick falls through and the apply-state derivation
+			// below quiesces the apply from the settled task states.
+		} else {
+			// Inside the budget the engine is still trusted: it may be
+			// serving a stale snapshot after a restart, or reporting
+			// pending for real work it has not begun executing yet.
+			logger.Debug("engine reports no active schema change for an in-flight apply; still inside the trust budget",
+				append(apply.MutableLogAttrs(), "engine_state", result.State, "pending_for", pendingFor.Round(time.Second))...)
+		}
+	} else {
+		ps.lostWork.reset()
+	}
+
 	ps.consecutiveErrors = 0
 	c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &ps.resumeEventLogged)
 
@@ -704,9 +745,6 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			}
 		}
 	}
-
-	now := time.Now()
-	newState := taskStateFromProgressResult(result)
 
 	// Log state transitions and track when waiting states are entered (for timeouts)
 	if newState != ps.lastTaskState {
@@ -1086,6 +1124,75 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 	return false
+}
+
+// engineReportsLostApplyWork reports whether a grouped progress poll came back
+// with no active schema change (a state that maps to pending) while durable
+// storage says at least one of the apply's tasks is in flight. A grouped apply
+// is a single engine operation, so the engine-vs-storage divergence is
+// detected at the apply level and one trust budget covers all of its tasks;
+// the per-task stored states still decide which tasks a settlement touches.
+// Like the sequential detection, this shape is ambiguous on its own — the
+// caller treats it as the start of a timed trust budget, not as evidence (see
+// engineReportsLostWork).
+func engineReportsLostApplyWork(engineTaskState string, tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if engineReportsLostWork(task.State, engineTaskState) {
+			return true
+		}
+	}
+	return false
+}
+
+// settleLostEngineWorkForTasks resolves a grouped apply's in-flight tasks after
+// the engine has stopped reporting on them, by verifying the target schema
+// directly — the grouped counterpart of settleLostEngineWork. The engine says
+// no schema change is active while durable storage says the apply's work is in
+// flight, and that divergence outlasted the tolerated staleness window, so
+// engine progress can never terminalize these tasks and the target itself is
+// the only remaining authority.
+//
+// Revert-phase tasks rest retryable without a target read — a schema read
+// cannot settle a revert — so they settle even when the re-plan below fails.
+// Every other in-flight task settles from one shared re-plan of the reviewed
+// schema set: completed when its (namespace, shard, table) no longer needs a
+// change, retryable when it still does. Tasks already at rest or terminal are
+// left untouched, so a settlement retried after a verification error never
+// re-settles what an earlier pass already decided. A verification error is
+// returned for the caller's consecutive-error budget to count.
+func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, engineState engine.State) error {
+	var unverified []*storage.Task
+	for _, task := range tasks {
+		if !state.IsInFlightTaskState(task.State) {
+			c.logger.Debug("leaving task out of lost-work settlement; its stored state has no active engine work",
+				append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+			continue
+		}
+		if taskInRevertPhase(task) {
+			c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
+			continue
+		}
+		unverified = append(unverified, task)
+	}
+	if len(unverified) == 0 {
+		return nil
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return fmt.Errorf("load plan for apply %s to verify target schema: %w", apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
+	}
+	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
+	if err != nil {
+		return fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, task := range unverified {
+		_, needsChange := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+		c.settleLostVerifiedTask(ctx, apply, task, needsChange, engineState)
+	}
+	return nil
 }
 
 // autoTriggerCutover fires the engine cutover for a drive that is not

@@ -518,6 +518,17 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
 	return out
 }
 
+// replanTargetSchema re-plans the reviewed schema set against the live target
+// and indexes the remaining changes by (namespace, shard, table), so callers
+// can look up whether each task's table still needs its change.
+func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.Apply, plan *storage.Plan) (map[shardTableKey][]string, error) {
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("re-plan check failed: %w", err)
+	}
+	return replanShardTableDDL(result), nil
+}
+
 // tableStillNeedsChange re-plans the full schema set and then looks up whether
 // this task's table still needs a change on its (namespace, shard). Returns
 // false if it already has the desired schema (e.g., Spirit's cutover completed
@@ -525,11 +536,11 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
 // the statements the re-plan would now apply to it so the caller can confirm the
 // task's own statement is still among them before applying it.
 func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) ([]string, bool, error) {
-	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
+	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 	if err != nil {
-		return nil, false, fmt.Errorf("re-plan check failed: %w", err)
+		return nil, false, err
 	}
-	statements, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+	statements, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 	return statements, stillNeeded, nil
 }
 

@@ -318,6 +318,13 @@ type atomicPollState struct {
 	// engine is unreachable (e.g., branch deleted mid-apply).
 	consecutiveErrors int
 
+	// lostWork measures how long the engine has been reporting no active
+	// schema change while stored tasks say the work is in flight, so the drive
+	// can stop trusting the engine and settle the tasks from the target
+	// schema. One tracker covers the whole apply: grouped work is a single
+	// engine operation, so the engine loses or keeps all of it together.
+	lostWork lostEngineWorkTracker
+
 	// warnedPerShardUnavailable is set after the drive warns that a sharded
 	// engine could not report per-shard/row-copy progress, so the warning is
 	// emitted once per apply rather than on every poll.
@@ -481,7 +488,8 @@ const (
 	defaultTaskStallWarnInterval = 5 * time.Minute
 )
 
-// taskPollInterval returns the sequential drive's progress poll cadence.
+// taskPollInterval returns a drive's progress poll cadence, shared by the
+// sequential and grouped polls.
 func (c *LocalClient) taskPollInterval() time.Duration {
 	if c.taskPollIntervalOverride > 0 {
 		return c.taskPollIntervalOverride
@@ -781,24 +789,13 @@ func (t *lostEngineWorkTracker) reset() {
 // active while durable storage says this task's change is in flight, and that
 // divergence outlasted the tolerated staleness window — so engine progress can
 // never terminalize the task and the target itself is the only remaining
-// authority. A target that already has the desired schema means the work
-// finished and only its outcome was lost: the task completes. A target that
-// still needs the change means the work is genuinely gone: the task is marked
-// retryable so a fresh claim re-drives it — never permanently failed, because
-// nothing about the target is known to be broken. A verification error is
-// returned for the caller's consecutive-error budget to count.
+// authority. Revert-phase tasks rest retryable without a target read; every
+// other task settles from the verification verdict (see
+// settleLostRevertPhaseTask and settleLostVerifiedTask). A verification error
+// is returned for the caller's consecutive-error budget to count.
 func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.Apply, task *storage.Task, engineState engine.State) (taskAction, error) {
-	// A revert-phase task can never be settled by reading the target. The
-	// forward change has already cut over, so the live schema matches the
-	// reviewed target by definition and a match says nothing about whether the
-	// revert this task was driving ever finished. Completing on it would report
-	// the apply as a successful schema change while the revert it was undoing is
-	// gone. Retryable is the only answer a schema read supports here.
 	if taskInRevertPhase(task) {
-		c.logger.Warn("engine reports no active schema change for a revert-phase task; marking it retryable because the target schema cannot settle a revert",
-			append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
-		c.markTaskRetryable(ctx, task,
-			fmt.Sprintf("engine reports no active schema change while table %s was in its revert phase; a fresh claim will re-drive it", task.TableName))
+		c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
 		return taskFailed, nil
 	}
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
@@ -812,6 +809,35 @@ func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.A
 	if err != nil {
 		return taskContinue, fmt.Errorf("verify target schema for task %s table %s: %w", task.TaskIdentifier, task.TableName, err)
 	}
+	c.settleLostVerifiedTask(ctx, apply, task, needsChange, engineState)
+	if needsChange {
+		return taskFailed, nil
+	}
+	return taskContinue, nil
+}
+
+// settleLostRevertPhaseTask rests a revert-phase task retryable after the
+// engine stopped reporting on it. A revert-phase task can never be settled by
+// reading the target: the forward change has already cut over, so the live
+// schema matches the reviewed target by definition and a match says nothing
+// about whether the revert this task was driving ever finished. Completing on
+// it would report the apply as a successful schema change while the revert it
+// was undoing is gone. Retryable is the only answer a schema read supports.
+func (c *LocalClient) settleLostRevertPhaseTask(ctx context.Context, apply *storage.Apply, task *storage.Task, engineState engine.State) {
+	c.logger.Warn("engine reports no active schema change for a revert-phase task; marking it retryable because the target schema cannot settle a revert",
+		append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+	c.markTaskRetryable(ctx, task,
+		fmt.Sprintf("engine reports no active schema change while table %s was in its revert phase; a fresh claim will re-drive it", task.TableName))
+}
+
+// settleLostVerifiedTask settles a task from its target-verification verdict
+// after the engine stopped reporting on it. A target that already has the
+// desired schema means the work finished and only its outcome was lost: the
+// task completes. A target that still needs the change means the work is
+// genuinely gone: the task rests retryable so a fresh claim re-drives it —
+// never permanently failed, because nothing about the target is known to be
+// broken.
+func (c *LocalClient) settleLostVerifiedTask(ctx context.Context, apply *storage.Apply, task *storage.Task, needsChange bool, engineState engine.State) {
 	if !needsChange {
 		now := time.Now()
 		task.ProgressPercent = 100
@@ -820,13 +846,12 @@ func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.A
 			append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
 		c.transitionTaskState(ctx, task, task.ApplyID, state.Task.Completed,
 			fmt.Sprintf("Task %s completed: engine no longer reports the schema change and the target has the desired schema", task.TaskIdentifier))
-		return taskContinue, nil
+		return
 	}
 	c.logger.Warn("engine reports no active schema change but the target still needs it; marking the task retryable for a fresh claim to re-drive",
 		append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
 	c.markTaskRetryable(ctx, task,
 		fmt.Sprintf("engine reports no active schema change for table %s but the target still needs the change; a fresh claim will re-drive it", task.TableName))
-	return taskFailed, nil
 }
 
 // taskWaitsForOperatorAction reports whether a task's state is one the drive is
