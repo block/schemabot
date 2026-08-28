@@ -121,6 +121,19 @@ type ServerConfig struct {
 	// UPDATE SKIP LOCKED queries to prevent races. Defaults to DefaultDrivers.
 	Drivers int `yaml:"drivers"`
 
+	// MaxDriversPerApply caps how many operation leases a single apply may hold
+	// at once across the whole deployment. Without a cap, one wide fan-out
+	// claims every driver on the plane and holds them for as long as its slowest
+	// operation runs, so no other database's work — and no control request — can
+	// be picked up until it finishes.
+	//
+	// Size it against this deployment's pods x Drivers: too high and it bounds
+	// nothing, too low and a sharded fan-out drives only a few operations at a
+	// time. The cap applies to starting new operations only; recovering a
+	// crashed operation and consuming stop/cancel requests are never capped.
+	// Defaults to storage.DefaultMaxDriversPerApply.
+	MaxDriversPerApply int `yaml:"max_drivers_per_apply,omitempty"`
+
 	// MetricsPort is the TCP port of the dedicated HTTP listener serving
 	// Prometheus metrics at /metrics. Metrics are served on their own listener —
 	// not on the main API port — so scrapers can reach them without traversing

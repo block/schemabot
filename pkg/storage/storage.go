@@ -21,6 +21,29 @@ import (
 // long two drivers can run the same engine work concurrently.
 const ApplyLeaseStaleAfter = time.Minute
 
+// DefaultMaxDriversPerApply is the per-apply driver cap used when a deployment
+// does not configure max_drivers_per_apply.
+//
+// The cap bounds how many operation leases one apply may hold at once. A wide
+// fan-out claims its operations oldest-first like any other work, so without a
+// bound a single apply takes every driver on the plane and holds them for as
+// long as its slowest operation runs — starving every other database behind it
+// with no limit. The cap is what keeps the plane available: one apply can
+// occupy at most this many drivers, whatever it is doing, so capacity always
+// remains to claim another tenant's work and to consume control requests.
+//
+// The count lives in storage, so the cap is plane-wide across pods with no
+// extra coordination, and both planes enforce it because both run these claim
+// queries against their own storage. It is deliberately soft: two drivers can
+// read the same count and both claim, landing one over. That costs a driver,
+// not correctness, and avoids serializing every claim behind a lock.
+//
+// It is configurable because the value only means something relative to a
+// plane's pods x drivers: too high and it bounds nothing, too low and a wide
+// sharded fan-out serializes. The default suits a plane running the default
+// driver count on more than one pod; size it deliberately when either differs.
+const DefaultMaxDriversPerApply = 2
+
 // Storage provides access to all stores.
 type Storage interface {
 	// Locks returns the lock store.

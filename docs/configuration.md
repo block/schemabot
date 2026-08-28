@@ -386,6 +386,18 @@ The listener binds `:9102` by default; set `metrics_port` to move it. The API po
 
 **Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
 
+### Per-apply driver cap
+
+A single apply that fans out across many deployments or shards claims its operations like any other work. Without a bound it takes every driver on the plane and holds them for as long as its slowest operation runs, so no other database's work — and no stop or cancel — is picked up until it finishes.
+
+```yaml
+max_drivers_per_apply: 2
+```
+
+`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time.
+
+The cap applies only to *starting* new operations. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped — an apply already at its cap must still be able to recover and to be controlled.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements can

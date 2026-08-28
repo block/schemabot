@@ -32,6 +32,12 @@ type applyOperationStore struct {
 	identity   identityInserter
 	locker     namedlock.Locker
 	classifier ErrorClassifier
+
+	// maxDriversPerApply caps how many operation leases one apply may hold at
+	// once; see freshLeaseCountSQL. Always positive — NewWithDependencies
+	// substitutes storage.DefaultMaxDriversPerApply for an unset value, so the
+	// claim path has no uncapped mode.
+	maxDriversPerApply int
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -683,6 +689,37 @@ const releasedFailureExemptionSQL = `NOT (
 	)
 )`
 
+// freshLeaseCountSQL counts the operation leases the candidate row's parent
+// apply already holds: sibling operations in an active state, owned by some
+// driver, whose heartbeat is still inside the staleness window. It is the
+// measure behind maxDriversPerApply: it is how many drivers the
+// apply occupies right now.
+//
+// Neither a stale-lease row nor a released one is counted. A stale row's driver
+// is gone and the row is claimable again by the recovery clauses, so counting it
+// would let a dead driver keep an apply capped out of the pool; a row released
+// at the cutover barrier clears its lease and backdates its heartbeat, so it is
+// parked, not occupying anything.
+//
+// The cap is a filter on the pending arm only, never a sort key. Sorting by the
+// count would replace the indexed (created_at, id) walk with a full sort that
+// evaluates a correlated subquery per row, which is the claim cost the ordering
+// index exists to avoid. Filtering keeps the index walk: a driver steps past a
+// capped apply's rows to the next apply's oldest claimable row, which is the
+// fairness the cap is for.
+//
+// It takes two format arguments in order: the active-state placeholder list and
+// the dialect's staleness cutoff expression, and one positional argument per
+// active state.
+const freshLeaseCountSQL = `(
+			SELECT COUNT(*)
+			FROM apply_operations AS busy
+			WHERE busy.apply_id = apply_operations.apply_id
+				AND busy.lease_owner <> ''
+				AND busy.state IN (%s)
+				AND busy.updated_at >= %s
+		)`
+
 // releasedFailureExemptionArgs returns the positional arguments for
 // releasedFailureExemptionSQL, in placeholder order.
 func releasedFailureExemptionArgs() []any {
@@ -782,6 +819,11 @@ func releasedFailureExemptionArgs() []any {
 // option — the schema parity tests pin both dialects to the same index shape,
 // and MySQL has no partial indexes — so retention, not indexing, is the lever
 // for that remaining bound.
+//
+// Oldest-first is fair only between applies of comparable width. On its own it
+// lets one wide fan-out hold every driver on the plane for as long as its
+// slowest operation runs, so the pending arm is additionally capped at
+// maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL).
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
@@ -863,6 +905,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.Apply.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	// Fan-out cap: a pending row is claimable only while its apply holds fewer
+	// than maxDriversPerApply fresh operation leases. It gates this arm alone,
+	// because this is the only arm that starts new work. The recovery and
+	// control-request arms below must stay uncapped: a capped-out apply still has
+	// to be able to re-lease a crashed operation and to consume a pending stop or
+	// cancel, and gating those on the same count would make the cap itself the
+	// thing that wedges the apply it is bounding.
+	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs, s.maxDriversPerApply)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -1028,6 +1079,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							)
 						)
 				)
+				AND `+freshLeaseCountSQL+` < ?
 			)
 			OR (
 				state IN (%s)
@@ -1104,7 +1156,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1316,6 +1368,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // the sort itself on every dialect. Both claim queries draw from the same
 // driver pool, so a change to one claim's ordering or eligibility belongs in
 // the other.
+//
+// It carries no maxDriversPerApply cap, unlike the copy claim's
+// pending arm, because the start gate above already bounds an apply to one
+// concurrent cutover: an earlier sibling that is itself parked is not completed,
+// so it blocks every later cutover. A cap could only bind here by exceeding what
+// the ordering gate already allows. The recovery arm is uncapped for the same
+// reason it is there — a stale mid-cutover row must always be re-leasable.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)
