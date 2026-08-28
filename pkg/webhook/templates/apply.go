@@ -1626,11 +1626,11 @@ func groupStateEmoji(tables []TableProgressData) string {
 	return "✅"
 }
 
-// writeSummaryTableEntry writes a single table with DDL block.
-// No emoji — the header carries the group state. Non-success tables get a text label.
-// labelCompleted controls whether completed tables also get one: on a summary
-// for an unsuccessful apply, each row must answer "did this table make it?",
-// so completed tables are labeled explicitly. On a successful apply the header
+// writeSummaryTableEntry writes a single table with a text outcome label and
+// DDL block. No emoji — the header carries the group state. labelCompleted
+// controls whether completed tables get a label too: on a summary for an
+// unsuccessful apply, each row must answer "did this table make it?", so
+// completed tables are labeled explicitly. On a successful apply the header
 // already says every table completed, so the label would be noise.
 func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompleted bool) {
 	normalized := state.NormalizeTaskStatus(t.Status)
@@ -1662,7 +1662,7 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompl
 		// Unknown or in-flight statuses still get a visible label — a bare
 		// table name reads as success, which is wrong for anything but
 		// completed.
-		if label := taskStatusLabel(normalized); label != "" {
+		if label := humanizeState(normalized); label != "" {
 			fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 		} else {
 			fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
@@ -1674,16 +1674,6 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompl
 	} else {
 		sb.WriteString("\n")
 	}
-}
-
-// taskStatusLabel renders a normalized task status as a display label,
-// e.g. "running" → "Running", "failed_retryable" → "Failed retryable".
-func taskStatusLabel(normalized string) string {
-	label := strings.ReplaceAll(normalized, "_", " ")
-	if label == "" {
-		return ""
-	}
-	return strings.ToUpper(label[:1]) + label[1:]
 }
 
 // ApplyStatusFromProgress converts a ProgressResponse to ApplyStatusCommentData.
