@@ -7511,6 +7511,40 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="plan-many-shards-32"></a><strong>Plan: Many Shards (32)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `cdb_resolute_sharded`
+<details>
+<summary><b>all 32 shards</b></summary>
+
+`-08`, `08-10`, `10-18`, `18-20`, `20-28`, `28-30`, `30-38`, `38-40`, `40-48`, `48-50`, `50-58`, `58-60`, `60-68`, `68-70`, `70-78`, `78-80`, `80-88`, `88-90`, `90-98`, `98-a0`, `a0-a8`, `a8-b0`, `b0-b8`, `b8-c0`, `c0-c8`, `c8-d0`, `d0-d8`, `d8-e0`, `e0-e8`, `e8-f0`, `f0-f8`, `f8-`
+
+</details>
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="plan-partially-applied-shards"></a><strong>Plan: Partially Applied Shards</strong></summary>
 
 

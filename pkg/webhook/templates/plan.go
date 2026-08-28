@@ -774,14 +774,14 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 		// satisfied shards means nothing is changing, so render nothing rather than
 		// an empty code block.
 		if len(groups) == 1 && !groups[0].Satisfied {
-			fmt.Fprintf(sb, "**%s**\n\n", planShardList(groups[0].Shards))
+			writeShardGroupHeading(sb, groups[0].Shards, len(shards))
 			writePlanDDLBlock(sb, groups[0].Statements)
 		}
 		return
 	}
 	sb.WriteString("Shards diverge — what applies where:\n\n")
 	for _, g := range groups {
-		fmt.Fprintf(sb, "**%s**\n\n", planShardList(g.Shards))
+		writeShardGroupHeading(sb, g.Shards, len(shards))
 		// A satisfied group already matches the desired schema; say so instead
 		// of rendering an empty code block.
 		if g.Satisfied {
@@ -834,16 +834,54 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 	return status + "\x02" + strings.Join(s.Statements, "\x01")
 }
 
-// planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`".
+// shardNamesInlineLimit caps how many shard names render inline in a PR
+// comment. Beyond it, listing every range reads as a wall — a wide keyspace
+// collapses to a count, with the names behind a collapsed block where the
+// rendering has room for one.
+const shardNamesInlineLimit = 8
+
+// planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
+// when few enough to read inline, collapsing to a bare count ("19 shards")
+// beyond that. Used where the list rides inside a line item and has no room
+// for a collapsed name list; the per-shard detail stays in the CLI plan.
 func planShardList(shards []string) string {
-	quoted := make([]string, len(shards))
-	for i, s := range shards {
-		quoted[i] = fmt.Sprintf("`%s`", s)
+	if len(shards) > shardNamesInlineLimit {
+		return fmt.Sprintf("%d shards", len(shards))
 	}
+	quoted := quotedShardNames(shards)
 	if len(quoted) == 1 {
 		return "shard " + quoted[0]
 	}
 	return "shards " + strings.Join(quoted, ", ")
+}
+
+// quotedShardNames renders each shard name as a markdown inline-code span,
+// normalized so a name from the topology can't break the span or the
+// surrounding comment structure.
+func quotedShardNames(shards []string) []string {
+	quoted := make([]string, len(shards))
+	for i, s := range shards {
+		quoted[i] = markdownInlineCode(s)
+	}
+	return quoted
+}
+
+// writeShardGroupHeading writes a shard group's bold heading above its DDL
+// block. Few shards read inline by name; a wide group leads with how much of
+// the keyspace it covers — "all 32 shards" when it covers every planned
+// shard, "19 of 32 shards" for a subset — as a single collapsed line that
+// expands into the full name list, so the names stay reachable without
+// walling the comment.
+func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards int) {
+	if len(shards) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "**%s**\n\n", planShardList(shards))
+		return
+	}
+	coverage := fmt.Sprintf("all %d shards", len(shards))
+	if len(shards) != totalShards {
+		coverage = fmt.Sprintf("%d of %d shards", len(shards), totalShards)
+	}
+	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n", coverage, strings.Join(quotedShardNames(shards), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform

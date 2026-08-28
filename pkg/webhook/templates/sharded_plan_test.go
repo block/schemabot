@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -151,6 +152,83 @@ func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
 
 	assert.NotContains(t, out, "No schema changes", "per-shard-only DDL is still counted as a change")
 	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
+}
+
+// A uniform plan across a wide keyspace leads with how much of the keyspace
+// the change covers instead of walling the comment with every range: the
+// heading reads "all N shards" and the names stay reachable behind a
+// collapsed block.
+func TestRenderPlanComment_ShardedUniformManyShardsCollapse(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	shards := make([]KeyspaceShardChange, 0, 32)
+	for i := range 32 {
+		shards = append(shards, KeyspaceShardChange{Shard: fmt.Sprintf("s%02d", i), Statements: []string{stmt}})
+	}
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{stmt},
+			Shards:     shards,
+		}},
+	})
+
+	assert.Contains(t, out, "<summary><b>all 32 shards</b></summary>", "a uniform wide keyspace leads with its coverage on one collapsed line")
+	assert.NotContains(t, out, "**shards `", "the heading does not enumerate ranges inline")
+	assert.Contains(t, out, "`s00`, `s01`", "the collapsed block lists the shard names")
+	assert.Contains(t, out, "`s31`", "the collapsed block lists every shard")
+	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
+}
+
+// A divergent plan whose larger group is still a subset of the keyspace names
+// its coverage as a fraction ("N of M shards"), so the operator can tell at a
+// glance how much of the keyspace each change set touches.
+func TestRenderPlanComment_ShardedDivergentWideGroupShowsFraction(t *testing.T) {
+	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	drift := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255)"
+	shards := make([]KeyspaceShardChange, 0, 16)
+	for i := range 15 {
+		shards = append(shards, KeyspaceShardChange{Shard: fmt.Sprintf("s%02d", i), Statements: []string{idx}})
+	}
+	shards = append(shards, KeyspaceShardChange{Shard: "s15", Statements: []string{drift}})
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{idx},
+			Shards:     shards,
+		}},
+	})
+
+	assert.Contains(t, out, "Shards diverge — what applies where:")
+	assert.Contains(t, out, "<summary><b>15 of 16 shards</b></summary>", "a wide subset names its coverage as a fraction on one collapsed line")
+	assert.Contains(t, out, "**shard `s15`**", "a small group still names its shards inline")
+	assert.Contains(t, out, "ADD COLUMN `reason`", "the divergent statement is shown")
+}
+
+// An unsafe change spanning a wide set of shards compacts its list-item shard
+// suffix to a count — a finding line has no room for a collapsed name list.
+func TestRenderPlanComment_UnsafeChangeManyShardsCompactsToCount(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN `x`"
+	names := make([]string, 0, 12)
+	shards := make([]KeyspaceShardChange, 0, 12)
+	for i := range 12 {
+		name := fmt.Sprintf("s%02d", i)
+		names = append(names, name)
+		shards = append(shards, KeyspaceShardChange{Shard: name, Statements: []string{stmt}})
+	}
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data", Shards: names}},
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards:   shards,
+		}},
+	})
+
+	assert.Contains(t, out, "`mutes` (12 shards)", "a wide shard suffix compacts to a count")
+	assert.NotContains(t, out, "(shards `s00`", "the finding line does not enumerate ranges")
 }
 
 // An unsafe change confined to one shard is flagged with that shard in the

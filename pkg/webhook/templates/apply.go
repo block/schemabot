@@ -880,8 +880,7 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
 
-	const inlineLimit = 8
-	if len(table.Shards) <= inlineLimit {
+	if len(table.Shards) <= shardNamesInlineLimit {
 		parts := make([]string, 0, len(table.Shards))
 		for _, sh := range table.Shards {
 			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
