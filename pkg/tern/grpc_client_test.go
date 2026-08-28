@@ -2546,171 +2546,84 @@ func TestGRPCClient_ResumeApplyOperationCancelsOperationStoppedBeforeDispatch(t 
 	assert.NotNil(t, cancelReq, "the apply-level cancel request must remain pending for sibling operations")
 }
 
-func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingCancel(t *testing.T) {
-	// An apply that is running with no remote apply id may or may not have
-	// created a remote apply whose dispatch response was lost, so a pending
-	// cancel cannot be satisfied locally without risking an orphan. The drive
-	// leaves the cancel to the dispatch ambiguity guard, which fails the apply
-	// closed and fails the pending cancel with the same message — a failed apply
-	// is never claimed again, so nothing later could answer the request, and the
-	// operator must see the rejection rather than a command pending forever.
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
+func TestGRPCClient_ResumeApplyAmbiguousDispatchAnswersPendingControlRequests(t *testing.T) {
+	// An apply running with no remote apply id may have created a remote apply
+	// whose dispatch response was lost, so a pending stop or cancel cannot be
+	// satisfied locally without reporting the change settled while it runs on to
+	// cutover. The drive leaves the request to the dispatch recovery, which
+	// re-sends under the original idempotency key and learns the remote apply id.
+	// The request must survive that pass deliverable and then be answered against
+	// the remote apply that actually exists — never rejected, which would refuse
+	// a command that was still satisfiable all along.
+	for _, tc := range []struct {
+		name string
+		// An operator who cancels an unresponsive apply and then stops it leaves
+		// both requests pending. Cancel is processed first, so a stop path that
+		// settled locally would take over from the unhandled cancel and route
+		// around recovery entirely — both must defer to it.
+		operations []storage.ControlOperation
+	}{
+		{name: "cancel", operations: []storage.ControlOperation{storage.ControlOperationCancel}},
+		{name: "stop", operations: []storage.ControlOperation{storage.ControlOperationStop}},
+		{name: "cancel and stop", operations: []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &capturingTernServer{remoteApplyID: "remote-recovered"}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
 
-	apply := &storage.Apply{
-		ID:              9,
-		ApplyIdentifier: "apply-ambiguous-cancel",
-		PlanID:          99,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	task := &storage.Task{
-		ID:             11,
-		TaskIdentifier: "task-users",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationCancel,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: "cli:alice",
-	}}}
-	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: apply},
-		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
-		logs:            &mockApplyLogStore{},
-		controlRequests: controlRequests,
-	}
+			apply := &storage.Apply{
+				ID:              9,
+				ApplyIdentifier: "apply-ambiguous-" + tc.name,
+				PlanID:          99,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.Running,
+			}
+			task := &storage.Task{
+				ID:             11,
+				TaskIdentifier: "task-users",
+				ApplyID:        apply.ID,
+				TableName:      "users",
+				State:          state.Task.Running,
+			}
+			requests := make([]*storage.ApplyControlRequest, 0, len(tc.operations))
+			for _, op := range tc.operations {
+				requests = append(requests, &storage.ApplyControlRequest{
+					ApplyID:     apply.ID,
+					Operation:   op,
+					Status:      storage.ControlRequestPending,
+					RequestedBy: "cli:alice",
+				})
+			}
+			controlRequests := &testControlRequestStore{requests: requests}
+			client.storage = &mockStorage{
+				applies:         &mockApplyStore{apply: apply},
+				tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+				logs:            &mockApplyLogStore{},
+				controlRequests: controlRequests,
+				plans: &mockPlanStore{plan: &storage.Plan{
+					ID:             apply.PlanID,
+					PlanIdentifier: "plan-ambiguous-" + tc.name,
+				}},
+			}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
 
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err, "the ambiguity guard fails the apply closed rather than cancelling work it cannot account for")
-	assert.Empty(t, server.getCancelApplyID(), "no remote cancel is addressable without a remote apply id")
-	assert.Equal(t, state.Apply.Failed, apply.State)
+			require.NoError(t, client.ResumeApply(ctx, apply))
+			assert.Equal(t, "remote-recovered", apply.ExternalID, "recovery must resolve the remote apply id the pending request needs to address")
+			assert.NotEqual(t, state.Apply.Failed, apply.State, "an apply whose ambiguity is resolvable must not be failed out from under a pending command")
+			assert.NotEqual(t, state.Task.Failed, task.State)
 
-	cancelReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
-	require.NoError(t, err)
-	require.NotNil(t, cancelReq)
-	assert.Equal(t, storage.ControlRequestFailed, cancelReq.Status, "the guard must fail the pending cancel so the operator sees the rejection")
-	assert.Contains(t, cancelReq.ErrorMessage, "remote dispatch state is ambiguous")
-}
-
-func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingStop(t *testing.T) {
-	// A stop carries the same orphan risk as a cancel: an apply running with no
-	// remote apply id may already have a remote apply the control plane cannot
-	// see, and settling the stop locally would report the change stopped while it
-	// ran on to cutover — with the apply left terminal, nothing would ever
-	// revisit it. The drive leaves the stop to the dispatch ambiguity guard,
-	// which fails the apply closed and fails the pending stop with the same
-	// message, since a failed apply is never claimed again.
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
-	apply := &storage.Apply{
-		ID:              9,
-		ApplyIdentifier: "apply-ambiguous-stop",
-		PlanID:          99,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	task := &storage.Task{
-		ID:             11,
-		TaskIdentifier: "task-users",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
-		ApplyID:     apply.ID,
-		Operation:   storage.ControlOperationStop,
-		Status:      storage.ControlRequestPending,
-		RequestedBy: "cli:alice",
-	}}}
-	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: apply},
-		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
-		logs:            &mockApplyLogStore{},
-		controlRequests: controlRequests,
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err, "the ambiguity guard fails the apply closed rather than reporting a stop it cannot account for")
-	assert.Empty(t, server.getStopApplyID(), "no remote stop is addressable without a remote apply id")
-	assert.Equal(t, state.Apply.Failed, apply.State, "the apply must not be recorded stopped while remote work may still be running")
-	assert.Equal(t, state.Task.Failed, task.State)
-
-	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
-	require.NoError(t, err)
-	require.NotNil(t, stopReq)
-	assert.Equal(t, storage.ControlRequestFailed, stopReq.Status, "the guard must fail the pending stop so the operator sees the rejection")
-	assert.Contains(t, stopReq.ErrorMessage, "remote dispatch state is ambiguous")
-}
-
-func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingCancelAndStop(t *testing.T) {
-	// An operator who cancels an unresponsive apply and then stops it leaves both
-	// requests pending. The drive processes cancel first, so a stop path that
-	// settled locally would take over from the unhandled cancel and route around
-	// the dispatch ambiguity guard entirely. Both requests must defer to the
-	// guard, and the guard must fail both once it has failed the apply closed.
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
-	apply := &storage.Apply{
-		ID:              9,
-		ApplyIdentifier: "apply-ambiguous-cancel-stop",
-		PlanID:          99,
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "staging",
-		State:           state.Apply.Running,
-	}
-	task := &storage.Task{
-		ID:             11,
-		TaskIdentifier: "task-users",
-		ApplyID:        apply.ID,
-		TableName:      "users",
-		State:          state.Task.Running,
-	}
-	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
-		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
-		{ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
-	}}
-	client.storage = &mockStorage{
-		applies:         &mockApplyStore{apply: apply},
-		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
-		logs:            &mockApplyLogStore{},
-		controlRequests: controlRequests,
-	}
-
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err, "a second pending request must not carry the drive past the ambiguity guard")
-	assert.Equal(t, state.Apply.Failed, apply.State)
-	assert.Empty(t, server.getCancelApplyID())
-	assert.Empty(t, server.getStopApplyID())
-
-	for _, op := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
-		req, err := controlRequests.GetByOperation(t.Context(), apply.ID, op)
-		require.NoError(t, err)
-		require.NotNilf(t, req, "the %s request must exist", op)
-		assert.Equalf(t, storage.ControlRequestFailed, req.Status, "the guard must fail the pending %s request so the operator sees the rejection", op)
-		assert.Contains(t, req.ErrorMessage, "remote dispatch state is ambiguous")
+			for _, op := range tc.operations {
+				req, err := controlRequests.GetByOperation(t.Context(), apply.ID, op)
+				require.NoError(t, err)
+				require.NotNilf(t, req, "the %s request must exist", op)
+				assert.Equalf(t, storage.ControlRequestCompleted, req.Status, "the %s request must be answered against the recovered remote apply, not rejected", op)
+			}
+		})
 	}
 }
 
@@ -6999,12 +6912,13 @@ func TestGRPCClient_MarkRemoteApplyFailedReturnsTaskLoadError(t *testing.T) {
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
 }
 
-func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T) {
-	// A stale active gRPC apply without an external_id is ambiguous: the prior
-	// driver may have sent the remote Apply RPC and crashed before persisting the
-	// returned data-plane ID. Fail closed instead of dispatching a duplicate
-	// remote schema change.
-	server := &capturingTernServer{remoteApplyID: "remote-duplicate"}
+func TestGRPCClient_ResumeApplyRecoversAmbiguousDispatchUnderTheOriginalKey(t *testing.T) {
+	// An active gRPC apply with no remote apply id is ambiguous: the prior drive
+	// may have sent the Apply RPC and died before persisting the returned id. The
+	// drive re-sends the dispatch under the key that dispatch would have used, so
+	// the data plane returns the apply it already created rather than starting a
+	// second one, and the apply is tracked again instead of failed.
+	server := &capturingTernServer{remoteApplyID: "remote-already-running"}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
 
@@ -7027,23 +6941,75 @@ func TestGRPCClient_ResumeApplyRejectsAmbiguousRemoteDispatchState(t *testing.T)
 	client.storage = &mockStorage{
 		applies: &mockApplyStore{apply: apply},
 		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
 		plans: &mockPlanStore{plan: &storage.Plan{
 			ID:             apply.PlanID,
 			PlanIdentifier: "plan-ambiguous-dispatch",
 		}},
 	}
 
+	// The key the lost dispatch would have carried. Recovery must reuse it
+	// verbatim: a different key does not dedupe, and the data plane would create
+	// a second remote apply for the same change.
+	wantKey := remoteApplyIdempotencyKey(apply, applyTaskScope{})
+
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	err := client.ResumeApply(ctx, apply)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "remote dispatch state is ambiguous")
+	require.NoError(t, client.ResumeApply(ctx, apply))
 
-	assert.Nil(t, server.getApplyRequest(), "ambiguous apply should not be dispatched to remote Tern")
-	assert.Equal(t, state.Apply.Failed, apply.State)
-	assert.Contains(t, apply.ErrorMessage, "remote dispatch state is ambiguous")
-	assert.Equal(t, state.Task.Failed, task.State)
-	assert.Contains(t, task.ErrorMessage, "remote dispatch state is ambiguous")
+	req := server.getApplyRequest()
+	require.NotNil(t, req, "the ambiguous apply must be re-dispatched to resolve whether a remote apply exists")
+	assert.Equal(t, wantKey, req.IdempotencyKey, "recovery must re-send under the original dispatch's idempotency key")
+	assert.Equal(t, "remote-already-running", apply.ExternalID, "the resolved remote apply id must be adopted")
+	assert.NotEqual(t, state.Apply.Failed, apply.State, "a resolvable ambiguity must never settle the apply failed")
+	assert.NotEqual(t, state.Task.Failed, task.State)
+}
+
+func TestGRPCClient_ResumeApplyLeavesAmbiguousDispatchClaimableWhenUnresolved(t *testing.T) {
+	// When the re-send cannot resolve the ambiguity, the apply must be left
+	// exactly as it was. Recording it failed_retryable would rotate its attempt
+	// on the next claim, and the idempotency key with it — the rotated key no
+	// longer dedupes, so the retry would create a second remote apply for a
+	// change the data plane may already be running.
+	server := &capturingTernServer{applyErr: status.Error(codes.Unavailable, "data plane restarting")}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              8,
+		ApplyIdentifier: "apply-ambiguous-unresolved",
+		PlanID:          100,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		Attempt:         3,
+	}
+	task := &storage.Task{
+		ID:             12,
+		TaskIdentifier: "task-ambiguous-unresolved",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks:   &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:    &mockApplyLogStore{},
+		plans: &mockPlanStore{plan: &storage.Plan{
+			ID:             apply.PlanID,
+			PlanIdentifier: "plan-ambiguous-unresolved",
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.Error(t, client.ResumeApply(ctx, apply))
+
+	assert.Equal(t, state.Apply.Running, apply.State, "an unresolved recovery must leave the apply claimable")
+	assert.NotEqual(t, state.Apply.FailedRetryable, apply.State, "failed_retryable would rotate the attempt and the idempotency key with it")
+	assert.Equal(t, 3, apply.Attempt, "the attempt must not move, so the next claim re-sends the same key")
+	assert.Equal(t, state.Task.Running, task.State)
 }
 
 func TestGRPCClient_ResumeApplyDoesNotFailStateWhenRemoteDispatchOutcomeIsAmbiguous(t *testing.T) {
