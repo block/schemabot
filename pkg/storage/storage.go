@@ -704,6 +704,13 @@ type ApplyStore interface {
 	// therefore leaves an apply that becomes startable again once its
 	// successor settles; the failed write is logged with both applies named,
 	// and neither case is retried.
+	//
+	// The refusal the marker backs is apply-granular even when the successor
+	// took over only part of the apply's work: start is apply-wide and would
+	// replay everything, including the part the successor now owns. Work the
+	// successor did not take over reaches the database through a fresh
+	// dispatch — the marked apply's hold on the database was already released
+	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
 	// CheckLease verifies that an operator apply lease is still current without

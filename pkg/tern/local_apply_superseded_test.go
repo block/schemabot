@@ -90,6 +90,39 @@ func TestMarkSupersededHoldersRecordsTheTakeover(t *testing.T) {
 	assert.Equal(t, int64(7), logs.logs[0].ApplyID, "the event belongs to the superseded apply, not the successor")
 	assert.Contains(t, logs.logs[0].Message, "apply-successor", "the timeline names the apply that took over")
 	assert.Contains(t, logs.logs[0].Message, "users", "the timeline names the table whose work was taken over")
+	assert.Contains(t, logs.logs[0].Message, "can no longer be started",
+		"the timeline states the consequence the marker enforces")
+	assert.Contains(t, logs.logs[0].Message, "fresh apply",
+		"the timeline says where work the successor did not take over goes")
+}
+
+// The marker and the refusal it backs are apply-granular: several released
+// tasks of one apply met by one dispatch are a single handoff, recorded with
+// one mark and one timeline event naming every table taken over — not one
+// event per task, which would read as several takeovers of the same apply.
+func TestMarkSupersededHoldersRecordsOneHandoffPerApply(t *testing.T) {
+	applies := &recordingApplyStore{}
+	logs := &mockApplyLogStore{}
+	client, _ := supersedeClient(applies, logs)
+
+	usersShardA := supersedeHolder()
+	usersShardB := supersedeHolder()
+	accounts := supersedeHolder()
+	accounts.table = "accounts"
+
+	client.markSupersededHolders(t.Context(), supersedeSuccessor(),
+		[]supersededHolder{usersShardA, usersShardB, accounts},
+		[]storage.TableChange{
+			{Namespace: "testdb", Table: "users", Operation: "alter"},
+			{Namespace: "testdb", Table: "accounts", Operation: "alter"},
+		})
+
+	require.Len(t, applies.calls, 1, "one apply's released tasks are one handoff, marked once")
+	assert.Equal(t, int64(7), applies.calls[0].applyID)
+
+	require.Len(t, logs.logs, 1, "one timeline event records the whole handoff")
+	assert.Contains(t, logs.logs[0].Message, "users, accounts",
+		"the single event names every table taken over, each once")
 }
 
 // Releasing a stopped apply's hold frees its whole database, but only a
@@ -108,11 +141,13 @@ func TestMarkSupersededHoldersLeavesAHolderOfAnUntouchedTable(t *testing.T) {
 	assert.Empty(t, logs.logs, "a holder that keeps its work gets no handoff event")
 }
 
-// Neither side of the match can name a table when the work is namespace-level:
-// a VSchema change has no copy on the target, and the holder of a VSchema task
-// left none behind. Two such absences are not a table in common, so nothing is
-// taken over.
-func TestMarkSupersededHoldersIgnoresWorkWithoutATable(t *testing.T) {
+// A holder whose task names no table is a multi-table atomic change: its
+// resting copies are real, just not keyed by table. Any table change the
+// dispatch makes in that namespace may meet one of them, and the ambiguity
+// resolves toward marking — an unmarked holder whose copy was met can be
+// started into replaying work the successor now owns, while a marked holder's
+// remaining work still reaches the database through a fresh apply.
+func TestMarkSupersededHoldersMarksATablelessHolderOnItsNamespace(t *testing.T) {
 	applies := &recordingApplyStore{}
 	logs := &mockApplyLogStore{}
 	client, _ := supersedeClient(applies, logs)
@@ -121,10 +156,50 @@ func TestMarkSupersededHoldersIgnoresWorkWithoutATable(t *testing.T) {
 	holder.table = ""
 
 	client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{holder},
-		[]storage.TableChange{{Namespace: "testdb", Operation: "alter"}})
+		[]storage.TableChange{{Namespace: "testdb", Table: "users", Operation: "alter"}})
 
-	assert.Empty(t, applies.calls, "a change with no table meets no resting copy")
-	assert.Empty(t, logs.logs)
+	require.Len(t, applies.calls, 1, "a table change in the holder's namespace meets its unkeyed copies")
+	assert.Equal(t, int64(7), applies.calls[0].applyID)
+
+	require.Len(t, logs.logs, 1)
+	assert.Contains(t, logs.logs[0].Message, "this change's unfinished work",
+		"a holder with no table to name has its work named as a whole")
+}
+
+// A tableless holder is met by table changes in its namespace, not by
+// namespace-level work: a dispatch of VSchema-only changes leaves no copy on
+// the target and meets none, and a table change in another namespace says
+// nothing about this holder's copies. Either way the holder keeps its work.
+func TestMarkSupersededHoldersLeavesATablelessHolderUnmet(t *testing.T) {
+	tests := []struct {
+		name    string
+		changes []storage.TableChange
+	}{
+		{
+			name:    "dispatch carries only namespace-level work",
+			changes: []storage.TableChange{{Namespace: "testdb", Operation: "alter"}},
+		},
+		{
+			name:    "dispatch changes tables in another namespace only",
+			changes: []storage.TableChange{{Namespace: "otherdb", Table: "users", Operation: "alter"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applies := &recordingApplyStore{}
+			logs := &mockApplyLogStore{}
+			client, _ := supersedeClient(applies, logs)
+
+			holder := supersedeHolder()
+			holder.table = ""
+
+			client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{holder}, tt.changes)
+
+			assert.Empty(t, applies.calls, "no table change meets the holder's namespace, so nothing is taken over")
+			assert.Empty(t, logs.logs)
+		})
+	}
 }
 
 // A namespace left absent means the dispatch's own database, on the change and

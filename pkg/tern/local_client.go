@@ -2427,7 +2427,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.
-	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID)
+	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
 	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
@@ -2573,7 +2573,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0)
+	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, 0)
 	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
