@@ -267,7 +267,7 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	t.Run("unparseable DDL is rejected", func(t *testing.T) {
 		_, err := canonicalDDLForDrift(parser, "this is not valid sql")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "unparseable DDL")
+		assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
 	})
 
 	t.Run("empty DDL is rejected", func(t *testing.T) {
@@ -349,7 +349,7 @@ func TestCanonicalDDLForDrift_PostgresDialect(t *testing.T) {
 	t.Run("MySQL-quoted DDL is rejected by the PostgreSQL grammar", func(t *testing.T) {
 		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "unparseable DDL")
+		assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
 	})
 
 	t.Run("non-DDL statement is rejected", func(t *testing.T) {
@@ -399,5 +399,5 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	my := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypeMySQL}}
 	_, err = my.driftMultisetFromPlanResult(planResult(), false, "")
 	require.Error(t, err, "PostgreSQL-only DDL must not parse under a MySQL-typed client")
-	assert.Contains(t, err.Error(), "unparseable DDL")
+	assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
 }

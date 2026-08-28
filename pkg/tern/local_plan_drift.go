@@ -203,7 +203,7 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	}
 	stmtType, _, err := p.Classify(raw)
 	if err != nil {
-		return "", fmt.Errorf("unparseable DDL: %w", err)
+		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
 	}
 	if !stmtType.IsDDL() {
 		return "", fmt.Errorf("expected a DDL statement, got %s", stmtType)
