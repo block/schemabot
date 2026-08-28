@@ -57,16 +57,21 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	waitForPodApplyState(t, podClient, fixture.DataPlaneApplyID, ternv1.State_STATE_RUNNING, testutil.PollDeadline)
 
 	// Kill the data plane's target connections on every poll tick until the
-	// engine run fails and the data plane parks the apply for its own retry.
-	// Spirit may absorb a single kill mid-chunk, so the injection repeats until
-	// the pause is actually observed on the wire. Throughout, the control
-	// plane's stored apply must stay non-terminal: the data plane will retry,
-	// so any terminal state here is the split-brain this stack prevents.
+	// pause is visible on the wire. Spirit may absorb a single kill mid-chunk,
+	// so the injection repeats until the pause is actually observed. Each tick
+	// observes the wire before it injects: once the pause is visible, the data
+	// plane's own recovery attempt may already be re-driving the apply, and a
+	// kill landing on that attempt would sabotage the very recovery the rest
+	// of the test waits for. The wire trails the engine — the pause is stamped
+	// to storage before it renders on the wire — so a tick can still inject
+	// just after the engine run has already failed; observing first narrows
+	// that window rather than closing it. Throughout, the control plane's
+	// stored apply must stay non-terminal: the data plane will retry, so any
+	// terminal state here is the split-brain this stack prevents.
 	var lastWireState ternv1.State
+	kills := 0
 	testutil.Poll(t, 3*time.Minute, 250*time.Millisecond,
 		func() bool {
-			killDataPlaneTargetConnections(t, killer)
-
 			cpState := storedControlPlaneApplyState(t, controlPlaneDB, fixture.ApplyID)
 			require.False(t, state.IsTerminalApplyState(cpState),
 				"control plane terminalized the apply (%s) while the data plane was still retrying", cpState)
@@ -74,11 +79,19 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 			lastWireState = podProgress(t, podClient, fixture.DataPlaneApplyID).State
 			require.NotEqual(t, ternv1.State_STATE_FAILED, lastWireState,
 				"data plane settled failed: the retry budget was exhausted before the pause was observed")
-			return lastWireState == ternv1.State_STATE_FAILED_RETRYABLE
+			if lastWireState == ternv1.State_STATE_FAILED_RETRYABLE {
+				return true
+			}
+
+			killDataPlaneTargetConnections(t, killer)
+			kills++
+			return false
 		},
 		func() string {
 			return fmt.Sprintf("timeout waiting for the data-plane pause to cross the wire as STATE_FAILED_RETRYABLE, last wire state: %s", lastWireState)
 		})
+	require.Positive(t, kills,
+		"the pause must come from injected connection kills, not a failure the apply produced on its own")
 
 	// The pause is on the wire and the control plane is still holding. Stop
 	// injecting failures: the data plane's next recovery attempt must finish
