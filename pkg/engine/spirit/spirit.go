@@ -87,6 +87,11 @@ type Engine struct {
 	// Drain released, so a progress poll that lands after the drain still
 	// observes the outcome. Apply releases it when it accepts new work.
 	drainedOutcome *drainedOutcome
+
+	// drainRaceWindow is a test seam invoked between the drained goroutine's
+	// exit and Drain's release of the tracked state, so tests can interleave
+	// engine activity into that window deterministically.
+	drainRaceWindow func()
 }
 
 // runningSchemaChange tracks the state of an in-progress schema change.
@@ -311,6 +316,7 @@ func (e *Engine) DebugLogs() bool {
 func (e *Engine) Drain() {
 	e.mu.Lock()
 	rm := e.runningSchemaChange
+	raceWindow := e.drainRaceWindow
 	if rm == nil {
 		e.mu.Unlock()
 		return
@@ -319,12 +325,17 @@ func (e *Engine) Drain() {
 
 	rm.wg.Wait()
 
+	if raceWindow != nil {
+		raceWindow()
+	}
+
 	e.mu.Lock()
 	if e.runningSchemaChange != rm {
-		// The engine started tracking a different schema change while this
-		// drain waited; that change's own flow owns the tracked state now.
+		// Another flow released or replaced the tracked state while this
+		// drain waited — a newer accepted schema change or a concurrent
+		// drain — and that flow owns the engine's state now.
 		e.mu.Unlock()
-		e.schemaChangeLogger(rm).Debug("drained schema change is no longer tracked; leaving the newer tracked state in place",
+		e.schemaChangeLogger(rm).Debug("drained schema change is no longer tracked; leaving the engine's current state in place",
 			"database", rm.database, "tables", rm.tables)
 		return
 	}

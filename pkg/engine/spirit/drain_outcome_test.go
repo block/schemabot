@@ -171,6 +171,34 @@ func TestDrainIdleEngineReportsPending(t *testing.T) {
 	assert.Empty(t, result.Tables)
 }
 
+// A drain can lose a race to newer work: while it waits for the drained
+// change's goroutine to exit, the engine can accept a new schema change. The
+// losing drain must leave the engine's state alone — releasing the tracked
+// state or retaining the old change's outcome here would clobber the newer
+// change's tracked progress or shadow its eventual result.
+func TestDrainLosingRaceToNewerChangeLeavesItUntouched(t *testing.T) {
+	eng := New(Config{})
+	first := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	first.state = engine.StateCompleted
+	first.tables = []string{"users"}
+	eng.mu.Unlock()
+
+	var second *runningSchemaChange
+	eng.drainRaceWindow = func() {
+		second = registerRunningSchemaChange(eng)
+	}
+
+	eng.Drain()
+
+	eng.mu.Lock()
+	tracked := eng.runningSchemaChange
+	outcome := eng.drainedOutcome
+	eng.mu.Unlock()
+	assert.Same(t, second, tracked)
+	assert.Nil(t, outcome)
+}
+
 // A stopped schema change is not an outcome: it resumes from its stored
 // checkpoint through a fresh Apply, and the drive layer owns that stopped
 // state durably. Draining one therefore retains nothing, and progress reports
