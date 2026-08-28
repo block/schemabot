@@ -956,6 +956,48 @@ func TestHandleDeploymentLogsReportsPerSourceTruncation(t *testing.T) {
 	require.Len(t, response.Sources[1].Logs, 1)
 }
 
+// A data-plane read is capped remotely: a request past the cap is served
+// exactly the cap's worth of newest entries, so a window at the cap plus the
+// probe would come back indistinguishable from a complete history. The
+// handler narrows the window below the cap — an operator viewing a long
+// remote apply gets one entry fewer at the cap and an honest partial marker,
+// never a partial window presented as the whole lifecycle.
+func TestHandleDeploymentLogsKeepsTruncationDetectableAtTheRemoteCap(t *testing.T) {
+	apply := &storage.Apply{ID: 14, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		// The remote serves at most its cap, from a history deeper than any
+		// window the handler can request.
+		count := min(int(req.Limit), tern.MaxLogsLimit)
+		resp := &ternv1.LogsResponse{ApplyId: req.ApplyId}
+		for id := 1; id <= count; id++ {
+			resp.Logs = append(resp.Logs, &ternv1.ApplyLog{Id: int64(id), Level: "info", Message: fmt.Sprintf("entry %d", id), CreatedAt: "2026-07-18T18:33:10Z"})
+		}
+		return resp, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("/api/logs?apply_id=apply-control&deployment=region-a&limit=%d", tern.MaxLogsLimit), nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, int32(tern.MaxLogsLimit), client.logsReqs[0].Limit, "the probe stays within what the remote will serve")
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	assert.True(t, response.Sources[0].Truncated, "a window at the remote cap still reports its older entries")
+	require.Len(t, response.Sources[0].Logs, tern.MaxLogsLimit-1)
+	assert.Equal(t, "entry 2", response.Sources[0].Logs[0].Message)
+}
+
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
 	_, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "not-a-time", MetadataJson: []byte(`{}`)})
 	require.ErrorContains(t, err, "created_at")

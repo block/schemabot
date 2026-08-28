@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -151,7 +152,10 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 // entries exist beyond it: an operator triaging an apply needs to know the
 // lifecycle they are looking at is partial, not that nothing else happened.
 // A window at the edge of the wire limit cannot be over-fetched, and is
-// reported untruncated rather than approximated.
+// reported untruncated rather than approximated. Data-plane reads are further
+// capped by the remote's own per-read maximum (tern.MaxLogsLimit), which
+// would clamp the extra entry away; handleDeploymentLogs narrows its window
+// below that cap before building the request so the extra entry survives it.
 func logFetchLimit(limit int) int {
 	if limit <= 0 || limit >= math.MaxInt32 {
 		return limit
@@ -247,6 +251,18 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	// The data plane serves at most tern.MaxLogsLimit entries per read and
+	// silently serves the cap to larger requests, which would swallow the
+	// over-fetch probe: the probe entry is exactly the one clamped away, and a
+	// partial window at the cap would read as the complete history. Narrow the
+	// window so the probe survives the cap — the last entry of a cap-sized
+	// window is the price of never reporting a partial lifecycle as complete.
+	if limit >= tern.MaxLogsLimit {
+		s.logger.Debug("narrowing the data-plane log window below the remote read cap so a partial window is still reported partial",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "requested_limit", limit, "window", tern.MaxLogsLimit-1)...)
+		limit = tern.MaxLogsLimit - 1
+	}
 	requestLimit := int32(min(int64(logFetchLimit(limit)), math.MaxInt32))
 	for _, key := range keys {
 		fetch := fetches[key]

@@ -18,9 +18,10 @@ const followInterval = 5 * time.Second
 
 // followFetchLimit bounds each follow poll's read. A poll fetches the newest
 // followFetchLimit entries (per data-plane source, for deployment tails) and
-// prints the ones not yet shown; an apply that writes more than this within
-// one poll interval produces more output than a terminal tail can usefully
-// render anyway.
+// prints the ones not yet shown; a poll whose bounded window no longer
+// overlaps what was already printed reports a possible gap (see
+// followState.missedEntries), so entries pushed past the bound between polls
+// are announced rather than silently dropped.
 const followFetchLimit = 500
 
 // LogsCmd views apply logs for a database or specific apply.
@@ -161,6 +162,13 @@ func printLogTruncationNotice(truncated bool, shown int) {
 	fmt.Printf("%sShowing the newest %d entries; older entries exist. Raise -n for a wider window.%s\n", templates.ANSIDim, shown, templates.ANSIReset)
 }
 
+// printFollowGapNotice reports a tail that fell behind: a poll's window filled
+// entirely with entries newer than the last one printed, so entries arriving
+// between polls may have been pushed past the window without being shown.
+func printFollowGapNotice() {
+	fmt.Printf("%sPossible gap: the poll window filled with new entries; entries between polls may have been skipped.%s\n", templates.ANSIDim, templates.ANSIReset)
+}
+
 // followLogs prints the newest initialLimit entries, then polls for new ones
 // until the command context is cancelled (Ctrl+C).
 func followLogs(ctx context.Context, endpoint, database, environment, applyID string, initialLimit int) error {
@@ -178,8 +186,11 @@ func followLogs(ctx context.Context, endpoint, database, environment, applyID st
 		return client.GetLogs(endpoint, database, environment, applyID, limit)
 	}
 	emit := func(result *apitypes.LogsResponse, initial bool) {
-		if initial {
+		switch {
+		case initial:
 			printLogTruncationNotice(result.Truncated, len(result.Logs))
+		case state.missedEntries(result.Logs, result.Truncated):
+			printFollowGapNotice()
 		}
 		printLogs(state.advance(result.Logs))
 	}
@@ -196,14 +207,20 @@ func followDeploymentLogs(ctx context.Context, endpoint, applyID, deployment str
 	fetch := func(limit int) (*apitypes.DeploymentLogsResponse, error) {
 		return client.GetDeploymentLogs(endpoint, applyID, deployment, limit)
 	}
-	emit := func(result *apitypes.DeploymentLogsResponse, initial bool) {
+	// The loop-wide initial flag is unused here: each source owes the
+	// truncation notice to its own first successful read, which for a source
+	// that failed the initial fan-out arrives on a later poll.
+	emit := func(result *apitypes.DeploymentLogsResponse, _ bool) {
 		batches, warnings := state.advance(result)
 		for _, batch := range batches {
 			if batch.label != "" {
 				fmt.Printf("%s%s%s\n", templates.ANSIDim, batch.label, templates.ANSIReset)
 			}
-			if initial {
+			switch {
+			case batch.firstRender:
 				printLogTruncationNotice(batch.truncated, len(batch.logs))
+			case batch.possibleGap:
+				printFollowGapNotice()
 			}
 			printLogs(batch.logs)
 		}
@@ -236,6 +253,18 @@ func (s *followState) advance(logs []*client.LogEntry) []*client.LogEntry {
 	return fresh
 }
 
+// missedEntries reports whether a poll's window may have skipped entries: the
+// read hit its own bound and even its oldest entry is newer than the newest
+// one already printed. Everything older was pushed out of the window, and the
+// response does not say whether any of it arrived after the last poll, so the
+// tail can no longer prove it printed every entry. A window that overlaps
+// what was printed, a window under its bound, or a first render with nothing
+// printed yet misses nothing. Evaluate before advance, which moves lastID
+// past the window.
+func (s *followState) missedEntries(logs []*client.LogEntry, truncated bool) bool {
+	return truncated && s.lastID > 0 && len(logs) > 0 && logs[0].ID > s.lastID
+}
+
 // deploymentFollowState tracks, per data-plane source, the newest log entry
 // already printed. A source is one remote apply on one target; its log ids
 // are that data plane's write-ordered keys, monotonic within the source but
@@ -263,13 +292,20 @@ func newDeploymentFollowState() *deploymentFollowState {
 type deploymentFollowBatch struct {
 	label string
 	logs  []*client.LogEntry
-	// truncated carries the source's window signal, which reports only that the
-	// read hit its own bound. That answers the operator's question on the
-	// initial window, where the bound is the window they asked for. On a later
-	// poll the bound is the loop's fetch limit and the entries beyond it are
-	// usually ones already printed, so the signal says nothing about whether
-	// the tail missed anything and is not rendered.
+	// firstRender marks the source's first successful read — the one render
+	// whose window reaches as deep as the tail ever will for that source, so
+	// the one that owes the operator the truncation notice. A source that
+	// fails the initial fan-out read gets its first render on the poll it
+	// recovers.
+	firstRender bool
+	// truncated carries the source's window signal: the read hit its own bound
+	// and older entries exist beyond it. On the first render it drives the
+	// truncation notice; on later polls it feeds the possible-gap check.
 	truncated bool
+	// possibleGap marks a later poll whose window filled entirely with entries
+	// newer than the last printed one (see followState.missedEntries): entries
+	// arriving between polls may have been pushed past the window unseen.
+	possibleGap bool
 }
 
 // deploymentFollowSourceKey identifies a data-plane log source (one remote
@@ -286,11 +322,13 @@ func deploymentFollowSourceKey(target string, operations []*apitypes.LogOperatio
 // the chronological order the server delivered them, plus the warnings to
 // surface for sources that could not be read this poll.
 func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse) ([]deploymentFollowBatch, []string) {
+	firstRender := make(map[string]bool)
 	for _, source := range result.Sources {
 		key := deploymentFollowSourceKey("", source.Operations, source.ExternalID)
 		s.seen[key] = true
 		if s.bySource[key] == nil {
 			s.bySource[key] = &followState{}
+			firstRender[key] = true
 		}
 		// A successful read clears the source's warning suppression so a
 		// relapse after recovery is reported again.
@@ -307,12 +345,14 @@ func (s *deploymentFollowState) advance(result *apitypes.DeploymentLogsResponse)
 	var batches []deploymentFollowBatch
 	for _, source := range result.Sources {
 		key := deploymentFollowSourceKey("", source.Operations, source.ExternalID)
-		fresh := s.bySource[key].advance(source.Logs)
+		sourceState := s.bySource[key]
+		possibleGap := sourceState.missedEntries(source.Logs, source.Truncated)
+		fresh := sourceState.advance(source.Logs)
 		if len(fresh) == 0 {
 			// Nothing new for this source since the last poll.
 			continue
 		}
-		batch := deploymentFollowBatch{logs: fresh, truncated: source.Truncated}
+		batch := deploymentFollowBatch{logs: fresh, firstRender: firstRender[key], truncated: source.Truncated, possibleGap: possibleGap}
 		if labelSources {
 			batch.label = deploymentLogSourceLabel("", source.Operations, source.ExternalID)
 		}
