@@ -100,12 +100,14 @@ func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
 	assert.Equal(t, int64(9001), posted.GitHubCommentID)
 }
 
-// TestApplyCommentStore_ClaimProgressCommentAuthority verifies the durable
-// progress-comment edit authority for applies whose parent lease is unheld
-// mid-apply: the first observer to claim the tracked progress comment row
-// wins, renews freely, and excludes every other owner until its heartbeat goes
-// stale, at which point exactly one successor takes the authority over. An
-// apply with no tracked progress comment row has nothing to claim.
+// TestApplyCommentStore_ClaimProgressCommentAuthority verifies the
+// crashed-holder handover of the progress-comment authority: a recorded owner
+// whose heartbeat is older than the stale window transfers to the next
+// claimant, exactly once — the takeover stamps a fresh heartbeat, so a third
+// claimant loses again. Aging the heartbeat requires backdating
+// observer_heartbeat_at with raw SQL, which the storage interface cannot
+// express, so the scenario lives in each dialect suite; the fresh-row claim
+// decisions run on both dialects through the parity suite.
 func TestApplyCommentStore_ClaimProgressCommentAuthority(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -114,25 +116,17 @@ func TestApplyCommentStore_ClaimProgressCommentAuthority(t *testing.T) {
 	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_comment_authority", 1)
 
-	held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
-	require.NoError(t, err)
-	assert.False(t, held, "no tracked progress comment row means nothing to claim")
-
 	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 		ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 555,
 	}))
 
-	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+	held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
 	require.NoError(t, err)
-	assert.True(t, held, "first claim on an unowned progress comment must win")
-
-	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
-	require.NoError(t, err)
-	assert.True(t, held, "the holder renews its own authority")
+	require.True(t, held, "first claim on an unowned progress comment must win")
 
 	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
 	require.NoError(t, err)
-	assert.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
+	require.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
 
 	// A crashed holder hands over only after its heartbeat goes stale, and
 	// exactly one successor wins the handover.

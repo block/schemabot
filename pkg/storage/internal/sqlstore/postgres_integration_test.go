@@ -58,6 +58,57 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
 	t.Run("ApplyCommentMutationsStampUpdatedAt", func(t *testing.T) { testPostgresApplyCommentMutationsStampUpdatedAt(t, h) })
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
+	t.Run("ApplyCommentProgressAuthorityStaleTakeover", func(t *testing.T) { testPostgresApplyCommentProgressAuthorityStaleTakeover(t, h) })
+}
+
+// backdatePostgresProgressObserverHeartbeat pushes an apply's progress-comment
+// authority heartbeat past the stale window, simulating an observer that
+// stopped renewing (crashed pod or cleared observer).
+func backdatePostgresProgressObserverHeartbeat(t *testing.T, db *sql.DB, applyID int64) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), `
+		UPDATE apply_comments SET observer_heartbeat_at = now() - make_interval(secs => $1)
+		WHERE apply_id = $2 AND comment_state = $3
+	`, int64(storage.ProgressCommentAuthorityStaleAfter.Seconds())+1, applyID, state.Comment.Progress)
+	require.NoError(t, err)
+}
+
+// testPostgresApplyCommentProgressAuthorityStaleTakeover verifies the
+// crashed-holder handover of the progress-comment authority on PostgreSQL: a
+// recorded owner whose heartbeat is older than the stale window transfers to
+// the next claimant, exactly once — the takeover stamps a fresh heartbeat, so
+// a third claimant loses again. Aging the heartbeat requires backdating
+// observer_heartbeat_at with raw SQL, which the storage interface cannot
+// express, so the scenario lives in each dialect suite; the fresh-row claim
+// decisions run on both dialects through the parity suite.
+func testPostgresApplyCommentProgressAuthorityStaleTakeover(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	lock := storagetest.CreateLock(t, store, "comment_authority_stale_db", storage.DatabaseTypeMySQL)
+	apply := storagetest.CreateApply(t, store, lock, "apply_comment_authority_stale", 723)
+
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 555,
+	}))
+
+	held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+	require.NoError(t, err)
+	require.True(t, held, "first claim on an unowned progress comment must win")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+	require.NoError(t, err)
+	require.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
+
+	backdatePostgresProgressObserverHeartbeat(t, h.db, apply.ID)
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+	require.NoError(t, err)
+	assert.True(t, held, "a stale authority transfers to the next claimant")
+
+	held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-c/3/comment-observer")
+	require.NoError(t, err)
+	assert.False(t, held, "a just-transferred authority is fresh again; a third owner loses")
 }
 
 // backdatePostgresSummaryClaim pushes an apply's summary marker updated_at
