@@ -1872,7 +1872,7 @@ func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.
 // through the ControlResumeValidator gate below — engines own validation of
 // opaque ResumeState.Metadata before control calls.
 func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials, eng engine.Engine, operation engine.ControlOperation) (*engine.ControlRequest, error) {
-	resumeState, err := c.loadStoredEngineResumeState(ctx, task, operation)
+	resumeState, err := c.loadStoredEngineResumeState(ctx, task, string(operation))
 	if err != nil {
 		return nil, fmt.Errorf("load engine resume state for %s of task %s: %w", operation, task.TaskIdentifier, err)
 	}
@@ -1894,18 +1894,19 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 // storage read failure is an error: a task without an apply operation and an
 // operation without a stored row are both legitimate nothing-persisted shapes,
 // because an engine that reattaches through in-process or database-side state
-// never persists one. The operation labels the control verb in logs.
-func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *storage.Task, operation engine.ControlOperation) (*engine.ResumeState, error) {
+// never persists one. The purpose names the request being built, so a log line
+// says which engine call went out without resume state.
+func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *storage.Task, purpose string) (*engine.ResumeState, error) {
 	operationID, err := applyOperationIDForTask(task)
 	if err != nil {
-		c.logger.Debug("task has no apply operation to hold persisted engine resume state; the control request goes to the engine without one",
-			append(task.LogAttrs(), "operation", string(operation), "reason", err.Error())...)
+		c.logger.Debug("task has no apply operation to hold persisted engine resume state; the engine request goes out without one",
+			append(task.LogAttrs(), "purpose", purpose, "reason", err.Error())...)
 		return nil, nil
 	}
 	stored, err := c.loadEngineResumeStateForOperation(ctx, operationID)
 	if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
-		c.logger.Debug("no persisted engine resume state for the task's apply operation; the control request goes to the engine without one",
-			append(task.LogAttrs(), "operation", string(operation), "apply_operation_id", operationID)...)
+		c.logger.Debug("no persisted engine resume state for the task's apply operation; the engine request goes out without one",
+			append(task.LogAttrs(), "purpose", purpose, "apply_operation_id", operationID)...)
 		return nil, nil
 	}
 	if err != nil {
