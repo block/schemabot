@@ -38,6 +38,15 @@ func PreviewCommentShardedApplyInProgress() string {
 		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
 		Keyspaces: []ShardedKeyspace{{
 			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 45},
+					{Shard: "40-80", Status: state.Task.Pending},
+					{Shard: "80-c0", Status: state.Task.Pending},
+					{Shard: "c0-", Status: state.Task.Pending},
+				},
+			}},
 			Shards: previewShardStatuses([]presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Running},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
@@ -57,6 +66,15 @@ func PreviewCommentShardedApplyFailed() string {
 		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
 		Keyspaces: []ShardedKeyspace{{
 			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Failed,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Failed},
+					{Shard: "40-80", Status: state.Task.Pending},
+					{Shard: "80-c0", Status: state.Task.Pending},
+					{Shard: "c0-", Status: state.Task.Pending},
+				},
+			}},
 			Shards: previewShardStatuses([]presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
@@ -81,6 +99,15 @@ func PreviewCommentShardedSummaryCompleted() string {
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
 		Keyspaces: []ShardedKeyspace{{
 			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Completed,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Completed},
+					{Shard: "40-80", Status: state.Task.Completed},
+					{Shard: "80-c0", Status: state.Task.Completed},
+					{Shard: "c0-", Status: state.Task.Completed},
+				},
+			}},
 			Shards: previewShardStatuses([]presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Completed},
 				{Deployment: "40-80", State: state.ApplyOperation.Completed},
@@ -121,6 +148,15 @@ func PreviewCommentShardedSummaryFailed() string {
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
 		Keyspaces: []ShardedKeyspace{{
 			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Failed,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Failed},
+					{Shard: "40-80", Status: state.Task.Pending},
+					{Shard: "80-c0", Status: state.Task.Pending},
+					{Shard: "c0-", Status: state.Task.Pending},
+				},
+			}},
 			Shards: previewShardStatuses([]presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
@@ -141,6 +177,14 @@ func PreviewCommentShardedApplyDivergent() string {
 		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
 		Keyspaces: []ShardedKeyspace{{
 			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
+					{Shard: "40-80", Status: state.Task.Pending},
+					{Shard: "80-c0", Status: state.Task.Pending},
+				},
+			}},
 			Shards: previewShardStatuses([]presentation.Operation{
 				{Deployment: "-40", State: state.ApplyOperation.Running},
 				{Deployment: "40-80", State: state.ApplyOperation.Pending},
@@ -180,16 +224,33 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 		Keyspaces: []ShardedKeyspace{
 			{
 				Keyspace: "cdb_resolute",
-				Shards:   []ShardStatus{unshard(shards[0], "-")},
-				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+				Tables: []ShardedTableStatus{{
+					Table: "outcomes", Status: state.Task.Completed,
+					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Completed}},
+				}},
+				Shards: []ShardStatus{unshard(shards[0], "-")},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
 			},
 			{
 				Keyspace: "cdb_resolute_lookup",
-				Shards:   []ShardStatus{unshard(shards[1], "-")},
-				Cells:    []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},
+				Tables: []ShardedTableStatus{{
+					Table: "outcomes_lookup", Status: state.Task.Running,
+					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
+				}},
+				Shards: []ShardStatus{unshard(shards[1], "-")},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},
 			},
 			{
 				Keyspace: "cdb_resolute_sharded",
+				Tables: []ShardedTableStatus{{
+					Table: "mutes", Status: state.Task.Pending,
+					Shards: []ShardProgressData{
+						{Shard: "-40", Status: state.Task.Pending},
+						{Shard: "40-80", Status: state.Task.Pending},
+						{Shard: "80-c0", Status: state.Task.Pending},
+						{Shard: "c0-", Status: state.Task.Pending},
+					},
+				}},
 				Shards: []ShardStatus{
 					unshard(shards[2], "-40"),
 					unshard(shards[3], "40-80"),

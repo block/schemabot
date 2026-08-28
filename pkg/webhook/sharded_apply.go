@@ -166,10 +166,12 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	}
 
 	shardsByKeyspace := shardStatusesByKeyspace(groupOrder, len(keyspaceOrder) > 1, released, tasksByOp)
+	tablesByKeyspace := shardedTableStatusesByKeyspace(ops, tasksByOp)
 	keyspaces := make([]templates.ShardedKeyspace, 0, len(keyspaceOrder))
 	for _, ns := range keyspaceOrder {
 		keyspaces = append(keyspaces, templates.ShardedKeyspace{
 			Keyspace: ns,
+			Tables:   tablesByKeyspace[ns],
 			Shards:   shardsByKeyspace[ns],
 			Cells:    cellsByKeyspace[ns],
 		})
@@ -350,6 +352,130 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, rele
 		})
 	}
 	return out
+}
+
+// shardedTableStatusesByKeyspace derives one rollup per (keyspace, table) in
+// resolved order and buckets the results per keyspace — the table-unit view of
+// the same shard work shardStatusesByKeyspace rolls up per shard. Each shard's
+// entry carries the task-vocabulary state (and copy percent) of its (shard,
+// table) operation, and the table's aggregate is its most attention-worthy
+// shard state, so a table with one failed shard reads failed even while its
+// siblings copy.
+func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardedTableStatus {
+	type keyspaceTable struct{ namespace, table string }
+	seen := make(map[keyspaceTable]struct{})
+	var order []keyspaceTable
+	shardsByTable := make(map[keyspaceTable][]templates.ShardProgressData)
+	for _, op := range ops {
+		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
+		if !ok {
+			// Finalizers render in the VSchema section, not as a table.
+			continue
+		}
+		key := keyspaceTable{namespace: ns, table: table}
+		if _, dup := seen[key]; !dup {
+			seen[key] = struct{}{}
+			order = append(order, key)
+		}
+		status, percent := shardTaskStatus(op, tasksByOp[op.ID])
+		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
+			Shard:           shard,
+			Status:          status,
+			PercentComplete: percent,
+		})
+	}
+	out := make(map[string][]templates.ShardedTableStatus, len(order))
+	for _, key := range order {
+		shards := shardsByTable[key]
+		out[key.namespace] = append(out[key.namespace], templates.ShardedTableStatus{
+			Table:  key.table,
+			Status: aggregateTableStatus(shards),
+			Shards: shards,
+		})
+	}
+	return out
+}
+
+// shardTaskStatus resolves one (shard, table) operation's display status and
+// copy percent from its most attention-worthy task — the task is where the
+// engine reports live shard state. The operation state stands in when the
+// operation has no tasks yet (dispatch creates them when its wave starts) or a
+// task has not reported state; it normalizes into the same vocabulary.
+func shardTaskStatus(op *storage.ApplyOperation, tasks []*storage.Task) (string, int) {
+	best := ""
+	percent := 0
+	for _, t := range tasks {
+		status := t.State
+		if status == "" {
+			status = op.State
+		}
+		if best == "" || taskStateRank(status) > taskStateRank(best) {
+			best = status
+			percent = t.ProgressPercent
+		}
+	}
+	if best == "" {
+		return op.State, 0
+	}
+	return best, percent
+}
+
+// aggregateTableStatus reduces a table's per-shard states to the one an
+// operator should act on first: failure over active work, active work over
+// waiting, waiting over done.
+func aggregateTableStatus(shards []templates.ShardProgressData) string {
+	best := shards[0].Status
+	for _, sh := range shards[1:] {
+		if taskStateRank(sh.Status) > taskStateRank(best) {
+			best = sh.Status
+		}
+	}
+	return best
+}
+
+// taskStateRank orders task states by how much they demand attention — the
+// task-vocabulary analogue of shardStateRank, normalizing first so operation
+// states fed through the no-task fallback rank the same way. Failure ranks
+// highest; completed lowest; an unknown state ranks with pending.
+func taskStateRank(s string) int {
+	switch state.NormalizeTaskStatus(s) {
+	case state.Task.Failed:
+		return 17
+	case state.Task.FailedRetryable:
+		return 16
+	case state.Task.CuttingOver:
+		return 15
+	case state.Task.Running:
+		return 14
+	case state.Task.PostChecksum:
+		return 13
+	case state.Task.Checksumming:
+		return 12
+	case state.Task.CatchingUp:
+		return 11
+	case state.Task.Reverting:
+		return 10
+	case state.Task.WaitingForCutover:
+		return 9
+	case state.Task.Recovering:
+		return 8
+	case state.Task.WaitingForDeploy:
+		return 7
+	case state.Task.Stopped:
+		return 6
+	case state.Task.RevertWindow:
+		return 5
+	case state.Task.Pending:
+		return 3
+	case state.Task.Cancelled:
+		return 2
+	case state.Task.Reverted:
+		return 1
+	case state.Task.Completed:
+		return 0
+	default:
+		return 3
+	}
 }
 
 // aggregateShardState reduces a shard's operations to its most significant

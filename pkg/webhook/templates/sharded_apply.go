@@ -62,19 +62,42 @@ type ShardedApplyData struct {
 	Rollback bool
 }
 
-// ShardedKeyspace is one keyspace's slice of a sharded apply: its shards in
-// resolved order, each with its aggregate status, and the (shard, table) cells
-// that define each shard's change signature for grouping.
+// ShardedKeyspace is one keyspace's slice of a sharded apply: its tables in
+// resolved order, each aggregated across the keyspace's shards, plus the
+// per-shard rollup and the (shard, table) cells behind them.
 type ShardedKeyspace struct {
 	Keyspace string
 
+	// Tables is the keyspace's per-table rollup in resolved order — the unit the
+	// section renders. Each entry carries the table's aggregate state and its
+	// per-shard breakdown for the compact shard summary line.
+	Tables []ShardedTableStatus
+
 	// Shards is the keyspace's per-shard rollup in resolved order: one entry per
-	// shard with its aggregate state, driving the keyspace section's status rows.
+	// shard with its aggregate state. It drives the cross-keyspace histogram and
+	// first-failure callout always, and the section's per-shard status rows when
+	// the keyspace needs shard detail (a failure or divergent shards).
 	Shards []ShardStatus
 
 	// Cells is one entry per (shard, table) operation — the unit that carries the
 	// DDL and defines a shard's change signature for grouping.
 	Cells []ShardCell
+}
+
+// ShardedTableStatus is one table's rollup within a keyspace: the aggregate
+// state across the keyspace's shards (the most attention-worthy shard's state,
+// in canonical task vocabulary) and the per-shard breakdown feeding the compact
+// shard summary line.
+type ShardedTableStatus struct {
+	Table string
+
+	// Status is the table's aggregate state in canonical task vocabulary.
+	Status string
+
+	// Shards is the per-shard state (and percent while copying) in resolved
+	// order, rendered as the compact one-line summary while the table is in
+	// flight.
+	Shards []ShardProgressData
 }
 
 // ShardStatus is one shard's aggregate status. Emoji/Label come from the same
@@ -125,6 +148,7 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedMetadata(&sb, data, renderedAt)
+	writeShardedStatusLine(&sb, data)
 
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
@@ -186,6 +210,58 @@ func shardedChangeIsSingular(data ShardedApplyData) bool {
 	return len(tables)+len(data.VSchemaChanges) == 1
 }
 
+// writeShardedStatusLine writes the status comment's at-a-glance line: the
+// apply's display state and how many of the plan's changes have landed. A
+// change is one (keyspace, table) unit or one VSchema update, matching the
+// plan comment's arithmetic. Omitted when no keyspace carries a table rollup —
+// without per-table aggregates the fraction would read 0 regardless of real
+// progress.
+func writeShardedStatusLine(sb *strings.Builder, data ShardedApplyData) {
+	hasTables := false
+	for _, ks := range data.Keyspaces {
+		if len(ks.Tables) > 0 {
+			hasTables = true
+			break
+		}
+	}
+	if !hasTables {
+		return
+	}
+	applied, total := shardedChangeFraction(data)
+	word := applyStatusDetail(data.State)
+	if data.Rollback && state.IsState(data.State, state.Apply.Completed) {
+		word = "Rolled Back"
+	}
+	noun := "changes"
+	if total == 1 {
+		noun = "change"
+	}
+	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s applied\n", word, applied, total, noun)
+}
+
+// shardedChangeFraction counts the apply's changes and how many have landed. A
+// change is one (keyspace, table) unit or one VSchema update. A table counts
+// as applied once its aggregate reaches completed or the revert window — the
+// DDL has landed in both, and the table line already distinguishes them.
+func shardedChangeFraction(data ShardedApplyData) (applied, total int) {
+	for _, ks := range data.Keyspaces {
+		for _, t := range ks.Tables {
+			total++
+			status := state.NormalizeTaskStatus(t.Status)
+			if status == state.Task.Completed || status == state.Task.RevertWindow {
+				applied++
+			}
+		}
+	}
+	for _, v := range data.VSchemaChanges {
+		total++
+		if v.Status == "applied" {
+			applied++
+		}
+	}
+	return applied, total
+}
+
 // writeShardedSummaryMetadata writes the terminal metadata line — database,
 // engine type, apply ID, and duration when both timestamps are known — followed
 // by the attribution line: the sharded analogue of writeSummaryMetadata.
@@ -203,16 +279,24 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 }
 
 // writeShardKeyspaceSections writes one section per keyspace: its heading and
-// the per-shard status tables grouped by change signature. Each section shows
-// shard status only: the DDL (what changes) is already shown in the plan and
-// apply-gate comments, so repeating it here adds nothing — and rendering "DDL
-// unavailable" when the apply path has no per-shard DDL is pure noise. Shards
-// are still grouped by change so a divergent keyspace shows which shards moved
-// together.
+// its per-table rollup lines, each with the compact shard summary while in
+// flight. The section shows status only: the DDL (what changes) is already
+// shown in the plan and apply-gate comments, so repeating it here adds nothing.
+// Per-shard status tables are exception detail — they render only when the
+// keyspace needs them: a shard in a failure state (the failed shard and its
+// halted siblings need naming), shards that diverge by change signature (which
+// shards moved together is invisible at the table altitude), or a keyspace
+// carrying no table rollup to stand in for them.
 func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace) {
 	for _, ks := range keyspaces {
-		fmt.Fprintf(sb, "\n#### Keyspace `%s`\n", ks.Keyspace)
+		fmt.Fprintf(sb, "\n#### Keyspace `%s`\n\n", ks.Keyspace)
+		for _, t := range ks.Tables {
+			writeShardedTableLine(sb, t)
+		}
 		groups := groupShardsBySignature(ks.Shards, ks.Cells)
+		if len(ks.Tables) > 0 && len(groups) <= 1 && !keyspaceHasShardFailure(ks.Shards) {
+			continue
+		}
 		if len(groups) <= 1 {
 			writeShardStatusTable(sb, ks.Shards)
 			continue
@@ -222,6 +306,76 @@ func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace
 			fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards, len(ks.Shards)))
 			writeShardStatusTable(sb, g.Shards)
 		}
+	}
+}
+
+// keyspaceHasShardFailure reports whether any of the keyspace's shards is in a
+// failure state, which promotes the keyspace's per-shard status table from
+// noise to the failure detail an operator acts on.
+func keyspaceHasShardFailure(shards []ShardStatus) bool {
+	for _, s := range shards {
+		if isShardFailureState(s.State) {
+			return true
+		}
+	}
+	return false
+}
+
+// writeShardedTableLine writes one table's rollup line — the table name and its
+// aggregate state phrase, with the shard count on a completed sharded table —
+// followed by the compact per-shard summary while the table is in flight. The
+// aggregate carries no single percent (each shard copies at its own pace), so
+// the line names the phase and the shard summary carries the per-shard
+// percents.
+func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
+	status := state.NormalizeTaskStatus(t.Status)
+	line := fmt.Sprintf("**`%s`**: %s", t.Table, shardedTableStatusPhrase(status))
+	if status == state.Task.Completed && len(t.Shards) > 1 {
+		line += fmt.Sprintf(" (%d shards)", len(t.Shards))
+	}
+	sb.WriteString(line + "\n")
+	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards})
+}
+
+// shardedTableStatusPhrase maps a table's aggregate task state to its display
+// phrase, reusing the single-deployment table vocabulary without the per-table
+// progress bar.
+func shardedTableStatusPhrase(status string) string {
+	switch status {
+	case state.Task.Pending:
+		return "⏳ Queued"
+	case state.Task.Completed:
+		return "✅ Complete"
+	case state.Task.Running:
+		return "🔄 Row copy in progress"
+	case state.Task.CatchingUp:
+		return "⏩ Catching up on accumulated changes..."
+	case state.Task.Checksumming:
+		return "🔍 Checksumming to verify data..."
+	case state.Task.PostChecksum:
+		return "⏩ Data verified, applying final changes..."
+	case state.Task.WaitingForCutover:
+		return "🟡 Waiting for cutover"
+	case state.Task.CuttingOver:
+		return "🔄 Cutting over..."
+	case state.Task.Recovering:
+		return "🔄 Recovering state..."
+	case state.Task.Failed:
+		return "❌ Failed"
+	case state.Task.FailedRetryable:
+		return "🔄 Interrupted — retrying automatically"
+	case state.Task.Stopped:
+		return "⏸ Stopped"
+	case state.Task.Cancelled:
+		return "⊘ Cancelled (not started)"
+	case state.Task.RevertWindow:
+		// Deliberately no checkmark: the change is applied but not final while
+		// the revert window is open, and a checkmark reads as "done, walk away".
+		return "Complete (revert window open)"
+	case state.Task.Reverting:
+		return "↩️ Reverting"
+	default:
+		return "🔄 In progress"
 	}
 }
 
