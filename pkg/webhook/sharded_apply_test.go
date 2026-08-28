@@ -68,9 +68,9 @@ func TestIsShardedApply(t *testing.T) {
 	assert.False(t, isShardedApply([]*storage.ApplyOperation{
 		{Deployment: "cake", OperationKey: "ks/-40/mutes"}, {Deployment: "eu", OperationKey: "ks/80-/mutes"},
 	}), "shards spanning deployments fall back to the deployment layout")
-	assert.False(t, isShardedApply([]*storage.ApplyOperation{
+	assert.True(t, isShardedApply([]*storage.ApplyOperation{
 		{Deployment: "cake", OperationKey: "ks1/-40/mutes"}, {Deployment: "cake", OperationKey: "ks2/-40/mutes"},
-	}), "shard work across multiple keyspaces falls back rather than mislabelling one keyspace")
+	}), "shard work across multiple keyspaces in one deployment is sharded")
 }
 
 // The failed sharded apply must render the shard-unit layout AND surface the
@@ -160,11 +160,13 @@ func TestBuildShardedApplyData_DivergentGroupsByTable(t *testing.T) {
 
 	data := buildShardedApplyData(apply, ops, false, tasks, nil, "")
 
-	assert.Equal(t, "ks", data.Keyspace)
-	require.Len(t, data.Cells, 3)
-	require.Len(t, data.Shards, 2, "two distinct shards, each shown once")
-	assert.Equal(t, "-40", data.Shards[0].Shard)
-	assert.Equal(t, "40-80", data.Shards[1].Shard)
+	require.Len(t, data.Keyspaces, 1)
+	ks := data.Keyspaces[0]
+	assert.Equal(t, "ks", ks.Keyspace)
+	require.Len(t, ks.Cells, 3)
+	require.Len(t, ks.Shards, 2, "two distinct shards, each shown once")
+	assert.Equal(t, "-40", ks.Shards[0].Shard)
+	assert.Equal(t, "40-80", ks.Shards[1].Shard)
 }
 
 // Defensive: in practice a (shard, table) operation has a single task — multiple
@@ -183,8 +185,9 @@ func TestBuildShardedApplyData_JoinsMultiTaskDDL(t *testing.T) {
 
 	data := buildShardedApplyData(apply, []*storage.ApplyOperation{op}, false, tasks, nil, "")
 
-	require.Len(t, data.Cells, 1)
-	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Cells[0].DDL,
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Cells, 1)
+	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX a\nALTER TABLE `mutes` ADD INDEX b", data.Keyspaces[0].Cells[0].DDL,
 		"all non-empty task DDLs are joined in order")
 }
 
@@ -211,7 +214,8 @@ func TestBuildShardedApplyData_FinalizerBecomesVSchemaChange(t *testing.T) {
 	assert.Equal(t, "ks", data.VSchemaChanges[0].Namespace)
 	assert.Equal(t, "applying", data.VSchemaChanges[0].Status)
 	assert.Equal(t, "+ vindex hash", data.VSchemaChanges[0].Diff, "the stored plan's diff rides on the keyspace's entry")
-	require.Len(t, data.Shards, 2, "the finalizer is not a shard row")
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Shards, 2, "the finalizer is not a shard row")
 
 	data = buildShardedApplyData(apply, ops, false, nil, nil, "")
 	require.Len(t, data.VSchemaChanges, 1)
@@ -399,6 +403,57 @@ func TestBuildShardedApplyData_FirstFailedFinalizerErrorWins(t *testing.T) {
 
 	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
 	assert.Equal(t, "finalize ks_a: first cause", data.ErrorMessage)
+}
+
+// A Strata apply that fans out across several keyspaces of one deployment —
+// unsharded siblings contribute a single "-" shard each — renders the sharded
+// layout with one section per keyspace, so the operator reads the rollout by
+// keyspace rather than a flat per-operation list keyed by the deployment name.
+func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Running, Caller: "morgo"}
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "contacts/-/entries", state.ApplyOperation.Completed),
+		mk(2, "contacts_lookup/-/entries_lookup", state.ApplyOperation.Running),
+		mk(3, "contacts_sharded/-40/entries_index", state.ApplyOperation.Pending),
+		mk(4, "contacts_sharded/40-/entries_index", state.ApplyOperation.Pending),
+		mk(5, "contacts_sharded/group_finalizer", state.ApplyOperation.Pending),
+	}
+
+	out := formatApplyStatusComment(apply, ops, false, nil, nil, nil, nil, "")
+
+	assert.NotContains(t, out, "**Deployments**:", "must not fall back to the deployment-unit layout")
+	assert.Contains(t, out, "#### Keyspace `contacts`")
+	assert.Contains(t, out, "#### Keyspace `contacts_lookup`")
+	assert.Contains(t, out, "#### Keyspace `contacts_sharded`")
+	assert.Contains(t, out, "**Shards**:", "the histogram spans every keyspace's shards")
+	assert.Contains(t, out, "| `-` | ✅ completed |", "an unsharded keyspace's shard renders its plain name")
+	assert.Contains(t, out, "### VSchema", "the finalizer renders in the VSchema section, not as a shard")
+}
+
+// When the apply spans keyspaces, a shard's ordering label names its blocker
+// with the keyspace-qualified shard — every unsharded keyspace's shard is "-",
+// so a bare name would be ambiguous — while the status row itself keeps the
+// plain shard name under its keyspace heading.
+func TestBuildShardedApplyData_MultiKeyspaceQualifiesOrderingLabels(t *testing.T) {
+	mk := func(id int64, key, opState, errMsg string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, ErrorMessage: errMsg, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "contacts/-/entries", state.ApplyOperation.Failed, "boom"),
+		mk(2, "contacts_lookup/-/entries_lookup", state.ApplyOperation.Pending, ""),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Failed}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+
+	require.Len(t, data.Keyspaces, 2)
+	require.Len(t, data.Keyspaces[1].Shards, 1)
+	halted := data.Keyspaces[1].Shards[0]
+	assert.Equal(t, "-", halted.Shard, "the status row keeps the plain shard name")
+	assert.Contains(t, halted.Label, "contacts/-", "the blocker is named with its keyspace-qualified shard")
 }
 
 // A terminal sharded apply's summary comment renders the verdict-titled
