@@ -767,12 +767,21 @@ func releasedFailureExemptionArgs() []any {
 // The ORDER BY must be able to walk an index on (created_at, id) rather than
 // sort. The eligibility filter ORs across several states, so no state-prefixed
 // index serves the ordering; without one on the ordering pair the planner
-// collects every claimable row and sorts it, and under FOR UPDATE that locks
-// the whole set before LIMIT 1 applies. SKIP LOCKED then has the opposite of
-// its intended effect — each driver skips everything a peer locked instead of
-// taking the next free row — so concurrent claims serialize, and worsen as
-// history grows. Each dialect's schema file names that index by its own
-// convention.
+// collects every claimable row and sorts it. On InnoDB that sort runs under
+// FOR UPDATE and locks the whole candidate set before LIMIT 1 applies, giving
+// SKIP LOCKED the opposite of its intended effect — each driver skips
+// everything a peer locked instead of taking the next free row, so concurrent
+// claims serialize. PostgreSQL locks rows only after the sort, so a single row
+// is ever locked; there the index spares the sort itself, which otherwise
+// reads and spills the full candidate set. Each dialect's schema file names
+// that index by its own convention.
+//
+// The index bounds the sort, not the walk: nothing prunes terminal rows from
+// an ascending scan, so a claim still steps over dead history before reaching
+// claimable work as the table grows. A filtered or partial index is not an
+// option — the schema parity tests pin both dialects to the same index shape,
+// and MySQL has no partial indexes — so retention, not indexing, is the lever
+// for that remaining bound.
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
@@ -1301,10 +1310,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 //
 // This path shares FindNextApplyOperation's claim ordering and its dependence
 // on an index over (created_at, id): the same OR'd state filter defeats every
-// state-prefixed index, so without that index the claim sorts and locks the
-// full candidate set before LIMIT 1, turning SKIP LOCKED into a serializer.
-// Both claim queries draw from the same driver pool, so a change to one claim's
-// ordering or eligibility belongs in the other.
+// state-prefixed index, so without that index the claim sorts the full
+// candidate set before LIMIT 1 — locking all of it on InnoDB, where the sort
+// runs under FOR UPDATE and turns SKIP LOCKED into a serializer, and paying
+// the sort itself on every dialect. Both claim queries draw from the same
+// driver pool, so a change to one claim's ordering or eligibility belongs in
+// the other.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)

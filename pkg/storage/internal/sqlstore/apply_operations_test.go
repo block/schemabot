@@ -4965,48 +4965,34 @@ func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
 // Both driver claim queries order candidates by (created_at, id) while their
 // eligibility filter ORs across several states, so no state-prefixed index can
 // serve the ordering. Without a dedicated index on the ordering pair the
-// planner sorts the full candidate set, and under FOR UPDATE that locks every
-// claimable row before LIMIT 1 applies — turning SKIP LOCKED into a serializer
-// that makes drivers contend instead of claiming distinct rows in parallel.
+// planner sorts the full candidate set — and on InnoDB that sort runs under
+// FOR UPDATE, locking every claimable row before LIMIT 1 applies and turning
+// SKIP LOCKED into a serializer that makes drivers contend instead of claiming
+// distinct rows in parallel.
 //
-// This asserts the index the bootstrapper actually created on the live MySQL
-// store, under the name MySQL's table-scoped naming gives it. The PostgreSQL
-// counterpart carries a different name because its index names are schema-wide;
-// the schema parity tests pin it by shape rather than by name.
+// This asserts the index as the embedded MySQL schema file declares it, on the
+// MySQL store this package's tests run against, under the name MySQL's
+// table-scoped naming gives it. The PostgreSQL counterpart carries a different
+// name because its index names are schema-wide; the schema parity tests pin it
+// by shape rather than by name.
 func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
 	ctx := t.Context()
 
-	rows, err := testDB.QueryContext(ctx, "SHOW INDEX FROM apply_operations")
+	rows, err := testDB.QueryContext(ctx, `
+		SELECT COLUMN_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'apply_operations' AND INDEX_NAME = 'idx_created_id'
+		ORDER BY SEQ_IN_INDEX`)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(rows)
 
-	columns, err := rows.Columns()
-	require.NoError(t, err)
-
-	// SHOW INDEX has grown columns across MySQL versions, so scan positionally
-	// into a variable-width row and read the three fields by name.
-	indexColumns := map[string][]string{}
+	var indexColumns []string
 	for rows.Next() {
-		cells := make([]any, len(columns))
-		for i := range cells {
-			cells[i] = new(sql.RawBytes)
-		}
-		require.NoError(t, rows.Scan(cells...))
-
-		field := func(name string) string {
-			for i, c := range columns {
-				if c == name {
-					return string(*cells[i].(*sql.RawBytes))
-				}
-			}
-			return ""
-		}
-		if field("Key_name") == "idx_created_id" {
-			indexColumns["idx_created_id"] = append(indexColumns["idx_created_id"], field("Column_name"))
-		}
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		indexColumns = append(indexColumns, column)
 	}
 	require.NoError(t, rows.Err())
 
-	assert.Equal(t, []string{"created_at", "id"}, indexColumns["idx_created_id"],
+	assert.Equal(t, []string{"created_at", "id"}, indexColumns,
 		"the claim ordering needs an index on exactly its ordering pair, in that order")
 }
