@@ -3127,7 +3127,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	return resp, nil
 }
 
-const maxLogsLimit = 1000
+// MaxLogsLimit is the most entries one Logs read returns; a larger request is
+// served the cap's worth of newest entries instead of failing. Readers that
+// over-fetch to detect older history must keep the extra entry within this
+// cap: a request past it comes back exactly at the cap, and the probe entry
+// is the one clamped away.
+const MaxLogsLimit = 1000
 
 func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
 	if req == nil {
@@ -3140,8 +3145,8 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if limit <= 0 {
 		limit = 50
 	}
-	if limit > maxLogsLimit {
-		limit = maxLogsLimit
+	if limit > MaxLogsLimit {
+		limit = MaxLogsLimit
 	}
 	apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 	if err != nil {

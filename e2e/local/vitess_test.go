@@ -872,8 +872,9 @@ func TestVitess_Apply_BranchValidation(t *testing.T) {
 	// Verify the branch validation passed by checking apply logs
 	applyID := extractApplyIDFromLog(out)
 	endpoint := schemabotURL(t)
-	logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+	logResult, err := client.GetLogs(endpoint, "", "", applyID, 50)
 	require.NoError(t, err)
+	logs := logResult.Logs
 
 	var foundValidation bool
 	for _, entry := range logs {
@@ -1317,8 +1318,9 @@ func TestVitess_Apply_DeployRequestURL(t *testing.T) {
 
 	// Deploy request should appear in apply logs
 	applyID := extractApplyIDFromLog(out)
-	logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+	logResult, err := client.GetLogs(endpoint, "", "", applyID, 50)
 	require.NoError(t, err)
+	logs := logResult.Logs
 	var foundDR bool
 	for _, entry := range logs {
 		if strings.Contains(entry.Message, "Deploy request") {
@@ -1345,8 +1347,9 @@ func TestVitess_Apply_SetupPhases(t *testing.T) {
 
 	// Setup phase messages should appear in apply logs
 	applyID := extractApplyIDFromLog(out)
-	logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+	logResult, err := client.GetLogs(endpoint, "", "", applyID, 50)
 	require.NoError(t, err)
+	logs := logResult.Logs
 	var foundBranch, foundDeploy bool
 	for _, entry := range logs {
 		if strings.Contains(entry.Message, "Creating branch") {
@@ -1709,8 +1712,9 @@ func TestVitess_Apply_BranchReuse(t *testing.T) {
 	// Verify branch refresh happened via apply logs
 	applyID := extractApplyIDFromLog(out)
 	endpoint := schemabotURL(t)
-	logs, err := client.GetLogs(endpoint, "", "", applyID, 50)
+	logResult, err := client.GetLogs(endpoint, "", "", applyID, 50)
 	require.NoError(t, err)
+	logs := logResult.Logs
 	var foundRefresh bool
 	for _, entry := range logs {
 		if strings.Contains(entry.Message, "Refreshing schema for branch") {

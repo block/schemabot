@@ -26,6 +26,11 @@ type LogEntry struct {
 type LogsResponse struct {
 	ApplyID string      `json:"apply_id,omitempty"`
 	Logs    []*LogEntry `json:"logs"`
+	// Truncated reports that entries older than Logs exist and were left
+	// outside the requested window. A reader that shows a full window without
+	// this signal reads as a complete lifecycle, which is the wrong conclusion
+	// when the interesting part scrolled past the limit.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type DeploymentLogsResponse struct {
@@ -39,6 +44,10 @@ type DeploymentLogSource struct {
 	ExternalID string                    `json:"external_id"`
 	Operations []*LogOperationProvenance `json:"operations"`
 	Logs       []*LogEntry               `json:"logs"`
+	// Truncated reports that this source has entries older than Logs. Each
+	// source is windowed independently, so one source can be truncated while
+	// another in the same response is complete.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type LogOperationProvenance struct {

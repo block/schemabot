@@ -65,9 +65,9 @@ func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 	assert.Equal(t, "pending", resp.Logs[0].OldState)
 	assert.Equal(t, "running", resp.Logs[0].NewState)
 
-	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: maxLogsLimit + 1})
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: MaxLogsLimit + 1})
 	require.NoError(t, err)
-	assert.Equal(t, maxLogsLimit, logs.recentLimit)
+	assert.Equal(t, MaxLogsLimit, logs.recentLimit)
 }
 
 type pullSchemaPSClient struct {
