@@ -594,7 +594,10 @@ type CheckStatusAccessDetails struct {
 func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
+	// Failure glyph, not refusal: a check-status read error is transient — an
+	// unchanged retry can succeed — so this is a failed verification the apply
+	// fail-closed on, not a request SchemaBot refuses to perform.
+	writeEnvironmentTitle(&sb, glyph.Failed+" Apply Blocked", environment)
 
 	if err != nil && strings.Contains(err.Error(), "Resource not accessible") {
 		app := "SchemaBot GitHub App"
@@ -692,7 +695,10 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
+	// Failure glyph, not refusal: the prior-environment read is transient —
+	// an unchanged retry can succeed — so this is a failed verification the
+	// apply fail-closed on, not a request SchemaBot refuses to perform.
+	sb.WriteString("## " + glyph.Failed + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Retry the apply command.\n\n", priorEnv, reason)
 	sb.WriteString("_See server logs for details._")
 

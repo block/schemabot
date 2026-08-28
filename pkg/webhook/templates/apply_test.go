@@ -1174,7 +1174,7 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	// The retry detail lives on the affected table, not in the headline, and
 	// counts the upcoming retry against the operator redispatch budget.
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically (attempt 1/10)")
-	assert.Contains(t, result, "> ❌ Last error: remote deployment unavailable")
+	assert.Contains(t, result, "> ⚠️ Last error: remote deployment unavailable")
 	assert.Contains(t, result, "🟧") // orange bar for the interrupted table
 	// Progress summary counts the retrying table.
 	assert.Contains(t, result, "1/2 complete")
@@ -1218,7 +1218,7 @@ func TestRenderApplyStatusComment_RemoteRetryablePauseDerivesRetryingFromTasks(t
 	assert.NotContains(t, result, "**Status**: In Progress")
 	assert.Contains(t, result, "🔄 Interrupted — retrying automatically\n")
 	assert.NotContains(t, result, "(attempt")
-	assert.Contains(t, result, "> ❌ Last error: failed to execute chunklet insert: Error 1041 (HY000): Out of memory")
+	assert.Contains(t, result, "> ⚠️ Last error: failed to execute chunklet insert: Error 1041 (HY000): Out of memory")
 	assert.Contains(t, result, "1 retrying")
 	assert.Contains(t, result, "SchemaBot retries automatically and marks it failed if retries are exhausted")
 	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
@@ -1306,7 +1306,7 @@ func TestRenderApplyStatusComment_FailedRetryableMultilineError(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "> ❌ Last error: rpc error: code = Unavailable\n> desc = upstream connect error")
+	assert.Contains(t, result, "> ⚠️ Last error: rpc error: code = Unavailable\n> desc = upstream connect error")
 }
 
 func TestRenderApplyStatusComment_Stopped(t *testing.T) {
@@ -1333,7 +1333,10 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	// Progress summary
 	assert.Contains(t, result, "📊 1/2 complete")
 	assert.Contains(t, result, "1 stopped")
-	assert.Contains(t, result, "remote apply remote-123 remained stopped after start grace period 30s")
+	// The heading already says the apply is stopped, so the error is context
+	// with the attention glyph, not a fresh failure.
+	assert.Contains(t, result, "> ⚠️ **Error:** remote apply remote-123 remained stopped after start grace period 30s")
+	assert.NotContains(t, result, "❌")
 	assert.Contains(t, result, "schemabot start")
 }
 
@@ -2042,7 +2045,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
-		assert.Contains(t, result, "## ⛔ Apply Blocked")
+		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.NotContains(t, result, "500 Internal Server Error",
@@ -2059,7 +2062,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 			MissingPermissions: []string{"Checks: Read"},
 		})
 
-		assert.Contains(t, result, "## ⛔ Apply Blocked")
+		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Production")
 		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
 		assert.Contains(t, result, "cannot read PR check statuses")
@@ -2091,7 +2094,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 	t.Run("nil error renders the same sanitized copy", func(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
-		assert.Contains(t, result, "## ⛔ Apply Blocked")
+		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
@@ -2103,7 +2106,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	t.Run("renders reason with sanitized detail", func(t *testing.T) {
 		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details")
 
-		assert.Contains(t, result, "## ⛔ Apply Blocked")
+		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details. Retry the apply command.")
 		assert.Contains(t, result, "_See server logs for details._")
 	})
@@ -2116,7 +2119,7 @@ func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
 	})
 
 	t.Run("full body is stable", func(t *testing.T) {
-		expected := "## ⛔ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
 
 		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
 	})
@@ -2142,6 +2145,27 @@ func TestRenderApplyBlockedByUntrustedPriorEnvCheck(t *testing.T) {
 	assert.Contains(t, result, "trusted-check-app-slugs")
 	assert.Contains(t, result, "Re-running `schemabot plan -e staging` will not resolve this")
 	assert.NotContains(t, result, "could not find a completed")
+}
+
+// An environment missing from the promotion order is a configuration refusal:
+// SchemaBot cannot place it in the staging-first sequence, and retrying
+// unchanged refuses again, so the heading carries the refusal glyph and the
+// body names the fix (add the environment to environment_order).
+func TestRenderApplyBlockedByUnlistedEnvironment(t *testing.T) {
+	result := RenderApplyBlockedByUnlistedEnvironment("canary", []string{"staging", "production"})
+
+	assert.Contains(t, result, "## ⛔ Apply Blocked — Canary")
+	assert.Contains(t, result, "`canary` is not in the configured promotion order")
+	assert.Contains(t, result, "Configured promotion order: `staging` → `production`")
+	assert.Contains(t, result, "Add `canary` to `environment_order`")
+
+	t.Run("empty promotion order omits the order line", func(t *testing.T) {
+		result := RenderApplyBlockedByUnlistedEnvironment("canary", nil)
+
+		assert.Contains(t, result, "## ⛔ Apply Blocked — Canary")
+		assert.NotContains(t, result, "Configured promotion order")
+		assert.Contains(t, result, "Add `canary` to `environment_order`")
+	})
 }
 
 func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {

@@ -66,8 +66,9 @@ func TestRenderShardedApplyComment_FailedRetryableSurfacesErrorAndStop(t *testin
 		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
 	})
 
-	assert.Contains(t, out, "First failure:", "a retrying shard's error is still lifted")
-	assert.Contains(t, out, retryErr, "the retrying shard's error is shown, not dropped")
+	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+retryErr,
+		"a retrying shard's error is still lifted, with the attention glyph — SchemaBot is retrying, nothing has stopped")
+	assert.NotContains(t, out, "❌", "no failure glyph while SchemaBot retries on its own")
 	assert.Contains(t, out, "To stop retrying:")
 	assert.Contains(t, out, "schemabot stop apply-x")
 }
@@ -373,4 +374,22 @@ func TestRenderShardedApplyComment_FailureOutsideShardWorkSurfacesApplyError(t *
 	assert.Contains(t, out, "## Schema Change Status — Staging")
 	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")
 	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
+}
+
+// An apply-level error on a still-retrying apply is surfaced with the
+// attention glyph, not the failure glyph — SchemaBot is retrying on its own,
+// so nothing has stopped and no triage is due yet.
+func TestRenderShardedApplyComment_RetryingApplyErrorCarriesAttentionGlyph(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.FailedRetryable, Environment: "staging", Database: "cdb_resolute",
+		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
+		Shards: []ShardStatus{
+			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+		},
+		Cells: []ShardCell{mutesCell("-40")},
+	})
+
+	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")
+	assert.NotContains(t, out, "❌", "no failure glyph while SchemaBot retries on its own")
 }

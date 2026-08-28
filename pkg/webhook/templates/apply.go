@@ -178,9 +178,17 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// per-table task (a VSchema-only apply has no tables at all).
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
-	// Error message for apply states that need operator triage.
-	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
-		writeErrorBlock(&sb, data.ErrorMessage)
+	// Error message for apply states that need operator attention. A failed
+	// apply gets the failure glyph — the system stopped and triage is due; a
+	// stopped apply gets the attention glyph — the heading already says the
+	// operator paused it, and the error is context, not a fresh failure.
+	if data.ErrorMessage != "" {
+		switch {
+		case state.IsState(data.State, state.Apply.Failed):
+			writeErrorBlock(&sb, glyph.Failed, data.ErrorMessage)
+		case state.IsState(data.State, state.Apply.Stopped):
+			writeErrorBlock(&sb, glyph.Attention, data.ErrorMessage)
+		}
 	}
 
 	// Footer with next actions
@@ -812,7 +820,7 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 		}
 		writeDDLLine(sb, table.DDL)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			writeTableErrorLine(sb, glyph.Failed, table.ErrorMessage)
 		}
 
 	case state.Task.FailedRetryable:
@@ -829,7 +837,9 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyStat
 		}
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			// The row above says SchemaBot is retrying on its own, so the
+			// error is context for the operator, not a failure to triage.
+			writeTableErrorLine(sb, glyph.Attention, table.ErrorMessage)
 		}
 
 	case state.Task.Cancelled:
@@ -1249,7 +1259,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	writeSummaryMetadata(sb, data)
 
 	if data.ErrorMessage != "" {
-		writeErrorBlock(sb, data.ErrorMessage)
+		writeErrorBlock(sb, glyph.Failed, data.ErrorMessage)
 	}
 
 	if completedCount > 0 {

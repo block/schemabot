@@ -158,7 +158,7 @@ rejected up front while they are present.
 
 | Icon | Where it appears | Meaning |
 |---|---|---|
-| ⛔ | Plan comment (**Cannot apply**), apply-rejection comments (**Apply rejected**, **Apply Blocked**), CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
+| ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
 | ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**) | Caution: unsafe changes to review before applying |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
@@ -175,3 +175,12 @@ Presentation notes:
   types) render as inline code.
 - The CLI and the plan comment share the same severity reading: ⚠️ marks
   unsafe changes awaiting review at plan time, and ⛔ marks the refused apply.
+- Not every **Apply Blocked** or **Apply rejected** heading is a refusal: the
+  glyph follows the cause. 🔒 marks an apply blocked by a held lock, ⏳ one
+  waiting on required checks or another apply (wait, then retry), ❌ one that
+  fail-closed on a transient verification error (retry unchanged can succeed),
+  and ⚠️ a stale-base rejection cleared by rebasing.
+- The severity vocabulary (🚨 ⛔ ❌ ⚠️ ℹ️) lives in `pkg/glyph`. The other
+  icons in this table — and state/consent icons such as ✅, 💡, ⚙️, and 🛑
+  (**Check before applying**, the unattributed-destructive-change gate) — are
+  deliberately outside it: they mark states and disclosures, not severities.

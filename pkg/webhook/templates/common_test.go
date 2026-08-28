@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 func TestSanitizeCommentError(t *testing.T) {
@@ -125,19 +126,19 @@ func TestSanitizeCellError(t *testing.T) {
 func TestWriteErrorBlock(t *testing.T) {
 	t.Run("multi-line error stays inside the blockquote", func(t *testing.T) {
 		var sb strings.Builder
-		writeErrorBlock(&sb, "first line\nsecond line")
+		writeErrorBlock(&sb, glyph.Failed, "first line\nsecond line")
 		assert.Equal(t, "\n> ❌ **Error:** first line\n> second line\n", sb.String())
 	})
 
 	t.Run("whitespace-only error writes nothing", func(t *testing.T) {
 		var sb strings.Builder
-		writeErrorBlock(&sb, "  \n ")
+		writeErrorBlock(&sb, glyph.Failed, "  \n ")
 		assert.Empty(t, sb.String())
 	})
 
 	t.Run("HTML markup is escaped so it renders as text", func(t *testing.T) {
 		var sb strings.Builder
-		writeErrorBlock(&sb, "unexpected <img src=x> in output")
+		writeErrorBlock(&sb, glyph.Failed, "unexpected <img src=x> in output")
 		assert.Contains(t, sb.String(), "&lt;img src=x&gt;")
 		assert.NotContains(t, sb.String(), "<img")
 	})
@@ -146,20 +147,20 @@ func TestWriteErrorBlock(t *testing.T) {
 func TestWriteTableErrorLine(t *testing.T) {
 	t.Run("whitespace-only error writes nothing", func(t *testing.T) {
 		var sb strings.Builder
-		writeTableErrorLine(&sb, " \n\t")
+		writeTableErrorLine(&sb, glyph.Failed, " \n\t")
 		assert.Empty(t, sb.String())
 	})
 
 	t.Run("endpoint detail is redacted in the rendered line", func(t *testing.T) {
 		var sb strings.Builder
-		writeTableErrorLine(&sb, "dial tcp 10.0.0.5:3306: i/o timeout")
+		writeTableErrorLine(&sb, glyph.Failed, "dial tcp 10.0.0.5:3306: i/o timeout")
 		assert.Contains(t, sb.String(), "[endpoint redacted]")
 		assert.NotContains(t, sb.String(), "10.0.0.5")
 	})
 
 	t.Run("HTML markup is escaped so it renders as text", func(t *testing.T) {
 		var sb strings.Builder
-		writeTableErrorLine(&sb, "expected <nil> but got <error>")
+		writeTableErrorLine(&sb, glyph.Failed, "expected <nil> but got <error>")
 		assert.Contains(t, sb.String(), "&lt;nil&gt;")
 		assert.NotContains(t, sb.String(), "<nil>")
 	})

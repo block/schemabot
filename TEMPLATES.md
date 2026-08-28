@@ -2748,7 +2748,7 @@ If the plan finds changes, apply `staging` and wait for the SchemaBot check to s
 <summary><a name="apply-blocked-prior-env-check-read-error"></a><strong>Apply Blocked: Prior Env Check Read Error</strong></summary>
 
 
-## ⛔ Apply Blocked
+## ❌ Apply Blocked
 
 Could not verify staging status: failed to query check runs. Retry the apply command.
 
@@ -2903,7 +2903,7 @@ schemabot apply -e staging
 <summary><a name="apply-blocked-check-status-read-error"></a><strong>Apply Blocked: Check Status Read Error</strong></summary>
 
 
-## ⛔ Apply Blocked — Staging
+## ❌ Apply Blocked — Staging
 
 The SchemaBot GitHub App `schemabot-app` cannot read PR check statuses for this repository.
 
@@ -3777,7 +3777,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-> ❌ Last error: lock wait timeout exceeded; try restarting transaction
+> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
 
 **`products`**: ⏳ Queued
 
@@ -3824,7 +3824,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-> ❌ Last error: lock wait timeout exceeded; try restarting transaction
+> ⚠️ Last error: lock wait timeout exceeded; try restarting transaction
 
 **`products`**: ⏳ Queued
 

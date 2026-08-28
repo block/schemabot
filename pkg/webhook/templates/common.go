@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"github.com/block/schemabot/pkg/glyph"
 )
 
 // capitalizeFirst capitalizes the first letter of a string.
@@ -300,26 +298,32 @@ func quoteBlockLines(msg string) string {
 	return strings.ReplaceAll(msg, "\n", "\n> ")
 }
 
-// writeErrorBlock writes an error message as a blockquote marked with the failure glyph.
-// The message is sanitized before rendering; a message that sanitizes to
-// empty writes nothing.
-func writeErrorBlock(sb *strings.Builder, msg string) {
+// writeErrorBlock writes an error message as a blockquote marked with the
+// caller's severity glyph. The severity comes from the call site because the
+// same error text carries different weight by apply state: glyph.Failed when
+// the system has stopped and the operator's job is triage, glyph.Attention
+// when SchemaBot is still acting on its own (retrying, stopped by request)
+// and no triage is due. The message is sanitized before rendering; a message
+// that sanitizes to empty writes nothing.
+func writeErrorBlock(sb *strings.Builder, severity, msg string) {
 	sanitized := sanitizeCommentError(msg)
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **Error:** %s\n", quoteBlockLines(html.EscapeString(sanitized)))
+	fmt.Fprintf(sb, "\n> %s **Error:** %s\n", severity, quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // writeTableErrorLine writes a task's last error as a blockquote below its
-// progress line. The message is sanitized before rendering; a message that
-// sanitizes to empty writes nothing.
-func writeTableErrorLine(sb *strings.Builder, msg string) {
+// progress line, marked with the caller's severity glyph — glyph.Failed for a
+// task the system stopped on, glyph.Attention for one it is still retrying.
+// The message is sanitized before rendering; a message that sanitizes to
+// empty writes nothing.
+func writeTableErrorLine(sb *strings.Builder, severity, msg string) {
 	sanitized := sanitizeCommentError(msg)
 	if sanitized == "" {
 		return
 	}
-	fmt.Fprintf(sb, "> "+glyph.Failed+" Last error: %s\n", quoteBlockLines(html.EscapeString(sanitized)))
+	fmt.Fprintf(sb, "> %s Last error: %s\n", severity, quoteBlockLines(html.EscapeString(sanitized)))
 }
 
 // taskErrorAddsDetail reports whether a failed table's own error message adds

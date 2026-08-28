@@ -1268,7 +1268,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
 			if errMsg, hasErr := data.Errors[env]; hasErr {
-				writeErrorBlock(&sb, errMsg)
+				writeErrorBlock(&sb, glyph.Failed, errMsg)
 				sb.WriteString("\n")
 				continue
 			}
