@@ -1494,7 +1494,7 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 			append(task.LogAttrs(), "probe_error", probeErr, "error", cancelErr)...)
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
 	}
-	if engineProgressShowsLiveWork(progress) {
+	if engineProgressShowsLiveWork(eng, progress) {
 		engineState := ""
 		if progress != nil {
 			engineState = string(progress.State)
@@ -1512,23 +1512,40 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 // work that a cancel must still terminate before storage may record the
 // schema change as cancelled. It reads the engine's own report, unlike
 // hasLiveEngineWork, which reads the stored task state's expectation.
-// Uncertainty counts as live work — only an affirmative nothing-is-running
-// answer clears the probe. Pending means the engine tracks no work for the
-// target; stopped, cancelled, and failed mean the engine's work already ended
-// without landing the change. Completed deliberately counts as live: a change
-// that landed must reconcile to its completed outcome, never settle as
-// cancelled, and the revert states keep the engine actively unwinding the
-// change.
-func engineProgressShowsLiveWork(progress *engine.ProgressResult) bool {
+// Uncertainty counts as live work — only an affirmative nothing-left-to-cancel
+// answer clears the probe, and what qualifies depends on who owns the engine's
+// truth:
+//
+//   - An engine whose progress is externally authoritative relays the
+//     provider's record of the change, so only a provider answer that closed
+//     the change clears the probe: cancelled, or failed with no retry path.
+//     Pending from such an engine is an open change the provider can still
+//     run, and a retryable failure remains runnable — both keep the cancel
+//     error surfacing so the change is never recorded cancelled while the
+//     provider can still land it.
+//   - Any other engine executes in this process, so pending — the idle
+//     sentinel — is the only answer proving nothing is left. A state the
+//     engine still tracks, terminal or not, means engine-owned work (such as
+//     target cleanup) remains that only a retried cancel finishes.
+//
+// Completed deliberately counts as live for every engine: a change that
+// landed must reconcile to its completed outcome, never settle as cancelled.
+// The revert states keep the engine actively unwinding the change.
+func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressResult) bool {
 	if progress == nil {
 		return true
 	}
-	switch progress.State {
-	case engine.StatePending, engine.StateStopped, engine.StateCancelled, engine.StateFailed:
-		return false
-	default:
-		return true
+	if engine.ProgressIsExternallyAuthoritative(eng) {
+		switch progress.State {
+		case engine.StateCancelled:
+			return false
+		case engine.StateFailed:
+			return progress.Retryable
+		default:
+			return true
+		}
 	}
+	return progress.State != engine.StatePending
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.
