@@ -1231,6 +1231,197 @@ func TestEngineProgressShowsLiveWork(t *testing.T) {
 	})
 }
 
+// A stop that reaches an engine with no live work for the task has nothing
+// left to pause — after a driver crash and restart, the engine tracks nothing
+// in memory while the persisted checkpoint already holds the resume point. The
+// engine stop error must not surface: the durable stop completes by recording
+// the tasks and apply stopped (resumable, no completion time), so a later
+// start resumes from the checkpoint. Surfacing the error would abort the drive
+// and re-run the same failing stop on every claim.
+func TestLocalClient_StopCompletesWhenEngineHasNoLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-no-live-work",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-no-live-work",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{
+		stopErr:        engine.NewPermanentError("no active schema change to stop"),
+		progressResult: &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+	require.NotNil(t, eng.stopReq, "stop must attempt the engine before deciding it has no live work")
+	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the stop")
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Nil(t, apply.CompletedAt, "a stopped apply is resumable and must not carry a completion time")
+}
+
+// A stop the engine refuses while it still has live work must surface: a
+// stopped record over an engine still copying rows would let the change keep
+// running unwatched, so storage must stay active until the engine work is
+// actually paused.
+func TestLocalClient_StopSurfacesErrorWhenEngineHasLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-live-work",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-live-work",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := errors.New("stop refused")
+	eng := &controlCaptureEngine{
+		stopErr:        stopErr,
+		progressResult: &engine.ProgressResult{State: engine.StateRunning},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	require.NotNil(t, eng.progressReq, "the live-work probe must run before the stop error surfaces")
+	assert.Equal(t, state.Task.Running, task.State, "a refused stop over live work must not record the task stopped")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// When the live-work probe itself fails, the engine's state is unknown:
+// completing the stop could record running work as stopped. The original stop
+// error surfaces so the drive retries with engine state intact.
+func TestLocalClient_StopSurfacesErrorWhenLiveWorkProbeFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-probe-error",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-probe-error",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := errors.New("stop refused")
+	eng := &controlCaptureEngine{
+		stopErr:     stopErr,
+		progressErr: errors.New("progress unavailable"),
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr, "the original stop error must surface, not the probe error")
+	assert.Equal(t, state.Task.Running, task.State, "an uncertain probe must never record the task stopped")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// An externally authoritative engine reporting pending has an open change the
+// provider can still run. A failed stop must surface rather than settle, or
+// the change could land on the target after storage recorded it stopped.
+func TestLocalClient_StopSurfacesErrorWhenProviderChangeStillOpen(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-strata-stop-open-change",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-strata-stop-open-change",
+		State:            state.Task.Running,
+	}
+	resumeState := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-strata-stop",
+		Metadata:         `{"change_id":"321"}`,
+	}
+	stopErr := errors.New("stop rejected: provider change state pending")
+	eng := &externallyAuthoritativeCaptureEngine{controlCaptureEngine: controlCaptureEngine{
+		stopErr:        stopErr,
+		progressResult: &engine.ProgressResult{State: engine.StatePending},
+	}}
+	client := newCustomTypeControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	assert.Equal(t, state.Task.Running, task.State, "an open provider change must never be recorded stopped")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// When the provider's own record says the change is closed, a failed stop call
+// has nothing left to pause: the durable stop completes by recording the tasks
+// and apply stopped instead of re-running a guaranteed-failing stop on every
+// claim. Stopped stays the resumable operator verb — a later start re-plans
+// against the target rather than resuming the closed provider change.
+func TestLocalClient_StopCompletesWhenProviderClosedTheChange(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-strata-stop-closed-change",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-strata-stop-closed-change",
+		State:            state.Task.Running,
+	}
+	resumeState := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-strata-stop",
+		Metadata:         `{"change_id":"321"}`,
+	}
+	eng := &externallyAuthoritativeCaptureEngine{controlCaptureEngine: controlCaptureEngine{
+		stopErr:        errors.New("stop rejected: provider change already cancelled"),
+		progressResult: &engine.ProgressResult{State: engine.StateCancelled},
+	}}
+	client := newCustomTypeControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the stop")
+	require.NotNil(t, eng.progressReq.ResumeState, "the probe must carry the persisted resume state to address the provider change")
+	assert.Equal(t, "ctx-strata-stop", eng.progressReq.ResumeState.MigrationContext)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Nil(t, apply.CompletedAt, "a stopped apply is resumable and must not carry a completion time")
+}
+
 // A task in the revert window has already cut over: the new schema is live.
 // Stop must reject rather than record it as cancelled, so an operator chooses
 // explicitly between reverting (undo) and skip-revert (finalize). The engine is
