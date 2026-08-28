@@ -26,9 +26,10 @@ const maxObservedStatusLen = 128
 // task's triage identifiers so the missing mapping can be added. Recognized
 // statuses record nothing, so observing on every poll tick is cheap.
 //
-// The zero value is ready to use. The warn-dedupe set grows only with
-// distinct unrecognized pairs — each one a missing mapping to fix — so it is
-// deliberately unbounded.
+// The zero value is ready to use. The warn-dedupe set is keyed by task (or
+// shard) and status, so one missing mapping grows it by the number of
+// affected tasks — bounded by the tasks this client drives, so it is
+// deliberately left unbounded.
 type unrecognizedStatusReporter struct {
 	mu     sync.Mutex
 	warned map[string]struct{}
