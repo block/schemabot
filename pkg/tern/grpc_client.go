@@ -3750,6 +3750,12 @@ func remoteTaskResumedFromRetryablePause(remoteTaskState string) bool {
 // syncStoredTasksFromRemoteTasks mirrors the per-task table progress fields
 // returned by remote Tern. It only copies the remote task snapshot; terminal
 // remote applies are persisted only after those copied task states are resolved.
+//
+// Every stored task row is written on every call, even when no field moved:
+// the operator reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing, so
+// the write must stay unconditional — including through parked states such as
+// deferred cutovers and revert windows, where nothing changes tick to tick.
 func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	ctx context.Context,
 	storedApply *storage.Apply,

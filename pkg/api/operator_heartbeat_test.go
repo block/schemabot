@@ -100,7 +100,12 @@ func TestOperationDriveStalled(t *testing.T) {
 	stalledStart := time.Now().Add(-2 * ApplyDriveStallAfter)
 
 	t.Run("a drive younger than the stall window is never stalled", func(t *testing.T) {
-		svc := newStallService(&stubTaskStore{})
+		// The stale task row is a previous claim's leftover: a young drive gets
+		// the full window before its first mirror write even when the rows it
+		// inherited stopped advancing long ago.
+		svc := newStallService(&stubTaskStore{tasks: []*storage.Task{
+			{State: state.Task.Running, UpdatedAt: stalledStart},
+		}})
 		assert.False(t, svc.operationDriveStalled(t.Context(), 1, op, apply, time.Now()))
 	})
 
@@ -131,7 +136,11 @@ func TestOperationDriveStalled(t *testing.T) {
 			OperationKind: storage.ApplyOperationKindGroupFinalizer,
 			State:         state.Apply.Running,
 		}
-		svc := newStallService(&stubTaskStore{})
+		// The stale task row would stall a work operation; only the operation
+		// kind exempts the finalizer.
+		svc := newStallService(&stubTaskStore{tasks: []*storage.Task{
+			{State: state.Task.Running, UpdatedAt: stalledStart},
+		}})
 		assert.False(t, svc.operationDriveStalled(t.Context(), 1, finalizer, apply, stalledStart))
 	})
 

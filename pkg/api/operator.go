@@ -35,7 +35,8 @@ const (
 	// is wedged and cancels the run. A healthy drive's poll loop writes every
 	// task row on every poll tick, so legitimate silence is far shorter than
 	// this window; the window is kept generous so slow pre-poll phases (target
-	// schema pulls, re-planning, engine acceptance) are never judged stalled.
+	// schema pulls, re-planning, engine acceptance) have the full window before
+	// their first mirror write.
 	ApplyDriveStallAfter = 5 * time.Minute
 
 	// DefaultDrivers is the number of concurrent operator drivers
