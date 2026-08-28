@@ -442,6 +442,11 @@ func heartbeatScopeName(operationScoped bool) string {
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 
 // pollTaskToCompletion polls a single task to completion (sequential mode).
+// Each poll tick persists the task row, even when no field moved: the operator
+// reads tasks.updated_at as the drive's liveness signal (ApplyDriveStallAfter)
+// and cancels a drive whose rows stop advancing, so the write must stay
+// unconditional — including through parked states such as deferred cutovers
+// and revert windows, where nothing changes tick to tick.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
 	ticker := time.NewTicker(500 * time.Millisecond)

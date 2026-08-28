@@ -1243,7 +1243,12 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 	ps.lastProgressLog = now
 }
 
-// syncAtomicTaskProgress updates all tasks with engine state and per-table progress.
+// syncAtomicTaskProgress updates all tasks with engine state and per-table
+// progress. Every task ends its tick with a persisted write, even when no
+// field moved: the operator reads tasks.updated_at as the drive's liveness
+// signal (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing,
+// so the write must stay unconditional — including through parked states such
+// as deferred cutovers and revert windows, where nothing changes tick to tick.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)

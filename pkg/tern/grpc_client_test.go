@@ -891,6 +891,7 @@ type mockTaskStore struct {
 	getByOperationIDErr error
 	updateErr           error
 	lastOperationID     int64
+	updated             []*storage.Task
 	upsertedShards      []*storage.Task
 	upsertShardErr      error
 }
@@ -920,7 +921,14 @@ func (m *mockTaskStore) GetByApplyOperationID(_ context.Context, applyOperationI
 	}
 	return m.tasks, nil
 }
-func (m *mockTaskStore) Update(context.Context, *storage.Task) error { return m.updateErr }
+func (m *mockTaskStore) Update(_ context.Context, task *storage.Task) error {
+	if m.updateErr != nil {
+		return m.updateErr
+	}
+	stored := *task
+	m.updated = append(m.updated, &stored)
+	return nil
+}
 
 func (m *mockTaskStore) UpsertShardProgress(_ context.Context, task *storage.Task) error {
 	if m.upsertShardErr != nil {
@@ -5791,6 +5799,42 @@ func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 			assert.NotEmpty(t, s.Shard, "no per-shard row may be stored without a shard name")
 		}
 	})
+}
+
+func TestGRPCClient_SyncUnchangedProgressAdvancesUpdatedAt(t *testing.T) {
+	// Every mirror tick stamps tasks.updated_at with the sync time, even when
+	// the remote progress is byte-for-byte identical to what is already stored.
+	// The operator consumes that timestamp as the drive's liveness signal
+	// (ApplyDriveStallAfter): long-running phases such as checksums legitimately
+	// hold row counts flat, so a poll over unchanged progress must still count
+	// as liveness rather than letting the task row age into a stall verdict.
+	now := time.Now()
+	staleUpdatedAt := now.Add(-time.Hour)
+	apply := &storage.Apply{ID: 51, ApplyIdentifier: "apply-liveness-stamp", State: state.Apply.Running}
+	storedTask := &storage.Task{
+		ID: 52, TaskIdentifier: "task-liveness-stamp", ApplyID: apply.ID,
+		Namespace: "commerce", TableName: "users",
+		State:      state.Task.Running,
+		RowsCopied: 150, RowsTotal: 300, ProgressPercent: 50,
+		UpdatedAt: staleUpdatedAt,
+	}
+	tasks := &mockTaskStore{tasks: []*storage.Task{storedTask}}
+	client := &GRPCClient{storage: &mockStorage{tasks: tasks, logs: &mockApplyLogStore{}}}
+
+	require.NoError(t, client.syncStoredTasksFromRemoteTasks(t.Context(), apply, []*storage.Task{storedTask}, []*ternv1.TableProgress{{
+		Namespace:       "commerce",
+		TableName:       "users",
+		Status:          state.Task.Running,
+		RowsCopied:      150,
+		RowsTotal:       300,
+		PercentComplete: 50,
+	}}, now))
+
+	require.Len(t, tasks.updated, 1)
+	assert.True(t, tasks.updated[0].UpdatedAt.Equal(now), "unchanged progress must still stamp updated_at with the sync time")
+	assert.Equal(t, state.Task.Running, tasks.updated[0].State)
+	assert.Equal(t, int64(150), tasks.updated[0].RowsCopied)
+	assert.Equal(t, 50, tasks.updated[0].ProgressPercent)
 }
 
 func TestGRPCClient_SyncRemoteProgressByNamespace(t *testing.T) {
