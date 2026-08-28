@@ -82,6 +82,34 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 		assert.Empty(t, op)
 		assert.ErrorContains(t, err, "unrecognized change type and no DDL to classify")
 	})
+
+	t.Run("DDL outside the shared vocabulary is rejected", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+		})
+
+		require.Error(t, err)
+		assert.Empty(t, op)
+		assert.ErrorContains(t, err, "outside the shared DDL vocabulary")
+	})
+
+	t.Run("DML is rejected", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "INSERT INTO t (id) VALUES (1)",
+		})
+
+		require.Error(t, err)
+		assert.Empty(t, op)
+		assert.ErrorContains(t, err, "not a DDL statement")
+	})
 }
 
 func TestLocalClientLogsValidationAndConversion(t *testing.T) {

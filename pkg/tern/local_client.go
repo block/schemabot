@@ -1728,15 +1728,19 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if table == "" || ddl == "" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty table or DDL", i)
 		}
-		op := protoChangeTypeToDDLAction(ch.ChangeType)
-		// A shard-scoped dispatch carries only table DDL (create/alter/drop) for one
-		// shard. A VSchema update is keyspace-wide, never shard-scoped — it is applied
-		// by the task-less group_finalizer path — so accepting it here would build a
-		// shard-tagged task with an unexpected operation. Reject it explicitly.
-		if op == "unknown" || op == "vschema_update" {
+		// A shard-scoped dispatch carries only the table DDL the plan-store shard
+		// gate admits — create/alter/drop for one shard — so allow exactly those and
+		// reject everything else. A VSchema update is keyspace-wide, never
+		// shard-scoped — it is applied by the task-less group_finalizer path — and
+		// any other change type would build a shard-tagged task the sharded path has
+		// no semantics for. An explicit allow-list keeps this gate's meaning fixed
+		// as the change-type vocabulary grows.
+		switch ch.ChangeType {
+		case ternv1.ChangeType_CHANGE_TYPE_CREATE, ternv1.ChangeType_CHANGE_TYPE_ALTER, ternv1.ChangeType_CHANGE_TYPE_DROP:
+		default:
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
-		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, op))
+		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, protoChangeTypeToDDLAction(ch.ChangeType)))
 	}
 	return out, nil
 }
@@ -2097,8 +2101,12 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 // materializedTableChangeOperation recovers the storage operation for a
 // materialized table change. The proto change type is authoritative when it maps
 // to a known DDL action; otherwise the operation is classified from the request's
-// authoritative DDL with the target dialect's parser so an unmapped change type
-// does not persist an "unknown" action that would resume as a no-op.
+// authoritative DDL with the target dialect's parser. DDL that classifies
+// outside the shared DDL vocabulary, or as DML, is rejected — never mapped to
+// an "unknown" action that would resume as a no-op. The two rejection causes
+// get distinct messages because they call for different remedies: DML has no
+// place in a schema change, while out-of-vocabulary SQL is a statement the
+// materialized plan has no name for.
 func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.TableChange) (string, error) {
 	if op := protoChangeTypeToDDLAction(ch.ChangeType); op != "unknown" {
 		return op, nil
@@ -2109,6 +2117,12 @@ func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.Tab
 	statementType, _, err := parser.Classify(ch.Ddl)
 	if err != nil {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
+	}
+	if statementType == ddl.StatementUnknown {
+		return "", fmt.Errorf("DDL for table %q classified outside the shared DDL vocabulary; cannot recover an operation", ch.TableName)
+	}
+	if !statementType.IsDDL() {
+		return "", fmt.Errorf("DDL for table %q is not a DDL statement, got %s", ch.TableName, statementType)
 	}
 	return ddl.StatementTypeToOp(statementType), nil
 }

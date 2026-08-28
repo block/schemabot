@@ -14,6 +14,28 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
+// Live-remote progress renders the same operation string for a table change
+// that the storage-served path persists as the task's DDL action, so a client
+// polling an apply sees a stable change type across the two sources. Only
+// CHANGE_TYPE_OTHER differs by design: live progress has no DDL parser to
+// recover an operation from, so it renders the change type as empty.
+func TestChangeTypeToStringMatchesStorageOperation(t *testing.T) {
+	for _, ct := range []ternv1.ChangeType{
+		ternv1.ChangeType_CHANGE_TYPE_CREATE,
+		ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		ternv1.ChangeType_CHANGE_TYPE_DROP,
+		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
+		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
+		ternv1.ChangeType_CHANGE_TYPE_RENAME,
+		ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
+		ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW,
+		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+	} {
+		assert.Equal(t, protoChangeTypeToOperation(ct), changeTypeToString(ct), "change type %v", ct)
+	}
+	assert.Empty(t, changeTypeToString(ternv1.ChangeType_CHANGE_TYPE_OTHER))
+}
+
 // A table's ETA travels from the progress proto through the HTTP response and
 // its JSON encoding unchanged, so CLI and API consumers see the same figure
 // the driver stored.

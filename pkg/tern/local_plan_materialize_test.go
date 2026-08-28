@@ -286,3 +286,21 @@ func TestNamespacesFromApplyRequest_UnmappedChangeTypeClassifiesDDL(t *testing.T
 	require.Len(t, got["testapp"].Tables, 1)
 	assert.Equal(t, "create", got["testapp"].Tables[0].Operation)
 }
+
+// A deployment materializes dispatched changes with its own dialect's parser: a
+// PostgreSQL deployment recovers the operation for an unmapped change type from
+// Postgres-only DDL that the MySQL-family grammar cannot parse.
+func TestNamespacesFromApplyRequest_UnmappedChangeTypeUsesTargetDialectParser(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	c.config.Type = storage.DatabaseTypePostgres
+	changes := []*ternv1.TableChange{
+		{TableName: "orders", Ddl: "CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_OTHER, Namespace: ""},
+	}
+
+	got, err := c.namespacesFromApplyRequest(changes, schema.SchemaFiles{})
+	require.NoError(t, err)
+
+	require.Contains(t, got, "testapp")
+	require.Len(t, got["testapp"].Tables, 1)
+	assert.Equal(t, "create", got["testapp"].Tables[0].Operation)
+}

@@ -40,13 +40,3 @@ func statementPreview(stmt string) string {
 	}
 	return s
 }
-
-// ClassifyStatementOp is like ClassifyStatement but returns the operation as a
-// lowercase string ("create", "alter", "drop") for storage/API boundaries.
-func ClassifyStatementOp(stmt string) (string, string, error) {
-	t, table, err := ClassifyStatement(stmt)
-	if err != nil {
-		return "", "", err
-	}
-	return StatementTypeToOp(t), table, nil
-}
