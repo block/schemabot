@@ -285,13 +285,22 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 		assert.Contains(t, err.Error(), "parsed as 2 statements")
 	})
 
-	t.Run("non-DDL statement is rejected", func(t *testing.T) {
-		// The parser classifies non-DDL such as SELECT, which has no place
-		// in a schema-change drift comparison. It must fail closed instead of
-		// canonicalizing it as if it were DDL.
-		_, err := canonicalDDLForDrift(parser, "SELECT 1")
+	t.Run("DML is rejected", func(t *testing.T) {
+		// DML has no place in a schema-change drift comparison. It must fail
+		// closed instead of canonicalizing it as if it were DDL, and the error
+		// names the remedy's cause: the statement should not be in the change.
+		_, err := canonicalDDLForDrift(parser, "INSERT INTO `users` (`id`) VALUES (1)")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "expected a DDL statement")
+	})
+
+	t.Run("a statement outside the shared vocabulary is rejected", func(t *testing.T) {
+		// A statement that parses cleanly but classifies to no shared
+		// StatementType is unverifiable rather than malformed, so the error
+		// distinguishes it from the DML rejection.
+		_, err := canonicalDDLForDrift(parser, "SELECT 1")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "outside the shared DDL vocabulary")
 	})
 
 	t.Run("parseable DDL is canonicalized", func(t *testing.T) {
@@ -352,10 +361,19 @@ func TestCanonicalDDLForDrift_PostgresDialect(t *testing.T) {
 		assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
 	})
 
-	t.Run("non-DDL statement is rejected", func(t *testing.T) {
-		_, err := canonicalDDLForDrift(parser, "SELECT 1")
+	t.Run("DML is rejected", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, "INSERT INTO users (id) VALUES (1)")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "expected a DDL statement")
+	})
+
+	t.Run("a statement outside the shared vocabulary is rejected", func(t *testing.T) {
+		// PostgreSQL classifies statement kinds the shared vocabulary has no
+		// name for (SELECT among them) as unknown; those are unverifiable
+		// rather than malformed, and the error says so.
+		_, err := canonicalDDLForDrift(parser, "SELECT 1")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "outside the shared DDL vocabulary")
 	})
 }
 

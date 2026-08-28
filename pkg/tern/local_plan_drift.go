@@ -193,9 +193,11 @@ func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
 // not actually DDL. The parser's Canonicalize returns the input unchanged on a
 // parse failure, so such input would otherwise compare by raw text and could
 // mask drift — Classify errors reject it first. Classify also rejects
-// multi-statement input, and accepts non-DDL (e.g. SELECT, INSERT), which has
-// no place in a schema-change drift comparison, so reject anything that did
-// not classify as a DDL statement.
+// multi-statement input. Of what classifies cleanly, two rejection causes get
+// distinct messages because they call for different remedies: DML (e.g.
+// INSERT) has no place in a schema change and should be removed from it, while
+// a statement outside the shared DDL vocabulary is SQL the comparison has no
+// name for and cannot verify.
 func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -204,6 +206,9 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	stmtType, _, err := p.Classify(raw)
 	if err != nil {
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
+	}
+	if stmtType == ddl.StatementUnknown {
+		return "", fmt.Errorf("statement classified outside the shared DDL vocabulary; drift cannot verify it")
 	}
 	if !stmtType.IsDDL() {
 		return "", fmt.Errorf("expected a DDL statement, got %s", stmtType)

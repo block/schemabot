@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/clock"
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -311,13 +313,18 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 // (schema.DialectForDatabaseType): drift comparison classifies and
 // canonicalizes DDL with the dialect's parser and fails closed on a type
 // whose dialect has no parser, so an engine registered without a dialect
-// mapping can plan but never pass the drift gate.
+// mapping could plan but never pass the drift gate. Registration rejects
+// such a type here, at setup, rather than surfacing it as a blocked drift
+// gate on every schema change against that database.
 func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory) error {
 	if databaseType == "" {
 		return fmt.Errorf("register engine: database type must not be empty")
 	}
 	if factory == nil {
 		return fmt.Errorf("register engine for database type %q: factory must not be nil", databaseType)
+	}
+	if _, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType)); err != nil {
+		return fmt.Errorf("register engine for database type %q: %w", databaseType, err)
 	}
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
