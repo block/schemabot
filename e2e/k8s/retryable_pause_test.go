@@ -59,14 +59,16 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	// Kill the data plane's target connections on every poll tick until the
 	// engine run fails and the data plane parks the apply for its own retry.
 	// Spirit may absorb a single kill mid-chunk, so the injection repeats until
-	// the pause is actually observed on the wire. Throughout, the control
-	// plane's stored apply must stay non-terminal: the data plane will retry,
-	// so any terminal state here is the split-brain this stack prevents.
+	// the pause is actually observed on the wire. Each tick observes the wire
+	// before it injects: once the pause is visible, the data plane's own
+	// recovery attempt may already be re-driving the apply, and a kill landing
+	// on that attempt would sabotage the very recovery the rest of the test
+	// waits for. Throughout, the control plane's stored apply must stay
+	// non-terminal: the data plane will retry, so any terminal state here is
+	// the split-brain this stack prevents.
 	var lastWireState ternv1.State
 	testutil.Poll(t, 3*time.Minute, 250*time.Millisecond,
 		func() bool {
-			killDataPlaneTargetConnections(t, killer)
-
 			cpState := storedControlPlaneApplyState(t, controlPlaneDB, fixture.ApplyID)
 			require.False(t, state.IsTerminalApplyState(cpState),
 				"control plane terminalized the apply (%s) while the data plane was still retrying", cpState)
@@ -74,7 +76,12 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 			lastWireState = podProgress(t, podClient, fixture.DataPlaneApplyID).State
 			require.NotEqual(t, ternv1.State_STATE_FAILED, lastWireState,
 				"data plane settled failed: the retry budget was exhausted before the pause was observed")
-			return lastWireState == ternv1.State_STATE_FAILED_RETRYABLE
+			if lastWireState == ternv1.State_STATE_FAILED_RETRYABLE {
+				return true
+			}
+
+			killDataPlaneTargetConnections(t, killer)
+			return false
 		},
 		func() string {
 			return fmt.Sprintf("timeout waiting for the data-plane pause to cross the wire as STATE_FAILED_RETRYABLE, last wire state: %s", lastWireState)
