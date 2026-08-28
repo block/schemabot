@@ -14,6 +14,23 @@ import (
 
 var openSQL = sql.Open
 
+// Default transport timeouts for SchemaBot-managed MySQL connections, applied
+// only when neither the DSN nor an option sets its own value. The connect
+// timeout bounds the TCP dial plus handshake, so a connection attempt against
+// an unreachable or half-open endpoint fails and is retried instead of
+// blocking its caller indefinitely. The write timeout bounds a single network
+// write; statement text is small, so a write blocked this long means the peer
+// is gone. No read-timeout default is set, deliberately: the Go MySQL driver's
+// read timeout caps a single network read, and a legitimately long-running
+// statement streams no bytes until it completes — for example a large DROP
+// TABLE or a DDL waiting on a metadata lock — so a read timeout would kill it
+// mid-flight. Reads are bounded by context deadlines at the call sites that
+// need them.
+const (
+	defaultConnectTimeout = 30 * time.Second
+	defaultWriteTimeout   = time.Minute
+)
+
 // Option customizes the parsed MySQL config before the DSN is reassembled.
 // Options are applied in ConnectionDSN, so they flow through Open,
 // OpenReloadable, and the credential-reload path alike.
@@ -21,8 +38,8 @@ type Option func(*mysql.Config)
 
 // WithConnectTimeout bounds a single connection attempt (TCP dial plus
 // handshake) by setting the driver's `timeout` DSN parameter. A non-positive
-// duration is ignored, leaving the driver default in place. It does not bound
-// query execution — use context deadlines for that.
+// duration is ignored, leaving the package's default connect timeout in
+// place. It does not bound query execution — use context deadlines for that.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(cfg *mysql.Config) {
 		if d > 0 {
@@ -109,10 +126,10 @@ func reloadConnectionDSN(reload func() (string, error), opts ...Option) string {
 }
 
 // ConnectionDSN returns a MySQL DSN with required connection settings applied
-// (RDS TLS, client-side parameter interpolation), plus any caller-supplied
-// options (for example WithConnectTimeout). Settings and options are applied
-// on every return path so they take effect regardless of whether the DSN also
-// needs RDS TLS enhancement.
+// (RDS TLS, client-side parameter interpolation, default transport timeouts),
+// plus any caller-supplied options (for example WithConnectTimeout). Settings
+// and options are applied on every return path so they take effect regardless
+// of whether the DSN also needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
@@ -143,13 +160,21 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	return requiredSettingsDSN(enhanced, opts...), nil
 }
 
-// requiredSettingsDSN applies any caller-supplied options, then the settings
-// every SchemaBot-managed MySQL connection needs, and returns the reassembled
-// DSN. Required settings are applied after options so no option can override
-// them.
+// requiredSettingsDSN applies any caller-supplied options, then default
+// transport timeouts for values still unset, then the settings every
+// SchemaBot-managed MySQL connection needs, and returns the reassembled DSN.
+// Required settings are applied after options so no option can override them;
+// the timeout defaults fill only zero values so a DSN or option that sets its
+// own timeout wins.
 func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	if cfg.Timeout == 0 {
+		cfg.Timeout = defaultConnectTimeout
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = defaultWriteTimeout
 	}
 	// Interpolate query parameters client-side instead of using server-side
 	// prepared statements. database/sql prepares, executes once, and closes on
