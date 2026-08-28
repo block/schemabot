@@ -37,13 +37,14 @@ func PreviewCommentPlan() string {
 // previewPlanData is the sample plan the plan previews render from.
 func previewPlanData() PlanCommentData {
 	return PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -72,13 +73,14 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -102,13 +104,14 @@ func PreviewCommentPlanBlocked() string {
 // so a dropped column is named by its table exactly as a dropped table is.
 func PreviewCommentPlanAttributedChange() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -143,6 +146,7 @@ func PreviewCommentPlanDirect() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		IsLocked:     true,
 		LockOwner:    previewRepository + "#42",
 		LockAcquired: "2026-01-15 14:30:00 UTC",
@@ -167,13 +171,14 @@ func PreviewCommentPlanDirect() string {
 // what the operator would lose by applying while that decision is still theirs.
 func PreviewCommentPlanCopyDiscarded() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -207,6 +212,7 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		IsLocked:     true,
 		LockOwner:    previewRepository + "#42",
 		LockAcquired: "2026-01-15 14:30:00 UTC",
@@ -244,6 +250,7 @@ func PreviewCommentPlanCopyDiscardedStopped() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		IsLocked:     true,
 		LockOwner:    previewRepository + "#42",
 		LockAcquired: "2026-01-15 14:30:00 UTC",
@@ -289,6 +296,7 @@ func PreviewCommentPlanCopyDiscardedApplying() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		IsLocked:     true,
 		LockOwner:    previewRepository + "#42",
 		LockAcquired: "2026-01-15 14:30:00 UTC",
@@ -317,13 +325,14 @@ func PreviewCommentPlanCopyDiscardedApplying() string {
 // starting it over.
 func PreviewCommentPlanCopyAdopted() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -349,13 +358,14 @@ func PreviewCommentPlanCopyAdopted() string {
 // already in flight and keeps every row of it.
 func PreviewCommentPlanCopyRunning() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -380,13 +390,14 @@ func PreviewCommentPlanCopyRunning() string {
 // plan containing statements the engine refuses.
 func PreviewCommentApplyBlockedRejected() string {
 	return RenderBlockedChangesApplyRejected(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -405,29 +416,31 @@ func PreviewCommentApplyBlockedRejected() string {
 // PreviewCommentPlanTenant renders a tenant-targeted plan comment.
 func PreviewCommentPlanTenant() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		Tenant:      "alpha",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
-		Changes:     samplePlanChanges(),
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		Tenant:       "alpha",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
 	})
 }
 
 // PreviewCommentPlanNoChanges renders a sample plan comment with no changes detected.
 func PreviewCommentPlanNoChanges() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
-		Changes:     nil,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      nil,
 	})
 }
 
@@ -435,14 +448,15 @@ func PreviewCommentPlanNoChanges() string {
 // rollup confirmed the reviewed plan on every deployment (uniform clean line).
 func PreviewCommentPlanDriftClean() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "production",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
-		Changes:     samplePlanChanges(),
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
 		DeploymentDrift: &DeploymentDriftData{
 			Computed: true,
 			Clean:    true,
@@ -460,14 +474,15 @@ func PreviewCommentPlanDriftClean() string {
 // per-deployment breakdown naming the matching, diverged, and errored targets.
 func PreviewCommentPlanDriftDetected() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "production",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
-		Changes:     samplePlanChanges(),
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      samplePlanChanges(),
 		DeploymentDrift: &DeploymentDriftData{
 			Computed: true,
 			Clean:    false,
@@ -491,6 +506,7 @@ func PreviewCommentPlanDriftUnverified() string {
 		Repository:      previewRepository,
 		RequestedBy:     previewRequestedBy,
 		IsMySQL:         true,
+		DatabaseType:    "mysql",
 		Changes:         samplePlanChanges(),
 		DeploymentDrift: &DeploymentDriftData{Computed: false},
 	})
@@ -929,13 +945,14 @@ func sampleLintWarnings() []LintViolationData {
 // the fold threshold, exercising the collapsed details block grouped by table.
 func PreviewCommentPlanManyLintWarnings() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -963,13 +980,14 @@ func PreviewCommentPlanManyLintWarnings() string {
 // PreviewCommentUnsafeBlocked renders a sample "unsafe changes blocked" comment.
 func PreviewCommentUnsafeBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -991,13 +1009,14 @@ func PreviewCommentUnsafeBlocked() string {
 // column drop is blocked until the application rollout is safe.
 func PreviewCommentDropColumnBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -1020,13 +1039,14 @@ func PreviewCommentDropColumnBlocked() string {
 // index drop is blocked until query performance has been reviewed.
 func PreviewCommentDropIndexBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -1050,13 +1070,14 @@ func PreviewCommentDropIndexBlocked() string {
 // "[ERROR] linter:" prefixes engines report; the renderer strips them.
 func PreviewCommentLintErrorsBlocked() string {
 	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -1084,6 +1105,7 @@ func PreviewCommentApplyPlan() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes:      samplePlanChanges(),
 		IsLocked:     true,
 		LockOwner:    "acme/myapp#42",
@@ -1101,6 +1123,7 @@ func PreviewCommentApplyPlanOptions() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes:      samplePlanChanges(),
 		DeferCutover: true,
 		SkipRevert:   true,
@@ -1113,13 +1136,14 @@ func PreviewCommentApplyPlanOptions() string {
 // PreviewCommentApplyPlanUnsafe renders a sample locked apply-plan with unsafe warning.
 func PreviewCommentApplyPlanUnsafe() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "testapp",
-		SchemaName:  "testapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -1152,6 +1176,7 @@ func PreviewCommentApplyPlanDowngraded() string {
 		Repository:                 previewRepository,
 		RequestedBy:                previewRequestedBy,
 		IsMySQL:                    true,
+		DatabaseType:               "mysql",
 		Changes:                    samplePlanChanges(),
 		IsLocked:                   true,
 		LockOwner:                  "acme/myapp#42",
@@ -1218,14 +1243,15 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 // PreviewCommentVitessPlan renders a sample Vitess plan comment with keyspaces and VSchema diff.
 func PreviewCommentVitessPlan() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "commerce",
-		SchemaName:  "commerce",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     false,
-		Changes:     sampleVitessPlanChanges(),
+		Database:     "commerce",
+		SchemaName:   "commerce",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "vitess",
+		Changes:      sampleVitessPlanChanges(),
 	})
 }
 
@@ -1234,13 +1260,14 @@ func PreviewCommentVitessPlan() string {
 // association — the removals surface in the Issues section as unsafe changes.
 func PreviewCommentVitessPlanVSchemaRemoval() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "commerce",
-		SchemaName:  "commerce",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     false,
+		Database:     "commerce",
+		SchemaName:   "commerce",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "vitess",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace:       "commerce_sharded",
@@ -1298,6 +1325,7 @@ func PreviewCommentVitessApplyPlan() string {
 		Repository:   previewRepository,
 		RequestedBy:  previewRequestedBy,
 		IsMySQL:      false,
+		DatabaseType: "vitess",
 		Changes:      sampleVitessPlanChanges(),
 		DeferCutover: true,
 		SkipRevert:   true,
@@ -1310,12 +1338,13 @@ func PreviewCommentVitessApplyPlan() string {
 // PreviewCommentMySQLMultiSchema renders a MySQL plan with multiple schema names.
 func PreviewCommentMySQLMultiSchema() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:    "myapp",
-		Environment: "staging",
-		HeadSHA:     previewHeadSHA,
-		Repository:  previewRepository,
-		RequestedBy: previewRequestedBy,
-		IsMySQL:     true,
+		Database:     "myapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "app_primary",
@@ -1348,22 +1377,25 @@ func PreviewCommentMultiEnvPlan() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
-				Database:    "testapp",
-				Environment: "staging",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     changes,
+				Database:     "testapp",
+				Environment:  "staging",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      changes,
 			},
 			"production": {
-				Database:    "testapp",
-				Environment: "production",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     changes,
+				Database:     "testapp",
+				Environment:  "production",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      changes,
 			},
 		},
 		Errors: map[string]string{},
@@ -1381,11 +1413,12 @@ func PreviewCommentMultiEnvPlanLint() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  "",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
-			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
-			"production": {Database: "testapp", Environment: "production", IsMySQL: true, Changes: changes, LintViolations: lintViolations},
+			"staging":    {Database: "testapp", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes, LintViolations: lintViolations},
+			"production": {Database: "testapp", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes, LintViolations: lintViolations},
 		},
 		Errors: map[string]string{},
 	})
@@ -1401,15 +1434,17 @@ func PreviewCommentMultiEnvPlanError() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
-				Database:    "testapp",
-				Environment: "staging",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     changes,
+				Database:     "testapp",
+				Environment:  "staging",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      changes,
 			},
 		},
 		Errors: map[string]string{
@@ -1427,22 +1462,25 @@ func PreviewCommentMultiEnvPlanDiff() string {
 		HeadSHA:      previewHeadSHA,
 		Repository:   previewRepository,
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		RequestedBy:  previewRequestedBy,
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{
 			"staging": {
-				Database:    "testapp",
-				Environment: "staging",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     nil,
+				Database:     "testapp",
+				Environment:  "staging",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      nil,
 			},
 			"production": {
-				Database:    "testapp",
-				Environment: "production",
-				RequestedBy: previewRequestedBy,
-				IsMySQL:     true,
-				Changes:     samplePlanChanges(),
+				Database:     "testapp",
+				Environment:  "production",
+				RequestedBy:  previewRequestedBy,
+				IsMySQL:      true,
+				DatabaseType: "mysql",
+				Changes:      samplePlanChanges(),
 			},
 		},
 		Errors: map[string]string{},

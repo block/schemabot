@@ -3,6 +3,8 @@ package ddl
 import (
 	"regexp"
 	"strings"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // FormatDDL formats a DDL statement for better readability.
@@ -52,6 +54,23 @@ func FormatDDL(ddl string) string {
 	// Ensure trailing semicolon
 	result = strings.TrimRight(result, "; ")
 	return result + ";"
+}
+
+// FormatDDLForDialect formats a DDL statement for display under the dialect's
+// own grammar. The MySQL family gets FormatDDL's full treatment; any other
+// dialect renders its own parser's canonical form, so a statement is never
+// reformatted — or judged unparseable — under another family's grammar. Like
+// FormatDDL, this is a best-effort display formatter: a statement the parser
+// rejects, or a dialect with no registered parser, renders as-is.
+func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
+	if dialect == schema.DialectMySQL {
+		return FormatDDL(stmt)
+	}
+	result := strings.TrimSpace(stmt)
+	if p, err := ParserForDialect(dialect); err == nil {
+		result = p.Canonicalize(result)
+	}
+	return strings.TrimRight(result, "; ") + ";"
 }
 
 // dataTypePattern matches SQL data types that should be lowercased.
