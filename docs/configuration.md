@@ -689,8 +689,9 @@ on the storage dialect:
 - **PostgreSQL** creates missing tables and verifies that existing tables
   contain every column and standalone unique index declared by the embedded
   schema. Missing objects fail startup with the affected table and objects
-  identified; extra columns and non-unique index differences are tolerated.
-  Column verification is presence-only: type, length, and nullability drift
+  identified; extra columns are tolerated, and a missing non-unique index is
+  tolerated with a startup warning naming it. Column verification is
+  presence-only: type, length, and nullability drift
   is outside its scope and is not detected. Existing tables are never altered,
   and `allow_destructive_schema_changes` has no effect because this flow never
   produces destructive DDL. Apply column changes to already-bootstrapped
@@ -699,7 +700,8 @@ on the storage dialect:
   Non-unique indexes work the same way, and the consequence is quieter: an
   index added to an embedded schema file reaches newly created databases only,
   so an already-bootstrapped database keeps answering the queries that index
-  was added for — correctly, but without it. Create those by hand. A database
+  was added for — correctly, but without it, and startup warns about the gap
+  on every deploy until it is closed. Create those by hand. A database
   bootstrapped before `idx_plans_created_at` was added to `plans` needs:
 
   ```sql
@@ -707,7 +709,15 @@ on the storage dialect:
   ```
 
   Without it, listing recent plans is a sequential scan plus a top-N sort,
-  which gets slower as plan history grows.
+  which gets slower as plan history grows. Likewise, one bootstrapped before
+  the driver claim ordering on `apply_operations` was indexed needs:
+
+  ```sql
+  CREATE INDEX idx_apply_operations_created_id ON apply_operations (created_at, id);
+  ```
+
+  Without it, every driver claim sorts the full claimable set before taking
+  one row, which slows claiming as apply history grows.
 
 The rest of this section describes the MySQL flow.
 

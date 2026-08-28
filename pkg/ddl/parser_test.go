@@ -42,7 +42,7 @@ func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
 	return nil, nil
 }
 
-func (f fakeStatementParser) CreateUniqueIndex(string) (string, string, bool, error) {
+func (f fakeStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, nil
 }
 

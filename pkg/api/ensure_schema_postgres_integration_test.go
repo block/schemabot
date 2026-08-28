@@ -3,6 +3,7 @@
 package api
 
 import (
+	"bytes"
 	"database/sql"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
@@ -93,7 +95,9 @@ func TestEnsureSchemaPostgres_AllowsExtraColumn(t *testing.T) {
 }
 
 // Startup tolerates a missing non-unique index because it affects query
-// performance rather than the storage model's write semantics.
+// performance rather than the storage model's write semantics — but it warns
+// with the table and index named, so an operator learns the index must be
+// created by hand instead of discovering unindexed queries later.
 func TestEnsureSchemaPostgres_AllowsMissingIndex(t *testing.T) {
 	ctx := t.Context()
 	dsn, db := startPostgresStorage(t)
@@ -103,7 +107,12 @@ func TestEnsureSchemaPostgres_AllowsMissingIndex(t *testing.T) {
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_apply_logs_level")
 	require.NoError(t, err)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	var logs bytes.Buffer
+	warnLogger := slog.New(slog.NewTextHandler(&logs, nil))
+	require.NoError(t, EnsureSchema(dsn, warnLogger, WithDialect(schema.DialectPostgres)))
+	assert.Contains(t, logs.String(), "missing non-unique indexes")
+	assert.Contains(t, logs.String(), "idx_apply_logs_level")
+	assert.Contains(t, logs.String(), "apply_logs")
 }
 
 // Startup refuses a missing unique index and identifies the exact table and
