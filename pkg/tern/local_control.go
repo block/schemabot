@@ -1449,13 +1449,103 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 		if err != nil {
 			return fmt.Errorf("build cancel request for task %s: %w", task.TaskIdentifier, err)
 		}
-		if _, err := eng.Cancel(ctx, req); err != nil {
-			return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, err)
+		if _, cancelErr := eng.Cancel(ctx, req); cancelErr != nil {
+			return c.resolveFailedEngineCancel(ctx, eng, task, creds, req.ResumeState, cancelErr)
 		}
 		return nil
 	}
 	c.logger.Debug("no targeted task has live engine work to cancel", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
 	return nil
+}
+
+// resolveFailedEngineCancel decides whether a failed engine cancel may still
+// complete durably. A cancel that cannot reach any running work has nothing
+// left to stop — completing it is the fail-closed choice for cancel semantics,
+// because the destructive direction is continuing the work, not stopping it.
+// Surfacing such an error instead would abort the drive, leave the durable
+// cancel request pending, and re-run the same failing cancel on every claim.
+//
+// The engine's own report decides: a progress probe scoped to the task shows
+// whether live work remains. Nothing running resolves to nil so the caller
+// proceeds to terminalize the tasks; live work — or any uncertainty about it
+// (a failed probe) — surfaces the original cancel error unchanged. Typed
+// rejections with their own resolution paths also surface unchanged: an
+// already-completed rejection has the caller reconcile stored state to the
+// completed outcome, and an unsupported-operation decline resolves the durable
+// request without recording a cancel.
+func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, cancelErr error) error {
+	if engine.IsAlreadyCompleted(cancelErr) {
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	// An unsupported-operation decline means the engine refuses cancel for its
+	// database type while the schema change keeps executing; it surfaces so the
+	// pending-request decline path resolves the request terminally without
+	// touching the running change.
+	if engine.IsUnsupportedOperation(cancelErr) {
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	progress, probeErr := eng.Progress(ctx, &engine.ProgressRequest{
+		Database:    c.config.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	})
+	if probeErr != nil {
+		c.logger.Warn("engine cancel failed and the live-work probe also failed; the cancel error surfaces and the drive will retry rather than complete a cancel over unknown engine state",
+			append(task.LogAttrs(), "probe_error", probeErr, "error", cancelErr)...)
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	if engineProgressShowsLiveWork(eng, progress) {
+		engineState := ""
+		if progress != nil {
+			engineState = string(progress.State)
+		}
+		c.logger.Warn("engine cancel failed while the engine still has live work; the cancel error surfaces so the work is never recorded cancelled while it keeps running",
+			append(task.LogAttrs(), "engine_state", engineState, "error", cancelErr)...)
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	c.logger.Warn("engine cancel failed but the engine has no live work for the task; the durable cancel proceeds and terminalizes the task",
+		append(task.LogAttrs(), "engine_state", string(progress.State), "error", cancelErr)...)
+	return nil
+}
+
+// engineProgressShowsLiveWork reports whether a progress probe shows engine
+// work that a cancel must still terminate before storage may record the
+// schema change as cancelled. It reads the engine's own report, unlike
+// hasLiveEngineWork, which reads the stored task state's expectation.
+// Uncertainty counts as live work — only an affirmative nothing-left-to-cancel
+// answer clears the probe, and what qualifies depends on who owns the engine's
+// truth:
+//
+//   - An engine whose progress is externally authoritative relays the
+//     provider's record of the change, so only a provider answer that closed
+//     the change clears the probe: cancelled, or failed with no retry path.
+//     Pending from such an engine is an open change the provider can still
+//     run, and a retryable failure remains runnable — both keep the cancel
+//     error surfacing so the change is never recorded cancelled while the
+//     provider can still land it.
+//   - Any other engine executes in this process, so pending — the idle
+//     sentinel — is the only answer proving nothing is left. A state the
+//     engine still tracks, terminal or not, means engine-owned work (such as
+//     target cleanup) remains that only a retried cancel finishes.
+//
+// Completed deliberately counts as live for every engine: a change that
+// landed must reconcile to its completed outcome, never settle as cancelled.
+// The revert states keep the engine actively unwinding the change.
+func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressResult) bool {
+	if progress == nil {
+		return true
+	}
+	if engine.ProgressIsExternallyAuthoritative(eng) {
+		switch progress.State {
+		case engine.StateCancelled:
+			return false
+		case engine.StateFailed:
+			return progress.Retryable
+		default:
+			return true
+		}
+	}
+	return progress.State != engine.StatePending
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.
@@ -1792,18 +1882,21 @@ func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.
 }
 
 // buildControlRequest creates a ControlRequest with persisted engine resume data.
-// Engines own validation of opaque ResumeState.Metadata before control calls.
+// Stored resume state is loaded for every database type: an engine that
+// addresses remote work (a deploy request) needs it to reach that work, and an
+// engine that keys control on in-process or database-side state ignores it.
+// Whether an operation may proceed without one is the engine's call, made
+// through the ControlResumeValidator gate below — engines own validation of
+// opaque ResumeState.Metadata before control calls.
 func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Task, creds *engine.Credentials, eng engine.Engine, operation engine.ControlOperation) (*engine.ControlRequest, error) {
+	resumeState, err := c.loadStoredEngineResumeState(ctx, task, string(operation))
+	if err != nil {
+		return nil, fmt.Errorf("load engine resume state for %s of task %s: %w", operation, task.TaskIdentifier, err)
+	}
 	req := &engine.ControlRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
-	}
-	if c.config.Type == storage.DatabaseTypeVitess {
-		resumeState, err := c.loadEngineResumeState(ctx, task)
-		if err != nil {
-			return nil, fmt.Errorf("load Vitess engine resume state for task %s: %w", task.TaskIdentifier, err)
-		}
-		req.ResumeState = resumeState
+		ResumeState: resumeState,
 	}
 	if validator, ok := eng.(engine.ControlResumeValidator); ok {
 		if err := validator.ValidateControlResumeState(operation, req.ResumeState); err != nil {
@@ -1811,6 +1904,32 @@ func (c *LocalClient) buildControlRequest(ctx context.Context, task *storage.Tas
 		}
 	}
 	return req, nil
+}
+
+// loadStoredEngineResumeState returns the persisted engine resume state for
+// the task's apply operation, or nil when none was ever persisted. Only a
+// storage read failure is an error: a task without an apply operation and an
+// operation without a stored row are both legitimate nothing-persisted shapes,
+// because an engine that reattaches through in-process or database-side state
+// never persists one. The purpose names the request being built, so a log line
+// says which engine call went out without resume state.
+func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *storage.Task, purpose string) (*engine.ResumeState, error) {
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		c.logger.Debug("task has no apply operation to hold persisted engine resume state; the engine request goes out without one",
+			append(task.LogAttrs(), "purpose", purpose, "reason", err.Error())...)
+		return nil, nil
+	}
+	stored, err := c.loadEngineResumeStateForOperation(ctx, operationID)
+	if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+		c.logger.Debug("no persisted engine resume state for the task's apply operation; the engine request goes out without one",
+			append(task.LogAttrs(), "purpose", purpose, "apply_operation_id", operationID)...)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load persisted engine resume state for apply operation %d: %w", operationID, err)
+	}
+	return stored, nil
 }
 
 // Volume adjusts the speed/concurrency of an in-flight schema change by

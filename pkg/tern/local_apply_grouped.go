@@ -292,14 +292,6 @@ func (c *LocalClient) saveEngineResumeStateForOperation(ctx context.Context, ope
 	})
 }
 
-func (c *LocalClient) loadEngineResumeState(ctx context.Context, task *storage.Task) (*engine.ResumeState, error) {
-	operationID, err := applyOperationIDForTask(task)
-	if err != nil {
-		return nil, err
-	}
-	return c.loadEngineResumeStateForOperation(ctx, operationID)
-}
-
 func (c *LocalClient) loadEngineResumeStateForOperation(ctx context.Context, operationID int64) (*engine.ResumeState, error) {
 	store := c.storage.ApplyOperations()
 	if store == nil {
