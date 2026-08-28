@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -4959,4 +4960,48 @@ func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, settled, 1, "the reaper lock is released after each pass")
 	assert.Equal(t, next.ID, settled[0].Operation.ID)
+}
+
+// Both driver claim queries order candidates by (created_at, id) while their
+// eligibility filter ORs across several states, so no state-prefixed index can
+// serve the ordering. Without a dedicated index on the ordering pair the
+// planner sorts the full candidate set, and under FOR UPDATE that locks every
+// claimable row before LIMIT 1 applies — turning SKIP LOCKED into a serializer
+// that makes drivers contend instead of claiming distinct rows in parallel.
+func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
+	ctx := t.Context()
+
+	rows, err := testDB.QueryContext(ctx, "SHOW INDEX FROM apply_operations")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	columns, err := rows.Columns()
+	require.NoError(t, err)
+
+	// SHOW INDEX has grown columns across MySQL versions, so scan positionally
+	// into a variable-width row and read the three fields by name.
+	indexColumns := map[string][]string{}
+	for rows.Next() {
+		cells := make([]any, len(columns))
+		for i := range cells {
+			cells[i] = new(sql.RawBytes)
+		}
+		require.NoError(t, rows.Scan(cells...))
+
+		field := func(name string) string {
+			for i, c := range columns {
+				if c == name {
+					return string(*cells[i].(*sql.RawBytes))
+				}
+			}
+			return ""
+		}
+		if field("Key_name") == "idx_created_id" {
+			indexColumns["idx_created_id"] = append(indexColumns["idx_created_id"], field("Column_name"))
+		}
+	}
+	require.NoError(t, rows.Err())
+
+	assert.Equal(t, []string{"created_at", "id"}, indexColumns["idx_created_id"],
+		"the claim ordering needs an index on exactly its ordering pair, in that order")
 }

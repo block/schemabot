@@ -763,6 +763,14 @@ func releasedFailureExemptionArgs() []any {
 // claiming is enabled. Multiple drivers each claim a different claimable row
 // (FOR UPDATE SKIP LOCKED), so same-deployment shard work siblings of one
 // apply drive concurrently across the driver pool.
+//
+// The ORDER BY must be able to walk idx_created_id rather than sort. The
+// eligibility filter ORs across several states, so no state-prefixed index
+// serves the ordering; without one on (created_at, id) the planner collects
+// every claimable row and sorts it, and under FOR UPDATE that locks the whole
+// set before LIMIT 1 applies. SKIP LOCKED then has the opposite of its intended
+// effect — each driver skips everything a peer locked instead of taking the
+// next free row — so concurrent claims serialize, and worsen as history grows.
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
@@ -1288,6 +1296,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // row is now cutting_over), while a returned cutting_over/revert_window row means
 // an in-flight cutover was recovered. owner is required and recorded as the lease
 // owner. Returns nil when nothing is ready to cut over.
+//
+// This path shares FindNextApplyOperation's claim ordering and its dependence on
+// idx_created_id: the same OR'd state filter defeats every state-prefixed index,
+// so without that index the claim sorts and locks the full candidate set before
+// LIMIT 1, turning SKIP LOCKED into a serializer. Both claim queries draw from
+// the same driver pool, so a change to one claim's ordering or eligibility
+// belongs in the other.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)
