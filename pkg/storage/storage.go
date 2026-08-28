@@ -34,9 +34,20 @@ const ApplyLeaseStaleAfter = time.Minute
 //
 // The count lives in storage, so the cap is plane-wide across pods with no
 // extra coordination, and both planes enforce it because both run these claim
-// queries against their own storage. It is deliberately soft: two drivers can
-// read the same count and both claim, landing one over. That costs a driver,
-// not correctness, and avoids serializing every claim behind a lock.
+// queries against their own storage.
+//
+// It is deliberately soft, and softer than a ceiling of one over. Claims run at
+// READ COMMITTED and count sibling rows rather than the row they lock, so
+// concurrent claimers never exclude each other: every driver whose claim reads
+// the count before the others commit sees the same pre-claim value and claims on
+// it. The transient overshoot is therefore bounded by how many drivers claim in
+// that window, not by one. It is self-correcting rather than durable — once
+// those leases commit, the next claim counts them and the cap binds — so the
+// steady-state occupancy is the cap and the excess drains as operations finish.
+// Size the cap for the steady state; do not read it as a hard admission limit
+// that some other guard will hold to cap+1. Paying for a hard bound would mean
+// serializing every claim behind a per-apply lock, which is the contention the
+// cap exists to avoid.
 //
 // It is configurable because the value only means something relative to a
 // plane's pods x drivers: too high and it bounds nothing, too low and a wide
