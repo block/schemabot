@@ -28,3 +28,4 @@ CREATE INDEX idx_webhook_events_claimable ON webhook_events (state, retry_after,
 CREATE INDEX idx_webhook_events_provider_repo_pr ON webhook_events (provider, repository, pull_request);
 CREATE INDEX idx_webhook_events_head_sha ON webhook_events (head_sha);
 CREATE INDEX idx_webhook_events_received_at ON webhook_events (received_at);
+CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);

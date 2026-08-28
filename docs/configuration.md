@@ -717,7 +717,16 @@ on the storage dialect:
   ```
 
   Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows.
+  one row, which slows claiming as apply history grows. And one bootstrapped
+  before the webhook inbox claim ordering on `webhook_events` was indexed
+  needs:
+
+  ```sql
+  CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);
+  ```
+
+  Without it, every webhook claim sorts the full claimable inbox before
+  taking one row, which slows claiming as delivery history grows.
 
 The rest of this section describes the MySQL flow.
 

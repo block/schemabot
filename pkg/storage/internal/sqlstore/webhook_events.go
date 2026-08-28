@@ -368,12 +368,24 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	}
 	defer rollbackTx(ctx, tx, "claim webhook event")
 
-	// Claim in two steps so the ordering filesort only ever handles narrow sort
-	// records. No index satisfies this ordering across the claimable
-	// predicate's OR-branches, so the sort packs every selected column into
-	// each sort record — selecting the payload JSON here would let a single
-	// oversized delivery exceed sort_buffer_size and fail every claim attempt
-	// (MySQL error 1038), wedging the whole inbox behind one wide row.
+	// The ORDER BY must be able to walk an index on (created_at, id) rather
+	// than sort. The claimable predicate ORs across several states, so no
+	// state-prefixed index serves the ordering; without one on the ordering
+	// pair the planner collects every claimable row and sorts it. On InnoDB
+	// that sort runs under FOR UPDATE and locks the whole candidate set before
+	// LIMIT 1 applies, turning SKIP LOCKED into a serializer — each driver
+	// skips everything a peer locked instead of taking the next free row.
+	// PostgreSQL locks rows only after the sort, so a single row is ever
+	// locked; there the index spares the sort itself. Each dialect's schema
+	// file names that index by its own convention.
+	//
+	// Claiming stays two-step — id here, then a primary-key load — so a plan
+	// that does sort (the planner may prefer another index, and an
+	// already-bootstrapped PostgreSQL database gains this index only by hand)
+	// handles narrow sort records. Packing the payload JSON into each sort
+	// record would let a single oversized delivery exceed sort_buffer_size
+	// and fail every claim attempt (MySQL error 1038), wedging the whole
+	// inbox behind one wide row.
 	var id int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT id
