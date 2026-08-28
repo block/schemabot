@@ -6,6 +6,7 @@
 
 - [Local Mode](#local-mode)
   - [Building DSNs from separate secrets](#building-dsns-from-separate-secrets)
+  - [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)
 - [gRPC Mode](#grpc-mode)
 - [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
   - [Deployment Order](#deployment-order)
@@ -17,8 +18,11 @@
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
+  - [Resyncing PostgreSQL identity sequences](#resyncing-postgresql-identity-sequences)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
+- [Postgres](#postgres)
+- [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
@@ -126,6 +130,51 @@ With the `config_paths` example above, SchemaBot reads:
 
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
+
+### PostgreSQL `dsn_from` targets
+
+`dsn_from` on a `target_resolver` target supports `type: postgres` in addition
+to `mysql`. The assembled DSN is a libpq URL that always names one database and
+always carries `sslmode=verify-full`.
+
+```yaml
+target_resolver:
+  targets:
+    orders-pg:
+      type: postgres
+      dsn_from:
+        config_ref: "secretsmanager:orders-pg-config"
+        username: "schemabot"
+        password_ref: "secretsmanager:orders-pg-password"
+        ca_ref: "embedded:rds-global"   # optional; see below
+```
+
+The referenced config document is JSON with top-level `host`, `port`, and
+`dbname` fields by default; set `config_paths` to read other keys:
+
+```json
+{"host": "orders.cluster-abc.us-east-1.rds.amazonaws.com", "port": 5432, "dbname": "orders"}
+```
+
+The PostgreSQL shape differs from MySQL in three ways:
+
+- **`config_paths.dbname` (PostgreSQL only).** A PostgreSQL connection is made
+  to one database, so the config document must carry the database name and the
+  assembled DSN includes it; the request namespace selects a schema within that
+  database. MySQL is the opposite — the DSN stays namespace-free and each
+  request supplies the schema — so `dbname` is rejected for MySQL targets.
+- **`params` allowlist.** Only `sslmode: "verify-full"` is accepted — the value
+  every assembled DSN carries regardless — so the field is validate-only.
+  Weaker modes (`require`, `prefer`, `verify-ca`, `disable`) prove at most
+  encryption, not server identity, and are rejected at config load. TLS trust
+  material is configured via `ca_ref`, never via raw libpq parameters.
+- **`ca_ref` (PostgreSQL only).** Selects the CA bundle the server certificate
+  is verified against: `embedded:rds-global` (the embedded AWS RDS global
+  bundle) or `file:<absolute-path>` (a read-only mounted PEM bundle, for
+  private proxies and test endpoints whose chain is not in the RDS bundle).
+  When omitted, an RDS endpoint defaults to the embedded bundle and a non-RDS
+  endpoint fails resolution: a verified CA is required, and the ambient trust
+  store is never an implicit fallback.
 
 ## gRPC Mode
 
@@ -448,11 +497,36 @@ keyword/value string (`postgres://user:pass@host:5432/schemabot`) for
 `postgres`. Both dialects support the same secret reference formats (`env:`,
 `file:`, `secretsmanager:`). When `storage.dsn` is unset, the DSN is read
 from the `STORAGE_DSN` environment variable, falling back to `MYSQL_DSN` — a
-legacy name that is honored regardless of dialect. `dsn_from` assembles a
-MySQL-format DSN and is only supported with the `mysql` dialect; combining it
-with `postgres` fails config validation. See
+legacy name that is honored regardless of dialect. `storage.dsn_from` assembles
+a MySQL-format DSN and is only supported with the `mysql` storage dialect;
+combining it with `postgres` fails config validation. (This restriction is
+specific to the storage database — `dsn_from` on a `target_resolver` target
+supports both `mysql` and `postgres`.) See
 [Storage Schema Changes](#storage-schema-changes) for how schema
 bootstrapping differs between the two dialects.
+
+### Resyncing PostgreSQL identity sequences
+
+After an explicit-ID bulk load into PostgreSQL storage, advance the identity
+sequences before SchemaBot resumes default inserts. Run the command only after
+the load has fully committed. It advances sequences when needed, never rewinds
+them, and is idempotent and safe to rerun.
+
+Pass the storage DSN directly:
+
+```shell
+schemabot storage resync-identity-sequences --dsn "$STORAGE_DSN"
+```
+
+Or resolve it from the server configuration:
+
+```shell
+schemabot storage resync-identity-sequences --config /etc/schemabot/config.yaml
+```
+
+The command refuses to run when none of SchemaBot's storage tables exist in
+the target database. Confirm the target and complete the resync before
+restarting the server or otherwise allowing default inserts.
 
 ## Storage Connection Pool
 
@@ -532,6 +606,76 @@ These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
 
+## Postgres
+
+The `postgres:` block sets the largest table on which the PostgreSQL engine
+will execute native-safe DDL. The limit is expressed in bytes and defaults to
+1 GiB:
+
+```yaml
+postgres:
+  native_safe_table_size_limit_bytes: 4294967296
+```
+
+The ceiling is SchemaBot's own conservatism about how much work to attempt
+under an exclusive lock, not a PostgreSQL limit. A native-safe `ALTER` that
+rewrites a table rebuilds its heap, its indexes, and its TOAST data while
+holding `ACCESS EXCLUSIVE`, and the size compared against the ceiling is the
+total relation size summed across the table's partition tree — indexes and
+TOAST included — so an index-heavy table cannot slip under it. Raising the
+ceiling converts an up-front refusal into a bounded attempt, not an unbounded
+lock: every apply still runs under short `lock_timeout` and
+`statement_timeout` budgets, so above the ceiling it is the statement
+timeout, not the ceiling, that stops a runaway rewrite.
+
+The server fails startup validation when
+`native_safe_table_size_limit_bytes` is zero or negative.
+
+The ceiling is process-wide: every PostgreSQL database this server drives
+shares the same value, and a database cannot override it in its own metadata.
+These settings only apply where this server constructs the PostgreSQL engine
+itself — local-mode PostgreSQL databases. Databases routed to a remote
+deployment over gRPC run with that deployment's engine settings.
+
+## PlanetScale mTLS
+
+Some PlanetScale-compatible endpoints require mutual TLS: every MySQL
+connection must present a client certificate in addition to verifying the
+server. The `planetscale:` block registers that identity process-wide at
+startup, and the Vitess engine then applies it to every MySQL connection it
+opens — branch hosts and vtgates alike:
+
+```yaml
+planetscale:
+  mtls:
+    ca_bundle: /etc/ssl/certs/ca-certificates.crt  # verifies the endpoint's server cert
+    client_cert: /etc/secrets/pca/tls.crt          # client identity presented to the endpoint
+    client_key: /etc/secrets/pca/tls.key
+```
+
+All three paths are required together, and the server fails startup when any
+file is missing or unparseable — a worker never comes up without the identity
+its endpoints require, where it would otherwise fail (or silently degrade) on
+every Vitess connection.
+
+This is the knob for the Vitess engine's own connections, and it works the
+same for statically registered databases and dynamically resolved targets (a
+data plane using `target_resolver`, which has no per-database config to
+attach TLS to). The registration is process-wide with no per-database
+opt-out: once set, every Vitess database this server serves connects with
+mTLS. Serve endpoints that require mTLS and plaintext endpoints (such as a
+LocalScale instance) from separate server processes.
+
+Certificate rotation on the configured paths takes effect without a restart:
+the client certificate and key are re-read from disk on every new
+connection's handshake, so replacing the mounted files (as a certificate
+manager does when renewing) rotates the presented identity on its own. The
+CA bundle is read once at startup — replacing it requires a restart.
+
+Certificate delivery is deployment infrastructure, not server config: in the
+Helm chart, mount the certificate secret with `extraVolumes` /
+`extraVolumeMounts` and point these paths at the mount.
+
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,
@@ -568,10 +712,12 @@ on the storage dialect:
 The rest of this section describes the MySQL flow.
 
 By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped whole (a
-mixed `ALTER TABLE` is not rewritten, so its additive clauses are skipped with
-it), while the remaining non-destructive statements still apply and startup
-proceeds. This protects
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
+`ALTER TABLE` is split: its additive clauses still execute and only the
+destructive clauses are refused, except that a clause which cannot run
+without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
+is refused with it. The remaining non-destructive statements still apply and
+startup proceeds. This protects
 against rolling deploys and rollbacks: a pod running an older binary sees a
 newer binary's tables and columns as surplus, and without the gate would drop
 them (destroying data the newer pods depend on). Each refused statement is

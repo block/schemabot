@@ -103,7 +103,6 @@ import (
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/go-sql-driver/mysql"
-	"github.com/google/uuid"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -136,12 +135,16 @@ type LocalConfig struct {
 	// TargetDSN is the connection string to the target database for schema changes.
 	TargetDSN string
 
+	// PostgresNativeSafeTableSizeLimitBytes is the maximum table size in bytes
+	// for PostgreSQL native-safe execution. Zero uses the engine default.
+	PostgresNativeSafeTableSizeLimitBytes int64
+
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
 	// Keys used by PlanetScale: organization, database (the PlanetScale
 	// database name when it differs from the registered identifier),
-	// token_name, token_value, tls_name, revert_window_duration, main_branch.
+	// token_name, token_value, revert_window_duration, main_branch.
 	// Keys used by Spirit: pending_drops ("false" disables the pending drops
 	// quarantine so DROP TABLE executes directly); direct_execution ("true"
 	// lets engine-refused ALTER statements run verbatim as native MySQL DDL)
@@ -199,6 +202,23 @@ type LocalClient struct {
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
 	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
 	heartbeatInterval time.Duration
+
+	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
+	// as the sequential drive's progress poll cadence. Tests may lower it to
+	// drive many polls quickly.
+	taskPollIntervalOverride time.Duration
+
+	// taskStallWarnIntervalOverride, when positive, replaces
+	// defaultTaskStallWarnInterval as the interval after which a polled task
+	// with no state or progress movement is warned about. Tests may lower it
+	// to observe the warning.
+	taskStallWarnIntervalOverride time.Duration
+
+	// lostEngineWorkPendingBudgetOverride, when positive, replaces
+	// defaultLostEngineWorkPendingBudget as how long the sequential drive keeps
+	// trusting an engine reporting no active schema change for an in-flight
+	// task. Tests may lower it to reach the verification path quickly.
+	lostEngineWorkPendingBudgetOverride time.Duration
 
 	// cancelApply cancels the background goroutine running executeApplySequential
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
@@ -309,7 +329,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine:    postgres.New(),
+		postgresEngine:    postgres.NewWithTableSizeLimit(cfg.PostgresNativeSafeTableSizeLimitBytes),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -438,7 +458,7 @@ func (c *LocalClient) credentials() *engine.Credentials {
 }
 
 func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	hasDatabase, err := mysqlDSNHasDatabase(c.config.TargetDSN)
@@ -495,7 +515,7 @@ func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
 }
 
 func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	if task == nil {
@@ -504,13 +524,32 @@ func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credential
 	return c.credentialsForMySQLNamespace(task.Namespace)
 }
 
+// usesPerNamespaceCredentials reports whether the database type's engine needs
+// credentials resolved per namespace instead of sharing the target-level
+// credentials. MySQL resolves a namespace-specific DSN so each task connects
+// to its own schema (per-target overrides can remap a namespace to a different
+// physical schema).
+func usesPerNamespaceCredentials(databaseType string) bool {
+	switch databaseType {
+	case storage.DatabaseTypeMySQL:
+		return true
+	case storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
+		return false
+	default:
+		// LocalConfig.Type is open-world: embedder-registered engine types
+		// (EngineFactories) and the zero-value type used by tests land here
+		// and get the conservative disposition — shared target credentials.
+		return false
+	}
+}
+
 // credentialsForGroupedApply resolves the single-namespace credentials for a
 // grouped/atomic MySQL apply. A grouped apply runs one Spirit execution against
 // one schema, so the plan must carry exactly one namespace. Fail closed rather
 // than pick a namespace by map iteration order (or silently use a namespace-free
 // DSN) if that invariant is ever violated.
 func (c *LocalClient) credentialsForGroupedApply(plan *storage.Plan) (*engine.Credentials, error) {
-	if c.config.Type != storage.DatabaseTypeMySQL {
+	if !usesPerNamespaceCredentials(c.config.Type) {
 		return c.credentials(), nil
 	}
 	if len(plan.Namespaces) != 1 {
@@ -1434,6 +1473,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		Changes:        changes,
 		LintViolations: violations,
 		Shards:         protoShards,
+		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
 	}, nil
 }
 
@@ -1611,13 +1651,24 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 }
 
 func (c *LocalClient) planNamespaceWithEngine(ctx context.Context, eng engine.Engine, req *ternv1.PlanRequest, database string, schemaFiles schema.SchemaFiles, creds *engine.Credentials) (*engine.PlanResult, error) {
+	// The grouping the apply will run under decides which stored progress it
+	// can continue, so a prediction made here has to use the caller's, not
+	// this engine's default. A caller that leaves the field absent predates
+	// the choice and cannot state one; predicting the joined batch for it errs
+	// toward disclosing a discard rather than promising a resume the apply
+	// will not perform.
+	groupedExecution := true
+	if req.GroupedExecution != nil {
+		groupedExecution = req.GetGroupedExecution()
+	}
 	return eng.Plan(ctx, &engine.PlanRequest{
-		Database:     database,
-		DatabaseType: c.config.Type,
-		SchemaFiles:  schemaFiles,
-		Repository:   req.Repository,
-		PullRequest:  int(req.PullRequest),
-		Credentials:  creds,
+		Database:         database,
+		DatabaseType:     c.config.Type,
+		SchemaFiles:      schemaFiles,
+		Repository:       req.Repository,
+		PullRequest:      int(req.PullRequest),
+		Credentials:      creds,
+		GroupedExecution: groupedExecution,
 	})
 }
 
@@ -1628,7 +1679,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 	}
 	sort.Strings(namespaces)
 
-	result := &engine.PlanResult{PlanID: fmt.Sprintf("plan-%d", time.Now().UnixNano()), NoChanges: true}
+	result := &engine.PlanResult{PlanID: engine.NewPlanID(), NoChanges: true}
 	for _, namespace := range namespaces {
 		creds, err := c.credentialsForMySQLNamespace(namespace)
 		if err != nil {
@@ -1640,6 +1691,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		}
 		result.Changes = append(result.Changes, nsResult.Changes...)
 		result.LintViolations = append(result.LintViolations, nsResult.LintViolations...)
+		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false
 		}
@@ -2137,11 +2189,6 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 	return existing, nil
 }
 
-// newTaskIdentifier returns a fresh opaque task identifier (`task-<16 hex>`).
-func newTaskIdentifier() string {
-	return "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
-}
-
 // dispatchScope is the execution shape derived from a dispatch request: the
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
 // dispatch, and whether the dispatch is a task-less VSchema finalizer.
@@ -2241,7 +2288,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 	tasks := make([]*storage.Task, len(scope.ddlChanges))
 	for i, ddlChange := range scope.ddlChanges {
 		tasks[i] = &storage.Task{
-			TaskIdentifier: newTaskIdentifier(),
+			TaskIdentifier: engine.NewTaskID(),
 			PlanID:         plan.ID,
 			Database:       plan.Database,
 			DatabaseType:   plan.DatabaseType,
@@ -2394,7 +2441,11 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return refusal, nil
 	}
 
-	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
+	// An attach already belongs to a keyed apply, so a conflict here is another
+	// apply holding the database and there is nothing for this dispatch to
+	// resolve into. Adoption is a create-path outcome only.
+	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -2434,7 +2485,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
-	err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	err = c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
 		// A concurrent same-operation attach won the insert; the winner's row
@@ -2457,6 +2508,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
+
+	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
@@ -2537,20 +2590,33 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
+	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, 0)
+	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
 		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
-			return nil, errors.Join(err, lookupErr)
+			return nil, errors.Join(conflictErr, lookupErr)
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
 				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
 			return c.dispatchIntoExistingApply(ctx, req, existing, plan, scope, "conflict_race")
 		}
+		// A dispatch whose key resolves to nothing may still be a re-apply of the
+		// change the blocking apply is running — the recovery for work that
+		// outlived the apply identity that started it. Resolve into that apply
+		// rather than being refused by it; anything short of an exact match keeps
+		// the refusal. Adoption only answers a conflict the check actually found:
+		// an error without a named blocking task is a storage read failure, and
+		// there is no apply to resolve into.
+		if blocking.blocks() {
+			if adopted, ok := c.adoptLiveApplyForDispatch(ctx, req, plan, scope, blocking); ok {
+				return adopted, nil
+			}
+		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
-			ErrorMessage: err.Error(),
+			ErrorMessage: conflictErr.Error(),
 		}, nil
 	}
 
@@ -2601,7 +2667,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	// same keyed generation attach one at a time, and the manifest is what the
 	// state projection holds the apply's success verdict on until every
 	// declared operation has attached and finished.
-	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	applyIdentifier := engine.NewApplyID()
 	apply := &storage.Apply{
 		ApplyIdentifier:       applyIdentifier,
 		PlanID:                plan.ID,
@@ -2694,6 +2760,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	apply.ID = applyID
 
+	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
+
 	// Record the queue event in the apply's durable log; the drive itself starts
 	// when an operator claims the apply, which the timeline records separately.
 	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
@@ -2747,6 +2815,13 @@ func (c *LocalClient) getEngine() engine.Engine {
 		// A registered engine for a non-built-in type (nil if none registered).
 		return c.customEngine
 	}
+}
+
+// Engine returns the engine that drives this client's database type, exposed
+// so callers that assemble a LocalClient can verify the engine settings they
+// configured actually reached it.
+func (c *LocalClient) Engine() engine.Engine {
+	return c.getEngine()
 }
 
 // Progress returns detailed progress for an active schema change.

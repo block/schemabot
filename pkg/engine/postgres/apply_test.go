@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -26,11 +27,39 @@ func TestClassifyRefusal(t *testing.T) {
 		name       string
 		err        error
 		wantReason string
+		wantDetail []string
 	}{
 		{
-			name:       "privilege error is a refusal with provisioning detail",
-			err:        fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{Grant: "GRANT ALTER ON users TO app"}),
+			name: "privilege error is a refusal with provisioning detail",
+			err: fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{
+				Tier:  preflight.TierAlterInPlace,
+				Check: "pg_has_role(limited, app_owner, 'USAGE')",
+				Grant: `GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
+				Hint:  "membership must be inheritable",
+			}),
 			wantReason: "insufficient-privileges",
+			wantDetail: []string{
+				"in-place ALTER TABLE",
+				`table "users"`,
+				`GRANT "app_owner" TO "limited" WITH INHERIT TRUE`,
+				"pg_has_role(limited, app_owner, 'USAGE')",
+				"membership must be inheritable",
+			},
+		},
+		{
+			name: "database-sourced identifiers are sanitized for Markdown",
+			err: fmt.Errorf("check privileges: %w", &preflight.PrivilegeError{
+				Tier:  preflight.TierAlterInPlace,
+				Check: "pg_has_role(evil\nrole, app|owner, 'USAGE')",
+				Grant: "GRANT \"app|owner\" TO \"evil\nrole\"",
+				Hint:  "membership\tmust be inheritable",
+			}),
+			wantReason: "insufficient-privileges",
+			wantDetail: []string{
+				`GRANT "app/owner" TO "evil role"`,
+				"pg_has_role(evil role, app/owner, 'USAGE')",
+				"membership must be inheritable",
+			},
 		},
 		{
 			name:       "statement budget exhaustion is a refusal",
@@ -71,6 +100,9 @@ func TestClassifyRefusal(t *testing.T) {
 			require.NotNil(t, r)
 			assert.Equal(t, tt.wantReason, r.reason)
 			assert.NotEmpty(t, r.detail)
+			for _, want := range tt.wantDetail {
+				assert.Contains(t, r.detail, want)
+			}
 		})
 	}
 }
@@ -163,4 +195,20 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
+}
+
+// The apply pool inherits the CA bundle the acceptance path resolved; a
+// bundle that disappears between acceptance and execution fails the pool
+// build closed, before any statement is attempted.
+func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
+	conn := targetConn{
+		dsn:        "postgres://schemabot:secret@localhost:5432/app?sslmode=verify-full",
+		caCertPath: filepath.Join(t.TempDir(), "missing.pem"),
+	}
+
+	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "open pg-sprite apply pool")
+	assert.Contains(t, err.Error(), "read CA bundle")
 }

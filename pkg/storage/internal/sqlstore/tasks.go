@@ -7,8 +7,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -42,7 +45,9 @@ var terminalTaskStatesSQL = func() string {
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
 	db       *rebindDB
+	dialect  Dialect
 	identity identityInserter
+	locker   namedlock.Locker
 }
 
 // Create stores a new task.
@@ -375,8 +380,12 @@ func (s *taskStore) GetByApplyID(ctx context.Context, applyID int64) ([]*storage
 				t.shard = ''
 				OR (
 					ao.operation_kind = ?
-					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table format.
-					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
+					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table
+					-- format. table_name is stored as NULL when empty, and MySQL's CONCAT
+					-- returns NULL when any operand is NULL (Postgres's concat() ignores
+					-- NULLs), so COALESCE keeps the key equal to the Go construction on
+					-- both dialects.
+					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', COALESCE(t.table_name, ''))
 				)
 			)
 		ORDER BY t.created_at, t.id
@@ -426,8 +435,12 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 				t.shard = ''
 				OR (
 					ao.operation_kind = ?
-					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table format.
-					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', t.table_name)
+					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table
+					-- format. table_name is stored as NULL when empty, and MySQL's CONCAT
+					-- returns NULL when any operand is NULL (Postgres's concat() ignores
+					-- NULLs), so COALESCE keeps the key equal to the Go construction on
+					-- both dialects.
+					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', COALESCE(t.table_name, ''))
 				)
 			)
 		ORDER BY t.created_at, t.id
@@ -601,6 +614,160 @@ func (s *taskStore) List(ctx context.Context, filter storage.TaskFilter) ([]*sto
 	defer utils.CloseAndLog(rows)
 
 	return scanTasks(rows)
+}
+
+// strandedRetryableQuiescence is how long a parent apply must have been settled
+// before the reaper hardens a failed_retryable task under it to failed. It is
+// deliberately longer than the retryable-recovery freshness window the claim
+// paths key on the same applies.updated_at column: a retry admitted at the very
+// edge of that window would refresh the parent's heartbeat the moment it is
+// claimed, so a parent still quiet this long past the window cannot have a
+// just-admitted retry in flight, and the reap can never race one at the
+// boundary. The buffer only needs to cover the gap between a claim selecting
+// the parent and its heartbeat write landing; all timestamps compared are
+// database-side, so there is no clock skew to absorb.
+const strandedRetryableQuiescence = retryableRecoveryFreshnessDays*24*time.Hour + 5*time.Minute
+
+// strandedTaskReaperLockName is the advisory lock that elects one retryable-task
+// reaper per pass. Instance-wide for the same reason as the stranded-operation
+// reaper's: the pass scans every target's rows, so there is nothing to scope it
+// to. It is a separate lock from the operation reaper's so the two maintenance
+// sweeps never serialize on each other.
+const strandedTaskReaperLockName = "schemabot_stranded_task_reaper"
+
+// strandedRetryableTaskSweep identifies the retryable-task sweep to the shared
+// election wrapper.
+var strandedRetryableTaskSweep = strandedSweep{
+	lockName: strandedTaskReaperLockName,
+	busy:     storage.ErrStrandedTaskReaperBusy,
+	subject:  "stranded retryable tasks",
+}
+
+// ReapStrandedRetryable elects one reaper per pass and reaps under the lock.
+// See storage.TaskStore for the contract.
+func (s *taskStore) ReapStrandedRetryable(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	return reapUnderElection(ctx, s.db, s.locker, strandedRetryableTaskSweep,
+		func(ctx context.Context) ([]*storage.ReapedTask, error) {
+			return s.reapStrandedRetryable(ctx, limit)
+		})
+}
+
+// reapStrandedRetryable hardens failed_retryable task rows under settled,
+// quiescent parents to failed, without electing a reaper. ReapStrandedRetryable
+// is the entry point that holds the lock; this is separate so the reaping
+// itself can be exercised on its own.
+//
+// Each row is settled by its own committed write, so a mid-pass failure returns
+// the settlements that already landed alongside the error: they are durable
+// whatever the caller does next, and dropping them would leave real state
+// changes with no log line and no count behind them.
+func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("reap stranded retryable tasks: limit must be positive, got %d", limit)
+	}
+
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedRetryableQuiescence)
+
+	selectArgs := []any{state.Task.FailedRetryable}
+	selectArgs = append(selectArgs, parentGateArgs...)
+	selectArgs = append(selectArgs, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM tasks
+		WHERE state = ?
+			AND %s
+		ORDER BY created_at, id
+		LIMIT ?
+	`, taskColumns, parentGate), selectArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query stranded retryable tasks: %w", err)
+	}
+	stranded, err := scanTasks(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan stranded retryable tasks: %w", err)
+	}
+	if len(stranded) == 0 {
+		return nil, nil
+	}
+
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, task := range stranded {
+		applyIDs = append(applyIDs, task.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded retryable tasks")
+	if err != nil {
+		return nil, err
+	}
+
+	reaped := make([]*storage.ReapedTask, 0, len(stranded))
+	for _, task := range stranded {
+		parent, ok := parents[task.ApplyID]
+		if !ok {
+			// The parent was deleted between the two reads (PR cleanup races the
+			// reaper). Its rows go with it, so there is nothing left to settle.
+			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded retryable task; the row is being deleted with it",
+				task.LogAttrs()...)
+			continue
+		}
+		settled, err := s.reapStrandedRetryableTask(ctx, task)
+		if err != nil {
+			return reaped, err
+		}
+		if !settled {
+			// The row left failed_retryable (or the parent left the settled set)
+			// between the read and the guarded write, so it belongs to whoever
+			// moved it.
+			slog.DebugContext(ctx, "stranded retryable task changed before it could be reaped; skipping",
+				task.LogAttrs()...)
+			continue
+		}
+		reaped = append(reaped, &storage.ReapedTask{Task: task, Parent: parent})
+	}
+	return reaped, nil
+}
+
+// reapStrandedRetryableTask hardens one failed_retryable task row to failed,
+// reporting whether the guarded write landed. The task's own error message is
+// kept — its failure is real; only the dead retry promise is retired — and
+// completed_at is stamped because failed is terminal.
+//
+// The write re-asserts the parent gate rather than trusting the sweep's read:
+// the guarded UPDATE re-verifies the parent it was chosen for, so a write never
+// lands on the strength of a read that may be seconds old.
+func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage.Task) (bool, error) {
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedRetryableQuiescence)
+	args := []any{state.Task.Failed, task.ID, state.Task.FailedRetryable}
+	args = append(args, parentGateArgs...)
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id = ? AND state = ?
+			AND `+parentGate+`
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("reap stranded retryable task %s (table %q): %w",
+			task.TaskIdentifier, task.TableName, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read reaped rows for stranded retryable task %s (table %q): %w",
+			task.TaskIdentifier, task.TableName, err)
+	}
+	if changed == 0 {
+		return false, nil
+	}
+
+	// Mirror the write onto the returned row so a caller reporting the
+	// settlement reads what is now stored, not the pre-write values.
+	now := time.Now()
+	task.State = state.Task.Failed
+	task.UpdatedAt = now
+	if task.CompletedAt == nil {
+		task.CompletedAt = &now
+	}
+	return true, nil
 }
 
 // scanTask scans a single task row, returning nil if not found.

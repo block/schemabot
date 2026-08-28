@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Globals holds flags shared by all commands.
@@ -183,10 +184,7 @@ var (
 	loadingSpinnerInterval           = 100 * time.Millisecond
 	loadingSpinnerFrames             = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	loadingSpinnerWriter   io.Writer = os.Stderr
-	loadingSpinnerTerminal           = func() bool {
-		info, err := os.Stderr.Stat()
-		return err == nil && info.Mode()&os.ModeCharDevice != 0
-	}
+	loadingSpinnerTerminal           = func() bool { return ui.IsTerminal(os.Stderr) }
 )
 
 func withLoading(message string, show bool, fn func() error) error {
@@ -504,7 +502,7 @@ type applyChangeCounts struct {
 	vschemaUpdates int
 }
 
-func countTableProgressChanges(tables []tableProgress) applyChangeCounts {
+func countTableProgressChanges(tables []templates.TableProgress) applyChangeCounts {
 	var counts applyChangeCounts
 	for _, table := range tables {
 		counts.add(table.ChangeType)

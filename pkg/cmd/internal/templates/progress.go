@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -439,22 +441,21 @@ func FormatTableProgressWithActivityBar(t TableProgress, activityBar string) str
 	return FormatTableProgressWithActivity(t, activityBar, "Finalizing copy")
 }
 
+// isInstantAlter reports whether the table should be described as applying
+// instantly: the engine flagged it instant and it is an ALTER. Other
+// operations may complete without a row copy, but they are not instant DDL,
+// so they keep their generic applying labels. ChangeType is populated for
+// every stored DDL change (storage rejects a blank operation), so an empty
+// value here means an unknown operation, not a missing field.
+func isInstantAlter(t TableProgress) bool {
+	return t.IsInstant && ddl.OpToStatementType(t.ChangeType) == ddl.StatementAlterTable
+}
+
 // FormatTableProgressWithActivity returns progress for a single table using the
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
 	var b strings.Builder
-
-	// Instant DDL: show "Applying instantly" for any non-terminal state.
-	if t.IsInstant && !state.IsTerminalApplyState(state.NormalizeTaskStatus(t.Status)) {
-		bar := ui.ProgressBarRowCopy(100)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...\n", t.TableName, bar)
-		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
-		}
-		b.WriteString("\n")
-		return b.String()
-	}
 
 	// Handle special states first - all use format: tablename: [bar] [status]
 	switch t.Status {
@@ -470,7 +471,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
 		label := "✓ Complete"
-		if t.IsInstant {
+		if isInstantAlter(t) {
 			label = "⚡ Applied instantly"
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
@@ -500,7 +501,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// source. On a large table this can run for hours, so show how far the
 		// verify has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
-			pct := ui.ClampPercent(int(t.ChecksumRowsChecked * 100 / t.ChecksumRowsTotal))
+			pct := ui.RowCopyDisplayPercent(int(math.Round(float64(t.ChecksumRowsChecked)*100/float64(t.ChecksumRowsTotal))), t.ChecksumRowsChecked)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)%s\n", t.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDL(t.DDL))
@@ -577,7 +578,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		return b.String()
 	case state.Apply.Failed:
 		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ❌ Failed\n", t.TableName, bar)
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s "+glyph.Failed+" Failed\n", t.TableName, bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDL(t.DDL))
 		}
@@ -742,7 +743,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarRowCopy(100)
 		op := ddl.OpToStatementType(t.ChangeType)
 		switch {
-		case t.IsInstant:
+		case isInstantAlter(t):
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...%s\n", t.TableName, bar, throttledSuffix(t))
 		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...%s\n", t.TableName, bar, throttledSuffix(t))
@@ -786,10 +787,10 @@ func writeThrottleTooltip(b *strings.Builder, t TableProgress) {
 	// protects. A reason whose signal has no tip renders alone so a new
 	// engine signal degrades to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(t.ThrottleReason); tip != "" {
-		fmt.Fprintf(b, indentDetail+"%sℹ️ Throttled: %s · %s%s\n", ANSIDim, t.ThrottleReason, tip, ANSIReset)
+		fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" Throttled: %s · %s%s\n", ANSIDim, t.ThrottleReason, tip, ANSIReset)
 		return
 	}
-	fmt.Fprintf(b, indentDetail+"%sℹ️ Throttled: %s%s\n", ANSIDim, t.ThrottleReason, ANSIReset)
+	fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" Throttled: %s%s\n", ANSIDim, t.ThrottleReason, ANSIReset)
 }
 
 func recoveringIsCopyingRows(t TableProgress) bool {
@@ -811,7 +812,7 @@ func formatEstimateExceededTable(t TableProgress, rowsCopied int64, activityBar,
 		b.WriteString(formatProgressDDL(t.DDL))
 	}
 	fmt.Fprintf(&b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(rowsCopied))
-	fmt.Fprintf(&b, indentDetail+"%sℹ️ %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
+	fmt.Fprintf(&b, indentDetail+"%s"+glyph.Info+" %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
 	writeThrottleTooltip(&b, t)
 	return b.String()
 }

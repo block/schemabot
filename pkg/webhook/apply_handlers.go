@@ -37,6 +37,11 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 //     terminal only when handleSchemaRequestError recognizes it as a
 //     user-facing rejection; an unexpected failure there (for example a
 //     transient GitHub config read) stays retryable.
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure inside the bootstrap): the
+//     delivery must not be re-driven, but the command never ran and no PR
+//     comment could be posted, so the error is recorded on the delivery as
+//     its only triage trail rather than marking it completed.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -57,6 +62,19 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
+		// A GitHub App resolution failure inside the bootstrap is deterministic
+		// per deployment config, so a re-drive reproduces it; recovery is an
+		// operator fixing the App mapping and the user re-issuing the command.
+		// The command never ran and no PR comment could be posted, so the
+		// error is returned (with retry=false) to record the failure on the
+		// delivery instead of marking it completed. Other bootstrap failures
+		// (an installation token fetch, for example) are transient and stay
+		// retryable.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("apply blocked: cannot resolve GitHub App client for repo",
+				"repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
+			return false, fmt.Errorf("apply command bootstrap %s#%d: %w", repo, pr, err)
+		}
 		h.logger.Error("apply: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return true, fmt.Errorf("apply command bootstrap %s#%d: %w", repo, pr, err)
 	}
@@ -77,9 +95,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
-			h.logger.Debug("unscoped fan-out apply touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
@@ -253,6 +271,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		SchemaPath:        schemaResult.SchemaPath,
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
 		SourceTrusted:     true,
+		// The copy disclosure in the comment this plan becomes is what the
+		// operator confirms, and the apply re-checks its own re-plan against
+		// that consent, so both have to predict the same apply. The command
+		// carrying the decision is already parsed here.
+		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
 	}
 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
@@ -325,13 +348,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
+	// DisclosedCopyDiscard records whether that plan's comment tells the operator
+	// a copy is destroyed, so the apply can later tell a discard they agreed to
+	// from one that appeared after they were asked.
 	lock := &storage.Lock{
-		DatabaseName:  database,
-		DatabaseType:  dbType,
-		Owner:         lockOwner,
-		Repository:    repo,
-		PullRequest:   pr,
-		PendingPlanID: planResp.PlanID,
+		DatabaseName:         database,
+		DatabaseType:         dbType,
+		Owner:                lockOwner,
+		Repository:           repo,
+		PullRequest:          pr,
+		PendingPlanID:        planResp.PlanID,
+		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
 	}
 	if err := h.service.Storage().Locks().Acquire(ctx, lock); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
@@ -393,13 +420,55 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
+			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
+			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
+		}
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkRunErr != nil {
 			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
 		}
 		if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
+		return false, nil
+	}
+
+	// Discarding an unfinished copy destroys work already done on the target —
+	// often hours of it — so it never happens in one step. Downgrade to the
+	// two-step confirm against the locked comment that discloses what is being
+	// thrown away, the same way a direct-execution change does: the operator
+	// spends the hours, so the operator decides, and there is no flag that
+	// converts an automatic apply into that consent.
+	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
+		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
+			"repo", repo, "pr", pr, "database", database, "environment", environment,
+			"discarded_copies", len(discarded))
+		// Store the check record before posting the paused comment: the pause
+		// is acknowledged only once the stored check state blocks the merge
+		// gate on the pending changes. A storage failure releases the lock
+		// (keyed on this plan's intent) and stays retryable — the re-drive
+		// re-plans from the top, reacquires the lock, and reaches this gate
+		// again — so the pause is never acknowledged over unknown check state.
+		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		if checkRunErr != nil {
+			h.logger.Error("failed to store check state for copy-discard downgrade; the merge gate does not reflect the pending changes, so the command stays retryable",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", checkRunErr)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "copy-discard downgrade check state store failure")
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not record the check state for this apply. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command copy-discard downgrade check record %s#%d: %w", repo, pr, checkRunErr)
+		}
+		if headSHA != "" {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		}
+		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
+		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
+			templates.RenderPlanComment(commentData), "copy-discard downgrade disclosure post failure"); postErr != nil {
+			return true, fmt.Errorf("apply command copy-discard downgrade disclosure %s#%d: %w", repo, pr, postErr)
 		}
 		return false, nil
 	}
@@ -433,8 +502,35 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
 	return false, nil
+}
+
+// postPendingConfirmation posts the plan comment a pending confirmation is meant
+// to be confirmed against, and releases the confirmation when the comment does
+// not land. The lock is acquired before this comment exists and already records
+// what the comment discloses about an unfinished copy, so a post that fails
+// would leave consent behind for a disclosure nobody was shown. A confirmation
+// whose comment never appeared is also one no operator can act on: they were
+// told nothing to confirm, and the lock would sit until someone unlocked it by
+// hand.
+//
+// The release is keyed on this plan's intent, so a lock that has since changed
+// hands or been re-pinned is preserved. Callers stay retryable — the re-drive
+// re-plans from the top, reacquires the lock, and asks again — and do not post a
+// command error, because posting is the operation that just failed.
+func (h *Handler) postPendingConfirmation(
+	ctx context.Context, repo string, pr int, installationID int64,
+	database, dbType, environment, planID, body, reason string,
+) error {
+	if err := h.postCommentReportingError(repo, pr, installationID, body); err != nil {
+		h.logger.Error("failed to post the comment the pending confirmation is confirmed against, so the confirmation was released rather than left recording consent for a disclosure that was never shown",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "plan_id", planID, "reason", reason, "error", err)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planID, reason)
+		return err
+	}
+	return nil
 }
 
 // handleApplyConfirmCommand handles the "schemabot apply-confirm -e <env>" PR comment command.
@@ -459,6 +555,11 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 //     only when handleSchemaRequestError recognizes it as a user-facing
 //     rejection; an unexpected failure there (for example a transient GitHub
 //     config read) stays retryable.
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure inside the bootstrap): the
+//     delivery must not be re-driven, but the command never ran and no PR
+//     comment could be posted, so the error is recorded on the delivery as
+//     its only triage trail rather than marking it completed.
 //
 // A gate block is terminal only when the gate evaluated its inputs and
 // blocked on the merits. A gate that could not evaluate (for example a
@@ -482,6 +583,19 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
 	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
+		// A GitHub App resolution failure inside the bootstrap is deterministic
+		// per deployment config, so a re-drive reproduces it; recovery is an
+		// operator fixing the App mapping and the user re-issuing the command.
+		// The command never ran and no PR comment could be posted, so the
+		// error is returned (with retry=false) to record the failure on the
+		// delivery instead of marking it completed. Other bootstrap failures
+		// (an installation token fetch, for example) are transient and stay
+		// retryable.
+		if errors.Is(err, errGitHubAppResolution) {
+			h.logger.Error("apply-confirm blocked: cannot resolve GitHub App client for repo",
+				"repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
+			return false, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
+		}
 		h.logger.Error("apply-confirm: failed to bootstrap command", "repo", repo, "pr", pr, "database", databaseName, "environment", environment, "error", err)
 		return true, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
 	}
@@ -500,9 +614,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
-		if h.skipUnownedUnscopedCommand(repo, result.Tenant, err) {
-			h.logger.Debug("unscoped fan-out apply-confirm touches no schema this deployment owns; staying silent",
-				"repo", repo, "pr", pr, "environment", environment, "error", err)
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+			h.logger.Debug("unscoped fan-out apply-confirm resolves to no schema this deployment answers for; staying silent",
+				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {
@@ -670,8 +784,31 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID)
+	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
+	if existingLock.DisclosedCopyDiscard && !disclosedCopyDiscard {
+		h.logger.Info("copy-discard disclosure not applied to this confirm: it was shown for another environment",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "pending_plan_id", existingLock.PendingPlanID)
+	}
+
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, existingLock.PendingPlanID, disclosedCopyDiscard)
 	return false, nil
+}
+
+// disclosureDescribesThisApply reports whether the consent recorded on the
+// pending confirmation was earned for the apply about to run. The lock carries
+// no environment dimension, so a disclosure the operator was shown confirming
+// one environment must not disarm the copy gate in another: the pinned plan
+// names the environment they actually saw. A confirmation with no loadable plan
+// counts as no disclosure, so the apply asks rather than assuming consent.
+func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
+	if !lock.DisclosedCopyDiscard {
+		return false
+	}
+	if plan == nil {
+		return false
+	}
+	return plan.Environment == environment
 }
 
 // handleUnlockCommand handles the "schemabot unlock" PR comment command. It is
@@ -715,6 +852,12 @@ func isUnlockRejection(err error) bool {
 //     locks found, an authorization block on the merits, an active apply
 //     still protecting the lock, or a command that predates every lock it
 //     matched).
+//   - retry=false, err!=nil — a deterministic failure a re-drive would only
+//     reproduce (a GitHub App resolution failure during database inference or
+//     the authorization client): the delivery must not be re-driven, but no
+//     PR comment could be posted without a client, so the error is recorded
+//     on the delivery as its only triage trail rather than marking it
+//     completed.
 //
 // issuedAt bounds the release targets: a lock acquired after issuedAt is
 // never released. On the durable path issuedAt is the delivery's received-at,
@@ -761,6 +904,15 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 			if isUnlockRejection(err) {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
 				return false, nil
+			}
+			// A GitHub App resolution failure is deterministic per deployment
+			// config, so a re-drive reproduces it; recovery is an operator
+			// fixing the App mapping and the user re-issuing the command. No
+			// PR comment could be posted without a client, so the error is
+			// returned (with retry=false) to record the failure on the
+			// delivery instead of marking it completed.
+			if errors.Is(err, errGitHubAppResolution) {
+				return false, fmt.Errorf("unlock command infer database %s#%d: %w", repo, pr, err)
 			}
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, "Failed to infer database for force unlock: "+err.Error())
@@ -830,12 +982,18 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// admin/operator for each affected database before any lock is released.
 	// Locks are not environment-scoped, so authorization is enforced per
 	// database without an environment.
-	client, blocked := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, locks[0].DatabaseName, "", action.Unlock)
-	if blocked {
+	client, err := h.actorAuthorizationClient(repo, pr, installationID, requestedBy, locks[0].DatabaseName, "", action.Unlock)
+	if err != nil {
 		// The gate has already logged the client-creation failure and posted
-		// the authorization-unavailable comment; it fails closed for this
-		// delivery, but a fresh client may succeed on a later attempt.
-		return true, fmt.Errorf("unlock command actor authorization client %s#%d: GitHub client unavailable", repo, pr)
+		// its best-effort authorization-unavailable comment; it fails closed
+		// for this delivery. A GitHub App resolution failure is deterministic
+		// per deployment config, so a re-drive reproduces it and the error is
+		// recorded on the delivery instead; any other cause (an installation
+		// token fetch, for example) may clear on a later attempt.
+		if errors.Is(err, errGitHubAppResolution) {
+			return false, fmt.Errorf("unlock command actor authorization client %s#%d: %w", repo, pr, err)
+		}
+		return true, fmt.Errorf("unlock command actor authorization client %s#%d: %w", repo, pr, err)
 	}
 	for _, lock := range locks {
 		blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, lock.DatabaseName, lock.DatabaseType, "", action.Unlock, result.SuppressRetryComments)

@@ -108,7 +108,7 @@ func httpGet(t *testing.T, url string) *http.Response {
 // =============================================================================
 
 func TestK8s_ControlPlane_Health(t *testing.T) {
-	resp := httpGet(t, testutil.Endpoint(t)+"/health")
+	resp := httpGet(t, controlPlaneEndpoint(t)+"/health")
 	defer resp.Body.Close()
 	require.Equal(t, 200, resp.StatusCode)
 
@@ -118,7 +118,7 @@ func TestK8s_ControlPlane_Health(t *testing.T) {
 }
 
 func TestK8s_DataPlaneHealth(t *testing.T) {
-	resp := httpGet(t, testutil.Endpoint(t)+"/tern-health/data-plane/staging")
+	resp := httpGet(t, controlPlaneEndpoint(t)+"/tern-health/data-plane/staging")
 	defer resp.Body.Close()
 	require.Equal(t, 200, resp.StatusCode)
 
@@ -137,7 +137,7 @@ func TestK8s_DataPlaneHealth(t *testing.T) {
 // gRPC path in Kubernetes. The control plane receives the HTTP request and
 // delegates to the data plane over gRPC, which runs Spirit against the target DB.
 func TestK8s_PlanApply_AddColumn(t *testing.T) {
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_addcol")
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
@@ -184,9 +184,7 @@ func TestK8s_PlanApply_AddColumn(t *testing.T) {
 	// Verify lifecycle fields on the control plane's storage. external_id is
 	// the data-plane apply ID returned over gRPC, while started_at/completed_at
 	// prove the control-plane poller persisted the remote lifecycle to storage.
-	sbDB, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(sbDB)
+	sbDB := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 
 	externalID, startedAt, completedAt := waitForControlPlaneApplyLifecycle(t, sbDB, applyResp.ApplyID)
 	assert.NotEmpty(t, externalID, "external_id should be set — proves data plane returned its apply ID over gRPC")
@@ -252,7 +250,7 @@ func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableN
 func TestK8s_ApplyLinksTasksToApplyOperation(t *testing.T) {
 	cleanupState(t)
 
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_applyop")
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
@@ -277,10 +275,7 @@ func TestK8s_ApplyLinksTasksToApplyOperation(t *testing.T) {
 
 	// The control plane owns the apply, its apply_operations rows, and the
 	// tasks. Inspect that storage directly to prove the per-operation linkage.
-	sbDB, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(sbDB)
-	require.NoError(t, sbDB.PingContext(t.Context()))
+	sbDB := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 	store := mysqlstore.New(sbDB)
 
 	apply, err := store.Applies().GetByApplyIdentifier(t.Context(), applyResp.ApplyID)
@@ -323,7 +318,7 @@ func taskIdentifiers(tasks []*storage.Task) []string {
 func TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus(t *testing.T) {
 	cleanupState(t)
 
-	endpoint := testutil.Endpoint(t)
+	endpoint := controlPlaneEndpoint(t)
 	failureMessage := "remote schema change failed while checking target connectivity"
 	tableName := testutil.UniqueTableName("k8s_remote_failure")
 
@@ -403,10 +398,7 @@ func TestK8s_RemoteFailureErrorVisibleInControlPlaneStatus(t *testing.T) {
 func createStoredK8sApplyWithTask(t *testing.T, dsn string, apply *storage.Apply, task *storage.Task) string {
 	t.Helper()
 
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	now := time.Now()
 	task.CreatedAt = now
@@ -437,7 +429,7 @@ func createStoredK8sApplyWithTask(t *testing.T, dsn string, apply *storage.Apply
 	}
 
 	store := mysqlstore.New(db)
-	_, err = store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{operation})
+	_, err := store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{operation})
 	require.NoError(t, err)
 	return apply.ApplyIdentifier
 }
@@ -500,7 +492,7 @@ func formatLogEntries(logs []*client.LogEntry) string {
 
 // TestK8s_PlanApply_CreateTable tests creating a new table through the two-tier path.
 func TestK8s_PlanApply_CreateTable(t *testing.T) {
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_create")
 	cleanupState(t)
 
@@ -534,7 +526,7 @@ func TestK8s_PlanApply_CreateTable(t *testing.T) {
 // TestK8s_Progress tests that progress reporting works over the gRPC path.
 // Adds an index on a table with 500k rows to force Spirit's copy phase.
 func TestK8s_Progress(t *testing.T) {
-	ep, dsn := testutil.Endpoint(t), testutil.TernStagingDSN(t)
+	ep, dsn := controlPlaneEndpoint(t), testutil.TernStagingDSN(t)
 	tableName := testutil.UniqueTableName("k8s_progress")
 
 	testutil.CreateTestTableWithCleanup(t, dsn, tableName, fmt.Sprintf(
@@ -676,10 +668,7 @@ func waitForControlPlaneStartControlRequestCompleted(t *testing.T, applyID strin
 func waitForControlPlaneControlRequestCompleted(t *testing.T, applyID string, operation storage.ControlOperation) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", testutil.SchemabotDSN(t))
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
 
 	var (
 		status       string
@@ -866,10 +855,7 @@ func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool
 
 func storedK8sApplyAndTaskStates(t *testing.T, dsn, applyID string) (string, string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	var applyState, taskState string
 	require.NoError(t, db.QueryRowContext(t.Context(), `
@@ -883,10 +869,7 @@ func storedK8sApplyAndTaskStates(t *testing.T, dsn, applyID string) (string, str
 
 func waitForDataPlaneStopControlRequestPending(t *testing.T, dsn, applyID string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err)
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()))
+	db := testutil.OpenMySQL(t, dsn)
 
 	var status string
 	var lastErr error
@@ -936,7 +919,10 @@ func TestK8s_Operator_ControlPlanePodRestartReconnectsToRunningDataPlane(t *test
 	markControlPlaneHeartbeatStale(t, fixture.ApplyID)
 	waitForReplacementPodReady(t, "control-plane", crashedPod, 2*time.Minute)
 
-	recoveredEndpoint := startControlPlanePortForward(t)
+	// Crashing the pod killed the port-forward behind the shared suite
+	// endpoint. controlPlaneEndpoint detects that and establishes a
+	// replacement forward that later tests inherit.
+	recoveredEndpoint := controlPlaneEndpoint(t)
 	waitForTernHealth(t, recoveredEndpoint, "data-plane", "staging", testutil.PollDeadline)
 
 	testutil.WaitForState(t, recoveredEndpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)

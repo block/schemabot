@@ -854,9 +854,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
+	// A stopped operation is reclaimable for start and for cancel, but the two
+	// arms are separate because only one of them terminates itself. The start
+	// claim always resolves — it either moves the row to resuming or the parent
+	// claim fails the request — so it needs no rematch guard. The cancel claim
+	// leaves the row stopped when the parent apply refuses to be claimed (a
+	// stopped apply is terminal), so it carries the rematch guard to keep an
+	// undeliverable cancel from re-claiming a driver on every poll.
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.Stopped,
+		storage.ControlOperationCancel, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -877,7 +887,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// resuming them is recovering work they started, not starting a new deployment.
 	//
 	//   - A stopped operation whose parent apply has a pending start request is
-	//     reclaimable so the operator can resume it.
+	//     reclaimable so the operator can resume it, and one whose parent has a
+	//     pending cancel request is reclaimable so the drive can terminalize it.
+	//     The cancel arm carries the rematch guard because its claim can leave
+	//     the row stopped; see requestRematchGuardSQL.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -916,6 +929,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// requests resume eligible work; they do not reorder the rollout.
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
+	// The two guarded arms differ in the equal-timestamp case for the same reason
+	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
+	// out of stopped atomically with its lease rotation, so no peer can match it
+	// in the same second and it can admit an equal timestamp; the
+	// waiting_for_deploy claim leaves the row where it is and must refuse one.
+	// See leaseRematchComparison.
+	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
+	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1014,6 +1035,17 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				)
 			)
 			OR (
+				state = ?
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+						AND `+stoppedCancelGuard+`
+				)
+			)
+			OR (
 				state IN (%s)
 				AND EXISTS (
 					SELECT 1
@@ -1027,11 +1059,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					WHERE cr.apply_id = apply_operations.apply_id
 						AND cr.operation = ?
 						AND cr.status = ?
-						AND (
-							apply_operations.lease_acquired_at IS NULL
-							OR apply_operations.lease_acquired_at < cr.updated_at
-							OR apply_operations.updated_at < %s
-						)
+						AND `+deferredDeployGuard+`
 				)
 			)
 			OR (
@@ -1057,7 +1085,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1106,13 +1134,20 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		}
 	case state.ApplyOperation.Stopped:
 		// Stopped → resuming: a stopped operation whose parent apply has a
-		// pending start request is a resumable claim, mirroring the apply-level
-		// stopped claim (transitionClaimToState). The claim must move the row out
-		// of stopped atomically with the lease rotation because the stopped-row
-		// predicate is request-gated, not heartbeat-gated: while the row stays
-		// stopped it keeps matching that predicate and a peer could re-lease it
-		// mid-drive. As resuming (an active state) it is re-leasable only by the
+		// pending start or cancel request is claimable, mirroring the
+		// apply-level stopped claim. The claim must move the row out of stopped
+		// atomically with the lease rotation because the stopped-row predicate
+		// is request-gated, not heartbeat-gated: while the row stays stopped it
+		// keeps matching that predicate and a peer could re-lease it mid-drive.
+		// As resuming (an active state) it is re-leasable only by the
 		// heartbeat-guarded stale-active clause, which recovers a crashed drive.
+		// A cancel drive holds resuming only transiently: after the drive the
+		// row is re-derived from its own tasks — cancelled tasks terminalize
+		// it, and a drive that delivered nothing settles it back to stopped.
+		// A crashed drive's leftover resuming row is recovered by the
+		// stale-active clause, whose next drive re-derives it the same way or,
+		// when the parent already terminalized, mirrors the terminal parent
+		// down (reconcileUnclaimableParent).
 		// WHERE state = ? guards a concurrent transition landing between the
 		// SELECT and this UPDATE; RowsAffected == 0 means another writer moved it.
 		result, err := tx.ExecContext(ctx, `
@@ -1603,20 +1638,31 @@ const strandedParentQuiescence = 10 * time.Minute
 // rows in one pass, so there is nothing to scope it to.
 const strandedReaperLockName = "schemabot_stranded_reaper"
 
+// strandedOperationSweep identifies the stranded-operation sweep to the shared
+// election wrapper.
+var strandedOperationSweep = strandedSweep{
+	lockName: strandedReaperLockName,
+	busy:     storage.ErrStrandedReaperBusy,
+	subject:  "stranded apply_operations",
+}
+
 // strandedParentGate renders the EXISTS admitting only parents whose outcome can
-// no longer change, correlated on the given apply_id column. Both the sweep's
-// SELECT and the guarded per-row UPDATE assert it, so the write re-verifies the
-// parent it was chosen for rather than trusting a read that may be seconds old.
+// no longer change, correlated on the given apply_id column. Both a reaper
+// sweep's SELECT and its guarded per-row UPDATE assert it, so the write
+// re-verifies the parent it was chosen for rather than trusting a read that may
+// be seconds old.
 //
 // Two conditions, each for its own reason:
-//   - settled state: the rollout has a verdict, so a pending child describes
-//     work that will never run.
-//   - quiescent: the apply's own paths — stop reconciliation, terminal
-//     derivation — may still be writing sibling rows just after it terminalized.
-func (s *applyOperationStore) strandedParentGate(correlation string) (string, []any) {
+//   - settled state: the rollout has a verdict, so a child row describing
+//     future work (a pending operation, a promised task retry) is dead.
+//   - quiescent for the given window: the apply's own paths — stop
+//     reconciliation, terminal derivation — may still be writing child rows
+//     just after it terminalized. Each reaper picks the window matching what
+//     could still race it.
+func strandedParentGate(d Dialect, correlation string, quiescence time.Duration) (string, []any) {
 	parentStates := settledApplyStates()
-	quiescentBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64(strandedParentQuiescence.Microseconds())), IntervalMicrosecond)
+	quiescentBefore := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(quiescence.Microseconds())), IntervalMicrosecond)
 
 	args := stringArgs(parentStates)
 	return fmt.Sprintf(`EXISTS (
@@ -1631,42 +1677,10 @@ func (s *applyOperationStore) strandedParentGate(correlation string) (string, []
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
-	if s.locker == nil {
-		return nil, fmt.Errorf("reap stranded apply_operations requires an advisory locker; reapers cannot elect a single instance without one")
-	}
-
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get stranded reaper connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	// Do not wait for the lock: whoever holds it is doing this pass's work, and
-	// this instance's next tick is soon enough.
-	acquired, err := s.locker.Acquire(ctx, conn.lockerConn(), strandedReaperLockName, 0)
-	if err != nil {
-		return nil, fmt.Errorf("acquire stranded reaper lock: %w", err)
-	}
-	if !acquired {
-		return nil, storage.ErrStrandedReaperBusy
-	}
-	defer func() {
-		// A held lock parks every instance's reaper until this session is
-		// retired, so the two ways it can survive the pass are reported apart:
-		// the release errored, or it ran and reported the lock was not held.
-		released, err := s.locker.Release(context.WithoutCancel(ctx), conn.lockerConn(), strandedReaperLockName)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to release the stranded reaper lock; reapers stay blocked until this session is retired",
-				"lock", strandedReaperLockName, "error", err)
-			return
-		}
-		if !released {
-			slog.WarnContext(ctx, "the stranded reaper lock was not held at release; another session may have taken it",
-				"lock", strandedReaperLockName)
-		}
-	}()
-
-	return s.reapStranded(ctx, limit)
+	return reapUnderElection(ctx, s.db, s.locker, strandedOperationSweep,
+		func(ctx context.Context) ([]*storage.ReapedOperation, error) {
+			return s.reapStranded(ctx, limit)
+		})
 }
 
 // reapStranded mirrors settled parents' outcomes onto their pending, unleased
@@ -1683,7 +1697,7 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 		return nil, fmt.Errorf("reap stranded apply_operations: limit must be positive, got %d", limit)
 	}
 
-	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 
 	selectArgs := []any{state.ApplyOperation.Pending}
 	selectArgs = append(selectArgs, parentGateArgs...)
@@ -1709,7 +1723,11 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 		return nil, nil
 	}
 
-	parents, err := s.loadStrandedParents(ctx, stranded)
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, op := range stranded {
+		applyIDs = append(applyIDs, op.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded apply_operations")
 	if err != nil {
 		return nil, err
 	}
@@ -1740,31 +1758,32 @@ func (s *applyOperationStore) reapStranded(ctx context.Context, limit int) ([]*s
 	return reaped, nil
 }
 
-// loadStrandedParents returns the settled parent applies of the reaped rows,
-// keyed by apply id.
-func (s *applyOperationStore) loadStrandedParents(ctx context.Context, stranded []*storage.ApplyOperation) (map[int64]*storage.Apply, error) {
-	applyIDs := make([]any, 0, len(stranded))
-	seen := make(map[int64]bool, len(stranded))
-	for _, op := range stranded {
-		if seen[op.ApplyID] {
+// loadSettledParents returns the settled parent applies of the rows a reaper
+// sweep selected, keyed by apply id. subject names the reaped row kind for
+// error context.
+func loadSettledParents(ctx context.Context, db *rebindDB, applyIDs []int64, subject string) (map[int64]*storage.Apply, error) {
+	args := make([]any, 0, len(applyIDs))
+	seen := make(map[int64]bool, len(applyIDs))
+	for _, applyID := range applyIDs {
+		if seen[applyID] {
 			continue
 		}
-		seen[op.ApplyID] = true
-		applyIDs = append(applyIDs, op.ApplyID)
+		seen[applyID] = true
+		args = append(args, applyID)
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
-		WHERE id IN (`+placeholders(len(applyIDs))+`)
-	`, applyIDs...)
+		WHERE id IN (`+placeholders(len(args))+`)
+	`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query settled parents of %d stranded apply_operations: %w", len(stranded), err)
+		return nil, fmt.Errorf("query settled parents of %d %s: %w", len(applyIDs), subject, err)
 	}
 	applies, err := scanApplies(rows)
 	utils.CloseAndLog(rows)
 	if err != nil {
-		return nil, fmt.Errorf("scan settled parents of %d stranded apply_operations: %w", len(stranded), err)
+		return nil, fmt.Errorf("scan settled parents of %d %s: %w", len(applyIDs), subject, err)
 	}
 
 	parents := make(map[int64]*storage.Apply, len(applies))
@@ -1790,7 +1809,7 @@ func (s *applyOperationStore) reapStrandedOperation(ctx context.Context, op *sto
 		setClause = "state = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW())"
 		args = []any{parent.State, nullString(parent.ErrorMessage)}
 	}
-	parentGate, parentGateArgs := s.strandedParentGate("apply_operations.apply_id")
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_operations.apply_id", strandedParentQuiescence)
 	args = append(args, op.ID, state.ApplyOperation.Pending)
 	args = append(args, parentGateArgs...)
 

@@ -304,6 +304,18 @@ func (e *Engine) DebugLogs() bool {
 	return e.debugLogs.Load()
 }
 
+// RegistersWorkSynchronously reports that Apply records the accepted schema
+// change on this engine before it returns, so there is no window in which Spirit
+// has accepted work it cannot yet describe. Spirit executes in a goroutine of
+// this process with nothing to provision first, and the tracked state is
+// published under the engine mutex before Apply returns; Drain and the cancel
+// path are the only writers that clear it, and both mean the work is not coming
+// back. A pending progress report for a task a driver believes is in flight is
+// therefore conclusive rather than a phase to wait out.
+func (e *Engine) RegistersWorkSynchronously() bool {
+	return true
+}
+
 // Drain waits for any in-flight schema change goroutine to complete and clears
 // the running schema change state. This ensures DB connections from a previous
 // run are fully released before new operations begin.
@@ -573,7 +585,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 
 	if !plan.HasChanges() {
 		return &engine.PlanResult{
-			PlanID:    fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+			PlanID:    engine.NewPlanID(),
 			NoChanges: true,
 		}, nil
 	}
@@ -698,13 +710,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	return &engine.PlanResult{
-		PlanID:         fmt.Sprintf("plan-%d", time.Now().UnixNano()),
+		PlanID:         engine.NewPlanID(),
 		Changes:        schemaChanges,
 		LintViolations: lintViolations,
 		// Applying this plan can meet a copy an earlier schema change left on
 		// the target and continue it or destroy it. Disclose which, so that is
 		// known before anyone confirms rather than after the copy is gone.
-		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes),
+		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes, req.GroupedExecution),
 	}, nil
 }
 

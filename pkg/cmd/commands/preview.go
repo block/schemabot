@@ -65,7 +65,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Status types
 	case templates.PreviewStatusList, templates.PreviewStatusDeployment, templates.PreviewStatusHistory,
-		templates.PreviewPlansList:
+		templates.PreviewPlansList, templates.PreviewPullSchema, templates.PreviewPullSchemaDetailed,
+		templates.PreviewPullVitessSchema:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
@@ -74,6 +75,10 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
 		templates.PreviewCommentPlanDirect,
+		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
+		templates.PreviewCommentPlanCopyDiscardedPaused,
+		templates.PreviewCommentPlanCopyDiscardedStopped,
+		templates.PreviewCommentPlanCopyAdopted, templates.PreviewCommentPlanCopyRunning,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
 		templates.PreviewCommentPlanEmpty,
@@ -95,6 +100,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentApplyFailed,
 		templates.PreviewCommentApplyFailedBeforeRowCopy,
 		templates.PreviewCommentApplyRetrying,
+		templates.PreviewCommentApplyRemoteRetryablePause,
 		templates.PreviewCommentApplyStopped,
 		templates.PreviewCommentApplyWaitingCutover, templates.PreviewCommentApplyCuttingOver,
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
@@ -227,6 +233,9 @@ Status:
   status_deployment     Deployment-scoped schema change status
   status_history        Database apply history
   plans_list            List of recently generated plans
+  pull_schema           Pulled live schema rendered as readable SQL
+  pull_schema_detailed  Pulled live schema with the detailed catalog's estimates
+  pull_schema_vitess    Multi-keyspace Vitess pull with VSchema artifacts
 
 Lint and Unsafe:
   lint_violations         Lint violations output
@@ -259,6 +268,12 @@ Comment Templates (GitHub PR comments):
   comment_no_managed_schema     No managed schema changes in current PR
   comment_reconcile_in_progress Empty diff with an in-progress apply
   comment_reconcile_completed   Empty diff with a completed apply
+  comment_plan_copy_discarded   Plan whose apply would throw away an unfinished copy
+  comment_plan_copy_discarded_applying Running apply recording the unfinished copy it threw away
+  comment_plan_copy_discarded_paused Automatic apply paused because applying would discard a copy
+  comment_plan_copy_discarded_stopped Confirmed apply stopped because a copy appeared after the comment
+  comment_plan_copy_adopted     Plan whose apply resumes an unfinished copy
+  comment_plan_copy_running     Plan whose apply joins a copy still being made
   comment_multi_env             Multi-env plan (identical plans, deduplicated)
   comment_multi_env_diff        Multi-env plan (different plans per environment)
   comment_multi_env_lint        Multi-env plan with lint violations
@@ -279,6 +294,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_failed          Multi-table: failed (with error and cancelled tables)
   comment_apply_failed_before_row_copy Multi-table: failed before row copy (preflight rejection, per-table error)
   comment_apply_retrying        Multi-table: interrupted, retrying automatically (attempt counter)
+  comment_apply_remote_retryable_pause Multi-table: active apply paused by a data-plane retry (no attempt counter)
   comment_apply_stopped         Multi-table: stopped (partial progress)
   comment_apply_waiting_cutover Waiting for cutover (deferred, operator triggers)
   comment_apply_waiting_cutover_automatic Waiting for cutover (non-deferred, drive triggers)

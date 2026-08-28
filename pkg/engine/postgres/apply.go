@@ -16,11 +16,9 @@ import (
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/postgresconn"
 )
 
 const (
-	optimisticTableSizeLimit = int64(1 << 30)
 	optimisticLockTimeout    = 3 * time.Second
 	optimisticStatementLimit = 30 * time.Second
 
@@ -41,6 +39,15 @@ type nativeApply struct {
 	sql       string
 }
 
+// targetConn carries one background apply's connection inputs: the raw DSN
+// (normalized at open time) and the CA bundle path the pool verifies the
+// target against — empty when the embedded RDS trust or the DSN's own
+// settings apply.
+type targetConn struct {
+	dsn        string
+	caCertPath string
+}
+
 // Apply starts one native-safe PostgreSQL statement under pg-sprite's bounded
 // optimistic executor. Planner-produced sequences use the same execution seam
 // but are deliberately not admitted by this first increment.
@@ -49,17 +56,32 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, err
 	}
+	// Resolve the CA reference at acceptance so a trust root the engine
+	// cannot honor refuses the apply before any background work is queued.
+	caPath, err := caCertPath(req.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
+	}
+	// The bundle itself is held to the same bar: an unreadable or
+	// certificate-free bundle can never dial, so it refuses the apply here
+	// rather than failing the background drive. This proves the reference is
+	// honorable at acceptance; the pool re-reads the path when it dials.
+	if caPath != "" {
+		if _, err := loadCABundle(caPath); err != nil {
+			return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
+		}
+	}
 
 	started := time.Now()
 	key := progressIdentity(req.ResumeState)
 	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""))
 	bgCtx := context.WithoutCancel(ctx)
-	dsn := req.Credentials.DSN
+	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	logger := req.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e.wg.Go(func() { e.runOptimisticApply(bgCtx, dsn, change, key, started, logger) })
+	e.wg.Go(func() { e.runOptimisticApply(bgCtx, conn, change, key, started, logger) })
 
 	return &engine.ApplyResult{
 		Accepted:    true,
@@ -94,12 +116,12 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
 }
 
-func (e *Engine) runOptimisticApply(ctx context.Context, dsn string, change nativeApply, key string, started time.Time, logger *slog.Logger) {
+func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
-	err := executeOptimistic(ctx, dsn, change)
+	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit)
 	if err == nil {
 		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
 		return
@@ -143,20 +165,24 @@ type refusal struct {
 }
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
-// refusals. A nil result means the failure is operational — a retry may
+// refusals, for both the plan-time privilege check and the apply path — one
+// classifier so the same underlying failure reads identically on both
+// surfaces. A nil result means the failure is operational — a retry may
 // succeed once conditions change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
 // with concurrent lock holders. Every detail string here is built from typed
-// error fields and identifiers, never from wrapped server output, so it is
-// safe to render on operator-facing surfaces.
+// error fields and identifiers, never from wrapped server output; fields
+// that embed database-sourced identifiers are sanitized before they leave,
+// so a detail is safe to render on operator-facing surfaces.
 func classifyRefusal(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		detail := fmt.Sprintf("insufficient privileges; provision with: %s", privilegeErr.Grant)
+		detail := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
+			privilegeErr.Tier, table, privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
 			detail += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: detail}
+		return &refusal{reason: "insufficient-privileges", detail: sanitizeReasonText(detail)}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
@@ -181,12 +207,12 @@ func classifyRefusal(err error, table string) *refusal {
 	return nil
 }
 
-func executeOptimistic(ctx context.Context, rawDSN string, change nativeApply) error {
-	dsn, err := postgresconn.ConnectionDSN(rawDSN)
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
+	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
-		return fmt.Errorf("normalize PostgreSQL DSN for apply: %w", err)
+		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
 	}
-	pool, err := dbconn.NewPool(ctx, dbconn.Config{URL: dsn})
+	pool, err := dbconn.NewPool(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("open pg-sprite apply pool: %w", err)
 	}
@@ -203,7 +229,7 @@ func executeOptimistic(ctx context.Context, rawDSN string, change nativeApply) e
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, optimisticTableSizeLimit)
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
 	}

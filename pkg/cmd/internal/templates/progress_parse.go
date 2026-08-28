@@ -6,7 +6,9 @@ import (
 	"strconv"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // spiritProgressPattern matches the row-copy prefix of a Spirit progress
@@ -42,6 +44,7 @@ type ProgressData struct {
 // ProgressOperation represents progress for one deployment operation.
 type ProgressOperation struct {
 	Deployment          string
+	OperationKey        string
 	ExternalID          string
 	ExternalOperationID string
 	Target              string
@@ -164,6 +167,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
 			Deployment:          op.Deployment,
+			OperationKey:        op.OperationKey,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
 			Target:              op.Target,
@@ -177,14 +181,14 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		})
 	}
 
-	for _, tbl := range result.Tables {
+	for _, tbl := range ddl.FilterInternalTablesTyped(result.Tables) {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
 			Namespace:           tbl.Keyspace,
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
-			Status:              state.NormalizeState(tbl.Status),
+			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			PercentComplete:     int(tbl.PercentComplete),
@@ -196,16 +200,40 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			IsInstant:           tbl.IsInstant,
 			ProgressDetail:      tbl.ProgressDetail,
 		}
+		// When a table carries an engine progress string, it is fresher than
+		// the stored copy fields, so prefer it and keep the percent, the rows
+		// line, and anything aggregated from them in agreement. The live
+		// progress API sends ProgressDetail empty (the drive loop does not
+		// persist it to the task record), so this override only takes effect
+		// for responses that populate the field, such as log preview fixtures.
+		if info := ParseSpiritProgress(tp.ProgressDetail); info != nil {
+			tp.PercentComplete = info.Percent
+			tp.RowsCopied = info.RowsCopied
+			tp.RowsTotal = info.RowsTotal
+		}
 		for _, sh := range tbl.Shards {
+			pct := int(sh.PercentComplete)
+			if pct == 0 && sh.RowsTotal > 0 {
+				pct = int(sh.RowsCopied * 100 / sh.RowsTotal)
+			}
+			// Row totals are estimates, so a nearly finished copy can exceed
+			// them whether the percent arrived from the server or was derived
+			// above; clamp so the rendered percent stays honest.
+			pct = ui.ClampPercent(pct)
 			tp.Shards = append(tp.Shards, ShardProgress{
 				Shard:           sh.Shard,
 				Status:          state.NormalizeShardStatus(sh.Status),
 				RowsCopied:      sh.RowsCopied,
 				RowsTotal:       sh.RowsTotal,
 				ETASeconds:      sh.ETASeconds,
-				PercentComplete: int(sh.PercentComplete),
+				PercentComplete: pct,
 				CutoverAttempts: int(sh.CutoverAttempts),
 			})
+			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
+			// the slowest shard's for a sharded (Vitess) table.
+			if sh.ETASeconds > tp.ETASeconds {
+				tp.ETASeconds = sh.ETASeconds
+			}
 		}
 		data.Tables = append(data.Tables, tp)
 	}

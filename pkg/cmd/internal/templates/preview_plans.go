@@ -1,6 +1,10 @@
 package templates
 
-import "time"
+import (
+	"time"
+
+	"github.com/block/schemabot/pkg/glyph"
+)
 
 func previewPlansListOutput() {
 	WritePlansList(PlansListData{
@@ -9,20 +13,33 @@ func previewPlansListOutput() {
 		HasMore:  true,
 		Plans: []PlanSummaryData{
 			{
+				PlanID:       "plan-1700000000000000004",
+				Database:     "billing-db",
+				Environment:  "production",
+				Source:       PullRequestLink("acme/billing", 77),
+				CreatedAt:    previewTime.Add(-5 * time.Minute),
+				Changes:      "1 alter · " + glyph.Refused,
+				BlockedCount: 1,
+			},
+			{
 				PlanID:      "plan-1700000000000000003",
 				Database:    "orders-db",
 				Environment: "staging",
-				Source:      "https://github.com/acme/shop/pull/412",
+				// Sources arrive pre-rendered by the command layer, so the
+				// preview mirrors its terminal form: the short name linked to
+				// the PR, falling back to the full URL off a terminal.
+				Source:      PullRequestLink("acme/shop", 412),
 				CreatedAt:   previewTime.Add(-10 * time.Minute),
-				Changes:     "3 changes: 1 create, 2 alter · ⚠️ 1 unsafe",
+				Changes:     "1 create, 2 alter · " + glyph.Attention,
+				UnsafeCount: 1,
 			},
 			{
 				PlanID:      "plan-1700000000000000002",
 				Database:    "users-db",
 				Environment: "production",
-				Source:      "https://github.com/acme/shop/pull/410",
+				Source:      PullRequestLink("acme/shop", 410),
 				CreatedAt:   previewTime.Add(-2 * time.Hour),
-				Changes:     "1 change: 1 alter",
+				Changes:     "1 alter",
 			},
 			{
 				PlanID:      "plan-1700000000000000001",

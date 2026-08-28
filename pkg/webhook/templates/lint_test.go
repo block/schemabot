@@ -27,7 +27,7 @@ func TestRenderPlanComment_LintInlineBelowFoldThreshold(t *testing.T) {
 		{Message: `Using "varchar" as primary key is discouraged`, Table: "sessions"},
 	}))
 
-	assert.Contains(t, plan, "💡 **Lint Warnings**: **2** advisory findings")
+	assert.Contains(t, plan, "💡 **Lint Warnings**: 2 advisory findings")
 	assert.Contains(t, plan, "- `users`: Index `idx_email` should be made invisible before dropping")
 	assert.Contains(t, plan, "- `sessions`: Using `varchar` as primary key is discouraged")
 	assert.NotContains(t, plan, "<summary>💡", "a short list never hides behind a fold")
@@ -47,7 +47,7 @@ func TestRenderPlanComment_LintFoldsAndGroupsAboveThreshold(t *testing.T) {
 		{Message: "third users finding", Table: "users"},
 	}))
 
-	assert.Contains(t, plan, "<summary>💡 <b>Lint Warnings</b>: <b>6</b> advisory findings</summary>")
+	assert.Contains(t, plan, "<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>")
 	assert.Contains(t, plan, "**`users`**\n- first users finding\n- second users finding\n- third users finding")
 	assert.Contains(t, plan, "**`sessions`**\n- first sessions finding\n- second sessions finding")
 

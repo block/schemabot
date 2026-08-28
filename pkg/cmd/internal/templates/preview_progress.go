@@ -301,9 +301,10 @@ func previewVitessInstantDDLOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:       "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status:    state.Apply.Completed,
-				IsInstant: true,
+				ChangeType: "alter",
+				DDL:        "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:     state.Apply.Completed,
+				IsInstant:  true,
 			},
 		},
 	}
@@ -672,11 +673,12 @@ func previewVitessManyKeyspacesOutput() {
 	for i := 1; i <= 32; i++ {
 		ks := fmt.Sprintf("commerce_%03d", i)
 		tables = append(tables, TableProgress{
-			TableName: "transactions",
-			Namespace: ks,
-			DDL:       "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
-			Status:    state.Apply.Completed,
-			IsInstant: true,
+			TableName:  "transactions",
+			Namespace:  ks,
+			ChangeType: "alter",
+			DDL:        "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
+			Status:     state.Apply.Completed,
+			IsInstant:  true,
 		})
 	}
 

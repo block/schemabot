@@ -445,3 +445,90 @@ func TestLocalClient_CancelQueuedApplyWithTasksSettlesViaTaskPath(t *testing.T) 
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
 }
+
+// A cancel that lands on a stopped apply must terminalize it. The stopped
+// apply is claimed to deliver the cancel — the claim leaves it stopped rather
+// than transitioning toward resume — and the drive cancels its stopped tasks
+// and settles the apply to cancelled without invoking the engine, since a
+// stopped task has no live engine work. This is the operator escape hatch for
+// a stopped copy that must be discarded: without it the pending cancel would
+// never be consumed and the apply would sit stopped, blocking reconciliation
+// of its target, forever.
+func TestLocalClient_CancelStoppedApplySettlesCancelled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, eng := newTasklessControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{{
+		Namespace: "testdb",
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN stopped_cancel_note VARCHAR(255)",
+		Operation: "alter",
+	}})
+
+	stopResp, err := client.Stop(ctx, &ternv1.StopRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, stopResp.Accepted)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
+
+	stopped, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stopped)
+	require.Equal(t, state.Apply.Stopped, stopped.State, "the apply must be stopped before the cancel lands")
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestCompleted)
+
+	// A drive that reaches a stopped apply with no pending control request
+	// must exit without resuming it or touching the engine: a stopped copy
+	// never resumes without an operator start.
+	engineCallsBeforeGate := eng.recorded()
+	require.NoError(t, client.ResumeApply(ctx, stopped))
+	afterGate, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, afterGate)
+	assert.Equal(t, state.Apply.Stopped, afterGate.State, "a drive with no pending request must leave the stopped apply stopped")
+	assert.Equal(t, engineCallsBeforeGate, eng.recorded(), "a gated drive must not touch the engine")
+
+	cancelResp, err := client.Cancel(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted)
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestPending)
+
+	engineCallsBeforeDrive := eng.recorded()
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Cancelled, settled.State, "a cancelled stopped apply must settle to cancelled")
+	assert.NotNil(t, settled.CompletedAt, "a cancelled apply must carry its completion time")
+
+	settledTasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, settledTasks, 1)
+	assert.Equal(t, state.Task.Cancelled, settledTasks[0].State,
+		"the stopped task must settle to cancelled alongside its apply")
+
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
+	assert.Equal(t, engineCallsBeforeDrive, eng.recorded(),
+		"cancelling a stopped apply must never invoke the engine: a stopped task has no live engine work")
+
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
+	require.NoError(t, err)
+	assert.Nil(t, reclaimed, "a cancelled apply must not be claimable again")
+}

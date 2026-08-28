@@ -156,10 +156,10 @@ func TestMySQLDialectUpsertClause(t *testing.T) {
 			conflict: []string{"repository", "pull_request", "environment", "database_type", "database_name"},
 			assignments: []UpsertAssignment{
 				{Column: "head_sha"},
-				{Column: "change_summary", Expr: "COALESCE(NULLIF(" + d.ExcludedValue("change_summary") + ", ''), change_summary)"},
+				{Column: "change_summary", Expr: "COALESCE(NULLIF(" + d.ExcludedValue("change_summary") + ", ''), checks.change_summary)"},
 			},
 			want: "ON DUPLICATE KEY UPDATE head_sha = VALUES(head_sha), " +
-				"change_summary = COALESCE(NULLIF(VALUES(change_summary), ''), change_summary)",
+				"change_summary = COALESCE(NULLIF(VALUES(change_summary), ''), checks.change_summary)",
 		},
 	}
 

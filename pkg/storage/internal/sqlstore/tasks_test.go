@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -910,4 +911,295 @@ func TestTaskStore_FindTableOwnersReturnsARecencyWindow(t *testing.T) {
 	require.Len(t, owners, tableOwnerLookupLimit)
 	assert.Equal(t, 100+total-1, owners[0].PullRequest, "the window holds the most recent owners")
 	assert.Equal(t, 100+total-tableOwnerLookupLimit, owners[len(owners)-1].PullRequest)
+}
+
+// createRetryableReapTask stores one task row under the apply in the given
+// state, carrying its own error message, and returns the stored row.
+func createRetryableReapTask(t *testing.T, store *Storage, apply *storage.Apply, identifier, table, taskState, errorMessage string) *storage.Task {
+	t.Helper()
+	now := time.Now()
+	_, err := store.Tasks().Create(t.Context(), &storage.Task{
+		TaskIdentifier: identifier,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          taskState,
+		ErrorMessage:   errorMessage,
+		TableName:      table,
+		DDL:            "ALTER TABLE `" + table + "` ADD COLUMN `email` varchar(255)",
+		DDLAction:      "ALTER",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+	task, err := store.Tasks().Get(t.Context(), identifier)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	return task
+}
+
+func assertTaskState(t *testing.T, store *Storage, identifier, want string) {
+	t.Helper()
+	task, err := store.Tasks().Get(t.Context(), identifier)
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Equal(t, want, task.State)
+}
+
+// A failed_retryable task promises a retry that only its parent apply's
+// recovery path can dispatch. Once the parent has settled, nothing will ever
+// dispatch it, and the row poisons readers that treat failed_retryable as "a
+// retry is coming" — most critically the control plane's remote-progress
+// snapshot, which copies the row verbatim and reads it as a permanent retryable
+// pause. The reaper hardens such rows to failed, keeping the task's own error
+// message: its failure is real, only the dead retry promise is retired. Parents
+// that are merely paused — stopped or failed_retryable — are resumable, so
+// their rows stay with the retry path, as do the rows of a live parent.
+func TestTaskStore_ReapStrandedRetryable_HardensTasksUnderSettledParents(t *testing.T) {
+	const taskError = "connection reset during copy"
+	const parentError = "target rejected the schema change"
+
+	tests := []struct {
+		name        string
+		parentState string
+		settles     bool
+	}{
+		{"completed parent hardens its dead retryable task", state.Apply.Completed, true},
+		{"failed parent hardens its dead retryable task", state.Apply.Failed, true},
+		{"cancelled parent hardens its dead retryable task", state.Apply.Cancelled, true},
+		{"reverted parent hardens its dead retryable task", state.Apply.Reverted, true},
+		{"stopped parent keeps its task for the resume path", state.Apply.Stopped, false},
+		{"failed_retryable parent keeps its task for the retry path", state.Apply.FailedRetryable, false},
+		{"running parent keeps its task for its driver", state.Apply.Running, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "reap_fr_db", "mysql")
+			parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_fr_"+tt.parentState, 1, tt.parentState, "staging")
+			// The parent carries its own explanation so the assertions below prove
+			// the task keeps its own error message rather than inheriting the
+			// parent's.
+			setApplyErrorMessage(t, parent.ID, parentError)
+			backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+			retryable := createRetryableReapTask(t, store, parent, "task_reap_fr_users", "users", state.Task.FailedRetryable, taskError)
+			// A sibling in another state is not the reaper's to touch, whatever
+			// the parent's verdict: only the dead retry promise is retired.
+			completedSibling := createRetryableReapTask(t, store, parent, "task_reap_fr_orders", "orders", state.Task.Completed, "")
+
+			settled, err := store.tasks.reapStrandedRetryable(ctx, 10)
+			require.NoError(t, err)
+
+			reloaded, err := store.Tasks().Get(ctx, retryable.TaskIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, reloaded)
+
+			if !tt.settles {
+				assert.Empty(t, settled, "a %s parent can still dispatch the retry, so its task stays failed_retryable", tt.parentState)
+				assert.Equal(t, state.Task.FailedRetryable, reloaded.State)
+				assert.Nil(t, reloaded.CompletedAt, "an untouched retryable task has no completion time")
+				return
+			}
+
+			require.Len(t, settled, 1, "the dead retryable task under a %s parent settles", tt.parentState)
+			assert.Equal(t, retryable.TaskIdentifier, settled[0].Task.TaskIdentifier)
+			assert.Equal(t, state.Task.Failed, settled[0].Task.State, "the returned row carries the state it was written to")
+			assert.Equal(t, parent.ApplyIdentifier, settled[0].Parent.ApplyIdentifier, "the parent travels with the settlement for triage logging")
+
+			assert.Equal(t, state.Task.Failed, reloaded.State, "the task hardens to failed, never to the parent's state")
+			assert.Equal(t, taskError, reloaded.ErrorMessage, "the task keeps its own failure explanation")
+			assert.NotNil(t, reloaded.CompletedAt, "failed is terminal, so the row is stamped complete")
+			assertTaskState(t, store, completedSibling.TaskIdentifier, state.Task.Completed)
+
+			again, err := store.tasks.reapStrandedRetryable(ctx, 10)
+			require.NoError(t, err)
+			assert.Empty(t, again, "a hardened row is no longer failed_retryable, so a later sweep finds nothing to do")
+		})
+	}
+}
+
+// The reaper's quiescence window is sized past the retryable-recovery freshness
+// window the claim paths key on the same parent heartbeat, so a retry admitted
+// at the very edge of that window can never race the reap. A parent quiet for
+// less than the reaper's window — even one long settled by the operation
+// reaper's standard — is left alone until the retry window has definitively
+// lapsed.
+func TestTaskStore_ReapStrandedRetryable_WaitsOutTheRetryFreshnessWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_fr_fresh_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_fr_fresh", 1, state.Apply.Failed, "staging")
+	task := createRetryableReapTask(t, store, parent, "task_reap_fr_fresh", "users", state.Task.FailedRetryable, "copy failed")
+
+	// Quiescent by the operation reaper's standard, but still inside the
+	// retryable-recovery freshness window.
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	settled, err := store.tasks.reapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a parent inside the retry freshness window is not yet quiescent for the task reaper")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.FailedRetryable)
+
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+	settled, err = store.tasks.reapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "once the retry window has lapsed the row settles")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
+}
+
+// The sweep is a bounded maintenance pass: it settles at most the requested
+// number of rows per call, oldest first, so a large backlog drains across ticks
+// instead of in one long transaction.
+func TestTaskStore_ReapStrandedRetryable_RespectsLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_fr_limit_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_fr_limit", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	first := createRetryableReapTask(t, store, parent, "task_reap_fr_1", "users", state.Task.FailedRetryable, "copy failed")
+	second := createRetryableReapTask(t, store, parent, "task_reap_fr_2", "orders", state.Task.FailedRetryable, "copy failed")
+	third := createRetryableReapTask(t, store, parent, "task_reap_fr_3", "items", state.Task.FailedRetryable, "copy failed")
+	backdateTaskCreatedAt(t, first.TaskIdentifier, 3)
+	backdateTaskCreatedAt(t, second.TaskIdentifier, 2)
+	backdateTaskCreatedAt(t, third.TaskIdentifier, 1)
+
+	settled, err := store.tasks.reapStrandedRetryable(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, settled, 2)
+	assert.Equal(t, first.TaskIdentifier, settled[0].Task.TaskIdentifier, "the oldest stranded row settles first")
+	assert.Equal(t, second.TaskIdentifier, settled[1].Task.TaskIdentifier)
+	assertTaskState(t, store, third.TaskIdentifier, state.Task.FailedRetryable)
+
+	settled, err = store.tasks.reapStrandedRetryable(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the next sweep drains the remainder")
+	assert.Equal(t, third.TaskIdentifier, settled[0].Task.TaskIdentifier)
+}
+
+// backdateTaskCreatedAt ages a task's created_at so ordering assertions do not
+// depend on sub-second insert timing (created_at has second precision).
+func backdateTaskCreatedAt(t *testing.T, identifier string, ageSeconds int64) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE tasks SET created_at = NOW() - INTERVAL ? SECOND WHERE task_identifier = ?",
+		ageSeconds, identifier)
+	require.NoError(t, err)
+}
+
+// Selection and the write are separate statements, so a concurrent writer can
+// advance the row in between. The write is guarded on the row still being
+// failed_retryable, so the sweep skips it rather than overwriting a newer state.
+func TestTaskStore_ReapStrandedRetryable_SkipsRowThatLeftFailedRetryable(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_fr_guard_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_fr_guard", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	task := createRetryableReapTask(t, store, parent, "task_reap_fr_guard", "users", state.Task.FailedRetryable, "copy failed")
+	selected, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+
+	// The row advances after selection: another writer moved it to running.
+	_, err = testDB.ExecContext(ctx, "UPDATE tasks SET state = ? WHERE id = ?", state.Task.Running, task.ID)
+	require.NoError(t, err)
+
+	settledRow, err := store.tasks.reapStrandedRetryableTask(ctx, selected)
+	require.NoError(t, err, "losing the race is a skip, not an error")
+	assert.False(t, settledRow, "the guarded write reports that it did not land")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+}
+
+// The parent's state is re-asserted by the write, not just by the sweep that
+// chose the row: hardening a task under a parent that has left the settled set
+// would retire a retry promise the revived rollout can still dispatch.
+func TestTaskStore_ReapStrandedRetryable_SkipsParentThatLeftTheSettledSet(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_fr_revived_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_fr_revived", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	task := createRetryableReapTask(t, store, parent, "task_reap_fr_revived", "users", state.Task.FailedRetryable, "copy failed")
+	selected, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+
+	// The parent leaves the settled set after selection. Its quiescence is
+	// restored so the state it moved to is the only thing the guarded write can
+	// object to.
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET state = ? WHERE id = ?`, state.Apply.FailedRetryable, parent.ID)
+	require.NoError(t, err)
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	settledRow, err := store.tasks.reapStrandedRetryableTask(ctx, selected)
+	require.NoError(t, err, "losing the race is a skip, not an error")
+	assert.False(t, settledRow, "the guarded write reports that it did not land")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.FailedRetryable)
+}
+
+// Only one instance reaps tasks per pass, and its election is independent of
+// the stranded-operation sweep's: the two sweeps hold different locks, so one
+// instance settling operations never parks another instance's task reap.
+func TestTaskStore_ReapStrandedRetryable_ElectsOneReaperPerPass(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_fr_elect_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_fr_elect", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_fr_elect", "users", state.Task.FailedRetryable, "copy failed")
+
+	// A second store stands in for another instance: it holds the task-reaper
+	// lock on its own connection while the first store tries to reap.
+	other := NewMySQL(testDB)
+	held, err := other.tasks.db.Conn(ctx)
+	require.NoError(t, err)
+	acquired, err := namedlock.MySQL{}.Acquire(ctx, held.lockerConn(), strandedTaskReaperLockName, 0)
+	require.NoError(t, err)
+	require.True(t, acquired, "the stand-in instance should take the task reaper lock")
+
+	_, err = store.Tasks().ReapStrandedRetryable(ctx, 10)
+	require.ErrorIs(t, err, storage.ErrStrandedTaskReaperBusy, "a second reaper steps aside rather than re-scanning")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.FailedRetryable)
+
+	// The operation reaper's lock is a different election: holding the task
+	// lock does not park it.
+	settledOps, err := store.ApplyOperations().ReapStranded(ctx, 10)
+	require.NoError(t, err, "the operation reaper elects independently of the task reaper")
+	assert.Empty(t, settledOps)
+
+	released, err := namedlock.MySQL{}.Release(ctx, held.lockerConn(), strandedTaskReaperLockName)
+	require.NoError(t, err)
+	require.True(t, released)
+	require.NoError(t, held.Close())
+
+	// With the lock free, the reaper settles the row and releases the lock again,
+	// so the pass after it is not locked out by its own predecessor.
+	settled, err := store.Tasks().ReapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1)
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
+
+	next := createRetryableReapTask(t, store, parent, "task_reap_fr_elect_2", "orders", state.Task.FailedRetryable, "copy failed")
+	settled, err = store.Tasks().ReapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the task reaper lock is released after each pass")
+	assert.Equal(t, next.TaskIdentifier, settled[0].Task.TaskIdentifier)
 }

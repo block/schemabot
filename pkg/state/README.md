@@ -278,7 +278,7 @@ Unknown raw engine states normalize to `running`. This keeps unfamiliar in-fligh
 
 ## Progress rendering
 
-The CLI renders progress via `pkg/cmd/templates/`. The data flow:
+The CLI renders progress via `pkg/cmd/internal/templates/`. The data flow:
 
 ```
 Engine (Spirit/Vitess)
@@ -292,7 +292,7 @@ Two normalization layers:
 
 1. **`NormalizeTaskStatus()`** (this package) — maps engine-specific strings to canonical Task constants. Called at the parsing boundary so rendering code can compare against `Task.*` directly.
 
-2. **`NormalizeState()`** (`pkg/cmd/templates/progress_parse.go`) — strips the `STATE_` prefix and lowercases (`STATE_RUNNING` → `running`). The prefix exists because protobuf enums require a common prefix by convention (see `State` enum in `tern.proto`: `STATE_PENDING`, `STATE_RUNNING`, etc.). Applied to the apply-level state and per-table status during `ParseProgressResponse()`.
+2. **`NormalizeState()`** (`pkg/cmd/internal/templates/progress_parse.go`) — strips the `STATE_` prefix and lowercases (`STATE_RUNNING` → `running`). The prefix exists because protobuf enums require a common prefix by convention (see `State` enum in `tern.proto`: `STATE_PENDING`, `STATE_RUNNING`, etc.). Applied to the apply-level state and per-table status during `ParseProgressResponse()`.
 
 The rendering layer (`WriteProgress`) uses normalized states to select progress bar styles and display labels (`StateLabel()`). Each state maps to a color:
 
@@ -300,16 +300,16 @@ The rendering layer (`WriteProgress`) uses normalized states to select progress 
 |-------|-------|---------|
 | Running | Blue | `🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%` |
 | Waiting for cutover | Yellow | `🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover` |
-| Cutting over | Yellow | `🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...` |
+| Cutting over | Blue | `🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...` |
 | Completed | Green | `🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete` |
 | Stopped | Orange | `🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 35%` |
 | Failed | Red | `🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed` |
 
-Bars are 20 squares wide; filled squares represent percent complete. Defined in `pkg/cmd/templates/progress_render.go`.
+Bars are 20 squares wide; filled squares represent percent complete. Defined in `pkg/cmd/internal/templates/progress_render.go`.
 
 ### Shard rendering
 
-For Vitess tables, per-shard progress is rendered below the table progress bar. Each shard has a status symbol and detail line. Implemented in `pkg/cmd/templates/progress_shard.go`.
+For Vitess tables, per-shard progress is rendered below the table progress bar. Each shard has a status symbol and detail line. Implemented in `pkg/cmd/internal/templates/progress_shard.go`.
 
 | Symbol | Color | Shard state | Detail |
 |--------|-------|-------------|--------|

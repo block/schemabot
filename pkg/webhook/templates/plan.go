@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -112,6 +113,18 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
+	// Unfinished copies already on the target that the apply will throw away
+	// and copy again from the start.
+	DiscardedCopies []ExistingCopyData
+
+	// Unfinished copies already on the target, left behind by an apply that is
+	// over, that the apply will resume.
+	AdoptedCopies []ExistingCopyData
+
+	// Unfinished copies still being made on the target right now, that the
+	// apply will join rather than resume or restart.
+	RunningCopies []ExistingCopyData
+
 	// Tables carrying a destructive change that another pull request owns, or
 	// whose ownership could not be established.
 	AttributedChanges []AttributedChangeData
@@ -127,6 +140,11 @@ type PlanCommentData struct {
 
 	// Automatic apply state
 	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
+
+	// StoppedConfirmedApply marks a downgrade that stopped an apply the
+	// operator confirmed themselves rather than pausing an automatic one, so
+	// the comment names what actually stopped.
+	StoppedConfirmedApply bool
 
 	RecoveredApplyOwnedCheckState bool
 
@@ -160,6 +178,28 @@ type DeploymentDriftEntry struct {
 	// Detail is a short human explanation for a diverged or errored deployment;
 	// empty for a match.
 	Detail string
+}
+
+// applyingWithoutConfirmation reports whether this comment announces an apply
+// that is already running rather than one waiting on the operator: a locked
+// comment with nothing pausing it. Nothing on such a comment is a question, so
+// the disclosures above the footer state what the apply is doing instead of
+// warning about what confirming would cost, and never offer a remedy that is
+// already out of reach. The footer reads the same predicate, so the two cannot
+// disagree about whether the reader still has a decision to make.
+func (d PlanCommentData) applyingWithoutConfirmation() bool {
+	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
+}
+
+// downgradeHeading names what the comment stopped. An operator who issued
+// apply-confirm themselves paused nothing automatic, so telling them an
+// automatic apply was paused would describe a schema change that was never in
+// flight.
+func (d PlanCommentData) downgradeHeading() string {
+	if d.StoppedConfirmedApply {
+		return "Apply stopped"
+	}
+	return "Automatic apply paused"
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -261,6 +301,21 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL)
 	}
 
+	// Copies already on the target. Shown on the locked apply comment too:
+	// discarding an unfinished copy destroys hours of work already done, so the
+	// disclosure must sit on the comment the confirmation acts on. The copy is
+	// read from the target at plan time, so it can appear on the apply comment
+	// without having been on the plan comment that preceded it.
+	if len(data.DiscardedCopies) > 0 {
+		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.AdoptedCopies) > 0 {
+		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.RunningCopies) > 0 {
+		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
+	}
+
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
@@ -304,9 +359,9 @@ func RenderPlanComment(data PlanCommentData) string {
 			applyConfirmCmd += " --skip-revert"
 		}
 
-		if data.AutoConfirmDowngradeReason != "" {
+		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, "⚠️ **Automatic apply paused**: %s\n\n", data.AutoConfirmDowngradeReason)
+			fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
 			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
@@ -368,7 +423,7 @@ func attributionStillActionable(data PlanCommentData) bool {
 // that last changed it, never the specific column or index.
 func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "🛑 **Check before applying**: **%d** %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
+	fmt.Fprintf(sb, "🛑 **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
 	for _, d := range changes {
 		if d.Unresolved {
 			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
@@ -378,8 +433,8 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 		// table, which is not necessarily the last one to change it: a later
 		// change from a pull request that has since closed leaves no open claim
 		// and is passed over.
-		fmt.Fprintf(sb, "- `%s`: changed by [%s#%d](https://github.com/%s/pull/%d), which is still open\n",
-			d.Table, d.Repository, d.PullRequest, d.Repository, d.PullRequest)
+		fmt.Fprintf(sb, "- `%s`: changed by %s, which is still open\n",
+			d.Table, caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
@@ -515,7 +570,7 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 	for i, ns := range ignored {
 		quoted[i] = fmt.Sprintf("`%s`", ns)
 	}
-	fmt.Fprintf(sb, "ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
 }
 
 // multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
@@ -569,14 +624,14 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 		for i, ns := range plan.IgnoredNamespaces {
 			quoted[i] = fmt.Sprintf("`%s`", ns)
 		}
-		fmt.Fprintf(sb, "ℹ️ **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
+		fmt.Fprintf(sb, glyph.Info+" **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
 	}
 }
 
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	sb.WriteString("✅ **No schema changes detected**\n")
 	if data.RecoveredApplyOwnedCheckState {
-		sb.WriteString("\nℹ️ SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
+		sb.WriteString("\n" + glyph.Info + " SchemaBot found stored PR check state for this database/environment that was still marked as an apply in progress. Because this fresh plan shows the target schema already matches this PR, SchemaBot updated the PR check to passing.\n")
 	}
 }
 
@@ -802,7 +857,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	}
 
 	if !drift.Computed {
-		sb.WriteString("⚠️ **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
+		sb.WriteString(glyph.Attention + " **Could not verify deployment drift** — the plan check is failing closed until it can be confirmed.\n\n")
 		return
 	}
 
@@ -812,7 +867,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
-	sb.WriteString("⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
 	for _, d := range drift.Deployments {
 		name := "`" + d.Deployment + "`"
 		if d.Primary {
@@ -822,9 +877,9 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		case "match":
 			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
 		case "diverged":
-			fmt.Fprintf(sb, "- %s ⚠️ diverged%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s\n", name, driftDetailSuffix(d.Detail))
 		default:
-			fmt.Fprintf(sb, "- %s ❌ could not verify%s\n", name, driftDetailSuffix(d.Detail))
+			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s\n", name, driftDetailSuffix(d.Detail))
 		}
 	}
 	sb.WriteString("\n")
@@ -850,10 +905,11 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 
 // writeBlockedChanges writes the section for statements the engine refuses,
 // naming each table and the engine's reason verbatim. There is no opt-in flag
-// that lets these through — the guidance is to rewrite the change, not retry.
+// that lets these through — the remedy is whatever each reason names: an
+// unsupported shape needs a rewrite, a missing grant needs provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, "⛔ **Cannot apply**: **%d** %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -865,7 +921,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nAn apply will fail on these statements. Rewrite them as a supported schema change, or contact your SchemaBot operators for help.\n\n")
+	sb.WriteString("\nAn apply will fail on these statements. Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n\n")
 }
 
 // directConsentCopy returns the header noun and consent footer for the
@@ -896,7 +952,7 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
 	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
 	n := len(changes)
-	fmt.Fprintf(sb, "⚙️ **Direct execution**: **%d** %s will run as %s\n", n, pluralize("change", n), headerNoun)
+	fmt.Fprintf(sb, "⚙️ **Direct execution**: %d %s will run as %s\n", n, pluralize("change", n), headerNoun)
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -913,7 +969,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := countUnsafeFindings(changes)
-	fmt.Fprintf(sb, "⚠️ **Issues**: **%d** unsafe %s detected\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -1047,7 +1103,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	n := len(warnings)
 
 	if n <= lintWarningsFoldThreshold {
-		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: **%d** advisory %s\n", n, pluralize("finding", n))
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %d advisory %s\n", n, pluralize("finding", n))
 		for _, w := range warnings {
 			message := ui.CodeQuoteIdentifiers(w.Message)
 			if w.Table != "" {
@@ -1062,7 +1118,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: <b>%d</b> advisory %s</summary>\n\n", n, pluralize("finding", n))
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %d advisory %s</summary>\n\n", n, pluralize("finding", n))
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**`%s`**\n", group.table)
@@ -1212,7 +1268,7 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 			fmt.Fprintf(&sb, "### %s\n\n", capitalizeFirst(env))
 
 			if errMsg, hasErr := data.Errors[env]; hasErr {
-				writeErrorBlock(&sb, errMsg)
+				writeErrorBlock(&sb, glyph.Failed, errMsg)
 				sb.WriteString("\n")
 				continue
 			}
@@ -1358,6 +1414,18 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
+	// Copies already on the target — read per environment, since each
+	// environment has its own target.
+	if len(plan.DiscardedCopies) > 0 {
+		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
+	}
+	if len(plan.AdoptedCopies) > 0 {
+		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
+	}
+	if len(plan.RunningCopies) > 0 {
+		writeRunningCopies(sb, plan.RunningCopies, plan.applyingWithoutConfirmation())
+	}
+
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
@@ -1424,7 +1492,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	if len(envsWithErrors) > 0 {
 		sb.WriteString("\n")
 		for _, env := range envsWithErrors {
-			fmt.Fprintf(sb, "⚠️ **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
+			fmt.Fprintf(sb, glyph.Attention+" **%s** failed to plan. Resolve the error above and re-run:\n", capitalizeFirst(env))
 			fmt.Fprintf(sb, "```\n%s\n```\n", tenantCommand("schemabot plan", env, data.Tenant))
 		}
 	}
@@ -1482,51 +1550,24 @@ func AnyEnvHasDriftToShow(data MultiEnvPlanCommentData) bool {
 	return false
 }
 
-// driftIdentical reports whether two plans' deployment-drift rollups render the
-// same, so environments are only deduplicated when their drift is identical too.
-func driftIdentical(a, b *DeploymentDriftData) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	if a.Computed != b.Computed || a.Clean != b.Clean || len(a.Deployments) != len(b.Deployments) {
-		return false
-	}
-	for i := range a.Deployments {
-		if a.Deployments[i] != b.Deployments[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// plansIdentical checks if two plans have the same DDL statements. Plans that
-// excluded different namespaces are never identical: deduplicating them into
-// one section would show one environment's exclusion disclosure for both.
+// plansIdentical reports whether two environments' plan sections are the same
+// section, so one may stand in for both under a combined header.
+//
+// It answers that by rendering both and comparing the bytes, because every
+// disclosure in a section is a promise about one environment's target and
+// standing in for the other means making that promise for a target it was never
+// read from. Identical DDL does not make those promises identical: execution
+// policy, the task history that attributes a change, and unfinished copies on
+// the target are all resolved per environment, so a section can differ on any of
+// them while the statements match. Comparing what the section says is the only
+// comparison that stays right as sections gain disclosures — a field-by-field
+// version silently drops each one added after it was written, and drops it from
+// the comment operators apply from.
 func plansIdentical(a, b *PlanCommentData) bool {
-	if !slices.Equal(a.IgnoredNamespaces, b.IgnoredNamespaces) {
-		return false
-	}
-	if len(a.Changes) != len(b.Changes) {
-		return false
-	}
-	for i, aChange := range a.Changes {
-		bChange := b.Changes[i]
-		if aChange.Keyspace != bChange.Keyspace {
-			return false
-		}
-		if len(aChange.Statements) != len(bChange.Statements) {
-			return false
-		}
-		for j, stmt := range aChange.Statements {
-			if stmt != bChange.Statements[j] {
-				return false
-			}
-		}
-		if aChange.VSchemaChanged != bChange.VSchemaChanged || aChange.VSchemaDiff != bChange.VSchemaDiff {
-			return false
-		}
-	}
-	return driftIdentical(a.DeploymentDrift, b.DeploymentDrift)
+	var renderedA, renderedB strings.Builder
+	writeEnvironmentPlanSection(&renderedA, a)
+	writeEnvironmentPlanSection(&renderedB, b)
+	return renderedA.String() == renderedB.String()
 }
 
 // capitalizeEnvNames joins environment names with " & " and capitalizes each.

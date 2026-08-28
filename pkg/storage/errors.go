@@ -4,6 +4,11 @@ import "errors"
 
 // Common storage errors.
 var (
+	// ErrNotImplemented is returned by interface methods that no
+	// implementation supports yet. Callers must treat it as a hard error,
+	// never as an empty result.
+	ErrNotImplemented = errors.New("not implemented")
+
 	// ErrLockHeld is returned when attempting to acquire a lock that is already held.
 	ErrLockHeld = errors.New("lock is already held")
 
@@ -41,6 +46,11 @@ var (
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
+
+	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
+	// apply's superseded_by marker to a different successor. The marker is
+	// write-once, so a second claimant means the takeover is ambiguous.
+	ErrApplyAlreadySuperseded = errors.New("apply already superseded by another apply")
 
 	// ErrPlanNotFound is returned when a plan does not exist.
 	ErrPlanNotFound = errors.New("plan not found")

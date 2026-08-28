@@ -93,6 +93,69 @@ func TestFormatDDL(t *testing.T) {
 			input:    "ALTER TABLE `t` ADD INDEX `idx`(`col`);",
 			expected: "ALTER TABLE `t` ADD INDEX `idx`(`col`);",
 		},
+		{
+			name: "CREATE TABLE with options and PARTITION BY LIST",
+			input: "CREATE TABLE `t` (`id` bigint NOT NULL AUTO_INCREMENT, `run_partition_id` bigint NOT NULL, " +
+				"PRIMARY KEY (`run_partition_id`,`id`), KEY `idx_id` (`id`)) " +
+				"ENGINE = InnoDB, CHARSET utf8mb4, COLLATE utf8mb4_0900_ai_ci " +
+				"PARTITION BY LIST (`run_partition_id`) (PARTITION p_seed VALUES IN (0))",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"    `run_partition_id` bigint NOT NULL,\n" +
+				"    PRIMARY KEY(`run_partition_id`, `id`),\n" +
+				"    INDEX `idx_id`(`id`)\n" +
+				") ENGINE InnoDB,\n" +
+				"  CHARSET utf8mb4,\n" +
+				"  COLLATE utf8mb4_0900_ai_ci\n" +
+				"  PARTITION BY LIST (`run_partition_id`) (PARTITION `p_seed` VALUES IN (0));",
+		},
+		{
+			name:  "CREATE TABLE with PARTITION BY HASH and no other options",
+			input: "CREATE TABLE `t2` (`id` bigint NOT NULL, `k` bigint NOT NULL) PARTITION BY HASH (`k`) PARTITIONS 8",
+			expected: "CREATE TABLE `t2` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `k` bigint NOT NULL\n" +
+				") PARTITION BY HASH (`k`) PARTITIONS 8;",
+		},
+		{
+			name:  "single column CREATE TABLE with PARTITION BY",
+			input: "CREATE TABLE `t3` (`id` BIGINT NOT NULL) ENGINE=InnoDB PARTITION BY HASH (`id`) PARTITIONS 4",
+			expected: "CREATE TABLE `t3` (`id` bigint NOT NULL) ENGINE InnoDB\n" +
+				"  PARTITION BY HASH (`id`) PARTITIONS 4;",
+		},
+		{
+			name:     "COMMENT containing PARTITION BY is not split",
+			input:    "CREATE TABLE `t4` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='do not PARTITION BY hand'",
+			expected: "CREATE TABLE `t4` (`id` bigint NOT NULL) ENGINE InnoDB,\n  COMMENT 'do not PARTITION BY hand';",
+		},
+		{
+			name:  "non-ASCII COMMENT before PARTITION BY",
+			input: "CREATE TABLE `t5` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='ılık ıslak' PARTITION BY HASH (`id`) PARTITIONS 2",
+			expected: "CREATE TABLE `t5` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
+				"  COMMENT 'ılık ıslak'\n" +
+				"  PARTITION BY HASH (`id`) PARTITIONS 2;",
+		},
+		{
+			name: "PARTITION BY RANGE with multiple definitions stays on one line",
+			input: "CREATE TABLE `events` (`id` bigint NOT NULL AUTO_INCREMENT, `created_at` datetime(3) NOT NULL, " +
+				"PRIMARY KEY (`created_at`,`id`), KEY `idx_id` (`id`)) " +
+				"ENGINE = InnoDB, CHARSET utf8mb4 " +
+				"PARTITION BY RANGE (TO_DAYS(`created_at`)) (" +
+				"PARTITION p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01'))," +
+				"PARTITION p2026_02 VALUES LESS THAN (TO_DAYS('2026-03-01'))," +
+				"PARTITION pmax VALUES LESS THAN (MAXVALUE))",
+			expected: "CREATE TABLE `events` (\n" +
+				"    `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"    `created_at` datetime(3) NOT NULL,\n" +
+				"    PRIMARY KEY(`created_at`, `id`),\n" +
+				"    INDEX `idx_id`(`id`)\n" +
+				") ENGINE InnoDB,\n" +
+				"  CHARSET utf8mb4\n" +
+				"  PARTITION BY RANGE (TO_DAYS(`created_at`)) " +
+				"(PARTITION `p2026_01` VALUES LESS THAN (TO_DAYS('2026-02-01'))," +
+				"PARTITION `p2026_02` VALUES LESS THAN (TO_DAYS('2026-03-01'))," +
+				"PARTITION `pmax` VALUES LESS THAN (MAXVALUE));",
+		},
 	}
 
 	for _, tt := range tests {

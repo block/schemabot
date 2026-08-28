@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -465,10 +466,10 @@ func WriteErrors(errors []string) {
 // entry) — the namespaces they name are fully reconciled.
 func WriteIgnoredNamespaces(ignored, unmatched []string) {
 	if len(ignored) > 0 {
-		fmt.Printf("ℹ️  Namespaces excluded by ignore_namespaces: %s\n", strings.Join(ignored, ", "))
+		fmt.Printf(glyph.Info+"  Namespaces excluded by ignore_namespaces: %s\n", strings.Join(ignored, ", "))
 	}
 	for _, entry := range unmatched {
-		fmt.Printf("⚠️  ignore_namespaces entry %q matched no namespace and excluded nothing\n", entry)
+		fmt.Printf(glyph.Attention+"  ignore_namespaces entry %q matched no namespace and excluded nothing\n", entry)
 	}
 	if len(ignored) > 0 || len(unmatched) > 0 {
 		fmt.Println()
@@ -479,23 +480,27 @@ func WriteIgnoredNamespaces(ignored, unmatched []string) {
 type UnsafeChange = apitypes.UnsafeChange
 
 // WriteUnsafeChangesWarning writes a warning about unsafe changes (for plan output).
+// At plan time nothing has been refused yet — the changes await consent, so the
+// heading carries Attention, matching the PR plan comment and list-plans.
 func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 	if len(changes) == 0 {
 		return
 	}
-	fmt.Println("⛔ Unsafe Changes Detected:")
+	fmt.Println(glyph.Attention + " Unsafe Changes Detected:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
 
 // WriteUnsafeChangesBlocked writes the unsafe changes list and instruction to re-run with --allow-unsafe.
+// The apply was refused, so Refused attaches to the refusal itself — the heading
+// names the blocked apply, not the unsafeness of the changes.
 func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, schemaDir string) {
 	if len(changes) > 0 {
-		fmt.Println("⛔ Unsafe Changes Detected:")
+		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", len(changes))
 		writeUnsafeChangesList(changes)
 		fmt.Println()
 	}
-	fmt.Println("🚨 To proceed with these destructive changes, re-run with --allow-unsafe:")
+	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
 	fmt.Printf("  %s apply -s %s -e %s --allow-unsafe\n", cliname.Name(), schemaDir, environment)
 	fmt.Println()
@@ -507,7 +512,7 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 		return
 	}
 	fmt.Println()
-	fmt.Println("🚨 Unsafe Changes (--allow-unsafe enabled)")
+	fmt.Println(glyph.Escalation + " Unsafe Changes (--allow-unsafe enabled)")
 	fmt.Println()
 	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)

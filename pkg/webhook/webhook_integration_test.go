@@ -382,6 +382,11 @@ type planFlowResult struct {
 	// "closed" before issuing the webhook request.
 	PRState atomic.Pointer[string]
 
+	// FailCommentPost makes every comment POST fail, so tests can exercise the
+	// paths that must not record durable state describing a comment the
+	// operator never received.
+	FailCommentPost atomic.Bool
+
 	// baseFiles is what the default branch holds, as repository path to blob
 	// SHA. It starts as the schema directory carrying the config at a blob of
 	// its own, so resolving a PR's schema file at the default branch tip walks
@@ -917,6 +922,12 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.comments <- body.Body
+		if result.FailCommentPost.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"message":"Server Error"}`))
+			return
+		}
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
 	})

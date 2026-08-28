@@ -1807,7 +1807,7 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 		assert.Contains(t, body, "Apply rejected — base schema is newer")
 		assert.Contains(t, body, "Merge or rebase")
 		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
-		assert.NotContains(t, body, "Unsafe Change", "unsafe prompt must not outrank the freshness rejection")
+		assert.NotContains(t, body, "unsafe change", "unsafe prompt must not outrank the freshness rejection")
 		assert.NotContains(t, body, "DROP COLUMN", "no stale-plan DDL may be rendered")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for base-schema rejection")
@@ -1932,7 +1932,7 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply rejected — base schema is newer")
 		assert.NotContains(t, body, "allow-unsafe", "stale branch must not be coached toward --allow-unsafe")
-		assert.NotContains(t, body, "Unsafe Change", "unsafe prompt must not outrank the freshness rejection")
+		assert.NotContains(t, body, "unsafe change", "unsafe prompt must not outrank the freshness rejection")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for final-gate base-schema rejection")
 	}
@@ -2825,7 +2825,7 @@ func TestE2EApplyAutoConfirmReGatesAgainstFreshHEADBeforeApply(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
+		comment: "schemabot apply -e staging",
 		isPR:    true,
 	}, nil)
 
@@ -2937,7 +2937,7 @@ func TestE2EApplyAutoConfirmFreshHEADBlockPreservesOtherPRLock(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging -y",
+		comment: "schemabot apply -e staging",
 		isPR:    true,
 	}, nil)
 

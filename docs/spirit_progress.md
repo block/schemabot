@@ -307,8 +307,8 @@ Defined in `pkg/cmd/internal/templates/progress.go`.
 
 | Color | Emoji | Meaning | Used when |
 |-------|-------|---------|-----------|
-| Blue  | `🟦`  | In progress | Actively copying rows |
-| Yellow | `🟨` | Waiting | Waiting for cutover / cutting over |
+| Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
+| Yellow | `🟨` | Waiting | Waiting for cutover (the operator holds the next move) |
 | Green | `🟩`  | Complete | Table finished successfully |
 | Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
 | Red   | `🟥`  | Failed | Table failed |
@@ -370,9 +370,10 @@ Defined in `pkg/cmd/internal/templates/progress.go`.
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 
-**Cutting over** — yellow bar at 100% with spinner:
+**Cutting over** — blue bar at 100% with spinner (the engine is working again, so the
+bar returns to blue):
 ```
-  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 🔄 Cutting over...
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
 ```
 

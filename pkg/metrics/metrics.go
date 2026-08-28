@@ -430,19 +430,35 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 	)
 }
 
+// Scope values for RecordStorageSchemaDestructiveRefusal: whether the whole
+// statement was refused or only the destructive clauses split out of a mixed
+// ALTER (whose safe clauses still executed).
+const (
+	StorageSchemaRefusalWhole = "whole"
+	StorageSchemaRefusalSplit = "split"
+)
+
 // RecordStorageSchemaDestructiveRefusal increments the counter for destructive
 // storage-schema DDL statements EnsureSchema refused to execute at startup.
 // A nonzero rate means a starting binary's embedded schema no longer declares
 // a table or column that exists in the storage database — expected briefly
-// from older pods during a rolling deploy or rollback. Operator action: if the
-// removal is intended and every pod runs a binary without the table or column,
-// set storage.allow_destructive_schema_changes to true for one deploy;
-// otherwise investigate which binary is starting against newer storage state.
-func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation string) {
+// from older pods during a rolling deploy or rollback. The scope attribute
+// says whether the safe clauses of the statement still ran: "split" means a
+// mixed ALTER executed its safe clauses and refused only the destructive
+// remainder; "whole" means nothing in the statement ran. Operator action: if
+// the removal is intended and every pod runs a binary without the table or
+// column, set storage.allow_destructive_schema_changes to true for one
+// deploy; otherwise investigate which binary is starting against newer
+// storage state.
+func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation, scope string) {
 	addCounter(ctx, "schemabot.storage_schema.destructive_refusals_total",
 		"Total destructive storage-schema DDL statements refused by EnsureSchema", "{statement}",
 		attribute.String("table", table),
 		attribute.String("operation", operation),
+		attribute.String("scope", scope),
+		// The storage-schema bootstrap precedes any schema-change
+		// environment, so the counter carries the canonical unknown value.
+		EnvironmentAttribute(""),
 	)
 }
 
@@ -602,8 +618,9 @@ func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{
-	"apply_finished":    true,
-	"rollback_finished": true,
+	"apply_finished":           true,
+	"apply_cancelled_finished": true,
+	"rollback_finished":        true,
 }
 
 // RecordCheckOwnershipMiss increments the counter for guarded check updates
@@ -870,9 +887,10 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 }
 
 // RecordConflictCheckOwnershipBlock counts conflict-check decisions that kept
-// a non-terminal task blocking its database because the task's parent apply
-// lease says this process's engine memory is not authoritative for it.
-// Reasons:
+// a non-terminal task blocking its database because this process could not
+// establish that no driver will reach the task on its own — either the apply's
+// lease says this process's engine memory is not authoritative for it, or a
+// driver is still on its way to it. Reasons:
 //   - "fresh_lease": a live driver holds the apply's lease, so the local
 //     engine probe was skipped and the live drive stays authoritative. A
 //     sustained rate means new applies are repeatedly dispatched against a
@@ -882,9 +900,17 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
 //     investigate if the same task repeats here without converging.
+//   - "pending_control_request": a stopped task's apply carries an operator
+//     command a driver has not delivered yet, so the task still holds its
+//     database. A sustained rate means commands are queued but not being
+//     drained — check that drivers are claiming on this deployment.
+//   - "control_request_unreadable": the control requests of a stopped task's
+//     apply could not be read, so the task kept blocking rather than being
+//     released on an unproven assumption. Any sustained rate is a storage
+//     problem, not a workload one.
 func RecordConflictCheckOwnershipBlock(ctx context.Context, database, databaseType, reason string) {
 	addCounter(ctx, "schemabot.conflict_check.ownership_blocks_total",
-		"Total conflict-check decisions that kept a task blocking because the apply lease denies local engine authority", "{block}",
+		"Total conflict-check decisions that kept a task blocking because no driver could be ruled out for it", "{block}",
 		attribute.String("database", database),
 		attribute.String("database_type", databaseType),
 		attribute.String("reason", reason),
@@ -956,6 +982,7 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 	"attach_race":      true,
 	"terminal_refused": true,
 	"manifest_refused": true,
+	"adopted":          true,
 }
 
 // RecordRemoteApplyAttach increments the counter for dispatches that resolved
@@ -975,6 +1002,10 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 //     two planes disagree about the generation's operation set (version or
 //     data skew), so compare the dispatcher's operation rows against the
 //     stored manifest before retrying.
+//   - "adopted": a dispatch resolved into the live apply already running its
+//     exact change set instead of being refused by it. A steady rate means
+//     applies are routinely outliving the identity that started them —
+//     investigate what is terminalizing them while their work continues.
 func RecordRemoteApplyAttach(ctx context.Context, database, environment, outcome string) {
 	if !knownRemoteApplyAttachOutcomes[outcome] {
 		outcome = "unknown"
@@ -1106,6 +1137,7 @@ func RecordOperatorStrandedOperationReaped(ctx context.Context, database, deploy
 var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
 	"stranded_reaper_error":                    true,
+	"stranded_task_reaper_error":               true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
 	"missing_operation_lease_token":            true,
@@ -2030,6 +2062,7 @@ var knownStatusCheckOperations = map[string]bool{
 	"plan_check_recorded":                  true,
 	"apply_started":                        true,
 	"apply_finished":                       true,
+	"apply_cancelled_finished":             true,
 	"rollback_finished":                    true,
 	"aggregate_check_sync":                 true,
 	"stale_check_cleanup":                  true,

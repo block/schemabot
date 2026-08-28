@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -177,9 +178,17 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// per-table task (a VSchema-only apply has no tables at all).
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
-	// Error message for apply states that need operator triage.
-	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
-		writeErrorBlock(&sb, data.ErrorMessage)
+	// Error message for apply states that need operator attention. A failed
+	// apply gets the failure glyph — the system stopped and triage is due; a
+	// stopped apply gets the attention glyph — the heading already says the
+	// operator paused it, and the error is context, not a fresh failure.
+	if data.ErrorMessage != "" {
+		switch {
+		case state.IsState(data.State, state.Apply.Failed):
+			writeErrorBlock(&sb, glyph.Failed, data.ErrorMessage)
+		case state.IsState(data.State, state.Apply.Stopped):
+			writeErrorBlock(&sb, glyph.Attention, data.ErrorMessage)
+		}
 	}
 
 	// Footer with next actions
@@ -220,7 +229,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Schema Change Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
@@ -242,7 +251,7 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Rollback Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
@@ -288,6 +297,13 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 		return
 	}
 	detail := applyStatusDetail(data.State)
+	if state.IsRunningApplyState(data.State) && hasRetryingTable(data.Tables) {
+		// A remote data plane retries its failures on its own: the stored
+		// apply stays active through the pause, so the retry is only visible
+		// on the task rows. Surface it as the status so the operator sees the
+		// same Retrying view a locally parked apply gets.
+		detail = "Retrying"
+	}
 	if data.Rollback && state.IsState(data.State, state.Apply.Completed) {
 		detail = "Rolled Back"
 	}
@@ -637,7 +653,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 				renderResumingTable(sb, table)
 				continue
 			}
-			renderTableProgress(sb, table, data.Attempt, data.ErrorMessage)
+			renderTableProgress(sb, table, data.State, data.Attempt, data.ErrorMessage)
 		}
 	}
 }
@@ -655,6 +671,19 @@ type namespaceTableGroup struct {
 // render without a header, so a comment never shows a meaningless
 // "Schema `default`" / "Keyspace `default`" header or splits the same logical
 // no-namespace tables into separate groups.
+// hasRetryingTable reports whether any table sits in a retryable pause. An
+// active apply with a retrying table means a data plane is recovering the
+// failure on its own; the pause never reaches the stored apply state, so
+// status and footer rendering derive it from the task rows.
+func hasRetryingTable(tables []TableProgressData) bool {
+	for _, table := range tables {
+		if state.IsState(state.NormalizeTaskStatus(table.Status), state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
+}
+
 func groupTablesByNamespace(tables []TableProgressData) []namespaceTableGroup {
 	var groups []namespaceTableGroup
 	index := make(map[string]int)
@@ -702,7 +731,7 @@ func tableStatePriority(tableStatus string) int {
 // instead of ANSI. applyError is the apply-level error message the comment
 // renders as its own block, so a failed table's identical error is not
 // repeated below the row.
-func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAttempt int, applyError string) {
+func renderTableProgress(sb *strings.Builder, table TableProgressData, applyState string, applyAttempt int, applyError string) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
@@ -766,12 +795,15 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 			writeRowsAndETA(sb, table)
 			break
 		}
-		bar := ui.ProgressBarWaitingCutover()
+		// Blue activity bar: the engine is working on its own with no
+		// meaningful percentage — yellow is reserved for states where the
+		// operator holds the next move.
+		bar := ui.ProgressBarActivity()
 		fmt.Fprintf(sb, "**`%s`**: %s Recovering state...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
 	case state.Task.CuttingOver:
-		bar := ui.ProgressBarWaitingCutover()
+		bar := ui.ProgressBarActivity() // blue — automatic work, no operator action
 		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Cutting over...\n", table.TableName, bar)
 		writeDDLLine(sb, table.DDL)
 
@@ -783,24 +815,34 @@ func renderTableProgress(sb *strings.Builder, table TableProgressData, applyAtte
 		// at all, so its failure label does not mention one.
 		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
 		case pct > 0:
-			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
+			fmt.Fprintf(sb, "**`%s`**: %s "+glyph.Failed+" Failed\n", table.TableName, ui.ProgressBarFailed(pct))
 		case table.IsInstant:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed\n", table.TableName)
 		default:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed (before row copy started)\n", table.TableName)
 		}
 		writeDDLLine(sb, table.DDL)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			writeTableErrorLine(sb, glyph.Failed, table.ErrorMessage)
 		}
 
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
-		fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
-			table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
+		if state.IsState(applyState, state.Apply.FailedRetryable) {
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
+				table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
+		} else {
+			// The apply is paused by a data plane that retries on its own; its
+			// attempt count does not cross the wire, so announce the retry
+			// without inventing a number.
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n",
+				table.TableName, bar)
+		}
 		writeDDLLine(sb, table.DDL)
 		if table.ErrorMessage != "" {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			// The row above says SchemaBot is retrying on its own, so the
+			// error is context for the operator, not a failure to triage.
+			writeTableErrorLine(sb, glyph.Attention, table.ErrorMessage)
 		}
 
 	case state.Task.Cancelled:
@@ -855,9 +897,15 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		for _, sh := range table.Shards {
 			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
 				parts = append(parts, fmt.Sprintf("%s %s %d%%", shardGlyph(sh.Status), sh.Shard, sh.PercentComplete))
-			} else {
-				parts = append(parts, fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard))
+				continue
 			}
+			part := fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard)
+			// Glyphs whose meaning isn't self-evident carry the same word the
+			// bucketed form uses, so the line reads without a legend.
+			if word := shardStatusWord(sh.Status); word != "" {
+				part += " " + word
+			}
+			parts = append(parts, part)
 		}
 		fmt.Fprintf(sb, "  └ shards: %s\n", strings.Join(parts, " · "))
 		return
@@ -933,6 +981,25 @@ func shardGlyph(status string) string {
 	}
 }
 
+// shardStatusWord returns the word the bucketed summary pairs with a shard's
+// glyph, for glyphs a reader can't decode on sight. Self-evident glyphs
+// (✓ complete, ⏳ queued) return "", and so does the unknown-status catch-all
+// — the bucketed form keeps its "…" bucket bare too. Copying shards return
+// "copying", which the caller replaces with a percent when one is available.
+func shardStatusWord(status string) string {
+	switch state.NormalizeShardStatus(status) {
+	case state.Task.WaitingForCutover:
+		return "ready"
+	case state.Task.Failed, state.Task.FailedRetryable:
+		return "failed"
+	default:
+		if isCopyingShardStatus(status) {
+			return "copying"
+		}
+		return ""
+	}
+}
+
 // isCopyingShardStatus reports whether a shard is actively doing copy/cutover work.
 func isCopyingShardStatus(status string) bool {
 	switch state.NormalizeShardStatus(status) {
@@ -951,7 +1018,7 @@ func renderRunningTable(sb *strings.Builder, table TableProgressData) {
 			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", table.TableName, ui.ProgressBarActivity(), throttledSuffix(table))
 			writeDDLLine(sb, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
-			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
 			return
 		}
 
@@ -1002,10 +1069,10 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
 		return
 	}
-	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -1101,6 +1168,15 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running, state.Apply.RunningDegraded,
 		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
+		if hasRetryingTable(data.Tables) {
+			// The apply is active but a data plane is retrying a failed table
+			// on its own; give the operator the same retry guidance a locally
+			// parked apply gets.
+			writeStopOrCancelFooterAction(sb, data,
+				"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
+				"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
+			return
+		}
 		writeStopOrCancelFooterAction(sb, data, "To stop this schema change:", "To cancel this schema change:")
 	case state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
@@ -1211,7 +1287,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	writeSummaryMetadata(sb, data)
 
 	if data.ErrorMessage != "" {
-		writeErrorBlock(sb, data.ErrorMessage)
+		writeErrorBlock(sb, glyph.Failed, data.ErrorMessage)
 	}
 
 	if completedCount > 0 {
@@ -1544,7 +1620,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 	}
 
 	if states[state.Task.Failed] {
-		return "❌"
+		return glyph.Failed
 	}
 	if states["reverted"] {
 		return "↩️"

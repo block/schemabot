@@ -36,6 +36,26 @@ func TestApplyCommandCoreBootstrapFailureIsRetryable(t *testing.T) {
 	assert.True(t, retry, "a command bootstrap failure is a transient infra failure a durable driver should re-drive")
 }
 
+// A GitHub App resolution failure inside the bootstrap is deterministic per
+// deployment config — the same repo resolves to the same missing App on every
+// attempt — so the core must report it as terminal rather than re-driving a
+// delivery that can only fail until an operator fixes the config. The command
+// never ran and no PR comment could be posted, so the core also returns the
+// error: the delivery is recorded as failed (its only triage trail) rather
+// than completed.
+func TestApplyCommandCoreAppResolutionFailureIsTerminal(t *testing.T) {
+	h := &Handler{
+		ghClients: ghclient.NewClientSet(nil),
+		logger:    testLogger(),
+	}
+
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errGitHubAppResolution)
+	assert.False(t, retry, "a deterministic GitHub App resolution failure must not be re-driven; recovery is fixing the deployment config")
+}
+
 // Terminal outcomes are the command's answer — a static skip or a config-shape
 // rejection the same input will always produce — so the core reports them as
 // (retry=false, err=nil): a durable driver must not re-drive them.
@@ -86,6 +106,23 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		body := requireComment(t, comments, "environment-not-configured apply error")
 		assert.Contains(t, body, `database &#34;orders&#34; environment &#34;staging&#34; is not configured on this server`)
 	})
+}
+
+// An aggregate participant that cannot enumerate a truncated repository does
+// not know whether it owns the changed schema — it might be the owner and
+// simply unable to prove it. A silent defer here could drop a command with no
+// deployment answering, so the failure surfaces fail-closed and stays
+// retryable for a durable driver.
+func TestApplyCommandCoreParticipantTruncatedDiscoverySurfaces(t *testing.T) {
+	h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+	serveTruncatedRepoWithChangedSchemaFile(t, mux)
+
+	retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "production", "", 12345, "hubot", CommandResult{Action: action.Apply})
+
+	require.Error(t, err)
+	assert.True(t, retry, "incomplete discovery is not the command's answer, so it must stay retryable")
+	body := requireComment(t, comments, "participant truncated-discovery error")
+	assert.Contains(t, body, "truncated repository tree")
 }
 
 // A GitHub read failure during config discovery (here, fetching the changed

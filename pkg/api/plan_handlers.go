@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
@@ -59,6 +58,12 @@ type PlanRequest struct {
 	// discovered the PR source itself. It is deliberately not JSON-decodable:
 	// direct API clients cannot attest repo/path ownership.
 	SourceTrusted bool `json:"-"`
+
+	// GroupedExecution reports whether an apply of this plan will hand the
+	// engine every ALTER at once or one table at a time. Engines predicting what
+	// an apply will do to unfinished work already on the target need the
+	// grouping the apply will actually run under; see engine.PlanRequest.
+	GroupedExecution bool `json:"grouped_execution,omitempty"`
 }
 
 type unsupportedPullSchemaError struct {
@@ -679,6 +684,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
+		// Always stated, never left absent: absence tells the data plane the
+		// caller predates the grouping choice, and this caller has made one.
+		GroupedExecution: new(req.GroupedExecution),
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest
@@ -1191,7 +1199,7 @@ func (s *Service) enqueueApply(
 	options map[string]string,
 	onApplyCreated func(int64),
 ) (string, int64, error) {
-	applyIdentifier := "apply-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
+	applyIdentifier := engine.NewApplyID()
 	apply, storedApplyID, err := s.createStoredApply(ctx, plan, req, options, applyIdentifier)
 	if err != nil {
 		return "", 0, err
@@ -1601,7 +1609,7 @@ func buildApplyTask(
 	now time.Time,
 ) *storage.Task {
 	return &storage.Task{
-		TaskIdentifier: "task-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16],
+		TaskIdentifier: engine.NewTaskID(),
 		PlanID:         plan.ID,
 		Database:       plan.Database,
 		DatabaseType:   plan.DatabaseType,

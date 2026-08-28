@@ -120,6 +120,30 @@ type Lock struct {
 	// path treats empty as "skip the freshness check" rather than fail closed.
 	PendingPlanID string
 
+	// DisclosedCopyDiscard records that the comment this pending confirmation
+	// was posted with told the operator applying would throw away an unfinished
+	// row copy on the target. It is a consent record, and its question is
+	// exactly "were they shown a discard at all?" — not which copy, or how
+	// many. An apply that finds a larger discard set than the one disclosed
+	// therefore still proceeds; narrowing that to the copies actually named
+	// needs the disclosed set persisted, not a flag.
+	//
+	// It travels with PendingPlanID and is written by the same statement, so the
+	// flag always describes the plan the confirm command loads. It is
+	// deliberately not the copy itself: a copy disposition is a reading of the
+	// target that is always re-read at apply time, and only this answer to "did
+	// they know?" has to be durable.
+	//
+	// The lock carries no environment dimension, so the flag alone does not say
+	// which environment the operator was shown. Readers pair it with the pinned
+	// plan's environment before treating it as consent for the apply at hand.
+	//
+	// False for locks acquired outside the PR apply path (rollback, CLI) and for
+	// rows written before this column existed, which is the safe default — an
+	// unrecorded disclosure is treated as no disclosure, so the apply asks again
+	// rather than assuming consent.
+	DisclosedCopyDiscard bool
+
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
 
@@ -708,6 +732,28 @@ type Apply struct {
 	// control-plane skip-revert handler and the data-plane finalizer.
 	RevertSkippedAt *time.Time
 
+	// SupersededBy names the apply that took over this one's unfinished work,
+	// by ApplyIdentifier. Empty means nothing took over.
+	//
+	// It records a handoff that the apply's own state cannot express: a stopped
+	// apply whose copy a later apply adopted or discarded is still stopped, and
+	// once the successor settles nothing else distinguishes it from a stopped
+	// apply nobody touched. Starting it would replay its statements against a
+	// target where that work already happened, so an apply carrying this marker
+	// can never be started — the marker outlives the successor and is never
+	// cleared.
+	//
+	// The refusal is enforced at every surface that can begin the work again:
+	// the control plane rejects a start request up front, a stopped-apply claim
+	// refuses to resume and fails the pending start request with the reason,
+	// and the claim predicate excludes a marked failed_retryable apply from
+	// automatic retry. The remaining claim paths cannot encounter the marker: a
+	// pending dispatch starts work that has never run, and work must have run
+	// before a successor can take it over; an active apply (including one
+	// waiting for a deploy) cannot gain a successor at all, because creation
+	// refuses a second apply for a target that already has a non-terminal one.
+	SupersededBy string
+
 	// UpdatedAt is when the apply was last updated.
 	UpdatedAt time.Time
 }
@@ -1161,6 +1207,33 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 		}
 	}
 	return opts
+}
+
+// GroupsEngineExecution reports whether an apply against databaseType hands the
+// engine every ALTER at once rather than driving one table at a time, given
+// whether its cutover is deferred.
+//
+// Two things depend on the answer and must agree. The drive uses it to pick how
+// it executes, and an engine predicting what an apply will do to unfinished
+// work already on the target uses it to know which stored progress that apply
+// could continue — progress is kept per batch, so the two shapes look in
+// different places. A prediction made for the shape the apply does not use
+// reports work as lost that would in fact be resumed.
+//
+// Grouping is opted into: Vitess groups because a deploy request covers the
+// whole change, and MySQL groups only when the caller asked to defer cutover so
+// every table can swap together. Everything else runs a table at a time.
+//
+// deferCutover must be the decision the drive will act on, not merely the
+// option the operator typed: a drive can defer cutover on its own (an
+// operation parked at a cutover barrier, see effectiveCopyDriveOptions in
+// pkg/tern), and a caller predicting for such an apply has to pass that
+// effective decision or its prediction describes the wrong shape.
+func GroupsEngineExecution(databaseType string, deferCutover bool) bool {
+	if databaseType == DatabaseTypeVitess {
+		return true
+	}
+	return databaseType == DatabaseTypeMySQL && deferCutover
 }
 
 // Map converts typed storage options back into API/proto option strings.

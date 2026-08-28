@@ -19,6 +19,21 @@ func applySource(c string) string {
 	return caller.Short(c)
 }
 
+// PullRequestLink renders a PR the way every CLI list surface renders one: the
+// short "owner/repo#pr" as an OSC 8 hyperlink to it on an interactive
+// terminal, the full URL everywhere else. Surfaces that already hold the
+// repository and number call this directly; those that carry a caller string
+// resolve it through sourceRef first.
+func PullRequestLink(repo string, pr int) string {
+	return ui.Link(pullRequestRef(repo, pr))
+}
+
+// pullRequestRef renders a PR as the display-text / URL pair a link is built
+// from, so the short form and the canonical URL are written in one place.
+func pullRequestRef(repo string, pr int) (text, url string) {
+	return fmt.Sprintf("%s#%d", repo, pr), caller.PullRequestURL(repo, pr)
+}
+
 // callerAndSourceBoxRows renders an apply's attribution for detail boxes.
 // When the caller's own trailing location is a repo#pr, the two are
 // separated: a short Caller row (who drove it) and a linked Source row (the
@@ -51,9 +66,9 @@ func callerAndSourceBoxRows(c, serverURL string) []BoxRow {
 // provenance at all.
 func sourceRef(c, serverURL string) (text, url string, ok bool) {
 	if repo, pr, found := caller.PullRequest(c); found {
-		derived := fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr)
+		short, derived := pullRequestRef(repo, pr)
 		if serverURL == "" || serverURL == derived {
-			return fmt.Sprintf("%s#%d", repo, pr), derived, true
+			return short, derived, true
 		}
 	}
 	if serverURL != "" {

@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -179,6 +180,16 @@ type ServerConfig struct {
 	// incident kill switch. A database's own metadata entry for the same
 	// key wins over this server-level value.
 	Spirit SpiritConfig `yaml:"spirit,omitempty"`
+
+	// PlanetScale configures process-wide behavior for the Vitess engine's
+	// connections to PlanetScale-compatible endpoints. It applies to every
+	// Vitess database this server drives, unlike the per-database tls block,
+	// which only covers statically registered databases.
+	PlanetScale PlanetScaleConfig `yaml:"planetscale,omitempty"`
+
+	// Postgres configures process-wide behavior for every PostgreSQL database
+	// this server drives directly.
+	Postgres PostgresConfig `yaml:"postgres,omitempty"`
 }
 
 // PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
@@ -484,9 +495,11 @@ type StorageConfig struct {
 	// AllowDestructiveSchemaChanges permits EnsureSchema to execute destructive
 	// DDL (DROP TABLE, or an ALTER TABLE containing DROP COLUMN) when converging
 	// the storage schema at startup. Default false: destructive statements are
-	// refused and skipped whole — including additive clauses in a mixed ALTER
-	// TABLE — while the remaining non-destructive statements still apply and
-	// startup proceeds. This keeps an older binary — starting during a rolling
+	// refused and skipped — a mixed ALTER TABLE is split so its additive
+	// clauses still execute (clauses that cannot run without a refused clause,
+	// such as the ADD PRIMARY KEY half of a primary-key change, are refused
+	// with it) — while the remaining non-destructive statements still apply
+	// and startup proceeds. This keeps an older binary — starting during a rolling
 	// deploy or rollback — from destroying tables or columns a newer binary's
 	// schema added. Set true only when intentionally removing storage tables or
 	// columns, after every running pod is on a binary whose embedded schema no
@@ -990,11 +1003,6 @@ type EnvironmentConfig struct {
 	// APIURL is the PlanetScale API base URL (e.g., "http://localscale:8080").
 	// DSN is the vtgate MySQL endpoint for schema queries and SHOW VITESS_MIGRATIONS.
 	APIURL string `yaml:"api_url,omitempty"`
-
-	// TLS configures MySQL TLS for branch connections.
-	// When set, registers a named TLS config with the Go MySQL driver.
-	// Omit for LocalScale (no TLS) or set for real PlanetScale (mTLS with CA bundle).
-	TLS *TLSConfig `yaml:"tls,omitempty"`
 }
 
 // DirectExecutionConfig configures direct execution of engine-refused ALTER
@@ -1068,16 +1076,74 @@ type externalDatabaseEndpoint struct {
 	Database string `yaml:"database"`
 }
 
-// TLSConfig holds TLS certificate paths for MySQL connections to PlanetScale branches.
-type TLSConfig struct {
-	// CABundle is the path to the CA certificate bundle (PEM).
+// PlanetScaleConfig holds process-wide settings for the Vitess engine's
+// connections to PlanetScale-compatible endpoints.
+type PlanetScaleConfig struct {
+	// MTLS holds certificate paths for mutual TLS on every MySQL connection
+	// the Vitess engine opens (branch hosts and vtgates). When set, the server
+	// registers the certificates with the Go MySQL driver at startup and fails
+	// to start if any file is missing or unparseable, so a worker never
+	// silently drives Vitess applies without the client identity the endpoint
+	// requires.
+	MTLS *PlanetScaleMTLSConfig `yaml:"mtls,omitempty"`
+}
+
+// PlanetScaleMTLSConfig holds certificate paths for mutual TLS with
+// PlanetScale-compatible endpoints. All three paths are required: the config
+// always presents a client identity.
+type PlanetScaleMTLSConfig struct {
+	// CABundle is the path to the CA certificate bundle (PEM) that verifies
+	// the endpoint's server certificate.
 	CABundle string `yaml:"ca_bundle"`
 
-	// ClientCert is the path to the client certificate (PEM).
-	ClientCert string `yaml:"client_cert,omitempty"`
+	// ClientCert is the path to the client certificate (PEM) presented to the
+	// endpoint.
+	ClientCert string `yaml:"client_cert"`
 
 	// ClientKey is the path to the client private key (PEM).
-	ClientKey string `yaml:"client_key,omitempty"`
+	ClientKey string `yaml:"client_key"`
+}
+
+// PostgresConfig holds process-wide settings for the PostgreSQL engine.
+type PostgresConfig struct {
+	// NativeSafeTableSizeLimitBytes is the largest table on which the engine
+	// will execute native-safe DDL. When unset,
+	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
+	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
+}
+
+// NativeSafeTableSizeLimit returns the configured limit or its default.
+func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
+	if c.NativeSafeTableSizeLimitBytes == nil {
+		return postgresengine.DefaultNativeSafeTableSizeLimitBytes
+	}
+	return *c.NativeSafeTableSizeLimitBytes
+}
+
+func (c PostgresConfig) validate() error {
+	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
+		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	return nil
+}
+
+// validate checks that an mtls block, when present, names all three
+// certificate paths. File readability is checked at startup registration, not
+// here, so config validation stays filesystem-independent.
+func (c *PlanetScaleConfig) validate() error {
+	if c.MTLS == nil {
+		return nil
+	}
+	if c.MTLS.CABundle == "" {
+		return fmt.Errorf("planetscale.mtls.ca_bundle is required when planetscale.mtls is set")
+	}
+	if c.MTLS.ClientCert == "" {
+		return fmt.Errorf("planetscale.mtls.client_cert is required when planetscale.mtls is set")
+	}
+	if c.MTLS.ClientKey == "" {
+		return fmt.Errorf("planetscale.mtls.client_key is required when planetscale.mtls is set")
+	}
+	return nil
 }
 
 // RepoConfig holds configuration for a specific repository.
@@ -1288,6 +1354,12 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
+		return err
+	}
+	if err := c.PlanetScale.validate(); err != nil {
+		return err
+	}
+	if err := c.Postgres.validate(); err != nil {
 		return err
 	}
 	if err := c.validateRequiredChecksNotAggregate(); err != nil {

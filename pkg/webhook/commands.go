@@ -32,12 +32,6 @@ type CommandSpec struct {
 	// SupportsDB means `-d <db>` is recognized.
 	SupportsDB bool
 
-	// SupportsAutoConfirm means `-y` / `--yes` is recognized. Only apply uses
-	// this today; other commands have the flag silently dropped from the
-	// CommandResult so the dispatcher can post an "unsupported flag" comment
-	// via HasAutoConfirmFlag.
-	SupportsAutoConfirm bool
-
 	// SupportsSkipRevert means `--skip-revert` is recognized.
 	SupportsSkipRevert bool
 
@@ -67,7 +61,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Plan, RequiresEnv: true, SupportsDB: true},
 	{Name: action.Apply, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
-		SupportsAllowUnsafe: true, SupportsAutoConfirm: true},
+		SupportsAllowUnsafe: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
@@ -145,7 +139,7 @@ func NewCommandParser() *CommandParser {
 		deferCutoverRegex:    regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:     regexp.MustCompile(`(?i)--allow-unsafe\b`),
 		forceRegex:           regexp.MustCompile(`(?i)--force\b`),
-		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
+		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:^|\s)(?:--yes|-y)(?:\s|$)`),
 		volumeFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
 	}
 }
@@ -174,7 +168,6 @@ type CommandResult struct {
 	DeferCutover bool
 	AllowUnsafe  bool
 	Force        bool
-	AutoConfirm  bool
 	// VolumeLevel is the numeric level from `-v` / `--volume` on commands whose
 	// spec opts into SupportsVolumeLevel. Zero means the flag was absent.
 	VolumeLevel int32
@@ -325,9 +318,6 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	if spec.SupportsForce {
 		result.Force = p.forceRegex.MatchString(body)
 	}
-	if spec.SupportsAutoConfirm {
-		result.AutoConfirm = p.autoConfirmRegex.MatchString(body)
-	}
 	if spec.SupportsVolumeLevel {
 		result.VolumeLevel, result.VolumeLevelError = p.extractVolumeLevel(body)
 	}
@@ -361,22 +351,47 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	return result
 }
 
-// HasAutoConfirmFlag reports whether the body contains the `-y` / `--yes`
-// flag, regardless of which command it accompanies. The dispatcher uses this
-// to post an "unsupported flag" comment when an operator pairs `-y` with a
-// command whose spec does not opt into SupportsAutoConfirm.
+// HasAutoConfirmFlag reports whether the command carries the `-y` / `--yes`
+// flag. No comment command takes it: a comment has no prompt to skip, and the
+// gates that stop an apply — direct-execution changes, a discarded copy — stop
+// it because the operator has to see what they are consenting to, which a flag
+// cannot express. The dispatcher uses this to say so rather than accept the
+// flag and ignore it, which would read as consent that was never recorded.
+// This is distinct from the CLI's own `-y` (`--auto-approve`), which skips an
+// interactive terminal prompt that genuinely exists.
+//
+// The answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from rather than the whole comment: a
+// reader who mentions the flag in prose, or pastes a CLI example in a fence, is
+// describing it, not passing it.
 func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
-	return p.autoConfirmRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.autoConfirmRegex.MatchString(directive)
 }
 
-// HasDatabaseFlag reports whether the body contains a `-d <database>` flag,
-// regardless of which command it accompanies.
+// HasDatabaseFlag reports whether the command carries a `-d <database>` flag,
+// regardless of which command it accompanies. Like HasAutoConfirmFlag, the
+// answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from: prose or a fenced CLI example
+// mentioning the flag describes it, not passes it.
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
-	return p.databaseRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.databaseRegex.MatchString(directive)
 }
 
-// HasDeferCutoverFlag reports whether the body contains `--defer-cutover`,
-// regardless of which command it accompanies.
+// HasDeferCutoverFlag reports whether the command carries `--defer-cutover`,
+// regardless of which command it accompanies. Read off the directive line for
+// the same reason as HasDatabaseFlag.
 func (p *CommandParser) HasDeferCutoverFlag(body string) bool {
-	return p.deferCutoverRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.deferCutoverRegex.MatchString(directive)
 }

@@ -109,7 +109,7 @@ func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *test
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "🛑 **Check before applying**: **1** destructive change SchemaBot cannot attribute to this PR")
+	assert.Contains(t, rendered, "🛑 **Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	// Reconciling the live database to the declared schema stays the operator's
 	// call, so the attribution informs the decision without removing it.

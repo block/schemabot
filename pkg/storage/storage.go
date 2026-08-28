@@ -94,7 +94,11 @@ type LockStore interface {
 	// List returns all active locks.
 	List(ctx context.Context) ([]*Lock, error)
 
-	// Update updates lock metadata (e.g., updated_at timestamp).
+	// Update touches updated_at to mark liveness of the caller's own lock.
+	// The touch is owner-scoped: it returns ErrLockNotFound when no lock
+	// exists for the database, and ErrLockNotOwned when another owner holds
+	// it — a caller whose lock was force-released and re-acquired elsewhere
+	// must not refresh the new owner's row.
 	Update(ctx context.Context, lock *Lock) error
 
 	// GetByPR returns all locks associated with a PR (for cleanup on merge/close).
@@ -147,14 +151,25 @@ type CheckStore interface {
 	// the stored state first.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
-	// MarkActionRequiredForApply marks stored check state action_required after
-	// a rollback only if no apply newer than the rollback exists for the same
-	// PR/environment/database. Rows owned by the rollback, by an older apply, or
-	// unowned all qualify: a rollback that never claimed the row must still be
-	// able to block the stale successful check left over from the apply it
-	// reverted. Returns false when any apply newer than the rollback exists for
-	// the target, whether or not it has claimed the row.
+	// MarkActionRequiredForApply marks stored check state action_required for a
+	// terminal apply only if no newer apply exists for the same target. The row
+	// may be owned by this apply, an older apply, or no apply: completed rollbacks
+	// must block stale success even when their claim never landed, and safely
+	// cancelled forward applies must be able to release retained ownership.
+	// Returns false when any newer apply exists for the target or a cancelled
+	// forward apply has completed task history, whether or not a newer apply has
+	// claimed the row.
 	MarkActionRequiredForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
+
+	// MarkCancelledApplyFailed marks stored check state as a terminal failure
+	// owned by a cancelled apply when a completed forward task proves that apply
+	// may have changed the target. The row may be owned by this apply, an older
+	// apply, or no apply, so a cancelled apply whose claim never landed can still
+	// block the stale check the owning apply left behind. It also accepts an
+	// already-completed owned row so stale reconciliation can durably record the
+	// decision. Returns false when the task evidence is absent or a newer apply
+	// exists for the target.
+	MarkCancelledApplyFailed(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// Get returns stored check state by its unique key (PR + env + database), or nil if not found.
 	Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*Check, error)
@@ -428,7 +443,9 @@ type PlanStore interface {
 	// GetByID returns a plan by ID, or nil if not found.
 	GetByID(ctx context.Context, id int64) (*Plan, error)
 
-	// GetByLock returns plans for a lock (0-2: staging + production).
+	// GetByLock is not implemented: plans carry no direct lock association,
+	// and every implementation returns ErrNotImplemented so a caller can
+	// never mistake the missing capability for "no plans".
 	GetByLock(ctx context.Context, lockID int64) ([]*Plan, error)
 
 	// GetByPR returns all plans for a PR.
@@ -571,14 +588,33 @@ type ApplyStore interface {
 	FindStuckPendingApplies(ctx context.Context, olderThan time.Duration, limit int) ([]*Apply, error)
 
 	// ClaimApplyByID atomically claims one specific apply by ID when it needs a
-	// driver (pending with child rows, stale active state, retryable within
-	// budget, or a pending start control request). On a
-	// successful claim it rotates the lease (owner, token, acquired_at) and
-	// refreshes the heartbeat so operator-owned writes can fail closed after
-	// ownership changes. Returns the claimed apply, or nil if the apply does not
-	// exist or is not currently claimable (e.g. another driver holds a fresh
-	// lease or the apply is terminal). Used by the operation-level claim loop to
-	// acquire the parent apply lease after claiming an apply_operations row.
+	// driver: pending with child rows, stale active state, retryable within
+	// budget, a pending start control request, or stopped with a pending cancel
+	// control request. On a successful claim it rotates the lease (owner, token,
+	// acquired_at) and refreshes the heartbeat so operator-owned writes can fail
+	// closed after ownership changes.
+	//
+	// Terminal state is not by itself a refusal: stopped is terminal, and a
+	// stopped apply is claimable both for a pending start (to resume it) and for
+	// a pending cancel (to terminalize it). Every other terminal state is
+	// refused. A claim for cancel leaves the apply stopped and rotates only the
+	// lease, so it is admitted at most once per request until the lease goes
+	// stale.
+	//
+	// Claiming a stopped apply settles a conflicting request as a side effect: a
+	// claim for cancel fails any pending start request on the same apply, so the
+	// cancel wins rather than racing a resume. A stopped claim refused because
+	// the apply was superseded (see MarkSuperseded) or because another active
+	// apply owns the target likewise fails the pending start request, with the
+	// reason, instead of stranding it.
+	//
+	// Returns the claimed apply, or nil if the apply does not exist or is not
+	// currently claimable — another driver holds a fresh lease, the apply is
+	// terminal without a request that admits it, the target's exclusion lock
+	// is held elsewhere, a stopped claim was refused as above, or the apply is
+	// failed_retryable but superseded, which excludes it from automatic retry.
+	// Used by the operation-level claim loop to acquire the parent apply lease
+	// after claiming an apply_operations row.
 	ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*Apply, error)
 
 	// FindNextApplyForStopReconciliation atomically claims one apply eligible for
@@ -640,6 +676,42 @@ type ApplyStore interface {
 	// control-plane skip-revert handler (no lease) and the data-plane finalizer
 	// call it without disturbing recovery-claim staleness.
 	SetRevertSkipped(ctx context.Context, applyID int64, at time.Time) error
+
+	// MarkSuperseded records that successor took over the apply's unfinished
+	// work, by ApplyIdentifier. It is a targeted write of superseded_by that
+	// preserves the apply's updated_at lease heartbeat and touches no other
+	// fields, so the apply that handed off keeps whatever terminal state it
+	// settled in.
+	//
+	// The marker is write-once: it must outlive the successor, so it is never
+	// cleared and never reassigned. Marking again with the same successor
+	// succeeds, since a redelivered handoff records the same fact. Marking with
+	// a different successor returns ErrApplyAlreadySuperseded — two applies
+	// claiming the same handoff means the takeover decision is ambiguous, and an
+	// ambiguous decision must not be resolved by overwriting. A successor equal
+	// to the apply's own identifier is rejected: the marker is never cleared, so
+	// a self-referential handoff would refuse the apply forever while pointing
+	// the operator back at the refused apply itself.
+	//
+	// Callers recording a takeover mark as soon as the successor durably
+	// exists — after its creation, so the marker never names an apply that
+	// does not exist, and before any driver acts on it. The marker does not
+	// carry that window alone: while the successor is active, a claim on the
+	// handed-off apply is refused by the claim-time one-active-apply re-check;
+	// the marker is what keeps refusing once the successor settles and that
+	// re-check has nothing left to catch. A takeover whose mark never lands —
+	// a failed write, or a crash between creating the successor and marking —
+	// therefore leaves an apply that becomes startable again once its
+	// successor settles; the failed write is logged with both applies named,
+	// and neither case is retried.
+	//
+	// The refusal the marker backs is apply-granular even when the successor
+	// took over only part of the apply's work: start is apply-wide and would
+	// replay everything, including the part the successor now owns. Work the
+	// successor did not take over reaches the database through a fresh
+	// dispatch — the marked apply's hold on the database was already released
+	// when the marker was earned.
+	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
@@ -799,6 +871,50 @@ type TaskStore interface {
 
 	// List returns tasks matching the filter criteria.
 	List(ctx context.Context, filter TaskFilter) ([]*Task, error)
+
+	// ReapStrandedRetryable hardens to failed the failed_retryable task rows
+	// whose parent apply has already settled, returning what it reaped (at
+	// most limit rows, oldest first). A failed_retryable task promises a retry, but
+	// retries are dispatched by the parent's recovery path: once the parent has
+	// settled, no driver will ever pick the row up again, so the promise is
+	// dead. Left in place, the row poisons every reader that treats
+	// failed_retryable as "a retry is coming" — most critically the control
+	// plane's remote-progress snapshot, which copies the row verbatim and reads
+	// it as a permanent retryable pause. Such rows are the residue of a partial
+	// failure write: a task update that errored mid-transition, or a retryable
+	// writer racing a concurrent failure writer.
+	//
+	// The row keeps its own error message — its failure is real; only the
+	// retry promise is retired — so the task is hardened to failed rather than
+	// mirroring the parent's state. Only settled parents (completed, failed,
+	// cancelled, reverted) that have been quiescent past the retryable-task
+	// reaper's own window qualify — longer than the retryable-recovery
+	// freshness window (and than ReapStranded's), so a retry admitted at the
+	// freshness window's edge, which refreshes the parent heartbeat on claim,
+	// can never race the reap. Stopped and failed_retryable parents are
+	// resumable, and their failed_retryable tasks belong to the resume/retry
+	// path. Each write
+	// re-verifies the row is still failed_retryable and the parent is still
+	// settled, so a row a concurrent writer advanced is skipped rather than
+	// overwritten. The parent apply row is never touched.
+	//
+	// One instance reaps per pass, guarded by an advisory lock;
+	// ErrStrandedTaskReaperBusy reports that another instance holds it. As with
+	// ReapStranded, the lock is an efficiency gate, not a safety one.
+	ReapStrandedRetryable(ctx context.Context, limit int) ([]*ReapedTask, error)
+}
+
+// ErrStrandedTaskReaperBusy reports that another instance holds the stranded
+// retryable-task reaper lock, so this pass did no work. It is an expected
+// outcome on every instance but one, not a failure.
+var ErrStrandedTaskReaperBusy = errors.New("another instance is reaping stranded retryable tasks")
+
+// ReapedTask records one failed_retryable task row hardened to failed under a
+// settled parent apply, carrying both rows so callers can log what the reaper
+// did with the canonical triage attributes.
+type ReapedTask struct {
+	Task   *Task
+	Parent *Apply
 }
 
 // TableRef names one table in a single deployment target. Namespace
@@ -837,7 +953,10 @@ type ApplyCommentStore interface {
 	// last_edited_at for a comment. Called after each successful edit.
 	IncrementEditCount(ctx context.Context, applyID int64, commentState string) error
 
-	// DeleteByApply removes all comment records for an apply.
+	// DeleteByApply removes all comment records for an apply. It is
+	// deliberately lease-agnostic: it serves per-apply teardown where the
+	// apply row itself is being removed, so no live drive holds a lease that
+	// could fence it.
 	DeleteByApply(ctx context.Context, applyID int64) error
 
 	// Supersede retires the tracked comment for a single (apply_id, comment_state)
@@ -989,9 +1108,9 @@ type ApplyOperationStore interface {
 	// the same transaction, returning the row populated with that lease.
 	//
 	// Pending rows are transitioned to running and stamped with started_at; a
-	// stopped row whose parent apply has a pending start request is resumable
-	// and is transitioned to resuming (so the request-gated stopped predicate
-	// stops matching once the row is claimed); already-active rows whose
+	// stopped row whose parent apply has a pending start or cancel request is
+	// claimable and is transitioned to resuming (so the request-gated stopped
+	// predicate stops matching once the row is claimed); already-active rows whose
 	// heartbeat has been stale for more than one minute are re-leased without
 	// changing their state. Other terminal rows
 	// (completed/failed/cancelled/reverted) are never claimed.
@@ -1144,8 +1263,11 @@ type ControlRequestStore interface {
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
 
 	// ListSettled returns every control request for an apply that has reached a
-	// terminal status, so the plane that accepted a control RPC can learn
-	// whether the operation took effect: accepting a request only queues it.
+	// terminal status, ordered by operation ascending, so the plane that
+	// accepted a control RPC can learn whether the operation took effect:
+	// accepting a request only queues it. The ordering is a varchar sort and
+	// therefore collation-dependent in principle; every ControlOperation value
+	// is lowercase ASCII, which all supported dialects order identically.
 	ListSettled(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// RecordRemoteFailure records the terminal failure another plane reported

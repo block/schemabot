@@ -11,25 +11,62 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 )
 
-// skipUnownedUnscopedCommand reports whether a "schema not owned by this
-// deployment" error should be silently ignored instead of reported on the PR.
-// On an aggregate repo (leader or participant), an unscoped command (no -t) is a
-// fan-out broadcast every installed deployment receives; a deployment that owns
-// none of the changed schema is expected to do nothing while the deployment that
-// does own it handles the command. Posting "config not authorized" or "database
-// not configured" from every non-owning deployment would be exactly the noise
-// fan-out removes. Scoped to the not-owned error classes only — real failures
-// still surface. A -t-scoped command (tenant != "") always reports, since it
-// named a specific deployment.
-func (h *Handler) skipUnownedUnscopedCommand(repo, tenant string, err error) bool {
+// silentDiscoveryFailureOnUnscopedFanOut reports whether a failed schema
+// discovery for an unscoped (no -t) command should be a logged silent skip
+// rather than a PR comment. Two independent outcomes qualify — the discovered
+// schema belongs to another deployment, or a participant's partial view cannot
+// resolve the named database — and they belong together here because they say
+// the same thing to the user: a different deployment owns this command's
+// answer, so a reply from this one would land as duplicate noise beside the
+// real one. Every other failure still surfaces, and a -t-scoped command
+// (tenant != "") always reports, since it named a specific deployment.
+func (h *Handler) silentDiscoveryFailureOnUnscopedFanOut(repo, tenant string, err error) bool {
 	if tenant != "" {
 		return false
 	}
+	return h.silentUnownedSchemaOnAggregateFanOut(repo, err) ||
+		h.silentUnresolvedDatabaseOnParticipantFanOut(repo, err)
+}
+
+// silentUnownedSchemaOnAggregateFanOut reports whether a "schema not owned by
+// this deployment" error should be silently ignored instead of reported on the
+// PR. On an aggregate repo (leader or participant), an unscoped command is a
+// fan-out broadcast every installed deployment receives; a deployment that owns
+// none of the changed schema is expected to do nothing while the deployment
+// that does own it handles the command. Posting "config not authorized" or
+// "database not configured" from every non-owning deployment would be exactly
+// the noise fan-out removes.
+func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo string, err error) bool {
 	config, ok := h.serverConfig()
-	if !ok || config.AggregateRoleForRepo(repo) == "" {
+	if !ok {
+		return false
+	}
+	if config.AggregateRoleForRepo(repo) == "" {
 		return false
 	}
 	return isSchemaUnownedByDeploymentError(err)
+}
+
+// silentUnresolvedDatabaseOnParticipantFanOut reports whether a database
+// discovery miss should be silently deferred on this deployment. A
+// participant's discovery covers only its own slice of the fleet, so an
+// authoritative "database not found" from that local view cannot establish
+// that the fleet has no matching schema — the aggregate leader, whose view
+// spans the fleet, answers instead while the participant stays silent. Only
+// the authoritative miss defers: an uncertain outcome (for example a truncated
+// repository tree the configured schema directory hints cannot recover) still
+// surfaces fail-closed, because the participant might own the database and
+// simply be unable to prove it.
+func (h *Handler) silentUnresolvedDatabaseOnParticipantFanOut(repo string, err error) bool {
+	config, ok := h.serverConfig()
+	if !ok {
+		return false
+	}
+	if config.AggregateRoleForRepo(repo) != api.AggregateRoleParticipant {
+		return false
+	}
+	var notFound *ghclient.DatabaseNotFoundError
+	return errors.As(err, &notFound)
 }
 
 // isSchemaUnownedByDeploymentError reports whether err means the command

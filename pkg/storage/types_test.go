@@ -396,3 +396,29 @@ func TestApplyGenerationManifestHelpers(t *testing.T) {
 			"a fully attached manifest has no missing keys")
 	})
 }
+
+// The grouping an apply runs under is read twice — once by the drive choosing
+// how to execute, once by the engine predicting what that execution does to a
+// copy already on the target — and the two are only consistent because they ask
+// the same question here. Vitess covers a whole change in one deploy request;
+// MySQL groups only when the caller asked to defer cutover so every table can
+// swap together, and otherwise drives a table at a time.
+func TestGroupsEngineExecution(t *testing.T) {
+	cases := []struct {
+		name         string
+		databaseType string
+		deferCutover bool
+		grouped      bool
+	}{
+		{"vitess groups whether or not cutover is deferred", DatabaseTypeVitess, false, true},
+		{"vitess groups with a deferred cutover too", DatabaseTypeVitess, true, true},
+		{"mysql groups when the cutover is deferred", DatabaseTypeMySQL, true, true},
+		{"mysql drives a table at a time by default", DatabaseTypeMySQL, false, false},
+		{"postgres never groups", DatabaseTypePostgres, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.grouped, GroupsEngineExecution(tc.databaseType, tc.deferCutover))
+		})
+	}
+}

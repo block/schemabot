@@ -504,7 +504,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assert.Error(t, err, "expected CLI apply to fail when PR holds lock")
-		assertContains(t, out, "Database Locked")
+		assertContains(t, out, "Apply blocked: database locked")
 		assertContains(t, out, "block/myrepo#123")
 		assertContains(t, out, "--force")
 	})
@@ -574,7 +574,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assert.Error(t, err, "expected CLI apply to fail when other CLI user holds lock")
-		assertContains(t, out, "Database Locked")
+		assertContains(t, out, "Apply blocked: database locked")
 		assertContains(t, out, "cli:otheruser@othermachine")
 	})
 
@@ -667,8 +667,8 @@ CREATE TABLE users (
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
-		// Should NOT show "Database Locked" error - cutover doesn't check locks
-		assert.NotContains(t, stripANSI(out), "Database Locked", "cutover should not be blocked by locking")
+		// Should NOT show "Apply blocked: database locked" error - cutover doesn't check locks
+		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked", "cutover should not be blocked by locking")
 	})
 
 	t.Run("stop_works_while_locked", func(t *testing.T) {
@@ -678,8 +678,8 @@ CREATE TABLE users (
 			"-e", "staging",
 			"--endpoint", endpoint,
 		)
-		// Should NOT show "Database Locked" error
-		assert.NotContains(t, stripANSI(out), "Database Locked", "stop should not be blocked by locking")
+		// Should NOT show "Apply blocked: database locked" error
+		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked", "stop should not be blocked by locking")
 	})
 
 	t.Run("start_works_while_locked", func(t *testing.T) {
@@ -690,8 +690,8 @@ CREATE TABLE users (
 			"--endpoint", endpoint,
 			"--watch=false",
 		)
-		// Should NOT show "Database Locked" error
-		assert.NotContains(t, stripANSI(out), "Database Locked", "start should not be blocked by locking")
+		// Should NOT show "Apply blocked: database locked" error
+		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked", "start should not be blocked by locking")
 	})
 
 	t.Run("volume_works_while_locked", func(t *testing.T) {
@@ -702,8 +702,8 @@ CREATE TABLE users (
 			"-v", "5",
 			"--endpoint", endpoint,
 		)
-		// Should NOT show "Database Locked" error
-		assert.NotContains(t, stripANSI(out), "Database Locked", "volume should not be blocked by locking")
+		// Should NOT show "Apply blocked: database locked" error
+		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked", "volume should not be blocked by locking")
 	})
 
 	t.Run("apply_blocked_while_locked", func(t *testing.T) {
@@ -716,7 +716,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assert.Error(t, err, "expected apply to fail when locked by another user")
-		assertContains(t, out, "Database Locked")
+		assertContains(t, out, "Apply blocked: database locked")
 	})
 
 	// Cleanup
@@ -762,7 +762,7 @@ CREATE TABLE users (
 			"--no-lock",
 		)
 		// Should not show lock conflict
-		assert.NotContains(t, stripANSI(out), "Database Locked")
+		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked")
 		// Should proceed with apply
 		assertContains(t, out, "Apply started")
 		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
@@ -906,7 +906,7 @@ CREATE TABLE users (
 			"--watch=false",
 		)
 		assert.Error(t, err, "expected CLI to be blocked on same environment")
-		assertContains(t, out, "Database Locked")
+		assertContains(t, out, "Apply blocked: database locked")
 		assertContains(t, out, "block/repo#100")
 	})
 
@@ -952,7 +952,7 @@ func TestCLI_Locking_DifferentEnvBlocked(t *testing.T) {
 	// Document the intended behavior:
 	// If we had production configured, attempting to apply would fail:
 	// $ schemabot apply -e production  # Would be blocked!
-	// Error: Database Locked
+	// Error: Apply blocked: database locked
 	//   Locked by: block/repo#200
 	//   ...
 	// This prevents concurrent schema changes across environments.

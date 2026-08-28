@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // ApplyLockConflictData contains data for apply lock conflict comments.
@@ -175,7 +176,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
-	fmt.Fprintf(&sb, "**⛔ %d Unsafe %s Detected:**\n", unsafeCount, pluralize("Change", unsafeCount))
+	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	for _, c := range data.UnsafeChanges {
 		writeUnsafeChangeItem(&sb, "`"+c.Table+"`", c.Reason)
 	}
@@ -189,7 +190,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
-	sb.WriteString("**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
+	sb.WriteString("**" + glyph.Escalation + " To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
 	applyCmd := fmt.Sprintf("schemabot apply -e %s", data.Environment)
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
@@ -225,7 +226,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
-	fmt.Fprintf(&sb, "**⛔ Apply rejected**: **%d** planned %s not supported by the schema-change engine\n", n, pluralize("change", n))
+	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -237,7 +238,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 			fmt.Fprintf(&sb, "- %s\n", table)
 		}
 	}
-	sb.WriteString("\nRewrite these statements as a supported schema change, or contact your SchemaBot operators for help.\n")
+	sb.WriteString("\nFix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.\n")
 
 	return appendAgentHint(sb.String(), data.AgentHint)
 }
@@ -308,8 +309,8 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	} else {
 		sb.WriteString("Another PR currently holds the lock for this database.\n\n")
 		if data.LockRepo != "" {
-			fmt.Fprintf(&sb, "**Locked by**: [%s#%d](https://github.com/%s/pull/%d)\n",
-				data.LockRepo, data.LockPR, data.LockRepo, data.LockPR)
+			fmt.Fprintf(&sb, "**Locked by**: %s\n",
+				caller.PullRequestMarkdownLink(data.LockRepo, data.LockPR))
 		} else {
 			fmt.Fprintf(&sb, "**Locked by**: `%s`\n", caller.Short(data.LockOwner))
 		}
@@ -330,7 +331,7 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 func RenderApplyInProgress(data ApplyLockConflictData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Apply Already In Progress", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Apply Already In Progress", data.Environment)
 	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")
@@ -349,14 +350,14 @@ func RenderApplyBlockedClosedPR(environment, requestedBy string, merged bool) st
 	var sb strings.Builder
 
 	if merged {
-		writeEnvironmentTitle(&sb, "⛔ Apply Blocked: PR Is Merged", environment)
+		writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked: PR Is Merged", environment)
 		writeRequesterOrTimestamp(&sb, requestedBy)
 		sb.WriteString("\nThis PR is already merged, so applies can no longer run from it. SchemaBot only applies schema changes from open PRs.\n\n")
 		sb.WriteString("If the schema change still needs to be applied, open a new PR with it and apply from there.\n")
 		return sb.String()
 	}
 
-	writeEnvironmentTitle(&sb, "⛔ Apply Blocked: PR Is Closed", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked: PR Is Closed", environment)
 	writeRequesterOrTimestamp(&sb, requestedBy)
 	sb.WriteString("\nThis PR is closed, so its schema changes can never merge. SchemaBot only applies schema changes from open PRs.\n\n")
 	sb.WriteString("Reopen this PR, or open a new PR with the schema change, and apply from there.\n")
@@ -390,7 +391,7 @@ func RenderLocksAlreadyReleased() string {
 func RenderCannotUnlock(database, environment, applyID, applyState string) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Cannot Unlock", environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Cannot Unlock", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "An apply is currently active (apply ID: `%s`, state: `%s`).\n\n",
@@ -429,7 +430,7 @@ type StaleSchemaRejectionData struct {
 func RenderStaleSchemaRejection(data StaleSchemaRejectionData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Rejected — new commits since discovery", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Rejected — new commits since discovery", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "Schema files were loaded at `%s`, but the current PR HEAD is `%s`. ", data.DiscoverySHA, data.CurrentSHA)
@@ -463,7 +464,7 @@ type StalePlanRejectionData struct {
 func RenderStalePlanRejection(data StalePlanRejectionData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Rejected — the plan you confirmed is stale", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Rejected — the plan you confirmed is stale", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "The confirmation plan was rendered at `%s`, but the current PR HEAD is `%s`. ", data.PlanSHA, data.CurrentSHA)
@@ -494,7 +495,7 @@ type BaseSchemaFreshnessRejectionData struct {
 func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ Apply rejected — base schema is newer", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" Apply rejected — base schema is newer", data.Environment)
 	writeDBLine(&sb, data.Database)
 	sb.WriteString("\n")
 	if data.VerificationError {
@@ -530,7 +531,7 @@ func RenderApplyConfirmNoLock(database, environment string) string {
 func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, action string) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "%s %s. %s before applying to %s.\n\n", capitalizeFirst(priorEnv), status, action, environment)
@@ -554,7 +555,7 @@ type BlockingCheck struct {
 func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []BlockingCheck) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
 	if len(notPassing) == 0 {
 		// Defensive: callers should only invoke this template when at least
 		// one non-passing check has been identified. Render a generic message
@@ -593,7 +594,10 @@ type CheckStatusAccessDetails struct {
 func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	// Failure glyph, not refusal: a check-status read error is transient — an
+	// unchanged retry can succeed — so this is a failed verification the apply
+	// fail-closed on, not a request SchemaBot refuses to perform.
+	writeEnvironmentTitle(&sb, glyph.Failed+" Apply Blocked", environment)
 
 	if err != nil && strings.Contains(err.Error(), "Resource not accessible") {
 		app := "SchemaBot GitHub App"
@@ -691,7 +695,10 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
+	// Failure glyph, not refusal: the prior-environment read is transient —
+	// an unchanged retry can succeed — so this is a failed verification the
+	// apply fail-closed on, not a request SchemaBot refuses to perform.
+	sb.WriteString("## " + glyph.Failed + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Retry the apply command.\n\n", priorEnv, reason)
 	sb.WriteString("_See server logs for details._")
 
@@ -705,7 +712,7 @@ func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string) string {
 func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "SchemaBot could not find a completed `%s` check for this PR.\n\n", priorEnv)
 	fmt.Fprintf(&sb, "SchemaBot must verify `%s` before applying a later environment. Create the missing `%s` status with:\n", priorEnv, priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot plan -e %s\n```\n\n", priorEnv)
@@ -723,7 +730,7 @@ func RenderApplyBlockedByMissingPriorEnvCheck(priorEnv string) string {
 func RenderApplyBlockedByUntrustedPriorEnvCheck(priorEnv, checkName string, untrustedApps []string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## ❌ Apply Blocked\n\n")
+	sb.WriteString("## " + glyph.Refused + " Apply Blocked\n\n")
 	fmt.Fprintf(&sb, "A `%s` check named `%s` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:\n\n", priorEnv, checkName)
 	for _, app := range untrustedApps {
 		fmt.Fprintf(&sb, "- `%s`\n", app)
@@ -761,7 +768,7 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 func RenderApplyBlockedByUnlistedEnvironment(environment string, promotionOrder []string) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "❌ Apply Blocked", environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
 	fmt.Fprintf(&sb, "`%s` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.\n\n", environment)
 	if len(promotionOrder) > 0 {
 		fmt.Fprintf(&sb, "Configured promotion order: `%s`\n\n", strings.Join(promotionOrder, "` → `"))

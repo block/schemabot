@@ -2,12 +2,14 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -19,7 +21,7 @@ import (
 // when the discovered database has no entry in this deployment's registry at
 // all — under the aggregate contract another deployment owns it. A -t-scoped
 // command, a non-aggregate repo, or a real error still surfaces.
-func TestSkipUnownedUnscopedCommand(t *testing.T) {
+func TestSilentDiscoveryFailureOnUnscopedFanOut(t *testing.T) {
 	cfg := &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
 			"octocat/participant-repo": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleParticipant}},
@@ -36,17 +38,17 @@ func TestSkipUnownedUnscopedCommand(t *testing.T) {
 	h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 	notOwned := &schemaConfigOutsideAllowedDirsError{Database: "orders", SchemaPath: "tenant-b/schema"}
 
-	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", notOwned),
+	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", notOwned),
 		"a participant silently skips an unowned unscoped command")
-	assert.True(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", notOwned),
+	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", notOwned),
 		"a leader silently skips schema it doesn't own (gates on the participant instead)")
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "tenant-b", notOwned),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "tenant-b", notOwned),
 		"a -t-scoped command named a deployment, so the error still surfaces")
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/plain-repo", "", notOwned),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/plain-repo", "", notOwned),
 		"a non-aggregate repo is a single deployment — the error is useful, keep it")
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/unknown-repo", "", notOwned),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/unknown-repo", "", notOwned),
 		"an unconfigured repo has no aggregate role — keep the error")
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", errors.New("github unavailable")),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", errors.New("github unavailable")),
 		"a real error is not the not-owned case and must still surface")
 
 	// The exact error the environment validator produces when a fan-out command
@@ -54,21 +56,43 @@ func TestSkipUnownedUnscopedCommand(t *testing.T) {
 	// aggregate repos, still surfaced for -t-scoped commands and plain repos.
 	notConfigured := h.validateRequestedDatabaseEnvironment("orders", "staging")
 	require.Error(t, notConfigured)
-	assert.True(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "", notConfigured),
+	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", notConfigured),
 		"a participant silently skips a database missing from its registry")
-	assert.True(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", notConfigured),
+	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", notConfigured),
 		"a leader silently skips a participant-owned database missing from its registry")
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/participant-repo", "tenant-b", notConfigured),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "tenant-b", notConfigured),
 		"a -t-scoped command named a deployment, so the error still surfaces")
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/plain-repo", "", notConfigured),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/plain-repo", "", notConfigured),
 		"a non-aggregate repo is a single deployment — the error is useful, keep it")
 
 	// A registered database with an unconfigured environment is a real user
 	// error on this deployment, not an ownership signal — never skipped.
 	envNotConfigured := h.validateRequestedDatabaseEnvironment("inventory", "production")
 	require.Error(t, envNotConfigured)
-	assert.False(t, h.skipUnownedUnscopedCommand("octocat/leader-repo", "", envNotConfigured),
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", envNotConfigured),
 		"an unconfigured environment for an owned database must still surface")
+
+	// A database discovery miss on a participant is authoritative only for
+	// that deployment's slice of the fleet, so it defers to the leader, which
+	// owns the fleet-authoritative response.
+	databaseNotFound := &ghclient.DatabaseNotFoundError{DatabaseName: "orders"}
+	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", databaseNotFound),
+		"a participant defers a database discovery miss to the leader")
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", databaseNotFound),
+		"the leader reports a fleet-authoritative database discovery miss")
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "tenant-b", databaseNotFound),
+		"a -t-scoped database discovery miss still surfaces")
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/plain-repo", "", databaseNotFound),
+		"a database discovery miss on a non-aggregate repo still surfaces")
+
+	// A truncated repository tree is uncertainty, not an authoritative miss:
+	// the deployment might own the schema and simply be unable to prove it,
+	// so truncation always surfaces fail-closed instead of deferring.
+	truncatedTree := fmt.Errorf("discover configs: %w", ghclient.ErrGitTreeTruncated)
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", truncatedTree),
+		"a participant must surface incomplete repository discovery")
+	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", truncatedTree),
+		"the leader must surface incomplete repository discovery")
 }
 
 // On an aggregate repo an unscoped command fans out to every deployment, so a

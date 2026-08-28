@@ -653,6 +653,10 @@ func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int6
 	return int64(len(s.tasks)), nil
 }
 
+func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
+	return nil, nil
+}
+
 func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5974,6 +5978,31 @@ func TestStartHandler(t *testing.T) {
 				assert.Nil(t, mock.progressReq)
 			})
 		}
+	})
+
+	// A stopped apply whose unfinished work another apply took over is refused at
+	// the request, not after a queued start reaches a driver: starting it would
+	// replay its statements against a target where that work already happened.
+	// The refusal names the successor so the operator knows where the work went.
+	t.Run("rejects start for an apply whose work was taken over", func(t *testing.T) {
+		mock := &mockTernClient{}
+		apply := activeTestApply("apply-superseded-holder")
+		apply.State = state.Apply.Stopped
+		apply.SupersededBy = "apply-superseded-successor"
+		svc := newControlTestServiceWithTasks(mock, apply, nil)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := fmt.Sprintf(`{"environment": "staging", "apply_id": %q}`, apply.ApplyIdentifier)
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), "superseded by apply-superseded-successor")
+		assert.Nil(t, mock.startReq, "a superseded apply must not reach the engine")
+		assert.Nil(t, mock.progressReq)
 	})
 
 	t.Run("missing environment", func(t *testing.T) {

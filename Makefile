@@ -22,6 +22,16 @@ E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
 E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 
+# Disable Buildx Bake: Compose delegates `up --build` and `compose build` to a
+# bake subprocess that can lose its stdio pipe (docker/compose#13243), failing
+# the build with `read |0: file already closed`. Every image composed here is
+# COPY-only over prebuilt binaries, so the classic builder costs nothing.
+# Exported so it reaches every compose recipe in this file — e2e, dev and demo
+# targets alike. Scripts invoked directly (not via make) carry their own
+# export. Drop this once that issue is fixed upstream and the flake stops
+# reproducing on CI runners.
+export COMPOSE_BAKE := false
+
 .PHONY: help lint lint-fix setup test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
