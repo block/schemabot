@@ -2475,6 +2475,118 @@ func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingCancel(t *testing
 	assert.Nil(t, cancelReq, "the cancel request must complete against the terminal apply instead of poisoning every later claim")
 }
 
+func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingStop(t *testing.T) {
+	// A stop carries the same orphan risk as a cancel: an apply running with no
+	// remote apply id may already have a remote apply the control plane cannot
+	// see, and settling the stop locally would report the change stopped while it
+	// ran on to cutover — with the apply left terminal, nothing would ever
+	// revisit it. The drive leaves the stop to the dispatch ambiguity guard,
+	// which fails the apply closed, and the next claim completes the request.
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              9,
+		ApplyIdentifier: "apply-ambiguous-stop",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: apply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	err := client.ResumeApply(ctx, apply)
+	require.Error(t, err, "the ambiguity guard fails the apply closed rather than reporting a stop it cannot account for")
+	assert.Empty(t, server.getStopApplyID(), "no remote stop is addressable without a remote apply id")
+	assert.Equal(t, state.Apply.Failed, apply.State, "the apply must not be recorded stopped while remote work may still be running")
+	assert.Equal(t, state.Task.Failed, task.State)
+
+	// The next claim finds a terminal apply and settles the request.
+	require.NoError(t, client.ResumeApply(ctx, apply))
+	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, stopReq, "the stop request must complete against the terminal apply instead of poisoning every later claim")
+}
+
+func TestGRPCClient_ResumeApplyAmbiguousDispatchResolvesPendingCancelAndStop(t *testing.T) {
+	// An operator who cancels an unresponsive apply and then stops it leaves both
+	// requests pending. The drive processes cancel first, so a stop path that
+	// settled locally would take over from the unhandled cancel and route around
+	// the dispatch ambiguity guard entirely. Both requests must defer to the
+	// guard, and both must complete once it has failed the apply closed.
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              9,
+		ApplyIdentifier: "apply-ambiguous-cancel-stop",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+		{ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+	}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: apply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	err := client.ResumeApply(ctx, apply)
+	require.Error(t, err, "a second pending request must not carry the drive past the ambiguity guard")
+	assert.Equal(t, state.Apply.Failed, apply.State)
+	assert.Empty(t, server.getCancelApplyID())
+	assert.Empty(t, server.getStopApplyID())
+
+	// A claim settles one control request, so both are consumed over successive
+	// claims against the now-terminal apply.
+	for _, op := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+		require.NoError(t, client.ResumeApply(ctx, apply))
+		req, err := controlRequests.GetPending(t.Context(), apply.ID, op)
+		require.NoError(t, err)
+		assert.Nilf(t, req, "the pending %s request must complete against the terminal apply", op)
+	}
+}
+
 func TestGRPCClient_ResumeApplyOperationStopReachingTerminalLeavesApplyStopPending(t *testing.T) {
 	// A multi-deployment apply has one durable stop request shared by every
 	// deployment. When a dispatched operation observes its own remote apply

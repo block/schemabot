@@ -845,26 +845,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		if scope.usesOperationRemoteResume() {
-			// A multi-operation apply has one stop request shared by every
-			// deployment. Stopping this undispatched operation must not
-			// terminalize the parent or complete the apply-level request:
-			// sibling deployments with their own remote apply id still need to
-			// observe the durable stop. Stop only this operation and leave the
-			// request pending for the siblings.
-			if err := c.terminalizeUndispatchedApplyOperation(ctx, apply, controlRequestCaller(controlReq), scope, stopUndispatchedTerminalization(apply.DatabaseType)); err != nil {
-				return true, err
-			}
-			logOperationDriveLeavesParentStop(logger, apply, scope)
-			return true, nil
-		}
-		if err := c.terminalizeUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope, stopUndispatchedTerminalization(apply.DatabaseType)); err != nil {
-			return true, err
-		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			return true, err
-		}
-		return true, nil
+		return c.settleUndispatchedControlRequest(ctx, apply, controlReq, scope, stopUndispatchedTerminalization(apply.DatabaseType), logOperationDriveLeavesParentStop)
 	}
 
 	// The data plane stores the stop durably on first receipt and its own
@@ -983,7 +964,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		return c.cancelUndispatchedRemoteApply(ctx, apply, controlReq, scope)
+		return c.settleUndispatchedControlRequest(ctx, apply, controlReq, scope, cancelUndispatchedTerminalization(), logOperationDriveLeavesParentCancel)
 	}
 	// The data plane stores the cancel durably on first receipt and its own
 	// driver consumes it, so retransmission is redelivery insurance on a bounded
@@ -1068,48 +1049,53 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	return false, nil
 }
 
-// cancelUndispatchedRemoteApply settles a pending cancel for an apply that
-// carries no remote apply id.
+// settleUndispatchedControlRequest settles a pending stop or cancel for an apply
+// that carries no remote apply id.
 //
-// Nothing remote exists to cancel exactly when the dispatch path would treat
+// Nothing remote exists to address exactly when the dispatch path would treat
 // this drive as a first dispatch. That is the same predicate dispatch itself
-// trusts to mean no remote apply was ever created, so the cancel is satisfied in
-// control-plane storage alone and the operator's request completes: there is
+// trusts to mean no remote apply was ever created, so the request is satisfied
+// in control-plane storage alone and the operator's command completes: there is
 // nothing to orphan.
 //
 // Every other shape is the ambiguous one — a dispatch may have created a remote
-// apply whose response was lost. Satisfying the cancel locally would orphan that
-// apply, so this reports the request unhandled and lets the drive continue to
-// the dispatch ambiguity guard, which fails the apply closed. The cancel then
-// completes against the terminal apply on the next claim. The request must never
-// be answered with an error here: the cancel stays pending across the error, so
-// every later claim would abort at this same point and the apply would occupy a
-// driver on every poll without ever resolving.
-func (c *GRPCClient) cancelUndispatchedRemoteApply(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
+// apply whose response was lost. Settling locally would report the change
+// stopped or cancelled while it kept running on the target, and because that
+// leaves the apply terminal, nothing would ever revisit it to find out. So this
+// reports the request unhandled and lets the drive continue to the dispatch
+// ambiguity guard, which fails the apply closed; the request then completes
+// against the terminal apply on the next claim. The guard is where this apply
+// was headed regardless — a pending request must not be what routes around it.
+//
+// The request must never be answered with an error here: it stays pending across
+// the error, so every later claim would abort at this same point and the apply
+// would occupy a driver on every poll without ever resolving.
+func (c *GRPCClient) settleUndispatchedControlRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope, terminalization undispatchedTerminalization, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
 	logger := c.applyLogger(apply)
 	caller := controlRequestCaller(controlReq)
 	if !shouldDispatchQueuedRemoteApply(apply, scope) {
-		logger.WarnContext(ctx, "leaving pending gRPC cancel to the dispatch ambiguity guard; remote dispatch state is ambiguous so the cancel cannot be satisfied locally",
+		logger.WarnContext(ctx, "leaving pending gRPC control request to the dispatch ambiguity guard; remote dispatch state is ambiguous so the request cannot be satisfied locally",
 			append(apply.MutableLogAttrs(),
+				"control_operation", terminalization.controlOperation,
 				"requested_by", caller,
 				"dispatch_state", scope.dispatchState(apply))...)
 		return false, nil
 	}
 	if scope.usesOperationRemoteResume() {
-		// A multi-operation apply has one cancel request shared by every
-		// deployment. Cancelling this undispatched operation must not terminalize
-		// the parent or complete the apply-level request: sibling deployments with
-		// their own remote apply id still need to observe the durable cancel.
-		if err := c.terminalizeUndispatchedApplyOperation(ctx, apply, caller, scope, cancelUndispatchedTerminalization()); err != nil {
+		// A multi-operation apply has one request shared by every deployment.
+		// Settling this undispatched operation must not terminalize the parent or
+		// complete the apply-level request: sibling deployments with their own
+		// remote apply id still need to observe the durable command.
+		if err := c.terminalizeUndispatchedApplyOperation(ctx, apply, caller, scope, terminalization); err != nil {
 			return true, err
 		}
-		logOperationDriveLeavesParentCancel(logger, apply, scope)
+		leaveParentRequestPending(logger, apply, scope)
 		return true, nil
 	}
-	if err := c.terminalizeUndispatchedApply(ctx, apply, caller, scope, cancelUndispatchedTerminalization()); err != nil {
+	if err := c.terminalizeUndispatchedApply(ctx, apply, caller, scope, terminalization); err != nil {
 		return true, err
 	}
-	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+	if err := completePendingControlRequests(ctx, c.storage, apply, terminalization.controlOperation); err != nil {
 		return true, err
 	}
 	c.controlSendGate.clear(controlReq.ID)
