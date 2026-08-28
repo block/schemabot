@@ -1590,7 +1590,7 @@ func (c *LocalClient) wrapFailedEngineStop(task *storage.Task, stopErr error) er
 // the schema change as stopped or cancelled. It reads the engine's own
 // report, unlike hasLiveEngineWork, which reads the stored task state's
 // expectation.
-// Uncertainty counts as live work — only an affirmative nothing-left-to-cancel
+// Uncertainty counts as live work — only an affirmative nothing-left-to-settle
 // answer clears the probe, and what qualifies depends on who owns the engine's
 // truth:
 //
@@ -1598,16 +1598,17 @@ func (c *LocalClient) wrapFailedEngineStop(task *storage.Task, stopErr error) er
 //     provider's record of the change, so only a provider answer that closed
 //     the change clears the probe: cancelled, or failed with no retry path.
 //     Pending from such an engine is an open change the provider can still
-//     run, and a retryable failure remains runnable — both keep the cancel
-//     error surfacing so the change is never recorded cancelled while the
-//     provider can still land it.
+//     run, and a retryable failure remains runnable — both keep the control
+//     error surfacing so the change is never recorded stopped or cancelled
+//     while the provider can still land it.
 //   - Any other engine executes in this process, so pending — the idle
 //     sentinel — is the only answer proving nothing is left. A state the
 //     engine still tracks, terminal or not, means engine-owned work (such as
-//     target cleanup) remains that only a retried cancel finishes.
+//     target cleanup) remains that only a retried stop or cancel finishes.
 //
 // Completed deliberately counts as live for every engine: a change that
-// landed must reconcile to its completed outcome, never settle as cancelled.
+// landed must reconcile to its completed outcome, never settle as stopped or
+// cancelled.
 // The revert states keep the engine actively unwinding the change.
 func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressResult) bool {
 	if progress == nil {
