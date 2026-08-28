@@ -340,7 +340,7 @@ func TestServiceRegisterEngineSuppliesLocalClientEngine(t *testing.T) {
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"customdb": {
-				Type: "customengine",
+				Type: "strata",
 				Environments: map[string]EnvironmentConfig{
 					"staging": {DSN: "root@tcp(localhost:3306)/customdb"},
 				},
@@ -353,7 +353,7 @@ func TestServiceRegisterEngineSuppliesLocalClientEngine(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no engine registered")
 
-	require.NoError(t, service.RegisterEngine("customengine", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+	require.NoError(t, service.RegisterEngine("strata", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
 		return &fakeRegisteredEngine{}, nil
 	}))
 	client, err := service.TernClient("customdb", "staging")
@@ -368,7 +368,17 @@ func TestServiceRegisterEngineValidates(t *testing.T) {
 	require.Error(t, service.RegisterEngine("", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
 		return &fakeRegisteredEngine{}, nil
 	}))
-	require.Error(t, service.RegisterEngine("customengine", nil))
+	require.Error(t, service.RegisterEngine("strata", nil))
+
+	// A type whose dialect has no statement parser could plan but never pass
+	// the drift gate, so registration rejects it at setup rather than letting
+	// every schema change against it block downstream.
+	err := service.RegisterEngine("customengine", func(tern.LocalConfig, *slog.Logger) (engine.Engine, error) {
+		return &fakeRegisteredEngine{}, nil
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no statement parser registered for dialect")
+	assert.Contains(t, err.Error(), "customengine")
 }
 
 // A PlanetScale token configured as a literal (the secrets resolver returns
