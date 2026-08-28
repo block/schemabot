@@ -7691,8 +7691,9 @@ schemabot apply -e production
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: 🔄 Row copy in progress
-  └ shards: ◐ -40 45% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
+**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7792,7 +7793,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 #### Keyspace `cdb_resolute_lookup`
 
-**`outcomes_lookup`**: 🔄 Row copy in progress
+**`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27%
+- Rows: 540,211 / 2,000,780 · ETA: 8m 0s
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -7906,8 +7908,8 @@ schemabot apply -e production
 | --- | --- |
 | `-40` | ✅ completed |
 | `40-80` | ✅ completed |
-| `80-c0` | ⛔ cancelled |
-| `c0-` | ⛔ cancelled |
+| `80-c0` | 🚫 cancelled |
+| `c0-` | 🚫 cancelled |
 
 ---
 

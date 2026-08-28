@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // ShardedApplyData is the input to the sharded-apply comment: an apply that fans
@@ -94,6 +95,16 @@ type ShardedTableStatus struct {
 
 	// Status is the table's aggregate state in canonical task vocabulary.
 	Status string
+
+	// RowsCopied/RowsTotal/ETASeconds aggregate the shards' live copy figures:
+	// rows summed across the shards that have reported, ETA from the slowest
+	// shard. They drive the progress bar and rows line while the table copies;
+	// zero totals fall back to the state-word rendering. The totals grow as
+	// dispatch waves start their shards' copies, so the fraction is live, not a
+	// plan-time promise.
+	RowsCopied int64
+	RowsTotal  int64
+	ETASeconds int64
 
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
@@ -385,32 +396,61 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 }
 
 // writeShardedTableLine writes one table's rollup line — the table name and its
-// aggregate state phrase, with the shard count on a completed sharded table —
-// followed by the compact per-shard summary while the table is in flight. The
-// aggregate carries no single percent (each shard copies at its own pace), so
-// the line names the phase and the shard summary carries the per-shard
-// percents. When the aggregate is a quiet state (no shard-summary breakdown)
-// but the change has already landed on some shards — a partially-landed table
-// between dispatch waves, or one cancelled after part of the fleet applied —
-// the line states the landed coverage so the aggregate phrase alone never
-// hides or contradicts work that happened.
+// aggregate state, with the shard count on a completed sharded table — followed
+// by the compact per-shard summary while the table is in flight. An actively
+// copying table with reported row figures renders the live progress form (bar,
+// summed rows, slowest-shard ETA); every other state names its phase, and the
+// shard summary carries the per-shard percents. When the aggregate is a quiet
+// state (no shard-summary breakdown) but the change has already landed on some
+// shards — a partially-landed table between dispatch waves, or one cancelled
+// after part of the fleet applied — the line states the landed coverage so the
+// aggregate phrase alone never hides or contradicts work that happened.
 func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 	status := state.NormalizeTaskStatus(t.Status)
-	phrase := shardedTableStatusPhrase(status)
-	if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
-		if status == state.Task.Cancelled {
-			// The pure-cancelled parenthetical ("not started") would be false
-			// here: the change is live on the landed shards.
-			phrase = "⊘ Cancelled"
+	if status == state.Task.Running && t.RowsTotal > 0 {
+		writeShardedTableCopyProgress(sb, t)
+	} else {
+		phrase := shardedTableStatusPhrase(status)
+		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
+			if status == state.Task.Cancelled {
+				// The pure-cancelled parenthetical ("not started") would be false
+				// here: the change is live on the landed shards.
+				phrase = "⊘ Cancelled"
+			}
+			phrase += fmt.Sprintf(" — applied on %d of %d shards", landed, len(t.Shards))
 		}
-		phrase += fmt.Sprintf(" — applied on %d of %d shards", landed, len(t.Shards))
+		line := fmt.Sprintf("**`%s`**: %s", t.Table, phrase)
+		if status == state.Task.Completed && len(t.Shards) > 1 {
+			line += fmt.Sprintf(" (%d shards)", len(t.Shards))
+		}
+		sb.WriteString(line + "\n")
 	}
-	line := fmt.Sprintf("**`%s`**: %s", t.Table, phrase)
-	if status == state.Task.Completed && len(t.Shards) > 1 {
-		line += fmt.Sprintf(" (%d shards)", len(t.Shards))
-	}
-	sb.WriteString(line + "\n")
 	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards})
+}
+
+// writeShardedTableCopyProgress renders an actively copying table's live
+// figures, mirroring the single-deployment row-copy idiom: a percent bar from
+// the summed shard rows plus the rows/ETA line. The same honesty guards apply —
+// a copy that has not reported rows yet shows a starting indicator instead of a
+// stuck-looking 0% bar, and a copy past its estimated total shows finalizing
+// instead of a bar pinned at 100% (the totals are estimates, and on a sharded
+// table they also grow as later dispatch waves start reporting).
+func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
+	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
+		fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy\n", t.Table, ui.ProgressBarActivity())
+		fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
+		fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+		return
+	}
+	rows := TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds}
+	pct := ui.ClampPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal) * 100 / t.RowsTotal))
+	if pct == 0 {
+		fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", t.Table)
+		writeRowsAndETA(sb, rows)
+		return
+	}
+	fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", t.Table, ui.ProgressBarRowCopy(pct), pct)
+	writeRowsAndETA(sb, rows)
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display

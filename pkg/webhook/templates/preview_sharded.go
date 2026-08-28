@@ -40,8 +40,9 @@ func PreviewCommentShardedApplyInProgress() string {
 			Keyspace: "cdb_resolute_sharded",
 			Tables: []ShardedTableStatus{{
 				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
 				Shards: []ShardProgressData{
-					{Shard: "-40", Status: state.Task.Running, PercentComplete: 45},
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
 					{Shard: "40-80", Status: state.Task.Pending},
 					{Shard: "80-c0", Status: state.Task.Pending},
 					{Shard: "c0-", Status: state.Task.Pending},
@@ -269,6 +270,7 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 				Keyspace: "cdb_resolute_lookup",
 				Tables: []ShardedTableStatus{{
 					Table: "outcomes_lookup", Status: state.Task.Running,
+					RowsCopied: 540211, RowsTotal: 2000780, ETASeconds: 480,
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
 				}},
 				Shards: []ShardStatus{unshard(shards[1], "-")},

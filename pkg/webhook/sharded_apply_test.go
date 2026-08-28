@@ -570,17 +570,18 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 		mk(2, "cdb_resolute_sharded/40-80/mutes", state.ApplyOperation.Running),
 		mk(3, "cdb_resolute_sharded/80-/mutes", state.ApplyOperation.Pending),
 	}
-	task := func(id, opID int64, shard, taskState string, percent int) *storage.Task {
+	task := func(id, opID int64, shard, taskState string, percent int, copied, total int64, eta int) *storage.Task {
 		oid := opID
 		return &storage.Task{
 			ID: id, ApplyID: 1, ApplyOperationID: &oid, Shard: shard,
 			Namespace: "cdb_resolute_sharded", TableName: "mutes",
 			State: taskState, ProgressPercent: percent,
+			RowsCopied: copied, RowsTotal: total, ETASeconds: eta,
 		}
 	}
 	tasks := []*storage.Task{
-		task(1, 1, "-40", state.Task.Completed, 100),
-		task(2, 2, "40-80", state.Task.Running, 37),
+		task(1, 1, "-40", state.Task.Completed, 100, 500000, 500000, 0),
+		task(2, 2, "40-80", state.Task.Running, 37, 185000, 500000, 240),
 		// The 80- operation has no task yet: dispatch creates tasks when the
 		// shard's wave starts, so its operation state stands in.
 	}
@@ -598,6 +599,9 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 	assert.Equal(t, templates.ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 37}, table.Shards[1])
 	assert.Equal(t, templates.ShardProgressData{Shard: "80-", Status: state.ApplyOperation.Pending, PercentComplete: 0}, table.Shards[2],
 		"an operation without a task contributes its operation state")
+	assert.Equal(t, int64(685000), table.RowsCopied, "rows sum across the shards that have reported")
+	assert.Equal(t, int64(1000000), table.RowsTotal, "the taskless shard contributes no rows yet")
+	assert.Equal(t, int64(240), table.ETASeconds, "the ETA is the slowest shard's")
 }
 
 // A shard whose table failed makes the whole table read failed, and each
