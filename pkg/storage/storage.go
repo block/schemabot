@@ -693,10 +693,24 @@ type ApplyStore interface {
 	// a self-referential handoff would refuse the apply forever while pointing
 	// the operator back at the refused apply itself.
 	//
-	// Callers recording a takeover must mark before committing the takeover's
-	// own effects: a crash after marking leaves an apply that refuses to start,
-	// which fails closed, while the reverse order leaves a window in which the
-	// handed-off work can be started again.
+	// Callers recording a takeover mark as soon as the successor durably
+	// exists — after its creation, so the marker never names an apply that
+	// does not exist, and before any driver acts on it. The marker does not
+	// carry that window alone: while the successor is active, a claim on the
+	// handed-off apply is refused by the claim-time one-active-apply re-check;
+	// the marker is what keeps refusing once the successor settles and that
+	// re-check has nothing left to catch. A takeover whose mark never lands —
+	// a failed write, or a crash between creating the successor and marking —
+	// therefore leaves an apply that becomes startable again once its
+	// successor settles; the failed write is logged with both applies named,
+	// and neither case is retried.
+	//
+	// The refusal the marker backs is apply-granular even when the successor
+	// took over only part of the apply's work: start is apply-wide and would
+	// replay everything, including the part the successor now owns. Work the
+	// successor did not take over reaches the database through a fresh
+	// dispatch — the marked apply's hold on the database was already released
+	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
 	// CheckLease verifies that an operator apply lease is still current without

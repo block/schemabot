@@ -32,18 +32,29 @@ import (
 // The conflict that refused the dispatch is returned alongside the error, so a
 // caller that can resolve into the holding apply rather than be refused by it
 // has the apply in hand without repeating the scan.
-func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, dispatchShard string, attachApplyID int64) (blockingTask, error) {
+//
+// The stopped applies whose resting tasks the check released are returned with
+// it: their work is what a dispatch for the same table takes over, and the scan
+// that frees the database is the one place that already knows who they are.
+//
+// environment is the dispatch's own environment. It plays no part in what
+// blocks — a namesake's active work on the shared database name still refuses
+// the dispatch — but it decides which released holders the dispatch may later
+// mark superseded (see markSupersededHolders): only work attributable to the
+// same environment and target is the dispatch's to take over.
+func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
+	memo := newConflictScanMemo()
 	for attempt := range 10 {
 		existingTasks, err := c.storage.Tasks().GetByDatabase(ctx, plan.Database)
 		if err != nil {
-			return blockingTask{}, fmt.Errorf("check existing tasks: %w", err)
+			return blockingTask{}, nil, fmt.Errorf("check existing tasks: %w", err)
 		}
 
 		c.logger.Debug("conflict check: found tasks", "count", len(existingTasks), "database", plan.Database, "shard", dispatchShard, "attempt", attempt)
 
-		blocking := c.findBlockingTask(ctx, existingTasks, plan, dispatchShard, attachApplyID)
+		blocking, released := c.findBlockingTask(ctx, existingTasks, plan, environment, dispatchShard, attachApplyID, memo)
 		if !blocking.blocks() {
-			return blockingTask{}, nil
+			return blockingTask{}, released, nil
 		}
 
 		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
@@ -60,21 +71,23 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 		// The refusal is what the operator sees when an apply dies on arrival, so
 		// it names the apply holding the database rather than only the task, which
 		// on its own gives them nothing to act on.
-		return blocking, fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
+		return blocking, nil, fmt.Errorf("schema change already in progress for database %q (plan %s): %s",
 			plan.Database, plan.PlanIdentifier, blocking.describe())
 	}
-	return blockingTask{}, nil
+	return blockingTask{}, nil, nil
 }
 
 // findBlockingTask checks if any non-terminal task for this database is truly active.
-// Returns the conflict, or a zero blockingTask when no conflict exists.
+// Returns the conflict, or a zero blockingTask when no conflict exists, along
+// with the stopped applies whose resting tasks it released along the way.
 // As a side effect, resolves stale tasks by checking engine state.
 //
 // dispatchShard scopes the conflict to a single shard (see checkActiveTaskConflict):
 // when both the candidate apply and an existing task target a non-empty shard,
 // a different shard does not conflict, so a sharded fan-out runs its shards
 // concurrently instead of serializing on the first one.
-func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, dispatchShard string, attachApplyID int64) blockingTask {
+func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Task, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64, memo *conflictScanMemo) (blockingTask, []supersededHolder) {
+	var released []supersededHolder
 	for _, t := range tasks {
 		c.logger.Debug("conflict check: checking task", "task_id", t.TaskIdentifier, "state", t.State, "shard", t.Shard, "is_terminal", state.IsTerminalTaskState(t.State))
 		if t.DatabaseType != plan.DatabaseType || state.IsTerminalTaskState(t.State) {
@@ -101,12 +114,38 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 		// keeps blocking (fail closed).
 		apply, ok := c.applyForConflictCheck(ctx, t)
 		if !ok {
-			return newBlockingTask(t, nil)
+			return newBlockingTask(t, nil), nil
 		}
 
 		// A pending task of a terminal apply can never start; cancel it so it
 		// stops blocking the database as phantom active work.
 		if c.tryResolveOrphanedPendingTask(ctx, t, apply) {
+			continue
+		}
+
+		// A stopped task rests without ending. Nothing reaches for it until a
+		// person asks, so it does not hold the database — and its apply's work
+		// is what a dispatch for the same table takes over. The decision is
+		// storage-only and memoized across the check's retry attempts: the
+		// retries exist to absorb engine staleness, which cannot change this
+		// answer (see conflictScanMemo).
+		resting, decided := memo.resting[t.TaskIdentifier]
+		if !decided {
+			resting.releases = c.restingTaskReleasesDatabase(ctx, t, apply)
+			if resting.releases {
+				resting.attributable = c.releasedHolderAttributableToDispatch(ctx, t, apply, plan, environment, memo.operationTargets)
+			}
+			memo.resting[t.TaskIdentifier] = resting
+		}
+		if resting.releases {
+			if resting.attributable {
+				released = append(released, supersededHolder{
+					applyID:         apply.ID,
+					applyIdentifier: apply.ApplyIdentifier,
+					namespace:       t.Namespace,
+					table:           t.TableName,
+				})
+			}
 			continue
 		}
 
@@ -117,9 +156,43 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 
 		c.logger.Debug("conflict check: task is active", append(t.LogAttrs(),
 			"apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
-		return newBlockingTask(t, apply)
+		return newBlockingTask(t, apply), nil
 	}
-	return blockingTask{}
+	return blockingTask{}, released
+}
+
+// conflictScanMemo carries one conflict check's decisions across its retry
+// attempts. The retries exist to absorb engine staleness — storage already
+// updated, the engine not yet settled — but the resting decision is
+// storage-only: re-deciding it on every attempt would count one refusal in the
+// ownership-block metrics up to once per attempt and re-read the apply's
+// control requests for an answer that does not change within the check. Going
+// stale inside the check's window is safe in both directions: a hold that
+// lifts is picked up by the dispatch's own retry, and a release that an
+// operator command overtakes is re-checked durably when the dispatch tries to
+// create its apply against the one-active-apply gate.
+//
+// operationTargets caches the operation-row targets read while attributing
+// released holders, exactly as runningCopyTables caches them across one scan.
+type conflictScanMemo struct {
+	resting          map[string]restingDecision
+	operationTargets map[int64]string
+}
+
+// restingDecision is what one conflict check decided about a stopped task:
+// whether it rests without holding the database, and — only when it does —
+// whether its apply's work is attributable to the dispatch and so eligible to
+// be marked superseded.
+type restingDecision struct {
+	releases     bool
+	attributable bool
+}
+
+func newConflictScanMemo() *conflictScanMemo {
+	return &conflictScanMemo{
+		resting:          map[string]restingDecision{},
+		operationTargets: map[int64]string{},
+	}
 }
 
 // blockingTask names the active work that refuses a new apply on a database,
@@ -306,6 +379,126 @@ func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *stor
 		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
 		previousState, state.Task.Cancelled)
 	return true
+}
+
+// restingTaskReleasesDatabase reports whether a stopped task has stopped
+// holding its database.
+//
+// A task holds the database only while a driver will pick it up on its own:
+// running work is being driven now, and pending or failed_retryable work is
+// claimed unprompted. Stopped is the one state where a task still exists and
+// nothing reaches for it until a person asks. That is what makes it safe to
+// ignore, and it is exactly what a terminal-task test cannot express, because
+// the same fact that makes it inert also makes it resumable.
+//
+// Three conditions must hold, each closing off a way a driver could still
+// arrive:
+//
+//	apply is terminal        a claimable apply is work someone will drive
+//	no fresh lease           a live driver is mid-settlement of this apply
+//	no pending start/cancel  an operator already asked, and the claim
+//	                         predicate admits a stopped apply for either
+//
+// Uncertainty keeps the hold: a control-request read that fails cannot prove no
+// driver is coming, so the task keeps blocking.
+func (c *LocalClient) restingTaskReleasesDatabase(ctx context.Context, t *storage.Task, apply *storage.Apply) bool {
+	if !state.IsState(t.State, state.Task.Stopped) {
+		// Every other non-terminal task state is either being driven now or
+		// waiting for a driver, so it stays with the engine-backed checks.
+		return false
+	}
+
+	if !state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("conflict check: stopped task's apply is still claimable; the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+		return false
+	}
+
+	// A terminal apply with a fresh lease is a driver mid-settlement of this
+	// same apply, so the task falls through to tryResolveStaleTask, which
+	// checks the lease again and owns the fresh_lease ownership-block record —
+	// recording it here too would count one refusal twice.
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Debug("conflict check: stopped task's apply still holds a fresh lease; the engine-backed checks decide whether it blocks",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		return false
+	}
+
+	operation, err := c.pendingDriverRequest(ctx, apply)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to read the stopped apply's control requests; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "control_request_unreadable")
+		return false
+	}
+	if operation != "" {
+		c.logger.Info("conflict check: stopped task's apply has an operator command waiting for a driver; the task keeps blocking until that command is delivered",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "pending_operation", string(operation))...)
+		metrics.RecordConflictCheckOwnershipBlock(ctx, t.Database, t.DatabaseType, "pending_control_request")
+		return false
+	}
+
+	c.logger.Info("conflict check: stopped task rests with no driver coming for it; it no longer holds the database",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+	return true
+}
+
+// releasedHolderAttributableToDispatch reports whether a released resting
+// task's work provably belongs to the environment and target this dispatch is
+// for. Task rows are keyed by database name alone, which is not a target: the
+// name can be shared by this deployment's staging and production databases
+// (see runningCopyTables). Releasing the hold is safe either way — a resting
+// task holds nothing regardless of whose it is — but the superseded marker is
+// a write-once, permanent refusal of start on the holder, so a holder that
+// cannot be attributed to this dispatch's own environment and target must not
+// be marked: refusing a namesake's apply forever is worse than leaving its
+// marker to the dispatch that actually meets its copy. Every unattributable
+// shape — a mismatched or absent environment, a target that cannot be
+// resolved, a failed attribution read — fails toward not marking, the same
+// direction taskRunsOnPlanTarget fails for plan disclosures.
+func (c *LocalClient) releasedHolderAttributableToDispatch(ctx context.Context, t *storage.Task, apply *storage.Apply, plan *storage.Plan, environment string, operationTargets map[int64]string) bool {
+	if !c.taskDescribesPlanTarget(t, environment) {
+		c.logger.Info("conflict check: released resting task belongs to a namesake environment, so this dispatch takes over none of its work",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "dispatch_environment", environment)...)
+		return false
+	}
+	onTarget, err := c.taskRunsOnPlanTarget(ctx, t, plan.Target, operationTargets)
+	if err != nil {
+		c.logger.Warn("conflict check: failed to attribute a released resting task to a target, so this dispatch will not mark its apply superseded",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "plan_target", plan.Target, "error", err)...)
+		return false
+	}
+	if !onTarget {
+		c.logger.Info("conflict check: released resting task runs on another target, so this dispatch takes over none of its work",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "plan_target", plan.Target)...)
+		return false
+	}
+	return true
+}
+
+// pendingDriverRequest names the operator command that will bring a driver back
+// to a stopped apply, empty when none is pending. Start and cancel are the two
+// the apply claim predicate admits on a stopped apply: a start resumes it and a
+// cancel is delivered by a drive, so either one means a driver arrives without
+// anyone asking again.
+func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.Apply) (storage.ControlOperation, error) {
+	requests := c.storage.ControlRequests()
+	if requests == nil {
+		// A storage without a control request store cannot answer whether a
+		// command is waiting, and an unanswerable question is not a "no".
+		return "", fmt.Errorf("read pending requests for apply %s: control request store is not configured", apply.ApplyIdentifier)
+	}
+
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel} {
+		request, err := requests.GetPending(ctx, apply.ID, operation)
+		if err != nil {
+			return "", fmt.Errorf("read pending %s request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+		}
+		if request != nil {
+			return operation, nil
+		}
+	}
+	return "", nil
 }
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
