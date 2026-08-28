@@ -555,6 +555,18 @@ func (h *recordingLogHandler) messages(level slog.Level) []string {
 	return out
 }
 
+func (h *recordingLogHandler) recordsAt(level slog.Level) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []slog.Record
+	for _, r := range h.records {
+		if r.Level == level {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // A task can legitimately sit in one state for a long time (a slow copy, a
 // throttled engine), but an operator reading the logs must be able to tell a
 // slow task from a wedged one. When the stored state and progress fields show
@@ -599,14 +611,22 @@ func TestPollTaskToCompletion_StallWatchdogWarnsWithoutChangingState(t *testing.
 
 	assert.Equal(t, taskContinue, action)
 	assert.Equal(t, state.Task.Completed, task.State, "the watchdog is observational; the task still completes normally")
-	warns := handler.messages(slog.LevelWarn)
 	stallWarns := 0
-	for _, msg := range warns {
-		if strings.Contains(msg, "stall-warning interval") {
-			stallWarns++
+	throttleAttrSeen := false
+	for _, r := range handler.recordsAt(slog.LevelWarn) {
+		if !strings.Contains(r.Message, "stall-warning interval") {
+			continue
 		}
+		stallWarns++
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "throttled" {
+				throttleAttrSeen = true
+			}
+			return true
+		})
 	}
 	assert.GreaterOrEqual(t, stallWarns, 1, "a motionless task past the interval is warned about")
+	assert.True(t, throttleAttrSeen, "the stall warning carries the engine's throttle state so triage can tell a throttled task from a wedged one")
 	assert.NotContains(t, taskStore.states, state.Task.FailedRetryable, "the watchdog never changes task state")
 	assert.NotContains(t, taskStore.states, state.Task.Failed, "the watchdog never changes task state")
 }

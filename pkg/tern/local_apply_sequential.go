@@ -714,8 +714,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			// deferred cutover and deferred deploy for as long as the operator
 			// takes to act.
 			if stalledFor, warn := watchdog.observe(now, taskProgressSnapshotOf(task)); warn && !taskWaitsForOperatorAction(task.State) {
+				// Throttle state answers the first triage question about a
+				// motionless task — is the engine deliberately holding back —
+				// without a trip to the task row.
 				c.logger.Warn("task state and progress fields are unchanged past the stall-warning interval; the drive continues polling the engine",
-					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "stalled_for", stalledFor.Round(time.Second), "engine_state", result.State)...)
+					append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "stalled_for", stalledFor.Round(time.Second), "engine_state", result.State, "throttled", task.Throttled, "throttle_reason", task.ThrottleReason)...)
 			}
 
 			c.transitionTaskState(ctx, task, 0, task.State, "")
