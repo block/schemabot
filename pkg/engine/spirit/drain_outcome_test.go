@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -121,8 +122,10 @@ func TestDrainedFailureKeepsLastObservedCopyPosition(t *testing.T) {
 }
 
 // A completed schema change copied everything, so the drained outcome reports
-// a full bar while keeping the last observed row counters. The mid-copy detail
-// line is dropped: its stale percentage would contradict the completed state.
+// a full bar with the row total reconciled to the copied count — the count is
+// ground truth once the copy finished, and a full bar contradicted by its own
+// rows line would misreport a change that landed. The mid-copy detail line is
+// dropped: its stale percentage would contradict the completed state.
 func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
@@ -153,7 +156,8 @@ func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	assert.Equal(t, string(engine.StateCompleted), tp.State)
 	assert.Equal(t, 100, tp.Progress)
 	assert.Equal(t, int64(49000), tp.RowsCopied)
-	assert.Equal(t, int64(50000), tp.RowsTotal)
+	assert.Equal(t, int64(49000), tp.RowsTotal,
+		"the estimated total reconciles to the copied count once the copy is complete")
 	assert.Empty(t, tp.ProgressDetail)
 }
 
@@ -185,9 +189,11 @@ func TestDrainLosingRaceToNewerChangeLeavesItUntouched(t *testing.T) {
 	eng.mu.Unlock()
 
 	var second *runningSchemaChange
+	eng.mu.Lock()
 	eng.drainRaceWindow = func() {
 		second = registerRunningSchemaChange(eng)
 	}
+	eng.mu.Unlock()
 
 	eng.Drain()
 
@@ -216,4 +222,135 @@ func TestDrainDoesNotRetainStoppedChange(t *testing.T) {
 	result := pollProgress(t, eng)
 	assert.Equal(t, engine.StatePending, result.State)
 	assert.Equal(t, "No active schema change", result.Message)
+}
+
+// A cancelled schema change resolves through the cancel call itself — the
+// caller already holds the outcome — so draining one retains nothing, and
+// progress reports the engine as having no active schema change.
+func TestDrainDoesNotRetainCancelledChange(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateCancelled
+	rm.tables = []string{"users"}
+	eng.mu.Unlock()
+
+	eng.Drain()
+
+	result := pollProgress(t, eng)
+	assert.Equal(t, engine.StatePending, result.State)
+	assert.Equal(t, "No active schema change", result.Message)
+}
+
+// Accepting new work is the release point for a retained outcome: once the
+// engine tracks a new schema change, the previous change's result must be
+// gone for good, because Drain never clears an outcome it did not retain. If
+// the new change ends in a state Drain does not retain — an operator stop —
+// the engine must report idle, never resurface the earlier change's completed
+// outcome for work that was stopped half-copied.
+func TestAcceptingNewWorkReleasesDrainedOutcome(t *testing.T) {
+	eng := New(Config{})
+	first := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	first.state = engine.StateCompleted
+	first.tables = []string{"users"}
+	eng.mu.Unlock()
+	eng.Drain()
+
+	second := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	second.state = engine.StateStopped
+	eng.mu.Unlock()
+	eng.Drain()
+
+	result := pollProgress(t, eng)
+	assert.Equal(t, engine.StatePending, result.State)
+	assert.Equal(t, "No active schema change", result.Message)
+}
+
+// An apply that accepts an empty plan is still accepted work: a poll landing
+// after the accept must read an idle engine, not the previous change's
+// retained outcome as this request's result.
+func TestApplyWithNoChangesReleasesDrainedOutcome(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateCompleted
+	rm.tables = []string{"users"}
+	eng.mu.Unlock()
+	eng.Drain()
+
+	result, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Credentials: &engine.Credentials{DSN: "root:pass@tcp(127.0.0.1:1)/testdb"},
+	})
+	require.NoError(t, err, "Apply() with no changes")
+	assert.True(t, result.Accepted)
+
+	progress := pollProgress(t, eng)
+	assert.Equal(t, engine.StatePending, progress.State)
+	assert.Equal(t, "No active schema change", progress.Message)
+}
+
+// A stop that arrives after the completed change was drained must be told the
+// change completed — through the same typed rejection a stop racing a tracked
+// completion receives — so the caller reconciles to the completed outcome
+// instead of concluding no schema change ever ran.
+func TestStopAfterDrainedCompletionReportsAlreadyCompleted(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateCompleted
+	eng.mu.Unlock()
+	eng.Drain()
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	assert.Nil(t, result)
+	require.Error(t, err)
+	assert.True(t, engine.IsAlreadyCompleted(err),
+		"the caller must reconcile to the completed outcome, not treat the stop as permanently impossible")
+	assert.Contains(t, err.Error(), "testdb")
+}
+
+// A cancel that arrives after the completed change was drained must likewise
+// reconcile to the completed outcome: marking it cancelled or reporting that
+// nothing ran would misrepresent a target the change already landed on.
+func TestCancelAfterDrainedCompletionReportsAlreadyCompleted(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateCompleted
+	eng.mu.Unlock()
+	eng.Drain()
+
+	result, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+	assert.Nil(t, result)
+	require.Error(t, err)
+	assert.True(t, engine.IsAlreadyCompleted(err),
+		"the caller must reconcile to the completed outcome, not treat the cancel as permanently impossible")
+	assert.Contains(t, err.Error(), "testdb")
+}
+
+// A drained failure is not a completion: a stop or cancel for it has nothing
+// left to act on, and answering already-completed would misrepresent a target
+// the change never landed on. The permanent rejection stands.
+func TestStopAndCancelAfterDrainedFailureStayPermanent(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	eng.mu.Lock()
+	rm.state = engine.StateFailed
+	rm.errorMessage = "schema change failed: checksum mismatch"
+	eng.mu.Unlock()
+	eng.Drain()
+
+	var permanent *engine.PermanentError
+
+	_, stopErr := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.Error(t, stopErr)
+	assert.False(t, engine.IsAlreadyCompleted(stopErr))
+	assert.True(t, errors.As(stopErr, &permanent), "a stop with nothing left to act on is permanently impossible")
+
+	_, cancelErr := eng.Cancel(t.Context(), &engine.ControlRequest{})
+	require.Error(t, cancelErr)
+	assert.False(t, engine.IsAlreadyCompleted(cancelErr))
+	assert.True(t, errors.As(cancelErr, &permanent), "a cancel with nothing left to act on is permanently impossible")
 }

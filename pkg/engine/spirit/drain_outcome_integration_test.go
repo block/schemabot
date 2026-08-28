@@ -153,7 +153,7 @@ func TestEngine_Apply_AfterDrainedFailureStartsFreshProgress(t *testing.T) {
 		"ALTER TABLE `drain_second` ADD COLUMN `email` varchar(255) NULL")
 
 	// waitForTerminalOutcome fails on any terminal state other than the wanted
-	// one, so a poll that resurfaced the first change's failure fails here.
+	// one, so the second change must report its own completion end to end.
 	final := waitForTerminalOutcome(t, eng, engine.StateCompleted)
 	assert.Empty(t, final.ErrorMessage)
 	require.Len(t, final.Tables, 1)

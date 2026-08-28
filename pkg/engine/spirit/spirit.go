@@ -346,6 +346,18 @@ func (e *Engine) Drain() {
 	e.mu.Unlock()
 }
 
+// installRunningSchemaChange publishes rm as the engine's tracked schema
+// change. Accepting new work releases the previous change's drained outcome in
+// the same critical section, so no poll can ever observe the new change's
+// tracked state alongside an older change's result — one schema change's
+// outcome never bleeds into the next one's progress.
+func (e *Engine) installRunningSchemaChange(rm *runningSchemaChange) {
+	e.mu.Lock()
+	e.runningSchemaChange = rm
+	e.drainedOutcome = nil
+	e.mu.Unlock()
+}
+
 // drainedOutcome is the retained result of a schema change that reached a
 // terminal outcome before Drain released its tracked state. Progress serves it
 // so a poll that lands after the drain reports the real result — the drain
@@ -353,6 +365,7 @@ func (e *Engine) Drain() {
 // under Engine.mu next to the tracked state it stands in for.
 type drainedOutcome struct {
 	state        engine.State
+	database     string
 	message      string
 	errorMessage string // Failure details when state is StateFailed
 	tables       []engine.TableProgress
@@ -387,32 +400,27 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 			tp.ThrottleReason = ""
 			if rm.state == engine.StateCompleted {
 				tp.Progress = 100
-				// The detail line carries a mid-copy percentage that would
-				// contradict the completed bar.
+				// A completed change copied everything, so the copied count is
+				// ground truth: reconcile the estimated total to it the way the
+				// live path does, and drop the detail line whose mid-copy
+				// percentage would contradict the completed bar.
+				tp.RowsTotal = tp.RowsCopied
 				tp.ProgressDetail = ""
 			}
 			tables = append(tables, tp)
 		}
 	} else {
-		tables = make([]engine.TableProgress, 0, len(rm.tables)+len(rm.directStatements))
-		for i, tableName := range rm.tables {
-			tp := engine.TableProgress{
-				Namespace: rm.tableNamespace[tableName],
-				Table:     tableName,
-				State:     string(rm.state),
+		tables = tableIdentityProgress(rm, string(rm.state))
+		if rm.state == engine.StateCompleted {
+			for i := range tables {
+				tables[i].Progress = 100
 			}
-			if i < len(rm.ddls) {
-				tp.DDL = rm.ddls[i]
-			}
-			if rm.state == engine.StateCompleted {
-				tp.Progress = 100
-			}
-			tables = append(tables, tp)
 		}
 	}
 	tables = append(tables, directStatementTableProgress(rm)...)
 	return &drainedOutcome{
 		state:        rm.state,
+		database:     rm.database,
 		message:      fmt.Sprintf("Schema change %s", rm.state),
 		errorMessage: rm.errorMessage,
 		tables:       tables,
@@ -719,6 +727,12 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	if len(req.FlatDDL()) == 0 {
+		// An accepted no-op is still accepted work: release the previous
+		// change's drained outcome so a poll after this accept reads an idle
+		// engine rather than another change's result as its own.
+		e.mu.Lock()
+		e.drainedOutcome = nil
+		e.mu.Unlock()
 		return &engine.ApplyResult{
 			Accepted: true,
 			Message:  "No changes to apply",
@@ -755,7 +769,6 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Initialize running state and start background execution.
-	e.mu.Lock()
 	// Build a table→namespace lookup from the apply request. Each SchemaChange
 	// carries a namespace and a list of table changes. Spirit flattens all DDLs
 	// into one execution, so we need to map each table back to its namespace
@@ -783,11 +796,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		password:       password,
 		threads:        e.threads,
 	}
-	e.runningSchemaChange = rm
-	// Accepting new work releases the previous change's drained outcome, so
-	// one schema change's result never bleeds into the next one's progress.
-	e.drainedOutcome = nil
-	e.mu.Unlock()
+	e.installRunningSchemaChange(rm)
 
 	// Start schema change in background with cancellable context.
 	// Use WithoutCancel to preserve context values (tracing) without inheriting
@@ -868,22 +877,10 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		rm.lastLiveTables = slices.Clone(tableProgress)
 	} else {
 		// Fallback: no per-table progress available
-		for i, tableName := range rm.tables {
-			ddl := ""
-			if i < len(rm.ddls) {
-				ddl = rm.ddls[i]
-			}
-			tp := engine.TableProgress{
-				Namespace: rm.tableNamespace[tableName],
-				Table:     tableName,
-				DDL:       ddl,
-				State:     stateStr,
-			}
-			// Only show progress detail on first table
-			if i == 0 {
-				tp.ProgressDetail = message
-			}
-			tableProgress = append(tableProgress, tp)
+		tableProgress = tableIdentityProgress(rm, stateStr)
+		// Only show progress detail on first table
+		if len(tableProgress) > 0 {
+			tableProgress[0].ProgressDetail = message
 		}
 	}
 
@@ -906,6 +903,28 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		ResumeState:           req.ResumeState,
 		ResumedFromCheckpoint: spiritProgress.Resume,
 	}, nil
+}
+
+// tableIdentityProgress renders one entry per tracked table carrying identity,
+// index-aligned DDL, and the given state — the shape shared by a live poll
+// with no per-table progress from Spirit yet and a drained outcome captured
+// before any live poll observed counters. Keeping the DDL index alignment in
+// one place keeps the two consumers from drifting apart. The caller must hold
+// e.mu.
+func tableIdentityProgress(rm *runningSchemaChange, stateStr string) []engine.TableProgress {
+	entries := make([]engine.TableProgress, 0, len(rm.tables))
+	for i, tableName := range rm.tables {
+		tp := engine.TableProgress{
+			Namespace: rm.tableNamespace[tableName],
+			Table:     tableName,
+			State:     stateStr,
+		}
+		if i < len(rm.ddls) {
+			tp.DDL = rm.ddls[i]
+		}
+		entries = append(entries, tp)
+	}
+	return entries
 }
 
 // directStatementTableProgress renders the schema change's direct-routed
