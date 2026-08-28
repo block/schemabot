@@ -37,10 +37,20 @@ var connectConfig = func(ctx context.Context, cfg pgx.ConnConfig) (driver.Conn, 
 // OpenReloadable, and the credential-reload path alike.
 type Option func(*pgx.ConnConfig)
 
-// WithConnectTimeout bounds a single connection attempt (TCP dial plus
-// handshake). A non-positive duration is ignored, leaving the driver default
-// in place. It does not bound query execution — use context deadlines for
-// that.
+// defaultConnectTimeout bounds a single connection attempt for every
+// SchemaBot-managed PostgreSQL connection whose parsed connect timeout is not
+// positive — the DSN or an option must set a positive connect_timeout to
+// override it, and the zero "wait indefinitely" value is deliberately
+// replaced — so an attempt against an unreachable or half-open endpoint fails
+// and is retried instead of blocking its caller indefinitely. pgconn applies
+// it to the whole connection process: dial, TLS, startup, and auth.
+const defaultConnectTimeout = 30 * time.Second
+
+// WithConnectTimeout bounds a single connection attempt — pgconn applies it
+// to the whole connection process: dial, TLS, startup, and auth. A
+// non-positive duration is ignored, leaving any DSN-carried value, or the
+// package default, in place. It does not bound query execution — use context
+// deadlines for that.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(cfg *pgx.ConnConfig) {
 		if d > 0 {
@@ -371,6 +381,13 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 	}
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	// The default fills non-positive values, so a positive DSN connect_timeout
+	// or WithConnectTimeout option wins while zero ("wait indefinitely") and
+	// negative values — which pgconn would silently treat as unbounded — are
+	// replaced: a managed connection attempt is never unbounded.
+	if cfg.ConnectTimeout <= 0 {
+		cfg.ConnectTimeout = defaultConnectTimeout
 	}
 	return cfg, nil
 }
