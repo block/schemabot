@@ -1662,11 +1662,7 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompl
 		// Unknown or in-flight statuses still get a visible label — a bare
 		// table name reads as success, which is wrong for anything but
 		// completed.
-		if label := humanizeState(normalized); label != "" {
-			fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
-		} else {
-			fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
-		}
+		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, taskOutcomeLabel(normalized))
 	}
 
 	if t.DDL != "" {
@@ -1674,6 +1670,24 @@ func writeSummaryTableEntry(sb *strings.Builder, t TableProgressData, labelCompl
 	} else {
 		sb.WriteString("\n")
 	}
+}
+
+// taskOutcomeLabel says where a table was left when the apply stopped running.
+// Most states read correctly once humanized, but three do not: two are internal
+// vocabulary the operator never sees elsewhere, and revert_window hides the fact
+// an operator most needs from a terminal record, that the change is already
+// applied and only the window is still open. Those get an explicit label; every
+// other state keeps the humanized constant this file uses by default.
+func taskOutcomeLabel(normalized string) string {
+	switch normalized {
+	case state.Task.RevertWindow:
+		return "Completed (revert window open)"
+	case state.Task.PostChecksum:
+		return "Data verified, not cut over"
+	case state.Task.FailedRetryable:
+		return "Interrupted"
+	}
+	return humanizeState(normalized)
 }
 
 // ApplyStatusFromProgress converts a ProgressResponse to ApplyStatusCommentData.

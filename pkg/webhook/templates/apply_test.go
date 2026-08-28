@@ -1854,6 +1854,40 @@ func TestRenderApplySummaryComment_NonTerminalTableStatusLabeled(t *testing.T) {
 	assert.Contains(t, result, "**`sessions`** — Running")
 }
 
+// A table left mid-apply is named by where it was left, not by the internal
+// state constant. The revert-window case matters most: the change is already
+// applied and only the window is still open, which an operator reading a
+// terminal record must not have to infer.
+func TestRenderApplySummaryComment_NonTerminalTableOutcomeVocabulary(t *testing.T) {
+	cases := []struct {
+		status string
+		label  string
+	}{
+		{state.Task.RevertWindow, "**`orders`** — Completed (revert window open)"},
+		{state.Task.PostChecksum, "**`orders`** — Data verified, not cut over"},
+		{state.Task.FailedRetryable, "**`orders`** — Interrupted"},
+		{state.Task.CuttingOver, "**`orders`** — Cutting over"},
+		{state.Task.Pending, "**`orders`** — Pending"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			result := RenderApplySummaryComment(ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				RequestedBy: "aparajon",
+				State:       state.Apply.Failed,
+				Engine:      "Spirit",
+				Tables: []TableProgressData{
+					{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: tc.status},
+				},
+			})
+
+			assert.Contains(t, result, tc.label)
+		})
+	}
+}
+
 // The terminal summary for a cancelled (permanent) change must not offer resume
 // and must direct the operator to open a new schema change.
 func TestRenderApplySummaryComment_Cancelled(t *testing.T) {
