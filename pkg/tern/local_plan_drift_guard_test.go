@@ -277,9 +277,9 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	})
 
 	t.Run("multi-statement DDL is rejected", func(t *testing.T) {
-		// Canonicalize only canonicalizes the first statement, so a
-		// multi-statement payload would silently drop the trailing statements
-		// and mask drift on them. It must fail closed instead.
+		// The parser rejects multi-statement input, so a destructive trailing
+		// statement cannot hide behind the classification of the first one and
+		// mask drift. It must fail closed instead.
 		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "parsed as 2 statements")
@@ -325,10 +325,17 @@ func TestCanonicalDDLForDrift_PostgresDialect(t *testing.T) {
 		assert.Equal(t, compact, spaced, "formatting-only differences canonicalize to the same form")
 	})
 
-	t.Run("CREATE INDEX CONCURRENTLY is DDL", func(t *testing.T) {
-		canon, err := canonicalDDLForDrift(parser, "CREATE INDEX CONCURRENTLY idx_users_email ON users (email)")
+	t.Run("CREATE INDEX CONCURRENTLY is canonicalized", func(t *testing.T) {
+		// Two spellings that differ only in keyword case and the implicit
+		// btree access method canonicalize to the same form, proving the
+		// statement round-trips through the parser rather than passing
+		// through as raw text.
+		implicit, err := canonicalDDLForDrift(parser, "CREATE INDEX CONCURRENTLY idx_users_email ON users (email)")
 		require.NoError(t, err)
-		assert.Contains(t, canon, "CONCURRENTLY")
+		explicit, err := canonicalDDLForDrift(parser, "create index concurrently idx_users_email on users using btree (email)")
+		require.NoError(t, err)
+		assert.Equal(t, explicit, implicit)
+		assert.Contains(t, implicit, "CONCURRENTLY")
 	})
 
 	t.Run("ALTER TABLE is canonicalized", func(t *testing.T) {
@@ -360,4 +367,37 @@ func TestStatementParser_UnregisteredDialectFailsClosed(t *testing.T) {
 	_, err := c.statementParser()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database type "oracle"`)
+}
+
+// The drift guard selects its grammar from the client's configured database
+// type: a PostgreSQL deployment's plan is judged by the PostgreSQL parser and
+// a MySQL deployment's by the MySQL parser. The same statement proves the
+// selection both ways — CREATE INDEX CONCURRENTLY is valid PostgreSQL that the
+// MySQL grammar cannot parse.
+func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
+	planResult := func() *engine.PlanResult {
+		return &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "public",
+			TableChanges: []engine.TableChange{{
+				Table:     "users",
+				Operation: ddl.StatementCreateIndex,
+				DDL:       "CREATE INDEX CONCURRENTLY idx_users_email ON users (email)",
+			}},
+		}}}
+	}
+
+	pg := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypePostgres}}
+	ms, err := pg.driftMultisetFromPlanResult(planResult(), false, "")
+	require.NoError(t, err)
+	require.Len(t, ms, 1)
+	for key := range ms {
+		assert.Equal(t, "public", key.namespace)
+		assert.Equal(t, "users", key.table)
+		assert.Contains(t, key.ddl, "CONCURRENTLY")
+	}
+
+	my := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypeMySQL}}
+	_, err = my.driftMultisetFromPlanResult(planResult(), false, "")
+	require.Error(t, err, "PostgreSQL-only DDL must not parse under a MySQL-typed client")
+	assert.Contains(t, err.Error(), "unparseable DDL")
 }

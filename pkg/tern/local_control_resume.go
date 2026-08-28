@@ -583,7 +583,7 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replannedDDL st
 	}
 	parser, err := c.statementParser()
 	if err != nil {
-		return fmt.Errorf("resolve statement parser for task %s: %w", task.TaskIdentifier, err)
+		return fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
 	}
 	reviewedCanon, err := canonicalDDLForDrift(parser, task.DDL)
 	if err != nil {

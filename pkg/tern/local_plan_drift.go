@@ -120,7 +120,7 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, shardScoped bool, targetShard string) (driftChangeMultiset, error) {
 	parser, err := c.statementParser()
 	if err != nil {
-		return nil, fmt.Errorf("resolve statement parser: %w", err)
+		return nil, err
 	}
 	ms := driftChangeMultiset{}
 	for _, sc := range result.Changes {
@@ -153,7 +153,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChange, targetShard string) (driftChangeMultiset, error) {
 	parser, err := c.statementParser()
 	if err != nil {
-		return nil, fmt.Errorf("resolve statement parser: %w", err)
+		return nil, err
 	}
 	ms := driftChangeMultiset{}
 	for _, ch := range changes {
@@ -183,7 +183,7 @@ func (c *LocalClient) driftMultisetFromApplyRequest(changes []*ternv1.TableChang
 func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
 	p, err := ddl.ParserForDialect(schema.DialectForDatabaseType(c.config.Type))
 	if err != nil {
-		return nil, fmt.Errorf("database type %q: %w", c.config.Type, err)
+		return nil, fmt.Errorf("resolve statement parser for database type %q: %w", c.config.Type, err)
 	}
 	return p, nil
 }

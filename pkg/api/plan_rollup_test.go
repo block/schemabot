@@ -192,6 +192,42 @@ func TestRollupDeploymentDiffs_PostgresDialectClean(t *testing.T) {
 	}
 }
 
+// A primary whose database type maps to no registered grammar cannot anchor
+// any comparison: the baseline self-comparison fails, so the rollup fails
+// closed rather than parsing the reviewed plan by a guess.
+func TestRollupDeploymentDiffs_UnregisteredPrimaryDialectBlocks(t *testing.T) {
+	primary := rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
+	primary.DatabaseType = "oracle"
+	diffs := []DeploymentPlanDiff{primary}
+	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	require.Len(t, rollup.Entries, 1)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[0].Class)
+	require.Error(t, rollup.Entries[0].Err)
+	assert.Contains(t, rollup.Entries[0].Err.Error(), `no statement parser registered for dialect "oracle"`)
+}
+
+// Deployments whose database types differ but share a grammar — vitess and
+// mysql are both the MySQL dialect — compare normally: the dialect guard
+// compares dialects, not raw type strings.
+func TestRollupDeploymentDiffs_MySQLFamilyTypesShareDialect(t *testing.T) {
+	change := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	mysqlDeployment := rollupDeployment("us", rollupAlterUsers(change))
+	mysqlDeployment.DatabaseType = "mysql"
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers(change)),
+		mysqlDeployment,
+	}
+	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	require.NoError(t, err)
+	assert.True(t, rollup.Clean)
+	require.Len(t, rollup.Entries, 2)
+	for _, e := range rollup.Entries {
+		assert.Equal(t, DeploymentMatch, e.Class, "deployment %q", e.Deployment)
+	}
+}
+
 // A deployment whose dialect differs from the reviewed primary's cannot be
 // compared meaningfully, so it classifies as errored and the rollup fails
 // closed rather than judging one dialect's DDL under another's grammar.

@@ -72,7 +72,7 @@ func (d ChangeSetDiff) Empty() bool {
 func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (ChangeSetDiff, error) {
 	parser, err := ddl.ParserForDialect(dialect)
 	if err != nil {
-		return ChangeSetDiff{}, fmt.Errorf("resolve statement parser: %w", err)
+		return ChangeSetDiff{}, err
 	}
 	baseMS, baseVS, err := changeSetMultiset(parser, baseline)
 	if err != nil {

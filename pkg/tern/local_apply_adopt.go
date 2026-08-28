@@ -311,7 +311,7 @@ func (c *LocalClient) dispatchMatchesApplyChangeSet(ctx context.Context, apply *
 func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope string) (driftChangeMultiset, error) {
 	parser, err := c.statementParser()
 	if err != nil {
-		return nil, fmt.Errorf("resolve statement parser: %w", err)
+		return nil, err
 	}
 
 	// Only a plan-derived dispatch side omits finished tables; a shard-scoped one
@@ -355,7 +355,7 @@ func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope s
 func (c *LocalClient) driftMultisetFromDispatchScope(scope dispatchScope) (driftChangeMultiset, error) {
 	parser, err := c.statementParser()
 	if err != nil {
-		return nil, fmt.Errorf("resolve statement parser: %w", err)
+		return nil, err
 	}
 	ms := driftChangeMultiset{}
 	for _, ch := range scope.ddlChanges {

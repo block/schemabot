@@ -322,6 +322,15 @@ func TestCompareChangeSets_PostgresDialect(t *testing.T) {
 	require.Error(t, err, "PostgreSQL DDL judged under the MySQL grammar must fail closed")
 }
 
+// A dialect with no registered parser gives the comparison no grammar to
+// canonicalize with, so it fails closed instead of guessing — even when both
+// change sets are empty and would trivially match.
+func TestCompareChangeSets_UnregisteredDialectFailsClosed(t *testing.T) {
+	_, err := CompareChangeSets(schema.Dialect("oracle"), ChangeSet{}, ChangeSet{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `no statement parser registered for dialect "oracle"`)
+}
+
 // PostgreSQL-only constructs the MySQL parser cannot read are comparable under
 // the PostgreSQL dialect, and a genuine difference still surfaces as drift.
 func TestCompareChangeSets_PostgresOnlyConstructDiverges(t *testing.T) {

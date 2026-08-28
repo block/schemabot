@@ -144,7 +144,10 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []str
 			// Change sets canonicalized under different grammars cannot be compared:
 			// a match under the wrong parser proves nothing. A deployment whose
 			// dialect differs from the primary's blocks rather than being judged by
-			// the primary's grammar.
+			// the primary's grammar. This is defense in depth: the production
+			// producer stamps one database's single configured type onto every
+			// deployment, so a mixed-dialect rollup only reaches here through a
+			// producer bug or a hand-built result.
 			entry.Class = DeploymentErrored
 			entry.Err = fmt.Errorf("deployment database type %q (dialect %q) differs from the primary's %q (dialect %q); cannot compare change sets across dialects",
 				d.DatabaseType, schema.DialectForDatabaseType(d.DatabaseType), diffs[0].DatabaseType, baselineDialect)

@@ -306,6 +306,12 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 //
 // It validates its inputs so a misconfiguration fails fast at setup rather than
 // as a confusing downstream error (or a panic on a nil factory).
+//
+// A registered type must also map to a registered SQL dialect
+// (schema.DialectForDatabaseType): drift comparison classifies and
+// canonicalizes DDL with the dialect's parser and fails closed on a type
+// whose dialect has no parser, so an engine registered without a dialect
+// mapping can plan but never pass the drift gate.
 func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory) error {
 	if databaseType == "" {
 		return fmt.Errorf("register engine: database type must not be empty")
