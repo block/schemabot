@@ -16,12 +16,13 @@ import (
 // pending-freeze marker, the exactly-once summary-claim machinery, and the
 // apply-lease guard on every lease-guarded mutation.
 //
-// Three claim behaviors can only be proven against an aged row and stay in
-// the dialect suites, which can backdate updated_at directly: the
-// stale-window takeover in ReclaimStaleSummaryClaim, its refusal to reclaim
-// a marker recording a posted comment, and the assertion that every mutation
-// renews updated_at (the claim machinery's freshness signal). The parity
-// suite covers the reclaim decisions that do not require aging a row.
+// Claim behaviors that can only be proven against an aged row stay in the
+// dialect suites, which can backdate timestamps directly: the stale-window
+// takeover in ReclaimStaleSummaryClaim, its refusal to reclaim a marker
+// recording a posted comment, the assertion that every mutation renews
+// updated_at (the claim machinery's freshness signal), and the stale-heartbeat
+// takeover in ClaimProgressCommentAuthority. The parity suite covers the
+// claim decisions that do not require aging a row.
 func TestApplyComments(t *testing.T, h Harness) {
 	// Upsert_And_Get verifies the tracked-comment round trip: an insert
 	// stores the posted level and control phase, a conflicting upsert for the
@@ -377,6 +378,52 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.False(t, won, "a superseded claim sentinel is not reclaimable")
 	})
 
+	// ClaimProgressCommentAuthority verifies the durable progress-comment edit
+	// authority's fresh-row decisions on every dialect: an apply with no
+	// tracked progress comment row has nothing to claim, the first claim on an
+	// unowned row wins and records its owner, the holder renews its own
+	// authority (on MySQL an identical-value renewal reports zero changed rows
+	// and must still be recognized as held), a second owner loses while the
+	// holder's heartbeat is fresh, and claims for different applies are
+	// independent. The stale-heartbeat takeover needs an aged row and lives in
+	// the dialect suites.
+	t.Run("ClaimProgressCommentAuthority", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "comment_authority_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_comment_authority", 713)
+		otherLock := CreateLock(t, store, "comment_authority_other_db", storage.DatabaseTypeMySQL)
+		other := CreateApply(t, store, otherLock, "apply_comment_authority_other", 714)
+
+		held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+		require.NoError(t, err)
+		assert.False(t, held, "no tracked progress comment row means nothing to claim")
+
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 555,
+		}))
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: other.ID, CommentState: state.Comment.Progress, GitHubCommentID: 556,
+		}))
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+		require.NoError(t, err)
+		assert.True(t, held, "first claim on an unowned progress comment must win")
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+		require.NoError(t, err)
+		assert.True(t, held, "the holder renews its own authority, including an identical-value renewal")
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+		require.NoError(t, err)
+		assert.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, other.ID, "pod-b/2/comment-observer")
+		require.NoError(t, err)
+		assert.True(t, held, "authorities for different applies are independent")
+	})
+
 	// ReclaimStaleSummaryClaim_RequiresStaleSentinel verifies the reclaim
 	// refusals that do not depend on aging a row: a missing marker is not
 	// reclaimable, and a fresh sentinel is an in-flight publish and stays
@@ -577,6 +624,12 @@ func TestApplyComments(t *testing.T, h Harness) {
 	t.Run("ReclaimStaleSummaryClaim_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ApplyComments().ReclaimStaleSummaryClaim(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ClaimProgressCommentAuthority_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ApplyComments().ClaimProgressCommentAuthority(t.Context(), 1, "pod-a/1/comment-observer")
 		require.Error(t, err)
 	})
 

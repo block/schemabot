@@ -1000,7 +1000,31 @@ type ApplyCommentStore interface {
 	// claim window. Deletes only the sentinel form of the marker — a recorded
 	// real comment is never released.
 	ReleaseSummaryClaim(ctx context.Context, applyID int64) error
+
+	// ClaimProgressCommentAuthority atomically claims — or renews for its
+	// current holder — the durable authority to edit the tracked progress
+	// comment of an apply whose parent apply lease is legitimately unheld
+	// because its work runs under operation leases. The claim is a conditional
+	// update on the tracked progress comment row: it succeeds when the row has
+	// no recorded observer, when the caller already holds it, or when the
+	// recorded observer's heartbeat is older than
+	// ProgressCommentAuthorityStaleAfter (a crashed holder). Exactly one of any
+	// set of concurrent claimants wins the same handover, so two observers can
+	// never both believe they own the comment. Returns true when the caller now
+	// holds the authority; false when another observer holds it or no tracked
+	// progress comment row exists to claim. Deliberately lease-agnostic — the
+	// claim itself is the authority, mirroring the terminal summary claim.
+	ClaimProgressCommentAuthority(ctx context.Context, applyID int64, owner string) (bool, error)
 }
+
+// ProgressCommentAuthorityStaleAfter is how long the progress-comment
+// authority may go without a renewal before its holder is considered gone and
+// another observer may take the authority over. Holders renew on every
+// admitted GitHub side effect (at least once per progress poll tick), so
+// anything older than this window is a stopped observer, not a slow one. It
+// matches the apply lease staleness bound so comment ownership hands over on
+// the same clock as drive ownership.
+const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 
 // SummaryClaimStaleAfter is how long a summary claim sentinel
 // (apply_comments row with github_comment_id = 0) may go without an update
