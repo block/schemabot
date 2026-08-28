@@ -249,3 +249,16 @@ func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
 		})
 	}
 }
+
+// The PostgreSQL engine runs each statement in a goroutine of this process and
+// claims the tracked progress before Apply returns, so it declares its work
+// registration synchronous. A driver reads that declaration to decide whether
+// a pending progress report about work it believes is in flight is conclusive.
+func TestRegistersWorkSynchronously(t *testing.T) {
+	eng := New()
+
+	assert.True(t, eng.RegistersWorkSynchronously(),
+		"the engine claims the tracked schema change before Apply returns")
+	assert.True(t, engine.RegistersWorkSynchronously(eng),
+		"the package helper resolves the engine's declaration")
+}

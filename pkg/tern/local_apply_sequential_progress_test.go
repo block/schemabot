@@ -374,6 +374,32 @@ func TestPollTaskToCompletion_LostEngineWorkTargetNotConverged(t *testing.T) {
 	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
 }
 
+// When the engine reports no active schema change and the target plan cannot
+// be read either, neither side can answer what happened to the work. The drive
+// must not spin between the two forever: each failed verification counts
+// against the same bounded error budget as a failed poll, and exhausting it
+// rests the task retryable for a fresh claim to re-drive — never permanently
+// failed, because nothing proved the target is broken.
+func TestPollTaskToCompletion_LostEngineWorkVerificationErrorsAreBounded(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "an unverifiable target is retryable, never permanently failed")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Contains(t, task.ErrorMessage, "could not be verified")
+	assert.Contains(t, task.ErrorMessage, "consecutive errors")
+	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing; the engine re-plan is never reached")
+}
+
 // A freshly restarted engine can serve a stale snapshot that omits in-flight
 // work for a few polls before it catches up. A short run of pending reports
 // inside the tolerated window must self-heal: the drive keeps polling, never

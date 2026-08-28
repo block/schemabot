@@ -447,14 +447,15 @@ func heartbeatScopeName(operationScoped bool) string {
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 
 const (
-	// defaultTaskPollInterval is the cadence of the sequential drive's engine
-	// progress polls.
+	// defaultTaskPollInterval is the cadence of a drive's engine progress
+	// polls, shared by the sequential and grouped polls.
 	defaultTaskPollInterval = 500 * time.Millisecond
 
 	// maxConsecutiveProgressPollErrors bounds how many consecutive progress
-	// poll failures the sequential drive tolerates before settling the task,
-	// matching the grouped poll. An apply that cannot reach a terminal state
-	// holds the database's active-apply slot and blocks every later apply.
+	// poll failures a drive tolerates before settling its work, shared by the
+	// sequential and grouped polls. An apply that cannot reach a terminal
+	// state holds the database's active-apply slot and blocks every later
+	// apply.
 	maxConsecutiveProgressPollErrors = 10
 
 	// defaultLostEngineWorkPendingBudget is how long an engine that provisions
@@ -639,7 +640,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					c.logger.Warn("engine reports no active schema change for an in-flight task and target verification failed; the drive re-verifies at the next poll",
 						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "error", settleErr)...)
 					if consecutiveErrors >= maxConsecutiveProgressPollErrors {
-						c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and target verification failed after %d consecutive errors; see server logs", consecutiveErrors))
+						c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", consecutiveErrors))
 						return taskFailed
 					}
 					continue
