@@ -210,28 +210,35 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          # Selectors are defined once here, keyed by shard name; per-package
-          # greps with the inverse of the dedicated selectors' union, so every
-          # integration-tagged package lands in exactly one shard by
-          # construction — narrowing or widening a dedicated selector moves
-          # packages between shards, it can never drop one from all of them.
+          # Dedicated shard selectors, keyed by shard name. per-package greps
+          # with the inverse of this map's union, so every integration-tagged
+          # package lands in exactly one shard by construction: a new entry
+          # here is excluded from per-package automatically, and narrowing or
+          # widening a selector moves packages between shards — it can never
+          # run one twice or drop one from all of them. The one edge this
+          # cannot enforce: an entry here without a matching matrix leg above
+          # silently drops its packages from every shard (the reverse, a leg
+          # without an entry, fails loudly below) — add both together.
           #
           # ./integration is anchored at the module root so only the top-level
           # cross-package suite takes that shard. A future nested package named
           # `integration` belongs beside the code it covers, in per-package.
           # pkg/tern and pkg/webhook are `$`-anchored so their subpackages stay
           # in per-package.
-          integration_re='^github\.com/block/schemabot/integration(/|$)'
-          tern_webhook_re='^github\.com/block/schemabot/pkg/(tern|webhook)$'
-          case "$SHARD" in
-            ./integration) match="-E";  selector="$integration_re" ;;
-            tern-webhook)  match="-E";  selector="$tern_webhook_re" ;;
-            per-package)   match="-vE"; selector="($integration_re|$tern_webhook_re)" ;;
-            *)
-              echo "::error::shard '$SHARD' has no selector mapping; add one here"
-              exit 1
-              ;;
-          esac
+          declare -A selectors=(
+            ["./integration"]='^github\.com/block/schemabot/integration(/|$)'
+            ["tern-webhook"]='^github\.com/block/schemabot/pkg/(tern|webhook)$'
+          )
+          if [ "$SHARD" = "per-package" ]; then
+            match="-vE"
+            selector="($(IFS='|'; echo "${selectors[*]}"))"
+          elif [ -n "${selectors[$SHARD]:-}" ]; then
+            match="-E"
+            selector="${selectors[$SHARD]}"
+          else
+            echo "::error::shard '$SHARD' has no selector mapping; add one here"
+            exit 1
+          fi
           all=$(go list -tags=integration ./...)
           set +e
           pkgs=$(printf '%s\n' "$all" | grep -v /localscale | grep "$match" "$selector")
