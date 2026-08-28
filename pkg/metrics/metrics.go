@@ -951,6 +951,26 @@ func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database,
 	)
 }
 
+// RecordUnrecognizedEngineTaskStatus counts engine- or data-plane-reported
+// task statuses that have no mapping in pkg/state. An unknown status
+// normalizes to Running so the work stays visible and blocking, but that
+// fallback is a guess: every surface renders the affected work as Running
+// regardless of what the engine is actually doing. A sustained rate here means
+// an engine or data-plane version introduced a status SchemaBot cannot
+// classify — add an explicit mapping in pkg/state. The paired drive warn
+// carries the task identifiers for the first sighting of each task and
+// status pair.
+func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseType, engineName, environment, status string) {
+	addCounter(ctx, "schemabot.engine.unrecognized_task_status_total",
+		"Total engine-reported task statuses with no task-state mapping, rendered as Running by the fail-open default", "{status}",
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		attribute.String("engine", engineName),
+		EnvironmentAttribute(environment),
+		attribute.String("status", status),
+	)
+}
+
 // RecordLockOperation increments the lock operations counter.
 // Operation should be "acquire" or "release".
 // Status should be "success", "conflict", "not_found", "not_owned", or "error".

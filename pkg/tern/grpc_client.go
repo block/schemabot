@@ -152,6 +152,10 @@ type GRPCClient struct {
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
 	controlSendGate remoteControlSendGate
+
+	// unrecognizedStatuses reports remote-reported statuses with no task-state
+	// mapping at the drive's ingest points. Zero value is ready.
+	unrecognizedStatuses unrecognizedStatusReporter
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -3858,6 +3862,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			continue
 		}
 		oldTaskState := storedTask.State
+		c.unrecognizedStatuses.observeTaskStatus(ctx, logger, storedTask, remoteTask.Status)
 		remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
 		switch {
 		case state.IsState(remoteTaskState, state.Task.Stopped):
@@ -4003,6 +4008,7 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 				append(storedApply.MutableLogAttrs(), "table", storedTask.TableName)...)
 			continue
 		}
+		c.unrecognizedStatuses.observeShardStatus(ctx, logger, storedTask, sh.Shard, sh.Status)
 		shardState := state.NormalizeShardStatus(sh.Status)
 		// The proto carries row totals, not a percent; derive it the way the read
 		// model does and clamp (row counts can momentarily exceed the total).
