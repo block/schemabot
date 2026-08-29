@@ -38,10 +38,10 @@ func progressSymbol(changeType string) string {
 
 // formatProgressDDL renders a DDL statement with syntax highlighting, indented under the table name.
 func formatProgressDDL(rawDDL string) string {
-	return formatProgressDDLForDialect(rawDDL, schema.DialectMySQL)
+	return formatProgressDDLForDialect(schema.DialectMySQL, rawDDL)
 }
 
-func formatProgressDDLForDialect(rawDDL string, dialect schema.Dialect) string {
+func formatProgressDDLForDialect(dialect schema.Dialect, rawDDL string) string {
 	if rawDDL == "" {
 		return ""
 	}
@@ -471,7 +471,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Pending = queued, not yet started
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Queued\n", t.TableName)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -484,7 +484,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -496,7 +496,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// full bar that looks finished.
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Catching up on accumulated changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsCopied > 0 {
 			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
@@ -512,14 +512,14 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			pct := ui.RowCopyDisplayPercent(int(math.Round(float64(t.ChecksumRowsChecked)*100/float64(t.ChecksumRowsTotal))), t.ChecksumRowsChecked)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)%s\n", t.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...%s\n", t.TableName, ui.ProgressBarRowCopy(100), throttledSuffix(t))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 		}
 		writeThrottleTooltip(&b, t)
@@ -532,7 +532,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// catch-up so the display doesn't rewind to an earlier phase.
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Data verified, applying final changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsCopied > 0 {
 			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
@@ -544,7 +544,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -555,7 +555,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			bar := ui.ProgressBarRowCopy(pct)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%d%%)\n", t.TableName, bar, pct)
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			writeStructuredRowsAndETA(&b, t)
 			b.WriteString("\n")
@@ -565,7 +565,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering state...\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -579,7 +579,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -588,7 +588,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s "+glyph.Failed+" Failed\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -602,7 +602,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Retrying\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -611,7 +611,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Complete (revert window open)\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -620,7 +620,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete, revert window closing
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (finalizing)\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -629,7 +629,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover() // yellow — undoing the change
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverting\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -641,7 +641,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBar(100, ui.ColorOrange)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverted\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -655,7 +655,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -674,7 +674,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏹️ Stopped (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
 			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
@@ -698,7 +698,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			bar := ui.ProgressBarRowCopy(displayPercent)
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			// Rows and ETA on the same line, rendered from the structured ETA
 			// so the CLI and PR comment show the same value via FormatETA.
@@ -710,7 +710,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// Can't parse - show raw detail
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s:\n", t.TableName)
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			fmt.Fprintf(&b, "    %s\n", t.ProgressDetail)
 		}
@@ -721,7 +721,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// bar that reads as stuck.
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Starting copy...%s\n", t.TableName, throttledSuffix(t))
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		writeStructuredRowsAndETA(&b, t)
 	case t.RowsTotal > 0:
@@ -736,7 +736,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
 
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 
 		writeStructuredRowsAndETA(&b, t)
@@ -759,7 +759,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...%s\n", t.TableName, bar, throttledSuffix(t))
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 	}
 
@@ -817,7 +817,7 @@ func formatEstimateExceededTable(t TableProgress, rowsCopied int64, activityBar,
 	var b strings.Builder
 	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, activityBar, activityLabel, throttledSuffix(t))
 	if t.DDL != "" {
-		b.WriteString(formatProgressDDLForDialect(t.DDL, t.Dialect))
+		b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 	}
 	fmt.Fprintf(&b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(rowsCopied))
 	fmt.Fprintf(&b, indentDetail+"%s"+glyph.Info+" %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)

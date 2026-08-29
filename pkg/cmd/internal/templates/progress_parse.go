@@ -165,6 +165,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Volume:         int(result.Volume),
 		Released:       result.Released,
 	}
+	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
@@ -188,7 +189,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
 			Namespace:           tbl.Keyspace,
-			Dialect:             schema.DialectForDatabaseType(result.DatabaseType),
+			Dialect:             dialect,
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
 			Status:              state.NormalizeTaskStatus(tbl.Status),
