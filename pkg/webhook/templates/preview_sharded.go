@@ -225,7 +225,7 @@ func PreviewCommentShardedPlanUnsafe() string {
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
 		HasUnsafeChanges: true,
-		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}}},
+		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}, TotalShards: 4}},
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
 			Shards: []KeyspaceShardChange{

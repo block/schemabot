@@ -46,11 +46,7 @@ func (d SchemaErrorData) EnvironmentHeader() string {
 	case 1:
 		return "**Environment**: " + markdownInlineCode(d.Environments[0])
 	default:
-		quoted := make([]string, len(d.Environments))
-		for i, name := range d.Environments {
-			quoted[i] = markdownInlineCode(name)
-		}
-		return "**Environments**: " + strings.Join(quoted, ", ")
+		return "**Environments**: " + strings.Join(markdownInlineCodeList(d.Environments), ", ")
 	}
 }
 
@@ -298,10 +294,7 @@ func RenderInvalidCommand() string {
 // handles. The configured environment names are normalized for markdown
 // display so an unexpected character cannot break the comment.
 func RenderInvalidEnv(action string, available []string) string {
-	quoted := make([]string, len(available))
-	for i, name := range available {
-		quoted[i] = markdownInlineCode(name)
-	}
+	quoted := markdownInlineCodeList(available)
 	availableLine := ""
 	if len(quoted) > 0 {
 		availableLine = "\n**Available environments**: " + strings.Join(quoted, ", ") + "\n"
@@ -319,6 +312,16 @@ func RenderInvalidEnv(action string, available []string) string {
 func markdownInlineCode(s string) string {
 	s = strings.ReplaceAll(s, "`", "")
 	return "`" + strings.Join(strings.Fields(s), " ") + "`"
+}
+
+// markdownInlineCodeList renders each value as a normalized markdown inline
+// code span, ready to join into a comma-separated list.
+func markdownInlineCodeList(values []string) []string {
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = markdownInlineCode(v)
+	}
+	return quoted
 }
 
 // RenderMissingEnv generates an error message when -e flag is missing.

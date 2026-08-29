@@ -28,6 +28,10 @@ type UnsafeChangeData struct {
 	// where only some shards carry it. Empty for a non-sharded change (applies to
 	// the whole table).
 	Shards []string
+	// TotalShards is how many shards the plan covers in the keyspace, so a
+	// rendering too wide to name every shard can state coverage ("12 of 32
+	// shards") instead of a bare count. Zero when unknown.
+	TotalShards int
 }
 
 // BlockedChangeData is a planned change the engine deterministically refuses:
@@ -38,6 +42,10 @@ type BlockedChangeData struct {
 	// Shards names the shards this blocked change applies to, for a sharded
 	// plan where only some shards carry it. Empty for a non-sharded change.
 	Shards []string
+	// TotalShards is how many shards the plan covers in the keyspace, so a
+	// rendering too wide to name every shard can state coverage ("12 of 32
+	// shards") instead of a bare count. Zero when unknown.
+	TotalShards int
 }
 
 // DirectChangeData is a planned change the database's direct execution policy
@@ -50,6 +58,10 @@ type DirectChangeData struct {
 	// Shards names the shards this direct change applies to, for a sharded
 	// plan where only some shards carry it. Empty for a non-sharded change.
 	Shards []string
+	// TotalShards is how many shards the plan covers in the keyspace, so a
+	// rendering too wide to name every shard can state coverage ("12 of 32
+	// shards") instead of a bare count. Zero when unknown.
+	TotalShards int
 }
 
 // AttributedChangeData is a table carrying a planned destructive change that
@@ -841,29 +853,34 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 const shardNamesInlineLimit = 8
 
 // planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
-// when few enough to read inline, collapsing to a bare count ("19 shards")
-// beyond that. Used where the list rides inside a line item and has no room
-// for a collapsed name list; the per-shard detail stays in the CLI plan.
-func planShardList(shards []string) string {
+// when few enough to read inline, stating coverage beyond that — "12 of 32
+// shards", or "all 32 shards" when the group spans the keyspace. Used where
+// the list rides inside a line item and has no room for a collapsed name
+// list; the full names stay reachable in the DDL section's collapsed
+// shard-group blocks.
+func planShardList(shards []string, totalShards int) string {
 	if len(shards) > shardNamesInlineLimit {
-		return fmt.Sprintf("%d shards", len(shards))
+		return shardCoveragePhrase(len(shards), totalShards)
 	}
-	quoted := quotedShardNames(shards)
+	quoted := markdownInlineCodeList(shards)
 	if len(quoted) == 1 {
 		return "shard " + quoted[0]
 	}
 	return "shards " + strings.Join(quoted, ", ")
 }
 
-// quotedShardNames renders each shard name as a markdown inline-code span,
-// normalized so a name from the topology can't break the span or the
-// surrounding comment structure.
-func quotedShardNames(shards []string) []string {
-	quoted := make([]string, len(shards))
-	for i, s := range shards {
-		quoted[i] = markdownInlineCode(s)
+// shardCoveragePhrase states how much of a keyspace a shard group covers:
+// "all 32 shards" when it covers every planned shard, "12 of 32 shards" for
+// a subset, or a bare count when the keyspace total is unknown — a subset
+// must never read like whole-keyspace coverage.
+func shardCoveragePhrase(count, totalShards int) string {
+	if count == totalShards {
+		return fmt.Sprintf("all %d shards", count)
 	}
-	return quoted
+	if totalShards > 0 {
+		return fmt.Sprintf("%d of %d shards", count, totalShards)
+	}
+	return fmt.Sprintf("%d shards", count)
 }
 
 // writeShardGroupHeading writes a shard group's bold heading above its DDL
@@ -874,14 +891,11 @@ func quotedShardNames(shards []string) []string {
 // walling the comment.
 func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards int) {
 	if len(shards) <= shardNamesInlineLimit {
-		fmt.Fprintf(sb, "**%s**\n\n", planShardList(shards))
+		fmt.Fprintf(sb, "**%s**\n\n", planShardList(shards, totalShards))
 		return
 	}
-	coverage := fmt.Sprintf("all %d shards", len(shards))
-	if len(shards) != totalShards {
-		coverage = fmt.Sprintf("%d of %d shards", len(shards), totalShards)
-	}
-	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n", coverage, strings.Join(quotedShardNames(shards), ", "))
+	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
+		shardCoveragePhrase(len(shards), totalShards), strings.Join(markdownInlineCodeList(shards), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
@@ -950,7 +964,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
 		if c.Reason != "" {
 			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
@@ -993,7 +1007,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
 		if c.Reason != "" {
 			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
@@ -1010,7 +1024,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
 		writeUnsafeChangeItem(sb, table, c.Reason)
 	}

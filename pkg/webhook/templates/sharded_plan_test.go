@@ -206,9 +206,11 @@ func TestRenderPlanComment_ShardedDivergentWideGroupShowsFraction(t *testing.T) 
 	assert.Contains(t, out, "ADD COLUMN `reason`", "the divergent statement is shown")
 }
 
-// An unsafe change spanning a wide set of shards compacts its list-item shard
-// suffix to a count — a finding line has no room for a collapsed name list.
-func TestRenderPlanComment_UnsafeChangeManyShardsCompactsToCount(t *testing.T) {
+// An unsafe change spanning a wide set of shards states its keyspace coverage
+// on the finding line — the line the reviewer consents against must never
+// leave a subset reading like whole-keyspace coverage — while the full names
+// stay reachable in the DDL section's collapsed shard groups.
+func TestRenderPlanComment_UnsafeChangeWideShardsStatesCoverage(t *testing.T) {
 	stmt := "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN `x`"
 	names := make([]string, 0, 12)
 	shards := make([]KeyspaceShardChange, 0, 12)
@@ -217,18 +219,85 @@ func TestRenderPlanComment_UnsafeChangeManyShardsCompactsToCount(t *testing.T) {
 		names = append(names, name)
 		shards = append(shards, KeyspaceShardChange{Shard: name, Statements: []string{stmt}})
 	}
-	out := RenderPlanComment(PlanCommentData{
-		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
-		HasUnsafeChanges: true,
-		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data", Shards: names}},
-		Changes: []KeyspaceChangeData{{
-			Keyspace: "cdb_resolute_sharded",
-			Shards:   shards,
-		}},
+	cases := []struct {
+		name        string
+		totalShards int
+		want        string
+	}{
+		{name: "a subset states its fraction of the keyspace", totalShards: 32, want: "`mutes` (12 of 32 shards)"},
+		{name: "whole-keyspace coverage says all", totalShards: 12, want: "`mutes` (all 12 shards)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderPlanComment(PlanCommentData{
+				Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+				HasUnsafeChanges: true,
+				UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data", Shards: names, TotalShards: tc.totalShards}},
+				Changes: []KeyspaceChangeData{{
+					Keyspace: "cdb_resolute_sharded",
+					Shards:   shards,
+				}},
+			})
+
+			assert.Contains(t, out, tc.want, "the finding line states coverage against the keyspace")
+			assert.NotContains(t, out, "(shards `s00`", "the finding line does not enumerate ranges")
+		})
+	}
+}
+
+// The gate-line shard suffix reads inline names when few, and keyspace
+// coverage when wide; with no known total it falls back to a bare count
+// rather than overstating coverage.
+func TestPlanShardList(t *testing.T) {
+	wide := make([]string, 12)
+	for i := range wide {
+		wide[i] = fmt.Sprintf("s%02d", i)
+	}
+	cases := []struct {
+		name        string
+		shards      []string
+		totalShards int
+		want        string
+	}{
+		{name: "one shard reads inline", shards: []string{"-40"}, totalShards: 4, want: "shard `-40`"},
+		{name: "few shards read inline", shards: []string{"-40", "40-80"}, totalShards: 4, want: "shards `-40`, `40-80`"},
+		{name: "a wide subset states its fraction", shards: wide, totalShards: 32, want: "12 of 32 shards"},
+		{name: "a wide whole keyspace says all", shards: wide, totalShards: 12, want: "all 12 shards"},
+		{name: "an unknown total falls back to a bare count", shards: wide, totalShards: 0, want: "12 shards"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, planShardList(tc.shards, tc.totalShards))
+		})
+	}
+}
+
+// The inline/collapsed pivot sits exactly at shardNamesInlineLimit: a group
+// at the limit still names every shard inline, one past it leads with its
+// coverage on a collapsed line.
+func TestWriteShardGroupHeading_InlineLimitBoundary(t *testing.T) {
+	shardNames := func(n int) []string {
+		names := make([]string, n)
+		for i := range names {
+			names[i] = fmt.Sprintf("s%02d", i)
+		}
+		return names
+	}
+
+	t.Run("at the limit the shards read inline", func(t *testing.T) {
+		var sb strings.Builder
+		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit), shardNamesInlineLimit)
+		assert.Contains(t, sb.String(), "**shards `s00`", "the heading names shards inline")
+		assert.Contains(t, sb.String(), fmt.Sprintf("`s%02d`**", shardNamesInlineLimit-1), "every shard is named")
+		assert.NotContains(t, sb.String(), "<details>", "no collapsed block at the limit")
 	})
 
-	assert.Contains(t, out, "`mutes` (12 shards)", "a wide shard suffix compacts to a count")
-	assert.NotContains(t, out, "(shards `s00`", "the finding line does not enumerate ranges")
+	t.Run("past the limit the heading collapses to coverage", func(t *testing.T) {
+		var sb strings.Builder
+		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit+1), shardNamesInlineLimit+1)
+		assert.Contains(t, sb.String(), fmt.Sprintf("<summary><b>all %d shards</b></summary>", shardNamesInlineLimit+1), "the heading leads with coverage")
+		assert.Contains(t, sb.String(), "`s00`, `s01`", "the collapsed block lists the names")
+	})
 }
 
 // An unsafe change confined to one shard is flagged with that shard in the
