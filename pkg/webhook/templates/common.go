@@ -213,6 +213,20 @@ var (
 	// dsnFragmentRe matches Go MySQL driver DSN fragments such as
 	// user:pass@tcp(host:3306)/db, which leak credentials and endpoints.
 	dsnFragmentRe = regexp.MustCompile(`\S*@tcp\([^)]*\)\S*`)
+	// absolutePathRe deliberately matches only absolute paths with at least
+	// two components. Relative paths and Go import paths remain useful in
+	// errors and do not reveal host filesystem layout.
+	absolutePathRe = regexp.MustCompile(`(^|[[:space:]\("'=,:])/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)+`)
+	// lookupHostRe matches the hostname in net.DNSError text. The resolver
+	// endpoint that may follow it is handled by ipEndpointRe.
+	lookupHostRe = regexp.MustCompile(`\b(lookup[[:space:]]+)[A-Za-z0-9][A-Za-z0-9.-]*`)
+	// libpqParameterRe matches identifying values in keyword/value connection
+	// fragments while preserving the parameter name for diagnostic context.
+	libpqParameterRe = regexp.MustCompile(`\b(user|database|dbname|host)=([^[:space:],;:]+)`)
+	// postgresSQLSTATELineRe scopes quoted identity redaction to PostgreSQL
+	// server errors, so ordinary application errors can still name a database.
+	postgresSQLSTATELineRe = regexp.MustCompile(`[^\n]*\(SQLSTATE[[:space:]]+[0-9A-Z]{5}\)`)
+	postgresIdentityRe     = regexp.MustCompile(`\b(user|database|dbname|host)[[:space:]]+"[^"]*"`)
 	// hostPortRe matches hostnames carrying an explicit port: dotted names
 	// such as db.internal.example.com:3306 and single-label service names
 	// such as mysql-primary:3306, which are common in dial errors. Requiring
@@ -221,6 +235,13 @@ var (
 	// multi-digit port so line:column references and similar numeric pairs
 	// are not redacted.
 	hostPortRe = regexp.MustCompile(`\b(?:(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*:\d{1,5}|[A-Za-z][A-Za-z0-9-]*:\d{2,5})\b`)
+	// contextualHostnameRe matches any dotted hostname after connection words,
+	// where the surrounding text disambiguates it from a Go symbol or prose.
+	contextualHostnameRe = regexp.MustCompile(`\b((?:connect(?:ion)? to|dial(?: tcp)?|server)[[:space:]]+)(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*\b`)
+	// infrastructureHostnameRe matches port-less names carrying suffixes used
+	// by private DNS and managed database endpoints. Restricting the suffixes
+	// avoids treating ordinary dotted words and Go symbols as hostnames.
+	infrastructureHostnameRe = regexp.MustCompile(`\b(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+(?:internal|rds\.amazonaws\.com)\b`)
 	// ipEndpointRe matches IPv4 addresses with an optional port.
 	ipEndpointRe = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b`)
 	// ansiEscapeRe matches ANSI terminal escape sequences (colors, cursor
@@ -231,21 +252,37 @@ var (
 // sanitizeCommentError makes an untrusted engine or task error safe to render
 // in a public PR comment: it normalizes line endings, strips control and
 // format characters (including bidi overrides usable for visual spoofing),
-// redacts connection endpoints (DSN fragments, host:port pairs,
-// IP addresses) that leak internal infrastructure, trims surrounding
-// whitespace, and clamps the length by rune count. The raw error remains
-// available server-side in the apply logs, so nothing is lost for triage.
+// redacts connection details that leak credentials, identifiers, or internal
+// infrastructure, trims surrounding whitespace, and clamps the length by rune
+// count. The raw error remains available server-side in the apply logs, so
+// nothing is lost for triage.
 func sanitizeCommentError(msg string) string {
 	msg = strings.ReplaceAll(msg, "\r\n", "\n")
 	msg = strings.ReplaceAll(msg, "\r", "\n")
 	msg = stripControlText(msg)
-	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
-	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = redactConnectionDetails(msg)
 	msg = strings.TrimSpace(msg)
 	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
 		msg = string(runes[:maxCommentErrorLen-1]) + "…"
 	}
+	return msg
+}
+
+func redactConnectionDetails(msg string) string {
+	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = absolutePathRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
+	msg = lookupHostRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
+	msg = libpqParameterRe.ReplaceAllString(msg, "${1}=[endpoint redacted]")
+	msg = postgresSQLSTATELineRe.ReplaceAllStringFunc(msg, func(line string) string {
+		return postgresIdentityRe.ReplaceAllStringFunc(line, func(identity string) string {
+			name := identity[:strings.IndexByte(identity, ' ')]
+			return name + ` "[endpoint redacted]"`
+		})
+	})
+	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = contextualHostnameRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
+	msg = infrastructureHostnameRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = ipEndpointRe.ReplaceAllString(msg, "[endpoint redacted]")
 	return msg
 }
 

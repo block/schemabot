@@ -125,9 +125,7 @@ func sanitizeLogText(text string) string {
 		text = strings.ReplaceAll(text, "```", "`` `")
 	}
 	text = stripControlText(text)
-	text = dsnFragmentRe.ReplaceAllString(text, "[endpoint redacted]")
-	text = hostPortRe.ReplaceAllString(text, "[endpoint redacted]")
-	text = ipEndpointRe.ReplaceAllString(text, "[endpoint redacted]")
+	text = redactConnectionDetails(text)
 	return text
 }
 

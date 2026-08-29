@@ -78,6 +78,68 @@ func TestSanitizeCommentError(t *testing.T) {
 		assert.Equal(t, msg, sanitizeCommentError(msg))
 	})
 
+	redactionCases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "TLS CA bundle path",
+			in:   "failed to connect: cannot load TLS root certificate /etc/schemabot/ca/bundle.pem: permission denied",
+			want: "failed to connect: cannot load TLS root certificate [endpoint redacted]: permission denied",
+		},
+		{
+			name: "port-less private hostname",
+			in:   "connection to db-primary.foo.internal failed: timeout",
+			want: "connection to [endpoint redacted] failed: timeout",
+		},
+		{
+			name: "port-less managed database hostname",
+			in:   "connection to xyz.us-east-1.rds.amazonaws.com failed: timeout",
+			want: "connection to [endpoint redacted] failed: timeout",
+		},
+		{
+			name: "contextual port-less hostname",
+			in:   "connect to db-primary.private.example.com failed: timeout",
+			want: "connect to [endpoint redacted] failed: timeout",
+		},
+		{
+			name: "DNS resolver error",
+			in:   "dial tcp: lookup db.internal on 10.0.0.2:53: no such host",
+			want: "dial tcp: lookup [endpoint redacted] on [endpoint redacted]: no such host",
+		},
+		{
+			name: "libpq authentication failure",
+			in:   "failed to connect to user=app_writer database=orders host=db.internal: password authentication failed",
+			want: "failed to connect to user=[endpoint redacted] database=[endpoint redacted] host=[endpoint redacted]: password authentication failed",
+		},
+		{
+			name: "libpq dbname fragment",
+			in:   "connect dbname=customer_data user=reporter sslmode=verify-full failed",
+			want: "connect dbname=[endpoint redacted] user=[endpoint redacted] sslmode=verify-full failed",
+		},
+		{
+			name: "pgconn SQLSTATE error",
+			in:   `failed to connect: FATAL: no pg_hba.conf entry for host "10.20.30.40", user "app_writer", database "orders", no encryption (SQLSTATE 28000)`,
+			want: `failed to connect: FATAL: no pg_hba.conf entry for host "[endpoint redacted]", user "[endpoint redacted]", database "[endpoint redacted]", no encryption (SQLSTATE 28000)`,
+		},
+		{
+			name: "pq SQLSTATE error",
+			in:   `pq: password authentication failed for user "app_writer" (SQLSTATE 28P01)`,
+			want: `pq: password authentication failed for user "[endpoint redacted]" (SQLSTATE 28P01)`,
+		},
+		{
+			name: "normal English and Go names",
+			in:   "context.DeadlineExceeded while pkg/webhook.foo handled pkg/webhook/inbox.go",
+			want: "context.DeadlineExceeded while pkg/webhook.foo handled pkg/webhook/inbox.go",
+		},
+	}
+	for _, tc := range redactionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, sanitizeCommentError(tc.in))
+		})
+	}
+
 	t.Run("long errors clamp by rune with truncation marker", func(t *testing.T) {
 		got := sanitizeCommentError(strings.Repeat("é", maxCommentErrorLen+100))
 		runes := []rune(got)
