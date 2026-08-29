@@ -111,10 +111,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
 	}
 	defer pool.Close()
-	return planSchemas(ctx, pool, req)
+	return planSchemas(ctx, pool, req, e.tableSizeLimit)
 }
 
-func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest) (*engine.PlanResult, error) {
+func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64) (*engine.PlanResult, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
@@ -145,6 +145,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
 			if err != nil {
 				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
+			}
+			changes, err = blockOversizedTable(ctx, pool, report, changes, tableSizeLimit)
+			if err != nil {
+				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
@@ -274,6 +278,39 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 		return changes, nil
 	}
 	return changes, nil
+}
+
+// blockOversizedTable applies the native-safe table size ceiling to every
+// still-executable step. The apply path repeats the same CheckTable call, so
+// growth between plan and apply cannot bypass the ceiling. A typed refusal is
+// rendered as a blocked verdict; an operational failure fails planning rather
+// than producing an executable plan while the table size is unknown.
+func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
+	if !hasExecutableChanges(changes) {
+		return changes, nil
+	}
+	if report.Table == "" {
+		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
+	}
+	if report.TableExists != nil && !*report.TableExists {
+		return changes, nil
+	}
+	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	if err == nil {
+		return changes, nil
+	}
+	r := classifyRefusal(err, report.Table)
+	if r == nil {
+		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
+	}
+	blockExecutableChanges(changes, r.detail)
+	return changes, nil
+}
+
+func hasExecutableChanges(changes []engine.TableChange) bool {
+	return slices.ContainsFunc(changes, func(change engine.TableChange) bool {
+		return change.ExecutionMode == ""
+	})
 }
 
 // blockExecutableChanges marks every still-executable change blocked with the

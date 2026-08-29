@@ -135,6 +135,32 @@ func TestEnginePlanPrivilegeRefusalPerTier(t *testing.T) {
 		"the reason must carry the exact provisioning statement")
 }
 
+// TestEnginePlanTableSizeRefusal proves the configured native-safe ceiling
+// blocks an otherwise executable plan when the target table exceeds it.
+func TestEnginePlanTableSizeRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_size_limit_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_size_limit_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, "1-byte threshold")
+	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
+}
+
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
 // pg-sprite's preflight and bounded optimistic executor.
 func TestEngineApplyNativeSafe(t *testing.T) {

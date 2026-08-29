@@ -286,6 +286,20 @@ func TestBlockChangesAtTier(t *testing.T) {
 		"an existing verdict must never be overwritten")
 }
 
+func TestBlockOversizedTableSkipsFullyBlockedPlans(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+		ExecutionMode: engine.ExecutionModeBlocked,
+	}}
+
+	changes, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	require.NoError(t, err)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+}
+
 func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 	eng := New()
 
