@@ -364,6 +364,24 @@ func TestFormatDDLForDialect(t *testing.T) {
 		assert.NotContains(t, got, "`")
 	})
 
+	t.Run("postgres CREATE TABLE is line-broken like the MySQL layout", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE sessions (id uuid PRIMARY KEY, payload jsonb, created_at timestamptz)")
+		assert.Equal(t, "CREATE TABLE sessions (\n"+
+			"    id uuid PRIMARY KEY,\n"+
+			"    payload jsonb,\n"+
+			"    created_at timestamptz\n"+
+			");", got)
+	})
+
+	t.Run("postgres multi-clause ALTER renders one clause per line", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"alter table users add column a integer, add column b text")
+		assert.Equal(t, "ALTER TABLE users\n"+
+			"    ADD COLUMN a int,\n"+
+			"    ADD COLUMN b text;", got)
+	})
+
 	t.Run("statement the dialect parser rejects renders as-is", func(t *testing.T) {
 		got := FormatDDLForDialect(schema.DialectPostgres, "THIS IS NOT SQL")
 		assert.Equal(t, "THIS IS NOT SQL;", got)

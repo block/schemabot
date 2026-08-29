@@ -67,7 +67,8 @@ func TestSummarizeChanges(t *testing.T) {
 
 	t.Run("per-shard-only DDL falls back to a statement count", func(t *testing.T) {
 		data := PlanCommentData{
-			IsMySQL: false,
+			IsMySQL:      false,
+			DatabaseType: "vitess",
 			Changes: []KeyspaceChangeData{{
 				Keyspace: "orders",
 				Shards: []KeyspaceShardChange{

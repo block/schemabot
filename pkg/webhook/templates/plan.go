@@ -544,6 +544,14 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
 	}
+	// Statements that classify as none of create/alter/drop — or per-shard-only
+	// DDL that countStatementTypes does not walk — still count. Report the raw
+	// statement total before the vschema clause so a vschema update never hides
+	// DDL the plan will run, keeping the summary in agreement with
+	// SummarizeChanges.
+	if len(parts) == 0 && totalStatements > 0 {
+		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
+	}
 	if keyspacesWithVSchema > 0 && !data.IsMySQL {
 		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
 	}
@@ -718,9 +726,14 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 	// they are never reformatted under another family's grammar.
 	dialect := schema.DialectForDatabaseType(data.DatabaseType)
 
+	// PostgreSQL groups changes by schema, not keyspace, so it shares MySQL's
+	// "Schema Name" label and heading suppression; Vitess and Strata keep the
+	// keyspace vocabulary.
+	schemaNamespaces := data.IsMySQL || dialect == schema.DialectPostgres
+
 	// Skip the schema/keyspace heading when there's only one and it matches
 	// the database name — it's redundant with the metadata line.
-	singleKeyspace := len(data.Changes) == 1 && data.IsMySQL && data.Changes[0].Keyspace == data.Database
+	singleKeyspace := len(data.Changes) == 1 && schemaNamespaces && data.Changes[0].Keyspace == data.Database
 
 	// The VSchema diff budget is per comment, not per keyspace: split it
 	// across the keyspaces that will render a diff so a multi-keyspace plan
@@ -742,7 +755,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if !singleKeyspace {
 			label := "Keyspace"
-			if data.IsMySQL {
+			if schemaNamespaces {
 				label = "Schema Name"
 			}
 			fmt.Fprintf(sb, "#### %s: `%s`\n", label, ks.Keyspace)

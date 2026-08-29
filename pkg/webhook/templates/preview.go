@@ -1240,6 +1240,29 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 	}
 }
 
+// PreviewCommentPostgresPlan renders a sample PostgreSQL plan comment whose
+// statements are classified and formatted under the PostgreSQL grammar.
+func PreviewCommentPostgresPlan() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"CREATE TABLE sessions (id uuid PRIMARY KEY, user_id bigint NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now())",
+					"ALTER TABLE users ADD COLUMN last_seen_at timestamptz, ADD COLUMN preferences jsonb",
+				},
+			},
+		},
+	})
+}
+
 // PreviewCommentVitessPlan renders a sample Vitess plan comment with keyspaces and VSchema diff.
 func PreviewCommentVitessPlan() string {
 	return RenderPlanComment(PlanCommentData{
