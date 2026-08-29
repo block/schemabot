@@ -133,11 +133,11 @@ comment is the *gate firing*. Same data, two moments in time:
 
 1. **Plan time — ⚠️ Issues.** The plan comment lists every unsafe change with
    its reason. Nothing has been refused yet; this is the review surface.
-2. **Apply time — ⛔ Unsafe Changes Detected.** If an operator runs
+2. **Apply time — ⛔ Apply rejected.** If an operator runs
    `schemabot apply` without `--allow-unsafe` while unsafe changes exist,
    SchemaBot posts a new comment: the full plan, a
-   `⛔ N Unsafe Changes Detected` section, and a 🚨 instruction to re-run with
-   `--allow-unsafe`. The apply did not start.
+   `⛔ Apply rejected: N unsafe changes detected` section, and a 🚨 instruction
+   to re-run with `--allow-unsafe`. The apply did not start.
 
 So ⚠️ always means "review this before you apply", and ⛔ always means "your
 command was refused". Once an apply *is* acknowledged with `--allow-unsafe`,
@@ -158,12 +158,13 @@ rejected up front while they are present.
 
 | Icon | Where it appears | Meaning |
 |---|---|---|
-| ⛔ | Plan comment (**Cannot apply**), apply-rejection comments (**Unsafe Changes Detected**, **Apply rejected**, **Apply Blocked: PR Is Merged/Closed**), CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
+| ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
 | ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**) | Caution: unsafe changes to review before applying |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
 | ✅ | Plan comment | No schema changes detected |
+| ❌ | Failed apply/rollback headings, error and first-failure callouts | An attempted operation failed |
 
 Presentation notes:
 
@@ -174,3 +175,12 @@ Presentation notes:
   types) render as inline code.
 - The CLI and the plan comment share the same severity reading: ⚠️ marks
   unsafe changes awaiting review at plan time, and ⛔ marks the refused apply.
+- Not every **Apply Blocked** or **Apply rejected** heading is a refusal: the
+  glyph follows the cause. 🔒 marks an apply blocked by a held lock, ⏳ one
+  waiting on required checks or another apply (wait, then retry), ❌ one that
+  fail-closed on a transient verification error (retry unchanged can succeed),
+  and ⚠️ a stale-base rejection cleared by rebasing.
+- The severity vocabulary (🚨 ⛔ ❌ ⚠️ ℹ️) lives in `pkg/glyph`. The other
+  icons in this table — and state/consent icons such as ✅, 💡, ⚙️, and 🛑
+  (**Check before applying**, the unattributed-destructive-change gate) — are
+  deliberately outside it: they mark states and disclosures, not severities.

@@ -693,10 +693,24 @@ type ApplyStore interface {
 	// a self-referential handoff would refuse the apply forever while pointing
 	// the operator back at the refused apply itself.
 	//
-	// Callers recording a takeover must mark before committing the takeover's
-	// own effects: a crash after marking leaves an apply that refuses to start,
-	// which fails closed, while the reverse order leaves a window in which the
-	// handed-off work can be started again.
+	// Callers recording a takeover mark as soon as the successor durably
+	// exists — after its creation, so the marker never names an apply that
+	// does not exist, and before any driver acts on it. The marker does not
+	// carry that window alone: while the successor is active, a claim on the
+	// handed-off apply is refused by the claim-time one-active-apply re-check;
+	// the marker is what keeps refusing once the successor settles and that
+	// re-check has nothing left to catch. A takeover whose mark never lands —
+	// a failed write, or a crash between creating the successor and marking —
+	// therefore leaves an apply that becomes startable again once its
+	// successor settles; the failed write is logged with both applies named,
+	// and neither case is retried.
+	//
+	// The refusal the marker backs is apply-granular even when the successor
+	// took over only part of the apply's work: start is apply-wide and would
+	// replay everything, including the part the successor now owns. Work the
+	// successor did not take over reaches the database through a fresh
+	// dispatch — the marked apply's hold on the database was already released
+	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
 	// CheckLease verifies that an operator apply lease is still current without
@@ -986,7 +1000,31 @@ type ApplyCommentStore interface {
 	// claim window. Deletes only the sentinel form of the marker — a recorded
 	// real comment is never released.
 	ReleaseSummaryClaim(ctx context.Context, applyID int64) error
+
+	// ClaimProgressCommentAuthority atomically claims — or renews for its
+	// current holder — the durable authority to edit the tracked progress
+	// comment of an apply whose parent apply lease is legitimately unheld
+	// because its work runs under operation leases. The claim is a conditional
+	// update on the tracked progress comment row: it succeeds when the row has
+	// no recorded observer, when the caller already holds it, or when the
+	// recorded observer's heartbeat is older than
+	// ProgressCommentAuthorityStaleAfter (a crashed holder). Exactly one of any
+	// set of concurrent claimants wins the same handover, so two observers can
+	// never both believe they own the comment. Returns true when the caller now
+	// holds the authority; false when another observer holds it or no tracked
+	// progress comment row exists to claim. Deliberately lease-agnostic — the
+	// claim itself is the authority, mirroring the terminal summary claim.
+	ClaimProgressCommentAuthority(ctx context.Context, applyID int64, owner string) (bool, error)
 }
+
+// ProgressCommentAuthorityStaleAfter is how long the progress-comment
+// authority may go without a renewal before its holder is considered gone and
+// another observer may take the authority over. Holders renew on every
+// admitted GitHub side effect (at least once per progress poll tick), so
+// anything older than this window is a stopped observer, not a slow one. It
+// matches the apply lease staleness bound so comment ownership hands over on
+// the same clock as drive ownership.
+const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 
 // SummaryClaimStaleAfter is how long a summary claim sentinel
 // (apply_comments row with github_comment_id = 0) may go without an update

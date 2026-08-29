@@ -147,7 +147,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	// Optionally start a gRPC server for the Tern proto (used by
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
 	if grpcPort != "" {
-		grpcServer := grpc.NewServer()
+		grpcServer := newTernGRPCServer(srv.logger)
 		if err := srv.RegisterGRPC(ctx, grpcServer); err != nil {
 			return fmt.Errorf("register grpc tern service: %w", err)
 		}
@@ -565,6 +565,16 @@ func (s *Server) Service() *api.Service { return s.svc }
 // before the server starts serving. When a target resolver is configured the
 // shared data-plane client is reused; otherwise a single-database client bound
 // to TERN_ENVIRONMENT is built.
+//
+// Registration installs no panic containment: interceptors cannot be attached
+// to an already-constructed grpc.Server, so a handler panic (for example in
+// Stop or Cutover) kills the embedding process — the one that drives applies —
+// unless the embedder installed RecoveryUnaryInterceptor and
+// RecoveryStreamInterceptor when constructing gs. Install them first in
+// grpc.ChainUnaryInterceptor / grpc.ChainStreamInterceptor, and never combine
+// them with the non-chained grpc.UnaryInterceptor / grpc.StreamInterceptor
+// options, which grpc-go runs ahead of the entire chain. The server that Run
+// serves installs both by construction.
 func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 	client := s.dataPlaneClient
 	if client == nil {

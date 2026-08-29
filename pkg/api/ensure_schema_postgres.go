@@ -21,8 +21,9 @@ import (
 // ensurePostgresSchema converges SchemaBot's storage schema on PostgreSQL by
 // creating every storage table whose embedded schema file has no matching
 // table in the current schema. Existing tables are checked for every expected
-// column and standalone unique index, but are never altered; extra columns and
-// non-unique index differences are tolerated. The column check is presence-only:
+// column and standalone unique index, but are never altered; extra columns are
+// tolerated, and a missing non-unique index is tolerated with a startup
+// warning naming it. The column check is presence-only:
 // type, length, and nullability drift are outside its scope and are not detected.
 // That bound is deliberate — PostgreSQL has
 // no in-process diff/apply mechanism here (Spirit is MySQL-only), and
@@ -134,7 +135,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 }
 
 func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
-	if err := verifyPostgresSchemaShape(ctx, db, tables, files); err != nil {
+	if err := verifyPostgresSchemaShape(ctx, db, tables, files, logger); err != nil {
 		logger.Error("PostgreSQL storage schema shape check failed",
 			"dialect", schema.DialectPostgres,
 			"database", database,
@@ -148,9 +149,12 @@ func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []s
 }
 
 // verifyPostgresSchemaShape checks expected columns by presence only; it does
-// not detect type, length, or nullability drift. It also requires standalone
+// not detect type, length, or nullability drift. It requires standalone
 // unique indexes because losing their constraints can change write semantics.
-func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
+// A missing non-unique index never alters results, so it does not fail
+// startup — but it is warned about by name, because the queries it serves run
+// unindexed until an operator creates it by hand (see docs/configuration.md).
+func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger) error {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return fmt.Errorf("select PostgreSQL statement parser: %w", err)
@@ -182,32 +186,52 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 			return fmt.Errorf("storage table %q is missing expected columns: %s", table, strings.Join(missing, ", "))
 		}
 
-		expectedIndexes := make([]string, 0)
+		expectedUnique := make([]string, 0)
+		expectedNonUnique := make([]string, 0)
 		for _, statement := range statements[1:] {
-			indexName, indexTable, unique, err := parser.CreateUniqueIndex(statement)
+			indexName, indexTable, unique, err := parser.CreateIndex(statement)
 			if err != nil {
-				return fmt.Errorf("extract expected unique indexes for table %q: %w", table, err)
+				return fmt.Errorf("extract expected indexes for table %q: %w", table, err)
 			}
-			if !unique {
+			if indexName == "" {
+				// Not a standalone CREATE INDEX statement, so it declares no
+				// index expectation.
 				continue
 			}
 			if indexTable != table {
-				return fmt.Errorf("schema file for table %q declares unique index %q on table %q", table, indexName, indexTable)
+				return fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
 			}
-			expectedIndexes = append(expectedIndexes, indexName)
+			if unique {
+				expectedUnique = append(expectedUnique, indexName)
+			} else {
+				expectedNonUnique = append(expectedNonUnique, indexName)
+			}
 		}
-		existingIndexes, err := postgresTableUniqueIndexes(ctx, db, table)
+		existingIndexes, err := postgresTableIndexes(ctx, db, table)
 		if err != nil {
 			return err
 		}
 		missing = nil
-		for _, indexName := range expectedIndexes {
+		for _, indexName := range expectedUnique {
 			if !existingIndexes[indexName] {
 				missing = append(missing, indexName)
 			}
 		}
 		if len(missing) > 0 {
 			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missing, ", "))
+		}
+		var missingNonUnique []string
+		for _, indexName := range expectedNonUnique {
+			if _, present := existingIndexes[indexName]; !present {
+				missingNonUnique = append(missingNonUnique, indexName)
+			}
+		}
+		if len(missingNonUnique) > 0 {
+			logger.Warn("storage table is missing non-unique indexes the embedded schema declares; the queries they serve run unindexed until an operator creates them by hand (see docs/configuration.md)",
+				"dialect", schema.DialectPostgres,
+				"table", table,
+				"indexes", strings.Join(missingNonUnique, ", "),
+			)
 		}
 	}
 	return nil
@@ -235,31 +259,35 @@ func postgresTableColumns(ctx context.Context, db *sql.DB, table string) (map[st
 	return existing, nil
 }
 
-func postgresTableUniqueIndexes(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+// postgresTableIndexes returns the table's live indexes as a name→uniqueness
+// map. A unique expectation requires its name to map to true; a non-unique
+// expectation is satisfied by presence under either uniqueness, since a
+// unique index answers the same reads.
+func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT index_class.relname
+		SELECT index_class.relname, index_info.indisunique
 		FROM pg_index AS index_info
 		JOIN pg_class AS table_class ON table_class.oid = index_info.indrelid
 		JOIN pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
 		JOIN pg_class AS index_class ON index_class.oid = index_info.indexrelid
 		WHERE table_namespace.nspname = current_schema()
-		  AND table_class.relname = $1
-		  AND index_info.indisunique`, table)
+		  AND table_class.relname = $1`, table)
 	if err != nil {
-		return nil, fmt.Errorf("list unique indexes for table %q: %w", table, err)
+		return nil, fmt.Errorf("list indexes for table %q: %w", table, err)
 	}
 	defer utils.CloseAndLog(rows)
 
 	existing := make(map[string]bool)
 	for rows.Next() {
 		var indexName string
-		if err := rows.Scan(&indexName); err != nil {
-			return nil, fmt.Errorf("scan unique index for table %q: %w", table, err)
+		var unique bool
+		if err := rows.Scan(&indexName, &unique); err != nil {
+			return nil, fmt.Errorf("scan index for table %q: %w", table, err)
 		}
-		existing[indexName] = true
+		existing[indexName] = unique
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate unique indexes for table %q: %w", table, err)
+		return nil, fmt.Errorf("iterate indexes for table %q: %w", table, err)
 	}
 	return existing, nil
 }

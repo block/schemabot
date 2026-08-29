@@ -27,6 +27,9 @@ func TestChangeTypeProtoRoundTrip(t *testing.T) {
 		ddl.StatementTypeToOp(ddl.StatementDropTable),
 		ddl.StatementTypeToOp(ddl.StatementCreateIndex),
 		ddl.StatementTypeToOp(ddl.StatementDropIndex),
+		ddl.StatementTypeToOp(ddl.StatementRenameTable),
+		ddl.StatementTypeToOp(ddl.StatementTruncateTable),
+		ddl.StatementTypeToOp(ddl.StatementCreateView),
 		"vschema_update",
 	} {
 		assert.Equal(t, op, protoChangeTypeToDDLAction(ddlActionToProtoChangeType(op)),

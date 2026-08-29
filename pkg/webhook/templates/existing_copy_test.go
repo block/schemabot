@@ -32,7 +32,7 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n")
 	assert.Contains(t, plan, "- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, "+
 		"which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`",
 		"a cause that is a comparison names the side the operator cannot see from the plan above")
@@ -74,7 +74,7 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 
 	assert.Contains(t, out, "**Applying automatically**",
 		"the fixture is the automatic path, which is what makes the section a record")
-	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**: 1 unfinished copy on the target\n")
 	assert.Contains(t, out, "- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it")
 	assert.NotContains(t, out, "⚠️ **This apply destroys work in progress**",
 		"a reader with no move to make is being informed, not warned")
@@ -181,7 +181,7 @@ func TestRenderPlanComment_AdoptedCopyReadsAsContinuation(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued")
+	assert.Contains(t, out, "♻️ **Resuming work in progress**: 1 unfinished copy on the target will be continued")
 	assert.Contains(t, out, "- `orders`, `products` in `testapp` (last progress 3h 12m ago)")
 	assert.Contains(t, out, "Applying picks up where the existing copy stopped")
 	assert.NotContains(t, out, "destroys work in progress", "an adopted copy is not a discard warning")
@@ -212,7 +212,7 @@ func TestRenderPlanComment_AdoptedCopyReadsAsAnEventOnceApplying(t *testing.T) {
 	assert.Contains(t, out, "**Applying automatically**",
 		"the fixture is the automatic path, which is what makes both sections a record")
 	assert.Contains(t, out, "ℹ️ **This apply destroys work in progress**")
-	assert.Contains(t, out, "♻️ **Resuming work in progress**: **2** unfinished copies on the target will be continued")
+	assert.Contains(t, out, "♻️ **Resuming work in progress**: 2 unfinished copies on the target will be continued")
 	assert.Contains(t, out, "This apply picks up where the existing copies stopped rather than starting over.")
 	assert.NotContains(t, out, "Applying picks up",
 		"the hypothetical subject belongs to a comment where applying is still a choice")
@@ -236,7 +236,7 @@ func TestRenderPlanComment_RunningCopyReadsAsJoiningWorkInFlight(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "♻️ **Work already in progress**: **1** unfinished copy still running on the target")
+	assert.Contains(t, out, "♻️ **Work already in progress**: 1 unfinished copy still running on the target")
 	assert.Equal(t, "- `orders`, `products` in `testapp` (still copying)", entryLine(t, out, "- `orders`"))
 	assert.Contains(t, out, "Applying joins the copy already running rather than starting a new one: "+
 		"every row copied so far is kept, and no second copy is made.")
@@ -269,11 +269,11 @@ func TestRenderPlanComment_RunningAndStoppedCopiesAreDisclosedApart(t *testing.T
 		},
 	})
 
-	assert.Contains(t, out, "♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued")
+	assert.Contains(t, out, "♻️ **Resuming work in progress**: 1 unfinished copy on the target will be continued")
 	assert.Equal(t, "- `orders` in `orders_a` (last progress 3h 12m ago)", entryLine(t, out, "- `orders` in"),
 		"a copy that stopped is still dated by how stale it is")
 
-	assert.Contains(t, out, "♻️ **Work already in progress**: **2** unfinished copies still running on the target")
+	assert.Contains(t, out, "♻️ **Work already in progress**: 2 unfinished copies still running on the target")
 	assert.Equal(t, "- `products` in `orders_b` (still copying)", entryLine(t, out, "- `products`"))
 	assert.Contains(t, out, "This apply joined the copies already running rather than starting new ones",
 		"an apply under way describes what it did, not what applying would do")
@@ -300,7 +300,7 @@ func TestRenderPlanComment_RunningCopyKeepsItsHeartbeatOutOfTheDiscardWarning(t 
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **2** unfinished copies on the target",
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: 2 unfinished copies on the target",
 		"a running copy the apply throws away is still a discard")
 	assert.Equal(t, "- `orders` in `orders_a` (last progress 3h 12m ago): the schema change differs from the one that started it",
 		entryLine(t, out, "- `orders` in"),
@@ -324,7 +324,7 @@ func TestRenderPlanComment_DiscardedCopyNamesExpiryCause(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n")
 	assert.Contains(t, out, "- `orders` in `testapp` (last progress 9d 4h ago): it is too old to resume")
 	assert.NotContains(t, out, "9d 4h of copying",
 		"an expired checkpoint is stale by construction; naming it as copying time contradicts the cause below it")
@@ -359,7 +359,7 @@ func TestRenderPlanComment_SeveralDiscardedCopiesReadAsPlural(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **2** unfinished copies on the target\n")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: 2 unfinished copies on the target\n")
 	assert.Contains(t, out, "- `orders` in `orders_a` (last progress 3h 12m ago): the schema change differs from the one that started it")
 	assert.Contains(t, out, "- `orders` in `orders_b` (last progress 9d 4h ago): it is too old to resume")
 	assert.Contains(t, out, "Applying restarts the copies from zero rows.")
@@ -381,7 +381,7 @@ func TestRenderPlanComment_DiscardedCopyWithoutAge(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target\n")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n")
 	assert.Contains(t, out, "- `orders` in `testapp`: the schema change differs from the one that started it",
 		"an unknown age is omitted rather than rendered as a bare zero, which would read as a copy that just started")
 	assert.Contains(t, out, "To keep the work already done, apply the schema change that started it.")
@@ -418,7 +418,7 @@ func TestRenderMultiEnvPlanComment_IdenticalDDLStillDisclosesOneEnvironmentsCopy
 	assert.Contains(t, out, "### Production\n", "the environment holding the copy keeps its own section")
 	assert.NotContains(t, out, "### Staging & Production",
 		"one section cannot speak for two targets when only one of them holds discardable work")
-	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target")
+	assert.Contains(t, out, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target")
 	assert.Contains(t, out, "- `orders` in `testapp` (last progress 9h 40m ago): the schema change differs from the one that started it")
 }
 
@@ -477,7 +477,7 @@ func TestRenderMultiEnvPlanComment_IdenticalDDLStillDisclosesOneEnvironmentsRunn
 	assert.Contains(t, out, "### Production\n", "the environment holding the running copy keeps its own section")
 	assert.NotContains(t, out, "### Staging & Production",
 		"one section cannot speak for two targets when only one of them holds live work")
-	assert.Contains(t, out, "♻️ **Work already in progress**: **1** unfinished copy still running on the target")
+	assert.Contains(t, out, "♻️ **Work already in progress**: 1 unfinished copy still running on the target")
 	assert.Contains(t, out, "- `orders` in `testapp` (still copying)")
 }
 

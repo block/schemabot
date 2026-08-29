@@ -5,6 +5,8 @@ import (
 	"html"
 	"strings"
 	"text/template"
+
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // SchemaErrorData contains data for rendering schema request error comments.
@@ -78,7 +80,7 @@ func (d SchemaErrorData) Attribution() string {
 	return "*Requested by @" + d.RequestedBy + " at " + d.Timestamp + " UTC*"
 }
 
-const databaseNotFoundTemplate = `## ⚠️ Database Not Found
+const databaseNotFoundTemplate = "## " + glyph.Attention + ` Database Not Found
 
 **Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
 
@@ -88,7 +90,7 @@ No ` + "`schemabot.yaml`" + ` configuration with ` + "`database: {{.DatabaseName
 
 Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`" + ` field matching the ` + "`-d`" + ` flag value.`
 
-const invalidConfigTemplate = `## ⚠️ No Valid SchemaBot Configuration Found
+const invalidConfigTemplate = "## " + glyph.Attention + ` No Valid SchemaBot Configuration Found
 
 {{with .EnvironmentHeader}}{{.}}
 
@@ -104,7 +106,7 @@ type: mysql
 - **database** (required): The database name
 - **type** (required): ` + "`vitess`" + ` or ` + "`mysql`" + ``
 
-const noConfigNoDatabaseTemplate = `## ℹ️ No SchemaBot Configuration Found
+const noConfigNoDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configuration Found
 
 {{with .EnvironmentHeader}}{{.}}
 
@@ -127,7 +129,7 @@ Use the ` + "`-d`" + ` flag to specify which database to {{.CommandName}}:
 schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
-const noConfigWithDatabaseTemplate = `## ℹ️ No SchemaBot Configuration Found
+const noConfigWithDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configuration Found
 
 **Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
 
@@ -143,7 +145,7 @@ database: {{.DatabaseName}}
 type: mysql
 ` + "```" + ``
 
-const configOutsideAllowedDirsTemplate = `## ⚠️ SchemaBot Configuration Not Authorized
+const configOutsideAllowedDirsTemplate = "## " + glyph.Attention + ` SchemaBot Configuration Not Authorized
 
 **Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
 
@@ -155,7 +157,7 @@ SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot i
 
 Ask a SchemaBot operator to add this directory to ` + "`databases.{{.DatabaseName}}.allowed_dirs`" + ` in the server config, or move the schema config and files under an allowed directory.`
 
-const unmanagedSchemaConfigsNoticeTemplate = `## ⚠️ Schema Changes Not Managed by SchemaBot
+const unmanagedSchemaConfigsNoticeTemplate = "## " + glyph.Attention + ` Schema Changes Not Managed by SchemaBot
 
 This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
 
@@ -165,7 +167,7 @@ These schema changes will **not** be planned or applied, and the SchemaBot check
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's ` + "`allowed_dirs`" + ` in the server config; otherwise remove these schema changes from this PR.`
 
-const multipleConfigsTemplate = `## ⚠️ Multiple Databases Detected
+const multipleConfigsTemplate = "## " + glyph.Attention + ` Multiple Databases Detected
 
 {{with .EnvironmentHeader}}{{.}}
 
@@ -185,7 +187,7 @@ Use the ` + "`-d`" + ` flag:
 schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 ` + "```" + ``
 
-const genericErrorTemplate = `## ❌ {{.CommandName}} Failed
+const genericErrorTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
 
 {{with .EnvironmentHeader}}{{.}}
 
@@ -289,7 +291,7 @@ func RenderGenericError(data SchemaErrorData) string {
 
 // RenderInvalidCommand generates an error message for unrecognized commands.
 func RenderInvalidCommand() string {
-	return offerSupportChannel("## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference())
+	return offerSupportChannel("## " + glyph.Failed + " Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n" + commandReference())
 }
 
 // RenderInvalidEnv generates an error message when the -e value does not name
@@ -306,7 +308,7 @@ func RenderInvalidEnv(action string, available []string) string {
 	if len(quoted) > 0 {
 		availableLine = "\n**Available environments**: " + strings.Join(quoted, ", ") + "\n"
 	}
-	return offerSupportChannel(fmt.Sprintf(`## ❌ Invalid Environment
+	return offerSupportChannel(fmt.Sprintf("## "+glyph.Failed+` Invalid Environment
 
 `+"`-e`"+` must name one of the configured environments.
 %s
@@ -323,7 +325,7 @@ func markdownInlineCode(s string) string {
 
 // RenderMissingEnv generates an error message when -e flag is missing.
 func RenderMissingEnv(action string) string {
-	return offerSupportChannel(fmt.Sprintf(`## ❌ Missing Argument
+	return offerSupportChannel(fmt.Sprintf("## "+glyph.Failed+` Missing Argument
 
 You'll need to specify which environment to target with the `+"`-e`"+` flag.
 

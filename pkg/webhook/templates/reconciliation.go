@@ -3,6 +3,8 @@ package templates
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // SchemaChangeReconciliationData contains the apply-owned PR state that must be
@@ -71,7 +73,7 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 // longer contains a schema change whose apply has already started.
 func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationData) string {
 	var sb strings.Builder
-	sb.WriteString("## ⚠️ Schema Change Reconciliation Required\n\n")
+	sb.WriteString("## " + glyph.Attention + " Schema Change Reconciliation Required\n\n")
 	writeReconciliationMetadata(&sb, data.Items)
 	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
 	sb.WriteString("\n")

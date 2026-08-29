@@ -183,22 +183,25 @@ func TestPostgresParserCreateTableColumns(t *testing.T) {
 	require.ErrorContains(t, err, "expected CREATE TABLE statement")
 }
 
-func TestPostgresParserCreateUniqueIndex(t *testing.T) {
+func TestPostgresParserCreateIndex(t *testing.T) {
 	p := postgresStatementParser{}
 
-	indexName, tableName, ok, err := p.CreateUniqueIndex(`CREATE UNIQUE INDEX "event delivery" ON public.webhook_events (provider, delivery_id)`)
+	indexName, tableName, unique, err := p.CreateIndex(`CREATE UNIQUE INDEX "event delivery" ON public.webhook_events (provider, delivery_id)`)
 	require.NoError(t, err)
-	assert.True(t, ok)
+	assert.True(t, unique)
 	assert.Equal(t, "event delivery", indexName)
 	assert.Equal(t, "webhook_events", tableName)
 
-	_, _, ok, err = p.CreateUniqueIndex("CREATE INDEX idx_events_state ON webhook_events (state)")
+	indexName, tableName, unique, err = p.CreateIndex("CREATE INDEX idx_events_state ON webhook_events (state)")
 	require.NoError(t, err)
-	assert.False(t, ok)
+	assert.False(t, unique)
+	assert.Equal(t, "idx_events_state", indexName)
+	assert.Equal(t, "webhook_events", tableName)
 
-	_, _, ok, err = p.CreateUniqueIndex("CREATE TABLE example (id bigint)")
+	indexName, _, unique, err = p.CreateIndex("CREATE TABLE example (id bigint)")
 	require.NoError(t, err)
-	assert.False(t, ok)
+	assert.False(t, unique)
+	assert.Empty(t, indexName, "a non-index statement is not an index expectation")
 }
 
 // The two parser implementations must diverge where the grammars genuinely

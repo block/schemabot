@@ -42,7 +42,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-💡 **Lint Warnings**: **2** advisory findings
+💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
 - `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
@@ -124,7 +124,7 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 ```
 
 <details>
-<summary>💡 <b>Lint Warnings</b>: <b>6</b> advisory findings</summary>
+<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>
 
 **`orders`**
 - Primary key column `order_ref` has type `varchar`
@@ -170,7 +170,7 @@ ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REF
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⛔ **Cannot apply**: **2** changes the schema-change engine refuses to execute
+⛔ **Cannot apply**: 2 changes the schema-change engine refuses to execute
 - `users`: dropping primary key is not supported
 - `orders`: adding foreign key constraints is not supported
 
@@ -208,7 +208,7 @@ ALTER TABLE `users`
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⚙️ **Direct execution**: **1** change will run as native MySQL DDL
+⚙️ **Direct execution**: 1 change will run as native MySQL DDL
 - `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
 
 These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
@@ -248,13 +248,13 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-🛑 **Check before applying**: **2** destructive changes SchemaBot cannot attribute to this PR
+🛑 **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
 - `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
 - `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
 
 A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
 
-⚠️ **Issues**: **2** unsafe changes detected
+⚠️ **Issues**: 2 unsafe changes detected
 - `orders`: DROP COLUMN discards the column's data
 - `reconcile_state`: DROP TABLE removes all data
 
@@ -288,7 +288,7 @@ schemabot apply -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
 - `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
@@ -321,7 +321,7 @@ schemabot apply -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-ℹ️ **This apply destroys work in progress**: **1** unfinished copy on the target
+ℹ️ **This apply destroys work in progress**: 1 unfinished copy on the target
 - `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
 📋 **Plan**: **1** table to alter
@@ -349,7 +349,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
 - `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
@@ -389,7 +389,7 @@ schemabot unlock
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-⚠️ **Applying destroys work in progress**: **1** unfinished copy on the target
+⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
 - `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
@@ -429,7 +429,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
 ```
 
-♻️ **Resuming work in progress**: **1** unfinished copy on the target will be continued
+♻️ **Resuming work in progress**: 1 unfinished copy on the target will be continued
 - `orders`, `products` in `testapp` (last progress 3h 12m ago)
 
 Applying picks up where the existing copy stopped rather than starting over.
@@ -462,7 +462,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ALTER TABLE `products` ADD COLUMN `sku` varchar(64);
 ```
 
-♻️ **Work already in progress**: **1** unfinished copy still running on the target
+♻️ **Work already in progress**: 1 unfinished copy still running on the target
 - `orders`, `products` in `testapp` (still copying)
 
 Applying joins the copy already running rather than starting a new one: every row copied so far is kept, and no second copy is made.
@@ -501,7 +501,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 
 ---
 
-**⛔ Apply rejected**: **1** planned change the schema-change engine refuses to execute
+**⛔ Apply rejected**: 1 planned change the schema-change engine refuses to execute
 - `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
@@ -811,7 +811,7 @@ schemabot apply -e staging
      }
 ```
 
-⚠️ **Issues**: **2** unsafe changes detected
+⚠️ **Issues**: 2 unsafe changes detected
 - `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
 - `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
 
@@ -1156,7 +1156,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ### Production
 
 
-> ⚠️ **Error:** tern client: resolve DSN for testapp/production: connection refused
+> ❌ **Error:** tern client: resolve DSN for testapp/production: connection refused
 
 ---
 
@@ -1214,7 +1214,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
-💡 **Lint Warnings**: **2** advisory findings
+💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
 - `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
@@ -1403,7 +1403,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 
 ---
 
-**⛔ 1 Unsafe Change Detected:**
+**⛔ Apply rejected**: 1 unsafe change detected
 - `customers`: Unsafe operation detected: DROP COLUMN `nickname`
 
 **Destructive drop guidance:**
@@ -1436,7 +1436,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 
 ---
 
-**⛔ 1 Unsafe Change Detected:**
+**⛔ Apply rejected**: 1 unsafe change detected
 - `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
 
 **Destructive drop guidance:**
@@ -1471,7 +1471,7 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 ---
 
-**⛔ 3 Unsafe Changes Detected:**
+**⛔ Apply rejected**: 3 unsafe changes detected
 - `orders`:
   - Primary key column `id` has type `int`
   - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
@@ -1579,7 +1579,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -1626,7 +1626,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-💡 **Lint Warnings**: **2** advisory findings
+💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
 - `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
 
@@ -2713,7 +2713,7 @@ _Requested by @jackjackbits_
 <summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
 
 
-## ❌ Apply Blocked — Production
+## ⛔ Apply Blocked — Production
 
 **Database**: `testapp`
 
@@ -2730,7 +2730,7 @@ schemabot apply -e staging
 <summary><a name="apply-blocked-by-prior-env-failed"></a><strong>Apply Blocked By Prior Env (Failed)</strong></summary>
 
 
-## ❌ Apply Blocked — Production
+## ⛔ Apply Blocked — Production
 
 **Database**: `testapp`
 
@@ -2765,7 +2765,7 @@ schemabot apply -e production
 <summary><a name="apply-blocked-prior-env-check-missing"></a><strong>Apply Blocked: Prior Env Check Missing</strong></summary>
 
 
-## ❌ Apply Blocked
+## ⛔ Apply Blocked
 
 SchemaBot could not find a completed `staging` check for this PR.
 
@@ -2796,7 +2796,7 @@ _See server logs for details._
 <summary><a name="apply-blocked-prior-env-check-untrusted"></a><strong>Apply Blocked: Prior Env Check Untrusted</strong></summary>
 
 
-## ❌ Apply Blocked
+## ⛔ Apply Blocked
 
 A `staging` check named `SchemaBot (staging)` exists on this PR, but it was created by a GitHub App this SchemaBot deployment does not trust:
 
@@ -2817,7 +2817,7 @@ Re-running `schemabot plan -e staging` will not resolve this.
 <summary><a name="apply-blocked-environment-not-in-promotion-order"></a><strong>Apply Blocked: Environment Not In Promotion Order</strong></summary>
 
 
-## ❌ Apply Blocked — Development
+## ⛔ Apply Blocked — Development
 
 `development` is not in the configured promotion order, so SchemaBot cannot determine which environments must be applied before it and cannot enforce staging-first ordering.
 
@@ -2896,7 +2896,7 @@ Schema changes require approval from an authorized reviewer before applying.
 <summary><a name="apply-blocked-checks-not-passing"></a><strong>Apply Blocked: Checks Not Passing</strong></summary>
 
 
-## ❌ Apply Blocked — Staging
+## ⛔ Apply Blocked — Staging
 
 Cannot apply while PR checks are not passing:
 
@@ -3111,7 +3111,7 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -3921,7 +3921,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** Error 1061: Duplicate key name &#39;idx_user_id&#39;
+> ❌ **Error:** Error 1061: Duplicate key name &#39;idx_user_id&#39;
 
 ---
 
@@ -3968,7 +3968,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -4001,7 +4001,7 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `orders` MODIFY COLUMN `status` enum('NEW','PENDING','SHIPPED','DELIVERED') NOT NULL;
 ```
-> ⚠️ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
+> ❌ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
 **`users`**: ⊘ Cancelled (not started)
 
@@ -4016,7 +4016,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** table orders failed: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
+> ❌ **Error:** table orders failed: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
 ---
 
@@ -4783,7 +4783,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** table users failed: schema change failed: unsafe warning: Field &#39;name&#39; doesn&#39;t have a default value
+> ❌ **Error:** table users failed: schema change failed: unsafe warning: Field &#39;name&#39; doesn&#39;t have a default value
 
 1 of 3 tables completed before failure.
 
@@ -4800,7 +4800,7 @@ ALTER TABLE `users`
     ADD UNIQUE `idx_email`(`email`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -4850,7 +4850,7 @@ schemabot apply -e staging
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -4877,7 +4877,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 
 1 of 2 tables completed before cancellation.
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -5032,7 +5032,7 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 
 *Applied by @jackjackbits at 2026-03-15 11:00:00 UTC*
 
-> ⚠️ **Error:** Error 1062: Duplicate entry &#39;12345&#39; for key &#39;addresses.idx_user_id&#39;
+> ❌ **Error:** Error 1062: Duplicate entry &#39;12345&#39; for key &#39;addresses.idx_user_id&#39;
 
 4 of 8 tables completed before failure.
 
@@ -5041,22 +5041,22 @@ _Apply ID: `apply-a1b2c3d4e5f6`_
 ALTER TABLE `addresses` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**
+**`users`** — Completed
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**
+**`products`** — Completed
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
-**`payments`**
+**`payments`** — Completed
 ```sql
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
@@ -5110,7 +5110,7 @@ schemabot apply -e staging
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
+> ❌ **Error:** table customers.addresses failed: Error 1205: Lock wait timeout exceeded
 
 3 of 5 tables completed before failure.
 
@@ -5121,7 +5121,7 @@ schemabot apply -e staging
 ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 ```
 
-**`users`**
+**`users`** — Completed
 ```sql
 ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 ```
@@ -5129,12 +5129,12 @@ ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
 
 ### ✅ commerce
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`payments`**
+**`payments`** — Completed
 ```sql
 ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
@@ -7039,7 +7039,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
-> ⚠️ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
+> ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -7120,7 +7120,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -7400,7 +7400,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 **Deployments**: 1 completed, 2 halted, 1 failed
 
-> ⚠️ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
+> ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
 ---
 
@@ -7456,7 +7456,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 *Applied by @aparajon at 2026-03-15 14:22:00 UTC*
 
-> ⚠️ **Error:** lock wait timeout exceeded; try restarting transaction
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
 1 of 3 tables completed before failure.
 
@@ -7467,7 +7467,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`orders`**
+**`orders`** — Completed
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
@@ -7607,7 +7607,7 @@ ALTER TABLE `mutes`
     DROP COLUMN `legacy_reason`;
 ```
 
-⚠️ **Issues**: **1** unsafe change detected
+⚠️ **Issues**: 1 unsafe change detected
 - `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
 **Destructive drop guidance:**
@@ -7663,7 +7663,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Shards**: 1 failed, 3 halted
 
-> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -7773,7 +7773,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Shards**: 1 failed, 3 halted
 
-> ⚠️ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
 #### Keyspace `cdb_resolute_sharded`
 

@@ -42,7 +42,7 @@ func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
 	return nil, nil
 }
 
-func (f fakeStatementParser) CreateUniqueIndex(string) (string, string, bool, error) {
+func (f fakeStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, nil
 }
 
@@ -79,13 +79,6 @@ func TestPackageHelpersDelegateToDefaultParser(t *testing.T) {
 		assert.Equal(t, "fake_table", gotTable)
 	})
 
-	t.Run("ClassifyStatementOp converts the default parser's type", func(t *testing.T) {
-		op, table, err := ClassifyStatementOp("CREATE TABLE `a` (`id` INT PRIMARY KEY)")
-		require.NoError(t, err)
-		assert.Equal(t, "rename", op)
-		assert.Equal(t, "fake_table", table)
-	})
-
 	t.Run("Canonicalize returns the default parser's result", func(t *testing.T) {
 		assert.Equal(t, "FAKE CANONICAL", Canonicalize("alter table users add column email varchar(255)"))
 	})
@@ -106,9 +99,6 @@ func TestPackageHelpersPropagateDefaultParserErrors(t *testing.T) {
 	assert.ErrorIs(t, err, splitErr)
 
 	_, _, err = ClassifyStatement("CREATE TABLE `a` (`id` INT PRIMARY KEY)")
-	assert.ErrorIs(t, err, classifyErr)
-
-	_, _, err = ClassifyStatementOp("CREATE TABLE `a` (`id` INT PRIMARY KEY)")
 	assert.ErrorIs(t, err, classifyErr)
 }
 

@@ -378,7 +378,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				return
 			}
 			continue
-		} else if err := verifyReplannedTaskDDL(task, replannedDDL); err != nil {
+		} else if err := c.verifyReplannedTaskDDL(task, replannedDDL); err != nil {
 			// Live schema drifted since resume began: the DDL this shard now
 			// needs no longer matches what was reviewed. Fail closed rather than
 			// apply unreviewed DDL.
@@ -537,7 +537,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// reviewed with: the re-plan recomputes the delta against live
 			// schema, so on a drifted deployment it can produce unreviewed DDL
 			// that overwriting task.DDL would silently apply.
-			if err := verifyReplannedTaskDDL(task, ddl); err != nil {
+			if err := c.verifyReplannedTaskDDL(task, ddl); err != nil {
 				return nil, err
 			}
 			task.DDL = ddl
@@ -577,15 +577,19 @@ func applyInRevertPhase(apply *storage.Apply) bool {
 // semantic divergence trips the guard. A task with no reviewed DDL carries no
 // reference to compare against (only the legacy synthetic VSchema tasks, which
 // the engine-change builder already skips), so it is left to existing handling.
-func verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
+func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
 	if task.DDL == "" {
 		return nil
 	}
-	reviewedCanon, err := canonicalDDLForDrift(task.DDL)
+	parser, err := c.statementParser()
+	if err != nil {
+		return fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
+	}
+	reviewedCanon, err := canonicalDDLForDrift(parser, task.DDL)
 	if err != nil {
 		return fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
 	}
-	replannedCanon, err := canonicalDDLForDrift(replannedDDL)
+	replannedCanon, err := canonicalDDLForDrift(parser, replannedDDL)
 	if err != nil {
 		return fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
 	}

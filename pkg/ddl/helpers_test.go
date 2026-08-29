@@ -208,36 +208,3 @@ func TestStatementPreview_TruncatesOnRuneBoundary(t *testing.T) {
 	assert.Equal(t, strings.Repeat("é", 80)+"...", got)
 	assert.True(t, utf8.ValidString(got))
 }
-
-func TestClassifyStatementOp(t *testing.T) {
-	tests := []struct {
-		stmt      string
-		wantOp    string
-		wantTable string
-		wantErr   bool
-	}{
-		{"CREATE TABLE t1 (id INT)", "create", "t1", false},
-		{"create table t1 (id int)", "create", "t1", false},
-		{"ALTER TABLE t1 ADD COLUMN x INT", "alter", "t1", false},
-		{"DROP TABLE t1", "drop", "t1", false},
-		{"  ALTER TABLE t1 DROP COLUMN x", "alter", "t1", false},
-		{"ALTER TABLE `my_table` ADD INDEX idx_name (name)", "alter", "my_table", false},
-		{"CREATE TABLE `backticked` (id INT)", "create", "backticked", false},
-		{"DROP TABLE IF EXISTS t1", "drop", "t1", false},
-		{"not valid sql at all", "", "", true},
-		{"ALTER TABLE t1 ADD COLUMN x INT; DROP TABLE t2", "", "", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.stmt, func(t *testing.T) {
-			gotOp, gotTable, err := ClassifyStatementOp(tt.stmt)
-			if tt.wantErr {
-				assert.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantOp, gotOp, "operation")
-			assert.Equal(t, tt.wantTable, gotTable, "table")
-		})
-	}
-}

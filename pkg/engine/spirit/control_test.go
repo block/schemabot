@@ -222,9 +222,7 @@ func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
 		username:       "root",
 		threads:        eng.threads,
 	}
-	eng.mu.Lock()
-	eng.runningSchemaChange = rm
-	eng.mu.Unlock()
+	eng.installRunningSchemaChange(rm)
 	return rm
 }
 

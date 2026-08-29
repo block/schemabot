@@ -97,7 +97,7 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "<details open>\n<summary>⏸ au — halted — us failed</summary>")
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code>\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code>\n")
 }
 
 func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) {
@@ -183,7 +183,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 	assert.NotContains(t, out, "Schema Change Failed")
 	// A later deployment is still running while siblings have failed.
 	assert.Contains(t, out, "- 🔄 au — running table copy")
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
 	// Only the earliest failure is lifted to the header.
 	assert.NotContains(t, out, "First failure:** <code>eu</code>")
 }
@@ -217,7 +217,7 @@ func TestRenderMultiDeploymentApplySummaryComment_FirstFailureSurfacesError(t *t
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — boom &lt;script&gt;\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — boom &lt;script&gt;\n")
 }
 
 // A deployment name with HTML-significant characters is escaped inside the
@@ -233,7 +233,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureEscapesName(t *testing.T)
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us&amp;ca</code> — boom\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us&amp;ca</code> — boom\n")
 }
 
 // Each deployment's <details> body is rendered by the single-deployment renderer,
@@ -602,6 +602,6 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureErrorSanitized(t *testing
 	})
 
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — dial tcp [endpoint redacted]: refused second line\n",
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — dial tcp [endpoint redacted]: refused second line\n",
 		"the first-failure line stays on one line")
 }

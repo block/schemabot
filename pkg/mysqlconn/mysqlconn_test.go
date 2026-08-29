@@ -106,7 +106,7 @@ func TestConnectionDSN_WithConnectTimeout(t *testing.T) {
 		assert.Equal(t, "rds", cfg.TLSConfig)
 	})
 
-	t.Run("non-positive timeout leaves the driver default", func(t *testing.T) {
+	t.Run("non-positive timeout falls back to the package default", func(t *testing.T) {
 		got, err := ConnectionDSN(
 			"root:secret@tcp(localhost:3306)/app?parseTime=true",
 			WithConnectTimeout(0),
@@ -115,7 +115,67 @@ func TestConnectionDSN_WithConnectTimeout(t *testing.T) {
 
 		cfg, err := mysql.ParseDSN(got)
 		require.NoError(t, err)
-		assert.Equal(t, time.Duration(0), cfg.Timeout)
+		assert.Equal(t, defaultConnectTimeout, cfg.Timeout)
+	})
+}
+
+// Every SchemaBot-managed connection gets bounded connect and write timeouts
+// so a target that stops responding surfaces as an error instead of a hung
+// drive. A positive timeout carried in the DSN or supplied as an option wins
+// over the package default, while a non-positive value — absent, zero, or
+// negative via a raw option closure — is filled with the default so no
+// managed connection is ever unbounded. Reads stay unbounded because
+// long-running DDL can legitimately stream no bytes for longer than any safe
+// fixed window.
+func TestConnectionDSN_TimeoutDefaults(t *testing.T) {
+	t.Run("plain DSN gets default connect and write timeouts", func(t *testing.T) {
+		got, err := ConnectionDSN("root:secret@tcp(localhost:3306)/app?parseTime=true")
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.Timeout)
+		assert.Equal(t, defaultWriteTimeout, cfg.WriteTimeout)
+		assert.Equal(t, time.Duration(0), cfg.ReadTimeout)
+	})
+
+	t.Run("DSN-carried timeouts are preserved", func(t *testing.T) {
+		got, err := ConnectionDSN("root:secret@tcp(localhost:3306)/app?timeout=3s&writeTimeout=9s")
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, 3*time.Second, cfg.Timeout)
+		assert.Equal(t, 9*time.Second, cfg.WriteTimeout)
+	})
+
+	t.Run("connect timeout option overrides the default, write default still applies", func(t *testing.T) {
+		got, err := ConnectionDSN(
+			"root:secret@tcp(localhost:3306)/app",
+			WithConnectTimeout(5*time.Second),
+		)
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, 5*time.Second, cfg.Timeout)
+		assert.Equal(t, defaultWriteTimeout, cfg.WriteTimeout)
+	})
+
+	t.Run("negative timeouts from a raw option closure are replaced by the defaults", func(t *testing.T) {
+		got, err := ConnectionDSN(
+			"root:secret@tcp(localhost:3306)/app",
+			func(cfg *mysql.Config) {
+				cfg.Timeout = -time.Second
+				cfg.WriteTimeout = -time.Second
+			},
+		)
+		require.NoError(t, err)
+
+		cfg, err := mysql.ParseDSN(got)
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.Timeout)
+		assert.Equal(t, defaultWriteTimeout, cfg.WriteTimeout)
 	})
 }
 

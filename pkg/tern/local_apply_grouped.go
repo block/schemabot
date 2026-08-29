@@ -292,14 +292,6 @@ func (c *LocalClient) saveEngineResumeStateForOperation(ctx context.Context, ope
 	})
 }
 
-func (c *LocalClient) loadEngineResumeState(ctx context.Context, task *storage.Task) (*engine.ResumeState, error) {
-	operationID, err := applyOperationIDForTask(task)
-	if err != nil {
-		return nil, err
-	}
-	return c.loadEngineResumeStateForOperation(ctx, operationID)
-}
-
 func (c *LocalClient) loadEngineResumeStateForOperation(ctx context.Context, operationID int64) (*engine.ResumeState, error) {
 	store := c.storage.ApplyOperations()
 	if store == nil {
@@ -568,7 +560,7 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
 	eng := c.getEngine()
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(defaultTaskPollInterval)
 	defer ticker.Stop()
 
 	// Seed revertSkipped from the durable signal so a driver that picks this apply
@@ -646,7 +638,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ps.consecutiveErrors++
 		logger.Warn("progress check failed",
 			append(apply.MutableLogAttrs(), "error", err, "consecutive_errors", ps.consecutiveErrors)...)
-		if ps.consecutiveErrors >= 10 {
+		if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
 			if c.shouldRetryEngineError(err) {
 				logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
 					"consecutive_errors", ps.consecutiveErrors)

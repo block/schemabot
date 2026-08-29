@@ -14,14 +14,38 @@ import (
 
 var openSQL = sql.Open
 
+// Default transport timeouts for SchemaBot-managed MySQL connections, applied
+// whenever the parsed value is unset — a DSN or option must set a positive
+// timeout to override them, and the zero "no timeout" value is deliberately
+// replaced so a managed connection can never be unbounded. The connect
+// timeout bounds the TCP dial only: the Go MySQL driver's handshake and auth
+// exchange run on the caller's context, so a half-open endpoint that accepts
+// the dial but never sends the server greeting unwinds via context
+// cancellation like any other read (the PostgreSQL side differs — pgconn's
+// ConnectTimeout bounds the whole connection process including TLS and auth).
+// The write timeout bounds a single network write; statement text is small,
+// so a write blocked this long means the peer is gone. No read-timeout
+// default is set, deliberately: the Go MySQL driver's read timeout caps a
+// single network read, and a legitimately long-running statement streams no
+// bytes until it completes — for example a large DROP TABLE or a DDL waiting
+// on a metadata lock — so a read timeout would kill it mid-flight. Reads
+// unwind when the caller's context is cancelled (the driver closes the
+// connection on cancellation); a call site that must bound a read on its own
+// sets an explicit context deadline.
+const (
+	defaultConnectTimeout = 30 * time.Second
+	defaultWriteTimeout   = time.Minute
+)
+
 // Option customizes the parsed MySQL config before the DSN is reassembled.
 // Options are applied in ConnectionDSN, so they flow through Open,
 // OpenReloadable, and the credential-reload path alike.
 type Option func(*mysql.Config)
 
-// WithConnectTimeout bounds a single connection attempt (TCP dial plus
-// handshake) by setting the driver's `timeout` DSN parameter. A non-positive
-// duration is ignored, leaving the driver default in place. It does not bound
+// WithConnectTimeout bounds the TCP dial of a single connection attempt by
+// setting the driver's `timeout` DSN parameter; the handshake that follows
+// runs on the caller's context. A non-positive duration is ignored, leaving
+// any DSN-carried value, or the package default, in place. It does not bound
 // query execution — use context deadlines for that.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(cfg *mysql.Config) {
@@ -109,10 +133,10 @@ func reloadConnectionDSN(reload func() (string, error), opts ...Option) string {
 }
 
 // ConnectionDSN returns a MySQL DSN with required connection settings applied
-// (RDS TLS, client-side parameter interpolation), plus any caller-supplied
-// options (for example WithConnectTimeout). Settings and options are applied
-// on every return path so they take effect regardless of whether the DSN also
-// needs RDS TLS enhancement.
+// (RDS TLS, client-side parameter interpolation, default transport timeouts),
+// plus any caller-supplied options (for example WithConnectTimeout). Settings
+// and options are applied on every return path so they take effect regardless
+// of whether the DSN also needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
@@ -143,13 +167,23 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	return requiredSettingsDSN(enhanced, opts...), nil
 }
 
-// requiredSettingsDSN applies any caller-supplied options, then the settings
-// every SchemaBot-managed MySQL connection needs, and returns the reassembled
-// DSN. Required settings are applied after options so no option can override
-// them.
+// requiredSettingsDSN applies any caller-supplied options, then default
+// transport timeouts for values still unset, then the settings every
+// SchemaBot-managed MySQL connection needs, and returns the reassembled DSN.
+// Required settings are applied after options so no option can override them;
+// the timeout defaults fill non-positive values, so a positive DSN or option
+// timeout wins while zero ("no timeout") and negative values — which the
+// driver would silently treat as unbounded — are replaced: a managed
+// connection is never unbounded.
 func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultConnectTimeout
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = defaultWriteTimeout
 	}
 	// Interpolate query parameters client-side instead of using server-side
 	// prepared statements. database/sql prepares, executes once, and closes on

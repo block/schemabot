@@ -5,7 +5,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // ChangeSet is a deployment's proto plan change set: the namespace-collapsed
@@ -55,19 +57,28 @@ func (d ChangeSetDiff) Empty() bool {
 }
 
 // CompareChangeSets reports how candidate differs from baseline, comparing table
-// DDL by canonicalized form and vschema by per-namespace parity.
+// DDL by canonicalized form and vschema by per-namespace parity. The dialect
+// selects the grammar both change sets are classified and canonicalized with,
+// so a PostgreSQL deployment's DDL is never judged by the MySQL parser; both
+// sides of a comparison are always the same dialect, since comparing DDL
+// canonicalized under different grammars proves nothing.
 //
-// It fails closed: malformed proto (nil entries, empty shard/table names, a
-// vschema change carrying table DDL, an inconsistent sharded/non-sharded shape)
-// and DDL that cannot be canonicalized (unparseable, multi-statement, or
-// non-DDL) return an error, so a caller can treat the deployment as blocking
-// rather than mistake a comparison it could not perform for agreement.
-func CompareChangeSets(baseline, candidate ChangeSet) (ChangeSetDiff, error) {
-	baseMS, baseVS, err := changeSetMultiset(baseline)
+// It fails closed: an unregistered dialect, malformed proto (nil entries, empty
+// shard/table names, a vschema change carrying table DDL, an inconsistent
+// sharded/non-sharded shape) and DDL that cannot be canonicalized (unparseable,
+// multi-statement, or non-DDL) return an error, so a caller can treat the
+// deployment as blocking rather than mistake a comparison it could not perform
+// for agreement.
+func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (ChangeSetDiff, error) {
+	parser, err := ddl.ParserForDialect(dialect)
+	if err != nil {
+		return ChangeSetDiff{}, err
+	}
+	baseMS, baseVS, err := changeSetMultiset(parser, baseline)
 	if err != nil {
 		return ChangeSetDiff{}, fmt.Errorf("baseline change set: %w", err)
 	}
-	candMS, candVS, err := changeSetMultiset(candidate)
+	candMS, candVS, err := changeSetMultiset(parser, candidate)
 	if err != nil {
 		return ChangeSetDiff{}, fmt.Errorf("candidate change set: %w", err)
 	}
@@ -110,7 +121,7 @@ func CompareChangeSets(baseline, candidate ChangeSet) (ChangeSetDiff, error) {
 // namespace carried by shard rows only the shard rows are counted. A non-sharded
 // namespace's changes live only on Changes and are counted there. VSchema
 // carries no table DDL and is compared by per-namespace parity.
-func changeSetMultiset(cs ChangeSet) (driftChangeMultiset, map[string]bool, error) {
+func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMultiset, map[string]bool, error) {
 	ms := driftChangeMultiset{}
 	vschema := map[string]bool{}
 
@@ -132,7 +143,7 @@ func changeSetMultiset(cs ChangeSet) (driftChangeMultiset, map[string]bool, erro
 			nsShardChanges[sp.Namespace] = true
 		}
 		for _, tc := range sp.Changes {
-			key, err := driftKeyForTableChange(sp.Namespace, shard, tc)
+			key, err := driftKeyForTableChange(parser, sp.Namespace, shard, tc)
 			if err != nil {
 				return nil, nil, fmt.Errorf("shard %q: %w", shard, err)
 			}
@@ -168,7 +179,7 @@ func changeSetMultiset(cs ChangeSet) (driftChangeMultiset, map[string]bool, erro
 			if nsShardChanges[ns] {
 				continue
 			}
-			key, err := driftKeyForTableChange(ns, "", tc)
+			key, err := driftKeyForTableChange(parser, ns, "", tc)
 			if err != nil {
 				return nil, nil, fmt.Errorf("namespace %q: %w", ns, err)
 			}
@@ -187,7 +198,7 @@ func changeSetMultiset(cs ChangeSet) (driftChangeMultiset, map[string]bool, erro
 // driftKeyForTableChange builds the multiset key for a proto table change,
 // deriving the operation the same way a materialized apply does and
 // canonicalizing the DDL with the fail-closed drift canonicalizer.
-func driftKeyForTableChange(namespace, shard string, tc *ternv1.TableChange) (driftChangeKey, error) {
+func driftKeyForTableChange(parser ddl.StatementParser, namespace, shard string, tc *ternv1.TableChange) (driftChangeKey, error) {
 	if tc == nil {
 		return driftChangeKey{}, fmt.Errorf("nil table change")
 	}
@@ -197,11 +208,11 @@ func driftKeyForTableChange(namespace, shard string, tc *ternv1.TableChange) (dr
 	if tc.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
 		return driftChangeKey{}, fmt.Errorf("table %q carries a vschema change; vschema is namespace-level, not table DDL", tc.TableName)
 	}
-	op, err := materializedTableChangeOperation(tc)
+	op, err := materializedTableChangeOperation(parser, tc)
 	if err != nil {
 		return driftChangeKey{}, err
 	}
-	canon, err := canonicalDDLForDrift(tc.Ddl)
+	canon, err := canonicalDDLForDrift(parser, tc.Ddl)
 	if err != nil {
 		return driftChangeKey{}, fmt.Errorf("table %q: %w", tc.TableName, err)
 	}

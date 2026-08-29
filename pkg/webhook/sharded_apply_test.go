@@ -488,7 +488,7 @@ func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) 
 	out := formatApplySummaryComment(apply, ops, false, nil, nil, nil, nil, "")
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
-	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
+	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
 		"the apply row's error reaches the callout when no shard carries the failure")
 	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
 }

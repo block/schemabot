@@ -63,6 +63,7 @@ func TestReplanShardTableDDLNonShardedDegradesToTable(t *testing.T) {
 // DDL: it must pass only when the re-plan matches what the task was reviewed
 // with, tolerating incidental formatting, and fail closed otherwise.
 func TestVerifyReplannedTaskDDL(t *testing.T) {
+	c := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypeMySQL}}
 	task := func(reviewed string) *storage.Task {
 		return &storage.Task{
 			TaskIdentifier: "task_abc123",
@@ -76,7 +77,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 
 	t.Run("matching re-plan passes", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 		require.NoError(t, err)
 	})
 
@@ -84,7 +85,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// Unquoted identifiers and extra whitespace canonicalize to the same form
 		// as the reviewed DDL, so they are not drift.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := verifyReplannedTaskDDL(tk, "ALTER TABLE   users   ADD COLUMN email varchar(255)")
+		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE   users   ADD COLUMN email varchar(255)")
 		require.NoError(t, err)
 	})
 
@@ -92,7 +93,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// The deployment drifted: the re-plan would apply a different column type
 		// than the one reviewed. This unreviewed DDL must be refused.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(100)")
+		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(100)")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 		assert.Contains(t, err.Error(), "commerce[-80].users/alter")
@@ -102,13 +103,13 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// Only legacy synthetic VSchema tasks carry no reviewed DDL; they have no
 		// reference to compare against and are handled downstream, not here.
 		tk := task("")
-		err := verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 		require.NoError(t, err)
 	})
 
 	t.Run("unparseable re-planned DDL fails closed", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := verifyReplannedTaskDDL(tk, "this is not valid sql")
+		err := c.verifyReplannedTaskDDL(tk, "this is not valid sql")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "re-planned DDL for task task_abc123")
 	})
@@ -171,7 +172,7 @@ func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, needsChange)
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
-	require.NoError(t, verifyReplannedTaskDDL(task, ddl), "matching re-plan is not drift")
+	require.NoError(t, c.verifyReplannedTaskDDL(task, ddl), "matching re-plan is not drift")
 }
 
 // When the table has dropped out of the re-plan diff (its cutover completed) the
@@ -239,7 +240,7 @@ func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
 	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
 	require.NoError(t, err)
 	require.True(t, needsChange)
-	err = verifyReplannedTaskDDL(task, ddl)
+	err = c.verifyReplannedTaskDDL(task, ddl)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 	assert.Contains(t, err.Error(), "testapp.users/alter")
