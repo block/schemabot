@@ -157,6 +157,7 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, `statement for table "users":`)
 	assert.Contains(t, change.ModeReason, "1-byte threshold")
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }

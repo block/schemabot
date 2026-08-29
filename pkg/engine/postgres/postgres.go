@@ -54,7 +54,7 @@ func New() *Engine {
 // table size ceiling expressed in bytes. Zero means unset and adopts
 // DefaultNativeSafeTableSizeLimitBytes. A negative value is kept as-is
 // rather than silently replaced with a ceiling the caller did not choose:
-// the preflight check rejects a non-positive limit loudly at apply time,
+// the plan-time preflight check rejects a non-positive limit before apply,
 // and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
 	if tableSizeLimit == 0 {
@@ -303,7 +303,7 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if r == nil {
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
-	blockExecutableChanges(changes, r.detail)
+	blockExecutableChanges(changes, fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
 	return changes, nil
 }
 

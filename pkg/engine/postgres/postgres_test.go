@@ -286,6 +286,8 @@ func TestBlockChangesAtTier(t *testing.T) {
 		"an existing verdict must never be overwritten")
 }
 
+// A fully blocked plan does not need a table-size answer. The nil pool proves
+// the guard returns before catalog access while preserving the prior verdict.
 func TestBlockOversizedTableSkipsFullyBlockedPlans(t *testing.T) {
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
@@ -298,6 +300,35 @@ func TestBlockOversizedTableSkipsFullyBlockedPlans(t *testing.T) {
 	changes, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
 	require.NoError(t, err)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+}
+
+// An executable step without a named target fails the plan closed because a
+// size check cannot answer for an unidentified table.
+func TestBlockOversizedTableRequiresTargetTable(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
+	}}
+
+	_, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	require.Error(t, err)
+	assert.EqualError(t, err, "plan report carries executable steps but names no target table")
+}
+
+// An operational size-check failure fails the plan closed instead of leaving
+// the step executable. A non-positive limit is rejected before catalog access.
+func TestBlockOversizedTableFailsClosedOnCheckError(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
+	}}
+
+	_, err := blockOversizedTable(t.Context(), nil, report, changes, -1)
+	require.Error(t, err)
+	assert.EqualError(t, err, `check size for table "users": size limit must be positive, got -1`)
 }
 
 func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
