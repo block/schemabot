@@ -104,8 +104,13 @@ func (s *Service) StartOperator(ctx context.Context) {
 		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
 	})
 
+	// The fan-out cap only means something relative to the pool it bounds, and
+	// an operator asking "why is my sharded apply only running two shards?" has
+	// no other way to read the effective value — an omitted config key resolves
+	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
+		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
 		"stranded_reaper_interval", reaperEvery)
 }

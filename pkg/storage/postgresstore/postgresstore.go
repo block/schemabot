@@ -17,6 +17,6 @@ type Storage = sqlstore.Storage
 var _ storage.Storage = (*Storage)(nil)
 
 // New creates a new PostgreSQL storage instance.
-func New(db *sql.DB) *Storage {
-	return sqlstore.NewPostgres(db)
+func New(db *sql.DB, opts ...storage.Option) *Storage {
+	return sqlstore.NewPostgres(db, opts...)
 }

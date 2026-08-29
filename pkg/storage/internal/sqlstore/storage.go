@@ -33,7 +33,7 @@ type Storage struct {
 var _ storage.Storage = (*Storage)(nil)
 
 // NewMySQL creates a MySQL storage instance.
-func NewMySQL(db *sql.DB) *Storage {
+func NewMySQL(db *sql.DB, opts ...storage.Option) *Storage {
 	dialect := MySQLDialect{}
 	return NewWithDependencies(Dependencies{
 		DB:         db,
@@ -42,11 +42,12 @@ func NewMySQL(db *sql.DB) *Storage {
 		Identity:   dialect,
 		Locker:     namedlock.MySQL{},
 		Classifier: NewMySQLErrorClassifier(),
+		Options:    storage.BuildOptions(opts...),
 	})
 }
 
 // NewPostgres creates a PostgreSQL storage instance.
-func NewPostgres(db *sql.DB) *Storage {
+func NewPostgres(db *sql.DB, opts ...storage.Option) *Storage {
 	dialect := PostgresDialect{}
 	return NewWithDependencies(Dependencies{
 		DB:         db,
@@ -55,6 +56,7 @@ func NewPostgres(db *sql.DB) *Storage {
 		Identity:   dialect,
 		Locker:     namedlock.Postgres{},
 		Classifier: NewPostgresErrorClassifier(),
+		Options:    storage.BuildOptions(opts...),
 	})
 }
 
@@ -66,12 +68,21 @@ type Dependencies struct {
 	Identity   identityInserter
 	Locker     namedlock.Locker
 	Classifier ErrorClassifier
+
+	// Options carries the deployment-tunable storage settings. A zero value
+	// resolves to the defaults, so a caller that does not tune anything still
+	// gets a capped claim path.
+	Options storage.Options
 }
 
 // NewWithDependencies creates a storage instance whose database-specific
 // behavior comes entirely from deps; no store hardwires a dialect.
 func NewWithDependencies(deps Dependencies) *Storage {
 	rdb := newRebindDB(deps.DB, deps.Binder)
+	maxDriversPerApply := deps.Options.MaxDriversPerApply
+	if maxDriversPerApply <= 0 {
+		maxDriversPerApply = storage.DefaultMaxDriversPerApply
+	}
 	return &Storage{
 		db:              rdb,
 		locks:           &lockStore{db: rdb, classifier: deps.Classifier},
@@ -82,7 +93,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
-		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
+		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
