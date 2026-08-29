@@ -219,7 +219,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace
 		}
 		sb.WriteString("\nShards diverge — grouped by change:\n")
 		for _, g := range groups {
-			fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards))
+			fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards, len(ks.Shards)))
 			writeShardStatusTable(sb, g.Shards)
 		}
 	}
@@ -280,16 +280,18 @@ func signatureOf(changes []ShardChange) string {
 	return strings.Join(parts, "\x01")
 }
 
-// shardList renders a group's shards as "shard `x`" or "shards `x`, `y`".
-func shardList(shards []ShardStatus) string {
+// shardList renders a divergence group's shards as "shard `x`" or
+// "shards `x`, `y`" when few enough to read inline, stating coverage against
+// the keyspace's shard count beyond that ("12 of 32 shards") — the full names
+// stay reachable in the group's status table below. A divergent keyspace
+// always has at least two groups, so with the real total no group can read
+// as "all" shards.
+func shardList(shards []ShardStatus, totalShards int) string {
 	names := make([]string, len(shards))
 	for i, s := range shards {
-		names[i] = fmt.Sprintf("`%s`", s.Shard)
+		names[i] = s.Shard
 	}
-	if len(names) == 1 {
-		return "shard " + names[0]
-	}
-	return "shards " + strings.Join(names, ", ")
+	return planShardList(names, totalShards)
 }
 
 // writeShardCounts writes the per-status histogram across shards so rollout
@@ -377,7 +379,7 @@ func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 	}
 	sb.WriteString("\n| Shard | Status |\n| --- | --- |\n")
 	for _, s := range shards {
-		fmt.Fprintf(sb, "| `%s` | %s |\n", s.Shard, shardStatusCell(s))
+		fmt.Fprintf(sb, "| %s | %s |\n", markdownInlineCode(s.Shard), shardStatusCell(s))
 	}
 }
 

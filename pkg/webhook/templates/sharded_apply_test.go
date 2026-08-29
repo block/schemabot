@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -103,6 +104,34 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	assert.NotContains(t, out, driftDDL, "the DDL is not repeated in the applied comment")
 }
 
+// A wide divergence group states its coverage against the keyspace's shard
+// count instead of enumerating names — the group's status table right below
+// still lists every shard. The fraction uses the keyspace total, so a subset
+// can never read as covering all shards.
+func TestRenderShardedApplyComment_DivergentWideGroupStatesCoverage(t *testing.T) {
+	const driftDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
+	shards := make([]ShardStatus, 0, 16)
+	cells := make([]ShardCell, 0, 16)
+	for i := range 15 {
+		shard := fmt.Sprintf("s%02d", i)
+		shards = append(shards, ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending})
+		cells = append(cells, mutesCell(shard))
+	}
+	shards = append(shards, ShardStatus{Shard: "s15", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending})
+	cells = append(cells, ShardCell{Shard: "s15", Table: "mutes", DDL: driftDDL})
+
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID:   "apply-x",
+		Keyspaces: oneKeyspace(shards, cells),
+	})
+
+	assert.Contains(t, out, "**15 of 16 shards**", "the wide group states coverage, not names")
+	assert.NotContains(t, out, "all 16 shards", "a divergent subset never reads as full coverage")
+	assert.Contains(t, out, "**shard `s15`**", "the small group still names its shard inline")
+	assert.Contains(t, out, "| `s00` |", "the group's status table still names every shard")
+}
+
 // A uniform multi-table change set is one group (no spurious "grouped by change"
 // header), and the applied comment shows status only — no DDL.
 func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
@@ -179,7 +208,7 @@ func TestRenderShardedApplyComment_MultiKeyspaceFailureLifted(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+failErr)
+	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
 	assert.Contains(t, out, "**Shards**: 1 completed, 1 failed")
 }
 
@@ -436,12 +465,11 @@ func TestRenderShardedApplyComment_FailureOutsideShardWorkSurfacesApplyError(t *
 func TestRenderShardedApplyComment_RetryingApplyErrorCarriesAttentionGlyph(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.FailedRetryable, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ApplyID:      "apply-x",
 		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")
