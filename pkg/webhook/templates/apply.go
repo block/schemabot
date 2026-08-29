@@ -60,6 +60,20 @@ func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
+// countReadyForCutover returns how many tables are parked at the cutover
+// barrier, per TaskStatusReadyForCutover. Every summary that reports a
+// ready/waiting count derives it from this single counter so the readiness
+// predicate cannot drift between render surfaces.
+func countReadyForCutover(tables []TableProgressData) int {
+	ready := 0
+	for _, t := range tables {
+		if TaskStatusReadyForCutover(t.Status) {
+			ready++
+		}
+	}
+	return ready
+}
+
 // ShardProgressData is the high-level status of one shard, for the compact
 // per-shard summary in the PR comment. It intentionally carries only state +
 // percent (no row counts/ETA) to keep the comment quiet.
@@ -426,13 +440,8 @@ func revertWindowCountdown(revertExpiresAt string) string {
 // writeCutoverSummary writes a readiness summary for cutover states,
 // showing how many tables are ready for cutover vs not yet ready.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
-	ready := 0
+	ready := countReadyForCutover(tables)
 	total := len(tables)
-	for _, t := range tables {
-		if TaskStatusReadyForCutover(t.Status) {
-			ready++
-		}
-	}
 	if total == 0 {
 		return
 	}
@@ -453,9 +462,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, recovering, cutting, cancelled int
 	var runningPct int
 	var runningEstimateExceeded bool
+
+	// Tables parked at the cutover barrier count through the shared readiness
+	// predicate, keeping this summary consistent with the cutover summary.
+	waiting := countReadyForCutover(tables)
 
 	for _, t := range tables {
 		switch state.NormalizeTaskStatus(t.Status) {
@@ -477,8 +490,6 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			checksumming++
 		case state.Task.Pending:
 			queued++
-		case state.Task.WaitingForCutover:
-			waiting++
 		case state.Task.Recovering:
 			recovering++
 		case state.Task.CuttingOver:
