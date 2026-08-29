@@ -904,9 +904,10 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,
-// naming each table and the engine's reason verbatim. There is no opt-in flag
-// that lets these through — the remedy is whatever each reason names: an
-// unsupported shape needs a rewrite, a missing grant needs provisioning.
+// naming each table and a sanitized, Markdown-safe engine reason. There is no
+// opt-in flag that lets these through — the remedy is whatever each reason
+// names: an unsupported shape needs a rewrite, a missing grant needs
+// provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
 	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
@@ -916,7 +917,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
 		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(c.Reason))
+			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
 		} else {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
@@ -959,7 +960,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
 		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(c.Reason))
+			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
 		} else {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}

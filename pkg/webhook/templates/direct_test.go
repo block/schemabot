@@ -50,6 +50,21 @@ func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
 	assert.Contains(t, out, "table user\\_events\\_v2 \\| column \\`event\\_id\\` runs directly")
 }
 
+func TestRenderPlanComment_DirectSanitizesReason(t *testing.T) {
+	reason := "refused by db-primary.internal:3306\n\n## Injected heading\n- fake item"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY"},
+		}},
+		DirectChanges: []DirectChangeData{{Table: "users", Reason: reason}},
+	})
+
+	assert.NotContains(t, out, "\n## Injected heading")
+	assert.NotContains(t, out, "db-primary.internal:3306")
+	assert.Contains(t, out, "- `users`: refused by \\[endpoint redacted\\] ## Injected heading - fake item\n")
+}
+
 // A direct change confined to specific shards names them, matching the
 // blocked section's shard scoping.
 func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
@@ -145,7 +160,7 @@ func TestRenderBlockedChangesApplyRejected(t *testing.T) {
 }
 
 // An engine refusal reason is untrusted error text: endpoints are redacted,
-// the reason stays on one line, and HTML is escaped so it cannot inject markup.
+// the reason stays on one line, and Markdown constructs cannot alter rendering.
 func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
 	out := RenderBlockedChangesApplyRejected(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
@@ -153,12 +168,12 @@ func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
 			Keyspace:   "testapp",
 			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY"},
 		}},
-		BlockedChanges: []BlockedChangeData{
-			{Table: "users", Reason: "refused by db-primary.internal:3306\n<details> & more"},
-		},
+		BlockedChanges: []BlockedChangeData{{
+			Table: "users", Reason: "refused by db-primary.internal:3306\n*event_id* | <details>",
+		}},
 	})
 
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
-	assert.Contains(t, out, "`users`: refused by [endpoint redacted] &lt;details&gt; &amp; more\n",
-		"the reason stays on one line with HTML escaped")
+	assert.Contains(t, out, "`users`: refused by \\[endpoint redacted\\] \\*event\\_id\\* \\| \\<details>\n",
+		"the reason stays on one line with Markdown escaped")
 }
