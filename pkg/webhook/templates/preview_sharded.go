@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -158,6 +159,42 @@ func PreviewCommentShardedPlanDivergent() string {
 	})
 }
 
+// PreviewCommentShardedPlanManyShards renders a uniform sharded plan across a
+// wide keyspace: the DDL shows once under an "all N shards" heading, with the
+// shard names behind a collapsed block instead of walling the comment.
+func PreviewCommentShardedPlanManyShards() string {
+	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	shards := make([]KeyspaceShardChange, 0, 32)
+	for i := range 32 {
+		shards = append(shards, KeyspaceShardChange{Shard: previewShardRange(i, 32), Statements: []string{idx}})
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{idx},
+			Shards:     shards,
+		}},
+	})
+}
+
+// previewShardRange returns shard i's keyrange name in an evenly-split
+// keyspace of n shards, in Vitess notation: "-08", "08-10", …, "f8-".
+func previewShardRange(i, n int) string {
+	width := 256 / n
+	lower := fmt.Sprintf("%02x", i*width)
+	upper := fmt.Sprintf("%02x", (i+1)*width)
+	switch i {
+	case 0:
+		return "-" + upper
+	case n - 1:
+		return lower + "-"
+	default:
+		return lower + "-" + upper
+	}
+}
+
 // PreviewCommentShardedPlanPartiallyApplied renders a sharded plan where one
 // shard already has the change (e.g. an interrupted earlier rollout) and the
 // rest still need it. The satisfied shard renders as an "already applied" group
@@ -188,7 +225,7 @@ func PreviewCommentShardedPlanUnsafe() string {
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
 		HasUnsafeChanges: true,
-		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}}},
+		UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}, TotalShards: 4}},
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
 			Shards: []KeyspaceShardChange{

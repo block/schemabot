@@ -230,7 +230,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
 		if reason := SanitizeInlineError(c.Reason); reason != "" {
 			fmt.Fprintf(&sb, "- %s: %s\n", table, html.EscapeString(reason))
