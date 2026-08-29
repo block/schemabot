@@ -33,8 +33,10 @@ satisfy all of these conditions:
 - The statement is an `ALTER TABLE` shape accepted by pg-sprite's
   privilege-tier check. Other statement kinds fail closed.
 - The target is an ordinary or partitioned table and its measured on-disk
-  size is no more than 1 GiB. For a partitioned parent, the measurement
-  includes its complete partition tree.
+  size is no more than the configured native-apply ceiling (1 GiB by
+  default; see `postgres.native_safe_table_size_limit_bytes` in
+  [configuration](configuration.md)). For a partitioned parent, the
+  measurement includes its complete partition tree.
 - The target role passes the privilege preflight for the planned statement.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
@@ -106,8 +108,10 @@ TABLE` or other statement kinds outside its admitted set.
 Planning establishes the statement shape. Apply time re-checks facts that can
 change or that depend on the target:
 
-- A table larger than 1 GiB is refused permanently. This is SchemaBot's
-  native-apply ceiling, not a PostgreSQL limit.
+- A table larger than the configured ceiling is refused permanently. This is
+  SchemaBot's native-apply ceiling, not a PostgreSQL limit. It defaults to
+  1 GiB and is set with `postgres.native_safe_table_size_limit_bytes`; see
+  [configuration](configuration.md) for the trade-offs of raising it.
 - A missing target, or an object that is not an ordinary or partitioned table,
   is refused permanently.
 - Insufficient privileges are refused permanently before DDL runs. The stored
