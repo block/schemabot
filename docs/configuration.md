@@ -396,7 +396,11 @@ max_drivers_per_apply: 2
 
 `max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time.
 
-The cap applies only to *starting* new operations. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped — an apply already at its cap must still be able to recover and to be controlled.
+The cap applies only to *starting* new operations — a first start, a resume after a stop, and a deferred deploy are all capped. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped: an apply already at its cap must still be able to recover and to be controlled, or the cap becomes the thing that wedges the apply it is bounding.
+
+**The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
+
+A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Cutting over such an apply therefore takes one `cutover` per capped batch rather than one for the whole fan-out, and shards that have not yet advanced are still subject to the manual-inaction timeout.
 
 ## Pending Drops
 

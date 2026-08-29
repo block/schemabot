@@ -28,9 +28,17 @@ const ApplyLeaseStaleAfter = time.Minute
 // fan-out claims its operations oldest-first like any other work, so without a
 // bound a single apply takes every driver on the plane and holds them for as
 // long as its slowest operation runs — starving every other database behind it
-// with no limit. The cap is what keeps the plane available: one apply can
-// occupy at most this many drivers, whatever it is doing, so capacity always
+// with no limit. The cap is what keeps the plane available: capacity always
 // remains to claim another tenant's work and to consume control requests.
+//
+// It gates every claim that starts work — a first start, a resume after a stop,
+// and a deferred deploy — and no claim that recovers or controls. That split is
+// the whole design: recovering a crashed operation and consuming a stop or
+// cancel must never be capped, or the cap wedges the apply it is bounding, while
+// leaving any start path uncapped is a way around the bound rather than an
+// exception to it. A stop/start cycle is the case that makes this concrete: stop
+// moves every pending sibling to stopped at once, so an uncapped resume would
+// hand one apply the whole pool for the rest of its rollout.
 //
 // The count lives in storage, so the cap is plane-wide across pods with no
 // extra coordination, and both planes enforce it because both run these claim

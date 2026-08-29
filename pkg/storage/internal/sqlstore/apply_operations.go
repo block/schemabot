@@ -708,9 +708,9 @@ const releasedFailureExemptionSQL = `NOT (
 // capped apply's rows to the next apply's oldest claimable row, which is the
 // fairness the cap is for.
 //
-// It takes two format arguments in order: the active-state placeholder list and
-// the dialect's staleness cutoff expression, and one positional argument per
-// active state.
+// It takes two format arguments in order: the occupying-state placeholder list
+// and the dialect's staleness cutoff expression, and one positional argument per
+// occupying state.
 const freshLeaseCountSQL = `(
 			SELECT COUNT(*)
 			FROM apply_operations AS busy
@@ -719,6 +719,36 @@ const freshLeaseCountSQL = `(
 				AND busy.state IN (%s)
 				AND busy.updated_at >= %s
 		)`
+
+// driverOccupyingOperationStates lists the operation states in which a driver
+// is holding the row and doing work on it. It is the question the fan-out cap
+// asks, and it is deliberately not claimableApplyStates(): "states an apply can
+// be claimed in" and "states in which a driver occupies an operation" are
+// different questions that only mostly overlap.
+//
+// failed_retryable is where they part. A redispatched operation keeps that
+// state for its whole drive — the claim rotates the lease and leaves the state
+// alone, and the row is not rewritten until the drive settles it — so a driver
+// really is occupying it the entire time. Counting it is what keeps a retry
+// sweep from running the apply at twice its cap.
+func driverOccupyingOperationStates() []string {
+	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
+}
+
+// driverCapClause renders the fan-out cap predicate and returns it with its
+// positional arguments, so an arm can be gated by appending both together.
+//
+// The clause is rendered here rather than spliced into the claim query as `%s`
+// verbs on purpose. The claim is a long hand-ordered query with many positional
+// arguments; adding the cap's arguments to that list at three separate sites
+// would put them in the middle of it, where one misplaced entry shifts every
+// later binding and silently corrupts eligibility for unrelated arms. Rendering
+// the count up front keeps each site's arguments to one named unit.
+func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, []any) {
+	occupyingStates := driverOccupyingOperationStates()
+	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff) + " < ?"
+	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
+}
 
 // releasedFailureExemptionArgs returns the positional arguments for
 // releasedFailureExemptionSQL, in placeholder order.
@@ -838,6 +868,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStatePlaceholders := placeholders(len(activeStates))
 	terminalStates := terminalApplyStates()
 	terminalStatePlaceholders := placeholders(len(terminalStates))
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
@@ -906,14 +938,26 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		state.Apply.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
 	// Fan-out cap: a pending row is claimable only while its apply holds fewer
-	// than maxDriversPerApply fresh operation leases. It gates this arm alone,
-	// because this is the only arm that starts new work. The recovery and
-	// control-request arms below must stay uncapped: a capped-out apply still has
-	// to be able to re-lease a crashed operation and to consume a pending stop or
-	// cancel, and gating those on the same count would make the cap itself the
-	// thing that wedges the apply it is bounding.
-	queryArgs = append(queryArgs, stringArgs(activeStates)...)
-	queryArgs = append(queryArgs, s.maxDriversPerApply)
+	// than maxDriversPerApply fresh operation leases.
+	//
+	// The cap gates every arm that *starts* work — this pending arm, the
+	// stopped+start resume arm, and the deferred-deploy arm — because all three
+	// admit an apply's siblings onto drivers, and an uncapped one is a way around
+	// the bound rather than an exception to it. A stop/start cycle is the shape
+	// that matters: stop bulk-moves every pending row to stopped, so an uncapped
+	// resume arm would make all of them claimable at once and hand one apply the
+	// whole pool durably, which is the starvation this exists to prevent.
+	//
+	// The recovery and control-request arms stay uncapped: a capped-out apply
+	// still has to be able to re-lease a crashed operation and to consume a
+	// pending stop or cancel, and gating those on the same count would make the
+	// cap itself the thing that wedges the apply it is bounding.
+	//
+	// Capping a start arm cannot wedge either, because the states it admits work
+	// into (resuming, running) are themselves counted: each resumed operation
+	// drops out of the count as it settles, so the rest drain behind it exactly
+	// as the pending arm's do.
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -934,6 +978,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
@@ -948,6 +993,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.Apply.WaitingForDeploy)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
@@ -997,7 +1043,6 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
-	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 	// The two guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
@@ -1079,7 +1124,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							)
 						)
 				)
-				AND `+freshLeaseCountSQL+` < ?
+				AND `+driverCap+`
 			)
 			OR (
 				state IN (%s)
@@ -1104,6 +1149,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.operation = ?
 						AND cr.status = ?
 				)
+				AND `+driverCap+`
 			)
 			OR (
 				state = ?
@@ -1132,6 +1178,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 						AND `+deferredDeployGuard+`
 				)
+				AND `+driverCap+`
 			)
 			OR (
 				state = ?
@@ -1156,7 +1203,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

@@ -2690,6 +2690,20 @@ func TestApplyOperationStore_FindNextApplyOperation_CapsDriversPerApply(t *testi
 	assert.True(t, otherClaimed, "the capacity the cap leaves behind must be claimable by another database's apply")
 }
 
+// occupyApplyOperation puts a fresh driver lease on an operation row, the way a
+// claim does. Insert does not persist lease columns, so a seeded LeaseOwner is
+// silently dropped and the row would not count against the fan-out cap — a test
+// that needs an apply to be at its cap has to write the lease itself.
+func occupyApplyOperation(t *testing.T, opID int64, owner string) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(), `
+		UPDATE apply_operations
+		SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW(), updated_at = NOW()
+		WHERE id = ?
+	`, owner, owner+"-token", opID)
+	require.NoError(t, err)
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_CapDoesNotBlockCancel verifies
 // that the cap bounds only new work. An apply already holding its full share of
 // drivers must still be able to consume an operator's cancel — a cap that gated
@@ -2703,12 +2717,13 @@ func TestApplyOperationStore_FindNextApplyOperation_CapDoesNotBlockCancel(t *tes
 	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_cap_cancel", 1, state.Apply.Stopped, "staging")
 
 	// One operation already running under a fresh lease consumes the cap.
-	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+	runningID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-0/users",
 		OperationKind: storage.ApplyOperationKindWork,
-		State:         state.ApplyOperation.Running, LeaseOwner: "peer-operator", LeaseToken: "peer-token",
+		State:         state.ApplyOperation.Running,
 	})
 	require.NoError(t, err)
+	occupyApplyOperation(t, runningID, "peer-operator")
 
 	stoppedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-1/users",
@@ -2723,6 +2738,118 @@ func TestApplyOperationStore_FindNextApplyOperation_CapDoesNotBlockCancel(t *tes
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a capped-out apply must still be able to consume a pending cancel")
 	assert.Equal(t, stoppedID, claimed.ID)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_CapsResumeAfterStop verifies
+// that a stop/start cycle cannot walk around the fan-out cap. Stop moves every
+// pending shard of a wide apply to stopped at once, so a start request makes all
+// of them eligible together — the cap must bound that resume exactly as it
+// bounds a first start, or one operator command hands the whole driver pool to
+// one apply for the rest of the rollout.
+func TestApplyOperationStore_FindNextApplyOperation_CapsResumeAfterStop(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB, storage.WithMaxDriversPerApply(2))
+
+	lock := createTestLock(t, store, "widedb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_cap_resume", 1, state.Apply.Stopped, "staging")
+	for i := range 5 {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+			OperationKey:  fmt.Sprintf("commerce/shard-%d/users", i),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Stopped,
+		})
+		require.NoError(t, err)
+	}
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationStart)
+
+	claimed := 0
+	for range 8 {
+		got, claimErr := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+		require.NoError(t, claimErr)
+		if got == nil {
+			break
+		}
+		assert.Equal(t, apply.ID, got.ApplyID)
+		claimed++
+	}
+	assert.Equal(t, 2, claimed, "a resumed rollout occupies the cap's worth of drivers, not every stopped shard at once")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_CapsDeferredDeploy verifies
+// that a deferred-deploy fan-out is bounded too. The start request that
+// triggers a deferred deploy is deliberately left pending so sibling operations
+// can act on it, which makes every sibling eligible in the same poll cycle — the
+// cap is what keeps that from starting all of them at once.
+func TestApplyOperationStore_FindNextApplyOperation_CapsDeferredDeploy(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB, storage.WithMaxDriversPerApply(2))
+
+	lock := createTestLock(t, store, "widedb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_cap_deferred", 1, state.Apply.WaitingForDeploy, "staging")
+	for i := range 5 {
+		// The operation row stays running while the apply parks at
+		// waiting_for_deploy, because only the deploy is deferred.
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+			OperationKey:  fmt.Sprintf("commerce/shard-%d/users", i),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.Running,
+		})
+		require.NoError(t, err)
+	}
+	requestPendingControlOperation(t, store, apply.ID, storage.ControlOperationStart)
+
+	claimed := 0
+	for range 8 {
+		got, claimErr := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+		require.NoError(t, claimErr)
+		if got == nil {
+			break
+		}
+		assert.Equal(t, apply.ID, got.ApplyID)
+		claimed++
+	}
+	assert.Equal(t, 2, claimed, "a deferred-deploy fan-out occupies the cap's worth of drivers, not every sibling at once")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_CountsRetryingSiblings verifies
+// that operations being retried count against the cap. A redispatched operation
+// keeps its failed_retryable state for the whole drive, so a driver is occupying
+// it the entire time — leaving it out of the count would let a retry sweep run
+// an apply at twice its configured cap.
+func TestApplyOperationStore_FindNextApplyOperation_CountsRetryingSiblings(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB, storage.WithMaxDriversPerApply(2))
+
+	lock := createTestLock(t, store, "widedb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_op_cap_retrying", 1)
+
+	for i := range 2 {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+			OperationKey:  fmt.Sprintf("commerce/shard-retry-%d/users", i),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.FailedRetryable,
+		})
+		require.NoError(t, err)
+		occupyApplyOperation(t, id, fmt.Sprintf("peer-operator-%d", i))
+	}
+	for i := range 3 {
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a",
+			OperationKey:  fmt.Sprintf("commerce/shard-pending-%d/users", i),
+			OperationKind: storage.ApplyOperationKindWork,
+		})
+		require.NoError(t, err)
+	}
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "two retrying siblings already occupy the cap, so no pending shard may start")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_OrdersDeploymentsWithShards
