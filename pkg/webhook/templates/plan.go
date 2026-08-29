@@ -916,7 +916,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
 		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(c.Reason))
 		} else {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
@@ -959,7 +959,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
 		}
 		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(c.Reason))
 		} else {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}

@@ -35,6 +35,21 @@ func TestRenderPlanComment_DirectShownOnPlanAndApply(t *testing.T) {
 	assert.Contains(t, apply, "Confirming the apply consents to this.")
 }
 
+func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `user_events_v2` DROP PRIMARY KEY"},
+		}},
+		DirectChanges: []DirectChangeData{
+			{Table: "user_events_v2", Reason: "table user_events_v2 | column `event_id` runs directly"},
+		},
+	})
+
+	assert.Contains(t, out, "table user\\_events\\_v2 \\| column \\`event\\_id\\` runs directly")
+}
+
 // A direct change confined to specific shards names them, matching the
 // blocked section's shard scoping.
 func TestRenderPlanComment_DirectNamesShards(t *testing.T) {
