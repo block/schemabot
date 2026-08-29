@@ -20,7 +20,9 @@ func TestDialectForEngine(t *testing.T) {
 		{"Postgres", schema.DialectPostgres},
 		// The engine field on comment data also carries database-type and
 		// display-cased values from older producers; all of them are
-		// MySQL-family except postgres.
+		// MySQL-family except the Postgres spellings.
+		{"PostgreSQL", schema.DialectPostgres},
+		{"postgresql", schema.DialectPostgres},
 		{"mysql", schema.DialectMySQL},
 		{"Vitess", schema.DialectMySQL},
 		{"Spirit", schema.DialectMySQL},
@@ -35,23 +37,34 @@ func TestDialectForEngine(t *testing.T) {
 // A PostgreSQL apply's progress comment renders each table's DDL in the
 // PostgreSQL grammar's canonical form — keywords uppercased by the Postgres
 // deparser, identifiers left unquoted — rather than being reformatted (or
-// left untouched as unparseable) under the MySQL grammar.
+// left untouched as unparseable) under the MySQL grammar. Every table status
+// renders its DDL through the same dialect routing, so the assertion holds
+// across the per-status rendering branches.
 func TestRenderApplyStatusComment_PostgresDialect(t *testing.T) {
-	out := RenderApplyStatusComment(ApplyStatusCommentData{
-		ApplyID:     "apply-1",
-		Database:    "testapp",
-		Environment: "staging",
-		State:       state.Apply.Running,
-		Engine:      "postgres",
-		Tables: []TableProgressData{{
-			TableName: "users",
-			Status:    state.Task.Running,
-			DDL:       "alter table users add column payload jsonb",
-		}},
-	})
+	for _, status := range []string{
+		state.Task.Running,
+		state.Task.Pending,
+		state.Task.Failed,
+		state.Task.Stopped,
+	} {
+		t.Run(status, func(t *testing.T) {
+			out := RenderApplyStatusComment(ApplyStatusCommentData{
+				ApplyID:     "apply-1",
+				Database:    "testapp",
+				Environment: "staging",
+				State:       state.Apply.Running,
+				Engine:      "postgres",
+				Tables: []TableProgressData{{
+					TableName: "users",
+					Status:    status,
+					DDL:       "alter table users add column payload jsonb",
+				}},
+			})
 
-	assert.Contains(t, out, "ALTER TABLE users ADD COLUMN payload jsonb;")
-	assert.NotContains(t, out, "ALTER TABLE `users`", "identifiers must not gain MySQL backtick quoting")
+			assert.Contains(t, out, "ALTER TABLE users ADD COLUMN payload jsonb;")
+			assert.NotContains(t, out, "ALTER TABLE `users`", "identifiers must not gain MySQL backtick quoting")
+		})
+	}
 }
 
 // A PostgreSQL apply's terminal summary comment renders each table's DDL in

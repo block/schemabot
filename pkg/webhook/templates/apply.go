@@ -1109,15 +1109,17 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 }
 
 // dialectForEngine maps an apply's engine value to the DDL dialect its
-// statements are written in, for display formatting. Every engine except
-// postgres drives a MySQL-protocol target, so the MySQL dialect is also the
-// fallback for an empty or unrecognized value: FormatDDLForDialect is
-// best-effort and returns the statement unchanged when it cannot be parsed,
-// so the fallback affects only formatting, never correctness. This is a
-// display concern — system-schema classification uses
+// statements are written in, for display formatting. The engine field on
+// comment data carries engine names, database types, and display-cased
+// variants ("postgres", "PostgreSQL", "Spirit", "vitess"), so the match is
+// case-insensitive and accepts both Postgres spellings; every other value
+// drives a MySQL-protocol target. MySQL is also the fallback for an empty or
+// unrecognized value, preserving the established rendering for legacy engine
+// values. This is a display concern — system-schema classification uses
 // schema.DialectForDatabaseType, which treats unknown values conservatively.
 func dialectForEngine(engine string) schema.Dialect {
-	if strings.EqualFold(engine, storage.EnginePostgres) {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case storage.EnginePostgres, "postgresql":
 		return schema.DialectPostgres
 	}
 	return schema.DialectMySQL
