@@ -32,6 +32,8 @@
 package storagetest
 
 import (
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -61,23 +63,57 @@ type Harness interface {
 	NewUnreachableStorage(t *testing.T) storage.Storage
 }
 
+type parityFamily struct {
+	name          string
+	storageMethod string
+	test          func(*testing.T, Harness)
+}
+
+var parityFamilies = []parityFamily{
+	{name: "Plans", storageMethod: "Plans", test: TestPlans},
+	{name: "PlanComments", storageMethod: "PlanComments", test: TestPlanComments},
+	{name: "Settings", storageMethod: "Settings", test: TestSettings},
+	{name: "ApplyLogs", storageMethod: "ApplyLogs", test: TestApplyLogs},
+	{name: "Locks", storageMethod: "Locks", test: TestLocks},
+	{name: "Applies", storageMethod: "Applies", test: TestApplies},
+	{name: "ApplyOperations", storageMethod: "ApplyOperations", test: TestApplyOperations},
+	{name: "ApplyComments", storageMethod: "ApplyComments", test: TestApplyComments},
+	{name: "ControlRequests", storageMethod: "ControlRequests", test: TestControlRequests},
+	{name: "Tasks", storageMethod: "Tasks", test: TestTasks},
+	{name: "WebhookEvents", storageMethod: "WebhookEvents", test: TestWebhookEvents},
+	{name: "Checks", storageMethod: "Checks", test: TestChecks},
+}
+
 // Run executes every parity family against the harness. Implementations call
 // Run from a single integration test so a storage backend cannot silently
 // opt out of part of the contract — each new family is added here as it
 // lands.
 func Run(t *testing.T, h Harness) {
-	t.Run("Plans", func(t *testing.T) { TestPlans(t, h) })
-	t.Run("PlanComments", func(t *testing.T) { TestPlanComments(t, h) })
-	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
-	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
-	t.Run("Locks", func(t *testing.T) { TestLocks(t, h) })
-	t.Run("Applies", func(t *testing.T) { TestApplies(t, h) })
-	t.Run("ApplyOperations", func(t *testing.T) { TestApplyOperations(t, h) })
-	t.Run("ApplyComments", func(t *testing.T) { TestApplyComments(t, h) })
-	t.Run("ControlRequests", func(t *testing.T) { TestControlRequests(t, h) })
-	t.Run("Tasks", func(t *testing.T) { TestTasks(t, h) })
-	t.Run("WebhookEvents", func(t *testing.T) { TestWebhookEvents(t, h) })
-	t.Run("Checks", func(t *testing.T) { TestChecks(t, h) })
+	assertParityFamilyCoverage(t)
+	for _, family := range parityFamilies {
+		t.Run(family.name, func(t *testing.T) { family.test(t, h) })
+	}
+}
+
+func assertParityFamilyCoverage(t *testing.T) {
+	t.Helper()
+
+	storageType := reflect.TypeFor[storage.Storage]()
+	errorType := reflect.TypeFor[error]()
+	var storageMethods []string
+	for method := range storageType.Methods() {
+		if method.Type.NumIn() == 0 && method.Type.NumOut() == 1 && method.Type.Out(0).Kind() == reflect.Interface && method.Type.Out(0) != errorType {
+			storageMethods = append(storageMethods, method.Name)
+		}
+	}
+
+	familyMethods := make([]string, 0, len(parityFamilies))
+	for _, family := range parityFamilies {
+		familyMethods = append(familyMethods, family.storageMethod)
+	}
+	sort.Strings(storageMethods)
+	sort.Strings(familyMethods)
+	require.Equal(t, storageMethods, familyMethods, "parity families must cover every storage sub-interface exactly once")
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the
