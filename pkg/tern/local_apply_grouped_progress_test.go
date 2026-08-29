@@ -283,3 +283,31 @@ func TestPollForCompletionAtomic_LostEngineWorkNeverCompletesRevertPhaseTasks(t 
 	}
 	assert.Equal(t, 0, eng.planCalls, "the target schema is never consulted for revert-phase tasks")
 }
+
+// A revert-phase task needs no target read to settle, so a plan the drive
+// cannot read must not strand it alongside the tasks that do need verifying.
+// The revert rests retryable on its own reason while the forward task falls to
+// the bounded error budget — an operator re-driving the apply has to be able to
+// tell a lost revert from a forward change whose target could not be read.
+func TestPollForCompletionAtomic_LostEngineWorkSettlesRevertPhaseTasksWhenVerificationFails(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetReached, state.Task.Reverting)
+	reverting, forward := tasks[0], tasks[1]
+	forward.State = state.Task.Running
+	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+
+	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unverifiable target pauses the apply retryable, never permanently failed")
+	assert.Equal(t, state.Task.FailedRetryable, reverting.State, "a lost revert rests retryable without ever reading the target")
+	assert.Contains(t, reverting.ErrorMessage, "revert phase", "the revert-phase task keeps the reason that names its phase")
+	assert.Nil(t, reverting.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Equal(t, state.Task.FailedRetryable, forward.State, "the task that needed verifying falls to the bounded error budget")
+	assert.Contains(t, forward.ErrorMessage, "could not be verified")
+	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing by re-plan; the engine is never consulted")
+}
