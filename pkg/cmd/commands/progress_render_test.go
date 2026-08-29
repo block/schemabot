@@ -6,8 +6,33 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestProgressRenderingUsesTargetDialect(t *testing.T) {
+	resp := &apitypes.ProgressResponse{
+		DatabaseType: "postgres",
+		Tables: []*apitypes.TableProgressResponse{
+			{
+				TableName:  "sessions",
+				ChangeType: "create",
+				Status:     "queued",
+				DDL:        "CREATE TABLE sessions (id uuid PRIMARY KEY, payload jsonb)",
+			},
+		},
+	}
+
+	data := templates.ParseProgressResponse(resp)
+	require.Len(t, data.Tables, 1)
+	assert.Equal(t, schema.DialectPostgres, data.Tables[0].Dialect)
+
+	out := templates.FormatTableProgress(data.Tables[0])
+	assert.Contains(t, out, "id uuid")
+	assert.Contains(t, out, "payload jsonb")
+	assert.NotContains(t, out, "`")
+}
 
 // TestProgressRenderingNormalizesRawEngineStatuses pins the operator-facing
 // rendering that `status`, `progress`, and the watch TUI produce for the raw

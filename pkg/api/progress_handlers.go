@@ -435,6 +435,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
+	httpResp.DatabaseType = apply.DatabaseType
 	httpResp.Environment = apply.Environment
 	httpResp.Caller = apply.Caller
 	if apply.Repository != "" && apply.PullRequest > 0 {
@@ -1138,12 +1139,13 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 
 	// Build response from local records
 	httpResp := &apitypes.ProgressResponse{
-		State:       apply.State,
-		Engine:      apply.Engine,
-		ApplyID:     apply.ApplyIdentifier,
-		Database:    apply.Database,
-		Environment: apply.Environment,
-		Caller:      apply.Caller,
+		State:        apply.State,
+		Engine:       apply.Engine,
+		ApplyID:      apply.ApplyIdentifier,
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  apply.Environment,
+		Caller:       apply.Caller,
 	}
 	if apply.Repository != "" && apply.PullRequest > 0 {
 		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
