@@ -371,6 +371,12 @@ func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
 		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
+		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
+	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
+		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
+		return ddl.StatementTypeToOp(ddl.StatementCreateView)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
@@ -394,6 +400,12 @@ func changeTypeToProto(op string) ternv1.ChangeType {
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
 	case ddl.StatementDropIndex:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
+	case ddl.StatementRenameTable:
+		return ternv1.ChangeType_CHANGE_TYPE_RENAME
+	case ddl.StatementTruncateTable:
+		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
+	case ddl.StatementCreateView:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}

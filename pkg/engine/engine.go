@@ -154,6 +154,40 @@ func ProgressIsExternallyAuthoritative(eng Engine) bool {
 	return ok && auth.ProgressIsExternallyAuthoritative()
 }
 
+// SynchronousWorkRegistration is an optional interface for engines whose Apply
+// registers accepted work before it returns, so the engine can never report
+// pending for work it has accepted but has not begun executing.
+//
+// This distinction decides how a driver reads a pending progress report for a
+// task whose durable state says the work is in flight. Pending is an overloaded
+// report. An engine that provisions resources after accepting the work — cutting
+// a branch, opening and validating a deploy request — reports pending for real,
+// healthy work for as long as that setup takes, so a driver has to give it time
+// before concluding anything from the report. An engine that registers the work
+// synchronously has no such phase: once Apply has returned, the work is either
+// running or it is gone, and a single pending report is already conclusive.
+//
+// Engines that do not implement this interface are treated as having a setup
+// phase. That is the safe default for a healthy schema change: an undeclared
+// engine is given the driver's full trust budget, so provisioning is never
+// mistaken for lost work and a change that was about to run is never bounced.
+type SynchronousWorkRegistration interface {
+	// RegistersWorkSynchronously reports whether Apply registers accepted work
+	// before returning, which makes a pending progress report conclusive
+	// evidence that accepted work is gone rather than not yet started.
+	RegistersWorkSynchronously() bool
+}
+
+// RegistersWorkSynchronously reports whether eng declares that Apply registers
+// accepted work before returning. Engines that do not implement
+// SynchronousWorkRegistration are treated as having a post-acceptance setup
+// phase, so a pending report about in-flight work is never read as conclusive
+// on its own.
+func RegistersWorkSynchronously(eng Engine) bool {
+	reg, ok := eng.(SynchronousWorkRegistration)
+	return ok && reg.RegistersWorkSynchronously()
+}
+
 // DeferredCutoverSignalRequest identifies the target database whose deferred
 // cutover signal should be inspected.
 type DeferredCutoverSignalRequest struct {

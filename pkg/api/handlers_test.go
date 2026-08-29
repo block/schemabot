@@ -720,6 +720,25 @@ func (s *noopApplyLogStore) Append(context.Context, *storage.ApplyLog) error {
 	return nil
 }
 
+// windowedApplyLogStore stands in for the real log store's windowing: it holds
+// available entries and returns the newest min(available, limit) of them in
+// chronological order, recording the limit each read asked for.
+type windowedApplyLogStore struct {
+	storage.ApplyLogStore
+	available int
+	lastLimit int
+}
+
+func (s *windowedApplyLogStore) List(_ context.Context, filter storage.ApplyLogFilter) ([]*storage.ApplyLog, error) {
+	s.lastLimit = filter.Limit
+	count := min(s.available, filter.Limit)
+	logs := make([]*storage.ApplyLog, 0, count)
+	for id := s.available - count + 1; id <= s.available; id++ {
+		logs = append(logs, &storage.ApplyLog{ID: int64(id), Level: "info", EventType: "state_transition", Message: fmt.Sprintf("entry %d", id)})
+	}
+	return logs, nil
+}
+
 type capturingApplyLogStore struct {
 	storage.ApplyLogStore
 	logs []*storage.ApplyLog
@@ -843,6 +862,142 @@ func (m *mockTernClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*tern
 	return &ternv1.LogsResponse{}, nil
 }
 
+// An apply with more history than the requested window returns exactly the
+// newest entries asked for and reports that older ones exist. Triage depends on
+// that signal: a full window with no marker reads as the whole lifecycle, when
+// the part that explains the apply may have scrolled past the limit.
+func TestHandleLogsReportsTruncatedWindow(t *testing.T) {
+	apply := &storage.Apply{ID: 11, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	logStore := &windowedApplyLogStore{available: 12}
+	service := New(&mockStorageWithApplyStores{
+		applies:   &staticApplyStore{apply: apply},
+		applyLogs: logStore,
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&limit=3", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 4, logStore.lastLimit, "the read takes one entry past the window to detect older history")
+	var response apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.True(t, response.Truncated)
+	require.Len(t, response.Logs, 3, "the extra entry is a probe, not part of the window")
+	assert.Equal(t, "entry 10", response.Logs[0].Message)
+	assert.Equal(t, "entry 12", response.Logs[2].Message)
+}
+
+// An apply whose whole history fits the window is reported complete, so the
+// truncation marker means something when it does appear.
+func TestHandleLogsReportsCompleteWindow(t *testing.T) {
+	apply := &storage.Apply{ID: 12, ApplyIdentifier: "apply-control", Database: "orders", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}
+	logStore := &windowedApplyLogStore{available: 3}
+	service := New(&mockStorageWithApplyStores{
+		applies:   &staticApplyStore{apply: apply},
+		applyLogs: logStore,
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&limit=3", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response apitypes.LogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.False(t, response.Truncated)
+	require.Len(t, response.Logs, 3)
+	assert.Equal(t, "entry 1", response.Logs[0].Message)
+}
+
+// Each data-plane source is windowed on its own, so a target with more history
+// than the window holds is marked partial without casting doubt on a sibling
+// whose logs are complete.
+func TestHandleDeploymentLogsReportsPerSourceTruncation(t *testing.T) {
+	apply := &storage.Apply{ID: 13, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a"},
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/80-/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-b", ExternalID: "remote-b"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		count := 1
+		if req.ApplyId == "remote-a" {
+			// More history than the window holds, including the probe entry.
+			count = int(req.Limit)
+		}
+		resp := &ternv1.LogsResponse{ApplyId: req.ApplyId}
+		for id := 1; id <= count; id++ {
+			resp.Logs = append(resp.Logs, &ternv1.ApplyLog{Id: int64(id), Level: "info", Message: fmt.Sprintf("entry %d", id), CreatedAt: "2026-07-18T18:33:10Z"})
+		}
+		return resp, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/logs?apply_id=apply-control&deployment=region-a&limit=2", nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 2)
+	assert.Equal(t, int32(3), client.logsReqs[0].Limit, "each remote read takes one entry past the window")
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 2)
+	assert.Equal(t, "remote-a", response.Sources[0].ExternalID)
+	assert.True(t, response.Sources[0].Truncated)
+	require.Len(t, response.Sources[0].Logs, 2)
+	assert.Equal(t, "entry 2", response.Sources[0].Logs[0].Message)
+	assert.Equal(t, "remote-b", response.Sources[1].ExternalID)
+	assert.False(t, response.Sources[1].Truncated)
+	require.Len(t, response.Sources[1].Logs, 1)
+}
+
+// A data-plane read is capped remotely: a request past the cap is served
+// exactly the cap's worth of newest entries, so a window at the cap plus the
+// probe would come back indistinguishable from a complete history. The
+// handler narrows the window below the cap — an operator viewing a long
+// remote apply gets one entry fewer at the cap and an honest partial marker,
+// never a partial window presented as the whole lifecycle.
+func TestHandleDeploymentLogsKeepsTruncationDetectableAtTheRemoteCap(t *testing.T) {
+	apply := &storage.Apply{ID: 14, ApplyIdentifier: "apply-control", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging"}
+	operations := []*storage.ApplyOperation{
+		{ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/-80/orders", OperationKind: storage.ApplyOperationKindWork, Target: "cluster-a", ExternalID: "remote-a"},
+	}
+	client := &mockTernClient{isRemote: true}
+	client.logsHook = func(req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+		// The remote serves at most its cap, from a history deeper than any
+		// window the handler can request.
+		count := min(int(req.Limit), tern.MaxLogsLimit)
+		resp := &ternv1.LogsResponse{ApplyId: req.ApplyId}
+		for id := 1; id <= count; id++ {
+			resp.Logs = append(resp.Logs, &ternv1.ApplyLog{Id: int64(id), Level: "info", Message: fmt.Sprintf("entry %d", id), CreatedAt: "2026-07-18T18:33:10Z"})
+		}
+		return resp, nil
+	}
+	service := New(&mockStorageWithApplyStores{
+		applies:    &staticApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{operations: operations},
+	}, testServerConfig(), map[string]tern.Client{"region-a/staging": client}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("/api/logs?apply_id=apply-control&deployment=region-a&limit=%d", tern.MaxLogsLimit), nil)
+	w := httptest.NewRecorder()
+	service.handleLogsWithoutDatabase(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, client.logsReqs, 1)
+	assert.Equal(t, int32(tern.MaxLogsLimit), client.logsReqs[0].Limit, "the probe stays within what the remote will serve")
+	var response apitypes.DeploymentLogsResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.Len(t, response.Sources, 1)
+	assert.True(t, response.Sources[0].Truncated, "a window at the remote cap still reports its older entries")
+	require.Len(t, response.Sources[0].Logs, tern.MaxLogsLimit-1)
+	assert.Equal(t, "entry 2", response.Sources[0].Logs[0].Message)
+}
+
 func TestDeploymentLogEntryRejectsMalformedRecords(t *testing.T) {
 	_, err := deploymentLogEntry("remote-a", &ternv1.ApplyLog{CreatedAt: "not-a-time", MetadataJson: []byte(`{}`)})
 	require.ErrorContains(t, err, "created_at")
@@ -916,7 +1071,7 @@ func TestHandleDeploymentLogsFansOutDeduplicatesAndPreservesPartialResults(t *te
 	require.Len(t, client.logsReqs, 3)
 	assert.Equal(t, "remote-a", client.logsReqs[0].ApplyId)
 	assert.Equal(t, "cluster-a", client.logsReqs[0].Target)
-	assert.Equal(t, int32(25), client.logsReqs[0].Limit)
+	assert.Equal(t, int32(26), client.logsReqs[0].Limit, "the remote read takes one entry past the window")
 	assert.Equal(t, "remote-b", client.logsReqs[1].ApplyId)
 	assert.Equal(t, "remote-c", client.logsReqs[2].ApplyId)
 	require.Len(t, response.Sources, 1)

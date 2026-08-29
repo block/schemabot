@@ -360,6 +360,18 @@ func sortedKeys[V any](values map[string]V) []string {
 	return keys
 }
 
+// RegistersWorkSynchronously reports that Apply records the accepted schema
+// change on this engine before it returns, so there is no window in which the
+// engine has accepted work it cannot yet describe. The statement executes in a
+// goroutine of this process with nothing to provision first, and the tracked
+// progress is claimed under the engine mutex before Apply returns; Drain is
+// the only writer that clears it, and a drained engine's work is not coming
+// back. A pending progress report for a task a driver believes is in flight is
+// therefore conclusive rather than a phase to wait out.
+func (e *Engine) RegistersWorkSynchronously() bool {
+	return true
+}
+
 // Drain blocks until every background apply goroutine has finished, then
 // clears the tracked schema change so the next Progress reports the idle
 // sentinel. Resume and recovery paths call this before re-planning so a

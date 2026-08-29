@@ -177,6 +177,7 @@ func previewCommentPlanAllOutput() {
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
 		{"VITESS PLAN: VSCHEMA REMOVAL (UNSAFE)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval()) }},
+		{"POSTGRES PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPostgresPlan()) }},
 		{"SCHEMA CHANGE APPLY (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"MYSQL MULTI-SCHEMA PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentMySQLMultiSchema()) }},
 		{"MULTI-ENV PLAN (IDENTICAL)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan()) }},

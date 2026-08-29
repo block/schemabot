@@ -115,23 +115,24 @@ func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error)
 	return columns, nil
 }
 
-// CreateUniqueIndex implements StatementParser using the parsed IndexStmt.
-// Only standalone CREATE UNIQUE INDEX statements match; ordinary indexes and
-// other parsed statement types are not uniqueness expectations.
-func (postgresStatementParser) CreateUniqueIndex(stmt string) (string, string, bool, error) {
+// CreateIndex implements StatementParser using the parsed IndexStmt. Any
+// standalone CREATE INDEX statement reports its index and table names, with
+// unique carrying the UNIQUE declaration; other parsed statement types return
+// an empty index name.
+func (postgresStatementParser) CreateIndex(stmt string) (string, string, bool, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return "", "", false, fmt.Errorf("parse CREATE UNIQUE INDEX %q: %w", statementPreview(stmt), err)
+		return "", "", false, fmt.Errorf("parse CREATE INDEX %q: %w", statementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
 		return "", "", false, fmt.Errorf("expected one statement, got %d", len(stmts))
 	}
 	indexNode, ok := stmts[0].GetStmt().GetNode().(*pgproto.Node_IndexStmt)
-	if !ok || !indexNode.IndexStmt.GetUnique() {
+	if !ok {
 		return "", "", false, nil
 	}
-	return indexNode.IndexStmt.GetIdxname(), indexNode.IndexStmt.GetRelation().GetRelname(), true, nil
+	return indexNode.IndexStmt.GetIdxname(), indexNode.IndexStmt.GetRelation().GetRelname(), indexNode.IndexStmt.GetUnique(), nil
 }
 
 // classifyPostgresNode maps one parsed statement node onto the pkg/ddl-owned

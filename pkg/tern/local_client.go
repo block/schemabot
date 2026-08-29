@@ -203,6 +203,23 @@ type LocalClient struct {
 	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
 	heartbeatInterval time.Duration
 
+	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
+	// as the sequential drive's progress poll cadence. Tests may lower it to
+	// drive many polls quickly.
+	taskPollIntervalOverride time.Duration
+
+	// taskStallWarnIntervalOverride, when positive, replaces
+	// defaultTaskStallWarnInterval as the interval after which a polled task
+	// with no state or progress movement is warned about. Tests may lower it
+	// to observe the warning.
+	taskStallWarnIntervalOverride time.Duration
+
+	// lostEngineWorkPendingBudgetOverride, when positive, replaces
+	// defaultLostEngineWorkPendingBudget as how long the sequential drive keeps
+	// trusting an engine reporting no active schema change for an in-flight
+	// task. Tests may lower it to reach the verification path quickly.
+	lostEngineWorkPendingBudgetOverride time.Duration
+
 	// cancelApply cancels the background goroutine running executeApplySequential
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
@@ -1728,15 +1745,19 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if table == "" || ddl == "" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty table or DDL", i)
 		}
-		op := protoChangeTypeToDDLAction(ch.ChangeType)
-		// A shard-scoped dispatch carries only table DDL (create/alter/drop) for one
-		// shard. A VSchema update is keyspace-wide, never shard-scoped — it is applied
-		// by the task-less group_finalizer path — so accepting it here would build a
-		// shard-tagged task with an unexpected operation. Reject it explicitly.
-		if op == "unknown" || op == "vschema_update" {
+		// A shard-scoped dispatch carries only the table DDL the plan-store shard
+		// gate admits — create/alter/drop for one shard — so allow exactly those and
+		// reject everything else. A VSchema update is keyspace-wide, never
+		// shard-scoped — it is applied by the task-less group_finalizer path — and
+		// any other change type would build a shard-tagged task the sharded path has
+		// no semantics for. An explicit allow-list keeps this gate's meaning fixed
+		// as the change-type vocabulary grows.
+		switch ch.ChangeType {
+		case ternv1.ChangeType_CHANGE_TYPE_CREATE, ternv1.ChangeType_CHANGE_TYPE_ALTER, ternv1.ChangeType_CHANGE_TYPE_DROP:
+		default:
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
-		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, op))
+		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, protoChangeTypeToDDLAction(ch.ChangeType)))
 	}
 	return out, nil
 }
@@ -2032,6 +2053,10 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 // change). Attaching it unconditionally would create spurious vschema_update
 // tasks on DDL-only plans, since Vitess always ships a vschema.json schema file.
 func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
 	namespaces := map[string]*storage.NamespacePlanData{}
 	vschemaChangedNamespaces := map[string]bool{}
 	ensure := func(ns string) *storage.NamespacePlanData {
@@ -2063,7 +2088,7 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			}
 			continue
 		}
-		op, err := materializedTableChangeOperation(ch)
+		op, err := materializedTableChangeOperation(parser, ch)
 		if err != nil {
 			return nil, err
 		}
@@ -2093,20 +2118,30 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 // materializedTableChangeOperation recovers the storage operation for a
 // materialized table change. The proto change type is authoritative when it maps
 // to a known DDL action; otherwise the operation is classified from the request's
-// authoritative DDL so an unmapped change type does not persist an "unknown"
-// action that would resume as a no-op.
-func materializedTableChangeOperation(ch *ternv1.TableChange) (string, error) {
+// authoritative DDL with the target dialect's parser. DDL that classifies
+// outside the shared DDL vocabulary, or as DML, is rejected — never mapped to
+// an "unknown" action that would resume as a no-op. The two rejection causes
+// get distinct messages because they call for different remedies: DML has no
+// place in a schema change, while out-of-vocabulary SQL is a statement the
+// materialized plan has no name for.
+func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.TableChange) (string, error) {
 	if op := protoChangeTypeToDDLAction(ch.ChangeType); op != "unknown" {
 		return op, nil
 	}
 	if strings.TrimSpace(ch.Ddl) == "" {
 		return "", fmt.Errorf("table change for %q has an unrecognized change type and no DDL to classify", ch.TableName)
 	}
-	op, _, err := ddl.ClassifyStatementOp(ch.Ddl)
+	statementType, _, err := parser.Classify(ch.Ddl)
 	if err != nil {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
 	}
-	return op, nil
+	if statementType == ddl.StatementUnknown {
+		return "", fmt.Errorf("DDL for table %q classified outside the shared DDL vocabulary; cannot recover an operation", ch.TableName)
+	}
+	if !statementType.IsDDL() {
+		return "", fmt.Errorf("DDL for table %q is not a DDL statement, got %s", ch.TableName, statementType)
+	}
+	return ddl.StatementTypeToOp(statementType), nil
 }
 
 func rejectUnsafeDDLChangesWithoutOptIn(planIdentifier string, changes []storage.TableChange, applyOpts storage.ApplyOptions) error {
@@ -2427,7 +2462,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.
-	if _, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, apply.ID); err != nil {
+	_, releasedHolders, err := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, apply.ID)
+	if err != nil {
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: err.Error(),
@@ -2467,7 +2503,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
-	err := c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	err = c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
 		// A concurrent same-operation attach won the insert; the winner's row
@@ -2490,6 +2526,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
+
+	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
@@ -2570,12 +2608,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	)
 
 	// Local mode: check for active tasks with engine verification
-	if blocking, err := c.checkActiveTaskConflict(ctx, plan, scope.shard, 0); err != nil {
+	blocking, releasedHolders, conflictErr := c.checkActiveTaskConflict(ctx, plan, req.Environment, scope.shard, 0)
+	if conflictErr != nil {
 		// A same-key request that committed while we were in the conflict check
 		// races as "already in progress". Re-resolve by idempotency key so the
 		// winning apply is returned instead of a spurious rejection.
 		if existing, lookupErr := c.existingIdempotentApply(ctx, req); lookupErr != nil {
-			return nil, errors.Join(err, lookupErr)
+			return nil, errors.Join(conflictErr, lookupErr)
 		} else if existing != nil {
 			c.logger.Info("Apply: idempotency key resolved an active-conflict race",
 				append(existing.LogAttrs(), "idempotency_key", req.IdempotencyKey)...)
@@ -2595,7 +2634,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		}
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
-			ErrorMessage: err.Error(),
+			ErrorMessage: conflictErr.Error(),
 		}, nil
 	}
 
@@ -2738,6 +2777,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		return nil, fmt.Errorf("create apply %s with tasks and operations: %w", applyIdentifier, err)
 	}
 	apply.ID = applyID
+
+	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
 
 	// Record the queue event in the apply's durable log; the drive itself starts
 	// when an operator claims the apply, which the timeline records separately.
@@ -3104,7 +3145,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	return resp, nil
 }
 
-const maxLogsLimit = 1000
+// MaxLogsLimit is the most entries one Logs read returns; a larger request is
+// served the cap's worth of newest entries instead of failing. Readers that
+// over-fetch to detect older history must keep the extra entry within this
+// cap: a request past it comes back exactly at the cap, and the probe entry
+// is the one clamped away.
+const MaxLogsLimit = 1000
 
 func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
 	if req == nil {
@@ -3117,8 +3163,8 @@ func (c *LocalClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv
 	if limit <= 0 {
 		limit = 50
 	}
-	if limit > maxLogsLimit {
-		limit = maxLogsLimit
+	if limit > MaxLogsLimit {
+		limit = MaxLogsLimit
 	}
 	apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, req.ApplyId)
 	if err != nil {

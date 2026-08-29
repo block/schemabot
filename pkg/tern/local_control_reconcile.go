@@ -163,26 +163,27 @@ func firstTaskWithLiveEngineWork(tasks []*storage.Task) *storage.Task {
 }
 
 // readEngineProgressForTask reads the engine's authoritative view of the change
-// the task addresses. It mirrors buildControlRequest's addressing: Vitess
-// targets are addressed through the persisted engine resume state (the deploy
-// request identifier lives there), other targets by credentials alone.
+// the task addresses. The read carries the persisted engine resume state for
+// every database type, because that state is how an engine is addressed at all:
+// one engine finds its deploy request through it, another keys its in-process
+// progress on it, and one that needs neither ignores it. Withholding it from
+// some types would have this read answer for a different change — or for none —
+// and the caller would then decline to adopt a terminal outcome that had in
+// fact already landed.
 func (c *LocalClient) readEngineProgressForTask(ctx context.Context, eng engine.Engine, task *storage.Task) (*engine.ProgressResult, error) {
 	creds, err := c.credentialsForTask(task)
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials for task %s: %w", task.TaskIdentifier, err)
 	}
-	req := &engine.ProgressRequest{
+	resumeState, err := c.loadStoredEngineResumeState(ctx, task, "progress")
+	if err != nil {
+		return nil, fmt.Errorf("load engine resume state for task %s: %w", task.TaskIdentifier, err)
+	}
+	res, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
-	}
-	if c.config.Type == storage.DatabaseTypeVitess {
-		resumeState, err := c.loadEngineResumeState(ctx, task)
-		if err != nil {
-			return nil, fmt.Errorf("load engine resume state for task %s: %w", task.TaskIdentifier, err)
-		}
-		req.ResumeState = resumeState
-	}
-	res, err := eng.Progress(ctx, req)
+		ResumeState: resumeState,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read engine progress for task %s: %w", task.TaskIdentifier, err)
 	}

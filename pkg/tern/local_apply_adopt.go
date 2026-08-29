@@ -309,6 +309,11 @@ func (c *LocalClient) dispatchMatchesApplyChangeSet(ctx context.Context, apply *
 // statement — so an apply whose change set cannot be reconstructed is never
 // mistaken for one that matches.
 func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope string) (driftChangeMultiset, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
+
 	// Only a plan-derived dispatch side omits finished tables; a shard-scoped one
 	// is rebuilt from task rows and still lists them.
 	dispatchIsPlanDerived := shardScope == ""
@@ -330,7 +335,7 @@ func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope s
 		if t.DDLAction == "" {
 			return nil, fmt.Errorf("task %s (table %q) records no DDL operation", t.TaskIdentifier, t.TableName)
 		}
-		canon, err := canonicalDDLForDrift(t.DDL)
+		canon, err := canonicalDDLForDrift(parser, t.DDL)
 		if err != nil {
 			return nil, fmt.Errorf("task %s (table %q): %w", t.TaskIdentifier, t.TableName, err)
 		}
@@ -348,6 +353,10 @@ func (c *LocalClient) driftMultisetFromTasks(tasks []*storage.Task, shardScope s
 // It fails closed on the same input driftMultisetFromTasks rejects, so the two
 // sides of the comparison are built to the same standard.
 func (c *LocalClient) driftMultisetFromDispatchScope(scope dispatchScope) (driftChangeMultiset, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
 	ms := driftChangeMultiset{}
 	for _, ch := range scope.ddlChanges {
 		if ch.Table == "" {
@@ -356,7 +365,7 @@ func (c *LocalClient) driftMultisetFromDispatchScope(scope dispatchScope) (drift
 		if ch.Operation == "" {
 			return nil, fmt.Errorf("dispatch change for table %q records no operation", ch.Table)
 		}
-		canon, err := canonicalDDLForDrift(ch.DDL)
+		canon, err := canonicalDDLForDrift(parser, ch.DDL)
 		if err != nil {
 			return nil, fmt.Errorf("dispatch change for table %q: %w", ch.Table, err)
 		}

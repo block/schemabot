@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -4959,4 +4960,39 @@ func TestApplyOperationStore_ReapStranded_ElectsOneReaperPerPass(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, settled, 1, "the reaper lock is released after each pass")
 	assert.Equal(t, next.ID, settled[0].Operation.ID)
+}
+
+// Both driver claim queries order candidates by (created_at, id) while their
+// eligibility filter ORs across several states, so no state-prefixed index can
+// serve the ordering. Without a dedicated index on the ordering pair the
+// planner sorts the full candidate set — and on InnoDB that sort runs under
+// FOR UPDATE, locking every claimable row before LIMIT 1 applies and turning
+// SKIP LOCKED into a serializer that makes drivers contend instead of claiming
+// distinct rows in parallel.
+//
+// This asserts the index as the embedded MySQL schema file declares it, on the
+// MySQL store this package's tests run against, under the name MySQL's
+// table-scoped naming gives it. The PostgreSQL counterpart carries a different
+// name because its index names are schema-wide; the schema parity tests pin it
+// by shape rather than by name.
+func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
+	ctx := t.Context()
+
+	rows, err := testDB.QueryContext(ctx, `
+		SELECT COLUMN_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'apply_operations' AND INDEX_NAME = 'idx_created_id'
+		ORDER BY SEQ_IN_INDEX`)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	var indexColumns []string
+	for rows.Next() {
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		indexColumns = append(indexColumns, column)
+	}
+	require.NoError(t, rows.Err())
+
+	assert.Equal(t, []string{"created_at", "id"}, indexColumns,
+		"the claim ordering needs an index on exactly its ordering pair, in that order")
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -178,9 +179,17 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// per-table task (a VSchema-only apply has no tables at all).
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
-	// Error message for apply states that need operator triage.
-	if state.IsState(data.State, state.Apply.Failed, state.Apply.Stopped) && data.ErrorMessage != "" {
-		writeErrorBlock(&sb, data.ErrorMessage)
+	// Error message for apply states that need operator attention. A failed
+	// apply gets the failure glyph — the system stopped and triage is due; a
+	// stopped apply gets the attention glyph — the heading already says the
+	// operator paused it, and the error is context, not a fresh failure.
+	if data.ErrorMessage != "" {
+		switch {
+		case state.IsState(data.State, state.Apply.Failed):
+			writeErrorBlock(&sb, glyph.Failed, data.ErrorMessage)
+		case state.IsState(data.State, state.Apply.Stopped):
+			writeErrorBlock(&sb, glyph.Attention, data.ErrorMessage)
+		}
 	}
 
 	// Footer with next actions
@@ -221,7 +230,7 @@ func writeApplyHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "✅ Schema Change Applied", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Schema Change Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Schema Change Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Schema Change Stopped", data.Environment)
@@ -243,7 +252,7 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Completed:
 		writeEnvironmentTitle(sb, "⏪ Rollback Complete", data.Environment)
 	case state.Apply.Failed:
-		writeEnvironmentTitle(sb, "❌ Rollback Failed", data.Environment)
+		writeEnvironmentTitle(sb, glyph.Failed+" Rollback Failed", data.Environment)
 		writeSupportChannelOffer(sb)
 	case state.Apply.Stopped:
 		writeEnvironmentTitle(sb, "⏹️ Rollback Stopped", data.Environment)
@@ -809,15 +818,15 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// at all, so its failure label does not mention one.
 		switch pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); {
 		case pct > 0:
-			fmt.Fprintf(sb, "**`%s`**: %s \u274c Failed\n", table.TableName, ui.ProgressBarFailed(pct))
+			fmt.Fprintf(sb, "**`%s`**: %s "+glyph.Failed+" Failed\n", table.TableName, ui.ProgressBarFailed(pct))
 		case table.IsInstant:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed\n", table.TableName)
 		default:
-			fmt.Fprintf(sb, "**`%s`**: \u274c Failed (before row copy started)\n", table.TableName)
+			fmt.Fprintf(sb, "**`%s`**: "+glyph.Failed+" Failed (before row copy started)\n", table.TableName)
 		}
 		writeDDLLine(sb, dialect, table.DDL)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			writeTableErrorLine(sb, glyph.Failed, table.ErrorMessage)
 		}
 
 	case state.Task.FailedRetryable:
@@ -834,7 +843,9 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 		writeDDLLine(sb, dialect, table.DDL)
 		if table.ErrorMessage != "" {
-			writeTableErrorLine(sb, table.ErrorMessage)
+			// The row above says SchemaBot is retrying on its own, so the
+			// error is context for the operator, not a failure to triage.
+			writeTableErrorLine(sb, glyph.Attention, table.ErrorMessage)
 		}
 
 	case state.Task.Cancelled:
@@ -1010,7 +1021,7 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 			fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", table.TableName, ui.ProgressBarActivity(), throttledSuffix(table))
 			writeDDLLine(sb, dialect, table.DDL)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
-			fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
 			return
 		}
 
@@ -1061,10 +1072,10 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- ℹ️ _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
 		return
 	}
-	fmt.Fprintf(sb, "- ℹ️ _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -1296,7 +1307,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	writeSummaryMetadata(sb, data)
 
 	if data.ErrorMessage != "" {
-		writeErrorBlock(sb, data.ErrorMessage)
+		writeErrorBlock(sb, glyph.Failed, data.ErrorMessage)
 	}
 
 	if completedCount > 0 {
@@ -1575,6 +1586,9 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// On an unsuccessful apply, each completed table is labeled so the reader
+	// can tell which tables made it before the failure/stop/cancellation.
+	labelCompleted := !state.IsState(data.State, state.Apply.Completed)
 	// Per-namespace status emojis only carry information when outcomes differ
 	// across namespaces (some failed, some succeeded). When every namespace
 	// succeeded, the repeated ✅ is noise, so the headers omit the emoji.
@@ -1614,7 +1628,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		}
 
 		for _, t := range g.tables {
-			writeSummaryTableEntry(sb, dialect, t)
+			writeSummaryTableEntry(sb, dialect, t, labelCompleted)
 		}
 
 		if groupCollapsed {
@@ -1631,7 +1645,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 	}
 
 	if states[state.Task.Failed] {
-		return "❌"
+		return glyph.Failed
 	}
 	if states["reverted"] {
 		return "↩️"
@@ -1645,14 +1659,22 @@ func groupStateEmoji(tables []TableProgressData) string {
 	return "✅"
 }
 
-// writeSummaryTableEntry writes a single table with DDL block.
-// No emoji — the header carries the group state. Non-success tables get a text label.
-func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData) {
+// writeSummaryTableEntry writes a single table with a text outcome label and
+// DDL block. No emoji — the header carries the group state. labelCompleted
+// controls whether completed tables get a label too: on a summary for an
+// unsuccessful apply, each row must answer "did this table make it?", so
+// completed tables are labeled explicitly. On a successful apply the header
+// already says every table completed, so the label would be noise.
+func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted bool) {
 	normalized := state.NormalizeTaskStatus(t.Status)
 
 	switch normalized {
 	case state.Task.Completed:
-		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		if labelCompleted {
+			fmt.Fprintf(sb, "**`%s`** — Completed\n", t.TableName)
+		} else {
+			fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		}
 	case state.Task.Failed:
 		label := "Failed"
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
@@ -1670,7 +1692,10 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	case state.Task.Cancelled:
 		fmt.Fprintf(sb, "**`%s`** — Cancelled\n", t.TableName)
 	default:
-		fmt.Fprintf(sb, "**`%s`**\n", t.TableName)
+		// Unknown or in-flight statuses still get a visible label — a bare
+		// table name reads as success, which is wrong for anything but
+		// completed.
+		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, taskOutcomeLabel(normalized))
 	}
 
 	if t.DDL != "" {
@@ -1678,6 +1703,24 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	} else {
 		sb.WriteString("\n")
 	}
+}
+
+// taskOutcomeLabel says where a table was left when the apply stopped running.
+// Most states read correctly once humanized, but three do not: two are internal
+// vocabulary the operator never sees elsewhere, and revert_window hides the fact
+// an operator most needs from a terminal record, that the change is already
+// applied and only the window is still open. Those get an explicit label; every
+// other state keeps the humanized constant this file uses by default.
+func taskOutcomeLabel(normalized string) string {
+	switch normalized {
+	case state.Task.RevertWindow:
+		return "Completed (revert window open)"
+	case state.Task.PostChecksum:
+		return "Data verified, not cut over"
+	case state.Task.FailedRetryable:
+		return "Interrupted"
+	}
+	return humanizeState(normalized)
 }
 
 // ApplyStatusFromProgress converts a ProgressResponse to ApplyStatusCommentData.

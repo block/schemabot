@@ -724,7 +724,9 @@ type LogEntry = apitypes.LogEntry
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
 // Otherwise, it fetches logs for the most recent apply in the environment.
-func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*LogEntry, error) {
+// The response carries the newest limit entries plus whether older ones exist
+// beyond the window.
+func GetLogs(endpoint, database, environment, applyID string, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -748,13 +750,11 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		path += "?" + encoded
 	}
 
-	var result struct {
-		Logs []*LogEntry `json:"logs"`
-	}
+	var result apitypes.LogsResponse
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
-	return result.Logs, nil
+	return &result, nil
 }
 
 func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {

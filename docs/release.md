@@ -257,7 +257,12 @@ the old shape until an operator opts in with
 still starts, running against a database where the drop never happened, so the
 code in that release has to tolerate the old shape too.
 
-Diff the embedded schema files. Additive changes need no action. A destructive
+Diff the embedded schema files. On MySQL, additive changes need no action. On
+PostgreSQL, only new tables land automatically: a new column on an existing
+table fails startup until an operator creates it by hand, and a new non-unique
+index is only warned about at startup, so both belong in the release notes
+with their statements (see
+[configuration.md](./configuration.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
 

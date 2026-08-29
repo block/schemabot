@@ -31,6 +31,16 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		if d := e.drainedOutcome; d != nil && d.state == engine.StateCompleted {
+			// The change landed and was drained before the stop arrived. The
+			// retained outcome is still this engine's answer for that change,
+			// so the typed rejection has the caller reconcile to the completed
+			// outcome — exactly as it would had the stop raced a tracked
+			// completion.
+			database := d.database
+			e.mu.Unlock()
+			return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
+		}
 		// Spirit tracks the change in-process, so with nothing tracked there is
 		// no change this instance could ever stop — retrying cannot make one
 		// appear.
@@ -106,6 +116,16 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		if d := e.drainedOutcome; d != nil && d.state == engine.StateCompleted {
+			// The change landed and was drained before the cancel arrived. The
+			// retained outcome is still this engine's answer for that change,
+			// so the typed rejection has the caller reconcile to the completed
+			// outcome — exactly as it would had the cancel raced a tracked
+			// completion.
+			database := d.database
+			e.mu.Unlock()
+			return nil, engine.NewAlreadyCompletedError("cancel rejected: the schema change on database %s completed before the cancel arrived", database)
+		}
 		// Spirit tracks the change in-process, so with nothing tracked there is
 		// no change this instance could ever cancel — retrying cannot make one
 		// appear.

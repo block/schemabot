@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -17,58 +18,69 @@ func FormatDDL(ddl string) string {
 	// Canonicalize first
 	ddl = Canonicalize(ddl)
 
-	upperDDL := strings.ToUpper(ddl)
-
-	var result string
-
-	switch {
-	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
-		// Format CREATE TABLE with line breaks
-		result = lowercaseTypes(formatCreateTable(ddl))
-	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
-		// Format ALTER TABLE with multiple clauses
-		clauses := splitAlterClauses(ddl)
-		if len(clauses) <= 1 {
-			result = lowercaseTypes(ddl)
-		} else {
-			// Extract table header (ALTER TABLE `name`) from first clause
-			tableEnd := findTableNameEnd(clauses[0])
-			tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
-			firstClause := strings.TrimSpace(clauses[0][tableEnd:])
-
-			// Format with header on first line, each clause on its own indented line
-			var sb strings.Builder
-			sb.WriteString(tableHeader)
-			sb.WriteString("\n    ")
-			sb.WriteString(firstClause)
-			for i := 1; i < len(clauses); i++ {
-				sb.WriteString(",\n    ")
-				sb.WriteString(clauses[i])
-			}
-			result = lowercaseTypes(sb.String())
-		}
-	default:
-		result = lowercaseTypes(ddl)
-	}
+	result := lowercaseTypes(layoutDDL(ddl))
 
 	// Ensure trailing semicolon
 	result = strings.TrimRight(result, "; ")
 	return result + ";"
 }
 
+// layoutDDL line-breaks a canonicalized statement for readability: a CREATE
+// TABLE gets each column/index and table option on its own line, and a
+// multi-clause ALTER TABLE gets each clause on its own line. The layout is
+// plain string splitting on the statement's own text, so it applies to any
+// dialect's canonical form. Other statement types are returned unchanged.
+func layoutDDL(ddl string) string {
+	upperDDL := strings.ToUpper(ddl)
+
+	switch {
+	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
+		return formatCreateTable(ddl)
+	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
+		clauses := splitAlterClauses(ddl)
+		if len(clauses) <= 1 {
+			return ddl
+		}
+		// Extract table header (ALTER TABLE `name`) from first clause
+		tableEnd := findTableNameEnd(clauses[0])
+		tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
+		firstClause := strings.TrimSpace(clauses[0][tableEnd:])
+
+		// Format with header on first line, each clause on its own indented line
+		var sb strings.Builder
+		sb.WriteString(tableHeader)
+		sb.WriteString("\n    ")
+		sb.WriteString(firstClause)
+		for i := 1; i < len(clauses); i++ {
+			sb.WriteString(",\n    ")
+			sb.WriteString(clauses[i])
+		}
+		return sb.String()
+	default:
+		return ddl
+	}
+}
+
 // FormatDDLForDialect formats a DDL statement for display under the dialect's
 // own grammar. The MySQL family gets FormatDDL's full treatment; any other
-// dialect renders its own parser's canonical form, so a statement is never
-// reformatted — or judged unparseable — under another family's grammar. Like
-// FormatDDL, this is a best-effort display formatter: a statement the parser
-// rejects, or a dialect with no registered parser, renders as-is.
+// dialect renders its own parser's canonical form with the same line-break
+// layout — so a statement is never canonicalized, or judged unparseable,
+// under another family's grammar — but skips the MySQL-specific lowercasing
+// pass. Like FormatDDL, this is a best-effort display formatter: a statement
+// the dialect's parser rejects — or any statement of a dialect with no
+// registered parser (logged, since it means a database type reached the
+// display layer without a parser) — renders unformatted, with only
+// surrounding whitespace trimmed and a trailing semicolon enforced.
 func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 	if dialect == schema.DialectMySQL {
 		return FormatDDL(stmt)
 	}
 	result := strings.TrimSpace(stmt)
-	if p, err := ParserForDialect(dialect); err == nil {
-		result = p.Canonicalize(result)
+	if p, err := ParserForDialect(dialect); err != nil {
+		slog.Warn("DDL display formatting has no parser for this dialect; statements will render unformatted",
+			"dialect", dialect, "error", err)
+	} else {
+		result = layoutDDL(p.Canonicalize(result))
 	}
 	return strings.TrimRight(result, "; ") + ";"
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -315,11 +316,12 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		if !isShardFailureState(s.State) {
 			continue
 		}
+		severity := failureSeverity(s.State == state.ApplyOperation.FailedRetryable)
 		shard := html.EscapeString(s.Shard)
 		if msg := SanitizeInlineError(s.Error); msg == "" {
-			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code>\n", shard)
+			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code>\n", severity, shard)
 		} else {
-			fmt.Fprintf(sb, "\n> ⚠️ **First failure:** shard <code>%s</code> — %s\n", shard, html.EscapeString(msg))
+			fmt.Fprintf(sb, "\n> %s **First failure:** shard <code>%s</code> — %s\n", severity, shard, html.EscapeString(msg))
 		}
 		return
 	}
@@ -327,8 +329,18 @@ func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
 		return
 	}
 	if msg := SanitizeInlineError(data.ErrorMessage); msg != "" {
-		fmt.Fprintf(sb, "\n> ⚠️ **Failure:** %s\n", html.EscapeString(msg))
+		fmt.Fprintf(sb, "\n> %s **Failure:** %s\n", failureSeverity(state.IsState(data.State, state.Apply.FailedRetryable)), html.EscapeString(msg))
 	}
+}
+
+// failureSeverity returns the glyph for a surfaced failure: glyph.Attention
+// while SchemaBot is still retrying on its own — nothing has stopped and no
+// triage is due — and glyph.Failed once the system has stopped on the error.
+func failureSeverity(retrying bool) string {
+	if retrying {
+		return glyph.Attention
+	}
+	return glyph.Failed
 }
 
 // writeShardStatusTable renders the per-shard status table for a set of shards.

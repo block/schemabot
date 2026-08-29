@@ -55,6 +55,25 @@ func TestFollowStateAdvance(t *testing.T) {
 	assert.Empty(t, state.advance(nil))
 }
 
+// TestFollowStateMissedEntries verifies gap detection on tail polls: a window
+// that hit its bound and no longer overlaps what was already printed cannot
+// prove the entries between polls were all shown, while an overlapping
+// window, a window under its bound, or a first render can.
+func TestFollowStateMissedEntries(t *testing.T) {
+	state := &followState{}
+
+	full := []*client.LogEntry{followLogEntry(5), followLogEntry(6)}
+	assert.False(t, state.missedEntries(full, true), "nothing printed yet, so nothing can have been missed")
+
+	state.advance([]*client.LogEntry{followLogEntry(1), followLogEntry(2)})
+	assert.True(t, state.missedEntries(full, true), "a full window past the last printed entry cannot prove continuity")
+	assert.False(t, state.missedEntries(full, false), "a window under its bound returned everything that exists")
+	assert.False(t, state.missedEntries(nil, true))
+
+	overlapping := []*client.LogEntry{followLogEntry(2), followLogEntry(3)}
+	assert.False(t, state.missedEntries(overlapping, true), "an overlapping window proves the tail kept up")
+}
+
 type followFetchResult struct {
 	logs []*client.LogEntry
 	err  error
@@ -96,8 +115,15 @@ func TestRunFollowLoop(t *testing.T) {
 	fetch, limits := scriptedFetch(script)
 
 	printed := make(chan *client.LogEntry, 64)
+	// The loop polls until cancellation, so the render record is unbounded and
+	// must never be what blocks it.
+	var rendersMu sync.Mutex
+	var renders []bool
 	state := &followState{}
-	emit := func(logs []*client.LogEntry) {
+	emit := func(logs []*client.LogEntry, initial bool) {
+		rendersMu.Lock()
+		renders = append(renders, initial)
+		rendersMu.Unlock()
 		for _, log := range state.advance(logs) {
 			printed <- log
 		}
@@ -146,13 +172,23 @@ func TestRunFollowLoop(t *testing.T) {
 	for _, limit := range seen[1:] {
 		assert.Equal(t, followFetchLimit, limit, "follow polls use the bounded fetch window")
 	}
+
+	// Only the first render is the operator's own window, so only it may report
+	// that history precedes the tail.
+	rendersMu.Lock()
+	defer rendersMu.Unlock()
+	require.NotEmpty(t, renders)
+	assert.True(t, renders[0], "the first render is the initial window")
+	for _, initial := range renders[1:] {
+		assert.False(t, initial, "later renders are polls, not the initial window")
+	}
 }
 
 // TestRunFollowLoopInitialFetchFails verifies that a broken endpoint fails the
 // command immediately rather than tailing nothing.
 func TestRunFollowLoopInitialFetchFails(t *testing.T) {
 	fetch, _ := scriptedFetch([]followFetchResult{{err: fmt.Errorf("endpoint unreachable")}})
-	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry) {}, 3, time.Millisecond)
+	err := runFollowLoop(t.Context(), fetch, func([]*client.LogEntry, bool) {}, 3, time.Millisecond)
 	require.ErrorContains(t, err, "fetch initial log window")
 	require.ErrorContains(t, err, "endpoint unreachable")
 }
@@ -226,6 +262,89 @@ func TestDeploymentFollowStateAdvance(t *testing.T) {
 	})
 	assert.Empty(t, batches)
 	assert.Empty(t, warnings)
+}
+
+// TestDeploymentFollowStateCarriesPerSourceTruncation verifies that each
+// source's window signal rides its own batch: a fan-out where one target has
+// more history than the window holds must not make the other target's complete
+// tail look partial, or vice versa.
+func TestDeploymentFollowStateCarriesPerSourceTruncation(t *testing.T) {
+	state := newDeploymentFollowState()
+
+	truncated := deploymentFollowSource("target-a", "remote-1", 1, 2)
+	truncated.Truncated = true
+	batches, _ := state.advance(&apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{
+			truncated,
+			deploymentFollowSource("target-b", "remote-2", 1),
+		},
+	})
+	require.Len(t, batches, 2)
+	assert.Equal(t, "target-a / spirit (remote-1)", batches[0].label)
+	assert.True(t, batches[0].truncated, "the source with older entries reports its window is partial")
+	assert.Equal(t, "target-b / spirit (remote-2)", batches[1].label)
+	assert.False(t, batches[1].truncated, "a complete source is not marked partial by a sibling")
+}
+
+// TestDeploymentFollowStateFirstRenderPerSource verifies that the truncation
+// notice belongs to each source's own first successful read: a source that
+// fails the initial fan-out and recovers on a later poll still gets exactly
+// one first render carrying its window signal, and a later poll that outruns
+// the window reports a possible gap instead of repeating the notice.
+func TestDeploymentFollowStateFirstRenderPerSource(t *testing.T) {
+	state := newDeploymentFollowState()
+
+	// target-b fails the initial fan-out read; target-a renders with history
+	// beyond its window.
+	initial := deploymentFollowSource("target-a", "remote-1", 1, 2)
+	initial.Truncated = true
+	batches, warnings := state.advance(&apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{initial},
+		Errors:  []*apitypes.DeploymentLogError{deploymentFollowError("target-b", "remote-2", "Data-plane logs could not be read; check server logs and retry.")},
+	})
+	require.Len(t, batches, 1)
+	require.Len(t, warnings, 1)
+	assert.True(t, batches[0].firstRender)
+	assert.True(t, batches[0].truncated)
+	assert.False(t, batches[0].possibleGap)
+
+	// target-b recovers with more accumulated history than the poll window
+	// holds: its first render arrives late but still carries the signal.
+	recovered := deploymentFollowSource("target-b", "remote-2", 7, 8)
+	recovered.Truncated = true
+	batches, _ = state.advance(&apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{
+			deploymentFollowSource("target-a", "remote-1", 2, 3),
+			recovered,
+		},
+	})
+	require.Len(t, batches, 2)
+	assert.Equal(t, "target-a / spirit (remote-1)", batches[0].label)
+	assert.False(t, batches[0].firstRender, "an already-rendered source does not repeat its window notice")
+	assert.Equal(t, "target-b / spirit (remote-2)", batches[1].label)
+	assert.True(t, batches[1].firstRender, "a source that only became readable later still gets its window notice")
+	assert.True(t, batches[1].truncated)
+	assert.False(t, batches[1].possibleGap, "a first render has printed nothing to fall behind")
+
+	// target-a's next poll outruns the window: every entry returned is newer
+	// than the last printed one and the read hit its bound.
+	outrun := deploymentFollowSource("target-a", "remote-1", 9, 10)
+	outrun.Truncated = true
+	batches, _ = state.advance(&apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{outrun},
+	})
+	require.Len(t, batches, 1)
+	assert.False(t, batches[0].firstRender)
+	assert.True(t, batches[0].possibleGap, "a full window past the last printed entry reports the possible gap")
+
+	// An overlapping later window proves continuity even at its bound.
+	overlap := deploymentFollowSource("target-a", "remote-1", 10, 11)
+	overlap.Truncated = true
+	batches, _ = state.advance(&apitypes.DeploymentLogsResponse{
+		Sources: []*apitypes.DeploymentLogSource{overlap},
+	})
+	require.Len(t, batches, 1)
+	assert.False(t, batches[0].possibleGap, "an overlapping window shows the tail kept up")
 }
 
 // TestDeploymentFollowStateWarnings verifies that a persistently failing

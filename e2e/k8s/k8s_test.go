@@ -228,9 +228,13 @@ func waitForControlPlaneApplyLogs(t *testing.T, endpoint string, applyID, tableN
 	var lastErr error
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
-			logs, lastErr = client.GetLogs(endpoint, "", "", applyID, 50)
-			return lastErr == nil &&
-				hasLogNewState(logs, "Apply queued", state.Apply.Pending) &&
+			result, err := client.GetLogs(endpoint, "", "", applyID, 50)
+			lastErr = err
+			if err != nil {
+				return false
+			}
+			logs = result.Logs
+			return hasLogNewState(logs, "Apply queued", state.Apply.Pending) &&
 				hasLogTransition(logs, "Apply dispatched to remote Tern", state.Apply.Pending, state.Apply.Running) &&
 				hasLogTransition(logs, "Remote apply reached terminal state: completed", state.Apply.Running, state.Apply.Completed) &&
 				hasLogTransitionTo(logs, "Remote task "+tableName+" changed state", state.Task.Completed)
@@ -441,8 +445,13 @@ func waitForControlPlaneFailureLog(t *testing.T, endpoint, applyID, failureMessa
 	var lastErr error
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
-			logs, lastErr = client.GetLogs(endpoint, "", "", applyID, 50)
-			return lastErr == nil && hasLogTransitionTo(logs, "Remote apply reached terminal state: failed: "+failureMessage, state.Apply.Failed)
+			result, err := client.GetLogs(endpoint, "", "", applyID, 50)
+			lastErr = err
+			if err != nil {
+				return false
+			}
+			logs = result.Logs
+			return hasLogTransitionTo(logs, "Remote apply reached terminal state: failed: "+failureMessage, state.Apply.Failed)
 		},
 		func() string {
 			return fmt.Sprintf("control-plane apply logs did not contain remote failure for %s: api_logs=%s last_err=%v",
