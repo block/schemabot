@@ -198,6 +198,74 @@ func TestWriteStatusListExternalID(t *testing.T) {
 	assert.Contains(t, output, "apply-complete")
 }
 
+// An operator who asked for the external-id column gets it even when no apply
+// on the page recorded a remote id: an all-dash column positively answers
+// "nothing recorded", where a missing column would be indistinguishable from
+// the flag doing nothing.
+func TestWriteStatusListExternalIDColumnRendersWithoutValues(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    0,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-local",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL ID", "the requested column renders even with nothing recorded")
+	assert.Contains(t, output, "apply-local  -", "a row with no remote id shows a dash in the column")
+}
+
+// On a mixed unfiltered page the DEPLOYMENT column is retained for the rows
+// that carry one, and a row without a deployment shows a dash rather than
+// blank padding, so the gap reads as "none recorded" instead of an alignment
+// artifact.
+func TestWriteStatusListMixedDeploymentRowsShowDash(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			MaxLimit:    1000,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-deployed",
+					Database:    "orders",
+					Environment: "staging",
+					Deployment:  "deploy-a",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+				{
+					ApplyID:     "apply-local",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:01:00Z",
+					CompletedAt: "2026-05-28T12:01:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "DEPLOYMENT", "one populated row retains the column for the page")
+	assert.Contains(t, output, "deploy-a")
+	assert.Contains(t, output, "staging  -", "a deployment-less row shows a dash in the retained column")
+}
+
 // A deployment-filtered list names each remote handle in its own column, the
 // way the detail views do: the deployment's shared data-plane apply id and the
 // per-operation remote row id. APPLY ID stays the control-plane id the status

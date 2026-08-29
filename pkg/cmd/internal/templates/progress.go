@@ -1150,8 +1150,11 @@ func statusListColumns(data StatusListData) []statusColumn {
 				statusColumn{header: "EXTERNAL OP ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalOperationID }},
 			)
 		} else {
+			// Unconditional: the operator asked for this column by flag, so an
+			// all-dash column positively answers "nothing recorded" — dropping
+			// it would be indistinguishable from the flag doing nothing.
 			columns = append(columns,
-				statusColumn{header: "EXTERNAL ID", optional: true, value: unfilteredStatusExternalID},
+				statusColumn{header: "EXTERNAL ID", value: unfilteredStatusExternalID},
 			)
 		}
 	}
