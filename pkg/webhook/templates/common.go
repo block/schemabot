@@ -216,13 +216,16 @@ var (
 	// absolutePathRe deliberately matches only absolute paths with at least
 	// two components. Relative paths and Go import paths remain useful in
 	// errors and do not reveal host filesystem layout.
-	absolutePathRe = regexp.MustCompile(`(^|[[:space:]\("'=,:])/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)+`)
+	absolutePathRe = regexp.MustCompile("(^|[[:space:]\\(\\\"'`=,:\\[])/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)+")
 	// lookupHostRe matches the hostname in net.DNSError text. The resolver
-	// endpoint that may follow it is handled by ipEndpointRe.
-	lookupHostRe = regexp.MustCompile(`\b(lookup[[:space:]]+)[A-Za-z0-9][A-Za-z0-9.-]*`)
+	// endpoint that may follow it is handled by ipEndpointRe. Requiring the
+	// DNS error suffix avoids redacting domain-specific uses of "lookup".
+	lookupHostRe = regexp.MustCompile(`\b(lookup[[:space:]]+)[A-Za-z0-9][A-Za-z0-9.-]*([[:space:]]+on[[:space:]]+|:[[:space:]]+no such host)`)
 	// libpqParameterRe matches identifying values in keyword/value connection
 	// fragments while preserving the parameter name for diagnostic context.
-	libpqParameterRe = regexp.MustCompile(`\b(user|database|dbname|host)=([^[:space:],;:]+)`)
+	libpqParameterRe = regexp.MustCompile("\\b(user|database|dbname|host|password)=([^[:space:],;:`]+)(?::[0-9]+)?")
+	// urlUserinfoRe matches credentials between a URL scheme and endpoint.
+	urlUserinfoRe = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]+@`)
 	// postgresSQLSTATELineRe scopes quoted identity redaction to PostgreSQL
 	// server errors, so ordinary application errors can still name a database.
 	postgresSQLSTATELineRe = regexp.MustCompile(`[^\n]*\(SQLSTATE[[:space:]]+[0-9A-Z]{5}\)`)
@@ -237,7 +240,7 @@ var (
 	hostPortRe = regexp.MustCompile(`\b(?:(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*:\d{1,5}|[A-Za-z][A-Za-z0-9-]*:\d{2,5})\b`)
 	// contextualHostnameRe matches any dotted hostname after connection words,
 	// where the surrounding text disambiguates it from a Go symbol or prose.
-	contextualHostnameRe = regexp.MustCompile(`\b((?:connect(?:ion)? to|dial(?: tcp)?|server)[[:space:]]+)(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*\b`)
+	contextualHostnameRe = regexp.MustCompile(`\b((?:connect(?:ion)? to|dial(?: tcp)?)[[:space:]]+)(?:[A-Za-z0-9][A-Za-z0-9-]*\.)+[A-Za-z0-9][A-Za-z0-9-]*\b`)
 	// infrastructureHostnameRe matches port-less names carrying suffixes used
 	// by private DNS and managed database endpoints. Restricting the suffixes
 	// avoids treating ordinary dotted words and Go symbols as hostnames.
@@ -270,14 +273,12 @@ func sanitizeCommentError(msg string) string {
 
 func redactConnectionDetails(msg string) string {
 	msg = dsnFragmentRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = urlUserinfoRe.ReplaceAllString(msg, "${1}[endpoint redacted]@")
 	msg = absolutePathRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
-	msg = lookupHostRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
+	msg = lookupHostRe.ReplaceAllString(msg, "${1}[endpoint redacted]${2}")
 	msg = libpqParameterRe.ReplaceAllString(msg, "${1}=[endpoint redacted]")
 	msg = postgresSQLSTATELineRe.ReplaceAllStringFunc(msg, func(line string) string {
-		return postgresIdentityRe.ReplaceAllStringFunc(line, func(identity string) string {
-			name := identity[:strings.IndexByte(identity, ' ')]
-			return name + ` "[endpoint redacted]"`
-		})
+		return postgresIdentityRe.ReplaceAllString(line, `${1} "[endpoint redacted]"`)
 	})
 	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
 	msg = contextualHostnameRe.ReplaceAllString(msg, "${1}[endpoint redacted]")

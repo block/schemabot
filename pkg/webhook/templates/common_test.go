@@ -109,6 +109,11 @@ func TestSanitizeCommentError(t *testing.T) {
 			want: "dial tcp: lookup [endpoint redacted] on [endpoint redacted]: no such host",
 		},
 		{
+			name: "vindex lookup is not a DNS error",
+			in:   `cannot drop lookup vindex "customers_email_lookup": still referenced`,
+			want: `cannot drop lookup vindex "customers_email_lookup": still referenced`,
+		},
+		{
 			name: "libpq authentication failure",
 			in:   "failed to connect to user=app_writer database=orders host=db.internal: password authentication failed",
 			want: "failed to connect to user=[endpoint redacted] database=[endpoint redacted] host=[endpoint redacted]: password authentication failed",
@@ -127,6 +132,51 @@ func TestSanitizeCommentError(t *testing.T) {
 			name: "pq SQLSTATE error",
 			in:   `pq: password authentication failed for user "app_writer" (SQLSTATE 28P01)`,
 			want: `pq: password authentication failed for user "[endpoint redacted]" (SQLSTATE 28P01)`,
+		},
+		{
+			name: "tab-separated pq identity",
+			in:   "pq: permission denied for database\t\"orders\" (SQLSTATE 42501)",
+			want: `pq: permission denied for database "[endpoint redacted]" (SQLSTATE 42501)`,
+		},
+		{
+			name: "pgx connect error keeps balanced backticks",
+			in:   "failed to connect to `user=app database=orders`: server error (SQLSTATE 28P01)",
+			want: "failed to connect to `user=[endpoint redacted] database=[endpoint redacted]`: server error (SQLSTATE 28P01)",
+		},
+		{
+			name: "backtick-delimited absolute path",
+			in:   "cannot read `/etc/schemabot/ca/bundle.pem`",
+			want: "cannot read `[endpoint redacted]`",
+		},
+		{
+			name: "bracket-delimited absolute path",
+			in:   "cannot read [/etc/schemabot/ca/bundle.pem]",
+			want: "cannot read [[endpoint redacted]]",
+		},
+		{
+			name: "libpq password",
+			in:   "host=db.internal user=app password=hunter2 dbname=orders",
+			want: "host=[endpoint redacted] user=[endpoint redacted] password=[endpoint redacted] dbname=[endpoint redacted]",
+		},
+		{
+			name: "URL userinfo",
+			in:   "connect postgres://app:hunter2@db.internal/orders failed",
+			want: "connect postgres://[endpoint redacted]@[endpoint redacted]/orders failed",
+		},
+		{
+			name: "server prose is not a hostname context",
+			in:   "the server pkg.Handler panicked",
+			want: "the server pkg.Handler panicked",
+		},
+		{
+			name: "deliberate non-redactions",
+			in:   "relative ca/bundle.pem import github.com/block/schemabot docs https://example.com/docs/guide column users.email at 12:30:45",
+			want: "relative ca/bundle.pem import github.com/block/schemabot docs https://example.com/docs/guide column users.email at 12:30:45",
+		},
+		{
+			name: "libpq host with port",
+			in:   "host=db.internal:5432 connection refused",
+			want: "host=[endpoint redacted] connection refused",
 		},
 		{
 			name: "normal English and Go names",
