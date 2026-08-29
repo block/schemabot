@@ -6825,8 +6825,8 @@ No recent schema changes
 
 1 active schema change
 
-  APPLY ID              EXTERNAL OP ID         DATABASE   ENV         DEPLOYMENT  STATE                STARTED        SOURCE
-  apply-multi-a1b2c3d4  remote-op-us-east-001  orders-db  production  us-east     Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
+  APPLY ID              EXTERNAL APPLY ID         EXTERNAL OP ID         DATABASE   ENV         STATE                STARTED        SOURCE
+  apply-multi-a1b2c3d4  remote-apply-us-east-001  remote-op-us-east-001  orders-db  production  Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
 
 Use 'schemabot status <apply_id>' to view details
 
@@ -6834,8 +6834,17 @@ Multiple matching operations:
 
 1 active schema change
 
-  APPLY ID                EXTERNAL OP ID  DATABASE      ENV         DEPLOYMENT  STATE    STARTED        SOURCE
-  apply-sharded-d5e6f7g8  -               inventory-db  production  us-east     Running  4 minutes ago  https://github.com/acme/shop/pull/412
+  APPLY ID                EXTERNAL APPLY ID         DATABASE      ENV         STATE    STARTED        SOURCE
+  apply-sharded-d5e6f7g8  remote-apply-us-east-002  inventory-db  production  Running  4 minutes ago  https://github.com/acme/shop/pull/412
+
+Use 'schemabot status <apply_id>' to view details
+
+No data-plane apply id recorded:
+
+1 active schema change
+
+  APPLY ID                DATABASE     ENV         STATE    STARTED       SOURCE
+  apply-pending-l3m4n5o6  payments-db  production  Pending  1 minute ago  https://github.com/acme/shop/pull/412
 
 Use 'schemabot status <apply_id>' to view details
 
