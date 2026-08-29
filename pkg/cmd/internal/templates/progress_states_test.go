@@ -3,7 +3,9 @@ package templates
 import (
 	"io"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
@@ -408,6 +410,59 @@ func TestWriteStatusListFailedOnly(t *testing.T) {
 	assert.NotContains(t, output, "APPLY ID")
 	assert.NotContains(t, output, "REASON")
 	assert.NotContains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
+// TestWriteDatabaseHistoryTable pins the exact bytes of the history table: a
+// bold title, a dimmed header row, one row per apply with every cell padded
+// to its column's widest value and the state cell wrapped in the state's
+// color (the separator after it stays uncolored), and the detail hint footer.
+// A state the CLI does not recognize renders uncolored, and an apply that
+// never recorded timestamps shows dashes for STARTED and DURATION.
+func TestWriteDatabaseHistoryTable(t *testing.T) {
+	now := time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC)
+	prevNow := nowFunc
+	prevUINow := ui.NowFunc
+	nowFunc = func() time.Time { return now }
+	ui.NowFunc = func() time.Time { return now }
+	t.Cleanup(func() {
+		nowFunc = prevNow
+		ui.NowFunc = prevUINow
+	})
+
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{
+			Database: "orders-db",
+			Applies: []ApplyHistoryData{
+				{ApplyID: "apply_abc123", Environment: "staging", State: state.Apply.Completed, Caller: "cli:jdoe@host", StartedAt: "2026-01-15T13:30:00Z", CompletedAt: "2026-01-15T13:45:00Z"},
+				{ApplyID: "apply_def456789", Environment: "production", State: state.Apply.Failed, Caller: "github:acme/shop#42", StartedAt: "2026-01-15T08:00:00Z", CompletedAt: "2026-01-15T08:30:00Z"},
+				{ApplyID: "apply_ghi", Environment: "staging", State: state.Apply.Running, Caller: "cli:ops@host", StartedAt: "2026-01-15T14:00:00Z"},
+				{ApplyID: "apply_unknown", Environment: "staging", State: "SOME_NEW_STATE", Caller: "cli:ops@host"},
+			},
+		})
+	})
+
+	expected := strings.Join([]string{
+		ANSIBold + "Schema change history for orders-db" + ANSIReset,
+		"",
+		"  " + ANSIDim + "APPLY ID         ENV         STATE           STARTED         DURATION  SOURCE" + ANSIReset,
+		"  apply_abc123     staging     " + ANSIGreen + "Completed     " + ANSIReset + "  1 hour ago      15m       cli:jdoe",
+		"  apply_def456789  production  " + ANSIRed + "Failed        " + ANSIReset + "  6 hours ago     30m       github:acme/shop#42",
+		"  apply_ghi        staging     " + ANSICyan + "Running       " + ANSIReset + "  30 minutes ago  30m       cli:ops",
+		"  apply_unknown    staging     SOME_NEW_STATE  -               -         cli:ops",
+		"",
+		ANSIDim + "Use 'schemabot status <apply_id>' to view details" + ANSIReset,
+		"",
+	}, "\n")
+	assert.Equal(t, expected, output)
+}
+
+// TestWriteDatabaseHistoryEmpty pins the dimmed one-line message a database
+// with no recorded schema changes renders instead of a table.
+func TestWriteDatabaseHistoryEmpty(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{Database: "new-db"})
+	})
+	assert.Equal(t, ANSIDim+"No schema changes found for database 'new-db'"+ANSIReset+"\n", output)
 }
 
 func captureStdout(t *testing.T, fn func()) string {

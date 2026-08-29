@@ -1045,30 +1045,7 @@ func WriteStatusList(data StatusListData) {
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
-	columns := statusListColumns(data)
-	widths := statusListColumnWidths(columns, data.Applies)
-
-	// Table header
-	fmt.Print("  " + ANSIDim)
-	for i, column := range columns {
-		fmt.Print(statusCell(column.header, widths[i], column.last))
-	}
-	fmt.Println(ANSIReset)
-
-	// Table rows
-	for _, a := range data.Applies {
-		fmt.Print("  ")
-		for i, column := range columns {
-			cell := statusCell(statusColumnValue(column, a), widths[i], column.last)
-			if column.colored {
-				if colorFn := stateColorFunc(a.State); colorFn != nil {
-					cell = colorFn(cell)
-				}
-			}
-			fmt.Print(cell)
-		}
-		fmt.Println()
-	}
+	writeStatusTable(statusListColumns(data), data.Applies, func(a ActiveApplyData) string { return a.State })
 
 	writeStatusListFooter(data)
 }
@@ -1121,17 +1098,52 @@ func writeFailedStatusList(data StatusListData) {
 	}
 }
 
-// statusColumn is one column of the status list. An optional column is dropped
+// statusColumn is one column of a status table. An optional column is dropped
 // when no row on the page has a value for it, so an operator only ever sees the
 // columns their own fleet populates: a deployment that drives its applies
 // locally has no remote handles to show, and an unfiltered list of a
 // single-deployment fleet has no deployment to distinguish.
-type statusColumn struct {
+type statusColumn[Row any] struct {
 	header   string
-	value    func(a ActiveApplyData) string
+	value    func(r Row) string
 	optional bool
 	colored  bool
 	last     bool
+}
+
+// writeStatusTable renders the aligned table every status surface shares: a
+// dimmed header row, then one indented line per row with each cell padded to
+// the column's widest value. rowState names a row's apply state so a colored
+// column can wrap its padded cell in that state's color; the separator
+// between cells stays outside the escape.
+func writeStatusTable[Row any](columns []statusColumn[Row], rows []Row, rowState func(Row) string) {
+	widths := statusColumnWidths(columns, rows)
+
+	fmt.Print("  " + ANSIDim)
+	for i, column := range columns {
+		fmt.Print(statusCell(column.header, widths[i], column.last))
+		if !column.last {
+			fmt.Print("  ")
+		}
+	}
+	fmt.Println(ANSIReset)
+
+	for _, row := range rows {
+		fmt.Print("  ")
+		for i, column := range columns {
+			cell := statusCell(statusColumnValue(column, row), widths[i], column.last)
+			if column.colored {
+				if colorFn := stateColorFunc(rowState(row)); colorFn != nil {
+					cell = colorFn(cell)
+				}
+			}
+			fmt.Print(cell)
+			if !column.last {
+				fmt.Print("  ")
+			}
+		}
+		fmt.Println()
+	}
 }
 
 // statusListColumns returns the columns the list renders, in order. The
@@ -1139,47 +1151,47 @@ type statusColumn struct {
 // already do — the deployment's shared data-plane apply id and the
 // per-operation remote row id — and omits DEPLOYMENT, which every row repeats
 // back to the operator who named it.
-func statusListColumns(data StatusListData) []statusColumn {
-	columns := []statusColumn{
+func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
+	columns := []statusColumn[ActiveApplyData]{
 		{header: "APPLY ID", value: func(a ActiveApplyData) string { return a.ApplyID }},
 	}
 	if data.ShowExternalID {
 		if data.Deployment != "" {
 			columns = append(columns,
-				statusColumn{header: "EXTERNAL APPLY ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalID }},
-				statusColumn{header: "EXTERNAL OP ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalOperationID }},
+				statusColumn[ActiveApplyData]{header: "EXTERNAL APPLY ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalID }},
+				statusColumn[ActiveApplyData]{header: "EXTERNAL OP ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalOperationID }},
 			)
 		} else {
 			// Unconditional: the operator asked for this column by flag, so an
 			// all-dash column positively answers "nothing recorded" — dropping
 			// it would be indistinguishable from the flag doing nothing.
 			columns = append(columns,
-				statusColumn{header: "EXTERNAL ID", value: unfilteredStatusExternalID},
+				statusColumn[ActiveApplyData]{header: "EXTERNAL ID", value: unfilteredStatusExternalID},
 			)
 		}
 	}
 	columns = append(columns,
-		statusColumn{header: "DATABASE", value: func(a ActiveApplyData) string { return a.Database }},
-		statusColumn{header: "ENV", value: func(a ActiveApplyData) string { return a.Environment }},
+		statusColumn[ActiveApplyData]{header: "DATABASE", value: func(a ActiveApplyData) string { return a.Database }},
+		statusColumn[ActiveApplyData]{header: "ENV", value: func(a ActiveApplyData) string { return a.Environment }},
 	)
 	if data.Deployment == "" {
 		columns = append(columns,
-			statusColumn{header: "DEPLOYMENT", optional: true, value: func(a ActiveApplyData) string { return a.Deployment }},
+			statusColumn[ActiveApplyData]{header: "DEPLOYMENT", optional: true, value: func(a ActiveApplyData) string { return a.Deployment }},
 		)
 	}
 	columns = append(columns,
-		statusColumn{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
-		statusColumn{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
-		statusColumn{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
+		statusColumn[ActiveApplyData]{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
+		statusColumn[ActiveApplyData]{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
+		statusColumn[ActiveApplyData]{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
 	)
 	return retainPopulatedStatusColumns(columns, data.Applies)
 }
 
 // retainPopulatedStatusColumns drops every optional column no row fills in.
-func retainPopulatedStatusColumns(columns []statusColumn, applies []ActiveApplyData) []statusColumn {
-	retained := make([]statusColumn, 0, len(columns))
+func retainPopulatedStatusColumns[Row any](columns []statusColumn[Row], rows []Row) []statusColumn[Row] {
+	retained := make([]statusColumn[Row], 0, len(columns))
 	for _, column := range columns {
-		if column.optional && !anyStatusRowFillsColumn(column, applies) {
+		if column.optional && !anyStatusRowFillsColumn(column, rows) {
 			continue
 		}
 		retained = append(retained, column)
@@ -1187,9 +1199,9 @@ func retainPopulatedStatusColumns(columns []statusColumn, applies []ActiveApplyD
 	return retained
 }
 
-func anyStatusRowFillsColumn(column statusColumn, applies []ActiveApplyData) bool {
-	for _, a := range applies {
-		if column.value(a) != "" {
+func anyStatusRowFillsColumn[Row any](column statusColumn[Row], rows []Row) bool {
+	for _, row := range rows {
+		if column.value(row) != "" {
 			return true
 		}
 	}
@@ -1198,19 +1210,19 @@ func anyStatusRowFillsColumn(column statusColumn, applies []ActiveApplyData) boo
 
 // statusColumnValue renders a row's cell, standing a dash in for a value this
 // row is missing from a column other rows on the page do fill.
-func statusColumnValue(column statusColumn, a ActiveApplyData) string {
-	if value := column.value(a); value != "" {
+func statusColumnValue[Row any](column statusColumn[Row], row Row) string {
+	if value := column.value(row); value != "" {
 		return value
 	}
 	return "-"
 }
 
-func statusListColumnWidths(columns []statusColumn, applies []ActiveApplyData) []int {
+func statusColumnWidths[Row any](columns []statusColumn[Row], rows []Row) []int {
 	widths := make([]int, len(columns))
 	for i, column := range columns {
 		widths[i] = len(column.header)
-		for _, a := range applies {
-			widths[i] = maxLen(widths[i], len(statusColumnValue(column, a)))
+		for _, row := range rows {
+			widths[i] = maxLen(widths[i], len(statusColumnValue(column, row)))
 		}
 	}
 	return widths
@@ -1222,7 +1234,7 @@ func statusCell(value string, width int, last bool) string {
 	if last {
 		return value
 	}
-	return fmt.Sprintf("%-*s  ", width, value)
+	return fmt.Sprintf("%-*s", width, value)
 }
 
 // unfilteredStatusExternalID collapses both remote handles into the single
@@ -1306,6 +1318,18 @@ type DatabaseHistoryData struct {
 	Applies  []ApplyHistoryData
 }
 
+// databaseHistoryColumns returns the columns the history table renders, in order.
+func databaseHistoryColumns() []statusColumn[ApplyHistoryData] {
+	return []statusColumn[ApplyHistoryData]{
+		{header: "APPLY ID", value: func(a ApplyHistoryData) string { return a.ApplyID }},
+		{header: "ENV", value: func(a ApplyHistoryData) string { return a.Environment }},
+		{header: "STATE", colored: true, value: func(a ApplyHistoryData) string { return state.Label(a.State) }},
+		{header: "STARTED", value: func(a ApplyHistoryData) string { return formatStartedAt(a.StartedAt) }},
+		{header: "DURATION", value: func(a ApplyHistoryData) string { return formatApplyDuration(a.StartedAt, a.CompletedAt) }},
+		{header: "SOURCE", last: true, value: func(a ApplyHistoryData) string { return applySource(a.Caller) }},
+	}
+}
+
 // WriteDatabaseHistory writes the database history output.
 func WriteDatabaseHistory(data DatabaseHistoryData) {
 	if len(data.Applies) == 0 {
@@ -1313,53 +1337,10 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 		return
 	}
 
-	// Header
 	fmt.Printf("%sSchema change history for %s%s\n", ANSIBold, data.Database, ANSIReset)
 	fmt.Println()
 
-	// Calculate column widths from data
-	maxID := 8      // "APPLY ID"
-	maxEnv := 3     // "ENV"
-	maxState := 5   // "STATE"
-	maxStarted := 7 // "STARTED"
-	maxDur := 8     // "DURATION"
-	for _, a := range data.Applies {
-		maxID = maxLen(maxID, len(a.ApplyID))
-		maxEnv = maxLen(maxEnv, len(a.Environment))
-		maxState = maxLen(maxState, len(state.Label(a.State)))
-		maxStarted = maxLen(maxStarted, len(formatStartedAt(a.StartedAt)))
-		maxDur = maxLen(maxDur, len(formatApplyDuration(a.StartedAt, a.CompletedAt)))
-	}
-
-	// Table header
-	fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-		ANSIDim,
-		maxID, "APPLY ID",
-		maxEnv, "ENV",
-		maxState, "STATE",
-		maxStarted, "STARTED",
-		maxDur, "DURATION",
-		"SOURCE",
-		ANSIReset)
-
-	// Table rows
-	for _, a := range data.Applies {
-		label := state.Label(a.State)
-		colorFn := stateColorFunc(a.State)
-		padded := fmt.Sprintf("%-*s", maxState, label)
-		coloredState := padded
-		if colorFn != nil {
-			coloredState = colorFn(padded)
-		}
-
-		fmt.Printf("  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
-			maxID, a.ApplyID,
-			maxEnv, a.Environment,
-			coloredState,
-			maxStarted, formatStartedAt(a.StartedAt),
-			maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
-			applySource(a.Caller))
-	}
+	writeStatusTable(databaseHistoryColumns(), data.Applies, func(a ApplyHistoryData) string { return a.State })
 
 	fmt.Println()
 	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
