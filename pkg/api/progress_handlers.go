@@ -992,7 +992,13 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 	}
 	if op != nil {
 		active.Deployment = op.Deployment
-		active.ExternalID = op.ExternalID
+		// A drive that is not operation-scoped records the remote apply id on
+		// the parent apply row, not the operation, so an empty operation-level
+		// id keeps the parent's rather than hiding the deployment's one remote
+		// handle.
+		if op.ExternalID != "" {
+			active.ExternalID = op.ExternalID
+		}
 		active.ExternalOperationID = op.ExternalOperationID
 		active.State = op.State
 		active.ErrorMessage = op.ErrorMessage
