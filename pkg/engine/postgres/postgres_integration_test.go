@@ -162,6 +162,31 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
+// TestEnginePlanCreateTableIgnoresSizeCeiling proves the native-safe table
+// size ceiling never blocks a greenfield CREATE TABLE: the ceiling bounds
+// rewrites of existing data, and a table that does not exist yet has none —
+// even a one-byte ceiling must leave the create executable.
+func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "create_size_limit_test")
+	req := &engine.PlanRequest{
+		Database: "create_size_limit_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode, "a greenfield create has no existing data for the ceiling to bound")
+	assert.Empty(t, change.ModeReason)
+}
+
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
 // pg-sprite's preflight and bounded optimistic executor.
 func TestEngineApplyNativeSafe(t *testing.T) {
@@ -229,6 +254,26 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
+	assert.Contains(t, progress.ErrorMessage, "re-plan")
+}
+
+// TestEngineApplyCreateIfNotExistsRefusal proves a CREATE TABLE carrying
+// IF NOT EXISTS is a permanent refusal naming the clause: the native-safe
+// path cannot prove what the clause's silent no-op would mean, so the drive
+// must direct the operator to drop it and re-plan — never offer a retry that
+// refails identically.
+func TestEngineApplyCreateIfNotExistsRefusal(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "if_not_exists_test")
+
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE IF NOT EXISTS public.widgets (id bigint PRIMARY KEY)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "an IF NOT EXISTS refusal is permanent until the clause is dropped and the change re-planned")
+	assert.Contains(t, progress.ErrorMessage, "IF NOT EXISTS")
 	assert.Contains(t, progress.ErrorMessage, "re-plan")
 }
 

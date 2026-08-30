@@ -191,8 +191,15 @@ func classifyRefusal(err error, table string) *refusal {
 func refusalForCause(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		detail := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
-			privilegeErr.Tier, table, privilegeErr.Grant, privilegeErr.Check)
+		object := fmt.Sprintf("on table %q", table)
+		if privilegeErr.Tier == preflight.TierCreateTable {
+			// The create tier's grant is schema-scoped: the table does not
+			// exist yet, so pointing the operator at a table-level grant
+			// would send them hunting for an object the target lacks.
+			object = fmt.Sprintf("in the schema that would hold table %q", table)
+		}
+		detail := fmt.Sprintf("the engine role lacks access for %s %s; provision with: %s (verified by: %s)",
+			privilegeErr.Tier, object, privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
 			detail += "; " + privilegeErr.Hint
 		}
@@ -218,10 +225,6 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "not-a-table",
 			detail: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
 	}
-	if errors.Is(err, executor.ErrCreateCollision) {
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a name the CREATE TABLE for %q needs was taken while the create ran; re-plan against the current schema", table)}
-	}
 	if preflight.IsNameOccupied(err) {
 		return &refusal{reason: "create-collision",
 			detail: fmt.Sprintf("a relation already occupies the name %q on the target; re-plan against the current schema", table)}
@@ -230,19 +233,67 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "schema-not-found",
 			detail: fmt.Sprintf("the schema that would hold table %q does not exist on the target; create the schema first", table)}
 	}
-	if errors.Is(err, executor.ErrDuplicateCreateName) {
+	r, _ := refusalForOutcome(executor.OutcomeCode(err), table)
+	return r
+}
+
+// refusalForOutcome maps pg-sprite's stable executor outcome vocabulary to
+// apply dispositions: a refusal when retrying the identical plan cannot
+// succeed, nil when the outcome is operational and a retry may. The switch
+// is total over executor.Codes() — the exhaustiveness test pins every code
+// to an explicit decision, so a new pg-sprite outcome surfaces as a failing
+// test here instead of silently falling through to the retryable tail. The
+// boolean reports whether the code is a known member of the vocabulary.
+func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
+	switch code {
+	case executor.CodeCreateCollision:
+		return &refusal{reason: "create-collision",
+			detail: fmt.Sprintf("a name the CREATE TABLE for %q needs is already taken on the target; re-plan against the current schema", table)}, true
+	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
-			detail: fmt.Sprintf("the CREATE TABLE for %q claims the same relation name twice; fix the schema file and re-plan", table)}
-	}
-	if errors.Is(err, executor.ErrPartitionOfUnsupported) {
+			detail: fmt.Sprintf("the CREATE TABLE for %q claims the same relation name twice; fix the schema file and re-plan", table)}, true
+	case executor.CodePartitionOfUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}
-	}
-	if errors.Is(err, executor.ErrUnsupportedCreateStep) {
+			detail: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}, true
+	case executor.CodeIfNotExistsUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run; rewrite the schema file and re-plan", table)}
+			detail: fmt.Sprintf("the planned statement for %q carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove; drop the clause and re-plan", table)}, true
+	case executor.CodeUnsupportedCreateStep:
+		return &refusal{reason: "unsupported-create-step",
+			detail: fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run; rewrite the schema file and re-plan", table)}, true
+	case executor.CodeTableNotFound:
+		return &refusal{reason: "table-not-found",
+			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}, true
+	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
+		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
+		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable:
+		// Shape refusals: the executor refused the statement's form at
+		// admission, so retrying the identical plan refails the same way.
+		return &refusal{reason: "unsupported-statement-shape",
+			detail: fmt.Sprintf("the planned statement for %q is not a shape the native-safe path can run; rewrite the schema change and re-plan", table)}, true
+	case executor.CodeBudgetStatementExceeded:
+		// Normally consumed upstream by the typed BudgetError arm, which
+		// renders the budget's own figures; this mapping keeps the outcome
+		// vocabulary total.
+		return &refusal{reason: "not-native-safe-budget-exceeded",
+			detail: fmt.Sprintf("the statement for table %q ran past its statement budget and was cancelled", table)}, true
+	case executor.CodeInvariantViolation:
+		// Never a retry candidate per the executor's contract: an invariant
+		// breach means the engine's own safety accounting failed, so the
+		// apply fails closed until an operator has inspected the target.
+		return &refusal{reason: "engine-invariant-violation",
+			detail: fmt.Sprintf("the engine's safety invariants did not hold while changing table %q; inspect the target and server logs before re-running", table)}, true
+	case executor.CodeBudgetLockExceeded, executor.CodeCancelledExternally,
+		executor.CodeInvalidIndexOwnLeftover, executor.CodeInvalidIndexPreexisting,
+		executor.CodeInvalidIndexUnproven, executor.CodePoolTooSmall,
+		executor.CodeExecutionFailed:
+		// Operational outcomes: a bounded lock race, an external stop, an
+		// invalid-index state an operator clears, engine pool sizing, or a
+		// failure outside the typed set. A retry can succeed once
+		// conditions change, so none is a permanent refusal.
+		return nil, true
 	}
-	return nil
+	return nil, false
 }
 
 func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {

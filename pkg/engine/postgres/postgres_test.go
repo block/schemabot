@@ -249,6 +249,33 @@ func TestBlockMissingPrivilegesRequiresTargetTable(t *testing.T) {
 	assert.Contains(t, err.Error(), "names no target table")
 }
 
+// TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent proves the unnamed-
+// target guard fires before dependent-step blocking rewrites verdicts: a
+// report that provably lacks its table but carries executable steps and no
+// target name must fail the plan closed, never launder the missing name into
+// a plan whose every step was blocked for a fabricated dependency.
+func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	exists := false
+	report.TableExists = &exists
+	changes := []engine.TableChange{
+		{
+			Table:         "users",
+			DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    "creation shape verdict",
+		},
+		{
+			Table: "users",
+			DDL:   "CREATE INDEX CONCURRENTLY idx_users_email ON public.users (email)",
+		},
+	}
+
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "names no target table")
+}
+
 // TestBlockMissingPrivilegesRequiresMatchingTiers proves a tier slice that
 // does not pair one-to-one with the planned changes fails the plan closed
 // instead of guessing which step needs which access.

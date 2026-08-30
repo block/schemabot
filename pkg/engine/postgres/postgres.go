@@ -233,6 +233,12 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
 	}
+	// Checked before any verdict rewriting below: blocking dependent steps
+	// must never launder a report that carries executable work but names no
+	// target into a plan that skips the privilege check entirely.
+	if hasExecutableChanges(changes) && report.Table == "" {
+		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
+	}
 	if report.TableExists != nil && !*report.TableExists {
 		// A privilege probe against a table that provably does not exist can
 		// only answer "table not found" — a dead end for the operator. Only
@@ -249,9 +255,6 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	}
 	if len(required) == 0 {
 		return changes, nil
-	}
-	if report.Table == "" {
-		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
 	for _, tier := range slices.Sorted(maps.Keys(required)) {
 		var err error
@@ -318,17 +321,19 @@ func hasExecutableChanges(changes []engine.TableChange) bool {
 	})
 }
 
-// blockAbsentTableDependents marks every still-executable step except the
-// CREATE TABLE tier's own blocked: a privilege probe against a table that
-// provably does not exist can only answer "table not found" — a dead end for
-// the operator — so each dependent step's accurate reason is its dependency
-// on the table's creation. Steps already carrying a verdict keep it.
+// blockAbsentTableDependents marks every still-executable step blocked,
+// except the CREATE TABLE tier's own step: a privilege probe against a table
+// that provably does not exist can only answer "table not found" — a dead end
+// for the operator — so each dependent step's accurate reason is its
+// dependency on the table's creation. The reason stays neutral about the
+// create step's own fate, which the privilege loop has not yet decided.
+// Steps already carrying a verdict keep it.
 func blockAbsentTableDependents(changes []engine.TableChange, tiers []preflight.Tier, table string) {
 	for i := range changes {
 		if changes[i].ExecutionMode == "" && tiers[i] != preflight.TierCreateTable {
 			changes[i].ExecutionMode = engine.ExecutionModeBlocked
-			changes[i].ModeReason = fmt.Sprintf(
-				"table %q does not exist on the target; this statement depends on the statement that creates it — apply the creating change first, then re-plan", table)
+			changes[i].ModeReason = sanitizeReasonText(fmt.Sprintf(
+				"table %q does not exist on the target; this statement depends on the statement that creates it — see that statement's verdict", table))
 		}
 	}
 }
