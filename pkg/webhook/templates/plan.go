@@ -545,11 +545,14 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
 	}
-	// Statements that classify as none of create/alter/drop — or per-shard-only
-	// DDL that countStatementTypes does not walk — still count. Report the raw
-	// statement total before the vschema clause so a vschema update never hides
-	// DDL the plan will run, keeping the summary in agreement with
-	// SummarizeChanges.
+	// Last-resort total: when nothing classified as create/alter/drop — a plan
+	// of only index or rename DDL, or per-shard-only DDL that
+	// countStatementTypes does not walk — report the raw statement total so
+	// the plan never reads as "no changes", and report it before the vschema
+	// clause so a vschema update never hides DDL the plan will run. A mixed
+	// plan with a non-zero typed count renders only the typed counts, so its
+	// untyped statements are not reflected here; SummarizeChanges shares this
+	// behavior, keeping the two surfaces in agreement.
 	if len(parts) == 0 && totalStatements > 0 {
 		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
 	}
