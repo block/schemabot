@@ -45,7 +45,10 @@ func formatProgressDDLForDialect(dialect schema.Dialect, rawDDL string) string {
 	if rawDDL == "" {
 		return ""
 	}
-	if dialect == "" {
+	if _, err := ddl.ParserForDialect(dialect); err != nil {
+		// A database type with no registered parser — empty (older server)
+		// or one this CLI doesn't know (newer server) — keeps the MySQL
+		// rendering rather than degrading to unformatted output.
 		dialect = schema.DialectMySQL
 	}
 	return IndentSQL(ddl.FormatDDLForDialect(dialect, rawDDL), indentContent) + "\n"

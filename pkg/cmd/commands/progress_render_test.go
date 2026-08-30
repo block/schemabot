@@ -36,6 +36,18 @@ func TestProgressRenderingUsesTargetDialect(t *testing.T) {
 			expectedDDL:  "ALTER TABLE `sessions`\n    ADD COLUMN `email` text,\n    ADD COLUMN `age` int;",
 			quoted:       true,
 		},
+		{
+			name:         "missing database type keeps MySQL formatting",
+			databaseType: "",
+			dialect:      schema.Dialect(""),
+			quoted:       true,
+		},
+		{
+			name:         "unrecognized database type keeps MySQL formatting",
+			databaseType: "spanner",
+			dialect:      schema.Dialect("spanner"),
+			quoted:       true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -53,7 +65,9 @@ func TestProgressRenderingUsesTargetDialect(t *testing.T) {
 			data := templates.ParseProgressResponse(resp)
 			require.Len(t, data.Tables, 1)
 			assert.Equal(t, tt.dialect, data.Tables[0].Dialect)
-			assert.Equal(t, tt.expectedDDL, ddl.FormatDDLForDialect(data.Tables[0].Dialect, rawDDL))
+			if tt.expectedDDL != "" {
+				assert.Equal(t, tt.expectedDDL, ddl.FormatDDLForDialect(data.Tables[0].Dialect, rawDDL))
+			}
 
 			out := templates.FormatTableProgress(data.Tables[0])
 			if tt.quoted {
