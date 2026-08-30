@@ -319,10 +319,10 @@ func derivePending(d *Deployment, ops []Operation, i int) {
 	}
 	if h, paused := blockingSibling(ops, i); h != nil {
 		if paused {
-			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", h.Deployment), "⏸", true)
+			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", h.Deployment), "⏸️", true)
 			return
 		}
-		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸", true)
+		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸️", true)
 		return
 	}
 	for j := range i {

@@ -950,7 +950,7 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 		RowsCopied:      300,
 		RowsTotal:       1000,
 	})
-	assert.Contains(t, cancelled, "⊘ Cancelled at 30%")
+	assert.Contains(t, cancelled, "🚫 Cancelled at 30%")
 	assert.Contains(t, cancelled, ui.ColorOrange)
 	assert.NotContains(t, cancelled, ui.ColorRed)
 

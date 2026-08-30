@@ -93,8 +93,8 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "schemabot apply -e production")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.Contains(t, out, "- ❌ us — failed")
-	assert.Contains(t, out, "- ⏸ au — halted — us failed")
-	assert.Contains(t, out, "<details open>\n<summary>⏸ au — halted — us failed</summary>")
+	assert.Contains(t, out, "- ⏸️ au — halted — us failed")
+	assert.Contains(t, out, "<details open>\n<summary>⏸️ au — halted — us failed</summary>")
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
 	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code>\n")
@@ -467,7 +467,7 @@ func TestRenderMultiDeploymentApplyComment_HaltedDetailUsesDerivedStatus(t *test
 		},
 	})
 
-	assert.Contains(t, out, "**Status**: ⏸ Halted — apse2 failed")
+	assert.Contains(t, out, "**Status**: ⏸️ Halted — apse2 failed")
 	assert.NotContains(t, out, "**Status**: Starting")
 	// The failed deployment keeps its raw-state gloss.
 	assert.Contains(t, out, "**Status**: Failed")
