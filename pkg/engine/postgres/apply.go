@@ -90,6 +90,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}, nil
 }
 
+// validateOptimisticApply validates only engine-level applicability. Blocked
+// verdicts are enforced at queue time by rejectBlockedStoredPlan before tasks
+// are created; task rows are rebuilt from stored plans and do not carry the
+// plan's ExecutionMode verdict.
 func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if req == nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL schema: request is required")
@@ -101,9 +105,6 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned statement", req.Database)
 	}
 	tc := req.Changes[0].TableChanges[0]
-	if tc.ExecutionMode == engine.ExecutionModeBlocked {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement is blocked: %s", tc.Table, tc.ModeReason)
-	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
 	}
