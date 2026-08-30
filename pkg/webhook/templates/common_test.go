@@ -159,6 +159,51 @@ func TestSanitizeCommentError(t *testing.T) {
 			want: "host=[endpoint redacted] user=[endpoint redacted] password=[endpoint redacted] dbname=[endpoint redacted]",
 		},
 		{
+			name: "libpq password containing a colon",
+			in:   "connect with password=p@ss:word failed",
+			want: "connect with password=[endpoint redacted] failed",
+		},
+		{
+			name: "libpq password containing commas",
+			in:   "password=a,b,c dbname=orders",
+			want: "password=[endpoint redacted] dbname=[endpoint redacted]",
+		},
+		{
+			name: "libpq password containing a semicolon",
+			in:   "auth failed for password=one;two",
+			want: "auth failed for password=[endpoint redacted]",
+		},
+		{
+			name: "libpq password with trailing text after a colon",
+			in:   "password=hunter:2x rejected",
+			want: "password=[endpoint redacted] rejected",
+		},
+		{
+			name: "MySQL access denied",
+			in:   "Error 1045 (28000): Access denied for user 'app_writer'@'10.20.30.40' (using password: YES)",
+			want: "Error 1045 (28000): Access denied for user [endpoint redacted] (using password: YES)",
+		},
+		{
+			name: "MySQL access denied to database",
+			in:   "Error 1044 (42000): Access denied for user 'app'@'%' to database 'orders'",
+			want: "Error 1044 (42000): Access denied for user [endpoint redacted] to database '[endpoint redacted]'",
+		},
+		{
+			name: "MySQL unknown database",
+			in:   "Error 1049 (42000): Unknown database 'orders'",
+			want: "Error 1049 (42000): Unknown database '[endpoint redacted]'",
+		},
+		{
+			name: "quoted database name in prose is not a MySQL error line",
+			in:   "database 'orders' has no deployment configured",
+			want: "database 'orders' has no deployment configured",
+		},
+		{
+			name: "lookup vindex prose is not a DNS error",
+			in:   "cannot use lookup vindex on unowned table users",
+			want: "cannot use lookup vindex on unowned table users",
+		},
+		{
 			name: "URL userinfo",
 			in:   "connect postgres://app:hunter2@db.internal/orders failed",
 			want: "connect postgres://[endpoint redacted]@[endpoint redacted]/orders failed",
@@ -200,6 +245,12 @@ func TestSanitizeCommentError(t *testing.T) {
 	t.Run("errors at the limit are not clamped", func(t *testing.T) {
 		msg := strings.Repeat("x", maxCommentErrorLen)
 		assert.Equal(t, msg, sanitizeCommentError(msg))
+	})
+
+	t.Run("clamp never leaves a partial redaction marker", func(t *testing.T) {
+		prefix := strings.Repeat("x", maxCommentErrorLen-10)
+		got := sanitizeCommentError(prefix + " /etc/schemabot/ca/bundle.pem")
+		assert.Equal(t, prefix+" …", got)
 	})
 }
 

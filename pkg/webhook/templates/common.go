@@ -217,13 +217,30 @@ var (
 	// two components. Relative paths and Go import paths remain useful in
 	// errors and do not reveal host filesystem layout.
 	absolutePathRe = regexp.MustCompile("(^|[[:space:]\\(\\\"'`=,:\\[])/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)+")
-	// lookupHostRe matches the hostname in net.DNSError text. The resolver
-	// endpoint that may follow it is handled by ipEndpointRe. Requiring the
-	// DNS error suffix avoids redacting domain-specific uses of "lookup".
-	lookupHostRe = regexp.MustCompile(`\b(lookup[[:space:]]+)[A-Za-z0-9][A-Za-z0-9.-]*([[:space:]]+on[[:space:]]+|:[[:space:]]+no such host)`)
+	// lookupHostRe matches the hostname in net.DNSError text. The "on"
+	// alternative is anchored on the resolver endpoint that follows the
+	// hostname — an IP or host:port, which later passes redact — so prose
+	// uses of "lookup … on …" are never matched.
+	lookupHostRe = regexp.MustCompile(`\b(lookup[[:space:]]+)[A-Za-z0-9][A-Za-z0-9.-]*([[:space:]]+on[[:space:]]+(?:\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z0-9][A-Za-z0-9.-]*):[0-9]{1,5}\b|:[[:space:]]+no such host)`)
+	// libpqPasswordRe matches a password value in keyword/value connection
+	// fragments. Unlike the other parameters, the value is bounded only by
+	// whitespace (and a backtick, so backtick-quoted connection fragments
+	// stay balanced): a secret may legally contain the delimiters the
+	// parameter pattern stops at, and a credential must be over-redacted
+	// rather than leave part of the secret behind.
+	libpqPasswordRe = regexp.MustCompile("\\bpassword=[^[:space:]`]*")
 	// libpqParameterRe matches identifying values in keyword/value connection
 	// fragments while preserving the parameter name for diagnostic context.
-	libpqParameterRe = regexp.MustCompile("\\b(user|database|dbname|host|password)=([^[:space:],;:`]+)(?::[0-9]+)?")
+	libpqParameterRe = regexp.MustCompile("\\b(user|database|dbname|host)=([^[:space:],;:`]+)(?::[0-9]+)?")
+	// mysqlUserHostRe matches the MySQL account form 'user'@'host', which
+	// names both a role and its origin host; the quoting is distinctive
+	// enough to redact wherever it appears.
+	mysqlUserHostRe = regexp.MustCompile(`'[^']*'@'[^']*'`)
+	// mysqlErrorLineRe scopes quoted-identity redaction to MySQL server
+	// error lines, mirroring the SQLSTATE scoping on the PostgreSQL side so
+	// ordinary application errors can still quote a database name.
+	mysqlErrorLineRe = regexp.MustCompile(`[^\n]*\bError [0-9]+ \([0-9A-Z]{5}\)[^\n]*`)
+	mysqlIdentityRe  = regexp.MustCompile(`\b(database|user)[[:space:]]+'[^']*'`)
 	// urlUserinfoRe matches credentials between a URL scheme and endpoint.
 	urlUserinfoRe = regexp.MustCompile(`\b([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]+@`)
 	// postgresSQLSTATELineRe scopes quoted identity redaction to PostgreSQL
@@ -266,7 +283,26 @@ func sanitizeCommentError(msg string) string {
 	msg = redactConnectionDetails(msg)
 	msg = strings.TrimSpace(msg)
 	if runes := []rune(msg); len(runes) > maxCommentErrorLen {
-		msg = string(runes[:maxCommentErrorLen-1]) + "…"
+		msg = trimPartialRedactionMarker(string(runes[:maxCommentErrorLen-1])) + "…"
+	}
+	return msg
+}
+
+// redactionMarker is the placeholder every redaction pass substitutes for
+// sensitive text.
+const redactionMarker = "[endpoint redacted]"
+
+// trimPartialRedactionMarker removes an incomplete redaction marker left
+// dangling at the end of a clamped message, so truncation can never turn a
+// redaction back into text that looks like a partially leaked value.
+func trimPartialRedactionMarker(msg string) string {
+	i := strings.LastIndexByte(msg, '[')
+	if i < 0 {
+		return msg
+	}
+	tail := msg[i:]
+	if len(tail) < len(redactionMarker) && strings.HasPrefix(redactionMarker, tail) {
+		return msg[:i]
 	}
 	return msg
 }
@@ -276,9 +312,14 @@ func redactConnectionDetails(msg string) string {
 	msg = urlUserinfoRe.ReplaceAllString(msg, "${1}[endpoint redacted]@")
 	msg = absolutePathRe.ReplaceAllString(msg, "${1}[endpoint redacted]")
 	msg = lookupHostRe.ReplaceAllString(msg, "${1}[endpoint redacted]${2}")
+	msg = libpqPasswordRe.ReplaceAllString(msg, "password=[endpoint redacted]")
 	msg = libpqParameterRe.ReplaceAllString(msg, "${1}=[endpoint redacted]")
 	msg = postgresSQLSTATELineRe.ReplaceAllStringFunc(msg, func(line string) string {
 		return postgresIdentityRe.ReplaceAllString(line, `${1} "[endpoint redacted]"`)
+	})
+	msg = mysqlUserHostRe.ReplaceAllString(msg, "[endpoint redacted]")
+	msg = mysqlErrorLineRe.ReplaceAllStringFunc(msg, func(line string) string {
+		return mysqlIdentityRe.ReplaceAllString(line, "${1} '[endpoint redacted]'")
 	})
 	msg = hostPortRe.ReplaceAllString(msg, "[endpoint redacted]")
 	msg = contextualHostnameRe.ReplaceAllString(msg, "${1}[endpoint redacted]")

@@ -115,16 +115,17 @@ func formatLogEntryLine(entry LogEntryData) string {
 // of the text render as comment markup), ANSI or bidi control characters
 // (which visually reorder or recolor the rendered text), or connection
 // endpoints (which leak internal infrastructure the error block above
-// already redacts). Newlines collapse to spaces; backtick runs are split
-// with a space until no fence marker remains; control characters are
-// stripped and endpoints redacted with the same rules as the comment error
-// sanitizer.
+// already redacts). Newlines collapse to spaces; control characters are
+// stripped before the fence check so that removing them cannot join
+// backticks into a new fence; backtick runs are then split with a space
+// until no fence marker remains; endpoints are redacted with the same rules
+// as the comment error sanitizer.
 func sanitizeLogText(text string) string {
 	text = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
+	text = stripControlText(text)
 	for strings.Contains(text, "```") {
 		text = strings.ReplaceAll(text, "```", "`` `")
 	}
-	text = stripControlText(text)
 	text = redactConnectionDetails(text)
 	return text
 }

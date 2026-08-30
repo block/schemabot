@@ -186,3 +186,13 @@ func TestRenderRecentFailureLogsStripsControlCharacters(t *testing.T) {
 	assert.NotContains(t, rendered, "\x1b", "ANSI escapes are stripped")
 	assert.NotContains(t, rendered, "\u202e", "bidi overrides are stripped")
 }
+
+// TestSanitizeLogTextControlCharCannotFormFence verifies that stripping a
+// control character between backticks cannot join them into a fence marker:
+// control characters are removed before the fence check, so the joined run
+// is still split.
+func TestSanitizeLogTextControlCharCannotFormFence(t *testing.T) {
+	got := sanitizeLogText("``\x01`")
+	assert.NotContains(t, got, "```")
+	assert.Equal(t, "`` `", got)
+}
