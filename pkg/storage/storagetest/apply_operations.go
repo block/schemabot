@@ -107,15 +107,14 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, first)
 		assert.Equal(t, shardA, first.ID, "concurrently claimable siblings are handed out in insertion order")
 
-		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
-		require.NoError(t, err)
-		require.NotNil(t, second, "a sibling shard is claimable while the first still runs")
-		assert.Equal(t, shardB, second.ID)
-		assert.NotEqual(t, first.LeaseToken, second.LeaseToken, "each shard claim rotates its own lease")
-
+		// Assert the finalizer's sibling gate while only one shard is occupied.
+		// With both shards running the apply is at the default fan-out cap, and a
+		// nil claim would prove nothing about the gate.
 		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
 		require.NoError(t, err)
-		assert.Nil(t, blocked, "the group finalizer waits for every work sibling")
+		require.NotNil(t, blocked, "a sibling shard is claimable while the first still runs")
+		assert.Equal(t, shardB, blocked.ID, "the finalizer waits for every work sibling, so the next claim is the second shard")
+		assert.NotEqual(t, first.LeaseToken, blocked.LeaseToken, "each shard claim rotates its own lease")
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardA))
 
@@ -130,6 +129,39 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, claimed)
 		assert.Equal(t, finalizerID, claimed.ID)
 		assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+	})
+
+	// FindNextApplyOperation_CapsDriversPerApply verifies that one wide fan-out
+	// cannot take the whole driver pool. A sharded apply with more claimable
+	// shards than the cap allows occupies exactly the cap's worth of drivers, so
+	// other databases' work still gets claimed while it runs.
+	t.Run("FindNextApplyOperation_CapsDriversPerApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cap_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cap", 909)
+
+		shards := storage.DefaultMaxDriversPerApply + 2
+		for i := range shards {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a",
+				OperationKey:  fmt.Sprintf("commerce/shard-%d/users", i),
+				OperationKind: storage.ApplyOperationKindWork,
+			})
+			require.NoError(t, err)
+		}
+
+		claimed := 0
+		for range shards + 1 {
+			got, claimErr := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, claimErr)
+			if got == nil {
+				break
+			}
+			assert.Equal(t, apply.ID, got.ApplyID)
+			claimed++
+		}
+		assert.Equal(t, storage.DefaultMaxDriversPerApply, claimed, "a wide apply occupies exactly the cap's worth of drivers, not every claimable shard")
 	})
 
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An

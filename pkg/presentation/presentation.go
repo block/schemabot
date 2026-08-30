@@ -221,7 +221,10 @@ func (a Apply) MultiDeployment() bool {
 
 // Derive projects the ordered operations of one apply into its rollup. The input
 // must be in resolved deployment order (as returned by ListByApply); earlier
-// siblings are those before a given index.
+// siblings are those before a given index. The returned Deployments slice is
+// index-parallel to ops — one entry per operation, in the same order, each
+// carrying its operation's Deployment name — and callers rely on that
+// correspondence to key results back to their inputs.
 func Derive(ops []Operation) Apply {
 	children := make([]state.RolloutChild, len(ops))
 	for i, op := range ops {

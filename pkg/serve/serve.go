@@ -377,7 +377,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	// Create service with dependencies
-	store, err := newStore(dialect, db)
+	store, err := newStore(dialect, db, storage.WithMaxDriversPerApply(cfg.MaxDriversPerApply))
 	if err != nil {
 		return nil, err
 	}
@@ -546,12 +546,12 @@ func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig) 
 // dialect. The dispatch fails closed: a dialect without a store returns an
 // error instead of running the MySQL implementation against another database
 // family.
-func newStore(dialect schema.Dialect, db *sql.DB) (storage.Storage, error) {
+func newStore(dialect schema.Dialect, db *sql.DB, opts ...storage.Option) (storage.Storage, error) {
 	switch dialect {
 	case schema.DialectMySQL:
-		return mysqlstore.New(db), nil
+		return mysqlstore.New(db, opts...), nil
 	case schema.DialectPostgres:
-		return postgresstore.New(db), nil
+		return postgresstore.New(db, opts...), nil
 	default:
 		return nil, fmt.Errorf("no storage implementation for storage dialect %q (supported: %q, %q)", dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}

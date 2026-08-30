@@ -68,6 +68,7 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 	require.Len(t, data.UnsafeChanges, 1)
 	assert.Equal(t, "mutes", data.UnsafeChanges[0].Table)
 	assert.Equal(t, []string{"40-80"}, data.UnsafeChanges[0].Shards, "the unsafe change is scoped to the drifted shard")
+	assert.Equal(t, 2, data.UnsafeChanges[0].TotalShards, "coverage is stated against every planned shard")
 }
 
 // A shard that already matches the desired schema while siblings change is

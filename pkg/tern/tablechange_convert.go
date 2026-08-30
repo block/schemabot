@@ -8,6 +8,11 @@ package tern
 // conversion site, and a helper that stops compiling is the signal that a
 // boundary was missed.
 //
+// ExecutionMode and ModeReason are deliberately one-directional: they only
+// travel out of the engine, and blocked verdicts are enforced when an apply
+// is queued rather than re-checked engine-side. Do not add a helper that
+// carries them back toward the engine without restoring an engine-side check.
+//
 // Identity fields that call sites derive differently (namespace scoping,
 // trimming, validation, operation mapping) are passed in explicitly: the
 // boundary that owns a rule keeps it.
