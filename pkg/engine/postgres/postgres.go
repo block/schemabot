@@ -233,6 +233,14 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
 	}
+	if report.TableExists != nil && !*report.TableExists {
+		// A privilege probe against a table that provably does not exist can
+		// only answer "table not found" — a dead end for the operator. Only
+		// the CREATE TABLE step's off-ladder tier states facts an absent
+		// target can satisfy; every other executable step depends on the
+		// table's creation, so that dependency is its accurate reason.
+		blockAbsentTableDependents(changes, tiers, report.Table)
+	}
 	required := make(map[preflight.Tier]bool)
 	for i, change := range changes {
 		if change.ExecutionMode == "" {
@@ -245,19 +253,16 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if report.Table == "" {
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
-		// A privilege probe against a table that provably does not exist can
-		// only answer "table not found" — a dead end for the operator. The
-		// executable steps here depend on the table's creation, and the
-		// CREATE TABLE statement itself is blocked by the per-statement
-		// verdict, so the accurate reason is that dependency, not a re-plan
-		// instruction that no re-plan can satisfy.
-		blockExecutableChanges(changes, fmt.Sprintf(
-			"table %q does not exist on the target; the statement that would create it is blocked, so this statement cannot run", report.Table))
-		return changes, nil
-	}
 	for _, tier := range slices.Sorted(maps.Keys(required)) {
-		_, err := preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		var err error
+		if tier == preflight.TierCreateTable {
+			// The off-ladder create tier is checked against the schema, not
+			// the table: CheckPrivileges' ladder walks facts about an
+			// existing table, and a greenfield target has none.
+			_, err = preflight.CheckCreatePrivileges(ctx, pool, report.Schema)
+		} else {
+			_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		}
 		if err == nil {
 			continue
 		}
@@ -311,6 +316,21 @@ func hasExecutableChanges(changes []engine.TableChange) bool {
 	return slices.ContainsFunc(changes, func(change engine.TableChange) bool {
 		return change.ExecutionMode == ""
 	})
+}
+
+// blockAbsentTableDependents marks every still-executable step except the
+// CREATE TABLE tier's own blocked: a privilege probe against a table that
+// provably does not exist can only answer "table not found" — a dead end for
+// the operator — so each dependent step's accurate reason is its dependency
+// on the table's creation. Steps already carrying a verdict keep it.
+func blockAbsentTableDependents(changes []engine.TableChange, tiers []preflight.Tier, table string) {
+	for i := range changes {
+		if changes[i].ExecutionMode == "" && tiers[i] != preflight.TierCreateTable {
+			changes[i].ExecutionMode = engine.ExecutionModeBlocked
+			changes[i].ModeReason = fmt.Sprintf(
+				"table %q does not exist on the target; this statement depends on the statement that creates it — apply the creating change first, then re-plan", table)
+		}
+	}
 }
 
 // blockExecutableChanges marks every still-executable change blocked with the

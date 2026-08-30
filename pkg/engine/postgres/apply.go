@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
@@ -216,6 +218,30 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "not-a-table",
 			detail: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
 	}
+	if errors.Is(err, executor.ErrCreateCollision) {
+		return &refusal{reason: "create-collision",
+			detail: fmt.Sprintf("a name the CREATE TABLE for %q needs was taken while the create ran; re-plan against the current schema", table)}
+	}
+	if preflight.IsNameOccupied(err) {
+		return &refusal{reason: "create-collision",
+			detail: fmt.Sprintf("a relation already occupies the name %q on the target; re-plan against the current schema", table)}
+	}
+	if errors.Is(err, preflight.ErrSchemaNotFound) {
+		return &refusal{reason: "schema-not-found",
+			detail: fmt.Sprintf("the schema that would hold table %q does not exist on the target; create the schema first", table)}
+	}
+	if errors.Is(err, executor.ErrDuplicateCreateName) {
+		return &refusal{reason: "duplicate-create-name",
+			detail: fmt.Sprintf("the CREATE TABLE for %q claims the same relation name twice; fix the schema file and re-plan", table)}
+	}
+	if errors.Is(err, executor.ErrPartitionOfUnsupported) {
+		return &refusal{reason: "unsupported-create-step",
+			detail: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}
+	}
+	if errors.Is(err, executor.ErrUnsupportedCreateStep) {
+		return &refusal{reason: "unsupported-create-step",
+			detail: fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run; rewrite the schema file and re-plan", table)}
+	}
 	return nil
 }
 
@@ -230,13 +256,19 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
-	statement, err := pgstatement.ParseOne(change.sql)
-	if err != nil {
-		return fmt.Errorf("parse planned PostgreSQL statement for table %q: %w", change.table, err)
-	}
 	tier, err := preflight.RequiredTier([]string{change.sql})
 	if err != nil {
 		return fmt.Errorf("derive privilege tier for table %q: %w", change.table, err)
+	}
+	if tier == preflight.TierCreateTable {
+		// The off-ladder create tier has its own preflight sequence: the
+		// ladder checks below state facts about an existing table, and a
+		// greenfield target has none.
+		return executeCreate(ctx, pool, change)
+	}
+	statement, err := pgstatement.ParseOne(change.sql)
+	if err != nil {
+		return fmt.Errorf("parse planned PostgreSQL statement for table %q: %w", change.table, err)
 	}
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
@@ -249,6 +281,41 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy()); err != nil {
 		return fmt.Errorf("execute native-safe PostgreSQL statement on table %q: %w", change.table, err)
+	}
+	return nil
+}
+
+// executeCreate runs one greenfield CREATE TABLE through pg-sprite's create
+// path: parse the desired shape, prove the role can create in the schema,
+// prove the name is free, then execute — both proofs minted here, in the
+// session that executes, because absence or privilege at plan time proves
+// nothing about apply time. The table size gate deliberately does not run:
+// it bounds rewrites of existing data, and a table that does not exist yet
+// has none.
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply) error {
+	// The planned statement arrives schema-qualified; the desired-schema
+	// contract wants the unqualified form and the executor pins the schema
+	// from the absence proof instead.
+	unqualified, err := pgstatement.Qualify(change.sql, "")
+	if err != nil {
+		return fmt.Errorf("render planned CREATE TABLE for table %q in unqualified form: %w", change.table, err)
+	}
+	desired, err := pgstatement.ParseDesired(unqualified)
+	if err != nil {
+		return fmt.Errorf("parse planned CREATE TABLE for table %q: %w", change.table, err)
+	}
+	role, err := preflight.CheckCreatePrivileges(ctx, pool, change.namespace)
+	if err != nil {
+		return fmt.Errorf("check creation access in PostgreSQL schema %q: %w", change.namespace, err)
+	}
+	absent, err := preflight.CheckTableAbsent(ctx, pool, change.namespace, change.table)
+	if err != nil {
+		return fmt.Errorf("verify PostgreSQL table %q is absent: %w", change.table, err)
+	}
+	if _, err := executor.ExecuteCreate(ctx, pool, absent, role, desired, executor.Budget{
+		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
+	}, executor.DefaultRetryPolicy()); err != nil {
+		return fmt.Errorf("execute PostgreSQL CREATE TABLE %q: %w", change.table, err)
 	}
 	return nil
 }

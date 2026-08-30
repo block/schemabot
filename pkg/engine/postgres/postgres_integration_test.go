@@ -17,10 +17,10 @@ import (
 
 const postgresApplyDeadline = 10 * time.Second
 
-// TestEnginePlanCreateTable proves a CREATE TABLE derived from desired state
-// is planned with a blocked verdict: the native-safe path cannot execute that
-// shape, so the plan the operator reviews must say so instead of emitting an
-// executable change that deterministically fails at apply.
+// TestEnginePlanCreateTable proves a greenfield CREATE TABLE derived from
+// desired state plans as an executable change: the role's schema CREATE
+// access is verified at plan time, so the plan the operator reviews carries
+// the same verdict the apply path will enforce.
 func TestEnginePlanCreateTable(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "plan_test")
 	req := &engine.PlanRequest{
@@ -42,8 +42,8 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Equal(t, "public", result.Changes[0].Namespace)
 	assert.Equal(t, "users", change.Table)
 	assert.Contains(t, change.DDL, "CREATE TABLE public.users")
-	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
-	assert.Equal(t, `statement for table "users" is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible`, change.ModeReason)
+	assert.Empty(t, change.ExecutionMode, "a greenfield create the role can run must plan executable")
+	assert.Empty(t, change.ModeReason)
 }
 
 // TestEnginePlanPrivilegeRefusal proves a role that cannot alter the target
@@ -187,6 +187,51 @@ func TestEngineApplyNativeSafe(t *testing.T) {
 	assert.True(t, exists)
 }
 
+// TestEngineApplyCreateTable proves a greenfield CREATE TABLE executes
+// through the native-safe path end to end: absence and schema CREATE access
+// are proved in the executing session, the table lands with its declared
+// shape, and the drive reports completion.
+func TestEngineApplyCreateTable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "create_test")
+
+	eng := New()
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text NOT NULL)"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+	assert.Equal(t, 100, progress.Progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+
+	var exists bool
+	err = db.QueryRowContext(t.Context(), `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'widgets' AND column_name = 'name')`).Scan(&exists)
+	require.NoError(t, err)
+	assert.True(t, exists)
+}
+
+// TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is
+// already occupied on the target is a permanent refusal directing a re-plan —
+// the apply must never guess whether the occupying relation is the desired
+// one — not a retryable failure.
+func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "collision_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.widgets (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text NOT NULL)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
+	assert.Contains(t, progress.ErrorMessage, "re-plan")
+}
+
 // TestEngineApplyPrivilegeRefusal proves a role that cannot alter the target
 // is blocked before execution and receives exact provisioning SQL.
 func TestEngineApplyPrivilegeRefusal(t *testing.T) {
@@ -307,7 +352,7 @@ func TestEngineSharedAcrossAppliesKeepsProgressPerApply(t *testing.T) {
 func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "shape_test")
 	eng := New()
-	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "CREATE TABLE public.users (id bigint PRIMARY KEY)"))
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "users", "DROP TABLE public.users"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }

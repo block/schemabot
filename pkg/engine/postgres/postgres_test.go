@@ -186,10 +186,10 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 }
 
 // TestBlockMissingPrivilegesSkipsMissingTable proves that executable steps on
-// a table the target provably does not have are blocked with the dependency
-// as the reason — the table's creation is itself blocked — never with a
-// privilege probe's "table not found", which reads as a re-plan instruction
-// no re-plan can satisfy. The nil pool proves no probe runs.
+// a table the target provably does not have are blocked with their dependency
+// on the table's creation as the reason — never with a privilege probe's
+// "table not found", which reads as a re-plan instruction no re-plan can
+// satisfy. The nil pool proves no probe runs.
 func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
@@ -213,7 +213,7 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Contains(t, changes[1].ModeReason, `table "users" does not exist on the target`)
-	assert.Contains(t, changes[1].ModeReason, "the statement that would create it is blocked")
+	assert.Contains(t, changes[1].ModeReason, "depends on the statement that creates it")
 }
 
 // TestBlockMissingPrivilegesSkipsFullyBlockedPlans proves the privilege check

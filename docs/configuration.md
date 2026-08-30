@@ -644,7 +644,9 @@ lock. An oversized table appears in the plan comment's **Cannot apply** section;
 adjust `postgres.native_safe_table_size_limit_bytes` if operators decide the
 target is safe for a bounded attempt. Every apply still runs under short
 `lock_timeout` and `statement_timeout` budgets, so above the ceiling it is the
-statement timeout, not the ceiling, that stops a runaway rewrite.
+statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
+`CREATE TABLE` does not consult the ceiling: the gate bounds rewrites of
+existing data, and a table that does not exist yet has none.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
