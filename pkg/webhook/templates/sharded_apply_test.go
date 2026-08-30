@@ -571,8 +571,8 @@ func TestRenderShardedApplyComment_DivergenceKeepsGroupedShardTables(t *testing.
 
 // The status comment's at-a-glance line counts one change per (keyspace,
 // table) unit plus one per VSchema update, matching the plan's arithmetic. A
-// table in its revert window has landed and counts as applied; a lone change
-// reads in the singular.
+// table counts as applied once every shard is completed or in its revert
+// window; a lone change reads in the singular.
 func TestRenderShardedApplyComment_StatusLineChangeFraction(t *testing.T) {
 	tbl := func(table, status string) ShardedTableStatus {
 		return ShardedTableStatus{Table: table, Status: status, Shards: []ShardProgressData{{Shard: "-", Status: status}}}
@@ -605,6 +605,35 @@ func TestRenderShardedApplyComment_StatusLineChangeFraction(t *testing.T) {
 		}},
 	})
 	assert.Contains(t, single, "**Status**: In Progress — 0 of 1 change applied", "a lone change reads in the singular")
+}
+
+// Under wave dispatch a table's aggregate status can hold in the revert
+// window while later-wave shards have not started. The change fraction counts
+// per-shard landings, so such a table is not yet applied — the status line
+// must not overstate how much of the plan has landed.
+func TestShardedChangeFraction_UndispatchedShardHoldsTheChange(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.RevertWindow,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.RevertWindow},
+					{Shard: "40-80", Status: state.Task.Pending},
+				},
+			}},
+			Shards: []ShardStatus{
+				{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
+				{Shard: "40-80", Emoji: "⏳", Label: "pending", State: state.ApplyOperation.Pending},
+			},
+			Cells: []ShardCell{mutesCell("-40"), mutesCell("40-80")},
+		}},
+	})
+
+	assert.Contains(t, out, "**Status**: In Progress — 0 of 1 change applied",
+		"a revert-window aggregate with a pending shard has not landed everywhere")
 }
 
 // Without a table rollup the status line is omitted — a fraction computed from
@@ -659,7 +688,8 @@ func TestRenderShardedApplyComment_RollbackStatusWord(t *testing.T) {
 		}},
 	})
 
-	assert.Contains(t, out, "**Status**: Rolled Back — 1 of 1 change applied")
+	assert.Contains(t, out, "**Status**: Rolled Back — 1 of 1 change rolled back",
+		"a rollback apply's fraction counts changes rolled back, not applied")
 }
 
 // The revert-window phrase deliberately carries no checkmark: the change is

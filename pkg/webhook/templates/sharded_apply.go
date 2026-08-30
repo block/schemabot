@@ -236,19 +236,20 @@ func writeShardedStatusLine(sb *strings.Builder, data ShardedApplyData) {
 	if total == 1 {
 		noun = "change"
 	}
-	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s applied\n", word, applied, total, noun)
+	verb := "applied"
+	if data.Rollback {
+		verb = "rolled back"
+	}
+	fmt.Fprintf(sb, "\n**Status**: %s — %d of %d %s %s\n", word, applied, total, noun, verb)
 }
 
 // shardedChangeFraction counts the apply's changes and how many have landed. A
-// change is one (keyspace, table) unit or one VSchema update. A table counts
-// as applied once its aggregate reaches completed or the revert window — the
-// DDL has landed in both, and the table line already distinguishes them.
+// change is one (keyspace, table) unit or one VSchema update.
 func shardedChangeFraction(data ShardedApplyData) (applied, total int) {
 	for _, ks := range data.Keyspaces {
 		for _, t := range ks.Tables {
 			total++
-			status := state.NormalizeTaskStatus(t.Status)
-			if status == state.Task.Completed || status == state.Task.RevertWindow {
+			if shardedTableChangeLanded(t) {
 				applied++
 			}
 		}
@@ -260,6 +261,26 @@ func shardedChangeFraction(data ShardedApplyData) (applied, total int) {
 		}
 	}
 	return applied, total
+}
+
+// shardedTableChangeLanded reports whether a table's DDL has landed on every
+// shard: each one completed or holding in its revert window. The aggregate
+// status alone cannot prove this — it surfaces the most attention-worthy
+// shard, and a revert-window aggregate can sit above shards whose dispatch
+// wave has not started. Without per-shard statuses the aggregate is all there
+// is, so it decides.
+func shardedTableChangeLanded(t ShardedTableStatus) bool {
+	if len(t.Shards) == 0 {
+		status := state.NormalizeTaskStatus(t.Status)
+		return status == state.Task.Completed || status == state.Task.RevertWindow
+	}
+	for _, sh := range t.Shards {
+		status := state.NormalizeTaskStatus(sh.Status)
+		if status != state.Task.Completed && status != state.Task.RevertWindow {
+			return false
+		}
+	}
+	return true
 }
 
 // writeShardedSummaryMetadata writes the terminal metadata line — database,
