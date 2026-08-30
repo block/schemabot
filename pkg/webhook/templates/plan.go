@@ -3,12 +3,14 @@ package templates
 import (
 	"fmt"
 	"html"
+	"log/slog"
 	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -543,7 +545,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	// Count statement types (Terraform-style: X to create, Y to alter, Z to drop)
-	creates, alters, drops := countStatementTypes(data.Changes)
+	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
 
 	var parts []string
 	if creates > 0 {
@@ -554,6 +556,17 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
+	}
+	// Last-resort total: when nothing classified as create/alter/drop — a plan
+	// of only index or rename DDL, or per-shard-only DDL that
+	// countStatementTypes does not walk — report the raw statement total so
+	// the plan never reads as "no changes", and report it before the vschema
+	// clause so a vschema update never hides DDL the plan will run. A mixed
+	// plan with a non-zero typed count renders only the typed counts, so its
+	// untyped statements are not reflected here; SummarizeChanges shares this
+	// behavior, keeping the two surfaces in agreement.
+	if len(parts) == 0 && totalStatements > 0 {
+		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
 	}
 	if keyspacesWithVSchema > 0 && !data.IsMySQL {
 		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
@@ -656,7 +669,7 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // create/alter/drop and vschema counting is identical to the plan comment's
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
-	creates, alters, drops := countStatementTypes(data.Changes)
+	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
 	var parts []string
@@ -689,12 +702,26 @@ func SummarizeChanges(data PlanCommentData) string {
 	return ddlSummary
 }
 
-// countStatementTypes counts CREATE, ALTER, and DROP statements across all keyspaces.
-func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
+// countStatementTypes counts CREATE, ALTER, and DROP statements across all
+// keyspaces, classifying each statement with its own dialect's parser so DDL
+// is never judged under another family's grammar. A database type with no
+// registered parser, or a statement its parser rejects, contributes nothing
+// to the typed counts — the callers' raw statement-total fallbacks keep the
+// summary honest — and each case is logged so a miscounted summary is
+// triageable from server logs.
+func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops int) {
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		slog.Warn("plan summary cannot classify statements; the summary will report raw statement totals instead of create/alter/drop counts",
+			"database_type", databaseType, "error", err)
+		return 0, 0, 0
+	}
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
-			stmtType, _, err := ddl.ClassifyStatement(stmt)
+			stmtType, _, err := parser.Classify(stmt)
 			if err != nil {
+				slog.Warn("plan summary could not classify a statement; it is left out of the create/alter/drop counts",
+					"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)
 				continue
 			}
 			switch stmtType {
@@ -711,9 +738,18 @@ func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops i
 }
 
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
+	// The DDL blocks below format statements under the plan's own dialect so
+	// they are never reformatted under another family's grammar.
+	dialect := schema.DialectForDatabaseType(data.DatabaseType)
+
+	// PostgreSQL groups changes by schema, not keyspace, so it shares MySQL's
+	// "Schema Name" label and heading suppression; Vitess and Strata keep the
+	// keyspace vocabulary.
+	schemaNamespaces := data.IsMySQL || dialect == schema.DialectPostgres
+
 	// Skip the schema/keyspace heading when there's only one and it matches
 	// the database name — it's redundant with the metadata line.
-	singleKeyspace := len(data.Changes) == 1 && data.IsMySQL && data.Changes[0].Keyspace == data.Database
+	singleKeyspace := len(data.Changes) == 1 && schemaNamespaces && data.Changes[0].Keyspace == data.Database
 
 	// The VSchema diff budget is per comment, not per keyspace: split it
 	// across the keyspaces that will render a diff so a multi-keyspace plan
@@ -735,7 +771,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if !singleKeyspace {
 			label := "Keyspace"
-			if data.IsMySQL {
+			if schemaNamespaces {
 				label = "Schema Name"
 			}
 			fmt.Fprintf(sb, "#### %s: `%s`\n", label, ks.Keyspace)
@@ -752,19 +788,20 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
-				writeShardedPlanDDL(sb, ks.Shards)
+				writeShardedPlanDDL(sb, ks.Shards, dialect)
 			} else {
-				writePlanDDLBlock(sb, ks.Statements)
+				writePlanDDLBlock(sb, ks.Statements, dialect)
 			}
 		}
 	}
 }
 
-// writePlanDDLBlock writes a single fenced SQL block of statements.
-func writePlanDDLBlock(sb *strings.Builder, statements []string) {
+// writePlanDDLBlock writes a single fenced SQL block of statements, formatted
+// under the plan's own dialect.
+func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect) {
 	sb.WriteString("```sql\n")
 	for i, stmt := range statements {
-		sb.WriteString(ddl.FormatDDL(stmt))
+		sb.WriteString(ddl.FormatDDLForDialect(dialect, stmt))
 		if i < len(statements)-1 {
 			sb.WriteString("\n\n")
 		} else {
@@ -778,7 +815,7 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string) {
 // that need the same statements share one block, so a uniform keyspace shows the
 // DDL once and a divergent one shows "what applies where" — each distinct change
 // set with the shards it applies to.
-func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
+func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dialect schema.Dialect) {
 	groups := groupKeyspaceShardsByStatements(shards)
 	if len(groups) <= 1 {
 		// A single group of changing shards shows the DDL once, but still names the
@@ -788,7 +825,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 		// an empty code block.
 		if len(groups) == 1 && !groups[0].Satisfied {
 			writeShardGroupHeading(sb, groups[0].Shards, len(shards))
-			writePlanDDLBlock(sb, groups[0].Statements)
+			writePlanDDLBlock(sb, groups[0].Statements, dialect)
 		}
 		return
 	}
@@ -801,7 +838,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 			sb.WriteString("_Already applied — no change._\n\n")
 			continue
 		}
-		writePlanDDLBlock(sb, g.Statements)
+		writePlanDDLBlock(sb, g.Statements, dialect)
 	}
 }
 

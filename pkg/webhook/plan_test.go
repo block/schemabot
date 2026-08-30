@@ -741,10 +741,11 @@ func TestRenderMultiEnvPlanComment_CollapsesDDL(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
-			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -775,10 +776,11 @@ func TestRenderMultiEnvPlanComment_SingleChangeInline(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
-			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -805,11 +807,11 @@ func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testks",
 		IsMySQL:      false,
-		DatabaseType: "PlanetScale",
+		DatabaseType: "vitess",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
-			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
+			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "vitess", Changes: changes},
+			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "vitess", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}

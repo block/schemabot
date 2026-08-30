@@ -154,6 +154,28 @@ func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
 	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
 }
 
+// A plan whose DDL is only per-shard still reports its raw statement count in
+// the summary when the same plan also carries a vschema update — the vschema
+// clause must not hide DDL the plan will run.
+func TestRenderPlanComment_PerShardDDLCountedAlongsideVSchema(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "orders", Environment: "staging", DatabaseType: "vitess",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "orders_sharded",
+			// No namespace-level Statements — only per-shard.
+			Shards: []KeyspaceShardChange{
+				{Shard: "-80", Statements: []string{stmt}},
+				{Shard: "80-", Statements: []string{stmt}},
+			},
+			VSchemaChanged: true,
+			VSchemaDiff:    `{"tables": {"mutes": {}}}`,
+		}},
+	})
+
+	assert.Contains(t, out, "📋 **Plan**: 1 DDL statement, **1** vschema update")
+}
+
 // A uniform plan across a wide keyspace leads with how much of the keyspace
 // the change covers instead of walling the comment with every range: the
 // heading reads "all N shards" and the names stay reachable behind a

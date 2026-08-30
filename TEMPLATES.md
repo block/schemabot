@@ -828,6 +828,41 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="postgres-plan"></a><strong>Postgres Plan</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE sessions (
+    id uuid PRIMARY KEY,
+    user_id bigint NOT NULL,
+    payload jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE users
+    ADD COLUMN last_seen_at timestamptz,
+    ADD COLUMN preferences jsonb;
+```
+
+📋 **Plan**: **1** table to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="schema-change-apply-locked--options"></a><strong>Schema Change Apply (Locked + Options)</strong></summary>
 
 

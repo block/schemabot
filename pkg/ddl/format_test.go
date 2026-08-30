@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 func TestFormatDDL(t *testing.T) {
@@ -337,4 +339,63 @@ func TestSplitAlterClauses(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestFormatDDLForDialect(t *testing.T) {
+	t.Run("mysql dialect gets full FormatDDL treatment", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectMySQL,
+			"ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), DROP COLUMN `old_field`")
+		assert.Equal(t, "ALTER TABLE `users`\n"+
+			"    ADD COLUMN `email` varchar(255),\n"+
+			"    DROP COLUMN `old_field`;", got)
+	})
+
+	t.Run("postgres dialect renders its own canonical form", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"alter   table users\n  add column session_id uuid")
+		assert.Equal(t, "ALTER TABLE users ADD COLUMN session_id uuid;", got)
+	})
+
+	t.Run("postgres types are never mangled under the MySQL grammar", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE sessions (id uuid PRIMARY KEY, payload jsonb, created_at timestamptz)")
+		assert.Contains(t, got, "uuid")
+		assert.Contains(t, got, "jsonb")
+		assert.NotContains(t, got, "`")
+	})
+
+	t.Run("postgres CREATE TABLE is line-broken like the MySQL layout", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE sessions (id uuid PRIMARY KEY, payload jsonb, created_at timestamptz)")
+		assert.Equal(t, "CREATE TABLE sessions (\n"+
+			"    id uuid PRIMARY KEY,\n"+
+			"    payload jsonb,\n"+
+			"    created_at timestamptz\n"+
+			");", got)
+	})
+
+	t.Run("postgres multi-clause ALTER renders one clause per line", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"alter table users add column a integer, add column b text")
+		assert.Equal(t, "ALTER TABLE users\n"+
+			"    ADD COLUMN a int,\n"+
+			"    ADD COLUMN b text;", got)
+	})
+
+	t.Run("postgres DROP COLUMN keeps the explicit COLUMN keyword", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"ALTER TABLE public.users DROP COLUMN legacy")
+		assert.Equal(t, "ALTER TABLE public.users DROP COLUMN legacy;", got)
+	})
+
+	t.Run("statement the dialect parser rejects renders as-is", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres, "THIS IS NOT SQL")
+		assert.Equal(t, "THIS IS NOT SQL;", got)
+	})
+
+	t.Run("dialect with no registered parser renders as-is", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.Dialect("customengine"),
+			"CREATE TABLE t (id INT);")
+		assert.Equal(t, "CREATE TABLE t (id INT);", got)
+	})
 }
