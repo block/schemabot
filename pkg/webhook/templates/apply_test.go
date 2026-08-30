@@ -967,7 +967,7 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 	assert.Contains(t, result, "lock wait timeout exceeded")
 	assert.Contains(t, result, "🟥") // red bar for failed table
 	assert.Contains(t, result, "❌ Failed")
-	assert.Contains(t, result, "⊘ Cancelled (not started)")
+	assert.Contains(t, result, "🚫 Cancelled (not started)")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/3 complete")
 	assert.Contains(t, result, "1 failed")

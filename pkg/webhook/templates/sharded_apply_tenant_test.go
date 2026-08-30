@@ -31,8 +31,8 @@ func TestShardedApplyHintsCarryTenant(t *testing.T) {
 				Keyspaces: []ShardedKeyspace{{
 					Keyspace: "cdb_resolute_sharded",
 					Shards: []ShardStatus{
-						{Shard: "-40", Emoji: "⏸", Label: "stopped", State: state.ApplyOperation.Stopped},
-						{Shard: "80-", Emoji: "⏸", Label: "stopped", State: state.ApplyOperation.Stopped},
+						{Shard: "-40", Emoji: "⏹️", Label: "stopped", State: state.ApplyOperation.Stopped},
+						{Shard: "80-", Emoji: "⏹️", Label: "stopped", State: state.ApplyOperation.Stopped},
 					},
 					Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
 				}},

@@ -849,7 +849,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**`%s`**: \u2298 Cancelled (not started)\n", table.TableName)
+		fmt.Fprintf(sb, "**`%s`**: 🚫 Cancelled (not started)\n", table.TableName)
 		writeDDLLine(sb, dialect, table.DDL)
 
 	case state.Task.RevertWindow:
@@ -1661,7 +1661,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 		return "⏹️"
 	}
 	if states[state.Task.Cancelled] && !states[state.Task.Completed] {
-		return "⊘"
+		return "🚫"
 	}
 	return "✅"
 }

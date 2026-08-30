@@ -418,7 +418,7 @@ func FormatProgressState(s string) string {
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
-		return ANSIOrange + "⏸️  Stopped" + ANSIReset
+		return ANSIOrange + "⏹️  Stopped" + ANSIReset
 	case state.Apply.Cancelled:
 		return ANSIOrange + "🚫 Cancelled" + ANSIReset
 	case state.Apply.RevertWindow:
@@ -650,9 +650,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🚫 Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
 		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: 🚫 Cancelled (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
@@ -838,7 +838,7 @@ type StopData struct {
 
 // WriteStopSuccess writes the stop command success output.
 func WriteStopSuccess(data StopData) {
-	fmt.Printf("%s%s⏸️  Schema change stopped%s\n", ANSIBold, ANSIYellow, ANSIReset)
+	fmt.Printf("%s%s⏹️  Schema change stopped%s\n", ANSIBold, ANSIYellow, ANSIReset)
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)

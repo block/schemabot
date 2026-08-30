@@ -324,7 +324,7 @@ func TestWatchModel_MultiDeploymentView(t *testing.T) {
 		"External operation ID: remote-op-us-east-test",
 		"External apply ID: remote-apply-us-east-test",
 		"❌ eu-west — failed (orders-eu-west)",
-		"⏸ ap-south — halted — eu-west failed (orders-ap-south)",
+		"⏸️ ap-south — halted — eu-west failed (orders-ap-south)",
 	)
 	assert.Contains(t, view, "duplicate key name 'idx_orders_source'")
 	assert.Contains(t, view, "orders")

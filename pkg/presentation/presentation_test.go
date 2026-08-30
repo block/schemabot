@@ -81,9 +81,9 @@ func TestDeriveDeployment_StateLabels(t *testing.T) {
 		{so.CuttingOver, StateCuttingOver, "cutting over", "🔁", true},
 		{so.Failed, StateFailed, "failed", "❌", true},
 		{so.FailedRetryable, StateRetrying, "retrying", "🔁", true},
-		{so.Stopped, StateStopped, "stopped — resume to continue", "⏸", true},
+		{so.Stopped, StateStopped, "stopped — resume to continue", "⏹️", true},
 		{so.RevertWindow, StateRevertWindow, "in revert window", "⏳", true},
-		{so.Cancelled, StateCancelled, "cancelled", "⛔", false},
+		{so.Cancelled, StateCancelled, "cancelled", "🚫", false},
 		{so.Reverted, StateReverted, "reverted", "↩️", false},
 		{"some_engine_state", StateUnknown, "some_engine_state", "", true},
 	}

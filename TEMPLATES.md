@@ -1572,7 +1572,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`**: ⊘ Cancelled (not started)
+**`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -3908,13 +3908,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: ⊘ Cancelled (not started)
+**`users`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: ⊘ Cancelled (not started)
+**`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -3961,7 +3961,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`**: ⊘ Cancelled (not started)
+**`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -4003,13 +4003,13 @@ ALTER TABLE `orders` MODIFY COLUMN `status` enum('NEW','PENDING','SHIPPED','DELI
 ```
 > ❌ Last error: preflight enumReorder check failed: reordering existing ENUM values on column `status` is unsafe: retained values must keep their relative order and new values must be appended at the end
 
-**`users`**: ⊘ Cancelled (not started)
+**`users`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-**`products`**: ⊘ Cancelled (not started)
+**`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -4119,7 +4119,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: ⊘ Cancelled (not started)
+**`users`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -5140,7 +5140,7 @@ ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 ```
 
 
-### ⊘ analytics
+### 🚫 analytics
 
 **`events`** — Cancelled
 ```sql
@@ -5734,10 +5734,10 @@ Sequential mode: First table failed (others cancelled)
      ~ users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-     ~ orders: ⊘ Cancelled (not started)
+     ~ orders: 🚫 Cancelled (not started)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: ⊘ Cancelled (not started)
+     ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
@@ -5770,7 +5770,7 @@ Sequential mode: Middle table failed
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-     ~ products: ⊘ Cancelled (not started)
+     ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
@@ -6148,7 +6148,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-     ~ orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⊘ Cancelled at 30%
+     ~ orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🚫 Cancelled at 30%
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
@@ -6698,7 +6698,7 @@ ESC detach • s stop • v volume
 
 Stop command: User runs 'schemabot stop -e staging <apply_id>'
 
-⏸️  Schema change stopped
+⏹️  Schema change stopped
 
 Database:    myapp
 Environment: staging
@@ -7059,8 +7059,8 @@ schemabot apply -e production
 
 - ✅ eu — completed
 - ❌ us — failed
-- ⏸ au — halted — us failed
-- ⏸ ca — halted — us failed
+- ⏸️ au — halted — us failed
+- ⏸️ ca — halted — us failed
 
 <details>
 <summary>✅ eu — completed</summary>
@@ -7122,7 +7122,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`products`**: ⊘ Cancelled (not started)
+**`products`**: 🚫 Cancelled (not started)
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -7141,14 +7141,14 @@ schemabot apply -e production
 </details>
 
 <details open>
-<summary>⏸ au — halted — us failed</summary>
+<summary>⏸️ au — halted — us failed</summary>
 
 _No details available yet._
 
 </details>
 
 <details open>
-<summary>⏸ ca — halted — us failed</summary>
+<summary>⏸️ ca — halted — us failed</summary>
 
 _No details available yet._
 
@@ -7420,8 +7420,8 @@ schemabot apply -e production
 
 - ✅ eu — completed
 - ❌ us — failed
-- ⏸ au — halted — us failed
-- ⏸ ca — halted — us failed
+- ⏸️ au — halted — us failed
+- ⏸️ ca — halted — us failed
 
 <details>
 <summary>✅ eu — completed</summary>
@@ -7497,14 +7497,14 @@ schemabot apply -e production
 </details>
 
 <details open>
-<summary>⏸ au — halted — us failed</summary>
+<summary>⏸️ au — halted — us failed</summary>
 
 _No details available yet._
 
 </details>
 
 <details open>
-<summary>⏸ ca — halted — us failed</summary>
+<summary>⏸️ ca — halted — us failed</summary>
 
 _No details available yet._
 
@@ -7713,9 +7713,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
-| `40-80` | ⏸ halted — -40 failed |
-| `80-c0` | ⏸ halted — -40 failed |
-| `c0-` | ⏸ halted — -40 failed |
+| `40-80` | ⏸️ halted — -40 failed |
+| `80-c0` | ⏸️ halted — -40 failed |
+| `c0-` | ⏸️ halted — -40 failed |
 
 ---
 
@@ -7865,9 +7865,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
-| `40-80` | ⏸ halted — -40 failed |
-| `80-c0` | ⏸ halted — -40 failed |
-| `c0-` | ⏸ halted — -40 failed |
+| `40-80` | ⏸️ halted — -40 failed |
+| `80-c0` | ⏸️ halted — -40 failed |
+| `c0-` | ⏸️ halted — -40 failed |
 
 ### VSchema
 
@@ -7958,9 +7958,9 @@ schemabot apply -e production
        ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
 
 
-⏸ ap-south — halted — eu-west failed (orders-ap-south)
+⏸️ ap-south — halted — eu-west failed (orders-ap-south)
 
-     ~ orders: ⊘ Cancelled (not started)
+     ~ orders: 🚫 Cancelled (not started)
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
 
 
@@ -8163,10 +8163,10 @@ Sequential mode: First table failed (others cancelled)
      ~ users: 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-     ~ orders: ⊘ Cancelled (not started)
+     ~ orders: 🚫 Cancelled (not started)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
 
-     ~ products: ⊘ Cancelled (not started)
+     ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 
@@ -8199,7 +8199,7 @@ Sequential mode: Middle table failed
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-     ~ products: ⊘ Cancelled (not started)
+     ~ products: 🚫 Cancelled (not started)
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
 
 

@@ -48,7 +48,7 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 		ApplyID: "apply-x",
 		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-			{Shard: "80-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏸️", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
 		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
@@ -282,14 +282,14 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 		ApplyID: "apply-x",
 		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-			{Shard: "80-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏸️", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
 		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
 	assert.NotContains(t, out, "Applied successfully", "a failed apply writes no success line")
 	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
-	assert.Contains(t, out, "| `80-` | ⏸ halted — -40 failed |", "halted siblings keep their final state in the results")
+	assert.Contains(t, out, "| `80-` | ⏸️ halted — -40 failed |", "halted siblings keep their final state in the results")
 	assert.Contains(t, out, "To retry:")
 }
 
