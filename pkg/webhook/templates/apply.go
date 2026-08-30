@@ -632,7 +632,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 	}
 	sb.WriteString("\n")
 
-	dialect := dialectForEngine(data.Engine)
+	dialect := dialectForEngine(data.Engine, data.ApplyID)
 
 	for _, group := range groupTablesByNamespace(data.Tables) {
 		// Label the group by namespace when one is set. The bold metadata-style
@@ -1124,15 +1124,23 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 // comment data carries engine names, database types, and display-cased
 // variants ("postgres", "PostgreSQL", "Spirit", "vitess"), so the match is
 // case-insensitive and accepts both Postgres spellings; every other value
-// drives a MySQL-protocol target. MySQL is also the fallback for an empty or
-// unrecognized value, preserving the established rendering for legacy engine
-// values. This is a display concern — system-schema classification uses
-// schema.DialectForDatabaseType, which treats unknown values conservatively.
-func dialectForEngine(engine string) schema.Dialect {
+// drives a MySQL-protocol target. MySQL is also the fallback for an empty
+// value — rows that predate the engine field — and for a value outside the
+// known set, which warns with the apply identifier: an unset or corrupted
+// engine on a Postgres apply renders its DDL under the wrong grammar, and
+// that must be triageable from logs. This is a display concern —
+// system-schema classification uses schema.DialectForDatabaseType, which
+// treats unknown values conservatively.
+func dialectForEngine(engine, applyID string) schema.Dialect {
 	switch strings.ToLower(strings.TrimSpace(engine)) {
 	case storage.EnginePostgres, "postgresql":
 		return schema.DialectPostgres
+	case storage.EngineSpirit, storage.EnginePlanetScale, storage.EngineStrata,
+		storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, "":
+		return schema.DialectMySQL
 	}
+	slog.Warn("unrecognized engine value on apply comment; DDL will render under the MySQL grammar",
+		"engine", engine, "apply_id", applyID)
 	return schema.DialectMySQL
 }
 
@@ -1529,7 +1537,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		return
 	}
 
-	dialect := dialectForEngine(data.Engine)
+	dialect := dialectForEngine(data.Engine, data.ApplyID)
 
 	// Order: failed/stopped/reverted first, then completed, then cancelled, then any remaining
 	included := make(map[int]bool)

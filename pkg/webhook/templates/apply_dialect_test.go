@@ -30,7 +30,7 @@ func TestDialectForEngine(t *testing.T) {
 		{"unknown", schema.DialectMySQL},
 	}
 	for _, tc := range tests {
-		assert.Equal(t, tc.want, dialectForEngine(tc.engine), "engine %q", tc.engine)
+		assert.Equal(t, tc.want, dialectForEngine(tc.engine, "apply-test"), "engine %q", tc.engine)
 	}
 }
 
