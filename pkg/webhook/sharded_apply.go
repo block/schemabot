@@ -300,7 +300,10 @@ func isFinalizerFailureState(opState string) bool {
 // names repeat across keyspaces (every unsharded keyspace's shard is "-") and
 // an ordering label naming a bare duplicate shard would be ambiguous. The
 // status row's own Shard stays the plain name either way — it renders under
-// its keyspace heading.
+// its keyspace heading. Either way the identity is unique across groups —
+// bare names are unique within a single keyspace, qualified names are unique
+// by construction — so results key back to their groups by identity rather
+// than by output position.
 func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
 	inputs := make([]presentation.Operation, 0, len(groups))
 	for _, g := range groups {
@@ -322,9 +325,22 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, rele
 		})
 	}
 	derived := presentation.Derive(inputs).Deployments
+	byIdentity := make(map[string]presentation.Deployment, len(derived))
+	for _, d := range derived {
+		byIdentity[d.Deployment] = d
+	}
 	out := make(map[string][]templates.ShardStatus, len(groups))
-	for i, d := range derived {
-		g := groups[i]
+	for i, g := range groups {
+		d, ok := byIdentity[inputs[i].Deployment]
+		if !ok {
+			// Derive returns one deployment per input operation with its
+			// identity preserved; a missing identity means that contract broke.
+			// Omit the row rather than render some other shard's status under
+			// this shard's name.
+			slog.Warn("sharded apply comment will omit a shard status row: presentation returned no deployment for identity",
+				"identity", inputs[i].Deployment, "keyspace", g.namespace, "shard", g.shard)
+			continue
+		}
 		out[g.namespace] = append(out[g.namespace], templates.ShardStatus{
 			Shard: g.shard,
 			Emoji: d.Emoji,
