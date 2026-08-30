@@ -627,3 +627,25 @@ func TestBuildShardedApplyData_TableAggregateAndOrder(t *testing.T) {
 	require.Len(t, data.Keyspaces[1].Tables, 1)
 	assert.Equal(t, "aliases", data.Keyspaces[1].Tables[0].Table)
 }
+
+// Under wave dispatch, landed shards hold in their revert window while later
+// waves are still queued. The table aggregate surfaces the queued work — the
+// table still has a whole copy ahead of it — not the landed shards' hold
+// state, so a mid-rollout table never reads as complete.
+func TestBuildShardedApplyData_PendingOutranksRevertWindow(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "contacts_sharded/-40/entries", state.ApplyOperation.RevertWindow),
+		mk(2, "contacts_sharded/40-/entries", state.ApplyOperation.Pending),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	assert.Equal(t, state.Task.Pending, data.Keyspaces[0].Tables[0].Status,
+		"an undispatched shard outranks a sibling holding in its revert window")
+}

@@ -14,11 +14,12 @@ import (
 // out across the shards of one or more keyspaces within one deployment. Its unit
 // of work is one operation per (shard, table). The applied comment shows shard
 // status only — the DDL is already shown in the plan and apply-gate comments, so
-// it is not repeated here. Shards are still grouped by their change signature so
-// a divergent apply (shards that drifted to different changes) shows which shards
-// moved together: a uniform keyspace renders one status table, a divergent one
-// renders a labelled status group per distinct change set. This is distinct from
-// the multi-deployment comment, whose unit is the deployment.
+// it is not repeated here. Each keyspace renders as per-table rollup lines;
+// per-shard status tables are exception detail, appearing only when the keyspace
+// needs shard-level attention (see writeShardKeyspaceSections), grouped by
+// change signature when shards diverge so a divergent apply shows which shards
+// moved together. This is distinct from the multi-deployment comment, whose unit
+// is the deployment.
 type ShardedApplyData struct {
 	// State is the aggregate apply state (state.Apply.*), driving the headline.
 	State string
@@ -138,9 +139,9 @@ type shardGroup struct {
 // RenderShardedApplyComment renders the PR comment for a sharded apply: the
 // shared apply header and metadata, a per-shard count histogram across every
 // keyspace, the first failed shard's error lifted to the top, then a section
-// per keyspace with its shards grouped by change signature — a single group
-// renders one status table; more than one renders a labelled status group per
-// distinct change set. The comment is status-only; the DDL is shown in the
+// per keyspace with its per-table rollup lines, adding per-shard status tables
+// (grouped by change signature when shards diverge) only where a keyspace
+// needs shard detail. The comment is status-only; the DDL is shown in the
 // plan and apply-gate comments, not repeated here.
 func RenderShardedApplyComment(data ShardedApplyData) string {
 	var sb strings.Builder
@@ -166,8 +167,9 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 // terminal sharded apply — the shard-unit analogue of RenderApplySummaryComment.
 // It leads with the state-specific verdict header and outcome line every other
 // apply shape's summary shares, then carries the same shard rollup the status
-// comment shows (counts, first failure, per-shard tables grouped by change
-// signature) so the outcome record names every shard's final state.
+// comment shows: counts, first failure, and per-table rollup lines, with
+// per-shard status tables wherever a keyspace's outcome needs shard detail —
+// a failure, divergent change signatures, or divergent shard outcomes.
 func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 	var sb strings.Builder
 
@@ -271,16 +273,28 @@ func shardedChangeFraction(data ShardedApplyData) (applied, total int) {
 // is, so it decides.
 func shardedTableChangeLanded(t ShardedTableStatus) bool {
 	if len(t.Shards) == 0 {
-		status := state.NormalizeTaskStatus(t.Status)
-		return status == state.Task.Completed || status == state.Task.RevertWindow
+		return shardChangeLanded(t.Status)
 	}
-	for _, sh := range t.Shards {
-		status := state.NormalizeTaskStatus(sh.Status)
-		if status != state.Task.Completed && status != state.Task.RevertWindow {
-			return false
+	return landedShardCount(t.Shards) == len(t.Shards)
+}
+
+// shardChangeLanded reports whether one shard's status means the table's DDL is
+// in place on that shard: completed, or applied and holding in its revert
+// window.
+func shardChangeLanded(status string) bool {
+	normalized := state.NormalizeTaskStatus(status)
+	return normalized == state.Task.Completed || normalized == state.Task.RevertWindow
+}
+
+// landedShardCount counts the shards where the table's change has landed.
+func landedShardCount(shards []ShardProgressData) int {
+	n := 0
+	for _, sh := range shards {
+		if shardChangeLanded(sh.Status) {
+			n++
 		}
 	}
-	return true
+	return n
 }
 
 // writeShardedSummaryMetadata writes the terminal metadata line — database,
@@ -304,18 +318,28 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 // flight. The section shows status only: the DDL (what changes) is already
 // shown in the plan and apply-gate comments, so repeating it here adds nothing.
 // Per-shard status tables are exception detail — they render only when the
-// keyspace needs them: a shard in a failure state (the failed shard and its
-// halted siblings need naming), shards that diverge by change signature (which
-// shards moved together is invisible at the table altitude), or a keyspace
-// carrying no table rollup to stand in for them.
+// keyspace needs them: a shard failure anywhere in the apply (the failed shard
+// and its halted siblings need naming, and a halted sibling can sit in another
+// keyspace, whose rows carry the attribution), shards that diverge by change
+// signature (which shards moved together is invisible at the table level),
+// divergent shard outcomes (the split the operator reconciles shard by shard),
+// or a keyspace carrying no table rollup to stand in for them.
 func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace) {
+	applyHasShardFailure := false
+	for _, ks := range keyspaces {
+		if keyspaceHasShardFailure(ks.Shards) {
+			applyHasShardFailure = true
+			break
+		}
+	}
 	for _, ks := range keyspaces {
 		fmt.Fprintf(sb, "\n#### Keyspace `%s`\n\n", ks.Keyspace)
 		for _, t := range ks.Tables {
 			writeShardedTableLine(sb, t)
 		}
+		needsShardDetail := applyHasShardFailure || keyspaceHasDivergentOutcome(ks.Shards)
 		groups := groupShardsBySignature(ks.Shards, ks.Cells)
-		if len(ks.Tables) > 0 && len(groups) <= 1 && !keyspaceHasShardFailure(ks.Shards) {
+		if len(ks.Tables) > 0 && len(groups) <= 1 && !needsShardDetail {
 			continue
 		}
 		if len(groups) <= 1 {
@@ -342,15 +366,46 @@ func keyspaceHasShardFailure(shards []ShardStatus) bool {
 	return false
 }
 
+// keyspaceHasDivergentOutcome reports whether the keyspace's shards split
+// between shards where the change landed (completed or holding in the revert
+// window) and shards where it terminally did not (cancelled, reverted, or
+// stopped). That split is a schema divergence the operator reconciles shard by
+// shard, so it promotes the per-shard status table.
+func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
+	landed, missed := false, false
+	for _, s := range shards {
+		switch {
+		case state.IsState(s.State, state.ApplyOperation.Completed, state.ApplyOperation.RevertWindow):
+			landed = true
+		case state.IsState(s.State, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted, state.ApplyOperation.Stopped):
+			missed = true
+		}
+	}
+	return landed && missed
+}
+
 // writeShardedTableLine writes one table's rollup line — the table name and its
 // aggregate state phrase, with the shard count on a completed sharded table —
 // followed by the compact per-shard summary while the table is in flight. The
 // aggregate carries no single percent (each shard copies at its own pace), so
 // the line names the phase and the shard summary carries the per-shard
-// percents.
+// percents. When the aggregate is a quiet state (no shard-summary breakdown)
+// but the change has already landed on some shards — a partially-landed table
+// between dispatch waves, or one cancelled after part of the fleet applied —
+// the line states the landed coverage so the aggregate phrase alone never
+// hides or contradicts work that happened.
 func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 	status := state.NormalizeTaskStatus(t.Status)
-	line := fmt.Sprintf("**`%s`**: %s", t.Table, shardedTableStatusPhrase(status))
+	phrase := shardedTableStatusPhrase(status)
+	if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
+		if status == state.Task.Cancelled {
+			// The pure-cancelled parenthetical ("not started") would be false
+			// here: the change is live on the landed shards.
+			phrase = "⊘ Cancelled"
+		}
+		phrase += fmt.Sprintf(" — applied on %d of %d shards", landed, len(t.Shards))
+	}
+	line := fmt.Sprintf("**`%s`**: %s", t.Table, phrase)
 	if status == state.Task.Completed && len(t.Shards) > 1 {
 		line += fmt.Sprintf(" (%d shards)", len(t.Shards))
 	}
@@ -395,6 +450,10 @@ func shardedTableStatusPhrase(status string) string {
 		return "Complete (revert window open)"
 	case state.Task.Reverting:
 		return "↩️ Reverting"
+	case state.Task.Reverted:
+		return "↩️ Reverted"
+	case state.Task.WaitingForDeploy:
+		return "🟡 Waiting for deploy"
 	default:
 		return "🔄 In progress"
 	}

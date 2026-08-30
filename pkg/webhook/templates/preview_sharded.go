@@ -169,6 +169,40 @@ func PreviewCommentShardedSummaryFailed() string {
 	})
 }
 
+// PreviewCommentShardedSummaryCancelledPartial renders the terminal summary
+// for a sharded apply cancelled after part of the fleet landed: the table line
+// states the landed coverage and the divergent outcome promotes the per-shard
+// status table, so the outcome record names which shards carry the change and
+// which do not.
+func PreviewCommentShardedSummaryCancelledPartial() string {
+	return RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Cancelled, Environment: "production", Database: "cdb_resolute",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		RequestedBy: previewRequestedBy,
+		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Cancelled,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Completed},
+					{Shard: "40-80", Status: state.Task.Completed},
+					{Shard: "80-c0", Status: state.Task.Cancelled},
+					{Shard: "c0-", Status: state.Task.Cancelled},
+				},
+			}},
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Completed},
+				{Deployment: "40-80", State: state.ApplyOperation.Completed},
+				{Deployment: "80-c0", State: state.ApplyOperation.Cancelled},
+				{Deployment: "c0-", State: state.ApplyOperation.Cancelled},
+			}),
+			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		}},
+	})
+}
+
 // PreviewCommentShardedApplyDivergent renders a sharded apply whose shards
 // diverged (one shard's combined ALTER also adds a column), grouped by change.
 func PreviewCommentShardedApplyDivergent() string {

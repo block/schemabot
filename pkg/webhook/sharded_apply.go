@@ -436,7 +436,10 @@ func aggregateTableStatus(shards []templates.ShardProgressData) string {
 // taskStateRank orders task states by how much they demand attention — the
 // task-vocabulary analogue of shardStateRank, normalizing first so operation
 // states fed through the no-task fallback rank the same way. Failure ranks
-// highest; completed lowest; an unknown state ranks with pending.
+// highest, then active work, then paused and queued work, then the settled
+// states. Pending outranks the revert window, matching deriveOverallState's
+// precedence: a table with undispatched shards still has work ahead of it,
+// however its landed shards hold, so the aggregate must not read as complete.
 func taskStateRank(s string) int {
 	switch state.NormalizeTaskStatus(s) {
 	case state.Task.Failed:
@@ -463,10 +466,10 @@ func taskStateRank(s string) int {
 		return 7
 	case state.Task.Stopped:
 		return 6
-	case state.Task.RevertWindow:
-		return 5
 	case state.Task.Pending:
-		return 3
+		return 5
+	case state.Task.RevertWindow:
+		return 4
 	case state.Task.Cancelled:
 		return 2
 	case state.Task.Reverted:
@@ -474,7 +477,10 @@ func taskStateRank(s string) int {
 	case state.Task.Completed:
 		return 0
 	default:
-		return 3
+		// NormalizeTaskStatus maps unrecognized statuses to Task.Running, so
+		// this arm is reachable only if that mapping changes; rank it the same
+		// way so an unknown state still reads as active work.
+		return 14
 	}
 }
 
