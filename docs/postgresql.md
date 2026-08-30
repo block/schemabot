@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [Supported changes](#supported-changes)
+  - [Greenfield tables](#greenfield-tables)
   - [Partitioned tables](#partitioned-tables)
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
@@ -31,13 +32,20 @@ satisfy all of these conditions:
 
 - pg-sprite classifies the statement for native execution.
 - The statement is an `ALTER TABLE` shape accepted by pg-sprite's
-  privilege-tier check. Other statement kinds fail closed.
-- The target is an ordinary or partitioned table and its measured on-disk
-  size is no more than the configured native-apply ceiling (1 GiB by
-  default; see `postgres.native_safe_table_size_limit_bytes` in
+  privilege-tier check, or a greenfield `CREATE TABLE`
+  (see [Greenfield tables](#greenfield-tables)). Other statement kinds fail
+  closed.
+- For a change to an existing table, the target is an ordinary or partitioned
+  table and its measured on-disk size is no more than the configured
+  native-apply ceiling (1 GiB by default; see
+  `postgres.native_safe_table_size_limit_bytes` in
   [configuration](configuration.md)). For a partitioned parent, the
-  measurement includes its complete partition tree.
+  measurement includes its complete partition tree. The ceiling bounds
+  rewrites of existing data, so it does not apply to a `CREATE TABLE`: a
+  table that does not exist yet has none.
 - The target role passes the privilege preflight for the planned statement.
+  A greenfield create is checked against the schema — the role needs `CREATE`
+  on the target schema — because no table exists to state facts about.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:
@@ -69,6 +77,31 @@ is recorded as retryable, but a retry cannot succeed. Do not include index
 builds in a PostgreSQL change until the apply path executes them outside a
 transaction.
 
+### Greenfield tables
+
+A `CREATE TABLE` for a table that does not exist on the target plans as a
+native statement and executes through pg-sprite's create path. The two facts
+the create depends on are proved in the session that executes, not at plan
+time, because absence or privilege at plan time proves nothing about apply
+time: the role holds `CREATE` on the target schema, and the name is free. A
+relation of any kind already occupying the name is a permanent refusal
+directing a re-plan against the current schema, as is a target schema that
+does not exist.
+
+The create path refuses shapes whose outcome it cannot prove, each
+permanently: `IF NOT EXISTS` (its no-op outcome cannot be proven),
+`CREATE TABLE ... PARTITION OF` attaching a partition to a live parent, and a
+statement that claims the same relation name twice.
+
+Declare a new table without secondary indexes. A schema file that declares a
+new table together with its indexes plans the create and each index build as
+separate statements, and every statement other than the create is blocked at
+plan time with its dependency on the table's creation as the reason — and a
+blocked statement blocks the whole plan. Index builds also cannot complete on
+the current apply path, as described above. Land the bare `CREATE TABLE`
+first; a later change against the then-existing table plans on its own
+merits.
+
 ### Partitioned tables
 
 The target preflight accepts ordinary tables, leaf partitions, and partitioned
@@ -85,8 +118,9 @@ SchemaBot blocks every planner verdict that is not a native execution verdict.
 This includes changes that require copy-and-swap, require a rewrite before
 they can be planned safely, are refused by pg-sprite, or carry an unrecognized
 planner contract or verdict. A native verdict is also blocked when its
-statement shape is outside the `ALTER TABLE` and `CREATE INDEX` set accepted
-by the apply path's shape check. The admitted set is defined by the pinned
+statement shape is outside the `ALTER TABLE`, `CREATE TABLE`, and
+`CREATE INDEX` set accepted by the apply path's shape check. The admitted set
+is defined by the pinned
 pg-sprite version, not by SchemaBot: when a pg-sprite upgrade widens the
 shapes its engine executes, SchemaBot's plan and apply gates widen with the
 pin, with no SchemaBot code change. That shape check admits `CREATE INDEX`,
@@ -99,9 +133,8 @@ attempt is rejected before any apply or task is queued. Rewrite the declarative
 change into an eligible form or use a separately reviewed operational process;
 flags do not override an engine-blocked verdict.
 
-`CREATE TABLE` is not supported by the current apply path. Adding a new table
-therefore produces a blocked plan. The engine also does not execute `DROP
-TABLE` or other statement kinds outside its admitted set.
+The engine does not execute `DROP TABLE` or other statement kinds outside its
+admitted set.
 
 ## Apply-time refusals
 
@@ -111,9 +144,14 @@ change or that depend on the target:
 - A table larger than the configured ceiling is refused permanently. This is
   SchemaBot's native-apply ceiling, not a PostgreSQL limit. It defaults to
   1 GiB and is set with `postgres.native_safe_table_size_limit_bytes`; see
-  [configuration](configuration.md) for the trade-offs of raising it.
-- A missing target, or an object that is not an ordinary or partitioned table,
-  is refused permanently.
+  [configuration](configuration.md) for the trade-offs of raising it. The
+  ceiling gates changes to existing tables only; a `CREATE TABLE` is exempt.
+- For a change to an existing table: a missing target, or an object that is
+  not an ordinary or partitioned table, is refused permanently.
+- For a `CREATE TABLE`: a relation of any kind already occupying the name, a
+  missing target schema, a duplicate name inside the statement, `IF NOT
+  EXISTS`, and `PARTITION OF` against a live parent are each refused
+  permanently, with a reason directing a fix or a re-plan.
 - Insufficient privileges are refused permanently before DDL runs. The stored
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
@@ -182,7 +220,8 @@ multi-host DSNs and whenever the deployment requires a stronger verification
 mode or custom certificate settings.
 
 For apply, the target role must be able to connect to the database, use the
-target schema, and act as the table owner for in-place `ALTER TABLE`.
+target schema, and act as the table owner for in-place `ALTER TABLE`. A
+greenfield `CREATE TABLE` instead requires `CREATE` on the target schema.
 SchemaBot checks the tier required by the exact planned statement and refuses
 before execution with specific provisioning advice when the role is
 insufficient.
