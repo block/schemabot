@@ -170,11 +170,22 @@ type refusal struct {
 // surfaces. A nil result means the failure is operational — a retry may
 // succeed once conditions change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
-// with concurrent lock holders. Every detail string here is built from typed
-// error fields and identifiers, never from wrapped server output; fields
-// that embed database-sourced identifiers are sanitized before they leave,
-// so a detail is safe to render on operator-facing surfaces.
+// with concurrent lock holders. Every detail string is built from typed
+// error fields and identifiers, never from wrapped server output, and every
+// detail is sanitized at this single exit — a refusal is safe to render on
+// operator-facing surfaces by construction, whichever branch produced it.
 func classifyRefusal(err error, table string) *refusal {
+	r := refusalForCause(err, table)
+	if r == nil {
+		return nil
+	}
+	r.detail = sanitizeReasonText(r.detail)
+	return r
+}
+
+// refusalForCause holds classifyRefusal's cause-to-refusal mapping; details
+// leave unsanitized and classifyRefusal sanitizes them at its return.
+func refusalForCause(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
 		detail := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
@@ -182,7 +193,7 @@ func classifyRefusal(err error, table string) *refusal {
 		if privilegeErr.Hint != "" {
 			detail += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: sanitizeReasonText(detail)}
+		return &refusal{reason: "insufficient-privileges", detail: detail}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
