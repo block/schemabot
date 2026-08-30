@@ -36,11 +36,8 @@ func progressSymbol(changeType string) string {
 	}
 }
 
-// formatProgressDDL renders a DDL statement with syntax highlighting, indented under the table name.
-func formatProgressDDL(rawDDL string) string {
-	return formatProgressDDLForDialect(schema.DialectMySQL, rawDDL)
-}
-
+// formatProgressDDLForDialect renders a DDL statement under the dialect's own
+// grammar with syntax highlighting, indented under the table name.
 func formatProgressDDLForDialect(dialect schema.Dialect, rawDDL string) string {
 	if rawDDL == "" {
 		return ""
