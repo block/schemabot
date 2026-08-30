@@ -1251,12 +1251,17 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 	ps.lastProgressLog = now
 }
 
-// syncAtomicTaskProgress updates all tasks with engine state and per-table
-// progress. Every task ends its tick with a persisted write, even when no
-// field moved: the operator reads tasks.updated_at as the drive's liveness
-// signal (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing,
-// so the write must stay unconditional — including through parked states such
-// as deferred cutovers and revert windows, where nothing changes tick to tick.
+// syncAtomicTaskProgress projects one grouped progress poll onto every task of
+// the apply. A poll carries two separable things, and each task takes them
+// through a separate helper: the fields the operator sees, which a poll may
+// always refresh, and the state the poll claims for the task, which is a
+// correctness decision.
+//
+// Every task ends its tick with a persisted write, even when no field moved:
+// the operator reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing, so the
+// write must stay unconditional — including through parked states such as
+// deferred cutovers and revert windows, where nothing changes tick to tick.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
@@ -1271,56 +1276,108 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 		if retryableFailure && state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		engineTaskState := newState
-		if tp, ok := tableProgress.ForTask(task); ok {
-			task.RowsCopied = tp.RowsCopied
-			task.RowsTotal = tp.RowsTotal
-			task.ProgressPercent = tp.Progress
-			task.ETASeconds = int(tp.ETASeconds)
-			task.ChecksumRowsChecked = tp.ChecksumRowsChecked
-			task.ChecksumRowsTotal = tp.ChecksumRowsTotal
-			task.Throttled = tp.Throttled
-			task.ThrottleReason = tp.ThrottleReason
-			task.IsInstant = tp.IsInstant
-			if tp.StartedAt != nil && task.StartedAt == nil {
-				task.StartedAt = tp.StartedAt
-			}
-			if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
-				task.CompletedAt = tp.CompletedAt
-			}
-			// A generic running apply refines into the table's post-copy phase
-			// when the engine reports one, so a table catching up on accumulated
-			// changes, checksumming, or cutting over is stored — and rendered —
-			// as that phase rather than as a serene fully-copied bar.
-			if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
-				engineTaskState = phase
-			}
-			// Persist the per-shard breakdown as per-shard tasks so the renderer
-			// can show per-shard state from storage. No-op outside the lease-held
-			// operator drive (read-path callers carry no operation lease).
-			c.writeShardProgress(ctx, logger, task, tp, now)
-		} else if instantFromMetadata {
-			task.IsInstant = true
-			if result.State.IsTerminal() && !retryableFailure {
-				task.ProgressPercent = 100
-			}
-		}
-		if task.StartedAt == nil && newState != state.Task.Pending {
-			task.StartedAt = &now
-		}
-		if result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		if result.State == engine.StateFailed && task.ErrorMessage == "" {
-			if msg := progressFailureMessage(result); msg != "" {
-				task.ErrorMessage = msg
-			}
-		}
-		if result.State == engine.StateCompleted {
+		tp, _ := tableProgress.ForTask(task)
+		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, result, instantFromMetadata, retryableFailure, now)
+		c.advanceTaskFromEngineProgress(ctx, task, newState, tp, result, retryableFailure, now)
+	}
+}
+
+// refreshTaskDisplayFromEngine projects a progress poll onto the fields the
+// operator sees: row counts, percentage, ETA, checksum progress, throttle
+// state, instant classification, and the per-shard breakdown. None of them
+// decides what state a task is in, so this is always safe to run — a stale or
+// absent engine snapshot degrades the display and nothing else. The per-shard
+// breakdown does carry a state per shard, but it lands on rows of its own
+// (shard != "") that only the per-shard renderer loads; the task state machine
+// never reads them.
+//
+// Those shard rows are the only write made here. The task's own refreshed
+// fields ride out on the persisted write advanceTaskFromEngineProgress makes,
+// which is why the refresh runs first: a transition rolled back by a storage
+// failure keeps the display fields the caller refreshed before it.
+func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, result *engine.ProgressResult, instantFromMetadata, retryableFailure bool, now time.Time) {
+	if tp != nil {
+		applyEngineTableDisplayFields(task, tp)
+		// Persist the per-shard breakdown as per-shard tasks so the renderer
+		// can show per-shard state from storage. No-op outside the lease-held
+		// operator drive (read-path callers carry no operation lease).
+		c.writeShardProgress(ctx, logger, task, tp, now)
+		return
+	}
+	if instantFromMetadata {
+		task.IsInstant = true
+		if result.State.IsTerminal() && !retryableFailure {
 			task.ProgressPercent = 100
 		}
-		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskState), "")
 	}
+}
+
+// advanceTaskFromEngineProgress applies the part of a progress poll that is a
+// correctness decision: the state the poll claims for the task, and the
+// start/completion/error stamps that belong to that outcome.
+//
+// It is separate from the display refresh so a drive that has already settled a
+// task from a more authoritative source — a durable record, or the target
+// schema itself — can keep showing live engine progress without letting the
+// poll re-open what was settled. taskStateWithNoBackwardProgress remains the
+// policy for whether the claim is allowed to move the stored state.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, newState string, tp *engine.TableProgress, result *engine.ProgressResult, retryableFailure bool, now time.Time) {
+	if tp != nil {
+		if tp.StartedAt != nil && task.StartedAt == nil {
+			task.StartedAt = tp.StartedAt
+		}
+		if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
+			task.CompletedAt = tp.CompletedAt
+		}
+	}
+	if task.StartedAt == nil && newState != state.Task.Pending {
+		task.StartedAt = &now
+	}
+	if result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
+		task.CompletedAt = &now
+	}
+	if result.State == engine.StateFailed && task.ErrorMessage == "" {
+		if msg := progressFailureMessage(result); msg != "" {
+			task.ErrorMessage = msg
+		}
+	}
+	if result.State == engine.StateCompleted {
+		task.ProgressPercent = 100
+	}
+	c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(newState, tp)), "")
+}
+
+// engineTaskStateClaim is the state a progress poll claims for one task: the
+// apply-wide state the poll mapped to, refined into the table's own post-copy
+// phase when the engine reported one. A table catching up on accumulated
+// changes, checksumming, or cutting over is then stored — and rendered — as
+// that phase rather than as a serene fully-copied bar.
+//
+// It is only a claim. Whether the stored state may move to it is decided by
+// taskStateWithNoBackwardProgress.
+func engineTaskStateClaim(newState string, tp *engine.TableProgress) string {
+	if tp == nil {
+		return newState
+	}
+	if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
+		return phase
+	}
+	return newState
+}
+
+// applyEngineTableDisplayFields copies a poll's per-table progress onto the
+// task's display fields. Shared by the grouped and sequential drives so both
+// render from the same projection of an engine report.
+func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress) {
+	task.RowsCopied = tp.RowsCopied
+	task.RowsTotal = tp.RowsTotal
+	task.ProgressPercent = tp.Progress
+	task.ETASeconds = int(tp.ETASeconds)
+	task.ChecksumRowsChecked = tp.ChecksumRowsChecked
+	task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+	task.Throttled = tp.Throttled
+	task.ThrottleReason = tp.ThrottleReason
+	task.IsInstant = tp.IsInstant
 }
 
 // tablePhaseTaskState maps a per-table engine state to the refined task state

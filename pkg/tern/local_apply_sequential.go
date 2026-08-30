@@ -596,17 +596,17 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				continue
 			}
 			prevState := task.State
-			engineTaskState := taskStateFromProgressResult(result)
-			// A sequential task drives a single DDL, so the first table's
-			// engine-reported post-copy phase (catching up, checksumming,
-			// post-checksum, cutting over) refines a running task the same way
-			// the grouped sync does. The no-backward guard keeps the displayed
-			// endgame monotonic across engine phases that map back to Running.
-			if len(result.Tables) > 0 && state.IsState(engineTaskState, state.Task.Running) {
-				if phase, isPhase := tablePhaseTaskState(result.Tables[0].State); isPhase {
-					engineTaskState = phase
-				}
+			// A sequential task drives a single DDL, so its progress is the
+			// first table's: the same projection the grouped sync applies per
+			// task, with the same refinement of a running task into the
+			// engine-reported post-copy phase. The no-backward guard keeps the
+			// displayed endgame monotonic across engine phases that map back to
+			// Running.
+			var tp *engine.TableProgress
+			if len(result.Tables) > 0 {
+				tp = &result.Tables[0]
 			}
+			engineTaskState := engineTaskStateClaim(taskStateFromProgressResult(result), tp)
 
 			now := time.Now()
 			if engineReportsLostWork(prevState, engineTaskState) {
@@ -645,19 +645,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			task.UpdatedAt = now
 			retryableFailure := state.IsState(task.State, state.Task.FailedRetryable)
 
-			// Update progress fields from engine result
-			if len(result.Tables) > 0 {
-				// For single-DDL task, use the first table's progress
-				tp := result.Tables[0]
-				task.RowsCopied = tp.RowsCopied
-				task.RowsTotal = tp.RowsTotal
-				task.ProgressPercent = tp.Progress
-				task.ETASeconds = int(tp.ETASeconds)
-				task.ChecksumRowsChecked = tp.ChecksumRowsChecked
-				task.ChecksumRowsTotal = tp.ChecksumRowsTotal
-				task.Throttled = tp.Throttled
-				task.ThrottleReason = tp.ThrottleReason
-				task.IsInstant = tp.IsInstant
+			if tp != nil {
+				applyEngineTableDisplayFields(task, tp)
 			}
 
 			if result.State.IsTerminal() {
