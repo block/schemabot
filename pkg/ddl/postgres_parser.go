@@ -2,6 +2,7 @@ package ddl
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	pgproto "github.com/pganalyze/pg_query_go/v6"
@@ -218,6 +219,32 @@ func (postgresStatementParser) Canonicalize(ddl string) string {
 	canonical, err := pgquery.Deparse(result)
 	if err != nil {
 		return ddl
+	}
+	return restoreDropColumnKeyword(result.GetStmts()[0].GetStmt(), canonical)
+}
+
+// restoreDropColumnKeyword reinstates the optional COLUMN keyword the
+// deparser elides from ALTER TABLE ... DROP COLUMN subcommands. The elided
+// form is valid PostgreSQL, but the canonical statement is a review surface a
+// human approves before a destructive apply, and "DROP legacy" next to an
+// explicit "DROP CONSTRAINT" no longer says that a column is what is going;
+// the explicit spelling is also the one pg_dump emits. The parse tree names
+// exactly which columns are dropped, so only those clauses are rewritten and
+// every other DROP subcommand (CONSTRAINT, DEFAULT, NOT NULL, IDENTITY,
+// EXPRESSION) passes through untouched.
+func restoreDropColumnKeyword(stmt *pgproto.Node, canonical string) string {
+	for _, cmd := range stmt.GetAlterTableStmt().GetCmds() {
+		alterCmd := cmd.GetAlterTableCmd()
+		if alterCmd.GetSubtype() != pgproto.AlterTableType_AT_DropColumn {
+			continue
+		}
+		// The deparser renders the column bare when it can and quoted when it
+		// must; match either rendering, bounded so one column's clause can
+		// never rewrite a longer name it prefixes.
+		bare := regexp.QuoteMeta(alterCmd.GetName())
+		quoted := regexp.QuoteMeta(`"` + strings.ReplaceAll(alterCmd.GetName(), `"`, `""`) + `"`)
+		pattern := regexp.MustCompile(`\bDROP ((?:IF EXISTS )?(?:` + quoted + `|` + bare + `))($|[ ,])`)
+		canonical = pattern.ReplaceAllString(canonical, "DROP COLUMN $1$2")
 	}
 	return canonical
 }

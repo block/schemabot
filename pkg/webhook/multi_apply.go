@@ -40,9 +40,9 @@ func releasedForApply(ctx context.Context, stor storage.Storage, apply *storage.
 // vschemaDiffs is the stored plan's per-namespace VSchema diffs (see
 // resolveShardedVSchemaDiffs), consumed only by the sharded layout.
 func formatApplyStatusComment(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, vschemaDiffs map[string]string, tenant string) string {
-	// A sharded apply fans out across the shards of one keyspace within a single
-	// deployment, so it gets the shard-unit layout rather than the deployment-unit
-	// one — its operations differ by shard, not deployment.
+	// A sharded apply fans out across the shards of one or more keyspaces within
+	// a single deployment, so it gets the shard-unit layout rather than the
+	// deployment-unit one — its operations differ by shard, not deployment.
 	if isShardedApply(ops) {
 		return templates.RenderShardedApplyComment(buildShardedApplyData(apply, ops, released, tasks, vschemaDiffs, tenant))
 	}

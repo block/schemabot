@@ -198,7 +198,80 @@ func TestWriteStatusListExternalID(t *testing.T) {
 	assert.Contains(t, output, "apply-complete")
 }
 
-func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
+// An operator who asked for the external-id column gets it even when no apply
+// on the page recorded a remote id: an all-dash column positively answers
+// "nothing recorded", where a missing column would be indistinguishable from
+// the flag doing nothing.
+func TestWriteStatusListExternalIDColumnRendersWithoutValues(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    0,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-local",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL ID", "the requested column renders even with nothing recorded")
+	assert.Contains(t, output, "apply-local  -", "a row with no remote id shows a dash in the column")
+}
+
+// On a mixed unfiltered page the DEPLOYMENT column is retained for the rows
+// that carry one, and a row without a deployment shows a dash rather than
+// blank padding, so the gap reads as "none recorded" instead of an alignment
+// artifact.
+func TestWriteStatusListMixedDeploymentRowsShowDash(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 0,
+			Limit:       20,
+			MaxLimit:    1000,
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-deployed",
+					Database:    "orders",
+					Environment: "staging",
+					Deployment:  "deploy-a",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					CompletedAt: "2026-05-28T12:00:02Z",
+					Caller:      "cli",
+				},
+				{
+					ApplyID:     "apply-local",
+					Database:    "orders",
+					Environment: "staging",
+					State:       state.Apply.Completed,
+					StartedAt:   "2026-05-28T12:01:00Z",
+					CompletedAt: "2026-05-28T12:01:02Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "DEPLOYMENT", "one populated row retains the column for the page")
+	assert.Contains(t, output, "deploy-a")
+	assert.Contains(t, output, "staging  -", "a deployment-less row shows a dash in the retained column")
+}
+
+// A deployment-filtered list names each remote handle in its own column, the
+// way the detail views do: the deployment's shared data-plane apply id and the
+// per-operation remote row id. APPLY ID stays the control-plane id the status
+// drill-down resolves, and DEPLOYMENT is dropped because every row repeats it
+// back to the operator who named it.
+func TestWriteStatusListDeploymentNamesBothRemoteHandles(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{
 			ActiveCount:    1,
@@ -209,7 +282,7 @@ func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
 			Applies: []ActiveApplyData{
 				{
 					ApplyID:             "apply-running",
-					ExternalID:          "parent-external",
+					ExternalID:          "apply-remote-a",
 					ExternalOperationID: "remote-operation-a",
 					Database:            "orders",
 					Environment:         "staging",
@@ -222,11 +295,75 @@ func TestWriteStatusListDeploymentExternalOperationID(t *testing.T) {
 		})
 	})
 
+	assert.Contains(t, output, "EXTERNAL APPLY ID")
 	assert.Contains(t, output, "EXTERNAL OP ID")
-	assert.Contains(t, output, "DEPLOYMENT")
+	assert.Contains(t, output, "apply-remote-a")
 	assert.Contains(t, output, "remote-operation-a")
-	assert.NotContains(t, output, "parent-external")
-	assert.Contains(t, output, "deploy-a")
+	assert.Contains(t, output, "apply-running",
+		"APPLY ID stays the control-plane id the status drill-down resolves")
+	assert.NotContains(t, output, "DEPLOYMENT",
+		"a list filtered to one deployment repeats it on every row, so the column carries nothing")
+	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details",
+		"every id in the APPLY ID column feeds the drill-down, so the footer needs no qualifier")
+}
+
+// A deployment that drives its applies locally records no remote handles, so
+// the remote-id columns are left out rather than rendered as a column of
+// dashes. The same holds for an apply not yet dispatched to a data plane.
+func TestWriteStatusListDeploymentOmitsUnpopulatedRemoteColumns(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    1,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Deployment:     "deploy-a",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-pending",
+					Database:    "orders",
+					Environment: "staging",
+					Deployment:  "deploy-a",
+					State:       state.Apply.Pending,
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "apply-pending")
+	assert.NotContains(t, output, "EXTERNAL APPLY ID")
+	assert.NotContains(t, output, "EXTERNAL OP ID")
+}
+
+// A deployment whose operations fold into one shared data-plane apply has no
+// per-operation remote row id, so only the shared handle gets a column.
+func TestWriteStatusListDeploymentOmitsOperationColumnWhenOnlyTheSharedApplyIsRecorded(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount:    1,
+			Limit:          20,
+			MaxLimit:       1000,
+			ShowExternalID: true,
+			Deployment:     "deploy-a",
+			Applies: []ActiveApplyData{
+				{
+					ApplyID:     "apply-sharded",
+					ExternalID:  "apply-remote-shared",
+					Database:    "inventory",
+					Environment: "staging",
+					Deployment:  "deploy-a",
+					State:       state.Apply.Running,
+					StartedAt:   "2026-05-28T12:00:00Z",
+					Caller:      "cli",
+				},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "EXTERNAL APPLY ID")
+	assert.Contains(t, output, "apply-remote-shared")
+	assert.NotContains(t, output, "EXTERNAL OP ID")
 }
 
 func TestWriteStatusListFailedOnly(t *testing.T) {

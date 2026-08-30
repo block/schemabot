@@ -21,6 +21,48 @@ import (
 // long two drivers can run the same engine work concurrently.
 const ApplyLeaseStaleAfter = time.Minute
 
+// DefaultMaxDriversPerApply is the per-apply driver cap used when a deployment
+// does not configure max_drivers_per_apply.
+//
+// The cap bounds how many operation leases one apply may hold at once. A wide
+// fan-out claims its operations oldest-first like any other work, so without a
+// bound a single apply takes every driver on the plane and holds them for as
+// long as its slowest operation runs — starving every other database behind it
+// with no limit. The cap is what keeps the plane available: capacity always
+// remains to claim another tenant's work and to consume control requests.
+//
+// It gates every claim that starts work — a first start, a resume after a stop,
+// and a deferred deploy — and no claim that recovers or controls. That split is
+// the whole design: recovering a crashed operation and consuming a stop or
+// cancel must never be capped, or the cap wedges the apply it is bounding, while
+// leaving any start path uncapped is a way around the bound rather than an
+// exception to it. A stop/start cycle is the case that makes this concrete: stop
+// moves every pending sibling to stopped at once, so an uncapped resume would
+// hand one apply the whole pool for the rest of its rollout.
+//
+// The count lives in storage, so the cap is plane-wide across pods with no
+// extra coordination, and both planes enforce it because both run these claim
+// queries against their own storage.
+//
+// It is deliberately soft, and softer than a ceiling of one over. Claims run at
+// READ COMMITTED and count sibling rows rather than the row they lock, so
+// concurrent claimers never exclude each other: every driver whose claim reads
+// the count before the others commit sees the same pre-claim value and claims on
+// it. The transient overshoot is therefore bounded by how many drivers claim in
+// that window, not by one. It is self-correcting rather than durable — once
+// those leases commit, the next claim counts them and the cap binds — so the
+// steady-state occupancy is the cap and the excess drains as operations finish.
+// Size the cap for the steady state; do not read it as a hard admission limit
+// that some other guard will hold to cap+1. Paying for a hard bound would mean
+// serializing every claim behind a per-apply lock, which is the contention the
+// cap exists to avoid.
+//
+// It is configurable because the value only means something relative to a
+// plane's pods x drivers: too high and it bounds nothing, too low and a wide
+// sharded fan-out serializes. The default suits a plane running the default
+// driver count on more than one pod; size it deliberately when either differs.
+const DefaultMaxDriversPerApply = 2
+
 // Storage provides access to all stores.
 type Storage interface {
 	// Locks returns the lock store.

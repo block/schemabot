@@ -382,6 +382,12 @@ func TestFormatDDLForDialect(t *testing.T) {
 			"    ADD COLUMN b text;", got)
 	})
 
+	t.Run("postgres DROP COLUMN keeps the explicit COLUMN keyword", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"ALTER TABLE public.users DROP COLUMN legacy")
+		assert.Equal(t, "ALTER TABLE public.users DROP COLUMN legacy;", got)
+	})
+
 	t.Run("statement the dialect parser rejects renders as-is", func(t *testing.T) {
 		got := FormatDDLForDialect(schema.DialectPostgres, "THIS IS NOT SQL")
 		assert.Equal(t, "THIS IS NOT SQL;", got)

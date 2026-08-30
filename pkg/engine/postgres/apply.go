@@ -90,6 +90,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}, nil
 }
 
+// validateOptimisticApply validates only engine-level applicability. Blocked
+// verdicts are enforced at queue time by rejectBlockedStoredPlan before tasks
+// are created; task rows are rebuilt from stored plans and do not carry the
+// plan's ExecutionMode verdict.
 func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if req == nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL schema: request is required")
@@ -101,9 +105,6 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned statement", req.Database)
 	}
 	tc := req.Changes[0].TableChanges[0]
-	if tc.ExecutionMode == engine.ExecutionModeBlocked {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement is blocked: %s", tc.Table, tc.ModeReason)
-	}
 	if req.Options["defer_cutover"] == "true" {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: deferred cutover is unsupported", tc.Table)
 	}
@@ -170,11 +171,22 @@ type refusal struct {
 // surfaces. A nil result means the failure is operational — a retry may
 // succeed once conditions change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
-// with concurrent lock holders. Every detail string here is built from typed
-// error fields and identifiers, never from wrapped server output; fields
-// that embed database-sourced identifiers are sanitized before they leave,
-// so a detail is safe to render on operator-facing surfaces.
+// with concurrent lock holders. Every detail string is built from typed
+// error fields and identifiers, never from wrapped server output, and every
+// detail is sanitized at this single exit — a refusal is safe to render on
+// operator-facing surfaces by construction, whichever branch produced it.
 func classifyRefusal(err error, table string) *refusal {
+	r := refusalForCause(err, table)
+	if r == nil {
+		return nil
+	}
+	r.detail = sanitizeReasonText(r.detail)
+	return r
+}
+
+// refusalForCause holds classifyRefusal's cause-to-refusal mapping; details
+// leave unsanitized and classifyRefusal sanitizes them at its return.
+func refusalForCause(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
 		detail := fmt.Sprintf("the engine role lacks access for %s on table %q; provision with: %s (verified by: %s)",
@@ -182,7 +194,7 @@ func classifyRefusal(err error, table string) *refusal {
 		if privilegeErr.Hint != "" {
 			detail += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: sanitizeReasonText(detail)}
+		return &refusal{reason: "insufficient-privileges", detail: detail}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {

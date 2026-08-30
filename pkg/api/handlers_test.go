@@ -4471,73 +4471,139 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
 }
 
-func TestHandleStatusDeploymentFilterSummarizesMatchingOperations(t *testing.T) {
+// A deployment applied per shard has exactly one data-plane apply, so the
+// deployment-filtered status list surfaces exactly one remote apply handle per
+// row: the shared id the operations recorded, or the parent apply row's when
+// the drive recorded it there instead (a drive that is not operation-scoped
+// writes the remote id to the parent). Per-operation remote ids surface only
+// when the filter matches a single operation; a fold keeps them in the detail
+// views.
+func TestHandleStatusDeploymentFilterRemoteHandles(t *testing.T) {
 	now := time.Now().UTC()
 	startedAt := now.Add(-2 * time.Minute)
 	completedAt := now.Add(-time.Minute)
-	applies := &recentApplyStore{
-		applies: []*storage.Apply{
-			{
-				ID:              101,
-				ApplyIdentifier: "apply-deployment",
-				ExternalID:      "parent-external",
-				Database:        "orders",
-				Environment:     "staging",
-				Deployment:      "deploy-a",
-				Engine:          storage.EngineSpirit,
-				State:           state.Apply.Completed,
-				Caller:          "cli",
-				CreatedAt:       now,
-				UpdatedAt:       now,
-			},
+	completedOp := func(externalID, externalOperationID string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			ID:                  202,
+			ApplyID:             101,
+			Deployment:          "deploy-a",
+			ExternalID:          externalID,
+			ExternalOperationID: externalOperationID,
+			State:               state.Apply.Completed,
+			StartedAt:           &startedAt,
+			CompletedAt:         &completedAt,
+			CreatedAt:           now.Add(-2 * time.Minute),
+			UpdatedAt:           completedAt,
+		}
+	}
+	runningOp := func(externalID, externalOperationID string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			ID:                  203,
+			ApplyID:             101,
+			Deployment:          "deploy-a",
+			ExternalID:          externalID,
+			ExternalOperationID: externalOperationID,
+			State:               state.Apply.Running,
+			StartedAt:           &startedAt,
+			CreatedAt:           now.Add(-90 * time.Second),
+			UpdatedAt:           now,
+		}
+	}
+
+	cases := []struct {
+		name             string
+		parentExternalID string
+		applyState       string
+		operations       []*storage.ApplyOperation
+		wantActiveCount  int
+		wantState        string
+		wantExternalID   string
+		wantExternalOpID string
+	}{
+		{
+			name:             "a fold surfaces the shared data-plane apply id and no per-operation id",
+			applyState:       state.Apply.Running,
+			operations:       []*storage.ApplyOperation{completedOp("remote-apply-shared", "remote-operation-202"), runningOp("remote-apply-shared", "remote-operation-203")},
+			wantActiveCount:  1,
+			wantState:        state.Apply.Running,
+			wantExternalID:   "remote-apply-shared",
+			wantExternalOpID: "",
+		},
+		{
+			name:             "a fold whose operations recorded no remote id keeps the parent apply row's",
+			parentExternalID: "parent-external",
+			applyState:       state.Apply.Completed,
+			operations:       []*storage.ApplyOperation{completedOp("", "remote-operation-202"), runningOp("", "remote-operation-203")},
+			wantActiveCount:  1,
+			wantState:        state.Apply.Running,
+			wantExternalID:   "parent-external",
+			wantExternalOpID: "",
+		},
+		{
+			name:             "a single matching operation without a remote id keeps the parent apply row's",
+			parentExternalID: "parent-external",
+			applyState:       state.Apply.Running,
+			operations:       []*storage.ApplyOperation{runningOp("", "")},
+			wantActiveCount:  1,
+			wantState:        state.Apply.Running,
+			wantExternalID:   "parent-external",
+			wantExternalOpID: "",
+		},
+		{
+			name:             "a single matching operation's own remote ids win over the parent's",
+			parentExternalID: "parent-external",
+			applyState:       state.Apply.Completed,
+			operations:       []*storage.ApplyOperation{completedOp("remote-apply-own", "remote-operation-202")},
+			wantActiveCount:  0,
+			wantState:        state.Apply.Completed,
+			wantExternalID:   "remote-apply-own",
+			wantExternalOpID: "remote-operation-202",
 		},
 	}
-	operations := &staticApplyOperationStore{
-		operations: []*storage.ApplyOperation{
-			{
-				ID:                  202,
-				ApplyID:             101,
-				Deployment:          "deploy-a",
-				ExternalOperationID: "remote-operation-202",
-				State:               state.Apply.Completed,
-				StartedAt:           &startedAt,
-				CompletedAt:         &completedAt,
-				CreatedAt:           now.Add(-2 * time.Minute),
-				UpdatedAt:           completedAt,
-			},
-			{
-				ID:                  203,
-				ApplyID:             101,
-				Deployment:          "deploy-a",
-				ExternalOperationID: "remote-operation-203",
-				State:               state.Apply.Running,
-				StartedAt:           &startedAt,
-				CreatedAt:           now.Add(-90 * time.Second),
-				UpdatedAt:           now,
-			},
-		},
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			applies := &recentApplyStore{
+				applies: []*storage.Apply{
+					{
+						ID:              101,
+						ApplyIdentifier: "apply-deployment",
+						ExternalID:      tc.parentExternalID,
+						Database:        "orders",
+						Environment:     "staging",
+						Deployment:      "deploy-a",
+						Engine:          storage.EngineSpirit,
+						State:           tc.applyState,
+						Caller:          "cli",
+						CreatedAt:       now,
+						UpdatedAt:       now,
+					},
+				},
+			}
+			operations := &staticApplyOperationStore{operations: tc.operations}
+			stor := &mockStorageWithApplyStores{applies: applies, operations: operations}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(stor, testServerConfig(), nil, logger)
+			mux := http.NewServeMux()
+			svc.ConfigureRoutes(mux)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?environment=staging&deployment=deploy-a", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code)
+			var resp apitypes.StatusResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+			assert.Equal(t, tc.wantActiveCount, resp.ActiveCount)
+			require.Len(t, resp.Applies, 1)
+			assert.Equal(t, "apply-deployment", resp.Applies[0].ApplyID)
+			assert.Equal(t, tc.wantExternalID, resp.Applies[0].ExternalID)
+			assert.Equal(t, tc.wantExternalOpID, resp.Applies[0].ExternalOperationID)
+			assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
+			assert.Equal(t, tc.wantState, resp.Applies[0].State)
+		})
 	}
-	stor := &mockStorageWithApplyStores{applies: applies, operations: operations}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(stor, testServerConfig(), nil, logger)
-	mux := http.NewServeMux()
-	svc.ConfigureRoutes(mux)
-
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/status?environment=staging&deployment=deploy-a", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	require.Equal(t, http.StatusOK, w.Code)
-	var resp apitypes.StatusResponse
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-
-	assert.Equal(t, 1, resp.ActiveCount)
-	require.Len(t, resp.Applies, 1)
-	assert.Equal(t, "apply-deployment", resp.Applies[0].ApplyID)
-	assert.Empty(t, resp.Applies[0].ExternalID)
-	assert.Empty(t, resp.Applies[0].ExternalOperationID)
-	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
-	assert.Equal(t, state.Apply.Running, resp.Applies[0].State)
 }
 
 func TestHandleStatusFailedFilter(t *testing.T) {
