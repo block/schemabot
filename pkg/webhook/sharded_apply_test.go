@@ -13,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // A sharded apply comment renders the attribution from the username, not the raw
@@ -429,7 +430,12 @@ func TestFormatApplyStatusComment_MultiKeyspaceRendersKeyspaceSections(t *testin
 	assert.Contains(t, out, "#### Keyspace `contacts_lookup`")
 	assert.Contains(t, out, "#### Keyspace `contacts_sharded`")
 	assert.Contains(t, out, "**Shards**:", "the histogram spans every keyspace's shards")
-	assert.Contains(t, out, "| `-` | ✅ completed |", "an unsharded keyspace's shard renders its plain name")
+	assert.Contains(t, out, "**Status**: In Progress — 1 of 4 changes applied",
+		"three table units plus the VSchema update make four changes, one landed")
+	assert.Contains(t, out, "**`entries`**: ✅ Complete", "each keyspace section renders its tables")
+	assert.Contains(t, out, "**`entries_lookup`**: 🔄 Row copy in progress")
+	assert.Contains(t, out, "**`entries_index`**: ⏳ Queued")
+	assert.NotContains(t, out, "| Shard | Status |", "healthy uniform keyspaces render no per-shard tables")
 	assert.Contains(t, out, "### VSchema", "the finalizer renders in the VSchema section, not as a shard")
 }
 
@@ -491,7 +497,8 @@ func TestFormatApplySummaryComment_ShardedRendersVerdict(t *testing.T) {
 	assert.NotContains(t, out, "Schema Change Status", "the summary is a verdict, not a status snapshot")
 	assert.Contains(t, out, "**Shards**: 2 completed")
 	assert.Contains(t, out, "**Duration**: 28m")
-	assert.Contains(t, out, "| `-40` | ✅ completed |")
+	assert.Contains(t, out, "**`mutes`**: ✅ Complete (2 shards)")
+	assert.NotContains(t, out, "| Shard | Status |", "a fully completed keyspace renders no per-shard table")
 	assert.NotContains(t, out, "**Deployments**:", "must not use the deployment-unit layout")
 }
 
@@ -546,4 +553,99 @@ func TestFormatApplySummaryComment_ShardedApplyLevelErrorSurfaced(t *testing.T) 
 	assert.Contains(t, out, "> ❌ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded",
 		"the apply row's error reaches the callout when no shard carries the failure")
 	assert.NotContains(t, out, "First failure:", "no shard failed, so there is no shard failure callout")
+}
+
+// The keyspace section's table rollup is derived from the tasks: each shard's
+// entry carries its task's live state and copy percent, and the table's
+// aggregate is its most attention-worthy shard state — so a table with one
+// copying shard reads as copying even while the other shards are done or
+// queued. An operation whose task has not been created yet contributes its
+// operation state instead, so early dispatch waves still render.
+func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "cdb_resolute_sharded/-40/mutes", state.ApplyOperation.Completed),
+		mk(2, "cdb_resolute_sharded/40-80/mutes", state.ApplyOperation.Running),
+		mk(3, "cdb_resolute_sharded/80-/mutes", state.ApplyOperation.Pending),
+	}
+	task := func(id, opID int64, shard, taskState string, percent int) *storage.Task {
+		oid := opID
+		return &storage.Task{
+			ID: id, ApplyID: 1, ApplyOperationID: &oid, Shard: shard,
+			Namespace: "cdb_resolute_sharded", TableName: "mutes",
+			State: taskState, ProgressPercent: percent,
+		}
+	}
+	tasks := []*storage.Task{
+		task(1, 1, "-40", state.Task.Completed, 100),
+		task(2, 2, "40-80", state.Task.Running, 37),
+		// The 80- operation has no task yet: dispatch creates tasks when the
+		// shard's wave starts, so its operation state stands in.
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, tasks, nil, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	table := data.Keyspaces[0].Tables[0]
+	assert.Equal(t, "mutes", table.Table)
+	assert.Equal(t, state.Task.Running, table.Status, "the copying shard is the most attention-worthy")
+	require.Len(t, table.Shards, 3)
+	assert.Equal(t, templates.ShardProgressData{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100}, table.Shards[0])
+	assert.Equal(t, templates.ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 37}, table.Shards[1])
+	assert.Equal(t, templates.ShardProgressData{Shard: "80-", Status: state.ApplyOperation.Pending, PercentComplete: 0}, table.Shards[2],
+		"an operation without a task contributes its operation state")
+}
+
+// A shard whose table failed makes the whole table read failed, and each
+// keyspace's tables keep resolved order even when their operations interleave
+// with another keyspace's.
+func TestBuildShardedApplyData_TableAggregateAndOrder(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "contacts_sharded/-40/entries", state.ApplyOperation.Completed),
+		mk(2, "contacts/-/aliases", state.ApplyOperation.Pending),
+		mk(3, "contacts_sharded/-40/blocks", state.ApplyOperation.Completed),
+		mk(4, "contacts_sharded/40-/entries", state.ApplyOperation.Failed),
+		mk(5, "contacts_sharded/40-/blocks", state.ApplyOperation.Pending),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Failed}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+
+	require.Len(t, data.Keyspaces, 2)
+	require.Len(t, data.Keyspaces[0].Tables, 2)
+	assert.Equal(t, "entries", data.Keyspaces[0].Tables[0].Table, "tables keep resolved order within their keyspace")
+	assert.Equal(t, state.Task.Failed, data.Keyspaces[0].Tables[0].Status, "one failed shard makes the table read failed")
+	assert.Equal(t, "blocks", data.Keyspaces[0].Tables[1].Table)
+	assert.Equal(t, state.Task.Pending, data.Keyspaces[0].Tables[1].Status, "a queued shard outranks completed siblings")
+	require.Len(t, data.Keyspaces[1].Tables, 1)
+	assert.Equal(t, "aliases", data.Keyspaces[1].Tables[0].Table)
+}
+
+// Under wave dispatch, landed shards hold in their revert window while later
+// waves are still queued. The table aggregate surfaces the queued work — the
+// table still has a whole copy ahead of it — not the landed shards' hold
+// state, so a mid-rollout table never reads as complete.
+func TestBuildShardedApplyData_PendingOutranksRevertWindow(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "contacts_sharded/-40/entries", state.ApplyOperation.RevertWindow),
+		mk(2, "contacts_sharded/40-/entries", state.ApplyOperation.Pending),
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_contacts", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, nil, nil, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	assert.Equal(t, state.Task.Pending, data.Keyspaces[0].Tables[0].Status,
+		"an undispatched shard outranks a sibling holding in its revert window")
 }

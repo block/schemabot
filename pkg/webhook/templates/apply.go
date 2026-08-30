@@ -877,6 +877,17 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
+// shardSummaryBreakdownState reports whether a table's aggregate status is
+// in-flight work whose line carries the compact per-shard breakdown.
+func shardSummaryBreakdownState(status string) bool {
+	switch state.NormalizeTaskStatus(status) {
+	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+		return true
+	default:
+		return false
+	}
+}
+
 // renderShardSummary appends a single compact per-shard status line for a
 // sharded table, only while it is in flight. It keeps the PR
 // comment quiet: at most one extra line per table. With few shards it lists each
@@ -887,10 +898,7 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 	if len(table.Shards) <= 1 {
 		return
 	}
-	switch state.NormalizeTaskStatus(table.Status) {
-	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
-		// in flight — a breakdown adds signal
-	default:
+	if !shardSummaryBreakdownState(table.Status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
 

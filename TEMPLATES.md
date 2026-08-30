@@ -7679,16 +7679,14 @@ schemabot apply -e production
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
+**Status**: In Progress — 0 of 1 change applied
+
 **Shards**: 1 running table copy, 3 waiting for -40
 
 #### Keyspace `cdb_resolute_sharded`
 
-| Shard | Status |
-| --- | --- |
-| `-40` | 🔄 running table copy |
-| `40-80` | ⏳ waiting for -40 |
-| `80-c0` | ⏳ waiting for -40 |
-| `c0-` | ⏳ waiting for -40 |
+**`mutes`**: 🔄 Row copy in progress
+  └ shards: ◐ -40 45% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7704,11 +7702,15 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
+**Status**: Failed — 0 of 1 change applied
+
 **Shards**: 1 failed, 3 halted
 
 > ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
 
 #### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ❌ Failed
 
 | Shard | Status |
 | --- | --- |
@@ -7736,9 +7738,14 @@ schemabot apply -e production
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
+**Status**: In Progress — 0 of 1 change applied
+
 **Shards**: 1 running table copy, 2 waiting for -40
 
 #### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: 🔄 Row copy in progress
+  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0
 
 Shards diverge — grouped by change:
 
@@ -7769,28 +7776,21 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
+**Status**: In Progress — 1 of 4 changes applied
+
 **Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
 
 #### Keyspace `cdb_resolute`
 
-| Shard | Status |
-| --- | --- |
-| `-` | ✅ completed |
+**`outcomes`**: ✅ Complete
 
 #### Keyspace `cdb_resolute_lookup`
 
-| Shard | Status |
-| --- | --- |
-| `-` | 🔄 running table copy |
+**`outcomes_lookup`**: 🔄 Row copy in progress
 
 #### Keyspace `cdb_resolute_sharded`
 
-| Shard | Status |
-| --- | --- |
-| `-40` | ⏳ waiting for cdb_resolute_lookup/- |
-| `40-80` | ⏳ waiting for cdb_resolute_lookup/- |
-| `80-c0` | ⏳ waiting for cdb_resolute_lookup/- |
-| `c0-` | ⏳ waiting for cdb_resolute_lookup/- |
+**`mutes`**: ⏳ Queued
 
 ### VSchema
 
@@ -7817,12 +7817,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 #### Keyspace `cdb_resolute_sharded`
 
-| Shard | Status |
-| --- | --- |
-| `-40` | ✅ completed |
-| `40-80` | ✅ completed |
-| `80-c0` | ✅ completed |
-| `c0-` | ✅ completed |
+**`mutes`**: ✅ Complete (4 shards)
 
 ### VSchema
 
@@ -7862,6 +7857,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 #### Keyspace `cdb_resolute_sharded`
 
+**`mutes`**: ❌ Failed
+
 | Shard | Status |
 | --- | --- |
 | `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
@@ -7880,6 +7877,35 @@ To retry:
 ```
 schemabot apply -e production
 ```
+
+</details>
+
+<details>
+<summary><a name="summary-cancelled-after-partial-landing"></a><strong>Summary: Cancelled After Partial Landing</strong></summary>
+
+
+## 🚫 Schema Change Cancelled — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 2 completed, 2 cancelled
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ⊘ Cancelled — applied on 2 of 4 shards
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ✅ completed |
+| `40-80` | ✅ completed |
+| `80-c0` | ⛔ cancelled |
+| `c0-` | ⛔ cancelled |
+
+---
+
+This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.
 </details>
 
 ## Multi-Deployment Apply (CLI)
