@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -62,6 +63,7 @@ type TableProgress struct {
 	TableName       string
 	Deployment      string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
+	Dialect         schema.Dialect
 	ChangeType      string // create, alter, drop
 	DDL             string
 	Status          string
@@ -163,6 +165,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Volume:         int(result.Volume),
 		Released:       result.Released,
 	}
+	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
@@ -186,6 +189,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
 			Namespace:           tbl.Keyspace,
+			Dialect:             dialect,
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
 			Status:              state.NormalizeTaskStatus(tbl.Status),

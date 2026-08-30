@@ -947,15 +947,16 @@ type VolumeResponse struct {
 
 // ProgressResponse is the HTTP response for GET /api/progress/apply/{apply_id}.
 type ProgressResponse struct {
-	State       string `json:"state"`
-	Engine      string `json:"engine"`
-	ApplyID     string `json:"apply_id,omitempty"`
-	Database    string `json:"database,omitempty"`     // Included in apply-id lookups
-	Environment string `json:"environment,omitempty"`  // Included in apply-id lookups
-	Caller      string `json:"caller,omitempty"`       // Included in apply-id lookups
-	PullRequest string `json:"pull_request,omitempty"` // PR URL (blank for CLI context)
-	StartedAt   string `json:"started_at,omitempty"`
-	CompletedAt string `json:"completed_at,omitempty"`
+	State        string `json:"state"`
+	Engine       string `json:"engine"`
+	ApplyID      string `json:"apply_id,omitempty"`
+	Database     string `json:"database,omitempty"`      // Included in apply-id lookups
+	DatabaseType string `json:"database_type,omitempty"` // Included in apply-id lookups
+	Environment  string `json:"environment,omitempty"`   // Included in apply-id lookups
+	Caller       string `json:"caller,omitempty"`        // Included in apply-id lookups
+	PullRequest  string `json:"pull_request,omitempty"`  // PR URL (blank for CLI context)
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
 	// Operations carries per-deployment operation rows for multi-deployment applies.
 	// Empty for single-deployment applies.
 	Operations   []*ProgressOperationResponse `json:"operations,omitempty"`

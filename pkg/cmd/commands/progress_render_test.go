@@ -6,8 +6,81 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// TestProgressRenderingUsesTargetDialect verifies watched applies preserve the
+// target database's identifier quoting in operator-facing DDL.
+func TestProgressRenderingUsesTargetDialect(t *testing.T) {
+	const rawDDL = "ALTER TABLE sessions ADD COLUMN email text, ADD COLUMN age int"
+	tests := []struct {
+		name         string
+		databaseType string
+		dialect      schema.Dialect
+		expectedDDL  string
+		quoted       bool
+	}{
+		{
+			name:         "Postgres identifiers remain unquoted",
+			databaseType: "postgres",
+			dialect:      schema.DialectPostgres,
+			expectedDDL:  "ALTER TABLE sessions\n    ADD COLUMN email text,\n    ADD COLUMN age int;",
+		},
+		{
+			name:         "MySQL identifiers use backticks",
+			databaseType: "mysql",
+			dialect:      schema.DialectMySQL,
+			expectedDDL:  "ALTER TABLE `sessions`\n    ADD COLUMN `email` text,\n    ADD COLUMN `age` int;",
+			quoted:       true,
+		},
+		{
+			name:         "missing database type keeps MySQL formatting",
+			databaseType: "",
+			dialect:      schema.Dialect(""),
+			quoted:       true,
+		},
+		{
+			name:         "unrecognized database type keeps MySQL formatting",
+			databaseType: "spanner",
+			dialect:      schema.Dialect("spanner"),
+			quoted:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &apitypes.ProgressResponse{
+				DatabaseType: tt.databaseType,
+				Tables: []*apitypes.TableProgressResponse{{
+					TableName:  "sessions",
+					ChangeType: "alter",
+					Status:     "queued",
+					DDL:        rawDDL,
+				}},
+			}
+
+			data := templates.ParseProgressResponse(resp)
+			require.Len(t, data.Tables, 1)
+			assert.Equal(t, tt.dialect, data.Tables[0].Dialect)
+			if tt.expectedDDL != "" {
+				assert.Equal(t, tt.expectedDDL, ddl.FormatDDLForDialect(data.Tables[0].Dialect, rawDDL))
+			}
+
+			out := templates.FormatTableProgress(data.Tables[0])
+			if tt.quoted {
+				assert.Contains(t, out, "`sessions`")
+				assert.Contains(t, out, "`email`")
+			} else {
+				assert.Contains(t, out, "sessions")
+				assert.Contains(t, out, "email")
+				assert.NotContains(t, out, "`")
+			}
+		})
+	}
+}
 
 // TestProgressRenderingNormalizesRawEngineStatuses pins the operator-facing
 // rendering that `status`, `progress`, and the watch TUI produce for the raw

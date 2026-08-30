@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -199,8 +200,9 @@ func WriteSQLChanges(changes []DDLChange) {
 	for _, change := range combined {
 		// Table name line: "     ~ tablename:"
 		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
-		// DDL indented below
-		fmt.Print(formatProgressDDL(change.DDL))
+		// DDL indented below. The plan view reconstructs statements under
+		// MySQL grammar (combineAlterStatements), so it renders MySQL-pinned.
+		fmt.Print(formatProgressDDLForDialect(schema.DialectMySQL, change.DDL))
 		fmt.Println()
 	}
 }
