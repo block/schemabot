@@ -56,7 +56,7 @@ func TestSyncAtomicTaskProgress_RefinesPhaseAndDisplayPerTask(t *testing.T) {
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{catchingUp, copying}, result, state.Task.Running, time.Now())
+	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{catchingUp, copying}, result, state.Task.Running, time.Now(), settledTaskSet{})
 
 	assert.Equal(t, state.Task.CatchingUp, catchingUp.State, "a table applying its changeset renders as catching up")
 	assert.EqualValues(t, 100, catchingUp.ProgressPercent)
@@ -149,10 +149,42 @@ func TestSyncAtomicTaskProgress_UnreportedTableKeepsApplyStateAndLastProgress(t 
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{unreported}, result, state.Task.Running, time.Now())
+	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{unreported}, result, state.Task.Running, time.Now(), settledTaskSet{})
 
 	assert.Equal(t, state.Task.Running, unreported.State, "a sibling table's phase never refines a task the engine did not report on")
 	assert.EqualValues(t, 500, unreported.RowsCopied, "an unreported table keeps its last known progress")
 	assert.EqualValues(t, 50, unreported.ProgressPercent)
 	assert.Len(t, taskStore.states, 1)
+}
+
+// A task the drive already settled from the live target schema is out of the
+// engine's hands: the poll that sent the drive to the target reports no active
+// schema change, so it carries neither progress to display nor a state the
+// task may take. The projection must leave such a task alone outright rather
+// than write it again and lean on the no-backward guard to reject the claim.
+func TestSyncAtomicTaskProgress_SettledTaskTakesNothingFromThePoll(t *testing.T) {
+	settledTask := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Completed,
+		RowsCopied: 900, RowsTotal: 900, ProgressPercent: 100,
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{settledTask}},
+	}
+	result := &engine.ProgressResult{
+		State:  engine.StateRunning,
+		Tables: []engine.TableProgress{{Table: "mutes", State: spiritstatus.CopyRows.String(), RowsCopied: 3, RowsTotal: 900, Progress: 1, Throttled: true, ThrottleReason: "replica lag"}},
+	}
+	client := groupedSyncClient(taskStore)
+	settled := settledTaskSet{}
+	settled.add(settledTask)
+
+	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{settledTask}, result, state.Task.Running, time.Now(), settled)
+
+	assert.Equal(t, state.Task.Completed, settledTask.State, "the target's verdict stands; the poll claims nothing")
+	assert.EqualValues(t, 900, settledTask.RowsCopied, "a settled task keeps the progress its settlement left")
+	assert.EqualValues(t, 100, settledTask.ProgressPercent)
+	assert.False(t, settledTask.Throttled, "an engine that lost the work reports nothing a settled task should show")
+	assert.Empty(t, taskStore.states, "settlement already persisted the task; the projection writes it no further")
 }

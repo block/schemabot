@@ -678,10 +678,12 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	now := time.Now()
 	newState := taskStateFromProgressResult(result)
 
+	settled := settledTaskSet{}
 	if engineReportsLostApplyWork(newState, tasks) {
 		pendingFor, exhausted := ps.lostWork.observePending(now)
 		if exhausted {
-			if settleErr := c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
+			var settleErr error
+			if settled, settleErr = c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
 				// Neither the engine nor the target has answered what happened
 				// to the work, so count the failed verification against the
 				// same bounded error budget as a failed poll — this must never
@@ -697,10 +699,10 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				}
 				return false
 			}
-			// The settled tasks are terminal or resting now. The no-backward
-			// sync guard keeps this tick's pending report from disturbing
-			// them, so the tick falls through and the apply-state derivation
-			// below quiesces the apply from the settled task states.
+			// The settled tasks are terminal or resting now, and the progress
+			// sync below leaves them out, so the tick falls through and the
+			// apply-state derivation quiesces the apply from the settled task
+			// states.
 		} else {
 			// Inside the budget the engine is still trusted: it may be
 			// serving a stale snapshot after a restart, or reporting
@@ -777,7 +779,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now)
+	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
@@ -1160,7 +1162,11 @@ func engineReportsLostApplyWork(engineTaskState string, tasks []*storage.Task) b
 // left untouched, so a settlement retried after a verification error never
 // re-settles what an earlier pass already decided. A verification error is
 // returned for the caller's consecutive-error budget to count.
-func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, engineState engine.State) error {
+//
+// Returns the tasks it settled, so the caller can keep the same tick's engine
+// report from claiming a state for work the target already answered for.
+func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, engineState engine.State) (settledTaskSet, error) {
+	settled := settledTaskSet{}
 	var unverified []*storage.Task
 	for _, task := range tasks {
 		if !state.IsInFlightTaskState(task.State) {
@@ -1170,29 +1176,44 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 		}
 		if taskInRevertPhase(task) {
 			c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
+			settled.add(task)
 			continue
 		}
 		unverified = append(unverified, task)
 	}
 	if len(unverified) == 0 {
-		return nil
+		return settled, nil
 	}
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		return fmt.Errorf("load plan for apply %s to verify target schema: %w", apply.ApplyIdentifier, err)
+		return settled, fmt.Errorf("load plan for apply %s to verify target schema: %w", apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
+		return settled, fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
 	}
 	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 	if err != nil {
-		return fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
+		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, task := range unverified {
 		_, needsChange := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		c.settleLostVerifiedTask(ctx, apply, task, needsChange, engineState)
+		settled.add(task)
 	}
-	return nil
+	return settled, nil
+}
+
+// settledTaskSet holds the tasks a drive resolved from a more authoritative
+// source than the engine during a single tick — here, the live target schema.
+// Their state is decided and persisted, so the same tick's engine report is no
+// longer entitled to claim one for them.
+type settledTaskSet map[*storage.Task]struct{}
+
+func (s settledTaskSet) add(task *storage.Task) { s[task] = struct{}{} }
+
+func (s settledTaskSet) contains(task *storage.Task) bool {
+	_, ok := s[task]
+	return ok
 }
 
 // autoTriggerCutover fires the engine cutover for a drive that is not
@@ -1386,12 +1407,13 @@ func (p enginePoll) retryableFailure() bool {
 // always refresh, and the state the poll claims for the task, which is a
 // correctness decision.
 //
-// Every task ends its tick with a persisted write, even when no field moved:
-// the operator reads tasks.updated_at as the drive's liveness signal
-// (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing, so the
-// write must stay unconditional — including through parked states such as
-// deferred cutovers and revert windows, where nothing changes tick to tick.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
+// Every task the poll speaks for ends its tick with a persisted write, even
+// when no field moved: the operator reads tasks.updated_at as the drive's
+// liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
+// advancing, so the write must stay unconditional — including through parked
+// states such as deferred cutovers and revert windows, where nothing changes
+// tick to tick.
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	poll := enginePoll{result: result, newState: newState, now: now}
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
@@ -1402,6 +1424,15 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 
 	for _, task := range tasks {
 		if poll.retryableFailure() && state.IsTerminalTaskState(task.State) {
+			continue
+		}
+		if settled.contains(task) {
+			// The target schema answered for this task earlier in the tick and
+			// settlement persisted the result. The poll that sent the drive to
+			// the target reports no active schema change, so it carries neither
+			// progress to display nor a state this task may take.
+			logger.Debug("leaving settled task out of the engine progress projection",
+				append(task.LogAttrs(), "engine_state", result.State)...)
 			continue
 		}
 		tp, _ := tableProgress.ForTask(task)
