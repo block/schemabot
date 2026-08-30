@@ -273,17 +273,37 @@ func cleanSingleLintReason(reason string) string {
 // Lint and safety messages quote SQL identifiers and types with single or
 // double quotes ('idx_category', "varchar"). The token pattern is restricted
 // to identifier and type characters so prose in quotes ("should not be
-// dropped") is left alone.
+// dropped") is left alone. Two quoted shapes carry spaces and are still
+// unambiguously SQL: an operation or statement fragment led by a DDL keyword
+// ("DROP TABLE `t`", "TRUNCATE PARTITION"), and a type or key part followed
+// by attribute words ("int(11) unsigned", "created_at DESC").
 var (
 	singleQuotedIdentifier = regexp.MustCompile(`'([A-Za-z0-9_$.()]+)'`)
 	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.()]+)"`)
+	quotedSQLFragment      = regexp.MustCompile(`"((?:ALTER|CREATE|DROP|RENAME|TRUNCATE|DISCARD|COALESCE)\b[^"]*)"`)
+	quotedTokenWithSuffix  = regexp.MustCompile(`"([A-Za-z0-9_$.()]+(?: (?:unsigned|signed|zerofill|precision|varying|DESC))+)"`)
 )
 
-// CodeQuoteIdentifiers rewrites quoted SQL identifiers and types in a
-// human-authored message to markdown inline code, so index, column, and type
-// names read as code on markdown surfaces. Best-effort display formatting:
-// tokens that don't look like identifiers keep their original quotes.
+// codeSpan wraps content in a markdown inline code span. Content that itself
+// contains backticks (SQL fragments quote identifiers with them) needs the
+// double-backtick delimiter form with padding spaces.
+func codeSpan(content string) string {
+	if !strings.Contains(content, "`") {
+		return "`" + content + "`"
+	}
+	return "`` " + content + " ``"
+}
+
+// CodeQuoteIdentifiers rewrites quoted SQL identifiers, types, and operation
+// fragments in a human-authored message to markdown inline code, so index,
+// column, and type names read as code on markdown surfaces. Best-effort
+// display formatting: tokens that don't look like SQL keep their original
+// quotes.
 func CodeQuoteIdentifiers(message string) string {
 	message = singleQuotedIdentifier.ReplaceAllString(message, "`$1`")
-	return doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	message = quotedSQLFragment.ReplaceAllStringFunc(message, func(quoted string) string {
+		return codeSpan(quoted[1 : len(quoted)-1])
+	})
+	message = doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	return quotedTokenWithSuffix.ReplaceAllString(message, "`$1`")
 }

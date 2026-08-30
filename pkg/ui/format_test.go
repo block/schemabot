@@ -154,6 +154,31 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 			input:  "DROP TABLE removes all data",
 			expect: "DROP TABLE removes all data",
 		},
+		{
+			name:   "quoted statement with backticked identifier gets a padded double-backtick span",
+			input:  "Unsafe operation detected: \"DROP TABLE `wallet_history`\"",
+			expect: "Unsafe operation detected: `` DROP TABLE `wallet_history` ``",
+		},
+		{
+			name:   "quoted operation without backticks gets a plain code span",
+			input:  `Unsafe operation detected: "TRUNCATE PARTITION"`,
+			expect: "Unsafe operation detected: `TRUNCATE PARTITION`",
+		},
+		{
+			name:   "quoted DROP COLUMN fragment keeps its backticked column",
+			input:  "Unsafe operation detected: \"DROP COLUMN `email`\"",
+			expect: "Unsafe operation detected: `` DROP COLUMN `email` ``",
+		},
+		{
+			name:   "quoted type with attribute words",
+			input:  `Column "qty" in table "orders" has type "int(11) unsigned"`,
+			expect: "Column `qty` in table `orders` has type `int(11) unsigned`",
+		},
+		{
+			name:   "quoted descending key part in a column list",
+			input:  `Index "idx_recent" on columns ("category", "created_at DESC") is redundant`,
+			expect: "Index `idx_recent` on columns (`category`, `created_at DESC`) is redundant",
+		},
 	}
 
 	for _, tt := range tests {
