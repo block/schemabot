@@ -35,14 +35,17 @@ func previewMutesCell(shard string) ShardCell {
 func PreviewCommentShardedApplyInProgress() string {
 	return RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
-		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Running},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
-			{Deployment: "c0-", State: state.ApplyOperation.Pending},
-		}),
-		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Running},
+				{Deployment: "40-80", State: state.ApplyOperation.Pending},
+				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
+				{Deployment: "c0-", State: state.ApplyOperation.Pending},
+			}),
+			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		}},
 	})
 }
 
@@ -51,14 +54,17 @@ func PreviewCommentShardedApplyInProgress() string {
 func PreviewCommentShardedApplyFailed() string {
 	return RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
-		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
-			{Deployment: "c0-", State: state.ApplyOperation.Pending},
-		}),
-		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
+				{Deployment: "40-80", State: state.ApplyOperation.Pending},
+				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
+				{Deployment: "c0-", State: state.ApplyOperation.Pending},
+			}),
+			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		}},
 	})
 }
 
@@ -69,16 +75,20 @@ func PreviewCommentShardedApplyFailed() string {
 func PreviewCommentShardedSummaryCompleted() string {
 	return RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Completed, Environment: "production", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		RequestedBy: previewRequestedBy,
 		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
-		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Completed},
-			{Deployment: "40-80", State: state.ApplyOperation.Completed},
-			{Deployment: "80-c0", State: state.ApplyOperation.Completed},
-			{Deployment: "c0-", State: state.ApplyOperation.Completed},
-		}),
-		Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Completed},
+				{Deployment: "40-80", State: state.ApplyOperation.Completed},
+				{Deployment: "80-c0", State: state.ApplyOperation.Completed},
+				{Deployment: "c0-", State: state.ApplyOperation.Completed},
+			}),
+			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		}},
 		VSchemaChanges: []apitypes.VSchemaChange{{
 			Namespace: "cdb_resolute_sharded",
 			Status:    "applied",
@@ -105,16 +115,20 @@ func PreviewCommentShardedSummaryCompleted() string {
 func PreviewCommentShardedSummaryFailed() string {
 	return RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "production", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		RequestedBy: previewRequestedBy,
 		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
 		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
-		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
-			{Deployment: "c0-", State: state.ApplyOperation.Pending},
-		}),
-		Cells:          []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Failed, Error: "resolve shard primary for `-40`: context deadline exceeded"},
+				{Deployment: "40-80", State: state.ApplyOperation.Pending},
+				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
+				{Deployment: "c0-", State: state.ApplyOperation.Pending},
+			}),
+			Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+		}},
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "cancelled"}},
 	})
 }
@@ -124,17 +138,68 @@ func PreviewCommentShardedSummaryFailed() string {
 func PreviewCommentShardedApplyDivergent() string {
 	return RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
-		Shards: previewShardStatuses([]presentation.Operation{
-			{Deployment: "-40", State: state.ApplyOperation.Running},
-			{Deployment: "40-80", State: state.ApplyOperation.Pending},
-			{Deployment: "80-c0", State: state.ApplyOperation.Pending},
-		}),
-		Cells: []ShardCell{
-			previewMutesCell("-40"),
-			{Shard: "40-80", Table: "mutes", DDL: previewMutesIndexDrift},
-			previewMutesCell("80-c0"),
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-40", State: state.ApplyOperation.Running},
+				{Deployment: "40-80", State: state.ApplyOperation.Pending},
+				{Deployment: "80-c0", State: state.ApplyOperation.Pending},
+			}),
+			Cells: []ShardCell{
+				previewMutesCell("-40"),
+				{Shard: "40-80", Table: "mutes", DDL: previewMutesIndexDrift},
+				previewMutesCell("80-c0"),
+			},
+		}},
+	})
+}
+
+// PreviewCommentShardedApplyMultiKeyspace renders a sharded apply spanning
+// several keyspaces in one deployment — the shape a database with unsharded
+// sibling keyspaces produces, where every unsharded keyspace contributes a
+// single "-" shard. Each keyspace renders its own section while the histogram
+// and rollout ordering span all of them, and the sharded keyspace's VSchema
+// change renders in the shared VSchema section.
+func PreviewCommentShardedApplyMultiKeyspace() string {
+	shards := previewShardStatuses([]presentation.Operation{
+		{Deployment: "cdb_resolute/-", State: state.ApplyOperation.Completed},
+		{Deployment: "cdb_resolute_lookup/-", State: state.ApplyOperation.Running},
+		{Deployment: "cdb_resolute_sharded/-40", State: state.ApplyOperation.Pending},
+		{Deployment: "cdb_resolute_sharded/40-80", State: state.ApplyOperation.Pending},
+		{Deployment: "cdb_resolute_sharded/80-c0", State: state.ApplyOperation.Pending},
+		{Deployment: "cdb_resolute_sharded/c0-", State: state.ApplyOperation.Pending},
+	})
+	unshard := func(s ShardStatus, shard string) ShardStatus {
+		s.Shard = shard
+		return s
+	}
+	return RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "production", Database: "cdb_resolute",
+		ApplyID: "apply-a1b2c3d4e5f6", RequestedBy: previewRequestedBy,
+		Keyspaces: []ShardedKeyspace{
+			{
+				Keyspace: "cdb_resolute",
+				Shards:   []ShardStatus{unshard(shards[0], "-")},
+				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+			},
+			{
+				Keyspace: "cdb_resolute_lookup",
+				Shards:   []ShardStatus{unshard(shards[1], "-")},
+				Cells:    []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},
+			},
+			{
+				Keyspace: "cdb_resolute_sharded",
+				Shards: []ShardStatus{
+					unshard(shards[2], "-40"),
+					unshard(shards[3], "40-80"),
+					unshard(shards[4], "80-c0"),
+					unshard(shards[5], "c0-"),
+				},
+				Cells: []ShardCell{previewMutesCell("-40"), previewMutesCell("40-80"), previewMutesCell("80-c0"), previewMutesCell("c0-")},
+			},
 		},
+		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: ""}},
 	})
 }
 

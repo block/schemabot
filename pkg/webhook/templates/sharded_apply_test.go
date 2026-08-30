@@ -1,6 +1,8 @@
 package templates
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,18 +15,23 @@ const mutesDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);"
 
 func mutesCell(shard string) ShardCell { return ShardCell{Shard: shard, Table: "mutes", DDL: mutesDDL} }
 
+// oneKeyspace wraps a single keyspace's shards and cells the way the webhook
+// builder shapes a single-keyspace apply.
+func oneKeyspace(shards []ShardStatus, cells []ShardCell) []ShardedKeyspace {
+	return []ShardedKeyspace{{Keyspace: "cdb_resolute_sharded", Shards: shards, Cells: cells}}
+}
+
 // A uniform sharded apply (every shard the same single change) renders one
 // status table and no per-shard grouping. The DDL is not repeated in the applied
 // comment — it is shown in the plan and apply-gate comments.
 func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x", RequestedBy: "morgo",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
 			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "**Shards**: 1 running table copy, 1 queued")
@@ -38,12 +45,11 @@ func TestRenderShardedApplyComment_FailedSurfacesError(t *testing.T) {
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
 			{Shard: "80-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "## Schema Change Status")
@@ -58,12 +64,11 @@ func TestRenderShardedApplyComment_FailedRetryableSurfacesErrorAndStop(t *testin
 	const retryErr = "lost connection to shard primary; retrying"
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.FailedRetryable, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔁", Label: "retrying", State: state.ApplyOperation.FailedRetryable, Error: retryErr},
 			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "> ⚠️ **First failure:** shard <code>-40</code> — "+retryErr,
@@ -80,17 +85,16 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	const driftDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
 			{Shard: "40-80", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
 			{Shard: "80-c0", Emoji: "⏳", Label: "waiting for -40", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{
+		}, []ShardCell{
 			mutesCell("-40"),
 			{Shard: "40-80", Table: "mutes", DDL: driftDDL}, // different signature → its own group
 			mutesCell("80-c0"),
-		},
+		}),
 	})
 
 	assert.Contains(t, out, "Shards diverge — grouped by change:")
@@ -98,6 +102,34 @@ func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	assert.Contains(t, out, "**shard `40-80`**", "the drifted shard is its own group")
 	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
 	assert.NotContains(t, out, driftDDL, "the DDL is not repeated in the applied comment")
+}
+
+// A wide divergence group states its coverage against the keyspace's shard
+// count instead of enumerating names — the group's status table right below
+// still lists every shard. The fraction uses the keyspace total, so a subset
+// can never read as covering all shards.
+func TestRenderShardedApplyComment_DivergentWideGroupStatesCoverage(t *testing.T) {
+	const driftDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
+	shards := make([]ShardStatus, 0, 16)
+	cells := make([]ShardCell, 0, 16)
+	for i := range 15 {
+		shard := fmt.Sprintf("s%02d", i)
+		shards = append(shards, ShardStatus{Shard: shard, Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending})
+		cells = append(cells, mutesCell(shard))
+	}
+	shards = append(shards, ShardStatus{Shard: "s15", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending})
+	cells = append(cells, ShardCell{Shard: "s15", Table: "mutes", DDL: driftDDL})
+
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID:   "apply-x",
+		Keyspaces: oneKeyspace(shards, cells),
+	})
+
+	assert.Contains(t, out, "**15 of 16 shards**", "the wide group states coverage, not names")
+	assert.NotContains(t, out, "all 16 shards", "a divergent subset never reads as full coverage")
+	assert.Contains(t, out, "**shard `s15`**", "the small group still names its shard inline")
+	assert.Contains(t, out, "| `s00` |", "the group's status table still names every shard")
 }
 
 // A uniform multi-table change set is one group (no spurious "grouped by change"
@@ -108,12 +140,11 @@ func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 	}
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
 			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{mutesCell("-40"), blocks("-40"), mutesCell("80-"), blocks("80-")},
+		}, []ShardCell{mutesCell("-40"), blocks("-40"), mutesCell("80-"), blocks("80-")}),
 	})
 
 	assert.NotContains(t, out, "grouped by change", "identical multi-table change sets are one group")
@@ -121,17 +152,76 @@ func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
 }
 
+// An apply spanning several keyspaces renders one section per keyspace in
+// resolved order, and the shard histogram spans every keyspace's shards, so
+// one comment tells the operator where the whole rollout stands.
+func TestRenderShardedApplyComment_MultiKeyspaceSections(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			{
+				Keyspace: "cdb_resolute",
+				Shards:   []ShardStatus{{Shard: "-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}},
+				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+			},
+			{
+				Keyspace: "cdb_resolute_sharded",
+				Shards: []ShardStatus{
+					{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+					{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+				},
+				Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "#### Keyspace `cdb_resolute`")
+	assert.Contains(t, out, "#### Keyspace `cdb_resolute_sharded`")
+	assert.Less(t, strings.Index(out, "#### Keyspace `cdb_resolute`"), strings.Index(out, "#### Keyspace `cdb_resolute_sharded`"),
+		"keyspaces render in resolved order")
+	assert.Contains(t, out, "**Shards**: 1 completed, 1 running table copy, 1 queued",
+		"the histogram spans every keyspace's shards")
+	assert.Contains(t, out, "| `-` | ✅ completed |", "an unsharded keyspace's lone shard renders under its own heading")
+	assert.NotContains(t, out, "grouped by change", "uniform keyspaces are not grouped")
+}
+
+// A failure in one keyspace's shard is lifted to the top even when other
+// keyspaces' shards are healthy, so the cross-keyspace comment still leads with
+// the cause.
+func TestRenderShardedApplyComment_MultiKeyspaceFailureLifted(t *testing.T) {
+	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{
+			{
+				Keyspace: "cdb_resolute",
+				Shards:   []ShardStatus{{Shard: "-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}},
+				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+			},
+			{
+				Keyspace: "cdb_resolute_sharded",
+				Shards:   []ShardStatus{{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr}},
+				Cells:    []ShardCell{mutesCell("-40")},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
+	assert.Contains(t, out, "**Shards**: 1 completed, 1 failed")
+}
+
 // A sharded rollback apply carries rollback vocabulary on the stable headline,
 // matching the single-deployment status comment.
 func TestRenderShardedApplyComment_Rollback(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
+		ApplyID: "apply-x", RequestedBy: "morgo",
 		Rollback: true,
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "## Rollback Status")
@@ -146,11 +236,10 @@ func TestRenderShardedApplyComment_FailedErrorSanitized(t *testing.T) {
 	const failErr = "dial tcp db-primary.internal:3306: connect refused\nretry | later"
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
@@ -166,13 +255,12 @@ func TestRenderShardedApplyComment_FailedErrorSanitized(t *testing.T) {
 func TestRenderShardedApplySummaryComment_Completed(t *testing.T) {
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
+		ApplyID: "apply-x", RequestedBy: "morgo",
 		StartedAt: "2026-01-01T00:00:00Z", CompletedAt: "2026-01-01T00:28:00Z",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
 			{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "## ✅ Schema Change Applied — Staging")
@@ -191,12 +279,11 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
 			{Shard: "80-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending},
-		},
-		Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
@@ -211,12 +298,11 @@ func TestRenderShardedApplySummaryComment_FailedSurfacesErrorAndRetry(t *testing
 func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
+		ApplyID: "apply-x", RequestedBy: "morgo",
 		Rollback: true,
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "Rolled back successfully — the schema change has been reverted.")
@@ -228,11 +314,10 @@ func TestRenderShardedApplySummaryComment_Rollback(t *testing.T) {
 func TestRenderShardedApplySummaryComment_CancelledOffersNoResume(t *testing.T) {
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Cancelled, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🚫", Label: "cancelled", State: state.ApplyOperation.Cancelled},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "## 🚫 Schema Change Cancelled — Staging")
@@ -247,12 +332,11 @@ func TestRenderShardedApplySummaryComment_CancelledOffersNoResume(t *testing.T) 
 func TestRenderShardedApplySummaryComment_FailureOutsideShardWorkSurfacesApplyError(t *testing.T) {
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ApplyID:      "apply-x",
 		ErrorMessage: "finalize vschema: dial tcp db-primary.internal:3306: connect refused retry | later\nsecond line",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "## ❌ Schema Change Failed — Staging")
@@ -268,12 +352,11 @@ func TestRenderShardedApplyComment_ShardFailureOwnsCallout(t *testing.T) {
 	const failErr = "resolve shard primary for `-40`: context deadline exceeded"
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ApplyID:      "apply-x",
 		ErrorMessage: "apply failed",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: failErr},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "> ❌ **First failure:** shard <code>-40</code> — "+failErr)
@@ -286,12 +369,11 @@ func TestRenderShardedApplyComment_ShardFailureOwnsCallout(t *testing.T) {
 func TestRenderShardedApplySummaryComment_NegativeDurationOmitted(t *testing.T) {
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ApplyID:   "apply-x",
 		StartedAt: "2026-01-01T01:00:00Z", CompletedAt: "2026-01-01T00:00:00Z",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.NotContains(t, out, "**Duration**:")
@@ -304,12 +386,11 @@ func TestRenderShardedApplySummaryComment_NegativeDurationOmitted(t *testing.T) 
 func TestRenderShardedApplyComment_VSchemaSection(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
 			{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells:          []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applying", Diff: "--- current\n+++ new\n+ vindex hash"}},
 	})
 
@@ -325,12 +406,11 @@ func TestRenderShardedApplyComment_VSchemaSection(t *testing.T) {
 func TestRenderShardedApplySummaryComment_VSchemaSectionAndPluralGrammar(t *testing.T) {
 	out := RenderShardedApplySummaryComment(ShardedApplyData{
 		State: state.Apply.Completed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x", RequestedBy: "morgo",
-		Shards: []ShardStatus{
+		ApplyID: "apply-x", RequestedBy: "morgo",
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
 			{Shard: "80-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells:          []ShardCell{mutesCell("-40"), mutesCell("80-")},
+		}, []ShardCell{mutesCell("-40"), mutesCell("80-")}),
 		VSchemaChanges: []apitypes.VSchemaChange{{Namespace: "cdb_resolute_sharded", Status: "applied"}},
 	})
 
@@ -340,21 +420,25 @@ func TestRenderShardedApplySummaryComment_VSchemaSectionAndPluralGrammar(t *test
 	assert.Contains(t, out, "**`cdb_resolute_sharded`**: Applied")
 }
 
-// The outcome line's grammar counts distinct tables and VSchema updates
-// together: exactly one change in total reads as singular, anything else as
-// plural.
+// The outcome line's grammar counts distinct (keyspace, table) pairs and
+// VSchema updates together: exactly one change in total reads as singular,
+// anything else as plural.
 func TestShardedChangeIsSingular_CountsVSchemaChanges(t *testing.T) {
-	oneTable := []ShardCell{mutesCell("-40"), mutesCell("80-")}
+	oneTable := oneKeyspace(nil, []ShardCell{mutesCell("-40"), mutesCell("80-")})
 	oneVSchema := []apitypes.VSchemaChange{{Namespace: "ks", Status: "applied"}}
 
-	assert.True(t, shardedChangeIsSingular(ShardedApplyData{Cells: oneTable}),
+	assert.True(t, shardedChangeIsSingular(ShardedApplyData{Keyspaces: oneTable}),
 		"one table across shards is one change")
-	assert.False(t, shardedChangeIsSingular(ShardedApplyData{Cells: oneTable, VSchemaChanges: oneVSchema}),
+	assert.False(t, shardedChangeIsSingular(ShardedApplyData{Keyspaces: oneTable, VSchemaChanges: oneVSchema}),
 		"a table change plus a VSchema update is two changes")
 	assert.True(t, shardedChangeIsSingular(ShardedApplyData{VSchemaChanges: oneVSchema}),
 		"a lone VSchema update is one change")
 	assert.False(t, shardedChangeIsSingular(ShardedApplyData{}),
 		"no cells and no VSchema changes does not prove a single change")
+	assert.False(t, shardedChangeIsSingular(ShardedApplyData{Keyspaces: []ShardedKeyspace{
+		{Keyspace: "cdb_resolute", Cells: []ShardCell{mutesCell("-")}},
+		{Keyspace: "cdb_resolute_sharded", Cells: []ShardCell{mutesCell("-40")}},
+	}}), "the same table name in two keyspaces is two changes")
 }
 
 // The status comment is frozen at terminal with the same failure callout the
@@ -363,12 +447,11 @@ func TestShardedChangeIsSingular_CountsVSchemaChanges(t *testing.T) {
 func TestRenderShardedApplyComment_FailureOutsideShardWorkSurfacesApplyError(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Failed, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ApplyID:      "apply-x",
 		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "## Schema Change Status — Staging")
@@ -382,12 +465,11 @@ func TestRenderShardedApplyComment_FailureOutsideShardWorkSurfacesApplyError(t *
 func TestRenderShardedApplyComment_RetryingApplyErrorCarriesAttentionGlyph(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.FailedRetryable, Environment: "staging", Database: "cdb_resolute",
-		Keyspace: "cdb_resolute_sharded", ApplyID: "apply-x",
+		ApplyID:      "apply-x",
 		ErrorMessage: "finalize vschema: apply vschema to keyspace: context deadline exceeded",
-		Shards: []ShardStatus{
+		Keyspaces: oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed},
-		},
-		Cells: []ShardCell{mutesCell("-40")},
+		}, []ShardCell{mutesCell("-40")}),
 	})
 
 	assert.Contains(t, out, "> ⚠️ **Failure:** finalize vschema: apply vschema to keyspace: context deadline exceeded")

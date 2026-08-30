@@ -27,13 +27,15 @@ func TestShardedApplyHintsCarryTenant(t *testing.T) {
 				State:       tc.state,
 				Environment: "staging",
 				Database:    "cdb_resolute",
-				Keyspace:    "cdb_resolute_sharded",
 				ApplyID:     "apply-x",
-				Shards: []ShardStatus{
-					{Shard: "-40", Emoji: "⏸", Label: "stopped", State: state.ApplyOperation.Stopped},
-					{Shard: "80-", Emoji: "⏸", Label: "stopped", State: state.ApplyOperation.Stopped},
-				},
-				Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+				Keyspaces: []ShardedKeyspace{{
+					Keyspace: "cdb_resolute_sharded",
+					Shards: []ShardStatus{
+						{Shard: "-40", Emoji: "⏸", Label: "stopped", State: state.ApplyOperation.Stopped},
+						{Shard: "80-", Emoji: "⏸", Label: "stopped", State: state.ApplyOperation.Stopped},
+					},
+					Cells: []ShardCell{mutesCell("-40"), mutesCell("80-")},
+				}},
 			}
 
 			untenanted := RenderShardedApplyComment(data)

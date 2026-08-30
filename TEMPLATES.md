@@ -7725,6 +7725,48 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="apply-across-multiple-keyspaces"></a><strong>Apply Across Multiple Keyspaces</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Shards**: 1 completed, 1 running table copy, 4 waiting for cdb_resolute_lookup/-
+
+#### Keyspace `cdb_resolute`
+
+| Shard | Status |
+| --- | --- |
+| `-` | ✅ completed |
+
+#### Keyspace `cdb_resolute_lookup`
+
+| Shard | Status |
+| --- | --- |
+| `-` | 🔄 running table copy |
+
+#### Keyspace `cdb_resolute_sharded`
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ⏳ waiting for cdb_resolute_lookup/- |
+| `40-80` | ⏳ waiting for cdb_resolute_lookup/- |
+| `80-c0` | ⏳ waiting for cdb_resolute_lookup/- |
+| `c0-` | ⏳ waiting for cdb_resolute_lookup/- |
+
+### VSchema
+
+**`cdb_resolute_sharded`**: Pending
+
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="summary-all-shards-completed"></a><strong>Summary: All Shards Completed</strong></summary>
 
 

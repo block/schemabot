@@ -11,12 +11,12 @@ import (
 )
 
 // ShardedApplyData is the input to the sharded-apply comment: an apply that fans
-// out across the shards of a single keyspace within one deployment. Its unit of
-// work is one operation per (shard, table). The applied comment shows shard
+// out across the shards of one or more keyspaces within one deployment. Its unit
+// of work is one operation per (shard, table). The applied comment shows shard
 // status only — the DDL is already shown in the plan and apply-gate comments, so
 // it is not repeated here. Shards are still grouped by their change signature so
 // a divergent apply (shards that drifted to different changes) shows which shards
-// moved together: a uniform apply renders one status table, a divergent one
+// moved together: a uniform keyspace renders one status table, a divergent one
 // renders a labelled status group per distinct change set. This is distinct from
 // the multi-deployment comment, whose unit is the deployment.
 type ShardedApplyData struct {
@@ -25,7 +25,6 @@ type ShardedApplyData struct {
 
 	Environment string
 	Database    string
-	Keyspace    string
 	ApplyID     string
 	RequestedBy string
 	StartedAt   string
@@ -38,14 +37,10 @@ type ShardedApplyData struct {
 	// failed shard row to carry the cause.
 	ErrorMessage string
 
-	// Shards is the per-shard rollup in resolved order: one entry per shard with
-	// its aggregate state. It drives the count histogram, each group's status
-	// rows, and the first-failure callout.
-	Shards []ShardStatus
-
-	// Cells is one entry per (shard, table) operation — the unit that carries the
-	// DDL and defines a shard's change signature for grouping.
-	Cells []ShardCell
+	// Keyspaces is the per-keyspace shard rollup in resolved order: each entry
+	// renders its own keyspace section, and together they drive the
+	// cross-keyspace count histogram and the first-failure callout.
+	Keyspaces []ShardedKeyspace
 
 	// VSchemaChanges holds per-keyspace VSchema application state, derived from
 	// the apply's finalizer operations rather than engine display metadata. Each
@@ -65,6 +60,21 @@ type ShardedApplyData struct {
 	// vocabulary from "apply" to "rollback", matching the single-deployment
 	// comment.
 	Rollback bool
+}
+
+// ShardedKeyspace is one keyspace's slice of a sharded apply: its shards in
+// resolved order, each with its aggregate status, and the (shard, table) cells
+// that define each shard's change signature for grouping.
+type ShardedKeyspace struct {
+	Keyspace string
+
+	// Shards is the keyspace's per-shard rollup in resolved order: one entry per
+	// shard with its aggregate state, driving the keyspace section's status rows.
+	Shards []ShardStatus
+
+	// Cells is one entry per (shard, table) operation — the unit that carries the
+	// DDL and defines a shard's change signature for grouping.
+	Cells []ShardCell
 }
 
 // ShardStatus is one shard's aggregate status. Emoji/Label come from the same
@@ -103,11 +113,12 @@ type shardGroup struct {
 }
 
 // RenderShardedApplyComment renders the PR comment for a sharded apply: the
-// shared apply header and metadata, a per-shard count histogram, the first
-// failed shard's error lifted to the top, then the shards grouped by change
-// signature — a single group renders one status table; more than one renders a
-// labelled status group per distinct change set. The comment is status-only; the
-// DDL is shown in the plan and apply-gate comments, not repeated here.
+// shared apply header and metadata, a per-shard count histogram across every
+// keyspace, the first failed shard's error lifted to the top, then a section
+// per keyspace with its shards grouped by change signature — a single group
+// renders one status table; more than one renders a labelled status group per
+// distinct change set. The comment is status-only; the DDL is shown in the
+// plan and apply-gate comments, not repeated here.
 func RenderShardedApplyComment(data ShardedApplyData) string {
 	var sb strings.Builder
 	renderedAt := currentTimestamp()
@@ -115,9 +126,9 @@ func RenderShardedApplyComment(data ShardedApplyData) string {
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedMetadata(&sb, data, renderedAt)
 
-	writeShardCounts(&sb, data.Shards)
+	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
-	writeShardKeyspaceSection(&sb, data)
+	writeShardKeyspaceSections(&sb, data.Keyspaces)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 
 	writeShardedFooter(&sb, data)
@@ -141,23 +152,36 @@ func RenderShardedApplySummaryComment(data ShardedApplyData) string {
 	if state.IsState(data.State, state.Apply.Completed) {
 		writeSuccessBlock(&sb, completedOutcomeMessage(shardedChangeIsSingular(data), data.Rollback))
 	}
-	writeShardCounts(&sb, data.Shards)
+	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
-	writeShardKeyspaceSection(&sb, data)
+	writeShardKeyspaceSections(&sb, data.Keyspaces)
 	writeVSchemaStatus(&sb, data.VSchemaChanges)
 	writeShardedFooter(&sb, data)
 	return sb.String()
 }
 
+// allShardStatuses flattens every keyspace's shards in resolved order, feeding
+// the rollup elements that span keyspaces — the count histogram and the
+// first-failure callout.
+func allShardStatuses(keyspaces []ShardedKeyspace) []ShardStatus {
+	var out []ShardStatus
+	for _, ks := range keyspaces {
+		out = append(out, ks.Shards...)
+	}
+	return out
+}
+
 // shardedChangeIsSingular reports whether the apply lands exactly one change —
-// one table's DDL across the shards, or one VSchema update — driving the
-// outcome line's singular/plural wording. Distinct tables and VSchema changes
-// each count as one change; an apply with neither reads as plural, since the
-// shard count alone does not prove a single change.
+// one keyspace table's DDL across the shards, or one VSchema update — driving
+// the outcome line's singular/plural wording. Distinct (keyspace, table) pairs
+// and VSchema changes each count as one change; an apply with neither reads as
+// plural, since the shard count alone does not prove a single change.
 func shardedChangeIsSingular(data ShardedApplyData) bool {
-	tables := make(map[string]struct{}, len(data.Cells))
-	for _, c := range data.Cells {
-		tables[c.Table] = struct{}{}
+	tables := make(map[string]struct{})
+	for _, ks := range data.Keyspaces {
+		for _, c := range ks.Cells {
+			tables[ks.Keyspace+"\x00"+c.Table] = struct{}{}
+		}
 	}
 	return len(tables)+len(data.VSchemaChanges) == 1
 }
@@ -178,23 +202,26 @@ func writeShardedSummaryMetadata(sb *strings.Builder, data ShardedApplyData) {
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
 }
 
-// writeShardKeyspaceSection writes the keyspace heading and the per-shard
-// status tables grouped by change signature. The section shows shard status
-// only: the DDL (what changes) is already shown in the plan and apply-gate
-// comments, so repeating it here adds nothing — and rendering "DDL unavailable"
-// when the apply path has no per-shard DDL is pure noise. Shards are still
-// grouped by change so a divergent apply shows which shards moved together.
-func writeShardKeyspaceSection(sb *strings.Builder, data ShardedApplyData) {
-	fmt.Fprintf(sb, "\n#### Keyspace `%s`\n", data.Keyspace)
-	groups := groupShardsBySignature(data.Shards, data.Cells)
-	if len(groups) <= 1 {
-		writeShardStatusTable(sb, data.Shards)
-		return
-	}
-	sb.WriteString("\nShards diverge — grouped by change:\n")
-	for _, g := range groups {
-		fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards))
-		writeShardStatusTable(sb, g.Shards)
+// writeShardKeyspaceSections writes one section per keyspace: its heading and
+// the per-shard status tables grouped by change signature. Each section shows
+// shard status only: the DDL (what changes) is already shown in the plan and
+// apply-gate comments, so repeating it here adds nothing — and rendering "DDL
+// unavailable" when the apply path has no per-shard DDL is pure noise. Shards
+// are still grouped by change so a divergent keyspace shows which shards moved
+// together.
+func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace) {
+	for _, ks := range keyspaces {
+		fmt.Fprintf(sb, "\n#### Keyspace `%s`\n", ks.Keyspace)
+		groups := groupShardsBySignature(ks.Shards, ks.Cells)
+		if len(groups) <= 1 {
+			writeShardStatusTable(sb, ks.Shards)
+			continue
+		}
+		sb.WriteString("\nShards diverge — grouped by change:\n")
+		for _, g := range groups {
+			fmt.Fprintf(sb, "\n**%s**\n", shardList(g.Shards, len(ks.Shards)))
+			writeShardStatusTable(sb, g.Shards)
+		}
 	}
 }
 
@@ -253,16 +280,18 @@ func signatureOf(changes []ShardChange) string {
 	return strings.Join(parts, "\x01")
 }
 
-// shardList renders a group's shards as "shard `x`" or "shards `x`, `y`".
-func shardList(shards []ShardStatus) string {
+// shardList renders a divergence group's shards as "shard `x`" or
+// "shards `x`, `y`" when few enough to read inline, stating coverage against
+// the keyspace's shard count beyond that ("12 of 32 shards") — the full names
+// stay reachable in the group's status table below. A divergent keyspace
+// always has at least two groups, so with the real total no group can read
+// as "all" shards.
+func shardList(shards []ShardStatus, totalShards int) string {
 	names := make([]string, len(shards))
 	for i, s := range shards {
-		names[i] = fmt.Sprintf("`%s`", s.Shard)
+		names[i] = s.Shard
 	}
-	if len(names) == 1 {
-		return "shard " + names[0]
-	}
-	return "shards " + strings.Join(names, ", ")
+	return planShardList(names, totalShards)
 }
 
 // writeShardCounts writes the per-status histogram across shards so rollout
@@ -312,7 +341,7 @@ func isShardFailureState(opState string) bool {
 // failed apply must still name it. Renders nothing when the apply carries no
 // failure to explain.
 func writeShardedFailure(sb *strings.Builder, data ShardedApplyData) {
-	for _, s := range data.Shards {
+	for _, s := range allShardStatuses(data.Keyspaces) {
 		if !isShardFailureState(s.State) {
 			continue
 		}
@@ -350,7 +379,7 @@ func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 	}
 	sb.WriteString("\n| Shard | Status |\n| --- | --- |\n")
 	for _, s := range shards {
-		fmt.Fprintf(sb, "| `%s` | %s |\n", s.Shard, shardStatusCell(s))
+		fmt.Fprintf(sb, "| %s | %s |\n", markdownInlineCode(s.Shard), shardStatusCell(s))
 	}
 }
 
