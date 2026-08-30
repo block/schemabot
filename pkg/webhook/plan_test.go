@@ -910,7 +910,7 @@ func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T)
 		HasUnsafeChanges: true,
 		UnsafeChanges: []templates.UnsafeChangeData{{
 			Table:  "uploads",
-			Reason: `Column "expires_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.; Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.; Primary key column "uid" has type "varchar"`,
+			Reason: `Column "expires_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.; Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.; Primary key column "uid" has type "varchar"`,
 		}},
 	}
 
@@ -918,8 +918,8 @@ func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T)
 
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 3 unsafe changes detected")
 	assert.Contains(t, rendered, "- `uploads`:\n")
-	assert.Contains(t, rendered, "  - Column `expires_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
-	assert.Contains(t, rendered, "  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
+	assert.Contains(t, rendered, "  - Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "  - Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
 	assert.Contains(t, rendered, "  - Primary key column `uid` has type `varchar`\n")
 	assert.NotContains(t, rendered, "instead.; ")
 }
@@ -940,7 +940,7 @@ func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
 		UnsafeChanges: []templates.UnsafeChangeData{
 			{
 				Table:  "orders",
-				Reason: `[ERROR] unsafe: DROP COLUMN removes data; [ERROR] has_timestamp: Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`,
+				Reason: `[ERROR] unsafe: DROP COLUMN removes data; [ERROR] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`,
 			},
 			{Table: "users", Reason: "DROP TABLE removes all data"},
 		},
@@ -951,7 +951,7 @@ func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
 	assert.Contains(t, rendered, "3 unsafe changes detected")
 	assert.Contains(t, rendered, "- `orders`:\n")
 	assert.Contains(t, rendered, "  - DROP COLUMN removes data\n")
-	assert.Contains(t, rendered, "  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
+	assert.Contains(t, rendered, "  - Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
 	assert.Contains(t, rendered, "- `users`: DROP TABLE removes all data\n")
 	assert.NotContains(t, rendered, "data; ")
 }
