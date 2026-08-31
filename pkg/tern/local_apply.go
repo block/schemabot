@@ -748,9 +748,11 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 // log. A storage failure (including a lease-guarded write refused because the
 // drive's lease was lost to a peer) is returned without recording the log
 // event, so the durable log never claims a transition the task row does not
-// carry, and the task is restored to the state storage still holds, so nothing
-// downstream reads a transition that did not happen off the in-memory row
-// either.
+// carry, and the task is rolled back to the values it arrived with, so nothing
+// downstream reads a state transition that did not happen. The rollback is to
+// the caller's own pre-call task rather than to storage: a caller that
+// refreshed display fields such as progress before calling keeps them, since
+// only the state gates control flow.
 func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
 	previous := *task
 	oldState := task.State
