@@ -34,6 +34,36 @@ func TestRenderPlanComment_BlockedShownOnPlanAndApply(t *testing.T) {
 	assert.Contains(t, apply, "dropping primary key is not supported")
 }
 
+func TestRenderPlanComment_BlockedEscapesReasonMarkdown(t *testing.T) {
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `user_events_v2` DROP PRIMARY KEY"},
+		}},
+		BlockedChanges: []BlockedChangeData{
+			{Table: "user_events_v2", Reason: "table user_events_v2 | column *event_id* is unsupported"},
+		},
+	})
+
+	assert.Contains(t, out, "table user\\_events\\_v2 \\| column \\*event\\_id\\* is unsupported")
+}
+
+func TestRenderPlanComment_BlockedSanitizesReason(t *testing.T) {
+	reason := "refused by db-primary.internal:3306\n\n## Injected heading\n- fake item"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY"},
+		}},
+		BlockedChanges: []BlockedChangeData{{Table: "users", Reason: reason}},
+	})
+
+	assert.NotContains(t, out, "\n## Injected heading")
+	assert.NotContains(t, out, "db-primary.internal:3306")
+	assert.Contains(t, out, "- `users`: refused by \\[endpoint redacted\\] ## Injected heading - fake item\n")
+}
+
 // A plan adding a foreign key — the most common statement the engine refuses —
 // discloses the refusal with the engine's foreign-key reason, alongside any
 // other blocked changes in the same section.

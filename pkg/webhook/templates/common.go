@@ -149,16 +149,18 @@ func escapeMarkdownLinkText(text string) string {
 
 // escapeInlineMarkdown backslash-escapes the characters that can change how
 // engine-influenced text renders inside an inline markdown span: emphasis and
-// code delimiters, link brackets, and HTML tag openers. Use it when untrusted
-// text is interpolated into styled inline markdown (for example inside an
-// italic span), where a stray delimiter would otherwise cut the styling short
-// or start a new construct.
+// code delimiters, link brackets, HTML tag openers, and table separators. A
+// backslash-escaped pipe renders as a literal pipe in GFM both inside and
+// outside tables, while sites that replace pipes with slashes predate this
+// escape. Use it when untrusted text is interpolated into styled inline
+// markdown (for example inside an italic span), where a stray delimiter would
+// otherwise cut the styling short or start a new construct.
 func escapeInlineMarkdown(text string) string {
 	var b strings.Builder
 	b.Grow(len(text))
 	for _, r := range text {
 		switch r {
-		case '\\', '`', '*', '_', '[', ']', '<':
+		case '\\', '`', '*', '_', '[', ']', '<', '|':
 			b.WriteByte('\\')
 		}
 		b.WriteRune(r)
