@@ -335,7 +335,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
 	// and blocks otherwise), so repeating them there is noise.
 	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.IsMySQL)
+		writeUnsafeWarning(&sb, data.UnsafeChanges)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -1057,7 +1057,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	sb.WriteString("\n" + footer + "\n\n")
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	for _, c := range changes {
@@ -1068,7 +1068,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL
 		writeUnsafeChangeItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, changes, isMySQL)
+	writeUnsafeDropGuidance(sb, changes)
 }
 
 // writeUnsafeChangeItem writes one table's unsafe findings as a list item:
@@ -1108,24 +1108,14 @@ func countUnsafeFindings(changes []UnsafeChangeData) int {
 	return n
 }
 
-func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData) {
 	applicationUsageTarget, hasApplicationUsageTarget := unsafeDropApplicationUsageTarget(changes)
-	indexActionTarget, indexInvisibleTarget, indexQueryTarget, hasIndexUsageTarget := unsafeDropIndexUsageTargets(changes)
-	if !hasApplicationUsageTarget && !hasIndexUsageTarget {
+	if !hasApplicationUsageTarget {
 		return
 	}
 
 	sb.WriteString("**Destructive drop guidance:**\n\n")
-	if hasApplicationUsageTarget {
-		fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", applicationUsageTarget)
-	}
-	if hasIndexUsageTarget {
-		if isMySQL {
-			fmt.Fprintf(sb, "Before dropping %s in MySQL, first make %s invisible and verify application queries no longer rely on %s for safe performance.\n\n", indexActionTarget, indexInvisibleTarget, indexQueryTarget)
-		} else {
-			fmt.Fprintf(sb, "Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", indexInvisibleTarget)
-		}
-	}
+	fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", applicationUsageTarget)
 }
 
 func unsafeDropApplicationUsageTarget(changes []UnsafeChangeData) (string, bool) {
@@ -1162,21 +1152,6 @@ func unsafeDropApplicationUsageTarget(changes []UnsafeChangeData) (string, bool)
 		return "any dropped tables", true
 	}
 	return "", false
-}
-
-func unsafeDropIndexUsageTargets(changes []UnsafeChangeData) (actionTarget, invisibleTarget, queryTarget string, ok bool) {
-	dropIndexes := 0
-	for _, change := range changes {
-		dropIndexes += strings.Count(strings.ToUpper(change.Reason), "DROP INDEX")
-	}
-
-	if dropIndexes == 1 {
-		return "an index", "the dropped index", "it", true
-	}
-	if dropIndexes > 1 {
-		return "indexes", "any dropped indexes", "them", true
-	}
-	return "", "", "", false
 }
 
 // lintWarningsFoldThreshold is the warning count above which the lint section
@@ -1518,7 +1493,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
+		writeUnsafeWarning(sb, plan.UnsafeChanges)
 	}
 
 	// Lint violations

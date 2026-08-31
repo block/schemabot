@@ -1035,36 +1035,6 @@ func PreviewCommentDropColumnBlocked() string {
 	})
 }
 
-// PreviewCommentDropIndexBlocked renders a sample plan where a destructive
-// index drop is blocked until query performance has been reviewed.
-func PreviewCommentDropIndexBlocked() string {
-	return RenderUnsafeChangesBlocked(PlanCommentData{
-		Database:     "testapp",
-		SchemaName:   "testapp",
-		Environment:  "staging",
-		HeadSHA:      previewHeadSHA,
-		Repository:   previewRepository,
-		RequestedBy:  previewRequestedBy,
-		IsMySQL:      true,
-		DatabaseType: "mysql",
-		Changes: []KeyspaceChangeData{
-			{
-				Keyspace: "testapp",
-				Statements: []string{
-					"ALTER TABLE `customers` DROP INDEX `idx_customers_email`;",
-				},
-			},
-		},
-		HasUnsafeChanges: true,
-		UnsafeChanges: []UnsafeChangeData{
-			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
-			},
-		},
-	})
-}
-
 // PreviewCommentLintErrorsBlocked renders a sample plan where error-severity
 // schema lint violations block the apply. The reasons carry the raw
 // "[ERROR] linter:" prefixes engines report; the renderer strips them.
