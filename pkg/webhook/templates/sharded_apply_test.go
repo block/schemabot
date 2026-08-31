@@ -552,6 +552,27 @@ func TestRenderShardedApplyComment_TableCopyStarting(t *testing.T) {
 	assert.Contains(t, out, "- Rows: 0 / 1,466,232")
 }
 
+// A huge table early in its copy has real rows copied but a fraction that
+// rounds down to zero percent; the line shows a 1% floor so live progress is
+// never misread as a copy that has not begun.
+func TestRenderShardedApplyComment_TableCopySubPercentFloorsAtOne(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 4200, RowsTotal: 1466232, ETASeconds: 5400,
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, out, "- Rows: 4,200 / 1,466,232")
+	assert.NotContains(t, out, "Starting copy", "rows are already flowing")
+}
+
 // When copied rows exceed the estimated total, the table shows the activity
 // bar and honest "so far" count instead of a >100% fraction.
 func TestRenderShardedApplyComment_TableCopyEstimateExceeded(t *testing.T) {

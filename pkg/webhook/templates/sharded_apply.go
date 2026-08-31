@@ -443,7 +443,7 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 		return
 	}
 	rows := TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds}
-	pct := ui.ClampPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal) * 100 / t.RowsTotal))
+	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
 	if pct == 0 {
 		fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", t.Table)
 		writeRowsAndETA(sb, rows)
