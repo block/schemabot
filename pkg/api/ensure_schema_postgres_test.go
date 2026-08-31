@@ -77,3 +77,23 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 		assert.NotEmpty(t, columns, "table %s", table)
 	}
 }
+
+func TestPostgresAddColumnRequiresManualBackfill(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		statement string
+		want      bool
+	}{
+		{name: "not null without default", statement: "ALTER TABLE settings ADD COLUMN setting_value text NOT NULL", want: true},
+		{name: "not null with default", statement: "ALTER TABLE applies ADD COLUMN caller varchar(255) DEFAULT '' NOT NULL"},
+		{name: "nullable", statement: "ALTER TABLE applies ADD COLUMN expected_operation_keys jsonb"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, postgresAddColumnRequiresManualBackfill(tt.statement))
+		})
+	}
+}

@@ -65,19 +65,22 @@ func TestEnsureSchemaPostgres_Idempotent(t *testing.T) {
 	requireStorageTables(t, db)
 }
 
-// Startup refuses an existing storage table that is missing an expected
-// column and identifies the exact table shape operators need to restore.
-func TestEnsureSchemaPostgres_RejectsMissingColumn(t *testing.T) {
+// Startup restores an additive column from the embedded CREATE TABLE and a
+// second startup observes the converged shape without executing more DDL.
+func TestEnsureSchemaPostgres_ConvergesMissingColumn(t *testing.T) {
 	ctx := t.Context()
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
-	_, err := db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
+	_, err := db.ExecContext(ctx, "ALTER TABLE applies DROP COLUMN caller")
 	require.NoError(t, err)
 
-	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
-	require.ErrorContains(t, err, `storage table "settings" is missing expected columns: setting_value`)
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	columns, err := postgresTableColumns(ctx, db, "applies")
+	require.NoError(t, err)
+	assert.True(t, columns["caller"])
 }
 
 // Startup tolerates columns unknown to the running binary so an older binary
@@ -90,15 +93,18 @@ func TestEnsureSchemaPostgres_AllowsExtraColumn(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "ALTER TABLE settings ADD COLUMN future_value text")
 	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE INDEX idx_settings_future_value ON settings (future_value)")
+	require.NoError(t, err)
 
 	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	indexes, err := postgresTableIndexes(ctx, db, "settings")
+	require.NoError(t, err)
+	assert.Contains(t, indexes, "idx_settings_future_value")
 }
 
-// Startup tolerates a missing non-unique index because it affects query
-// performance rather than the storage model's write semantics — but it warns
-// with the table and index named, so an operator learns the index must be
-// created by hand instead of discovering unindexed queries later.
-func TestEnsureSchemaPostgres_AllowsMissingIndex(t *testing.T) {
+// Startup recreates a missing non-unique index from the schema file's own
+// CREATE INDEX statement.
+func TestEnsureSchemaPostgres_ConvergesMissingNonUniqueIndex(t *testing.T) {
 	ctx := t.Context()
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -108,16 +114,17 @@ func TestEnsureSchemaPostgres_AllowsMissingIndex(t *testing.T) {
 	require.NoError(t, err)
 
 	var logs bytes.Buffer
-	warnLogger := slog.New(slog.NewTextHandler(&logs, nil))
-	require.NoError(t, EnsureSchema(dsn, warnLogger, WithDialect(schema.DialectPostgres)))
-	assert.Contains(t, logs.String(), "missing non-unique indexes")
-	assert.Contains(t, logs.String(), "idx_apply_logs_level")
-	assert.Contains(t, logs.String(), "apply_logs")
+	convergeLogger := slog.New(slog.NewTextHandler(&logs, nil))
+	require.NoError(t, EnsureSchema(dsn, convergeLogger, WithDialect(schema.DialectPostgres)))
+	indexes, err := postgresTableIndexes(ctx, db, "apply_logs")
+	require.NoError(t, err)
+	assert.Contains(t, indexes, "idx_apply_logs_level")
+	assert.Contains(t, logs.String(), "CREATE INDEX idx_apply_logs_level ON apply_logs (level)")
 }
 
-// Startup refuses a missing unique index and identifies the exact table and
-// index operators must restore before writes can safely resume.
-func TestEnsureSchemaPostgres_RejectsMissingUniqueIndex(t *testing.T) {
+// Startup recreates a missing unique index transactionally before accepting
+// traffic that depends on its write constraint.
+func TestEnsureSchemaPostgres_ConvergesMissingUniqueIndex(t *testing.T) {
 	ctx := t.Context()
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -126,8 +133,26 @@ func TestEnsureSchemaPostgres_RejectsMissingUniqueIndex(t *testing.T) {
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
 	require.NoError(t, err)
 
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	indexes, err := postgresTableIndexes(ctx, db, "settings")
+	require.NoError(t, err)
+	assert.True(t, indexes["idx_settings_setting_key"])
+}
+
+// Startup refuses automatic convergence when the desired missing column is
+// NOT NULL without a DEFAULT and gives the operator a safe remediation.
+func TestEnsureSchemaPostgres_RejectsMissingNotNullColumnWithoutDefault(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
+	require.NoError(t, err)
+
 	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
-	require.ErrorContains(t, err, `storage table "settings" is missing expected unique indexes: idx_settings_setting_key`)
+	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value" whose definition is NOT NULL without a DEFAULT`)
+	require.ErrorContains(t, err, "add it manually or ship the column with a DEFAULT")
 }
 
 // A storage database missing a subset of tables converges back to the full

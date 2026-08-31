@@ -706,38 +706,19 @@ on the storage dialect:
 - **MySQL** diffs the embedded schema files against the live database and
   applies whatever DDL is needed (via Spirit) — new tables, new columns, and
   index changes all converge automatically.
-- **PostgreSQL** creates missing tables and verifies that existing tables
-  contain every column and standalone unique index declared by the embedded
-  schema. Missing objects fail startup with the affected table and objects
-  identified; extra columns are tolerated, and a missing non-unique index is
-  tolerated with a startup warning naming it. Column verification is
-  presence-only: type, length, and nullability drift
-  is outside its scope and is not detected. Existing tables are never altered,
-  and `allow_destructive_schema_changes` has no effect because this flow never
-  produces destructive DDL. Apply column changes to already-bootstrapped
-  PostgreSQL databases before deploying schema files that expect them.
+- **PostgreSQL** automatically creates missing tables, columns, and standalone
+  indexes. It discovers drift before taking the bootstrap advisory lock, then
+  re-checks and applies each table's changes transactionally under that lock.
+  A missing `NOT NULL` column without a `DEFAULT` fails startup with instructions
+  to add it manually or ship a default, because adding it safely may require a
+  deliberate backfill. Startup also fails when additive DDL cannot be parsed or
+  executed, or when re-verification finds unresolved drift.
 
-  Non-unique indexes work the same way, and the consequence is quieter: an
-  index added to an embedded schema file reaches newly created databases only,
-  so an already-bootstrapped database keeps answering the queries that index
-  was added for — correctly, but without it, and startup warns about the gap
-  on every deploy until it is closed. Create those by hand. A database
-  bootstrapped before `idx_plans_created_at` was added to `plans` needs:
-
-  ```sql
-  CREATE INDEX idx_plans_created_at ON plans (created_at);
-  ```
-
-  Without it, listing recent plans is a sequential scan plus a top-N sort,
-  which gets slower as plan history grows. Likewise, one bootstrapped before
-  the driver claim ordering on `apply_operations` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_created_id ON apply_operations (created_at, id);
-  ```
-
-  Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows.
+  Convergence is additive-only: extra columns and indexes remain in place for
+  binary rollback, and `allow_destructive_schema_changes` has no effect because
+  this flow never produces destructive DDL. Column verification remains
+  presence-only, so type, length, and nullability drift is outside its scope and
+  is not detected.
 
 The rest of this section describes the MySQL flow.
 
