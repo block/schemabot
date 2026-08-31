@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // maxAppNameChars caps the length of a database's app identifier so app names
@@ -31,6 +32,9 @@ func validateDatabaseApp(database string, dbConfig DatabaseConfig) error {
 	}
 	if app[0] == '-' || app[len(app)-1] == '-' {
 		return fmt.Errorf("databases.%s.app value %q must start and end with a letter or digit", database, app)
+	}
+	if strings.Contains(app, "--") {
+		return fmt.Errorf("databases.%s.app value %q must not contain consecutive hyphens", database, app)
 	}
 	return nil
 }
