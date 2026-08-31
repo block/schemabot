@@ -123,6 +123,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	var payloadInstallationID int64
 	if payload.Installation != nil {
@@ -949,6 +950,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 			"repo", event.Repository, "pr", event.PullRequest)
 		return false, nil
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
 		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
 			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
@@ -1065,14 +1067,15 @@ func durableIssueCommentCommand(event *storage.WebhookEvent) (CommandResult, str
 	if err != nil {
 		return CommandResult{}, "", 0, 0, "", err
 	}
-	if payload.Repository.FullName == "" || payload.Issue.Number == 0 {
+	repo := storage.CanonicalKey(payload.Repository.FullName)
+	if repo == "" || payload.Issue.Number == 0 {
 		return CommandResult{}, "", 0, 0, "", fmt.Errorf("durable issue_comment terminal notification %s is missing repo or PR", event.DeliveryID)
 	}
 	requestedBy := ""
 	if payload.Comment.User != nil {
 		requestedBy = payload.Comment.User.Login
 	}
-	return result, payload.Repository.FullName, payload.Issue.Number, installationID, requestedBy, nil
+	return result, repo, payload.Issue.Number, installationID, requestedBy, nil
 }
 
 // durableIssueCommentCommandReady reports whether the driver implements the

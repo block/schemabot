@@ -79,6 +79,7 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.writeError(w, http.StatusBadRequest, "invalid check_suite payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	repo := payload.Repository.FullName
 	headSHA := payload.CheckSuite.HeadSHA
 
@@ -195,6 +196,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return false, fmt.Errorf("decode durable check_suite delivery %s: %w", event.DeliveryID, err)
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	// Re-validate the action fail-closed: rows can arrive via replay or a
 	// future producer, and a non-requested action carries no recovery work.
 	if payload.Action != checkSuiteRecoveryAction {

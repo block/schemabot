@@ -95,6 +95,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	// Repo-level webhook deliveries carry no installation id in the payload; the
 	// dispatcher resolves it and stashes it on the context.
