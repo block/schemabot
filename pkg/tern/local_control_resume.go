@@ -89,8 +89,9 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	// We scope to a single apply to avoid cross-contamination: a poller race can
 	// erroneously mark tasks from earlier applies as STOPPED (see pollTaskToCompletion).
 	var apply *storage.Apply
-	// Only discovery is age-bounded; a named apply has already been chosen.
-	ageBounded := req.ApplyId == ""
+	// The most recent stopped task discovery passed over for age alone. When
+	// nothing lands in the window, its apply is the hint the refusal points at.
+	var passedOver *storage.Task
 
 	c.logger.Info("Start: looking for stopped tasks",
 		"database", c.config.Database,
@@ -115,6 +116,9 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 			if time.Since(task.UpdatedAt) > stoppedApplyDiscoveryWindow {
 				c.logger.Info("Start: stopped task is older than the discovery window, so an unqualified start passes over it; naming its apply still resumes it",
 					append(task.LogAttrs(), "updated_at", task.UpdatedAt, "discovery_window", stoppedApplyDiscoveryWindow)...)
+				if passedOver == nil || task.UpdatedAt.After(passedOver.UpdatedAt) {
+					passedOver = task
+				}
 				continue
 			}
 			if task.ApplyID > 0 {
@@ -127,7 +131,7 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	}
 
 	if apply == nil {
-		return nil, 0, 0, fmt.Errorf("no stopped schema change to resume")
+		return nil, 0, 0, c.noDiscoverableApplyError(ctx, len(tasks), passedOver)
 	}
 
 	// Deferred deploy that isn't ready yet — reject with a clear message.
@@ -141,7 +145,7 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
 
-	var startedCount, skippedCount, staleCount int64
+	var startedCount, skippedCount int64
 	var unresumable []string
 	for _, task := range tasks {
 		if task.ApplyID != apply.ID {
@@ -162,35 +166,50 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 				append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
 			continue
 		}
-		if ageBounded && time.Since(task.UpdatedAt) > stoppedApplyDiscoveryWindow {
-			staleCount++
-			c.logger.Info("Start: stopped task is older than the discovery window",
-				append(task.LogAttrs(), "updated_at", task.UpdatedAt, "discovery_window", stoppedApplyDiscoveryWindow)...)
-			continue
-		}
 		startedCount++
 	}
 
 	if startedCount == 0 {
-		return nil, 0, 0, c.noResumableWorkError(apply, len(tasks), skippedCount, staleCount, unresumable)
+		return nil, 0, 0, c.noResumableWorkError(apply, len(tasks), skippedCount, unresumable)
 	}
 	c.logger.Info("Start: resolved resumable work",
 		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount)...)
 	return apply, startedCount, skippedCount, nil
 }
 
+// noDiscoverableApplyError explains why an unqualified start resolved no apply
+// at all. When discovery passed over a stopped task for age alone, the refusal
+// names its apply and the command that resumes it anyway — "nothing to resume"
+// would send the operator looking for a change that is sitting right there,
+// and the hint is only useful on the surface they can see, not in a server log.
+func (c *LocalClient) noDiscoverableApplyError(ctx context.Context, taskCount int, passedOver *storage.Task) error {
+	if passedOver != nil && passedOver.ApplyID > 0 {
+		a, err := c.storage.Applies().Get(ctx, passedOver.ApplyID)
+		switch {
+		case err != nil:
+			c.logger.Warn("Start: failed to load the apply of the stopped task discovery passed over; the refusal cannot name it",
+				append(passedOver.LogAttrs(), "error", err)...)
+		case a == nil:
+			c.logger.Warn("Start: the stopped task discovery passed over points at an apply that no longer exists; the refusal cannot name it",
+				passedOver.LogAttrs()...)
+		default:
+			return fmt.Errorf("schema change %s has been resting longer than the %s an unqualified start searches; re-issue the start naming %s to resume it anyway",
+				a.ApplyIdentifier, stoppedApplyDiscoveryWindow, a.ApplyIdentifier)
+		}
+	}
+	return fmt.Errorf("no stopped schema change to resume (found %d tasks for database %s, none of them stopped within the last %s)",
+		taskCount, c.config.Database, stoppedApplyDiscoveryWindow)
+}
+
 // noResumableWorkError explains why a start resolved an apply but found nothing
 // on it to resume. Each cause asks a different thing of the operator — wait for
 // the driver, reconcile the target, name the apply — so they are reported
 // separately rather than collapsed into one "nothing to resume".
-func (c *LocalClient) noResumableWorkError(apply *storage.Apply, taskCount int, skipped, stale int64, unresumable []string) error {
+func (c *LocalClient) noResumableWorkError(apply *storage.Apply, taskCount int, skipped int64, unresumable []string) error {
 	switch {
 	case len(unresumable) > 0:
 		return fmt.Errorf("schema change %s has no stopped work to resume: %d of its tasks are in a state start cannot act on (%s)",
 			apply.ApplyIdentifier, len(unresumable), strings.Join(distinctSorted(unresumable), ", "))
-	case stale > 0:
-		return fmt.Errorf("schema change %s has been resting longer than the %s an unqualified start searches; re-issue it naming %s to resume it anyway",
-			apply.ApplyIdentifier, stoppedApplyDiscoveryWindow, apply.ApplyIdentifier)
 	case skipped > 0:
 		return fmt.Errorf("schema change %s has no stopped work to resume: all %d of its tasks already reached a terminal state",
 			apply.ApplyIdentifier, skipped)

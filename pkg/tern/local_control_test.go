@@ -1769,7 +1769,8 @@ func TestLocalClient_ControlOperationCountsOnlyLandedTaskWrites(t *testing.T) {
 		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, nil, state.Task.Stopped)
 
 	require.Error(t, err, "a refused task write must be reported, not absorbed into the count")
-	assert.Contains(t, err.Error(), "settle 1 of 2 tasks")
+	assert.Contains(t, err.Error(), "failed to settle 1 of 2 tasks",
+		"the count in the message is the failures, and it must read as such")
 	assert.Equal(t, int64(1), marked, "only the landed write is counted")
 	assert.Equal(t, int64(1), skipped, "the already-terminal task is skipped, not marked")
 	assert.Equal(t, apply.ID, applyID)
@@ -1845,8 +1846,27 @@ func TestLocalClient_StartOutsideTheDiscoveryWindowNamesTheWayForward(t *testing
 	_, _, _, err := client.resolveStartRequest(t.Context(), &ternv1.StartRequest{})
 
 	require.Error(t, err, "an unqualified start passes over a change older than the window")
-	assert.Contains(t, err.Error(), "no stopped schema change to resume",
-		"discovery finds no candidate at all, so the apply is never resolved")
+	assert.Contains(t, err.Error(), apply.ApplyIdentifier,
+		"the refusal names the change it passed over, not just that nothing was found")
+	assert.Contains(t, err.Error(), "re-issue the start naming",
+		"the refusal points at the command that resumes the change anyway")
+}
+
+// Task states arrive in proto form for terminal states too, so a finished
+// table must be counted as skipped rather than reported as a state start
+// cannot act on — the latter tells the operator something is wedged when the
+// change is simply done.
+func TestLocalClient_StartSkipsProtoFormattedTerminalTasks(t *testing.T) {
+	apply, task := restingStartApply("STATE_COMPLETED", time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already reached a terminal state",
+		"a proto-formatted completed state is still a finished table")
+	assert.NotContains(t, err.Error(), "state start cannot act on")
 }
 
 // A task that is neither terminal nor resting is not something a start can act
