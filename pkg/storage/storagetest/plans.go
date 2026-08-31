@@ -17,6 +17,45 @@ import (
 // storage.ErrNotImplemented. When an implementation lands, it joins this
 // family.
 func TestPlans(t *testing.T, h Harness) {
+	t.Run("CanonicalizesIdentityKeys", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_mixed_case",
+			Database:       "OrdersDB",
+			DatabaseType:   "MySQL",
+			Repository:     "MixedCase/Sample-Repo",
+			PullRequest:    42,
+			Environment:    "Staging",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		}
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		assert.Equal(t, "ordersdb", plan.Database)
+		assert.Equal(t, "mysql", plan.DatabaseType)
+		assert.Equal(t, "mixedcase/sample-repo", plan.Repository)
+		assert.Equal(t, "staging", plan.Environment)
+
+		byPR, err := store.Plans().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 42)
+		require.NoError(t, err)
+		require.Len(t, byPR, 1)
+		assert.Equal(t, "plan_mixed_case", byPR[0].PlanIdentifier)
+
+		listed, err := store.Plans().List(ctx, storage.ListPlansOptions{
+			Database: "ORDERSDB", Environment: "STAGING",
+			Repository: "MIXEDCASE/SAMPLE-REPO", PullRequest: 42, Limit: 10,
+		})
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.Equal(t, "plan_mixed_case", listed[0].PlanIdentifier)
+
+		require.NoError(t, store.Plans().DeleteByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 42))
+		deleted, err := store.Plans().Get(ctx, "plan_mixed_case")
+		require.NoError(t, err)
+		assert.Nil(t, deleted)
+	})
+
 	t.Run("Create_And_Get", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

@@ -107,6 +107,34 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		return claimExpecting(t, store, "old")
 	}
 
+	t.Run("CanonicalizesRepositoryKey", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		event := newPullRequestEvent("delivery-mixed-case", "synchronize", 42, "mixed-head", time.Time{})
+		event.Repository = "MixedCase/Sample-Repo"
+		createEvent(t, store, event)
+		assert.Equal(t, "mixedcase/sample-repo", event.Repository)
+
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "MIXEDCASE/SAMPLE-REPO", 42, "mixed-head")
+		require.NoError(t, err)
+		assert.True(t, found)
+
+		claimed := claimExpecting(t, store, "delivery-mixed-case")
+		claimed.Repository = "MIXEDCASE/SAMPLE-REPO"
+		successor := newPullRequestEvent("delivery-mixed-successor", "synchronize", 42, "new-head", time.Now().UTC().Add(time.Second))
+		successor.Repository = "mixedcase/sample-repo"
+		createEvent(t, store, successor)
+
+		covered, err := store.WebhookEvents().HasCoveringSuccessor(ctx, claimed)
+		require.NoError(t, err)
+		assert.True(t, covered)
+		claimed.Repository = "MIXEDCASE/SAMPLE-REPO"
+		superseded, err := store.WebhookEvents().SupersedeIfCovered(ctx, claimed)
+		require.NoError(t, err)
+		assert.True(t, superseded)
+	})
+
 	t.Run("Create_DeduplicatesDeliveryID", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

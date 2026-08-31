@@ -24,6 +24,8 @@ type planCommentStore struct {
 
 // Insert stores a newly posted plan comment and sets comment.ID.
 func (s *planCommentStore) Insert(ctx context.Context, comment *storage.PlanComment) error {
+	canonicalizePlanCommentIdentity(comment)
+
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO plan_comments (repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -39,6 +41,9 @@ func (s *planCommentStore) Insert(ctx context.Context, comment *storage.PlanComm
 // ListUnminimizedForSlot returns the not-yet-minimized comments for a
 // (repository, pull_request, database) slot, ordered by id ascending.
 func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*storage.PlanComment, error) {
+	repo = storage.CanonicalKey(repo)
+	database = storage.CanonicalKey(database)
+	databaseType = storage.CanonicalKey(databaseType)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+planCommentColumns+`
 		FROM plan_comments
@@ -58,6 +63,7 @@ func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo stri
 // database has no other way to ask. The (repository, pull_request) prefix of
 // the slot index serves it.
 func (s *planCommentStore) ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
+	repo = storage.CanonicalKey(repo)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+planCommentColumns+`
 		FROM plan_comments
@@ -99,6 +105,13 @@ func (s *planCommentStore) MarkMinimized(ctx context.Context, id int64) error {
 		return fmt.Errorf("mark plan comment %d minimized: %w", id, err)
 	}
 	return nil
+}
+
+func canonicalizePlanCommentIdentity(comment *storage.PlanComment) {
+	comment.Repository = storage.CanonicalKey(comment.Repository)
+	comment.DatabaseName = storage.CanonicalKey(comment.DatabaseName)
+	comment.DatabaseType = storage.CanonicalKey(comment.DatabaseType)
+	comment.EnvironmentScope = storage.CanonicalKey(comment.EnvironmentScope)
 }
 
 // scanPlanComment scans plan comment data from any scanner (Row or Rows).

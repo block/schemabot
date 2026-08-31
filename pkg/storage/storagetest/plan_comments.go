@@ -40,6 +40,27 @@ func InsertPlanComment(t *testing.T, store storage.Storage, repo string, pr int,
 // behavior — a minimized comment drops out of the unminimized listings and
 // repeat or missing-id marks are no-ops.
 func TestPlanComments(t *testing.T, h Harness) {
+	t.Run("CanonicalizesIdentityKeys", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		inserted := InsertPlanComment(t, store, "MixedCase/Sample-Repo", 42, "OrdersDB", "MySQL", "Production,Staging", "sha1", 100)
+		assert.Equal(t, "mixedcase/sample-repo", inserted.Repository)
+		assert.Equal(t, "ordersdb", inserted.DatabaseName)
+		assert.Equal(t, "mysql", inserted.DatabaseType)
+		assert.Equal(t, "production,staging", inserted.EnvironmentScope)
+
+		comments, err := store.PlanComments().ListUnminimizedForSlot(ctx, "MIXEDCASE/SAMPLE-REPO", 42, "ORDERSDB", "MYSQL")
+		require.NoError(t, err)
+		require.Len(t, comments, 1)
+		assert.Equal(t, inserted.ID, comments[0].ID)
+
+		comments, err = store.PlanComments().ListUnminimizedForRepoPR(ctx, "MIXEDCASE/SAMPLE-REPO", 42)
+		require.NoError(t, err)
+		require.Len(t, comments, 1)
+		assert.Equal(t, inserted.ID, comments[0].ID)
+	})
+
 	t.Run("Insert_And_ListUnminimizedForSlot", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

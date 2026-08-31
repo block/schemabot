@@ -27,6 +27,8 @@ type webhookEventStore struct {
 }
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	event.Repository = storage.CanonicalKey(event.Repository)
+
 	if event.DeliveryID == "" {
 		return false, fmt.Errorf("webhook delivery ID is required")
 	}
@@ -182,6 +184,7 @@ func webhookClaimableArgs() []any {
 }
 
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	repository = storage.CanonicalKey(repository)
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
 	}
@@ -267,6 +270,7 @@ func (s *webhookEventStore) coveringSuccessorQuery(provider string, event *stora
 // the live PR is worth a GitHub call at all — the common no-successor claim
 // stays storage-only.
 func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	event.Repository = storage.CanonicalKey(event.Repository)
 	if event.Repository == "" || event.PullRequest == 0 {
 		return false, fmt.Errorf("check covering successor for webhook event %d: repository and pull request are required for coalescing", event.ID)
 	}
@@ -311,6 +315,7 @@ func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *sto
 // terminally failed / superseded rows never run — none of those may justify
 // discarding older work.
 func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	event.Repository = storage.CanonicalKey(event.Repository)
 	if event.LeaseToken == "" {
 		return false, fmt.Errorf("webhook event lease token is required")
 	}
