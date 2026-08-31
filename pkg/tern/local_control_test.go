@@ -1649,3 +1649,144 @@ func TestProcessPendingStopControlRequest_LogsCarryApplyIdentity(t *testing.T) {
 	require.NotNil(t, settled)
 	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
 }
+
+// leaseLostTaskStore refuses every task write the way a lease-guarded UPDATE
+// does once the operation lease has moved to a peer driver — the apply lease
+// the control operation holds is a different lease, so the apply-level write
+// that follows would still land.
+type leaseLostTaskStore struct {
+	*controlTestTaskStore
+}
+
+func (s *leaseLostTaskStore) Update(context.Context, *storage.Task) error {
+	return storage.ErrApplyLeaseLost
+}
+
+// A stop holds the apply lease, but each task write is guarded by the operation
+// lease, and driver churn can hand that one to a peer mid-stop. When the task
+// writes are refused the stop must fail rather than settle the apply on its
+// own: an apply recorded as stopped over task rows that still read as active
+// work detaches the apply from its tasks, and the tasks left behind hold the
+// database with neither start nor a later apply able to act on them. An
+// operator re-issuing the stop is the recoverable outcome.
+func TestLocalClient_StopFailsWhenTaskWritesAreRefused(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-stop-refused",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-refused",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+	stor := client.storage.(*controlTestStorage)
+	stor.tasks = &leaseLostTaskStore{controlTestTaskStore: stor.tasks.(*controlTestTaskStore)}
+
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.Error(t, err, "a stop whose task writes were all refused must not report success")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost, "the refusal's cause must survive for triage")
+	assert.Contains(t, err.Error(), "testdb")
+	assert.Nil(t, resp)
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must not be settled over task rows that never moved")
+	assert.Equal(t, state.Task.Running, task.State)
+}
+
+// A cancel splits the same two leases as a stop, and an apply recorded as
+// cancelled over task rows that never moved detaches it from its tasks the same
+// way.
+func TestLocalClient_CancelFailsWhenTaskWritesAreRefused(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-cancel-refused",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-refused",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+	stor := client.storage.(*controlTestStorage)
+	stor.tasks = &leaseLostTaskStore{controlTestTaskStore: stor.tasks.(*controlTestTaskStore)}
+
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.Error(t, err, "a cancel whose task writes were all refused must not report success")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.Nil(t, resp)
+	assert.Equal(t, state.Apply.Running, apply.State)
+	assert.Equal(t, state.Task.Running, task.State)
+}
+
+// A control operation reports what it persisted: a task write that lands is
+// counted, one that is refused is not, because the counts become the
+// operator-facing "N tasks stopped" event and response. Every task is still
+// attempted, so a retry has only the refused ones left to write.
+func TestLocalClient_ControlOperationCountsOnlyLandedTaskWrites(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              44,
+		ApplyIdentifier: "apply-partial-stop",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+	}
+	landing := &storage.Task{
+		ID: 9, ApplyID: apply.ID, TaskIdentifier: "task-lands",
+		Database: "testdb", Namespace: "testdb", State: state.Task.Running,
+	}
+	refused := &storage.Task{
+		ID: 10, ApplyID: apply.ID, TaskIdentifier: "task-refused",
+		Database: "testdb", Namespace: "testdb", State: state.Task.Running,
+	}
+	alreadyDone := &storage.Task{
+		ID: 11, ApplyID: apply.ID, TaskIdentifier: "task-done",
+		Database: "testdb", Namespace: "testdb", State: state.Task.Completed,
+	}
+	client := newMySQLControlTestClient(apply, nil, &controlCaptureEngine{})
+	stor := client.storage.(*controlTestStorage)
+	stor.tasks = &selectivelyFailingTaskStore{
+		controlTestTaskStore: &controlTestTaskStore{tasks: []*storage.Task{landing, refused, alreadyDone}},
+		failIdentifier:       refused.TaskIdentifier,
+	}
+
+	marked, skipped, applyID, err := client.markTasksWithState(t.Context(),
+		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, nil, state.Task.Stopped)
+
+	require.Error(t, err, "a refused task write must be reported, not absorbed into the count")
+	assert.Contains(t, err.Error(), "settle 1 of 2 tasks")
+	assert.Equal(t, int64(1), marked, "only the landed write is counted")
+	assert.Equal(t, int64(1), skipped, "the already-terminal task is skipped, not marked")
+	assert.Equal(t, apply.ID, applyID)
+	assert.Equal(t, state.Task.Stopped, landing.State, "every task is still attempted")
+	assert.Equal(t, state.Task.Completed, alreadyDone.State)
+}
+
+// selectivelyFailingTaskStore refuses the write for one named task and serves
+// the rest normally, standing in for a lease that moves partway through a
+// control operation's task writes.
+type selectivelyFailingTaskStore struct {
+	*controlTestTaskStore
+	failIdentifier string
+}
+
+func (s *selectivelyFailingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if task.TaskIdentifier == s.failIdentifier {
+		return storage.ErrApplyLeaseLost
+	}
+	return s.controlTestTaskStore.Update(ctx, task)
+}
