@@ -402,6 +402,16 @@ func (c *LocalClient) settleOrphanedTask(ctx context.Context, t *storage.Task, a
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
 		return
 	}
+	// A terminal apply with a fresh lease is a driver mid-settlement of this
+	// same apply — its own task writes may still be in flight, and racing them
+	// leaves the row to whichever write lands last. This check holds no lease,
+	// so it defers: the task keeps blocking, and the sweep settles it on a
+	// later check once the lease has aged out.
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Debug("conflict check: orphan candidate's apply still holds a fresh lease; a driver may be settling it, so the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		return
+	}
 	c.logger.Info("conflict check: settling orphaned task; its apply is terminal so no driver will ever claim the task",
 		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_state", settledState)...)
 
@@ -409,6 +419,13 @@ func (c *LocalClient) settleOrphanedTask(ctx context.Context, t *storage.Task, a
 	now := time.Now()
 	t.State = settledState
 	t.UpdatedAt = now
+	// Every settled state is at rest, so the row must not carry a frozen ETA
+	// or render as paused with no copy in flight (the same clearing
+	// persistTaskStateTransition does). The rows this sweep repairs are
+	// precisely the ones written by paths that never got to clear them.
+	t.ETASeconds = 0
+	t.Throttled = false
+	t.ThrottleReason = ""
 	// A settlement that ends the task records why it ended. A settlement to
 	// stopped keeps the engine's own failure message instead: the change is
 	// resumable, and that message is why the copy stopped where it did.
