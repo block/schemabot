@@ -145,7 +145,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (checkout, Go, cache restore, image prepull — about two
+    # minutes) plus go test's own timeout below still lands inside the job
+    # budget: a hung binary then panics with its goroutine dump instead of
+    # the runner cancelling the job first. It also leaves the ./integration
+    # shard, whose normal wall time approaches ten minutes, real headroom.
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
