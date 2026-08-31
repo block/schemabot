@@ -1,11 +1,13 @@
 package ddl
 
 import (
+	"io/fs"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	pgquery "github.com/wasilibs/go-pgquery"
 
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -206,6 +208,74 @@ func TestPostgresParserCreateTableColumns(t *testing.T) {
 
 	_, err = p.CreateTableColumns("ALTER TABLE example ADD COLUMN value text")
 	require.ErrorContains(t, err, "expected CREATE TABLE statement")
+}
+
+func TestSynthesizePostgresAddColumn(t *testing.T) {
+	tests := []struct {
+		name       string
+		createDDL  string
+		columnName string
+		want       string
+	}{
+		{"plain column", "CREATE TABLE users (id bigint, email text)", "email", "ALTER TABLE users ADD COLUMN email text"},
+		{"not null and default", "CREATE TABLE users (id bigint, enabled boolean NOT NULL DEFAULT true)", "enabled", "ALTER TABLE users ADD COLUMN enabled boolean NOT NULL DEFAULT true"},
+		{"type modifier", "CREATE TABLE users (name varchar(255))", "name", "ALTER TABLE users ADD COLUMN name varchar(255)"},
+		{"timestamp function default", "CREATE TABLE users (updated_at timestamptz DEFAULT now())", "updated_at", "ALTER TABLE users ADD COLUMN updated_at timestamptz DEFAULT now()"},
+		{"schema-qualified table", "CREATE TABLE app.users (id bigint)", "id", "ALTER TABLE app.users ADD COLUMN id bigint"},
+		{"quoted identifiers", `CREATE TABLE "App"."UserProfiles" ("DisplayName" varchar(255) NOT NULL)`, "DisplayName", `ALTER TABLE "App"."UserProfiles" ADD COLUMN "DisplayName" varchar(255) NOT NULL`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := SynthesizePostgresAddColumn(tc.createDDL, tc.columnName)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("column not found", func(t *testing.T) {
+		_, err := SynthesizePostgresAddColumn("CREATE TABLE users (id bigint)", "email")
+		require.ErrorContains(t, err, `column "email" not found`)
+	})
+
+	t.Run("multiple statements", func(t *testing.T) {
+		_, err := SynthesizePostgresAddColumn("CREATE TABLE users (id bigint); CREATE TABLE teams (id bigint)", "id")
+		require.ErrorContains(t, err, "expected one CREATE TABLE statement, got 2")
+	})
+
+	t.Run("not a CREATE TABLE", func(t *testing.T) {
+		_, err := SynthesizePostgresAddColumn("ALTER TABLE users ADD COLUMN email text", "email")
+		require.ErrorContains(t, err, "expected CREATE TABLE statement")
+	})
+
+	t.Run("parse failure", func(t *testing.T) {
+		_, err := SynthesizePostgresAddColumn("CREATE TABLE users (", "email")
+		require.ErrorContains(t, err, "parse CREATE TABLE")
+	})
+}
+
+func TestSynthesizePostgresAddColumn_EmbeddedSchema(t *testing.T) {
+	files, err := fs.Glob(schema.PostgresFS, "postgres/*.sql")
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+	p := postgresStatementParser{}
+
+	for _, file := range files {
+		content, err := schema.PostgresFS.ReadFile(file)
+		require.NoError(t, err, "read %s", file)
+		statements, err := p.Split(string(content))
+		require.NoError(t, err, "split %s", file)
+		require.NotEmpty(t, statements, "schema file %s", file)
+		columns, err := p.CreateTableColumns(statements[0])
+		require.NoError(t, err, "columns in %s", file)
+
+		for _, column := range columns {
+			ddl, err := SynthesizePostgresAddColumn(statements[0], column)
+			require.NoError(t, err, "%s column %s", file, column)
+			parsed, err := pgquery.Parse(ddl)
+			require.NoError(t, err, "%s column %s: %s", file, column, ddl)
+			require.Len(t, parsed.GetStmts(), 1, "%s column %s", file, column)
+		}
+	}
 }
 
 func TestPostgresParserCreateIndex(t *testing.T) {
