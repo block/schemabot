@@ -70,7 +70,7 @@ per statement).
         ├─ operation         one per deployment/target — lease, resume state
         │    ├─ task         ALTER TABLE users ... (rows copied, %, ETA)
         │    └─ task         one per DDL statement (per shard on sharded Vitess)
-        ├─ control requests  durable stop/start/cutover/volume commands
+        ├─ control requests  durable stop/start/cutover commands
         ├─ apply logs        audit trail — powers `schemabot logs`
         └─ comments          tracked PR comments — progress + summary recovery
 

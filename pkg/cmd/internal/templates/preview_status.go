@@ -46,7 +46,6 @@ func previewStatusListOutput() {
 				Caller:      "github:octocat@acme/shop#412",
 				StartedAt:   previewTime.Add(-15 * time.Minute).Format(time.RFC3339),
 				UpdatedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
-				Volume:      4,
 			},
 			{
 				ApplyID:     "apply_def456",
@@ -57,7 +56,6 @@ func previewStatusListOutput() {
 				Caller:      "cli:jdoe@macbook.local",
 				StartedAt:   previewTime.Add(-45 * time.Minute).Format(time.RFC3339),
 				UpdatedAt:   previewTime.Add(-1 * time.Minute).Format(time.RFC3339),
-				Volume:      6,
 			},
 			{
 				ApplyID:     "apply_ghi789",

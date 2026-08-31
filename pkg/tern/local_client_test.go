@@ -506,7 +506,6 @@ type fakeControlEngine struct {
 	cancelErr               error
 	startCount              int
 	cutoverCount            int
-	volumeCount             int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
 	progressReq             *engine.ProgressRequest
@@ -584,11 +583,6 @@ func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*en
 
 func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	return &engine.ControlResult{Accepted: true}, nil
-}
-
-func (e *fakeControlEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	e.volumeCount++
-	return &engine.VolumeResult{Accepted: true}, nil
 }
 
 type exactProgressStorage struct {

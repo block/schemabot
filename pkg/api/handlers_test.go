@@ -781,9 +781,6 @@ type mockTernClient struct {
 	progressReq              *ternv1.ProgressRequest
 	logsReqs                 []*ternv1.LogsRequest
 	logsHook                 func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
-	volumeResp               *ternv1.VolumeResponse
-	volumeErr                error
-	volumeReq                *ternv1.VolumeRequest // captured request
 	stopResp                 *ternv1.StopResponse
 	stopErr                  error
 	stopReq                  *ternv1.StopRequest // captured request
@@ -1185,13 +1182,6 @@ func (m *mockTernClient) Start(ctx context.Context, req *ternv1.StartRequest) (*
 		return m.startResp, m.startErr
 	}
 	return nil, m.startErr
-}
-func (m *mockTernClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	m.volumeReq = req
-	if m.volumeResp != nil {
-		return m.volumeResp, m.volumeErr
-	}
-	return nil, m.volumeErr
 }
 func (m *mockTernClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	m.revertReq = req
@@ -5173,120 +5163,6 @@ func TestTernHealth(t *testing.T) {
 	})
 }
 
-func TestVolumeHandler(t *testing.T) {
-	// A volume adjustment is queued as a durable control request for the
-	// driving instance, so the accepted response carries the queued target
-	// level; the previous level is only known to the driver and stays unset.
-	t.Run("accepted queue returns target volume", func(t *testing.T) {
-		mock := &mockTernClient{
-			volumeResp: &ternv1.VolumeResponse{
-				Accepted:  true,
-				NewVolume: 11,
-			},
-		}
-		svc := newControlTestService(mock, activeTestApply("apply-vol123"))
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"environment": "staging", "apply_id": "apply-vol123", "volume": 11}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-
-		var resp map[string]any
-		err := json.NewDecoder(w.Body).Decode(&resp)
-		require.NoError(t, err, "failed to decode response")
-
-		assert.Equal(t, true, resp["accepted"])
-		prevVol, _ := resp["previous_volume"].(float64) // JSON numbers are float64
-		newVol, _ := resp["new_volume"].(float64)
-		assert.Equal(t, float64(0), prevVol)
-		assert.Equal(t, float64(11), newVol)
-
-		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
-		assert.Equal(t, "apply-vol123", mock.volumeReq.ApplyId)
-		assert.Equal(t, "staging", mock.volumeReq.Environment)
-		assert.Equal(t, int32(11), mock.volumeReq.Volume)
-	})
-
-	// A remote deployment knows the apply only by its own data-plane id, so
-	// its rejection copy names an identifier the operator cannot resolve on
-	// the control plane. The relay must rewrite it to the apply identifier the
-	// operator addressed, so the reply is about the schema change they asked
-	// about and no internal identifier reaches PR-facing markdown.
-	t.Run("rejection names the operator apply id, not the remote id", func(t *testing.T) {
-		mock := &mockTernClient{
-			volumeResp: &ternv1.VolumeResponse{
-				Accepted:     false,
-				ErrorMessage: "Schema change apply-remote999 is completed; volume can only be adjusted while it is running",
-			},
-		}
-		apply := activeTestApply("apply-vol123")
-		apply.ExternalID = "apply-remote999"
-		svc := newControlTestService(mock, apply)
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"environment": "staging", "apply_id": "apply-vol123", "volume": 5}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
-
-		var resp map[string]any
-		err := json.NewDecoder(w.Body).Decode(&resp)
-		require.NoError(t, err, "failed to decode response")
-
-		assert.Equal(t, false, resp["accepted"])
-		errMsg, _ := resp["error_message"].(string)
-		assert.Contains(t, errMsg, "apply-vol123")
-		assert.NotContains(t, errMsg, "apply-remote999")
-		assert.Contains(t, errMsg, "volume can only be adjusted while it is running")
-
-		require.NotNil(t, mock.volumeReq, "expected volume request to be captured")
-		assert.Equal(t, "apply-remote999", mock.volumeReq.ApplyId, "the data plane is still addressed by its own id")
-	})
-
-	t.Run("invalid volume range", func(t *testing.T) {
-		svc := newControlTestService(&mockTernClient{}, activeTestApply("apply-vol123"))
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"environment": "staging", "apply_id": "apply-vol123", "volume": 0}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusBadRequest, w.Code)
-
-		var resp map[string]string
-		err := json.NewDecoder(w.Body).Decode(&resp)
-		require.NoError(t, err, "failed to decode response")
-		assert.NotEmpty(t, resp["error"], "expected error message for invalid volume")
-	})
-
-	t.Run("missing apply_id", func(t *testing.T) {
-		svc := newTestService()
-		mux := http.NewServeMux()
-		svc.ConfigureRoutes(mux)
-
-		body := `{"environment": "staging", "volume": 5}`
-		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/volume", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
-
-		assert.Equal(t, http.StatusBadRequest, w.Code)
-		assert.Contains(t, w.Body.String(), "apply_id is required")
-	})
-}
-
 func TestControlHandlersRejectClientDeployment(t *testing.T) {
 	tests := []struct {
 		name string
@@ -5307,11 +5183,6 @@ func TestControlHandlersRejectClientDeployment(t *testing.T) {
 			name: "cutover",
 			path: "/api/cutover",
 			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default"}`,
-		},
-		{
-			name: "volume",
-			path: "/api/volume",
-			body: `{"environment": "staging", "apply_id": "apply-123", "deployment": "default", "volume": 5}`,
 		},
 		{
 			name: "revert",
@@ -5382,11 +5253,6 @@ func TestControlHandlersRejectClientDatabase(t *testing.T) {
 			name: "cutover",
 			path: "/api/cutover",
 			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123"}`,
-		},
-		{
-			name: "volume",
-			path: "/api/volume",
-			body: `{"database": "testdb", "environment": "staging", "apply_id": "apply-123", "volume": 5}`,
 		},
 		{
 			name: "revert",

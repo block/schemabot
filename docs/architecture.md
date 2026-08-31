@@ -90,7 +90,6 @@ schemabot progress <apply_id>               # Watch progress
 schemabot cutover -e staging <apply_id>     # Trigger cutover
 schemabot stop -e staging <apply_id>        # Pause execution
 schemabot start -e staging <apply_id>       # Resume execution
-schemabot volume -e staging <apply_id> -v 8 # Adjust speed
 schemabot revert -e staging <apply_id>      # Revert during the revert window (Vitess)
 schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
 ```
@@ -226,9 +225,13 @@ Users can control a running schema change via CLI, PR comments, or PlanetScale U
 | `schemabot stop` | Pause execution (Spirit: checkpoint saved; Vitess: cancel permanently) |
 | `schemabot start` | Resume from checkpoint (Spirit only) |
 | `schemabot cutover` | Trigger the final table swap |
-| `schemabot volume 8` | Adjust execution speed (1=slowest, 11=fastest) |
 | `schemabot revert` | Roll back a completed change during the revert window (Vitess only) |
 | `schemabot skip-revert` | Close the revert window and finalize (Vitess only) |
+
+SchemaBot exposes no throughput control. On Spirit, the copy autoscales its write
+threads from live throttler feedback. On Vitess, throughput is a property of the
+deploy request itself: adjust its throttle directly in the PlanetScale console,
+where the setting is the one the platform actually applies.
 
 **Design principle: control operations must be stateless.** A control operation
 should work by writing to shared external state (the target database or an API),
@@ -358,7 +361,7 @@ tracks those scenario tables and the review checklist for future control work.
 
 ## Tern Layer (Orchestrator)
 
-Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`Plan`, `Apply`, `Progress`, `Cutover`, `Stop`, `Start`, `Volume`, `Revert`, `SkipRevert`).
+Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`Plan`, `Apply`, `Progress`, `Cutover`, `Stop`, `Start`, `Revert`, `SkipRevert`).
 
 ### Plan
 
@@ -897,7 +900,7 @@ Apply flow:
     → SchemaBot stores external_id="tern-42"
     → driver polls remote progress until terminal
 
-Subsequent RPCs (Progress, Stop, Start, Cutover, Volume):
+Subsequent RPCs (Progress, Stop, Start, Cutover):
   HTTP caller sends apply_id="apply-abc123"
     → storage lookup for apply "apply-abc123"
     → external_id="tern-42"
@@ -943,7 +946,6 @@ The engine is a stateless executor. It diffs schemas, executes DDL, and reports 
 | `Cutover()` | Trigger table swap |
 | `Revert()` | Roll back completed change (Vitess only) |
 | `SkipRevert()` | Close revert window (Vitess only) |
-| `Volume()` | Adjust execution speed |
 
 ### Engine Differences
 

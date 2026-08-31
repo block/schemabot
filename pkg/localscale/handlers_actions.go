@@ -223,41 +223,6 @@ func (s *Server) handleSkipRevertDeployRequest(w http.ResponseWriter, r *http.Re
 	return nil
 }
 
-func (s *Server) handleThrottleDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, ref, err := s.resolveDeployAction(r)
-	if err != nil {
-		return err
-	}
-	number := ref.number
-
-	var body struct {
-		ThrottleRatio float64 `json:"throttle_ratio"`
-	}
-	if err := s.decodeJSON(r, &body); err != nil {
-		return err
-	}
-
-	if body.ThrottleRatio < 0 || body.ThrottleRatio > 0.95 {
-		return newHTTPError(http.StatusUnprocessableEntity, "throttle_ratio must be between 0.0 and 0.95, got %f", body.ThrottleRatio)
-	}
-
-	// Store in metadata for query purposes
-	_, err = s.metadataDB.ExecContext(r.Context(),
-		`UPDATE localscale_deploy_requests
-		 SET throttle_ratio = ?
-		 WHERE org = ? AND database_name = ? AND number = ?`,
-		body.ThrottleRatio, ref.org, ref.database, number)
-	if err != nil {
-		return newHTTPError(http.StatusInternalServerError, "update throttle: %v", err)
-	}
-
-	if err := s.applyThrottle(r.Context(), backend, number, body.ThrottleRatio); err != nil {
-		return newHTTPError(http.StatusInternalServerError, "apply throttle: %v", err)
-	}
-	s.writeJSON(w, map[string]string{"status": "ok"})
-	return nil
-}
-
 // applyThrottle sets the throttle ratio for online DDL migrations across all keyspaces.
 // Ratio 0.0 = full speed, 0.95 = max throttle (PlanetScale caps at 0.95).
 //

@@ -34,7 +34,6 @@ type Engine interface {
     Cutover(ctx, *ControlRequest) (*ControlResult, error)
     Revert(ctx, *ControlRequest) (*ControlResult, error)
     SkipRevert(ctx, *ControlRequest) (*ControlResult, error)
-    Volume(ctx, *VolumeRequest) (*VolumeResult, error)
 }
 ```
 
@@ -44,7 +43,7 @@ type Engine interface {
 
 **Progress** returns the current state, per-table row copy metrics, and ETA.
 
-**Control operations** manage a running schema change: pause (`Stop`), permanently abort (`Cancel`), resume (`Start`), trigger the final table swap (`Cutover`), adjust speed (`Volume`), or roll back (`Revert`/`SkipRevert`).
+**Control operations** manage a running schema change: pause (`Stop`), permanently abort (`Cancel`), resume (`Start`), trigger the final table swap (`Cutover`), or roll back (`Revert`/`SkipRevert`).
 
 ## State Machine
 
@@ -131,5 +130,4 @@ metadata before they can target a server-side deploy request.
 - **ApplyRequest/ApplyResult**: DDL + options in, async acceptance out
 - **ProgressResult**: State, per-table `TableProgress` (rows copied/total, ETA, progress %)
 - **ControlResult**: Accepted flag + message
-- **VolumeRequest**: Volume level 1 (minimal) to 11 (maximum throughput)
 - **Credentials**: DSN for MySQL, or org/token for PlanetScale

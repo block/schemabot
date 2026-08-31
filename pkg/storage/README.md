@@ -74,7 +74,7 @@ growth is bounded by webhook volume, not by retries.
 
 - **Lock**: Database name, type, owner (PR identifier), timestamps
 - **Plan**: DDL statements, table changes, original schema (for rollback), schema files
-- **Apply**: Links to plan and lock, state, environment, engine, options (defer_cutover, volume)
+- **Apply**: Links to plan and lock, state, environment, engine, options (defer_cutover)
 - **Task**: Single DDL within an apply — table name, DDL, state, progress (rows copied/total, ETA)
 - **ApplyLog**: Level, event type, source (schemabot/spirit), message, state transitions
 - **ApplyControlRequest**: Durable control operation intent and processing status

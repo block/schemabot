@@ -2,10 +2,8 @@ package storage
 
 import (
 	"encoding/json"
-	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -995,9 +993,6 @@ type ApplyOptions struct {
 	// SkipRevert skips the revert window after completion (Vitess only).
 	SkipRevert bool `json:"skip_revert,omitempty"`
 
-	// Volume controls schema change aggressiveness (1-11).
-	Volume int `json:"volume,omitempty"`
-
 	// Target is the opaque endpoint-discovery target forwarded to Tern.
 	// Defaults to the apply database when empty.
 	Target string `json:"target,omitempty"`
@@ -1040,13 +1035,6 @@ const (
 	// 'start': 'start' resumes stopped work and carries no claim-ordering
 	// clause, so it cannot release a paused rollout.
 	ControlOperationRelease ControlOperation = "release"
-	// ControlOperationVolume adjusts the speed/concurrency of a running schema
-	// change. Durable because only the instance driving the apply holds the
-	// engine state for the running schema change, and a volume RPC can land on
-	// any instance sharing the route's storage. The desired level travels in
-	// the request metadata (see VolumeControlRequestMetadata); the driver
-	// retunes the engine at its next progress tick.
-	ControlOperationVolume ControlOperation = "volume"
 )
 
 // Valid reports whether the operation is one SchemaBot recognizes. Control
@@ -1056,45 +1044,17 @@ func (o ControlOperation) Valid() bool {
 	switch o {
 	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
 		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
-		ControlOperationRelease, ControlOperationVolume:
+		ControlOperationRelease:
 		return true
 	}
 	return false
 }
 
-// MinVolume and MaxVolume bound the volume scale shared by every engine:
-// 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
-const (
-	MinVolume int32 = 1
-	MaxVolume int32 = 11
-)
-
-// VolumeControlRequestMetadata is the JSON payload stored on a volume control
-// request. The row carries the desired level so the driving instance can
-// retune the engine without a synchronous exchange with the requester.
-type VolumeControlRequestMetadata struct {
-	Volume int32 `json:"volume"`
-}
-
-// EncodeVolumeControlRequestMetadata serializes the desired volume level for
-// storage on a volume control request, rejecting out-of-range levels so an
-// invalid request is refused at write time rather than discovered by the
-// driver.
-func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
-	if volume < MinVolume || volume > MaxVolume {
-		return nil, fmt.Errorf("volume %d is out of range: must be between %d and %d", volume, MinVolume, MaxVolume)
-	}
-	data, err := json.Marshal(VolumeControlRequestMetadata{Volume: volume})
-	if err != nil {
-		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
-	}
-	return data, nil
-}
-
 // mirroredControlRequestMetadataKey marks a control request row this plane never
 // queued: the row exists only because another plane reported the operation
-// rejected, as happens for a pure proxy like volume where the request lives
-// entirely in the serving plane. Such a row has no local lifecycle to reset it,
+// rejected, as happens for an operation this plane only proxies, where the
+// request lives entirely in the serving plane. Such a row has no local
+// lifecycle to reset it,
 // so it is the mirror's to clear when the operation later succeeds. Rows this
 // plane queued itself carry no marker and are only ever cleared by their own
 // request lifecycle.
@@ -1132,22 +1092,6 @@ func (r *ApplyControlRequest) IsMirroredRemoteRejection() bool {
 	}
 	marked, _ := payload[mirroredControlRequestMetadataKey].(bool)
 	return marked
-}
-
-// DecodeVolumeControlRequestMetadata parses the desired volume level from a
-// volume control request's metadata, validating the shared volume range.
-func DecodeVolumeControlRequestMetadata(metadata []byte) (int32, error) {
-	if len(metadata) == 0 {
-		return 0, fmt.Errorf("volume control request metadata is empty")
-	}
-	var payload VolumeControlRequestMetadata
-	if err := json.Unmarshal(metadata, &payload); err != nil {
-		return 0, fmt.Errorf("decode volume control request metadata: %w", err)
-	}
-	if payload.Volume < MinVolume || payload.Volume > MaxVolume {
-		return 0, fmt.Errorf("volume %d in control request metadata is out of range: must be between %d and %d", payload.Volume, MinVolume, MaxVolume)
-	}
-	return payload.Volume, nil
 }
 
 // ControlRequestStatus is the durable processing status for a control request.
@@ -1200,12 +1144,6 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 		Target:       options["target"],
 		Rollback:     options["rollback"] == "true",
 	}
-	if rawVolume := options["volume"]; rawVolume != "" {
-		volume, err := strconv.Atoi(rawVolume)
-		if err == nil && volume >= 1 && volume <= 11 {
-			opts.Volume = volume
-		}
-	}
 	return opts
 }
 
@@ -1253,9 +1191,6 @@ func (opts ApplyOptions) Map() map[string]string {
 	}
 	if opts.SkipRevert {
 		options["skip_revert"] = "true"
-	}
-	if opts.Volume > 0 {
-		options["volume"] = strconv.Itoa(opts.Volume)
 	}
 	if opts.Target != "" {
 		options["target"] = opts.Target
@@ -1422,13 +1357,6 @@ type ApplyComment struct {
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
 
-	// PostedVolume records the apply's volume level at the moment a progress
-	// comment was posted. The observer compares it against the apply's current
-	// level to detect an applied volume change and rotate in a fresh progress
-	// comment. Nil for comment states where the level is not meaningful and
-	// for rows that predate volume tracking — nil never triggers a rotation.
-	PostedVolume *int
-
 	// PostedPhase records the control-operation phase the apply was in when a
 	// progress comment was posted (e.g. reverting, skipping revert, the
 	// post-cutover revert window) — empty when the apply was in no such phase.
@@ -1531,7 +1459,6 @@ const (
 	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
 	LogEventReleaseRequested    = "release_requested"
-	LogEventVolumeRequested     = "volume_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"
