@@ -4247,6 +4247,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
+📊 3 in other states
+
 **Keyspace `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
@@ -4298,6 +4300,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 
+📊 3 in other states
+
 **Keyspace `testapp`**
 
 **`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)
@@ -4340,6 +4344,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 **Status**: Reverting
 
 Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
+
+📊 3 in other states
 
 **Keyspace `testapp`**
 

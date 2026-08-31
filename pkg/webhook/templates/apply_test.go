@@ -2276,6 +2276,31 @@ func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
 	assert.NotContains(t, result, "waiting on")
 }
 
+// A multi-table progress summary buckets every table: statuses without a
+// dedicated counter (waiting for deploy, the revert family) fold into an
+// "in other states" part instead of disappearing from the summary line, and
+// tables parked at the cutover barrier count through the shared readiness
+// predicate.
+func TestRenderApplyStatusComment_ProgressSummaryCountsOtherStates(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Running,
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Completed},
+			{TableName: "users", Status: state.Task.WaitingForCutover},
+			{TableName: "products", Status: state.Task.WaitingForDeploy},
+			{TableName: "carts", Status: state.Task.RevertWindow},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "📊 1/4 complete")
+	assert.Contains(t, result, "1 waiting for cutover")
+	assert.Contains(t, result, "2 in other states")
+}
+
 func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {
 	data := ApplyStatusCommentData{
 		ApplyID:     "apply-abc123",
