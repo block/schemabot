@@ -31,6 +31,8 @@ func engineStateToStorage(es engine.State) string {
 		return state.Task.Pending
 	case engine.StateRunning:
 		return state.Task.Running
+	case engine.StateChecksumming:
+		return state.Task.Checksumming
 	case engine.StateWaitingForDeploy:
 		return state.Task.WaitingForDeploy
 	case engine.StateWaitingForCutover:

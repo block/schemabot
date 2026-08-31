@@ -92,6 +92,30 @@ func TestProgressState(t *testing.T) {
 			want:        engine.StateRunning,
 		},
 		{
+			name: "verify pass surfaces as checksumming",
+			rm: &runningSchemaChange{
+				state: engine.StateRunning,
+			},
+			spiritState: status.Checksum,
+			want:        engine.StateChecksumming,
+		},
+		{
+			name: "verify pass does not reopen a terminal outcome",
+			rm: &runningSchemaChange{
+				state: engine.StateCancelled,
+			},
+			spiritState: status.Checksum,
+			want:        engine.StateCancelled,
+		},
+		{
+			name: "the changeset apply after the verify stays running",
+			rm: &runningSchemaChange{
+				state: engine.StateRunning,
+			},
+			spiritState: status.PostChecksum,
+			want:        engine.StateRunning,
+		},
+		{
 			name: "volume restart reports stopped state as running",
 			rm: &runningSchemaChange{
 				state:                   engine.StateStopped,

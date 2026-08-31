@@ -1066,19 +1066,57 @@ func spiritPostCopyPhase(s status.State) bool {
 // progressState resolves the state reported for a progress poll. The tracked
 // state is authoritative for terminal outcomes: they are recorded before the
 // runner is closed, so a runner observed mid-teardown never changes the
-// recorded outcome. Spirit's status only refines a non-terminal state, e.g.
-// surfacing the sentinel wait for a deferred cutover. A stopped tracked state
-// with a volume restart in flight reports running because the schema change
-// is restarting with new settings.
+// recorded outcome. Spirit's phase only refines a non-terminal state. A stopped
+// tracked state with a volume restart in flight reports running because the
+// schema change is restarting with new settings.
 func progressState(rm *runningSchemaChange, spiritState status.State) engine.State {
-	state := rm.state
-	if state == engine.StateStopped && rm.volumeRestartInProgress {
-		state = engine.StateRunning
+	tracked := rm.state
+	if tracked == engine.StateStopped && rm.volumeRestartInProgress {
+		tracked = engine.StateRunning
 	}
-	if !state.IsTerminal() && spiritState == status.WaitingOnSentinelTable && rm.deferCutover {
-		state = engine.StateWaitingForCutover
+	if tracked.IsTerminal() {
+		return tracked
 	}
-	return state
+	if refined, ok := spiritPhaseState(spiritState, rm.deferCutover); ok {
+		return refined
+	}
+	return tracked
+}
+
+// spiritPhaseState maps a Spirit phase to the engine state it should be
+// reported as, and reports whether the phase refines the tracked state at all.
+// Phases with no operator-visible distinction of their own deliberately flatten
+// into the tracked state; they are listed rather than left to the default so
+// that adding vocabulary for one of them is a decision made here, not an
+// omission discovered on a long apply.
+func spiritPhaseState(spiritState status.State, deferCutover bool) (engine.State, bool) {
+	switch spiritState {
+	case status.Checksum:
+		// Verifying the copied data against the source. Hours on a large table,
+		// with its own row counters, so it gets its own state.
+		return engine.StateChecksumming, true
+
+	case status.WaitingOnSentinelTable:
+		// Spirit parks on the sentinel table only because SchemaBot asked it to
+		// hold the cutover. Without that request the wait is Spirit's own brief
+		// internal step and says nothing to the operator.
+		if deferCutover {
+			return engine.StateWaitingForCutover, true
+		}
+		return "", false
+
+	case status.Initial, status.CopyRows, status.ApplyChangeset,
+		status.RestoreSecondaryIndexes, status.AnalyzeTable, status.PostChecksum,
+		status.CutOver, status.Close, status.ErrCleanup:
+		// Flattened into the tracked state. The changeset applies and the analyze
+		// are short; cutover, close and cleanup are the tracked state's own
+		// business. The secondary-index rebuild is the one that can run for hours
+		// like the checksum does, and is the next candidate for its own state.
+		return "", false
+
+	default:
+		return "", false
+	}
 }
 
 // fetchCurrentSchema retrieves table schemas from the database, filtering out

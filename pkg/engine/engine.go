@@ -655,8 +655,14 @@ type ShardProgress struct {
 type State string
 
 const (
-	StatePending           State = "pending"
-	StateRunning           State = "running"
+	StatePending State = "pending"
+	StateRunning State = "running"
+	// StateChecksumming is the post-copy verification pass: the engine is
+	// comparing the copied data against the source before cutover. On a large
+	// table it runs for hours, so it is reported as its own state rather than
+	// folded into Running, which would leave the operator watching a finished
+	// copy bar with nothing to indicate a verification is under way.
+	StateChecksumming      State = "checksumming"
 	StateWaitingForDeploy  State = "waiting_for_deploy"
 	StateWaitingForCutover State = "waiting_for_cutover"
 	StateCuttingOver       State = "cutting_over"
