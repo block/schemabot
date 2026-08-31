@@ -1586,8 +1586,8 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 }
 
 // markTasksWithState settles all non-terminal targeted tasks into newState,
-// preserving engine progress. Returns (marked count, skipped count, apply ID
-// for logging).
+// preserving engine progress. Returns the marked count, the skipped count, an
+// apply ID for logging, and an error joining every refused write.
 //
 // The counts are landed writes, not attempts: they become the operator-facing
 // "N tasks stopped" event and response, and they gate the apply-level write
@@ -1638,7 +1638,7 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 	}
 
 	if len(refused) > 0 {
-		return stoppedCount, skippedCount, applyID, fmt.Errorf("settle %d of %d tasks to %s: %w",
+		return stoppedCount, skippedCount, applyID, fmt.Errorf("failed to settle %d of %d tasks to %s: %w",
 			len(refused), int64(len(refused))+stoppedCount, newState, errors.Join(refused...))
 	}
 	return stoppedCount, skippedCount, applyID, nil
