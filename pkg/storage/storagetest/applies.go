@@ -33,6 +33,10 @@ func TestApplies(t *testing.T, h Harness) {
 		}
 		id, err := store.Applies().Create(ctx, apply)
 		require.NoError(t, err)
+		require.Equal(t, "mixedcase_db", apply.Database)
+		require.Equal(t, "mysql", apply.DatabaseType)
+		require.Equal(t, "mixedcase/sample-repo", apply.Repository)
+		require.Equal(t, "staging", apply.Environment)
 
 		byDatabase, err := store.Applies().GetByDatabase(ctx, "MIXEDCASE_DB", "MYSQL", "STAGING")
 		require.NoError(t, err)

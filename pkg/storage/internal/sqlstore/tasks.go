@@ -294,8 +294,6 @@ const shardTaskInsertColumns = `
 // appends its own lease-guard ("FROM <lease table> WHERE ... lease_token = ?")
 // and the guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
-	canonicalizeTaskIdentity(task)
-
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")

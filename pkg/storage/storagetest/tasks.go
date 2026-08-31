@@ -26,6 +26,10 @@ func TestTasks(t *testing.T, h Harness) {
 		task.Environment = "StAgInG"
 		id, err := store.Tasks().Create(ctx, task)
 		require.NoError(t, err)
+		require.Equal(t, "mixedcase_db", task.Database)
+		require.Equal(t, "mysql", task.DatabaseType)
+		require.Equal(t, "mixedcase/sample-repo", task.Repository)
+		require.Equal(t, "staging", task.Environment)
 
 		byDatabase, err := store.Tasks().GetByDatabase(ctx, "MIXEDCASE_DB")
 		require.NoError(t, err)
