@@ -23,6 +23,9 @@ type lockStore struct {
 }
 
 func canonicalizeLock(lock *storage.Lock) {
+	if lock == nil {
+		return
+	}
 	lock.DatabaseName = storage.CanonicalKey(lock.DatabaseName)
 	lock.DatabaseType = storage.CanonicalKey(lock.DatabaseType)
 	lock.Repository = storage.CanonicalKey(lock.Repository)
@@ -46,9 +49,8 @@ func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 
 // acquireOnce performs a single claim attempt. Concurrent same-owner callers
 // racing to claim the same key can hit a transient InnoDB lock conflict on the
-// INSERT below; Acquire retries those.
+// INSERT below; Acquire retries those. Acquire canonicalizes the lock first.
 func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
-	canonicalizeLock(lock)
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
 		return fmt.Errorf("read existing lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
@@ -111,8 +113,8 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 // between this caller's read and its write. The owner still holds the lock in that
 // case, so the refresh has succeeded. To distinguish that from a genuine ownership
 // change, re-read the lock and branch on its actual state.
+// Acquire canonicalizes the lock before reaching this helper.
 func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existing *storage.Lock) error {
-	canonicalizeLock(lock)
 	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
 		return nil
 	}
