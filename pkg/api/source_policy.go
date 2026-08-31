@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -217,7 +219,7 @@ func validateAllowedRepos(field string, repos []string) error {
 }
 
 func repoAllowed(allowedRepos []string, repo string) bool {
-	repo = strings.TrimSpace(repo)
+	repo = storage.CanonicalKey(strings.TrimSpace(repo))
 	for _, allowed := range allowedRepos {
 		switch strings.TrimSpace(allowed) {
 		case "*":

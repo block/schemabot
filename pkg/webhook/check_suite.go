@@ -196,7 +196,6 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return false, fmt.Errorf("decode durable check_suite delivery %s: %w", event.DeliveryID, err)
 	}
-	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	// Re-validate the action fail-closed: rows can arrive via replay or a
 	// future producer, and a non-requested action carries no recovery work.
 	if payload.Action != checkSuiteRecoveryAction {
@@ -212,7 +211,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 			"delivery_id", event.DeliveryID, "repo", event.Repository, "head_sha", event.HeadSHA)
 		return false, nil
 	}
-	repo := event.Repository
+	repo := storage.CanonicalKey(event.Repository)
 	headSHA := event.HeadSHA
 	if repo == "" || headSHA == "" {
 		return false, fmt.Errorf("durable check_suite delivery %s missing repo or head SHA", event.DeliveryID)

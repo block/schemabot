@@ -243,7 +243,9 @@ func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 func TestDurablePullRequestWebhookCanonicalizesRepository(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{}, nil, logger)
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
+	}, nil, logger)
 	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
 
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
@@ -255,6 +257,7 @@ func TestDurablePullRequestWebhookCanonicalizesRepository(t *testing.T) {
 	h.ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `{"message":"auto-plan queued"}`, rr.Body.String())
 	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-pull-request")
 	require.NoError(t, err)
 	require.NotNil(t, event)
