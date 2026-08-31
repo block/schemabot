@@ -146,7 +146,7 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 			}},
 		}},
 		LintResults: []*apitypes.LintViolationResponse{{
-			Message:  "Index 'idx_status' should be made invisible before dropping",
+			Message:  `Index "idx_status" should be made invisible before dropping`,
 			Table:    "orders",
 			Linter:   "invisible_index_before_drop",
 			Severity: "error",

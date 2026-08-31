@@ -97,8 +97,8 @@ func TestLintReasons(t *testing.T) {
 
 	t.Run("strips severity prefix and linter name", func(t *testing.T) {
 		assert.Equal(t,
-			[]string{"Index 'idx_status' should be made invisible"},
-			LintReasons("[ERROR] invisible_index_before_drop: Index 'idx_status' should be made invisible"))
+			[]string{`Index "idx_status" should be made invisible`},
+			LintReasons(`[ERROR] invisible_index_before_drop: Index "idx_status" should be made invisible`))
 		assert.Equal(t,
 			[]string{"DROP COLUMN removes data"},
 			LintReasons("[WARNING] unsafe: DROP COLUMN removes data"))
@@ -120,8 +120,8 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 		expect string
 	}{
 		{
-			name:   "single-quoted index name",
-			input:  "Index 'idx_status' should be made invisible before dropping",
+			name:   "double-quoted index name",
+			input:  `Index "idx_status" should be made invisible before dropping`,
 			expect: "Index `idx_status` should be made invisible before dropping",
 		},
 		{
@@ -136,18 +136,28 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 		},
 		{
 			name:   "multiple identifiers in one message",
-			input:  `Column 'created_at' of type "DATETIME" should not be the leftmost index column`,
+			input:  `Column "created_at" of type "DATETIME" should not be the leftmost index column`,
 			expect: "Column `created_at` of type `DATETIME` should not be the leftmost index column",
 		},
 		{
 			name:   "quoted prose with spaces is left alone",
-			input:  "The index 'idx_a' is marked \"do not drop\"",
+			input:  `The index "idx_a" is marked "do not drop"`,
 			expect: "The index `idx_a` is marked \"do not drop\"",
 		},
 		{
 			name:   "qualified table name",
-			input:  "Table 'app.users' has no primary key",
+			input:  `Table "app.users" has no primary key`,
 			expect: "Table `app.users` has no primary key",
+		},
+		{
+			name:   "enum type keeps its quoted values inside one code span",
+			input:  `Column "status" in table "orders" has type "enum('active','archived')"`,
+			expect: "Column `status` in table `orders` has type `enum('active','archived')`",
+		},
+		{
+			name:   "parameterised type with a comma",
+			input:  `Column "amount" in table "orders" has type "decimal(10,2)" but 2 other table(s) use type "decimal(12,4)"`,
+			expect: "Column `amount` in table `orders` has type `decimal(10,2)` but 2 other table(s) use type `decimal(12,4)`",
 		},
 		{
 			name:   "no quoted tokens passes through",
@@ -178,6 +188,11 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 			name:   "quoted descending key part in a column list",
 			input:  `Index "idx_recent" on columns ("category", "created_at DESC") is redundant`,
 			expect: "Index `idx_recent` on columns (`category`, `created_at DESC`) is redundant",
+		},
+		{
+			name:   "identifier with a doubled backtick sizes the span past the run",
+			input:  "Unsafe operation detected: \"DROP COLUMN `a``b`\"",
+			expect: "Unsafe operation detected: ``` DROP COLUMN `a``b` ```",
 		},
 	}
 
