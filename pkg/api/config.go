@@ -59,12 +59,16 @@ type ServerConfig struct {
 	// Every entry in Repos MUST set GitHubApp to one of the keys in this map.
 	Apps map[string]GitHubAppConfig `yaml:"apps,omitempty"`
 
-	// TernDeployments maps deployment names to Tern gRPC endpoints per environment.
-	// Use "default" for single-deployment setups.
+	// TernDeployments maps lowercase deployment names to Tern gRPC endpoints
+	// per lowercase environment name. These names are storage identity keys
+	// compared byte-wise across storage dialects. Use "default" for
+	// single-deployment setups.
 	TernDeployments TernConfig `yaml:"tern_deployments"`
 
 	// Databases contains registered database configurations per environment.
-	// Key format: "database_name" with nested environment configs.
+	// Map keys are lowercase database names used as storage identity keys and
+	// schema-directory routing keys. Identity keys are compared byte-wise across
+	// storage dialects and are validated rather than rewritten.
 	Databases map[string]DatabaseConfig `yaml:"databases"`
 
 	// TargetResolver configures how a data-plane server (serve --grpc) resolves
@@ -839,7 +843,9 @@ type DatabaseConfig struct {
 	// Type is the database type: "mysql", "vitess", or "strata".
 	Type string `yaml:"type"`
 
-	// Environments contains per-environment configuration.
+	// Environments contains per-environment configuration. Map keys are
+	// lowercase environment names used as storage identity keys and compared
+	// byte-wise across storage dialects.
 	Environments map[string]EnvironmentConfig `yaml:"environments"`
 
 	// EnvironmentOrder optionally overrides the server-wide environment_order
@@ -942,14 +948,16 @@ type EnvironmentConfig struct {
 	// Mutually exclusive with Deployments.
 	Target string `yaml:"target,omitempty"`
 
-	// Deployment is the Tern deployment key for gRPC mode.
+	// Deployment is the lowercase Tern deployment key for gRPC mode. Deployment
+	// names are storage identity keys compared byte-wise across storage dialects.
 	// Mutually exclusive with Deployments.
 	Deployment string `yaml:"deployment,omitempty"`
 
-	// Deployments maps a Tern deployment key to its per-deployment target
+	// Deployments maps a lowercase Tern deployment key to its per-deployment target
 	// for multi-deployment environments. Each key MUST also appear in the
 	// top-level tern_deployments map. Mutually exclusive with the scalar
-	// Target/Deployment fields above.
+	// Target/Deployment fields above. Deployment names are storage identity keys
+	// compared byte-wise across storage dialects.
 	//
 	// Example:
 	//   deployments:
@@ -1345,6 +1353,12 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("databases or target_resolver is required")
 	}
 
+	if err := validateLowercaseIdentifiers("environment_order environment name", c.EnvironmentOrder); err != nil {
+		return err
+	}
+	if err := validateLowercaseIdentifiers("allowed_environments environment name", c.AllowedEnvironments); err != nil {
+		return err
+	}
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
 		return err
 	}
@@ -1387,6 +1401,12 @@ func (c *ServerConfig) Validate() error {
 	// Validate Databases if present. An environment is either local mode
 	// (direct DSN) or gRPC mode (server-side target + deployment).
 	for name, dbConfig := range c.Databases {
+		if err := validateLowercaseIdentifier("database name", name); err != nil {
+			return err
+		}
+		if err := validateLowercaseIdentifiers(fmt.Sprintf("database %q environment_order environment name", name), dbConfig.EnvironmentOrder); err != nil {
+			return err
+		}
 		if dbConfig.Type == "" {
 			return fmt.Errorf("database %q missing type", name)
 		}
@@ -1408,6 +1428,17 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		for env, envConfig := range dbConfig.Environments {
+			if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment name", name), env); err != nil {
+				return err
+			}
+			if envConfig.Deployment != "" {
+				if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), envConfig.Deployment); err != nil {
+					return err
+				}
+			}
+			if err := validateLowercaseIdentifiers(fmt.Sprintf("database %q environment %q deployment_order deployment name", name, env), envConfig.DeploymentOrder); err != nil {
+				return err
+			}
 			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
 				return err
 			}
@@ -1460,6 +1491,9 @@ func (c *ServerConfig) Validate() error {
 					}
 				}
 				for deployment, dt := range envConfig.Deployments {
+					if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), deployment); err != nil {
+						return err
+					}
 					if deployment == "" {
 						return fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", name, env)
 					}
@@ -1511,10 +1545,16 @@ func (c *ServerConfig) Validate() error {
 
 	// Validate TernDeployments if present (gRPC mode)
 	for name, endpoints := range c.TernDeployments {
+		if err := validateLowercaseIdentifier("tern_deployments deployment name", name); err != nil {
+			return err
+		}
 		if len(endpoints) == 0 {
 			return fmt.Errorf("deployment %q has no environments configured", name)
 		}
 		for env, addr := range endpoints {
+			if err := validateLowercaseIdentifier(fmt.Sprintf("deployment %q environment name", name), env); err != nil {
+				return err
+			}
 			if addr == "" {
 				return fmt.Errorf("deployment %q environment %q has empty address", name, env)
 			}
@@ -1532,6 +1572,22 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("auth config: %w", err)
 	}
 
+	return nil
+}
+
+func validateLowercaseIdentifier(field, value string) error {
+	if strings.IndexFunc(value, unicode.IsUpper) >= 0 {
+		return fmt.Errorf("%s %q must be lowercase", field, value)
+	}
+	return nil
+}
+
+func validateLowercaseIdentifiers(field string, values []string) error {
+	for _, value := range values {
+		if err := validateLowercaseIdentifier(field, value); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

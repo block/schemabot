@@ -714,6 +714,74 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"orders": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "orders-staging", Deployment: "primary"},
+					},
+				},
+			},
+			TernDeployments: TernConfig{
+				"primary": {"staging": "localhost:9090"},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		mutate    func(*ServerConfig)
+		wantError string
+	}{
+		{
+			name: "database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["Orders"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "Orders" must be lowercase`,
+		},
+		{
+			name: "environment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.Environments["Staging"] = database.Environments["staging"]
+				delete(database.Environments, "staging")
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment name "Staging" must be lowercase`,
+		},
+		{
+			name: "deployment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Deployment = "Primary"
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must be lowercase`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			require.EqualError(t, err, tt.wantError)
+		})
+	}
+
+	t.Run("lowercase identifiers", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 // A required_checks entry that names SchemaBot's own aggregate Check Run would
 // be silently unenforced: SchemaBot checks are excluded from the passing-checks
 // gate, so the gate would treat the named check as always satisfied. Config
