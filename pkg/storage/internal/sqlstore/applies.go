@@ -772,13 +772,15 @@ func verifyExpectedLockIntent(ctx context.Context, tx *rebindTx, apply *storage.
 	// one: it matches only a lock whose pending_plan_id is unset (the column is
 	// NOT NULL DEFAULT ''), so an unpinned lock that a rollback re-pins mid-flight
 	// still fails this check.
+	database := storage.CanonicalKey(apply.Database)
+	databaseType := storage.CanonicalKey(apply.DatabaseType)
 	var lockID int64
 	err := tx.QueryRowContext(ctx, `
 		SELECT id
 		FROM locks
 		WHERE database_name = ? AND database_type = ? AND owner = ? AND pending_plan_id = ?
 		FOR UPDATE
-	`, apply.Database, apply.DatabaseType, apply.ExpectedLockOwner, apply.ExpectedPendingPlanID).Scan(&lockID)
+	`, database, databaseType, apply.ExpectedLockOwner, apply.ExpectedPendingPlanID).Scan(&lockID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storage.ErrLockIntentChanged
 	}

@@ -30,8 +30,19 @@ type checkStore struct {
 	classifier ErrorClassifier
 }
 
+func canonicalizeCheck(check *storage.Check) {
+	if check == nil {
+		return
+	}
+	check.Repository = storage.CanonicalKey(check.Repository)
+	check.Environment = storage.CanonicalKey(check.Environment)
+	check.DatabaseType = storage.CanonicalKey(check.DatabaseType)
+	check.DatabaseName = storage.CanonicalKey(check.DatabaseName)
+}
+
 // Upsert creates or updates stored check state.
 func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
+	canonicalizeCheck(check)
 	// Convert CheckRunID=0 to NULL (0 is Go's zero value, not a valid check run ID)
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -82,6 +93,7 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 // only a write that re-ran the rollup and found the deployments clean may clear
 // it. See storage.PlanDriftState.
 func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) error {
+	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -182,6 +194,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 // RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check
 // state when a successful no-op plan proves the target already matches the PR schema.
 func (s *checkStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *storage.Check) (bool, error) {
+	canonicalizeCheck(check)
 	if !successfulNoOpPlanResult(check) {
 		return false, nil
 	}
@@ -240,6 +253,7 @@ func successfulNoOpPlanResult(check *storage.Check) bool {
 // plan is no longer part of the merge gate, so the plan-only drift block should
 // stop blocking. A started apply still owns the row and is left untouched.
 func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage.Check) (bool, error) {
+	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -300,6 +314,7 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 // commit) does not match and is preserved. Returns true when the row was
 // cleared.
 func (s *checkStore) ClearAggregateBlock(ctx context.Context, check *storage.Check) (bool, error) {
+	canonicalizeCheck(check)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE checks
 		SET blocking_reason = '',
@@ -335,6 +350,7 @@ func isPlanOnlySuccessful(check *storage.Check) bool {
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -407,6 +423,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 // Cancelled forward applies additionally require that no completed forward
 // task exists under this or an earlier apply for the target.
 func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -483,6 +500,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 // after the cancellation, and the completed-task predicate keeps a
 // cancellation that is safe to release from being retained here.
 func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
+	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
@@ -568,6 +586,10 @@ func (s *checkStore) completedForwardTaskPredicate(required bool) string {
 
 // Get returns a check by its unique key (PR + env + database), or nil if not found.
 func (s *checkStore) Get(ctx context.Context, repo string, pr int, environment, dbType, database string) (*storage.Check, error) {
+	repo = storage.CanonicalKey(repo)
+	environment = storage.CanonicalKey(environment)
+	dbType = storage.CanonicalKey(dbType)
+	database = storage.CanonicalKey(database)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+checkColumns+`
 		FROM checks
@@ -591,6 +613,7 @@ func (s *checkStore) GetByCheckRunID(ctx context.Context, checkRunID int64) (*st
 
 // GetByPR returns all checks for a PR.
 func (s *checkStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Check, error) {
+	repo = storage.CanonicalKey(repo)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+checkColumns+`
 		FROM checks
@@ -608,6 +631,10 @@ func (s *checkStore) GetByPR(ctx context.Context, repo string, pr int) ([]*stora
 // GetByDatabase returns all checks for a database across all PRs.
 // Used for cross-PR coordination (blocking other PRs when one is applying).
 func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbType, database string) ([]*storage.Check, error) {
+	repo = storage.CanonicalKey(repo)
+	environment = storage.CanonicalKey(environment)
+	dbType = storage.CanonicalKey(dbType)
+	database = storage.CanonicalKey(database)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+checkColumns+`
 		FROM checks
@@ -665,6 +692,7 @@ func (s *checkStore) Delete(ctx context.Context, id int64) error {
 // action_required when the schema change is gone from the PR, or a fresh
 // plan result replaces it when the change is still present.
 func (s *checkStore) DeleteByPRRetainingBlockingApplyOwned(ctx context.Context, repo string, pr int, merged bool) error {
+	repo = storage.CanonicalKey(repo)
 	if merged {
 		_, err := s.db.ExecContext(ctx, `
 			DELETE FROM checks

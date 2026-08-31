@@ -22,6 +22,12 @@ type lockStore struct {
 	classifier ErrorClassifier
 }
 
+func canonicalizeLock(lock *storage.Lock) {
+	lock.DatabaseName = storage.CanonicalKey(lock.DatabaseName)
+	lock.DatabaseType = storage.CanonicalKey(lock.DatabaseType)
+	lock.Repository = storage.CanonicalKey(lock.Repository)
+}
+
 // Acquire attempts to acquire a lock. Returns ErrLockHeld if held by another owner.
 // Acquiring a lock the same owner already holds is a success (idempotent): two
 // concurrent applies for the same PR and database (e.g. staging and production
@@ -31,6 +37,7 @@ type lockStore struct {
 // confirm command loads, and its disclosure record travels with it. A re-acquire
 // that passes an empty PendingPlanID (CLI) leaves the existing values intact.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
+	canonicalizeLock(lock)
 	op := fmt.Sprintf("acquire lock for %s/%s owner=%s", lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	return withLockRetry(ctx, s.classifier, op, func() error {
 		return s.acquireOnce(ctx, lock)
@@ -41,6 +48,7 @@ func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 // racing to claim the same key can hit a transient InnoDB lock conflict on the
 // INSERT below; Acquire retries those.
 func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
+	canonicalizeLock(lock)
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
 		return fmt.Errorf("read existing lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
@@ -104,6 +112,7 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock) error {
 // case, so the refresh has succeeded. To distinguish that from a genuine ownership
 // change, re-read the lock and branch on its actual state.
 func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existing *storage.Lock) error {
+	canonicalizeLock(lock)
 	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
 		return nil
 	}
@@ -143,6 +152,8 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 
 // Release releases a lock. Only succeeds if caller is the owner.
 func (s *lockStore) Release(ctx context.Context, database, dbType, owner string) error {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
 		WHERE database_name = ? AND database_type = ? AND owner = ?
@@ -172,6 +183,8 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 // apply lock can become a rollback lock), so owner-only release is insufficient
 // after a network call or other long-running operation.
 func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error) {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
 		WHERE database_name = ? AND database_type = ? AND owner = ? AND pending_plan_id = ?
@@ -189,6 +202,8 @@ func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType
 
 // ForceRelease releases a lock regardless of owner (admin override).
 func (s *lockStore) ForceRelease(ctx context.Context, database, dbType string) error {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
 		WHERE database_name = ? AND database_type = ?
@@ -202,6 +217,8 @@ func (s *lockStore) ForceRelease(ctx context.Context, database, dbType string) e
 
 // Get returns a lock by database name and type, or nil if not found.
 func (s *lockStore) Get(ctx context.Context, database, dbType string) (*storage.Lock, error) {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+lockColumns+`
 		FROM locks
@@ -240,6 +257,7 @@ func (s *lockStore) List(ctx context.Context) ([]*storage.Lock, error) {
 // ErrLockNotFound when it is gone or ErrLockNotOwned when another owner holds
 // it.
 func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
+	canonicalizeLock(lock)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
 		SET updated_at = NOW()
@@ -273,6 +291,7 @@ func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
 
 // GetByPR returns all locks associated with a PR.
 func (s *lockStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Lock, error) {
+	repo = storage.CanonicalKey(repo)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+lockColumns+`
 		FROM locks

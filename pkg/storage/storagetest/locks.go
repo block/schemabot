@@ -16,6 +16,47 @@ import (
 // requires backdating the stored row via SQL, which is dialect-specific and
 // lives in each implementation's own integration tests.
 func TestLocks(t *testing.T, h Harness) {
+	t.Run("CanonicalIdentityKey", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := &storage.Lock{
+			DatabaseName:  "Orders_DB",
+			DatabaseType:  "MySQL",
+			Repository:    "MixedCase/Sample-Repo",
+			PullRequest:   123,
+			Owner:         "MixedCase/Sample-Repo#123",
+			PendingPlanID: "plan-1",
+		}
+		require.NoError(t, store.Locks().Acquire(ctx, lock))
+
+		stored, err := store.Locks().Get(ctx, "ORDERS_DB", "MYSQL")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "orders_db", stored.DatabaseName)
+		assert.Equal(t, "mysql", stored.DatabaseType)
+		assert.Equal(t, "mixedcase/sample-repo", stored.Repository)
+		assert.Equal(t, "MixedCase/Sample-Repo#123", stored.Owner)
+
+		locks, err := store.Locks().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 123)
+		require.NoError(t, err)
+		require.Len(t, locks, 1)
+
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "orders_db", DatabaseType: "mysql",
+			Repository: "mixedcase/sample-repo", PullRequest: 123,
+			Owner: "MixedCase/Sample-Repo#123",
+		}))
+		require.ErrorIs(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "ORDERS_DB", DatabaseType: "MYSQL",
+			Repository: "MIXEDCASE/SAMPLE-REPO", PullRequest: 123,
+			Owner: "different-owner",
+		}), storage.ErrLockHeld)
+
+		released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "MixedCase/Sample-Repo#123", "plan-1")
+		require.NoError(t, err)
+		assert.True(t, released)
+	})
+
 	t.Run("Acquire", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
