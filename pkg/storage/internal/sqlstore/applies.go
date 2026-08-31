@@ -166,6 +166,13 @@ func hasApplyTarget(database, dbType, environment string) bool {
 	return database != "" && dbType != "" && environment != ""
 }
 
+func canonicalizeApplyIdentity(apply *storage.Apply) {
+	apply.Database = storage.CanonicalKey(apply.Database)
+	apply.DatabaseType = storage.CanonicalKey(apply.DatabaseType)
+	apply.Repository = storage.CanonicalKey(apply.Repository)
+	apply.Environment = storage.CanonicalKey(apply.Environment)
+}
+
 func placeholders(count int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
@@ -516,6 +523,8 @@ func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.App
 
 // Create stores a new apply and returns its ID.
 func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, error) {
+	canonicalizeApplyIdentity(apply)
+
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
 	if len(options) == 0 {
@@ -692,6 +701,8 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 }
 
 func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
+	canonicalizeApplyIdentity(apply)
+
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
 	if len(options) == 0 {
@@ -975,6 +986,8 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	canonicalizeApplyIdentity(apply)
+
 	// A drive that holds only an operation lease must never write the parent
 	// applies row directly: under fan-out the parent state is owned solely by
 	// the rollout projection (UpdateDerivedState). A single-operation drive
@@ -1270,6 +1283,8 @@ func (s *applyStore) FindStuckPendingApplies(ctx context.Context, olderThan time
 // recent-apply list and count queries, so both views agree on which applies a
 // filter selects.
 func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
+	filter.Environment = storage.CanonicalKey(filter.Environment)
+
 	var where []string
 	var args []any
 	if filter.Environment != "" {
@@ -2421,6 +2436,10 @@ func retryableExpirationReason(apply *storage.Apply) storage.RetryableExpiration
 // GetByDatabase returns applies for a specific database and optionally filtered by dbType and environment.
 // If dbType or environment are empty strings, they are not used as filters.
 func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	environment = storage.CanonicalKey(environment)
+
 	query := `
 		SELECT ` + applyColumns + `
 		FROM applies
@@ -2499,6 +2518,8 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 
 // GetByPR returns all applies for a PR.
 func (s *applyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Apply, error) {
+	repo = storage.CanonicalKey(repo)
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
@@ -2519,6 +2540,10 @@ func (s *applyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*stora
 // from, so it must count as matching any head rather than silently dropping
 // out of the result.
 func (s *applyStore) ExistsForDatabaseHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) (bool, error) {
+	repo = storage.CanonicalKey(repo)
+	database = storage.CanonicalKey(database)
+	databaseType = storage.CanonicalKey(databaseType)
+
 	var exists bool
 	err := s.db.QueryRowContext(ctx, `
 		SELECT EXISTS (
@@ -2575,6 +2600,8 @@ func (s *applyStore) Delete(ctx context.Context, id int64) error {
 // transactionally prevents orphan operation rows that the operator claim loop
 // would otherwise re-claim forever (their parent lookup returns nil).
 func (s *applyStore) DeleteByPR(ctx context.Context, repo string, pr int) error {
+	repo = storage.CanonicalKey(repo)
+
 	const opName = "delete applies by PR"
 	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
 	if err != nil {

@@ -50,12 +50,21 @@ type taskStore struct {
 	locker   namedlock.Locker
 }
 
+func canonicalizeTaskIdentity(task *storage.Task) {
+	task.Database = storage.CanonicalKey(task.Database)
+	task.DatabaseType = storage.CanonicalKey(task.DatabaseType)
+	task.Repository = storage.CanonicalKey(task.Repository)
+	task.Environment = storage.CanonicalKey(task.Environment)
+}
+
 // Create stores a new task.
 func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, error) {
 	return insertTask(ctx, s.db, s.identity, task)
 }
 
 func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
+	canonicalizeTaskIdentity(task)
+
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
 	if len(options) == 0 {
@@ -180,6 +189,8 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 // reuses the lease-guarded Update, which applies the same lease precedence. On
 // conflict only the progress fields change; identity and DDL are preserved.
 func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
+	canonicalizeTaskIdentity(task)
+
 	if task.ApplyOperationID == nil {
 		return fmt.Errorf("upsert shard progress for %s.%s shard %q requires apply_operation_id", task.Namespace, task.TableName, task.Shard)
 	}
@@ -283,6 +294,8 @@ const shardTaskInsertColumns = `
 // appends its own lease-guard ("FROM <lease table> WHERE ... lease_token = ?")
 // and the guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
+	canonicalizeTaskIdentity(task)
+
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")
@@ -486,6 +499,8 @@ func (s *taskStore) GetShardProgressByApplyOperationID(ctx context.Context, appl
 // Results are ordered by created_at DESC, then by id DESC as a tiebreaker
 // (since created_at only has second precision).
 func (s *taskStore) GetByDatabase(ctx context.Context, database string) ([]*storage.Task, error) {
+	database = storage.CanonicalKey(database)
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
@@ -518,6 +533,8 @@ func (s *taskStore) GetActive(ctx context.Context) ([]*storage.Task, error) {
 
 // GetByPR returns all tasks for a repository and pull request.
 func (s *taskStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Task, error) {
+	repo = storage.CanonicalKey(repo)
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
@@ -546,6 +563,10 @@ const tableOwnerLookupLimit = 20
 // is on the plan path: one query per table the plan would drop, served by the
 // tasks index on (database_name, database_type, environment, table_name).
 func (s *taskStore) FindTableOwners(ctx context.Context, ref storage.TableRef) ([]storage.TableOwner, error) {
+	ref.Database = storage.CanonicalKey(ref.Database)
+	ref.DatabaseType = storage.CanonicalKey(ref.DatabaseType)
+	ref.Environment = storage.CanonicalKey(ref.Environment)
+
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT repository, pull_request, MAX(created_at)
 		FROM tasks
@@ -579,6 +600,8 @@ func (s *taskStore) FindTableOwners(ctx context.Context, ref storage.TableRef) (
 
 // List returns tasks matching the filter criteria.
 func (s *taskStore) List(ctx context.Context, filter storage.TaskFilter) ([]*storage.Task, error) {
+	filter.Repository = storage.CanonicalKey(filter.Repository)
+
 	query := `
 		SELECT ` + taskColumns + `
 		FROM tasks
