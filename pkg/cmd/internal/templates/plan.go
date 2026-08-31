@@ -543,7 +543,9 @@ func writeUnsafeChangesList(changes []UnsafeChange) {
 
 // countUnsafeFindings sums the individual findings across changes so the
 // apply-blocked heading counts exactly what the list below shows; a change
-// with no parseable reason still counts once.
+// with no parseable reason still counts once. The PR comment's
+// countUnsafeFindings in pkg/webhook/templates mirrors this; the two must
+// agree so the CLI and PR comment report the same count for the same plan.
 func countUnsafeFindings(changes []UnsafeChange) int {
 	n := 0
 	for _, c := range changes {

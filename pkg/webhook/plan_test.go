@@ -955,9 +955,9 @@ func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
 }
 
 // An engine can report an unsafe change without a parseable reason. The
-// blocking comment still lists the table — as a bare bullet, no dangling
-// colon — and the header counts it as one finding.
-func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *testing.T) {
+// blocking comment still lists the table — with the engine's change type as
+// the explanation, matching the CLI — and the header counts it as one finding.
+func TestRenderUnsafeChangesBlocked_EmptyReasonListsChangeTypeAndCountsOnce(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:    "testdb",
 		Environment: "staging",
@@ -968,7 +968,7 @@ func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *te
 		}},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []templates.UnsafeChangeData{
-			{Table: "users", Reason: ""},
+			{Table: "users", Reason: "", ChangeType: "drop"},
 			{Table: "orders", Reason: "DROP TABLE removes all data"},
 		},
 	}
@@ -976,13 +976,13 @@ func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *te
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 2 unsafe changes detected")
-	assert.Contains(t, rendered, "1. `users`\n")
-	assert.NotContains(t, rendered, "1. `users`:")
+	assert.Contains(t, rendered, "1. `users`: drop\n")
 	assert.Contains(t, rendered, "2. `orders`: DROP TABLE removes all data\n")
 }
 
-// The plan comment's unsafe-issues section handles a reasonless change the
-// same way: a bare table bullet that still counts once in the header.
+// A change with neither a reason nor a change type still gets a line in the
+// plan comment's unsafe-issues section — a bare table entry, no dangling
+// colon — and still counts once in the header.
 func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:    "testdb",
