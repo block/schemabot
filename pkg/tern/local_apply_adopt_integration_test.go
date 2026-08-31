@@ -237,8 +237,17 @@ func TestApplyRefusesToAdoptADifferentChangeSet(t *testing.T) {
 	assert.False(t, resp.Accepted, "a different change set must not be adopted")
 	assert.Contains(t, resp.ErrorMessage, "schema change already in progress",
 		"the refusal must still name what holds the database")
-	assert.Contains(t, resp.ErrorMessage, first.ApplyId,
-		"the refusal must name the apply an operator acts on")
+	assert.Contains(t, resp.ErrorMessage, "users",
+		"the refusal names the table whose work holds the database")
+
+	// The refusal also travels as structured facts, so a control plane can tell
+	// an operator why the database is busy without rendering engine prose. The
+	// engine's own apply identifier is not among them: it resolves only here, so
+	// an operator who took it to the control-plane CLI would be refused.
+	require.NotNil(t, resp.Conflict, "a refused dispatch reports the conflict that refused it")
+	assert.Equal(t, "users", resp.Conflict.Table)
+	assert.NotEmpty(t, resp.Conflict.BlockingState, "the state holding the database decides what an operator does next")
+	assert.NotContains(t, resp.ErrorMessage, first.ApplyId)
 }
 
 // A terminal apply is not running anything to rejoin, so a dispatch is never
@@ -284,7 +293,7 @@ func TestApplyDoesNotAdoptATerminalApply(t *testing.T) {
 // An apply that is reverting is live, but it is running the change backwards.
 // Resolving a forward dispatch into it would report the operator's schema
 // change as under way while the system is actively removing it, so the refusal
-// stands and names the apply the operator has to deal with first.
+// stands and names the work the operator has to deal with first.
 func TestApplyRefusesToAdoptAnApplyThatIsUndoingItsChange(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

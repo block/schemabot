@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/metrics"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -240,19 +241,69 @@ func (b blockingTask) applyStateName() string {
 	return b.apply.State
 }
 
-// describe renders the conflict for an operator: what holds the database, and
-// where to go to clear it.
+// describe renders the conflict for an operator: what holds the database, who
+// owns it, and what has to happen before the database is free.
+//
+// The holding change is named by its pull request or its caller, not by the
+// engine's apply identifier. That identifier belongs to the data plane alone:
+// the control plane resolves an apply only by its own identifier, so offering
+// the engine's as the handle sends an operator to a command that refuses them.
+// It stays in the logs, where every triage attribute already carries it.
 func (b blockingTask) describe() string {
 	if b.apply == nil {
-		return b.subject() + " is held by an apply that could not be loaded"
+		return b.subject() + " is held by a schema change that could not be loaded"
 	}
 
-	described := fmt.Sprintf("%s is held by apply %s (%s)",
-		b.subject(), b.apply.ApplyIdentifier, b.apply.State)
-	if resolution := b.resolution(); resolution != "" {
-		return described + "; " + resolution
+	described := fmt.Sprintf("%s is held by a schema change (%s)%s",
+		b.subject(), b.apply.State, b.holder())
+	if hold := state.Hold(b.apply.State); hold != "" {
+		return described + "; " + hold
 	}
 	return described
+}
+
+// holder names who owns the blocking change, preferring the pull request an
+// operator can open over the caller string. Both are empty for a change whose
+// provenance was not recorded, which leaves the conflict described by its work
+// and its state alone rather than by an identifier that resolves nowhere.
+func (b blockingTask) holder() string {
+	switch {
+	case b.apply.Repository != "" && b.apply.PullRequest > 0:
+		return fmt.Sprintf(" on %s#%d", b.apply.Repository, b.apply.PullRequest)
+	case b.apply.Caller != "":
+		return fmt.Sprintf(" started by %s", b.apply.Caller)
+	default:
+		return ""
+	}
+}
+
+// conflict renders the refusal as the structured facts a caller can present on
+// its own surfaces: the work being held, the state holding it, and who owns the
+// holding change.
+//
+// The holding apply's own identifier crosses too, but as a lookup key rather
+// than as text. A caller that dispatched this work recorded that identifier
+// against its own apply, so it can turn the key into a handle that resolves on
+// its side. That is the opposite of what describe() omits — this identifier is
+// never rendered, it is what lets the caller avoid rendering it.
+//
+// Returns nil when there is no conflict to report, or when the blocking task's
+// apply could not be loaded — the dispatch is still refused (the check fails
+// closed), but with nothing proven about the holder there is nothing to render
+// beyond the sanitized error the caller already has.
+func (b blockingTask) conflict() *ternv1.ApplyConflict {
+	if !b.blocks() || b.apply == nil {
+		return nil
+	}
+	return &ternv1.ApplyConflict{
+		Table:            b.table,
+		Shard:            b.shard,
+		BlockingState:    state.NormalizeState(b.apply.State),
+		Repository:       b.apply.Repository,
+		PullRequest:      int32(b.apply.PullRequest),
+		Caller:           b.apply.Caller,
+		HolderExternalId: b.apply.ApplyIdentifier,
+	}
 }
 
 // subject names the work being done, leading with the table an operator
@@ -270,50 +321,6 @@ func (b blockingTask) subject() string {
 		return fmt.Sprintf("table %s (task %s)", b.table, b.taskIdentifier)
 	default:
 		return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
-	}
-}
-
-// resolution continues the sentence describe() opens, so it speaks of the apply
-// already named there rather than restating the state alongside it. The split is
-// between an apply that holds the database until someone decides its fate and one
-// that releases it on its own, which is the distinction that tells an operator
-// whether to act or to wait.
-//
-// The resting states differ only in which decision is owed: a stopped apply waits
-// to be started, a retryable failure to be retried, an apply at the cutover
-// barrier to be cut over, and one in its revert window to be reverted or
-// skip-reverted. The revert window is the one that offers no cancel: the change
-// has already cut over, so stop and cancel are permanently rejected there. It is
-// also the one whose wait is bounded without an operator, since the window's
-// expiry triggers the skip-revert itself rather than being a third way out.
-// A revert already under way, like a running apply, finishes on its own — with
-// the caveat that a running apply may still park, since a deferred or ordered
-// cutover moves it to waiting_for_cutover rather than to a terminal state, so
-// the running line promises progress, not release.
-//
-// Other active states (pending, cutting over, recovering, waiting for a deploy
-// that tern may be about to trigger itself) get no resolution line rather than a
-// guess — the state is still named, and inventing an action for a state whose
-// next move is not certain would send an operator the wrong way.
-func (b blockingTask) resolution() string {
-	if b.apply == nil {
-		return ""
-	}
-	switch {
-	case state.IsState(b.apply.State, state.Apply.Stopped):
-		return "it holds the database until it is started or cancelled"
-	case state.IsState(b.apply.State, state.Apply.FailedRetryable):
-		return "it holds the database until it is retried or cancelled"
-	case state.IsState(b.apply.State, state.Apply.WaitingForCutover):
-		return "it holds the database until it is cut over or cancelled"
-	case state.IsState(b.apply.State, state.Apply.RevertWindow):
-		return "it holds the database until it is reverted or skip-reverted"
-	case state.IsState(b.apply.State, state.Apply.Reverting, state.Apply.SkippingRevert):
-		return "it releases the database when the revert finishes, which it does on its own"
-	case state.IsRunningApplyState(b.apply.State):
-		return "it releases the database when it finishes, unless it parks for cutover first"
-	default:
-		return ""
 	}
 }
 

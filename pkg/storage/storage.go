@@ -1163,6 +1163,22 @@ type ApplyOperationStore interface {
 	// ErrRemoteApplyDeploymentIDConflict.
 	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
 
+	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
+	// control plane dispatched as the given remote apply, or "" when it
+	// dispatched no such thing. It answers the question an operator asks about
+	// someone else's work: the data plane names the change holding a database by
+	// its own identifier, which resolves nowhere the operator can reach, and this
+	// turns that into the handle their CLI accepts.
+	//
+	// A remote apply this control plane did not start is the ordinary empty
+	// answer, not an error — another control plane or a direct engine run owns
+	// it, and there is no handle to offer. The correlation is read from the
+	// operation rows because a multi-operation apply has no single authoritative
+	// remote identifier; every operation carrying one remote apply id belongs to
+	// the same parent, so more than one parent matching means the correlation
+	// itself is broken and the store refuses to guess.
+	ApplyIdentifierForRemoteApply(ctx context.Context, externalID string) (string, error)
+
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
 

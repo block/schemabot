@@ -26,5 +26,6 @@ CREATE TABLE `apply_operations` (
   KEY `idx_deployment_state` (`deployment`,`state`),
   KEY `idx_state_created_id` (`state`,`created_at`,`id`),
   KEY `idx_apply_created_id` (`apply_id`,`created_at`,`id`),
-  KEY `idx_created_id` (`created_at`,`id`)
+  KEY `idx_created_id` (`created_at`,`id`),
+  KEY `idx_external_id` (`external_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
