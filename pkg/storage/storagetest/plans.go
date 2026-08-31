@@ -32,6 +32,7 @@ func TestPlans(t *testing.T, h Harness) {
 		_, err := store.Plans().Create(ctx, plan)
 		require.NoError(t, err)
 
+		// Stored-value equality is the cross-dialect check that identity keys are canonicalized before persistence.
 		assert.Equal(t, "ordersdb", plan.Database)
 		assert.Equal(t, "mysql", plan.DatabaseType)
 		assert.Equal(t, "mixedcase/sample-repo", plan.Repository)

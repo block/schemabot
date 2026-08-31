@@ -45,6 +45,7 @@ func TestPlanComments(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 
 		inserted := InsertPlanComment(t, store, "MixedCase/Sample-Repo", 42, "OrdersDB", "MySQL", "Production,Staging", "sha1", 100)
+		// Stored-value equality is the cross-dialect check that identity keys are canonicalized before persistence.
 		assert.Equal(t, "mixedcase/sample-repo", inserted.Repository)
 		assert.Equal(t, "ordersdb", inserted.DatabaseName)
 		assert.Equal(t, "mysql", inserted.DatabaseType)
