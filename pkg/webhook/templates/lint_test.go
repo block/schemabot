@@ -23,7 +23,7 @@ func lintPlanData(violations []LintViolationData) PlanCommentData {
 // scans both sections the same way, with quoted identifiers as inline code.
 func TestRenderPlanComment_LintInlineBelowFoldThreshold(t *testing.T) {
 	plan := RenderPlanComment(lintPlanData([]LintViolationData{
-		{Message: "Index 'idx_email' should be made invisible before dropping", Table: "users"},
+		{Message: `Index "idx_email" should be made invisible before dropping`, Table: "users"},
 		{Message: `Using "varchar" as primary key is discouraged`, Table: "sessions"},
 	}))
 
