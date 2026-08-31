@@ -99,6 +99,13 @@ func TestClassifyRefusal(t *testing.T) {
 			err:  fmt.Errorf("execute: %w", executor.ErrCancelledExternally),
 		},
 		{
+			name: "partitioned-parent admission refusal renders the typed sentence",
+			err: fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", "users",
+				&preflight.UnsupportedPartitionedParentError{Cause: preflight.PartitionCauseConcurrentIndexBuild}),
+			wantReason: "unsupported-partitioned-parent",
+			wantDetail: []string{"cannot build parent-level indexes concurrently"},
+		},
+		{
 			name:       "statement budget exhaustion is a refusal",
 			err:        fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}),
 			wantReason: "not-native-safe-budget-exceeded",

@@ -33,6 +33,16 @@ const (
 	// (retry attempts x statement limit plus backoffs) so it only fires on
 	// genuine hangs.
 	optimisticApplyCeiling = 5 * time.Minute
+
+	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
+	// Concurrent builds get their own budget instead of the per-statement
+	// limit: their snapshot waits are lock waits by implementation, so the
+	// executor runs them with lock_timeout disabled under one overall
+	// statement deadline. Deliberately below the apply ceiling so the
+	// server-side deadline fires before the client-side ceiling cancels
+	// the session — exhaustion then surfaces as the typed budget verdict
+	// rather than an ambiguous external cancellation.
+	concurrentIndexBudget = 4 * time.Minute
 )
 
 type nativeApply struct {
@@ -151,6 +161,25 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
+	var invalidErr *executor.InvalidIndexError
+	if errors.As(err, &invalidErr) {
+		// An invalid index — pre-existing or a build's own unrecovered
+		// leftover — is operational: an operator clears it and a retry can
+		// succeed. The detail is built from the typed identifiers, never
+		// the wrapped build or cleanup errors, which may carry raw server
+		// text; the full cause lands in the server log below it.
+		logger.Error("PostgreSQL concurrent index build left or found an invalid index",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
+		result := progressResult(engine.StateFailed, "failed", started, change,
+			sanitizeReasonText(fmt.Sprintf(
+				"an invalid index %q.%q blocks this build on the target; drop the invalid index, then retry",
+				invalidErr.Schema, invalidErr.Index)))
+		result.Retryable = true
+		e.publishProgress(key, result, logger)
+		return
+	}
+
 	logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
 	result := progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs")
 	// Operational failures are retryable by definition: classifyRefusal
@@ -208,6 +237,13 @@ func refusalForCause(err error, table string) *refusal {
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 		return &refusal{reason: "not-native-safe-budget-exceeded", detail: budgetErr.Error()}
+	}
+	var partitionErr *preflight.UnsupportedPartitionedParentError
+	if errors.As(err, &partitionErr) {
+		// The typed error's message is a fixed English sentence with no
+		// interpolated identifiers or server text — a deliberate pg-sprite
+		// property — so rendering it verbatim is safe by construction.
+		return &refusal{reason: "unsupported-partitioned-parent", detail: partitionErr.Error()}
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
@@ -327,6 +363,32 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	if table.Partitioned() {
+		// The partition admission policy runs here, in the session window
+		// that executes, not only at plan time: a table partitioned after
+		// planning must get the typed refusal, never a raw server error
+		// mid-statement. Server major matters to the policy (NOT VALID
+		// foreign keys), so it is read from the same target.
+		facts, err := preflight.LookupTargetFacts(ctx, pool, change.namespace, change.table)
+		if err != nil {
+			return fmt.Errorf("look up PostgreSQL target facts for table %q: %w", change.table, err)
+		}
+		if err := preflight.CheckPartitionSupport(table, facts.ServerMajor(), []string{change.sql}); err != nil {
+			return fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", change.table, err)
+		}
+	}
+	if statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent() {
+		// A concurrent build cannot run inside a transaction block, so it
+		// must not reach the transactional optimistic executor: pg-sprite's
+		// dedicated index-build executor runs it under the CONCURRENTLY
+		// budget policy and returns a catalog-verified verdict — including
+		// the invalid-index recovery a failed build needs.
+		if _, err := executor.BuildIndexConcurrently(ctx, pool, change.sql,
+			executor.ConcurrentBudget{Overall: concurrentIndexBudget}); err != nil {
+			return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
+		}
+		return nil
 	}
 	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,

@@ -402,6 +402,81 @@ func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
 
+// TestEngineApplyConcurrentIndexBuild proves a CREATE INDEX CONCURRENTLY
+// routes to the dedicated concurrent-build executor and completes: the
+// statement must never reach the transactional optimistic executor, whose
+// transaction block PostgreSQL refuses, and the built index must be valid
+// on the target when the drive reports completion.
+func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	eng := New()
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+	assert.Equal(t, 100, progress.Progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
+}
+
+// TestEngineApplyPartitionedParentConcurrentIndexRefusal proves the
+// partition admission policy runs at apply time: a concurrent build against
+// a partitioned parent is permanently refused with the typed fixed-sentence
+// detail, never attempted as a raw statement the server would fail.
+func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "partition_test")
+	_, err := db.ExecContext(t.Context(),
+		"CREATE TABLE public.events (id bigint, created date) PARTITION BY RANGE (created)")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "events",
+		"CREATE INDEX CONCURRENTLY events_created_idx ON public.events (created)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "events")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a partitioned-parent refusal is permanent until the plan or target changes")
+	assert.Contains(t, progress.ErrorMessage, "cannot build parent-level indexes concurrently")
+}
+
+// TestEngineApplyConcurrentIndexPreexistingInvalidRetryable proves an
+// invalid index already occupying the target name fails the build as a
+// retryable operational failure whose detail names the index and the
+// operator action — the executor fails closed on debris it cannot prove
+// its own, and clearing it makes a retry viable.
+func TestEngineApplyConcurrentIndexPreexistingInvalidRetryable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "invalid_index_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_idx ON public.orders (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "an operator can drop the invalid index; the drive must offer the retry")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, "drop the invalid index")
+}
+
 // applyRequest builds a single-statement apply request with the same identity
 // shape the drive layer uses: the task identifier stamped into
 // ResumeState.MigrationContext keys the engine's progress to this apply.
