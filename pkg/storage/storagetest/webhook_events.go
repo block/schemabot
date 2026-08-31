@@ -123,7 +123,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 		claimed := claimExpecting(t, store, "delivery-mixed-case")
 		claimed.Repository = "MIXEDCASE/SAMPLE-REPO"
-		successor := newPullRequestEvent("delivery-mixed-successor", "synchronize", 42, "new-head", time.Now().UTC().Add(time.Second))
+		successor := newPullRequestEvent("delivery-mixed-successor", "synchronize", 42, "new-head", claimed.ReceivedAt.Add(time.Second))
 		successor.Repository = "mixedcase/sample-repo"
 		createEvent(t, store, successor)
 
