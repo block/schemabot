@@ -103,80 +103,129 @@ type Harness struct {
 	Skips map[Case]string
 }
 
-// Run executes the engine contract suite against the harness. Every case runs
-// as a subtest; a case is either exercised by its fixture or skipped with the
-// harness's documented reason — a case with neither fails.
+// contractCase binds one Case to the Harness fixture it consumes, the
+// engine.Engine methods whose contract it pins, and the subtest body that
+// exercises it. The completeness test in this package holds the registry,
+// the Harness fixture fields, and the engine.Engine method set in lockstep,
+// so a new fixture, case, or engine capability cannot land unclassified.
+type contractCase struct {
+	name Case
+	// harnessField names the Harness fixture field this case consumes.
+	harnessField string
+	// engineMethods names the engine.Engine methods whose cross-engine
+	// contract this case pins. A method no case names must carry a
+	// documented reason in engineMethodExclusions.
+	engineMethods []string
+	run           func(t *testing.T, h Harness)
+}
+
+var contractCases = []contractCase{
+	{name: CaseCancelAlreadyCompleted, harnessField: "CancelAlreadyCompleted", engineMethods: []string{"Cancel"}, run: runCancelAlreadyCompleted},
+	{name: CaseStopAlreadyCompleted, harnessField: "StopAlreadyCompleted", engineMethods: []string{"Stop"}, run: runStopAlreadyCompleted},
+	{name: CaseCancelNonexistent, harnessField: "CancelNonexistent", engineMethods: []string{"Cancel"}, run: runCancelNonexistent},
+	{name: CaseStopNonexistent, harnessField: "StopNonexistent", engineMethods: []string{"Stop"}, run: runStopNonexistent},
+	{name: CaseProgressTerminalTruth, harnessField: "TerminalProgress", engineMethods: []string{"Progress"}, run: runProgressTerminalTruth},
+	// The not-ready fixture invokes an operation of the engine's choosing,
+	// so the case pins the rejection's error typing, not one method.
+	{name: CaseNotReadyDistinguishable, harnessField: "NotReady", run: runNotReadyDistinguishable},
+}
+
+// engineMethodExclusions documents the engine.Engine methods this suite
+// deliberately does not pin, keyed by method name with the reason. The suite
+// exists for the cross-engine error-typing contract the driver layer depends
+// on; behavior that is inherently engine-specific belongs to each engine's
+// own tests. A new engine.Engine method must either be pinned by a contract
+// case or carry a reason here — the completeness test fails it otherwise.
+var engineMethodExclusions = map[string]string{
+	"Name":       "identifier accessor with no backend behavior to pin",
+	"Plan":       "plan output is engine-specific; each engine's own tests pin it",
+	"Apply":      "apply orchestration is engine-specific; each engine's own tests pin it",
+	"Start":      "resume semantics are engine-specific; each engine's own tests pin them",
+	"Cutover":    "cutover semantics are engine-specific; each engine's own tests pin them",
+	"Revert":     "revert semantics are engine-specific; each engine's own tests pin them",
+	"SkipRevert": "revert-window semantics are engine-specific; each engine's own tests pin them",
+	"Volume":     "throttle semantics are engine-specific; each engine's own tests pin them",
+}
+
+// Run executes the engine contract suite against the harness. Every
+// registered case runs as a subtest; a case is either exercised by its
+// fixture or skipped with the harness's documented reason — a case with
+// neither fails.
 func Run(t *testing.T, h Harness) {
-	t.Run(string(CaseCancelAlreadyCompleted), func(t *testing.T) {
-		fixture, ok := controlFixture(t, h, CaseCancelAlreadyCompleted, h.CancelAlreadyCompleted)
-		if !ok {
-			return
-		}
-		_, err := fixture.Engine.Cancel(t.Context(), fixture.Req)
-		requireAlreadyCompleted(t, "cancel", err)
-	})
+	for _, c := range contractCases {
+		t.Run(string(c.name), func(t *testing.T) { c.run(t, h) })
+	}
+}
 
-	t.Run(string(CaseStopAlreadyCompleted), func(t *testing.T) {
-		fixture, ok := controlFixture(t, h, CaseStopAlreadyCompleted, h.StopAlreadyCompleted)
-		if !ok {
-			return
-		}
-		_, err := fixture.Engine.Stop(t.Context(), fixture.Req)
-		requireAlreadyCompleted(t, "stop", err)
-	})
+func runCancelAlreadyCompleted(t *testing.T, h Harness) {
+	fixture, ok := controlFixture(t, h, CaseCancelAlreadyCompleted, h.CancelAlreadyCompleted)
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Cancel(t.Context(), fixture.Req)
+	requireAlreadyCompleted(t, "cancel", err)
+}
 
-	t.Run(string(CaseCancelNonexistent), func(t *testing.T) {
-		fixture, ok := controlFixture(t, h, CaseCancelNonexistent, h.CancelNonexistent)
-		if !ok {
-			return
-		}
-		_, err := fixture.Engine.Cancel(t.Context(), fixture.Req)
-		requirePermanent(t, "cancel", err)
-	})
+func runStopAlreadyCompleted(t *testing.T, h Harness) {
+	fixture, ok := controlFixture(t, h, CaseStopAlreadyCompleted, h.StopAlreadyCompleted)
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Stop(t.Context(), fixture.Req)
+	requireAlreadyCompleted(t, "stop", err)
+}
 
-	t.Run(string(CaseStopNonexistent), func(t *testing.T) {
-		fixture, ok := controlFixture(t, h, CaseStopNonexistent, h.StopNonexistent)
-		if !ok {
-			return
-		}
-		_, err := fixture.Engine.Stop(t.Context(), fixture.Req)
-		requirePermanent(t, "stop", err)
-	})
+func runCancelNonexistent(t *testing.T, h Harness) {
+	fixture, ok := controlFixture(t, h, CaseCancelNonexistent, h.CancelNonexistent)
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Cancel(t.Context(), fixture.Req)
+	requirePermanent(t, "cancel", err)
+}
 
-	t.Run(string(CaseProgressTerminalTruth), func(t *testing.T) {
-		if handleSkip(t, h, CaseProgressTerminalTruth, h.TerminalProgress == nil) {
-			return
-		}
-		fixtures := h.TerminalProgress(t)
-		require.NotEmpty(t, fixtures, "the terminal-progress fixture must cover at least one terminal backend state")
-		for _, fixture := range fixtures {
-			t.Run(fixture.Name, func(t *testing.T) {
-				require.True(t, fixture.Want.IsTerminal(),
-					"fixture %s wants state %q, which is not terminal — this case only covers terminal truth", fixture.Name, fixture.Want)
-				result, err := fixture.Engine.Progress(t.Context(), fixture.Req)
-				require.NoError(t, err, "progress on a terminal change must report the outcome, not fail")
-				require.NotNil(t, result)
-				assert.Equal(t, fixture.Want, result.State,
-					"progress must report the backend's terminal outcome truthfully")
-			})
-		}
-	})
+func runStopNonexistent(t *testing.T, h Harness) {
+	fixture, ok := controlFixture(t, h, CaseStopNonexistent, h.StopNonexistent)
+	if !ok {
+		return
+	}
+	_, err := fixture.Engine.Stop(t.Context(), fixture.Req)
+	requirePermanent(t, "stop", err)
+}
 
-	t.Run(string(CaseNotReadyDistinguishable), func(t *testing.T) {
-		if handleSkip(t, h, CaseNotReadyDistinguishable, h.NotReady == nil) {
-			return
-		}
-		fixture := h.NotReady(t)
-		require.NotNil(t, fixture.Invoke, "the not-ready fixture must supply the operation to invoke")
-		err := fixture.Invoke(t.Context())
-		require.Error(t, err, "an operation against a not-ready backend must be rejected")
-		assert.True(t, engine.IsNotReady(err),
-			"a not-ready rejection must be a typed NotReadyError so polling drives reattempt instead of reporting a failure, got: %v", err)
-		assert.True(t, engine.IsRetryable(err),
-			"a not-ready rejection must stay retryable — the backend is expected to accept the operation once it catches up, got: %v", err)
-		assert.False(t, engine.IsAlreadyCompleted(err),
-			"a not-ready rejection must not read as already-completed, got: %v", err)
-	})
+func runProgressTerminalTruth(t *testing.T, h Harness) {
+	if handleSkip(t, h, CaseProgressTerminalTruth, h.TerminalProgress == nil) {
+		return
+	}
+	fixtures := h.TerminalProgress(t)
+	require.NotEmpty(t, fixtures, "the terminal-progress fixture must cover at least one terminal backend state")
+	for _, fixture := range fixtures {
+		t.Run(fixture.Name, func(t *testing.T) {
+			require.True(t, fixture.Want.IsTerminal(),
+				"fixture %s wants state %q, which is not terminal — this case only covers terminal truth", fixture.Name, fixture.Want)
+			result, err := fixture.Engine.Progress(t.Context(), fixture.Req)
+			require.NoError(t, err, "progress on a terminal change must report the outcome, not fail")
+			require.NotNil(t, result)
+			assert.Equal(t, fixture.Want, result.State,
+				"progress must report the backend's terminal outcome truthfully")
+		})
+	}
+}
+
+func runNotReadyDistinguishable(t *testing.T, h Harness) {
+	if handleSkip(t, h, CaseNotReadyDistinguishable, h.NotReady == nil) {
+		return
+	}
+	fixture := h.NotReady(t)
+	require.NotNil(t, fixture.Invoke, "the not-ready fixture must supply the operation to invoke")
+	err := fixture.Invoke(t.Context())
+	require.Error(t, err, "an operation against a not-ready backend must be rejected")
+	assert.True(t, engine.IsNotReady(err),
+		"a not-ready rejection must be a typed NotReadyError so polling drives reattempt instead of reporting a failure, got: %v", err)
+	assert.True(t, engine.IsRetryable(err),
+		"a not-ready rejection must stay retryable — the backend is expected to accept the operation once it catches up, got: %v", err)
+	assert.False(t, engine.IsAlreadyCompleted(err),
+		"a not-ready rejection must not read as already-completed, got: %v", err)
 }
 
 // controlFixture resolves the fixture for a control case, honoring a
