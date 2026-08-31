@@ -364,10 +364,11 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, rele
 func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardedTableStatus {
 	type keyspaceTable struct{ namespace, table string }
 	type tableRollup struct {
-		shards     []templates.ShardProgressData
-		rowsCopied int64
-		rowsTotal  int64
-		etaSeconds int64
+		shards          []templates.ShardProgressData
+		rowsCopied      int64
+		rowsTotal       int64
+		etaSeconds      int64
+		shardsReporting int
 	}
 	var order []keyspaceTable
 	rollups := make(map[keyspaceTable]*tableRollup)
@@ -391,9 +392,13 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			PercentComplete: sp.percent,
 		})
 		// Rows sum across the shards that have reported; the ETA is the slowest
-		// shard's, since the table finishes when its last shard does. Shards
-		// whose dispatch wave has not started contribute nothing yet, so the
-		// totals grow as the rollout fans out.
+		// reporting shard's. Shards whose dispatch wave has not started
+		// contribute nothing yet, so the reporting count travels with the sums
+		// and the renderer discloses the coverage instead of presenting a
+		// wave's figures as the whole table's.
+		if sp.rowsTotal > 0 {
+			r.shardsReporting++
+		}
 		r.rowsCopied += sp.rowsCopied
 		r.rowsTotal += sp.rowsTotal
 		if sp.etaSeconds > r.etaSeconds {
@@ -404,12 +409,13 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 	for _, key := range order {
 		r := rollups[key]
 		out[key.namespace] = append(out[key.namespace], templates.ShardedTableStatus{
-			Table:      key.table,
-			Status:     aggregateTableStatus(r.shards),
-			RowsCopied: r.rowsCopied,
-			RowsTotal:  r.rowsTotal,
-			ETASeconds: r.etaSeconds,
-			Shards:     r.shards,
+			Table:           key.table,
+			Status:          aggregateTableStatus(r.shards),
+			RowsCopied:      r.rowsCopied,
+			RowsTotal:       r.rowsTotal,
+			ETASeconds:      r.etaSeconds,
+			ShardsReporting: r.shardsReporting,
+			Shards:          r.shards,
 		})
 	}
 	return out

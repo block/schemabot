@@ -601,7 +601,8 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 		"an operation without a task contributes its operation state")
 	assert.Equal(t, int64(685000), table.RowsCopied, "rows sum across the shards that have reported")
 	assert.Equal(t, int64(1000000), table.RowsTotal, "the taskless shard contributes no rows yet")
-	assert.Equal(t, int64(240), table.ETASeconds, "the ETA is the slowest shard's")
+	assert.Equal(t, int64(240), table.ETASeconds, "the ETA is the slowest reporting shard's")
+	assert.Equal(t, 2, table.ShardsReporting, "the taskless shard is not counted as reporting")
 }
 
 // A shard whose table failed makes the whole table read failed, and each

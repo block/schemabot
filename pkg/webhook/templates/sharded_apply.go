@@ -100,11 +100,19 @@ type ShardedTableStatus struct {
 	// rows summed across the shards that have reported, ETA from the slowest
 	// shard. They drive the progress bar and rows line while the table copies;
 	// zero totals fall back to the state-word rendering. The totals grow as
-	// dispatch waves start their shards' copies, so the fraction is live, not a
-	// plan-time promise.
+	// dispatch waves start their shards' copies, so ShardsReporting says how
+	// many shards the figures cover and the rows line discloses partial
+	// coverage rather than passing a wave's fraction off as the table's.
 	RowsCopied int64
 	RowsTotal  int64
 	ETASeconds int64
+
+	// ShardsReporting is the number of shards whose engine has reported row
+	// figures — the shards the copy aggregates above cover. While it is below
+	// len(Shards), the totals describe only the started waves: the rows line
+	// names the coverage and floors the ETA (the unstarted shards can only add
+	// to both).
+	ShardsReporting int
 
 	// Shards is the per-shard state (and percent while copying) in resolved
 	// order, rendered as the compact one-line summary while the table is in
@@ -433,8 +441,9 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 // the summed shard rows plus the rows/ETA line. The same honesty guards apply —
 // a copy that has not reported rows yet shows a starting indicator instead of a
 // stuck-looking 0% bar, and a copy past its estimated total shows finalizing
-// instead of a bar pinned at 100% (the totals are estimates, and on a sharded
-// table they also grow as later dispatch waves start reporting).
+// instead of a bar pinned at 100%. While some shards have yet to report (later
+// dispatch waves), the rows line names the coverage and floors the ETA, so the
+// figures never claim to describe shards that have not started.
 func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 		fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy\n", t.Table, ui.ProgressBarActivity())
@@ -442,15 +451,38 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 		fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
 		return
 	}
-	rows := TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds}
 	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
 	if pct == 0 {
 		fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", t.Table)
-		writeRowsAndETA(sb, rows)
+		writeShardedRowsAndETA(sb, t)
 		return
 	}
 	fmt.Fprintf(sb, "**`%s`**: %s %d%%\n", t.Table, ui.ProgressBarRowCopy(pct), pct)
-	writeRowsAndETA(sb, rows)
+	writeShardedRowsAndETA(sb, t)
+}
+
+// writeShardedRowsAndETA writes the copying table's rows/ETA line. With every
+// shard reporting it matches the single-deployment line. While later waves
+// have yet to start, the summed totals cover only the reporting shards and the
+// slowest-reporting-shard ETA is a floor, so the line says both: it names the
+// coverage and renders the ETA as "≥" — the remaining shards can only add
+// rows and time.
+func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
+	if t.RowsTotal <= 0 {
+		return
+	}
+	if t.ShardsReporting >= len(t.Shards) {
+		writeRowsAndETA(sb, TableProgressData{TableName: t.Table, RowsCopied: t.RowsCopied, RowsTotal: t.RowsTotal, ETASeconds: t.ETASeconds})
+		return
+	}
+	line := fmt.Sprintf("- Rows: %s / %s across %d of %d shards",
+		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
+		ui.FormatNumber(t.RowsTotal),
+		t.ShardsReporting, len(t.Shards))
+	if t.ETASeconds > 0 {
+		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
+	}
+	sb.WriteString(line + "\n")
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display

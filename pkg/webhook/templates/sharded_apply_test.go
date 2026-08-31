@@ -507,9 +507,10 @@ func TestRenderShardedApplyComment_TableLinesReplaceShardTable(t *testing.T) {
 	assert.NotContains(t, out, "| Shard | Status |", "a healthy uniform keyspace renders no per-shard table")
 }
 
-// A copying table with live row figures renders the same progress bar, rows
-// line, and ETA a single-target apply shows, with the compact shard summary
-// underneath — the operator reads real copy progress, not just a state word.
+// A copying table with every shard reporting renders the same progress bar,
+// rows line, and ETA a single-target apply shows, with the compact shard
+// summary underneath — the operator reads real copy progress, not just a
+// state word.
 func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
@@ -519,6 +520,35 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 			Tables: []ShardedTableStatus{{
 				Table: "mutes", Status: state.Task.Running,
 				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+				ShardsReporting: 2,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 71},
+					{Shard: "80-", Status: state.Task.Running, PercentComplete: 54},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
+	assert.Contains(t, out, "└ shards: ◐ -40 71% · ◐ 80- 54%", "the shard summary stays below the rows line")
+	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
+	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
+}
+
+// While later dispatch waves have yet to start, the summed figures cover only
+// the reporting shards; the rows line names that coverage and floors the ETA
+// so a wave's fraction is never passed off as the whole table's.
+func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+				ShardsReporting: 1,
 				Shards: []ShardProgressData{
 					{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
 					{Shard: "80-", Status: state.Task.Pending},
@@ -528,9 +558,8 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
-	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ETA: ≥ 3m 15s")
 	assert.Contains(t, out, "└ shards: ◐ -40 62% · ⏳ 80-", "the shard summary stays below the rows line")
-	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
 }
 
 // Before the first progress poll lands the copied count is still zero; the
