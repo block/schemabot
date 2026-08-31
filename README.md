@@ -76,7 +76,9 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder.
+General design docs are in the [docs](./docs/) folder. The PostgreSQL support
+envelope — what plans, what applies, and how each refusal is reported — is in
+[docs/postgresql.md](./docs/postgresql.md).
 
 ## Releases
 

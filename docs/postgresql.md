@@ -31,10 +31,11 @@ its own task and its own PostgreSQL transaction, and each must independently
 satisfy all of these conditions:
 
 - pg-sprite classifies the statement for native execution.
-- The statement is an `ALTER TABLE` shape accepted by pg-sprite's
-  privilege-tier check, or a greenfield `CREATE TABLE`
-  (see [Greenfield tables](#greenfield-tables)). Other statement kinds fail
-  closed.
+- The statement is a kind the shape check admits: an `ALTER TABLE` shape
+  accepted by pg-sprite's privilege-tier check, a greenfield `CREATE TABLE`
+  (see [Greenfield tables](#greenfield-tables)), or a `CREATE INDEX` — with
+  the caveat that an admitted index build cannot complete at apply time (see
+  below). Statement kinds outside that set fail closed.
 - For a change to an existing table, the target is an ordinary or partitioned
   table and its measured on-disk size is no more than the configured
   native-apply ceiling (1 GiB by default; see
@@ -213,11 +214,24 @@ use the same `env:`, `file:`, or `secretsmanager:` reference forms as other
 SchemaBot secrets. Planning and applying both require DSN credentials and
 verify the connection before use.
 
-SchemaBot honors an explicit `sslmode`. When the first host in the DSN is an
-RDS host and `sslmode` is absent, it adds `sslmode=require`. Non-RDS hosts are
-left to the PostgreSQL driver's defaults. Set `sslmode` explicitly for
-multi-host DSNs and whenever the deployment requires a stronger verification
-mode or custom certificate settings.
+TLS posture depends on which of the two DSN configuration paths supplies the
+DSN. On the raw-DSN path, SchemaBot uses the DSN as given: an explicit
+`sslmode` is honored; when the first host in the DSN is an RDS host and
+`sslmode` is absent, `sslmode=require` is added; a non-RDS host with no
+explicit `sslmode` connects under the driver's default, `sslmode=prefer`,
+which falls back to an unencrypted connection when TLS fails. On this path,
+set `sslmode` explicitly for multi-host DSNs and for any non-RDS host that
+must not connect in plaintext.
+
+The assembled path — `dsn_from` with `ca_ref`, described in
+[configuration](configuration.md#postgresql-dsn_from-targets) — is fail-closed
+instead: every assembled DSN carries `sslmode=verify-full`, weaker modes are
+rejected at config load, and the server certificate is verified against the
+named CA bundle (the embedded AWS RDS bundle or a mounted PEM file), never the
+ambient trust store. A pinned `file:` CA bundle also requires a
+certificate-verifying `sslmode`: paired with a mode that does not verify the
+server certificate, the engine refuses every apply before execution, because
+the pinned roots would never be consulted.
 
 For apply, the target role must be able to connect to the database, use the
 target schema, and act as the table owner for in-place `ALTER TABLE`. A
