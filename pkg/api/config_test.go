@@ -826,6 +826,41 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 			},
 			wantError: `deployment "primary" environment name "Staging" must be lowercase`,
 		},
+		{
+			name: "empty database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases[""] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name must not be empty`,
+		},
+		{
+			name: "empty environment order entry",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{""}
+			},
+			wantError: `environment_order environment name must not be empty`,
+		},
+		{
+			name: "empty deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name must not be empty`,
+		},
+		{
+			name: "empty tern deployments name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments[""] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name must not be empty`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1835,8 +1870,8 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 // validateDeploymentOrder must report an empty deployments map key with the
 // same clear error used elsewhere, rather than the confusing
 // "missing deployment \"\"" that fell out of the permutation check. This guards
-// the Validate() path, which calls validateDeploymentOrder before its own
-// empty-key check.
+// the Validate() path, which calls validateDeploymentOrder before the
+// identifier validation rejects the empty key.
 func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	err := validateDeploymentOrder(
 		map[string]DeploymentTarget{

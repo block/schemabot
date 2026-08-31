@@ -1494,9 +1494,6 @@ func (c *ServerConfig) Validate() error {
 					if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), deployment); err != nil {
 						return err
 					}
-					if deployment == "" {
-						return fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", name, env)
-					}
 					if dt.Target == "" {
 						return fmt.Errorf("database %q environment %q deployment %q missing target", name, env, deployment)
 					}
@@ -1576,6 +1573,9 @@ func (c *ServerConfig) Validate() error {
 }
 
 func validateLowercaseIdentifier(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s must not be empty", field)
+	}
 	if value != storage.CanonicalKey(value) {
 		return fmt.Errorf("%s %q must be lowercase", field, value)
 	}
