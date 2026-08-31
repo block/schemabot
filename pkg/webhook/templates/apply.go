@@ -62,6 +62,18 @@ func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
+// countReadyForCutover returns how many tables are parked at the cutover
+// barrier, per TaskStatusReadyForCutover.
+func countReadyForCutover(tables []TableProgressData) int {
+	ready := 0
+	for _, t := range tables {
+		if TaskStatusReadyForCutover(t.Status) {
+			ready++
+		}
+	}
+	return ready
+}
+
 // ShardProgressData is the high-level status of one shard, for the compact
 // per-shard summary in the PR comment. It intentionally carries only state +
 // percent (no row counts/ETA) to keep the comment quiet.
@@ -436,13 +448,8 @@ func revertWindowCountdown(revertExpiresAt string) string {
 // writeCutoverSummary writes a readiness summary for cutover states,
 // showing how many tables are ready for cutover vs not yet ready.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
-	ready := 0
+	ready := countReadyForCutover(tables)
 	total := len(tables)
-	for _, t := range tables {
-		if TaskStatusReadyForCutover(t.Status) {
-			ready++
-		}
-	}
 	if total == 0 {
 		return
 	}
@@ -463,11 +470,18 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		return
 	}
 
-	var completed, running, catchingUp, checksumming, queued, failed, retrying, stopped, waiting, recovering, cutting, cancelled int
+	var completed, running, catchingUp, checksumming, queued, waiting, failed, retrying, stopped, recovering, cutting, cancelled, other int
 	var runningPct int
 	var runningEstimateExceeded bool
 
 	for _, t := range tables {
+		// Tables parked at the cutover barrier count through the shared
+		// readiness predicate, keeping this summary consistent with the
+		// cutover summary.
+		if TaskStatusReadyForCutover(t.Status) {
+			waiting++
+			continue
+		}
 		switch state.NormalizeTaskStatus(t.Status) {
 		case state.Task.Completed:
 			completed++
@@ -487,8 +501,6 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			checksumming++
 		case state.Task.Pending:
 			queued++
-		case state.Task.WaitingForCutover:
-			waiting++
 		case state.Task.Recovering:
 			recovering++
 		case state.Task.CuttingOver:
@@ -501,6 +513,11 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 			stopped++
 		case state.Task.Cancelled:
 			cancelled++
+		default:
+			// Statuses without a dedicated bucket (waiting for deploy, the
+			// revert family, future states) surface as "other" rather than
+			// silently vanishing from the summary line.
+			other++
 		}
 	}
 
@@ -585,6 +602,13 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 	}
 	if cancelled > 0 && multi {
 		parts = append(parts, fmt.Sprintf("%d cancelled", cancelled))
+	}
+	if other > 0 {
+		if multi {
+			parts = append(parts, fmt.Sprintf("%d in other states", other))
+		} else {
+			parts = append(parts, "in another state")
+		}
 	}
 
 	if len(parts) > 0 {
@@ -925,11 +949,16 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 	slowestShard := ""
 	slowestPct := -1
 	for _, sh := range table.Shards {
+		// Shards parked at the cutover barrier count through the shared
+		// readiness predicate, keeping the shard buckets consistent with the
+		// table summaries.
+		if TaskStatusReadyForCutover(sh.Status) {
+			ready++
+			continue
+		}
 		switch state.NormalizeShardStatus(sh.Status) {
 		case state.Task.Completed:
 			complete++
-		case state.Task.WaitingForCutover:
-			ready++
 		case state.Task.Failed, state.Task.FailedRetryable:
 			failed++
 		case state.Task.Pending:
