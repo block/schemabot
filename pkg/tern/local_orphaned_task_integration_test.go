@@ -279,11 +279,14 @@ func TestLocalClient_StartRecoversAfterAStrandedTaskIsSettled(t *testing.T) {
 	stoppedApply, stranded := seedStrandedStoppedApply(t, stor)
 	startReq := &ternv1.StartRequest{ApplyId: stoppedApply.ApplyIdentifier}
 
-	// The wedge: the apply is stopped, but no task is, so start finds nothing
-	// to resume and the operator is told there is no stopped schema change.
+	// The wedge: the apply is stopped, but no task is, so start finds nothing to
+	// resume. The refusal names the state it found rather than reporting the
+	// change as absent, which is what sent an operator looking in the wrong place.
 	_, _, _, err := client.resolveStartRequest(ctx, startReq)
 	require.Error(t, err, "a stranded task leaves start with no stopped work to resume")
-	assert.Contains(t, err.Error(), "no stopped schema change to resume")
+	assert.Contains(t, err.Error(), "state start cannot act on")
+	assert.Contains(t, err.Error(), state.Task.FailedRetryable)
+	assert.Contains(t, err.Error(), stoppedApply.ApplyIdentifier)
 
 	// A conflict check on the same database settles the stranded task.
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}

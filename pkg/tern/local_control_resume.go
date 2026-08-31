@@ -70,6 +70,15 @@ type localStartControlRequestMetadata struct {
 	SkippedCount int64 `json:"skipped_count,omitempty"`
 }
 
+// stoppedApplyDiscoveryWindow bounds how far back a start that names no apply
+// looks when choosing which stopped change to resume. It is a discovery
+// heuristic for picking among candidates, not a safety gate: a start that names
+// its apply resumes it however long it has been resting. Refusing a change the
+// operator explicitly named, because a timestamp on it is old, reads to them as
+// the change not existing — and the re-plan and the engine both still get their
+// say on whether its copy is still usable.
+const stoppedApplyDiscoveryWindow = 7 * 24 * time.Hour
+
 func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.StartRequest) (*storage.Apply, int64, int64, error) {
 	tasks, err := c.storage.Tasks().GetByDatabase(ctx, c.config.Database)
 	if err != nil {
@@ -80,7 +89,8 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	// We scope to a single apply to avoid cross-contamination: a poller race can
 	// erroneously mark tasks from earlier applies as STOPPED (see pollTaskToCompletion).
 	var apply *storage.Apply
-	maxAge := 7 * 24 * time.Hour
+	// Only discovery is age-bounded; a named apply has already been chosen.
+	ageBounded := req.ApplyId == ""
 
 	c.logger.Info("Start: looking for stopped tasks",
 		"database", c.config.Database,
@@ -99,10 +109,12 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	} else {
 		// First pass: find the most recent stopped apply
 		for _, task := range tasks {
-			if task.State != state.Task.Stopped {
+			if !state.IsState(task.State, state.Task.Stopped) {
 				continue
 			}
-			if time.Since(task.UpdatedAt) > maxAge {
+			if time.Since(task.UpdatedAt) > stoppedApplyDiscoveryWindow {
+				c.logger.Info("Start: stopped task is older than the discovery window, so an unqualified start passes over it; naming its apply still resumes it",
+					append(task.LogAttrs(), "updated_at", task.UpdatedAt, "discovery_window", stoppedApplyDiscoveryWindow)...)
 				continue
 			}
 			if task.ApplyID > 0 {
@@ -119,7 +131,7 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	}
 
 	// Deferred deploy that isn't ready yet — reject with a clear message.
-	if apply.GetOptions().DeferDeploy && apply.State != state.Apply.WaitingForDeploy {
+	if apply.GetOptions().DeferDeploy && !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return nil, 0, 0, fmt.Errorf("schema change is not ready for deploy (current state: %s)", apply.State)
 	}
 	if state.IsState(apply.State, state.Apply.WaitingForDeploy) {
@@ -129,38 +141,79 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
 
-	var startedCount int64
-	var skippedCount int64
+	var startedCount, skippedCount, staleCount int64
+	var unresumable []string
 	for _, task := range tasks {
-		c.logger.Info("Start: checking task",
-			"task_id", task.TaskIdentifier,
-			"table", task.TableName,
-			"state", task.State,
-			"apply_id", task.ApplyID,
-			"target_apply_id", apply.ID,
-		)
-		if task.State != state.Task.Stopped {
-			continue
-		}
 		if task.ApplyID != apply.ID {
 			continue
 		}
-		if time.Since(task.UpdatedAt) > maxAge {
-			c.logger.Info("skipping old stopped task", "task_id", task.TaskIdentifier, "updated_at", task.UpdatedAt)
+		if state.IsTerminalTaskState(task.State) {
+			// Settled by an earlier drive: the table needs no resuming, and the
+			// count is what tells the operator how much of the change is done.
+			skippedCount++
 			continue
 		}
-		switch {
-		case state.IsState(task.State, state.Task.Stopped):
-			startedCount++
-		case state.IsTerminalTaskState(task.State):
-			skippedCount++
+		if !state.IsState(task.State, state.Task.Stopped) {
+			// Not resting, so a start has nothing to hand it. Under a claimable
+			// apply a driver reaches it on its own; under a terminal one the
+			// conflict check settles it.
+			unresumable = append(unresumable, task.State)
+			c.logger.Warn("Start: task is not resting, so this start does not resume it",
+				append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
+			continue
 		}
+		if ageBounded && time.Since(task.UpdatedAt) > stoppedApplyDiscoveryWindow {
+			staleCount++
+			c.logger.Info("Start: stopped task is older than the discovery window",
+				append(task.LogAttrs(), "updated_at", task.UpdatedAt, "discovery_window", stoppedApplyDiscoveryWindow)...)
+			continue
+		}
+		startedCount++
 	}
 
 	if startedCount == 0 {
-		return nil, 0, 0, fmt.Errorf("no stopped schema change to resume (found %d tasks for database, apply has ID %d)", len(tasks), apply.ID)
+		return nil, 0, 0, c.noResumableWorkError(apply, len(tasks), skippedCount, staleCount, unresumable)
 	}
+	c.logger.Info("Start: resolved resumable work",
+		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount)...)
 	return apply, startedCount, skippedCount, nil
+}
+
+// noResumableWorkError explains why a start resolved an apply but found nothing
+// on it to resume. Each cause asks a different thing of the operator — wait for
+// the driver, reconcile the target, name the apply — so they are reported
+// separately rather than collapsed into one "nothing to resume".
+func (c *LocalClient) noResumableWorkError(apply *storage.Apply, taskCount int, skipped, stale int64, unresumable []string) error {
+	switch {
+	case len(unresumable) > 0:
+		return fmt.Errorf("schema change %s has no stopped work to resume: %d of its tasks are in a state start cannot act on (%s)",
+			apply.ApplyIdentifier, len(unresumable), strings.Join(distinctSorted(unresumable), ", "))
+	case stale > 0:
+		return fmt.Errorf("schema change %s has been resting longer than the %s an unqualified start searches; re-issue it naming %s to resume it anyway",
+			apply.ApplyIdentifier, stoppedApplyDiscoveryWindow, apply.ApplyIdentifier)
+	case skipped > 0:
+		return fmt.Errorf("schema change %s has no stopped work to resume: all %d of its tasks already reached a terminal state",
+			apply.ApplyIdentifier, skipped)
+	default:
+		return fmt.Errorf("no stopped schema change to resume (found %d tasks for database %s, none of them belonging to apply %s)",
+			taskCount, apply.Database, apply.ApplyIdentifier)
+	}
+}
+
+// distinctSorted reduces repeated task states to a stable, readable list for an
+// operator-facing message.
+func distinctSorted(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type deferredDeployStart struct {
@@ -487,7 +540,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 	var activeTasks []*storage.Task
 	var completedCount int64
 	for _, task := range tasks {
-		if task.State == state.Task.Completed {
+		if state.IsState(task.State, state.Task.Completed) {
 			continue
 		}
 		if state.IsState(task.State, state.Task.Reverted) {

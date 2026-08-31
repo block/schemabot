@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1789,4 +1790,131 @@ func (s *selectivelyFailingTaskStore) Update(ctx context.Context, task *storage.
 		return storage.ErrApplyLeaseLost
 	}
 	return s.controlTestTaskStore.Update(ctx, task)
+}
+
+// restingStartApply builds a stopped apply and its resting task, last written
+// `age` ago, for exercising how start resolves resumable work.
+func restingStartApply(taskState string, age time.Duration) (*storage.Apply, *storage.Task) {
+	apply := &storage.Apply{
+		ID:              90,
+		ApplyIdentifier: "apply-resume-target",
+		State:           state.Apply.Stopped,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             91,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-resume-target",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		TableName:      "users",
+		State:          taskState,
+		UpdatedAt:      time.Now().Add(-age),
+	}
+	return apply, task
+}
+
+// The window that keeps an unqualified start from reaching back forever is a
+// way of choosing among candidates, not a rule about what may be resumed. An
+// operator who names the apply has already chosen, so the change resumes however
+// long it has been resting — refusing it here reads as the change not existing.
+func TestLocalClient_StartResumesANamedApplyOlderThanTheDiscoveryWindow(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Stopped, stoppedApplyDiscoveryWindow+48*time.Hour)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	resolved, startedCount, skippedCount, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a named apply resumes however long it has been resting")
+	require.NotNil(t, resolved)
+	assert.Equal(t, apply.ApplyIdentifier, resolved.ApplyIdentifier)
+	assert.Equal(t, int64(1), startedCount)
+	assert.Equal(t, int64(0), skippedCount)
+}
+
+// An unqualified start picks among candidates, so it does keep the window — but
+// it must say that is why it passed over the change, and point at the command
+// that resumes it anyway. Reporting it as "nothing to resume" sends the operator
+// looking for a change that is sitting right there.
+func TestLocalClient_StartOutsideTheDiscoveryWindowNamesTheWayForward(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Stopped, stoppedApplyDiscoveryWindow+48*time.Hour)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(), &ternv1.StartRequest{})
+
+	require.Error(t, err, "an unqualified start passes over a change older than the window")
+	assert.Contains(t, err.Error(), "no stopped schema change to resume",
+		"discovery finds no candidate at all, so the apply is never resolved")
+}
+
+// A task that is neither terminal nor resting is not something a start can act
+// on, and saying only "nothing to resume" hides which state it is actually in.
+// The refusal names the states so an operator can tell a task awaiting its
+// driver from one stranded under a terminal apply.
+func TestLocalClient_StartNamesTheStatesItCannotResume(t *testing.T) {
+	apply, task := restingStartApply(state.Task.FailedRetryable, time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "state start cannot act on")
+	assert.Contains(t, err.Error(), state.Task.FailedRetryable, "the refusal names the state it found")
+	assert.Contains(t, err.Error(), apply.ApplyIdentifier)
+}
+
+// Task states arrive in proto form ("STATE_STOPPED") as well as canonical
+// lowercase, so start must compare them normalized. A raw comparison silently
+// finds no resumable work and refuses a change that is sitting ready.
+func TestLocalClient_StartResolvesProtoFormattedTaskStates(t *testing.T) {
+	apply, task := restingStartApply("STATE_STOPPED", time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	resolved, startedCount, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a proto-formatted stopped state is still stopped")
+	require.NotNil(t, resolved)
+	assert.Equal(t, int64(1), startedCount)
+}
+
+// Tables that finished before the stop are skipped, not resumed, and the count
+// is what tells the operator how much of the change is already done.
+func TestLocalClient_StartSkipsTerminalTablesOfTheSameApply(t *testing.T) {
+	apply, resting := restingStartApply(state.Task.Stopped, time.Minute)
+	done := &storage.Task{
+		ID: 92, ApplyID: apply.ID, TaskIdentifier: "task-already-done",
+		Database: "testdb", Namespace: "testdb", TableName: "orders",
+		State: state.Task.Completed, UpdatedAt: time.Now(),
+	}
+	otherApply := &storage.Task{
+		ID: 93, ApplyID: 999, TaskIdentifier: "task-other-apply",
+		Database: "testdb", Namespace: "testdb", TableName: "shipments",
+		State: state.Task.Stopped, UpdatedAt: time.Now(),
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{resting, done, otherApply}, &controlCaptureEngine{})
+
+	_, startedCount, skippedCount, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), startedCount, "only the resting table is resumed")
+	assert.Equal(t, int64(1), skippedCount, "the finished table is reported as skipped, not silently dropped")
+}
+
+// Every task of the apply already finished, so there is nothing to resume — but
+// that is a completed change, not a missing one, and the refusal must say which.
+func TestLocalClient_StartDistinguishesAFinishedApplyFromAMissingOne(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Completed, time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already reached a terminal state")
+	assert.NotContains(t, err.Error(), "state start cannot act on")
 }
