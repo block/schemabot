@@ -438,10 +438,11 @@ func TestParseCommand(t *testing.T) {
 	}{
 		{
 			name: "plan with environment",
-			body: "schemabot plan -e staging",
+			body: "schemabot plan -d Sample_DB -e StAgInG",
 			expected: CommandResult{
 				Action:      "plan",
 				Environment: "staging",
+				Database:    "sample_db",
 				Found:       true,
 				IsMention:   true,
 			},

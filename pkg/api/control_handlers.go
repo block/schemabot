@@ -356,6 +356,7 @@ func (s *Service) decodeControlRequest(w http.ResponseWriter, r *http.Request, o
 		s.writeBodyDecodeError(w, err)
 		return nil, nil, "", false
 	}
+	*environment = storage.CanonicalKey(*environment)
 	if *applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return nil, nil, "", false
@@ -2233,6 +2234,7 @@ func (s *Service) handleRollbackPlan(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Environment = storage.CanonicalKey(req.Environment)
 	if req.ApplyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
 		return

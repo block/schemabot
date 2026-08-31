@@ -2236,7 +2236,7 @@ func TestPullSchemaHandlerRoutesPrimaryDeployment(t *testing.T) {
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","environment":"production","type":"mysql"}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"OrDeRs","environment":"PrOdUcTiOn","type":"MySQL"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -2361,12 +2361,13 @@ func TestPullSchemaHandlerRejectsUnknownRouteAsBadRequest(t *testing.T) {
 // plane decides whether it can plan the change.
 func TestPlanHandlerAcceptsConfiguredCustomType(t *testing.T) {
 	client := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-custom-type"}}
-	st := &mockStorageWithPlanLookup{plans: &capturingPlanStore{}}
+	plans := &capturingPlanStore{}
+	st := &mockStorageWithPlanLookup{plans: plans}
 	svc := newTypeVocabularyService(t, st, client, "orders", "cockroach", "primary")
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
-	body := `{"database":"orders","environment":"production","type":"cockroach","schema_files":{"orders":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`
+	body := `{"database":"OrDeRs","environment":"PrOdUcTiOn","type":"Cockroach","repository":"MixedCase/Sample-Repo","schema_files":{"orders":{"files":{"users.sql":"CREATE TABLE users (id bigint primary key)"}}}}`
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -2377,6 +2378,8 @@ func TestPlanHandlerAcceptsConfiguredCustomType(t *testing.T) {
 	require.NotNil(t, client.planReq, "the plan must be dispatched to the data plane")
 	assert.Equal(t, "cockroach", client.planReq.Type)
 	assert.Equal(t, "orders-production", client.planReq.Target)
+	require.NotNil(t, plans.created)
+	assert.Equal(t, "mixedcase/sample-repo", plans.created.Repository)
 	var resp apitypes.PlanResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
 	assert.Equal(t, "plan-custom-type", resp.PlanID)
