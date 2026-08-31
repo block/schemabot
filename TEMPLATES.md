@@ -3008,6 +3008,131 @@ Verify the database name, or run the command against the SchemaBot instance that
 </details>
 
 <details>
+<summary><a name="appscoped-apply-dispatch-summary"></a><strong>App-scoped Apply: Dispatch Summary</strong></summary>
+
+
+## App-Scoped Apply — Staging
+
+**App**: `billing-service`
+**Requested by**: @jackjackbits
+
+`schemabot apply --app billing-service` expands to **2** databases:
+
+- `billing-invoices`
+- `billing-ledger`
+
+**Skipped**:
+- `billing-archive` — environment `staging` is not configured
+- `billing-reports` — no plan for this PR
+
+Each database runs as its own apply with its own progress comment and check.
+
+</details>
+
+<details>
+<summary><a name="appscoped-apply-dispatch-halted-head-advanced"></a><strong>App-scoped Apply: Dispatch Halted (Head Advanced)</strong></summary>
+
+
+## ⚠️ App-Scoped Dispatch Halted — Staging
+
+**App**: `billing-service`
+
+A new commit landed on this PR while `schemabot apply --app billing-service` was dispatching: the command started from `abcdef1234567890abcdef1234567890abcdef12`, but the PR head is now `0123456789abcdef0123456789abcdef01234567`.
+
+To keep every database on the same commit, this database was **not** started:
+
+- `billing-ledger`
+
+Databases dispatched before the halt continue at `abcdef1234567890abcdef1234567890abcdef12` and report in their own comments. Review the new commit, then run `schemabot apply -e staging --app billing-service` again to apply the current head everywhere.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="appscoped-apply-actor-not-authorized"></a><strong>App-scoped Apply: Actor Not Authorized</strong></summary>
+
+
+## SchemaBot Command Not Authorized
+
+**App**: `billing-service`
+**Database**: `billing-ledger` | **Environment**: `staging`
+
+@jackjackbits is not authorized to run `schemabot apply` for database `billing-ledger`.
+
+An app-scoped command requires authorization for **every** database in the app, so the whole command was denied — no database in `billing-service` was applied.
+
+**Operators of `billing-ledger`** — members of these teams, or these users, can run it:
+- `acme/billing-operators`
+
+**Other authorized teams and users**:
+- `acme/db-admins`
+- `jdoe`
+
+Ask one of them to run it, or request membership in one of the teams above.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="appscoped-apply-rejected"></a><strong>App-scoped Apply: Rejected</strong></summary>
+
+
+## ⛔ App-Scoped Command Rejected — Staging
+
+**App**: `billing-service`
+**Requested by**: @jackjackbits
+
+`schemabot apply --app billing-service` was rejected: no database in the app has a stored `staging` plan for this PR — run `schemabot plan -e staging` first
+
+No schema change was started for any database.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="app-flag-missing-or-invalid"></a><strong>App Flag: Missing Or Invalid</strong></summary>
+
+
+## Missing or Invalid App
+
+Usage: `schemabot apply -e <environment> --app <app>`
+
+The `--app` flag requires an application identifier (lowercase alphanumeric with hyphens) that matches the `app` field on the target databases.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="app-flag-conflicting-flags"></a><strong>App Flag: Conflicting Flags</strong></summary>
+
+
+### --app with -d
+
+## Conflicting Flags
+
+`--app` and `-d` cannot be combined.
+
+- `schemabot apply -e <environment> --app <app>` targets every database in the app
+- `schemabot apply -e <environment> -d <database>` targets a single database
+<!-- schemabot:offer-support-channel -->
+
+
+### --app with --defer-cutover
+
+## Conflicting Flags
+
+`--defer-cutover` is not supported with `--app`; use `-d` to target individual databases for deferred cutover.
+
+To roll out cautiously: canary one database with `-d --defer-cutover`, then apply to the fleet with `--app` (each database cuts over automatically as it finishes copying).
+<!-- schemabot:offer-support-channel -->
+
+
+### --app on an unsupported command
+
+The `--app` flag is not supported for `plan`.
+</details>
+
+<details>
 <summary><a name="single-table-running"></a><strong>Single Table: Running</strong></summary>
 
 

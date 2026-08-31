@@ -130,7 +130,11 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentDatabaseNotConfigured,
 		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
 		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive,
-		templates.PreviewCommentVolumeAccepted, templates.PreviewCommentVolumeInvalid:
+		templates.PreviewCommentVolumeAccepted, templates.PreviewCommentVolumeInvalid,
+		templates.PreviewCommentAppScopedDispatch, templates.PreviewCommentAppScopedHalted,
+		templates.PreviewCommentAppScopedNotAuthorized,
+		templates.PreviewCommentAppScopedRejected, templates.PreviewCommentAppFlagInvalid,
+		templates.PreviewCommentAppFlagConflicts:
 		templates.PreviewCLIOutput(previewType)
 	// Paired aggregate types (PR + CLI subsections)
 	case templates.PreviewCommentPlanAll, templates.PreviewCommentLockingAll,
@@ -338,6 +342,14 @@ Apply Command Comments (GitHub PR apply commands):
   comment_cutover_active        Cutover already in progress
   comment_volume_accepted       Volume request accepted
   comment_volume_invalid        Volume command with a missing or invalid level
+
+App-Scoped Command Comments (--app expansion):
+  comment_app_scoped_dispatch       App expansion summary (targeted + skipped databases)
+  comment_app_scoped_halted         PR head advanced mid-dispatch, remaining databases not started
+  comment_app_scoped_not_authorized Actor denied on one database, whole command denied
+  comment_app_scoped_rejected       Fail-closed expansion rejection
+  comment_app_flag_invalid          Missing or malformed --app value
+  comment_app_flag_conflicts        --app combined with flags it excludes
 
 Aggregate Types (grouped PR + CLI pairs):
   comment_plan_all              PR plan & status comments

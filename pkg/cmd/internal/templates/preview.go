@@ -216,4 +216,12 @@ const (
 	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
 	PreviewCommentVolumeAccepted        PreviewType = "comment_volume_accepted"              // Volume command accepted
 	PreviewCommentVolumeInvalid         PreviewType = "comment_volume_invalid"               // Volume command with a missing or invalid level
+
+	// App-scoped command comment previews (--app expansion)
+	PreviewCommentAppScopedDispatch      PreviewType = "comment_app_scoped_dispatch"       // App expansion summary: targeted + skipped databases
+	PreviewCommentAppScopedHalted        PreviewType = "comment_app_scoped_halted"         // PR head advanced mid-dispatch, remaining databases not started
+	PreviewCommentAppScopedNotAuthorized PreviewType = "comment_app_scoped_not_authorized" // Actor denied on one database, whole command denied
+	PreviewCommentAppScopedRejected      PreviewType = "comment_app_scoped_rejected"       // Fail-closed expansion rejection
+	PreviewCommentAppFlagInvalid         PreviewType = "comment_app_flag_invalid"          // Missing or malformed --app value
+	PreviewCommentAppFlagConflicts       PreviewType = "comment_app_flag_conflicts"        // --app combined with flags it excludes
 )
