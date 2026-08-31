@@ -5072,7 +5072,7 @@ func TestApplyHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"plan_id": "plan-old-direct", "environment": "staging"}`
+		body := `{"plan_id": "plan-old-direct", "environment": "StAgInG"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/apply", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
@@ -5086,6 +5086,7 @@ func TestApplyHandler(t *testing.T) {
 		assert.True(t, resp.Accepted)
 		assert.NotEmpty(t, resp.ApplyID)
 		require.NotNil(t, applies.apply)
+		assert.Equal(t, "staging", applies.apply.Environment)
 		assert.Equal(t, state.Apply.Pending, applies.apply.State)
 		assert.Equal(t, "payments-staging-target", applies.apply.GetOptions().Target)
 		require.Len(t, tasks.tasks, 1)
@@ -5365,6 +5366,24 @@ func TestRollbackPlanRequiresEnvironment(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "environment is required")
 }
 
+func TestRollbackPlanCanonicalizesEnvironment(t *testing.T) {
+	now := time.Now().UTC()
+	apply := rollbackGuardrailApply("apply_latest", 1, 10, now)
+	svc := newRollbackGuardrailService(apply, rollbackGuardrailPlan(10, true), []*storage.Task{
+		rollbackGuardrailTask(1, 10, now),
+	})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/rollback/plan",
+		strings.NewReader(`{"apply_id":"apply_latest","environment":"StAgInG"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	assert.NotEqual(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "belongs to environment")
+}
+
 func TestControlHandlersRejectClientDatabase(t *testing.T) {
 	tests := []struct {
 		name string
@@ -5467,7 +5486,7 @@ func TestStopHandler(t *testing.T) {
 		mux := http.NewServeMux()
 		svc.ConfigureRoutes(mux)
 
-		body := `{"environment": "staging", "apply_id": "apply-abc123"}`
+		body := `{"environment": "StAgInG", "apply_id": "apply-abc123"}`
 		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/stop", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
