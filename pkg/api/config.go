@@ -1576,7 +1576,7 @@ func (c *ServerConfig) Validate() error {
 }
 
 func validateLowercaseIdentifier(field, value string) error {
-	if strings.IndexFunc(value, unicode.IsUpper) >= 0 {
+	if value != storage.CanonicalKey(value) {
 		return fmt.Errorf("%s %q must be lowercase", field, value)
 	}
 	return nil

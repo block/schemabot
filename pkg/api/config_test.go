@@ -765,6 +765,67 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 			},
 			wantError: `database "orders" environment "staging" deployment name "Primary" must be lowercase`,
 		},
+		{
+			name: "top-level environment order",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"Staging"}
+			},
+			wantError: `environment_order environment name "Staging" must be lowercase`,
+		},
+		{
+			name: "top-level allowed environments",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"Staging"}
+			},
+			wantError: `allowed_environments environment name "Staging" must be lowercase`,
+		},
+		{
+			name: "per-database environment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.EnvironmentOrder = []string{"Staging"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment_order environment name "Staging" must be lowercase`,
+		},
+		{
+			name: "per-database deployment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.DeploymentOrder = []string{"Primary"}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment_order deployment name "Primary" must be lowercase`,
+		},
+		{
+			name: "deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"Primary": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must be lowercase`,
+		},
+		{
+			name: "tern deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["Primary"] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "Primary" must be lowercase`,
+		},
+		{
+			name: "tern deployments environment key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["primary"]["Staging"] = "localhost:9090"
+			},
+			wantError: `deployment "primary" environment name "Staging" must be lowercase`,
+		},
 	}
 
 	for _, tt := range tests {

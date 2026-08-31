@@ -69,6 +69,10 @@ databases:
         dsn: "file:/run/secrets/prod-dsn"
 ```
 
+Database keys under `databases:` and environment keys under `environments:`
+must be lowercase. The server refuses to start if either contains uppercase
+characters.
+
 ### Building DSNs from separate secrets
 
 If your deployment stores database connection metadata separately from passwords,
@@ -201,6 +205,9 @@ tern_deployments:
     production: "tern-production:9090"
 ```
 
+Deployment keys and their nested environment keys under `tern_deployments:`
+must be lowercase. The server refuses to start otherwise.
+
 In gRPC mode, `target` is an opaque identifier understood by the remote Tern service. SchemaBot stores the resolved `target` and `deployment` on each plan, then reuses that stored route during apply. Callers do not send target or deployment in plan/apply requests.
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
@@ -245,12 +252,16 @@ Rules:
 
 - `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`.
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
+- Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
 - Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
 
 ### Deployment Order
 
 `deployment_order` defines the rollout order across the `deployments` map for an environment, analogous to the server-wide `environment_order`. When set, it MUST list every key in `deployments` exactly once (no empty, duplicate, or unknown entries) and MUST accompany a `deployments` map. `ResolveDatabaseTargets` then returns deployments in this order. When omitted, deployments resolve in alphabetical key order, which stays the deterministic default.
+
+Every deployment name in `deployment_order` must be lowercase; the server
+refuses to start otherwise.
 
 ## Environment Order
 
@@ -263,6 +274,10 @@ environment_order:
 ```
 
 If omitted, SchemaBot defaults to `staging` before `production`. Before applying production from a PR comment, SchemaBot checks staging first because the server-owned `environment_order` says staging precedes production.
+
+Every environment name in the top-level or per-database `environment_order`
+must be lowercase; the server refuses to start otherwise. Values in
+`allowed_environments` have the same lowercase requirement.
 
 There are two related but separate concepts:
 
@@ -332,6 +347,13 @@ The override is validated at startup, fail-fast in both directions:
 - Every `environment_order` entry owned by this instance (per `allowed_environments`; all entries when the instance is unscoped) must be configured under the database's `environments` — otherwise a later environment's apply would wait on a prior check that can never exist.
 
 Entries owned by another instance in the promotion chain (outside this instance's `allowed_environments`) may be absent from the database's local `environments`: the promotion gate verifies them through the peer's GitHub aggregate check, exactly as with the server-wide order. Instances sharing a database must declare the same effective order for it — render all instances' config from a single source.
+
+### Renaming identifiers
+
+When lowercasing an existing database key, rename the server config key, every
+consumer repository's `schemabot.yaml` `database:` value, and the schema
+directory in lockstep. Renaming while an apply is in flight is unsafe; drain
+all in-flight applies first.
 
 ## Hybrid Mode
 
@@ -810,6 +832,9 @@ rest of the hint on the PR page. When omitted, plan comments are unchanged.
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.
+
+Repository names in `repos:` and consumer `allowed_repos` lists are matched
+case-insensitively and normalized to lowercase when loaded.
 
 ```yaml
 # Local mode — repos as allowlist only
