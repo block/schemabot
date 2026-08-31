@@ -180,7 +180,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 		writeUnsafeChangeItem(&sb, "`"+c.Table+"`", c.Reason)
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
+	writeUnsafeDropGuidance(&sb, data.UnsafeChanges)
 
 	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
 	// is consent to destroy the data, and whether the change is this pull
