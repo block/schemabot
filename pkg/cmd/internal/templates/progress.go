@@ -1217,12 +1217,15 @@ func statusColumnValue[Row any](column statusColumn[Row], row Row) string {
 	return "-"
 }
 
+// statusColumnWidths sizes each column by terminal cells rather than bytes,
+// so a multi-byte value — a non-ASCII database name, a state glyph — cannot
+// misalign every column to its right.
 func statusColumnWidths[Row any](columns []statusColumn[Row], rows []Row) []int {
 	widths := make([]int, len(columns))
 	for i, column := range columns {
-		widths[i] = len(column.header)
+		widths[i] = ui.VisibleWidth(column.header)
 		for _, row := range rows {
-			widths[i] = maxLen(widths[i], len(statusColumnValue(column, row)))
+			widths[i] = maxLen(widths[i], ui.VisibleWidth(statusColumnValue(column, row)))
 		}
 	}
 	return widths
@@ -1234,7 +1237,7 @@ func statusCell(value string, width int, last bool) string {
 	if last {
 		return value
 	}
-	return fmt.Sprintf("%-*s", width, value)
+	return ui.PadVisible(value, width)
 }
 
 // unfilteredStatusExternalID collapses both remote handles into the single
