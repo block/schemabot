@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 
 	spiritstatus "github.com/block/spirit/pkg/status"
@@ -122,4 +123,18 @@ func TestIsInFlightTaskState_NormalizesProtoPrefix(t *testing.T) {
 	assert.True(t, IsInFlightTaskState("WAITING_FOR_CUTOVER"))
 	assert.False(t, IsInFlightTaskState("STATE_STOPPED"))
 	assert.False(t, IsInFlightTaskState("FAILED_RETRYABLE"))
+}
+
+// Task states arrive in proto form ("STATE_COMPLETED") as well as canonical
+// lowercase, so the terminal test must compare them normalized — a terminal
+// row that fails it is treated as work still owed a driver.
+func TestIsTerminalTaskState_NormalizesProtoPrefix(t *testing.T) {
+	for _, s := range TerminalTaskStates {
+		assert.True(t, IsTerminalTaskState(s), "IsTerminalTaskState(%q)", s)
+		proto := "STATE_" + strings.ToUpper(s)
+		assert.True(t, IsTerminalTaskState(proto), "IsTerminalTaskState(%q)", proto)
+	}
+	assert.False(t, IsTerminalTaskState("STATE_STOPPED"), "stopped rests, it does not end")
+	assert.False(t, IsTerminalTaskState("STATE_FAILED_RETRYABLE"), "retryable work is still claimable")
+	assert.False(t, IsTerminalTaskState(Task.Running))
 }
