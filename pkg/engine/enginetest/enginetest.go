@@ -26,6 +26,7 @@ package enginetest
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -116,7 +117,7 @@ type contractCase struct {
 	// contract this case pins. A method no case names must carry a
 	// documented reason in engineMethodExclusions.
 	engineMethods []string
-	run           func(t *testing.T, h Harness)
+	run           func(t *testing.T, h Harness, c contractCase)
 }
 
 var contractCases = []contractCase{
@@ -141,7 +142,7 @@ var engineMethodExclusions = map[string]string{
 	"Plan":       "plan output is engine-specific; each engine's own tests pin it",
 	"Apply":      "apply orchestration is engine-specific; each engine's own tests pin it",
 	"Start":      "resume semantics are engine-specific; each engine's own tests pin them",
-	"Cutover":    "cutover semantics are engine-specific; each engine's own tests pin them",
+	"Cutover":    "the suite exercises cutover only indirectly through engine-specific fixtures, so it cannot pin the method directly",
 	"Revert":     "revert semantics are engine-specific; each engine's own tests pin them",
 	"SkipRevert": "revert-window semantics are engine-specific; each engine's own tests pin them",
 	"Volume":     "throttle semantics are engine-specific; each engine's own tests pin them",
@@ -152,13 +153,20 @@ var engineMethodExclusions = map[string]string{
 // fixture or skipped with the harness's documented reason — a case with
 // neither fails.
 func Run(t *testing.T, h Harness) {
+	registered := make(map[Case]bool, len(contractCases))
 	for _, c := range contractCases {
-		t.Run(string(c.name), func(t *testing.T) { c.run(t, h) })
+		registered[c.name] = true
+	}
+	for key := range h.Skips {
+		require.True(t, registered[key], "unknown skip key %q — not a registered contract case", key)
+	}
+	for _, c := range contractCases {
+		t.Run(string(c.name), func(t *testing.T) { c.run(t, h, c) })
 	}
 }
 
-func runCancelAlreadyCompleted(t *testing.T, h Harness) {
-	fixture, ok := controlFixture(t, h, CaseCancelAlreadyCompleted, h.CancelAlreadyCompleted)
+func runCancelAlreadyCompleted(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
 	if !ok {
 		return
 	}
@@ -166,8 +174,8 @@ func runCancelAlreadyCompleted(t *testing.T, h Harness) {
 	requireAlreadyCompleted(t, "cancel", err)
 }
 
-func runStopAlreadyCompleted(t *testing.T, h Harness) {
-	fixture, ok := controlFixture(t, h, CaseStopAlreadyCompleted, h.StopAlreadyCompleted)
+func runStopAlreadyCompleted(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
 	if !ok {
 		return
 	}
@@ -175,8 +183,8 @@ func runStopAlreadyCompleted(t *testing.T, h Harness) {
 	requireAlreadyCompleted(t, "stop", err)
 }
 
-func runCancelNonexistent(t *testing.T, h Harness) {
-	fixture, ok := controlFixture(t, h, CaseCancelNonexistent, h.CancelNonexistent)
+func runCancelNonexistent(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
 	if !ok {
 		return
 	}
@@ -184,8 +192,8 @@ func runCancelNonexistent(t *testing.T, h Harness) {
 	requirePermanent(t, "cancel", err)
 }
 
-func runStopNonexistent(t *testing.T, h Harness) {
-	fixture, ok := controlFixture(t, h, CaseStopNonexistent, h.StopNonexistent)
+func runStopNonexistent(t *testing.T, h Harness, c contractCase) {
+	fixture, ok := controlFixture(t, h, c.name, fixtureField[func(*testing.T) ControlFixture](t, h, c))
 	if !ok {
 		return
 	}
@@ -193,11 +201,12 @@ func runStopNonexistent(t *testing.T, h Harness) {
 	requirePermanent(t, "stop", err)
 }
 
-func runProgressTerminalTruth(t *testing.T, h Harness) {
-	if handleSkip(t, h, CaseProgressTerminalTruth, h.TerminalProgress == nil) {
+func runProgressTerminalTruth(t *testing.T, h Harness, c contractCase) {
+	build := fixtureField[func(*testing.T) []ProgressFixture](t, h, c)
+	if handleSkip(t, h, c.name, build == nil) {
 		return
 	}
-	fixtures := h.TerminalProgress(t)
+	fixtures := build(t)
 	require.NotEmpty(t, fixtures, "the terminal-progress fixture must cover at least one terminal backend state")
 	for _, fixture := range fixtures {
 		t.Run(fixture.Name, func(t *testing.T) {
@@ -212,11 +221,12 @@ func runProgressTerminalTruth(t *testing.T, h Harness) {
 	}
 }
 
-func runNotReadyDistinguishable(t *testing.T, h Harness) {
-	if handleSkip(t, h, CaseNotReadyDistinguishable, h.NotReady == nil) {
+func runNotReadyDistinguishable(t *testing.T, h Harness, c contractCase) {
+	build := fixtureField[func(*testing.T) NotReadyFixture](t, h, c)
+	if handleSkip(t, h, c.name, build == nil) {
 		return
 	}
-	fixture := h.NotReady(t)
+	fixture := build(t)
 	require.NotNil(t, fixture.Invoke, "the not-ready fixture must supply the operation to invoke")
 	err := fixture.Invoke(t.Context())
 	require.Error(t, err, "an operation against a not-ready backend must be rejected")
@@ -226,6 +236,15 @@ func runNotReadyDistinguishable(t *testing.T, h Harness) {
 		"a not-ready rejection must stay retryable — the backend is expected to accept the operation once it catches up, got: %v", err)
 	assert.False(t, engine.IsAlreadyCompleted(err),
 		"a not-ready rejection must not read as already-completed, got: %v", err)
+}
+
+func fixtureField[T any](t *testing.T, h Harness, c contractCase) T {
+	t.Helper()
+	field := reflect.ValueOf(h).FieldByName(c.harnessField)
+	require.True(t, field.IsValid(), "case %q names missing Harness field %q", c.name, c.harnessField)
+	fixture, ok := field.Interface().(T)
+	require.True(t, ok, "case %q Harness field %q has type %s, not the fixture type its runner requires", c.name, c.harnessField, field.Type())
+	return fixture
 }
 
 // controlFixture resolves the fixture for a control case, honoring a

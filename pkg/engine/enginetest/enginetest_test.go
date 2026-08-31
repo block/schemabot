@@ -1,12 +1,18 @@
 package enginetest
 
 import (
+	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
 	"reflect"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -14,11 +20,9 @@ import (
 
 // TestContractCaseCoverage holds the contract-case registry, the Harness
 // fixture fields, and the engine.Engine method set in lockstep. A new Harness
-// fixture must be consumed by exactly one registered case, each case's subtest
-// must be the run function named for it, and every engine.Engine method must
-// either be pinned by a case or carry a documented exclusion — so a new engine
-// capability cannot land without a conformance decision. Runs without a
-// database.
+// fixture must be consumed by exactly one registered case, and every
+// engine.Engine method must either be pinned by a case or carry a documented
+// exclusion. Runs without a database.
 func TestContractCaseCoverage(t *testing.T) {
 	harnessType := reflect.TypeFor[Harness]()
 	engineType := reflect.TypeFor[engine.Engine]()
@@ -26,6 +30,7 @@ func TestContractCaseCoverage(t *testing.T) {
 	seenCases := make(map[Case]bool, len(contractCases))
 	claimedFields := make(map[string]Case, len(contractCases))
 	pinnedMethods := make(map[string]bool)
+	distinctRunFuncPointers := make(map[uintptr]bool, len(contractCases))
 	for _, c := range contractCases {
 		require.False(t, seenCases[c.name], "case %q is registered more than once", c.name)
 		seenCases[c.name] = true
@@ -38,10 +43,7 @@ func TestContractCaseCoverage(t *testing.T) {
 		require.False(t, claimed, "Harness fixture %q is consumed by both case %q and case %q", c.harnessField, prev, c.name)
 		claimedFields[c.harnessField] = c.name
 
-		runFunc := runtime.FuncForPC(reflect.ValueOf(c.run).Pointer())
-		require.NotNil(t, runFunc, "resolve the run function for case %q", c.name)
-		require.True(t, strings.HasSuffix(runFunc.Name(), "."+expectedRunName(c.name)),
-			"case %q runs %q; want %s", c.name, runFunc.Name(), expectedRunName(c.name))
+		distinctRunFuncPointers[reflect.ValueOf(c.run).Pointer()] = true
 
 		for _, method := range c.engineMethods {
 			_, ok := engineType.MethodByName(method)
@@ -52,13 +54,17 @@ func TestContractCaseCoverage(t *testing.T) {
 			pinnedMethods[method] = true
 		}
 	}
+	require.Len(t, distinctRunFuncPointers, len(contractCases), "each contract case must have its own run function")
 
-	// Every fixture field on Harness is consumed by a registered case; a
-	// fixture with no case would be dead weight the suite silently ignores.
-	// Non-function fields (Skips) are configuration, not fixtures.
+	// This reflection ratchet follows pkg/storage/storagetest/storagetest.go;
+	// extract the pattern if a third package needs it.
+	nonFixtureFields := map[string]string{
+		"Skips": "suite configuration documenting unsupported contract cases",
+	}
 	var unclaimed []string
 	for field := range harnessType.Fields() {
-		if field.Type.Kind() != reflect.Func {
+		if reason, excluded := nonFixtureFields[field.Name]; excluded {
+			assert.NotEmpty(t, reason, "Harness field %q is excluded without a reason", field.Name)
 			continue
 		}
 		if _, ok := claimedFields[field.Name]; !ok {
@@ -66,7 +72,7 @@ func TestContractCaseCoverage(t *testing.T) {
 		}
 	}
 	sort.Strings(unclaimed)
-	require.Empty(t, unclaimed, "Harness fixture fields no contract case consumes")
+	assert.Empty(t, unclaimed, "Harness fields with neither a contract case nor a documented exclusion")
 
 	// Every engine.Engine method is classified: pinned by a case or excluded
 	// with a documented reason.
@@ -84,7 +90,7 @@ func TestContractCaseCoverage(t *testing.T) {
 		}
 	}
 	sort.Strings(unclassified)
-	require.Empty(t, unclassified, "engine.Engine methods with neither a contract case nor a documented exclusion")
+	assert.Empty(t, unclassified, "engine.Engine methods with neither a contract case nor a documented exclusion")
 
 	var staleExclusions []string
 	for method := range engineMethodExclusions {
@@ -93,21 +99,163 @@ func TestContractCaseCoverage(t *testing.T) {
 		}
 	}
 	sort.Strings(staleExclusions)
-	require.Empty(t, staleExclusions, "excluded methods missing from engine.Engine")
+	assert.Empty(t, staleExclusions, "excluded methods missing from engine.Engine")
 }
 
-// expectedRunName maps a case name to its run function's name: each hyphened
-// word capitalized, prefixed with "run" (cancel-already-completed →
-// runCancelAlreadyCompleted).
-func expectedRunName(c Case) string {
-	var b strings.Builder
-	b.WriteString("run")
-	for part := range strings.SplitSeq(string(c), "-") {
-		if part == "" {
+// optionalCapabilityDecisions must classify every exported optional interface
+// in package engine. Add new optional capabilities here with an explicit reason.
+var optionalCapabilityDecisions = map[reflect.Type]string{
+	reflect.TypeFor[engine.Drainer]():                         "lifecycle cleanup is outside the error-typing contract",
+	reflect.TypeFor[engine.ShutdownHalter]():                  "shutdown behavior has engine-specific tests",
+	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    "recovery signaling has engine-specific tests",
+	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): "routing policy is outside the conformance suite",
+	reflect.TypeFor[engine.SynchronousWorkRegistration]():     "registration timing is outside the conformance suite",
+	reflect.TypeFor[engine.ControlResumeValidator]():          "resume metadata is engine-specific",
+}
+
+func TestOptionalCapabilityCoverage(t *testing.T) {
+	interfaces := exportedInterfaces(t, "..")
+	delete(interfaces, "Engine")
+	for typ, reason := range optionalCapabilityDecisions {
+		assert.NotEmpty(t, reason, "optional engine capability %s has no conformance decision", typ.Name())
+		assert.True(t, interfaces[typ.Name()], "classified optional engine capability %s does not exist", typ.Name())
+		delete(interfaces, typ.Name())
+	}
+	assert.Empty(t, interfaces, "exported optional engine interfaces without a conformance decision")
+}
+
+func TestCaseConstantCoverage(t *testing.T) {
+	constants := caseConstants(t)
+	for _, c := range contractCases {
+		delete(constants, c.name)
+	}
+	assert.Empty(t, constants, "Case constants missing from contractCases")
+}
+
+func exportedInterfaces(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	interfaces := make(map[string]bool)
+	for _, file := range parsePackageFiles(t, dir, "engine", false) {
+		ast.Inspect(file, func(node ast.Node) bool {
+			spec, ok := node.(*ast.TypeSpec)
+			if ok && spec.Name.IsExported() {
+				if _, ok := spec.Type.(*ast.InterfaceType); ok {
+					interfaces[spec.Name.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return interfaces
+}
+
+func caseConstants(t *testing.T) map[Case]bool {
+	t.Helper()
+	constants := make(map[Case]bool)
+	for _, file := range parsePackageFiles(t, ".", "enginetest", true) {
+		ast.Inspect(file, func(node ast.Node) bool {
+			spec, ok := node.(*ast.ValueSpec)
+			if !ok {
+				return true
+			}
+			typ, ok := spec.Type.(*ast.Ident)
+			if !ok || typ.Name != "Case" {
+				return true
+			}
+			for _, value := range spec.Values {
+				literal, ok := value.(*ast.BasicLit)
+				if ok {
+					constants[Case(literal.Value[1:len(literal.Value)-1])] = true
+				}
+			}
+			return true
+		})
+	}
+	return constants
+}
+
+func parsePackageFiles(t *testing.T, dir, packageName string, includeTests bool) []*ast.File {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	files := make([]*ast.File, 0, len(entries))
+	fileSet := token.NewFileSet()
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || (!includeTests && strings.HasSuffix(entry.Name(), "_test.go")) {
 			continue
 		}
-		b.WriteString(strings.ToUpper(part[:1]))
-		b.WriteString(part[1:])
+		file, err := parser.ParseFile(fileSet, filepath.Join(dir, entry.Name()), nil, 0)
+		require.NoError(t, err)
+		if file.Name.Name == packageName {
+			files = append(files, file)
+		}
 	}
-	return b.String()
+	return files
+}
+
+func TestRunExecutesEveryRegisteredCase(t *testing.T) {
+	executed := make(map[Case]int)
+	markControl := func(c Case) func(*testing.T) ControlFixture {
+		return func(*testing.T) ControlFixture {
+			executed[c]++
+			return ControlFixture{Engine: fakeEngine{}, Req: &engine.ControlRequest{Database: string(c)}}
+		}
+	}
+	Run(t, Harness{
+		CancelAlreadyCompleted: markControl(CaseCancelAlreadyCompleted),
+		StopAlreadyCompleted:   markControl(CaseStopAlreadyCompleted),
+		CancelNonexistent:      markControl(CaseCancelNonexistent),
+		StopNonexistent:        markControl(CaseStopNonexistent),
+		TerminalProgress: func(*testing.T) []ProgressFixture {
+			executed[CaseProgressTerminalTruth]++
+			return []ProgressFixture{{Name: "completed", Engine: fakeEngine{}, Req: &engine.ProgressRequest{}, Want: engine.StateCompleted}}
+		},
+		NotReady: func(*testing.T) NotReadyFixture {
+			executed[CaseNotReadyDistinguishable]++
+			return NotReadyFixture{Invoke: func(context.Context) error { return engine.NewNotReadyError("not ready") }}
+		},
+	})
+	for _, c := range contractCases {
+		assert.Equal(t, 1, executed[c.name], "registered case %q did not execute exactly once", c.name)
+	}
+}
+
+type fakeEngine struct{}
+
+func (fakeEngine) Name() string { return "fake" }
+func (fakeEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	return nil, nil
+}
+func (fakeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	return nil, nil
+}
+func (fakeEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{State: engine.StateCompleted}, nil
+}
+func (fakeEngine) Stop(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	if req.Database == string(CaseStopNonexistent) {
+		return nil, engine.NewPermanentError("not found")
+	}
+	return nil, engine.NewAlreadyCompletedError("completed")
+}
+func (fakeEngine) Cancel(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	if req.Database == string(CaseCancelNonexistent) {
+		return nil, engine.NewPermanentError("not found")
+	}
+	return nil, engine.NewAlreadyCompletedError("completed")
+}
+func (fakeEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, nil
+}
+func (fakeEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, nil
+}
+func (fakeEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, nil
+}
+func (fakeEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, nil
+}
+func (fakeEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	return nil, nil
 }
