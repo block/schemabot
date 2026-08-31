@@ -1,10 +1,15 @@
 package webhook
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/webhook/action"
-	"github.com/stretchr/testify/assert"
 )
 
 // TestCommandSpecs_CoverEveryDispatcherAction enforces that every command the
@@ -45,6 +50,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		requiresEnv         bool
 		hasApplyID          bool
 		supportsDB          bool
+		supportsApp         bool
 		supportsSkipRevert  bool
 		supportsDefer       bool
 		supportsAllowUnsafe bool
@@ -77,6 +83,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 			assert.Equal(t, tc.requiresEnv, spec.RequiresEnv, "RequiresEnv")
 			assert.Equal(t, tc.hasApplyID, spec.HasApplyID, "HasApplyID")
 			assert.Equal(t, tc.supportsDB, spec.SupportsDB, "SupportsDB")
+			assert.Equal(t, tc.supportsApp, spec.SupportsApp, "SupportsApp")
 			assert.Equal(t, tc.supportsSkipRevert, spec.SupportsSkipRevert, "SupportsSkipRevert")
 			assert.Equal(t, tc.supportsDefer, spec.SupportsDeferCutover, "SupportsDeferCutover")
 			assert.Equal(t, tc.supportsAllowUnsafe, spec.SupportsAllowUnsafe, "SupportsAllowUnsafe")
@@ -270,6 +277,20 @@ func TestParseTenantFlag(t *testing.T) {
 			assert.Equal(t, tc.result, parser.ParseCommand(tc.body))
 		})
 	}
+}
+
+func TestHasAppFlag(t *testing.T) {
+	p := NewCommandParser()
+	assert.True(t, p.HasAppFlag("schemabot plan -e staging --app billing-service"))
+	assert.True(t, p.HasAppFlag("schemabot unlock --app"))
+	assert.False(t, p.HasAppFlag("schemabot apply -e staging"))
+	assert.False(t, p.HasAppFlag(""))
+
+	// Only the directive line carries flags. Prose and fenced CLI examples
+	// describe the flag rather than pass it, so neither rejects the command.
+	assert.False(t, p.HasAppFlag("schemabot plan -e staging\n\nnext time we can use --app billing-service"))
+	assert.False(t, p.HasAppFlag("schemabot plan -e staging\n\n```\nschemabot apply -e staging --app billing-service\n```\n"))
+	assert.False(t, p.HasAppFlag("we could pass --app billing-service here"))
 }
 
 // TestParseVolumeCommand verifies the volume command parses its apply id,
@@ -973,6 +994,87 @@ func TestParseCommand(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := parser.ParseCommand(tt.body)
 			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestIssueCommentGateBlockAppFlags pins the shared gate ladder's usage gates
+// for `--app`. No shipped command opts into SupportsApp yet, so the parser
+// never populates App or AppError from a comment; the cases below build the
+// result fields directly where a gate needs them, pinning the ladder's order
+// for when a command opts in.
+func TestIssueCommentGateBlockAppFlags(t *testing.T) {
+	h := &Handler{logger: testLogger()}
+	parser := NewCommandParser()
+
+	t.Run("app flag on any command is unsupported", func(t *testing.T) {
+		for _, body := range []string{
+			"schemabot plan -e staging --app billing-service",
+			"schemabot apply -e staging --app billing-service",
+			"schemabot apply-confirm -e staging --app billing-service",
+			"schemabot unlock --app",
+		} {
+			result := parser.ParseCommand(body)
+			assert.Equal(t, issueCommentGateApp, h.issueCommentGateBlock("octocat/hello-world", result, parser, body), body)
+		}
+	})
+
+	t.Run("malformed app value blocks before the unsupported gate", func(t *testing.T) {
+		body := "schemabot apply -e staging --app billing@service"
+		result := parser.ParseCommand(body)
+		result.AppError = true
+		assert.Equal(t, issueCommentGateInvalidApp, h.issueCommentGateBlock("octocat/hello-world", result, parser, body))
+	})
+
+	t.Run("app with database flag", func(t *testing.T) {
+		body := "schemabot apply -e staging -d billing-ledger"
+		result := parser.ParseCommand(body)
+		result.App = "billing-service"
+		assert.Equal(t, issueCommentGateAppWithDatabase, h.issueCommentGateBlock("octocat/hello-world", result, parser, body))
+	})
+
+	t.Run("app with dangling database flag", func(t *testing.T) {
+		body := "schemabot apply -e staging -d"
+		result := parser.ParseCommand(body)
+		result.App = "billing-service"
+		assert.Equal(t, issueCommentGateAppWithDatabase, h.issueCommentGateBlock("octocat/hello-world", result, parser, body))
+	})
+
+	t.Run("app with defer-cutover", func(t *testing.T) {
+		body := "schemabot apply -e staging --defer-cutover"
+		result := parser.ParseCommand(body)
+		result.App = "billing-service"
+		assert.Equal(t, issueCommentGateAppDeferCutover, h.issueCommentGateBlock("octocat/hello-world", result, parser, body))
+	})
+}
+
+// Until a command opts into SupportsApp, an `--app` flag on any comment
+// command is rejected with the unsupported-flag usage comment.
+func TestWebhookAppFlagUnsupportedComment(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	for _, cmd := range []string{
+		"schemabot plan -e staging --app billing-service",
+		"schemabot apply -e staging --app billing-service",
+	} {
+		t.Run(cmd, func(t *testing.T) {
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: cmd,
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "The `--app` flag is not supported for")
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for error comment")
+			}
 		})
 	}
 }

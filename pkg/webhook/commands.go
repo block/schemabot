@@ -32,6 +32,12 @@ type CommandSpec struct {
 	// SupportsDB means `-d <db>` is recognized.
 	SupportsDB bool
 
+	// SupportsApp means `--app <identifier>` is recognized. The flag targets
+	// every configured database whose app field matches the identifier, so it
+	// is mutually exclusive with `-d`; the dispatcher posts the rejection
+	// comment when both are present.
+	SupportsApp bool
+
 	// SupportsSkipRevert means `--skip-revert` is recognized.
 	SupportsSkipRevert bool
 
@@ -92,6 +98,11 @@ func commandSupportsDatabaseFlag(actionName string) bool {
 	return ok && spec.SupportsDB
 }
 
+func commandSupportsAppFlag(actionName string) bool {
+	spec, ok := specByName[actionName]
+	return ok && spec.SupportsApp
+}
+
 // commandNamePattern is the alternation of every registered command name,
 // sorted by length descending so "apply-confirm" wins over "apply" at the same
 // start position under RE2's leftmost-first semantics.
@@ -113,6 +124,9 @@ type CommandParser struct {
 	environmentRegex     *regexp.Regexp
 	environmentNameRegex *regexp.Regexp
 	databaseRegex        *regexp.Regexp
+	databaseTokenRegex   *regexp.Regexp
+	appNameRegex         *regexp.Regexp
+	appFlagRegex         *regexp.Regexp
 	tenantRegex          *regexp.Regexp
 	tenantFlagRegex      *regexp.Regexp
 	skipRevertRegex      *regexp.Regexp
@@ -133,6 +147,9 @@ func NewCommandParser() *CommandParser {
 		environmentRegex:     regexp.MustCompile(`(?i)-e\s+([^-\s][^\s]*)`),
 		environmentNameRegex: regexp.MustCompile(`^[a-z0-9][a-z0-9_]*(?:-[a-z0-9_]+)*$`),
 		databaseRegex:        regexp.MustCompile(`(?i)-d\s+([a-zA-Z0-9_-]+)`),
+		databaseTokenRegex:   regexp.MustCompile(`(?i)(?:^|\s)-d(?:\s|$)`),
+		appNameRegex:         regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
+		appFlagRegex:         regexp.MustCompile(`(?i)(?:^|\s)--app(?:[ \t]+([^\s]+))?`),
 		tenantRegex:          regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
 		tenantFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--tenant|-t)(?:[ \t]+([^\s]+))?`),
 		skipRevertRegex:      regexp.MustCompile(`(?i)--skip-revert\b`),
@@ -155,6 +172,11 @@ type CommandResult struct {
 	// the single terminal answer after exhaustion; synchronous handling leaves
 	// it false.
 	SuppressRetryComments bool
+	// ExpectedHeadSHA pins the PR head a command must run against. It is never
+	// parsed from the comment: app-scoped dispatch sets it on the per-database
+	// commands it fans out so every database applies the same commit, and the
+	// cores reject when the live head no longer matches.
+	ExpectedHeadSHA string
 	// CommentID is the PR comment that carried this command. Handlers
 	// acknowledge it with a reaction once they commit to acting, so on a
 	// fan-out only the deployments actually doing work acknowledge.
@@ -162,6 +184,8 @@ type CommandResult struct {
 	ApplyID      string // Positional apply identifier for apply-scoped commands.
 	Environment  string
 	Database     string // Optional -d flag value
+	App          string // Optional --app flag value naming a configured application.
+	AppError     bool   // True when --app is present without a valid application identifier.
 	Tenant       string // Optional --tenant/-t routing target for this command.
 	TenantError  bool   // True when --tenant/-t is present without a valid routing target.
 	SkipRevert   bool
@@ -253,6 +277,21 @@ func (p *CommandParser) extractVolumeLevel(body string) (int32, bool) {
 	return int32(level), false
 }
 
+// extractApp returns the application identifier from `--app` and whether the
+// flag was present but unusable (missing value or malformed identifier). An
+// absent flag returns ("", false); whether the identifier names a configured
+// application is the dispatcher's job.
+func (p *CommandParser) extractApp(body string) (string, bool) {
+	match := p.appFlagRegex.FindStringSubmatch(body)
+	if len(match) == 0 {
+		return "", false
+	}
+	if len(match) < 2 || match[1] == "" || !p.appNameRegex.MatchString(match[1]) {
+		return "", true
+	}
+	return strings.ToLower(match[1]), false
+}
+
 func (p *CommandParser) extractTenant(body string) (string, bool) {
 	match := p.tenantFlagRegex.FindStringSubmatch(body)
 	if len(match) == 0 {
@@ -305,6 +344,9 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 		if m := p.databaseRegex.FindStringSubmatch(body); len(m) >= 2 {
 			result.Database = m[1]
 		}
+	}
+	if spec.SupportsApp {
+		result.App, result.AppError = p.extractApp(body)
 	}
 	if spec.SupportsSkipRevert {
 		result.SkipRevert = p.skipRevertRegex.MatchString(body)
@@ -372,9 +414,11 @@ func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 	return p.autoConfirmRegex.MatchString(directive)
 }
 
-// HasDatabaseFlag reports whether the command carries a `-d <database>` flag,
-// regardless of which command it accompanies. Like HasAutoConfirmFlag, the
-// answer decides whether a command is rejected, so it is read off the
+// HasDatabaseFlag reports whether the command carries a `-d` flag — with or
+// without a value — regardless of which command it accompanies. A dangling
+// `-d` still signals database-scoping intent, so gates that reject the flag
+// must see it even when no database name follows. Like HasAutoConfirmFlag,
+// the answer decides whether a command is rejected, so it is read off the
 // directive line the command was parsed from: prose or a fenced CLI example
 // mentioning the flag describes it, not passes it.
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
@@ -382,7 +426,7 @@ func (p *CommandParser) HasDatabaseFlag(body string) bool {
 	if !ok {
 		return false
 	}
-	return p.databaseRegex.MatchString(directive)
+	return p.databaseTokenRegex.MatchString(directive)
 }
 
 // HasDeferCutoverFlag reports whether the command carries `--defer-cutover`,
@@ -394,4 +438,19 @@ func (p *CommandParser) HasDeferCutoverFlag(body string) bool {
 		return false
 	}
 	return p.deferCutoverRegex.MatchString(directive)
+}
+
+// HasAppFlag reports whether the command carries an `--app` flag, regardless
+// of which command it accompanies. The dispatcher uses this to post an
+// "unsupported flag" comment when an operator pairs `--app` with a command
+// whose spec does not opt into SupportsApp. Like HasAutoConfirmFlag, the
+// answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from: prose or a fenced CLI example
+// mentioning the flag describes it, not passes it.
+func (p *CommandParser) HasAppFlag(body string) bool {
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.appFlagRegex.MatchString(directive)
 }

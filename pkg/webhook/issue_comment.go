@@ -57,6 +57,10 @@ const (
 	issueCommentGateAutoConfirm         issueCommentGateBlockReason = "auto-confirm flag unsupported for command"
 	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
 	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
+	issueCommentGateInvalidApp          issueCommentGateBlockReason = "invalid app flag"
+	issueCommentGateApp                 issueCommentGateBlockReason = "app flag unsupported for command"
+	issueCommentGateAppWithDatabase     issueCommentGateBlockReason = "app flag combined with database flag"
+	issueCommentGateAppDeferCutover     issueCommentGateBlockReason = "defer-cutover flag unsupported with app flag"
 )
 
 // issueCommentGateBlock evaluates the routing and usage gates shared by the
@@ -100,6 +104,21 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	}
 	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(commentBody) {
 		return issueCommentGateDatabase
+	}
+	if result.AppError {
+		return issueCommentGateInvalidApp
+	}
+	if !commandSupportsAppFlag(result.Action) && parser.HasAppFlag(commentBody) {
+		return issueCommentGateApp
+	}
+	// Textual `-d` presence, not the parsed result.Database: a dangling `-d`
+	// with no value still signals database-scoping intent and must not be
+	// silently ignored by an app fan-out.
+	if result.App != "" && parser.HasDatabaseFlag(commentBody) {
+		return issueCommentGateAppWithDatabase
+	}
+	if result.App != "" && result.DeferCutover {
+		return issueCommentGateAppDeferCutover
 	}
 	return issueCommentGatePass
 }
@@ -424,6 +443,54 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedDatabaseFlag(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
+	if gateReason == issueCommentGateInvalidApp {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping invalid app flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.postComment(repo, pr, installationID, templates.RenderInvalidAppFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid app flag"})
+		return
+	}
+
+	if gateReason == issueCommentGateApp {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping unsupported app flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAppFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
+	if gateReason == issueCommentGateAppWithDatabase {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping app-with-database flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.postComment(repo, pr, installationID, templates.RenderAppWithDatabaseFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "conflicting flags"})
+		return
+	}
+
+	if gateReason == issueCommentGateAppDeferCutover {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping app defer-cutover flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.postComment(repo, pr, installationID, templates.RenderAppDeferCutoverUnsupported())
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "conflicting flags"})
 		return
 	}
 
