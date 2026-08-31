@@ -420,7 +420,7 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 
 | State | Footer |
 |-------|--------|
-| Running | `ESC detach` |
+| Running | `ESC detach • s stop` |
 | Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
 | Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
 | Cutting over | `Cutover in progress - please wait...` |
