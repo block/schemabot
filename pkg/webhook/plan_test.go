@@ -344,8 +344,8 @@ func TestRenderPlanComment_UnsafeWarningSummaryCountsChanges(t *testing.T) {
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "⚠️ **Issues**: 2 unsafe changes detected")
-	assert.Contains(t, rendered, "- `orders`: DROP INDEX without making invisible first")
-	assert.Contains(t, rendered, "- `customers`: DROP COLUMN is destructive")
+	assert.Contains(t, rendered, "1. `orders`: DROP INDEX without making invisible first")
+	assert.Contains(t, rendered, "2. `customers`: DROP COLUMN is destructive")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -917,10 +917,9 @@ func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T)
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 3 unsafe changes detected")
-	assert.Contains(t, rendered, "- `uploads`:\n")
-	assert.Contains(t, rendered, "  - Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
-	assert.Contains(t, rendered, "  - Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
-	assert.Contains(t, rendered, "  - Primary key column `uid` has type `varchar`\n")
+	assert.Contains(t, rendered, "1. `uploads`: Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "2. `uploads`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `uploads`: Primary key column `uid` has type `varchar`\n")
 	assert.NotContains(t, rendered, "instead.; ")
 }
 
@@ -949,17 +948,16 @@ func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "3 unsafe changes detected")
-	assert.Contains(t, rendered, "- `orders`:\n")
-	assert.Contains(t, rendered, "  - DROP COLUMN removes data\n")
-	assert.Contains(t, rendered, "  - Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
-	assert.Contains(t, rendered, "- `users`: DROP TABLE removes all data\n")
+	assert.Contains(t, rendered, "1. `orders`: DROP COLUMN removes data\n")
+	assert.Contains(t, rendered, "2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `users`: DROP TABLE removes all data\n")
 	assert.NotContains(t, rendered, "data; ")
 }
 
 // An engine can report an unsafe change without a parseable reason. The
-// blocking comment still lists the table — as a bare bullet, no dangling
-// colon — and the header counts it as one finding.
-func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *testing.T) {
+// blocking comment still lists the table — with the engine's change type as
+// the explanation, matching the CLI — and the header counts it as one finding.
+func TestRenderUnsafeChangesBlocked_EmptyReasonListsChangeTypeAndCountsOnce(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:    "testdb",
 		Environment: "staging",
@@ -970,7 +968,7 @@ func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *te
 		}},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []templates.UnsafeChangeData{
-			{Table: "users", Reason: ""},
+			{Table: "users", Reason: "", ChangeType: "drop"},
 			{Table: "orders", Reason: "DROP TABLE removes all data"},
 		},
 	}
@@ -978,13 +976,13 @@ func TestRenderUnsafeChangesBlocked_EmptyReasonListsBareTableAndCountsOnce(t *te
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
 	assert.Contains(t, rendered, "**⛔ Apply rejected**: 2 unsafe changes detected")
-	assert.Contains(t, rendered, "- `users`\n")
-	assert.NotContains(t, rendered, "- `users`:")
-	assert.Contains(t, rendered, "- `orders`: DROP TABLE removes all data\n")
+	assert.Contains(t, rendered, "1. `users`: drop\n")
+	assert.Contains(t, rendered, "2. `orders`: DROP TABLE removes all data\n")
 }
 
-// The plan comment's unsafe-issues section handles a reasonless change the
-// same way: a bare table bullet that still counts once in the header.
+// A change with neither a reason nor a change type still gets a line in the
+// plan comment's unsafe-issues section — a bare table entry, no dangling
+// colon — and still counts once in the header.
 func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testing.T) {
 	data := templates.PlanCommentData{
 		Database:    "testdb",
@@ -1001,8 +999,8 @@ func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testi
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "1 unsafe change detected")
-	assert.Contains(t, rendered, "- `users`\n")
-	assert.NotContains(t, rendered, "- `users`:")
+	assert.Contains(t, rendered, "1. `users`\n")
+	assert.NotContains(t, rendered, "1. `users`:")
 }
 
 func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {
