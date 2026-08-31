@@ -203,18 +203,24 @@ func TestRenderVolumeInvalidLevel(t *testing.T) {
 }
 
 // TestRenderVolumeSupersededProgressComment verifies the frozen body written
-// over an old progress comment after a volume change: it names the new level,
-// links the successor comment, and folds the final pre-change progress into a
-// details block so the record stays on the PR without looking live.
+// over an old progress comment after a volume change: the headline names the
+// level the frozen comment covered (its own era) with the new level mentioned
+// only as what superseded it, links the successor comment, and folds the final
+// pre-change progress into a details block so the record stays on the PR
+// without looking live.
 func TestRenderVolumeSupersededProgressComment(t *testing.T) {
 	rendered := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume:       8,
-		Repo:         "acme/testapp",
-		PR:           42,
-		NewCommentID: 2222222222,
-		PreviousBody: "## Schema Change Progress\n\nVolume: 3/11",
+		Volume:         8,
+		PreviousVolume: 3,
+		Repo:           "acme/testapp",
+		PR:             42,
+		NewCommentID:   2222222222,
+		PreviousBody:   "## Schema Change Progress\n\nVolume: 3/11",
 	})
-	assert.Contains(t, rendered, "Volume changed to **8/11**")
+	assert.Contains(t, rendered, "⏩ Progress at volume **3/11**",
+		"the headline names the frozen comment's own era level")
+	assert.Contains(t, rendered, "superseded by the change to **8/11**",
+		"the new level appears only as what superseded the era")
 	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Progress before the volume change</summary>")
@@ -222,10 +228,33 @@ func TestRenderVolumeSupersededProgressComment(t *testing.T) {
 		"the superseded body is preserved inside the fold")
 }
 
+// TestRenderVolumeSupersededProgressCommentDefaultVolumeEra verifies the
+// frozen body for a comment posted before any explicit level: the headline
+// describes the default-volume era instead of rendering a zero level.
+func TestRenderVolumeSupersededProgressCommentDefaultVolumeEra(t *testing.T) {
+	rendered := RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
+		Volume:         2,
+		PreviousVolume: 0,
+		Repo:           "acme/testapp",
+		PR:             42,
+		NewCommentID:   2222222222,
+		PreviousBody:   "## Schema Change Progress\n\nCopying",
+	})
+	assert.Contains(t, rendered, "⏩ Progress at the default volume",
+		"a zero recorded level renders as the default-volume era")
+	assert.Contains(t, rendered, "superseded by the change to **2/11**")
+	assert.NotContains(t, rendered, "**0/11**",
+		"a zero level is never rendered as a numeric era")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<summary>Progress before the volume change</summary>")
+}
+
 // TestRenderResumeSupersededProgressComment verifies the frozen body written
-// over an old progress comment after a resume: it links the successor comment
-// and folds the final pre-stop progress into a details block so the record
-// stays on the PR without looking live.
+// over an old progress comment after a resume: the headline names the pre-stop
+// era the frozen comment covered with the resume mentioned only as where
+// progress continues, links the successor comment, and folds the final
+// pre-stop progress into a details block so the record stays on the PR without
+// looking live.
 func TestRenderResumeSupersededProgressComment(t *testing.T) {
 	rendered := RenderResumeSupersededProgressComment(SupersededProgressData{
 		Repo:         "acme/testapp",
@@ -233,12 +262,72 @@ func TestRenderResumeSupersededProgressComment(t *testing.T) {
 		NewCommentID: 2222222222,
 		PreviousBody: "## Schema Change Progress\n\nStopped at 21%",
 	})
-	assert.Contains(t, rendered, "Schema change resumed")
+	assert.Contains(t, rendered, "⏸️ Progress before the stop — the schema change resumed in",
+		"the headline names the pre-stop era, with the resume subordinate")
 	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
 	assert.Contains(t, rendered, "<details>")
 	assert.Contains(t, rendered, "<summary>Progress before the stop</summary>")
 	assert.Contains(t, rendered, "Stopped at 21%",
 		"the superseded body is preserved inside the fold")
+}
+
+// TestRenderRevertSupersededProgressComment verifies the frozen body written
+// over an old progress comment after a revert: the headline names the
+// pre-revert era the frozen comment covered with the revert mentioned only as
+// where tracking continues, links the successor comment, and folds the final
+// pre-revert progress into a details block.
+func TestRenderRevertSupersededProgressComment(t *testing.T) {
+	rendered := RenderRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Progress\n\nRevert window open",
+	})
+	assert.Contains(t, rendered, "⏪ Progress before the revert — the revert is tracked in",
+		"the headline names the pre-revert era, with the revert subordinate")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<summary>Progress before the revert</summary>")
+	assert.Contains(t, rendered, "Revert window open",
+		"the superseded body is preserved inside the fold")
+}
+
+// TestRenderSkipRevertSupersededProgressComment verifies the frozen body
+// written over an old progress comment after a skip-revert: the headline names
+// the revert-window era the frozen comment covered with the skip mentioned
+// only as where finalization continues, links the successor comment, and folds
+// the final revert-window rendering into a details block.
+func TestRenderSkipRevertSupersededProgressComment(t *testing.T) {
+	rendered := RenderSkipRevertSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Progress\n\nRevert window open",
+	})
+	assert.Contains(t, rendered, "⏭️ Revert window before the skip — the schema change is finalizing in",
+		"the headline names the revert-window era, with the skip subordinate")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<summary>Progress before the revert was skipped</summary>")
+	assert.Contains(t, rendered, "Revert window open",
+		"the superseded body is preserved inside the fold")
+}
+
+// TestRenderCutoverSupersededComment verifies the frozen body written over the
+// spent cutover prompt: the headline names what the frozen comment was — the
+// prompt — with the completed cutover mentioned only as what superseded it,
+// links the successor comment, and folds the prompt into a details block.
+func TestRenderCutoverSupersededComment(t *testing.T) {
+	rendered := RenderCutoverSupersededComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Ready for cutover\n\nRun the cutover command.",
+	})
+	assert.Contains(t, rendered, "⏸️ Cutover prompt — the cutover completed; progress continues in",
+		"the headline names the prompt era, with the completed cutover subordinate")
+	assert.Contains(t, rendered, "https://github.com/acme/testapp/pull/42#issuecomment-2222222222")
+	assert.Contains(t, rendered, "<summary>Cutover prompt</summary>")
+	assert.Contains(t, rendered, "Ready for cutover",
+		"the prompt body is preserved inside the fold")
 }
 
 // TestRenderSupersededProgressComment verifies the frozen body written over a
@@ -258,7 +347,7 @@ func TestRenderSupersededProgressComment(t *testing.T) {
 	assert.Contains(t, rendered, "<summary>Earlier progress</summary>")
 	assert.Contains(t, rendered, "Stopped at 21%",
 		"the superseded body is preserved inside the fold")
-	assert.NotContains(t, rendered, "Volume changed",
+	assert.NotContains(t, rendered, "superseded by the change to",
 		"the generic fold does not claim a volume change caused it")
 	assert.NotContains(t, rendered, "resumed",
 		"the generic fold does not claim a resume caused it")
@@ -286,6 +375,25 @@ func TestIsSupersededProgressComment(t *testing.T) {
 	for flavor, body := range frozen {
 		assert.Truef(t, IsSupersededProgressComment(body),
 			"a %s-frozen body is recognized as frozen", flavor)
+	}
+
+	// Bodies frozen by earlier server versions carry the headlines those
+	// versions rendered. They can still hold a pending-freeze marker (the
+	// marker-clear write may have failed), so the retry must recognize them as
+	// frozen rather than wrap them in a second fold.
+	legacyFold := func(headline string) string {
+		return headline + " [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-1).\n\n<details>\n<summary>Earlier progress</summary>\n\nold\n\n</details>\n"
+	}
+	legacyFrozen := map[string]string{
+		"volume":      legacyFold("⏩ Volume changed to **8/11** — progress continues in"),
+		"resume":      legacyFold("▶️ Schema change resumed — progress continues in"),
+		"revert":      legacyFold("Schema change reverting — the revert is tracked in"),
+		"skip-revert": legacyFold("Revert skipped — the schema change is finalizing in"),
+		"cutover":     legacyFold("Cutover complete — progress continues in"),
+	}
+	for flavor, body := range legacyFrozen {
+		assert.Truef(t, IsSupersededProgressComment(body),
+			"a %s body frozen by an earlier version is recognized as frozen", flavor)
 	}
 
 	live := map[string]string{
