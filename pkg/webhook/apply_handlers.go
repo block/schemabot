@@ -60,6 +60,9 @@ func (h *Handler) handleApplyCommand(repo string, pr int, environment, databaseN
 // The core logs each failure at its site, so the synchronous wrapper can discard
 // the result without losing observability.
 func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	if result.App != "" {
+		return h.appScopedApplyCore(parent, repo, pr, environment, installationID, requestedBy, result, action.Apply)
+	}
 	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
 		// A GitHub App resolution failure inside the bootstrap is deterministic
@@ -250,6 +253,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return true, fmt.Errorf("apply command fetch PR for stale-schema check %s#%d: %w", repo, pr, prErr)
 	}
 	if rejected := h.assertSchemaStillCurrent(ctx, repo, pr, installationID, schemaResult, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
+		return false, nil
+	}
+	if rejected := h.assertPinnedHeadStillCurrent(ctx, repo, pr, installationID, schemaResult, result.ExpectedHeadSHA, prInfo.HeadSHA, environment, requestedBy, action.Apply); rejected {
 		return false, nil
 	}
 	if rejected, gateErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, prInfo, environment, requestedBy, action.Apply); gateErr != nil {
@@ -581,6 +587,9 @@ func (h *Handler) handleApplyConfirmCommand(repo string, pr int, environment, da
 // The core logs each failure at its site, so the synchronous wrapper can discard
 // the result without losing observability.
 func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, pr int, environment, databaseName string, installationID int64, requestedBy string, result CommandResult) (bool, error) {
+	if result.App != "" {
+		return h.appScopedApplyCore(parent, repo, pr, environment, installationID, requestedBy, result, action.ApplyConfirm)
+	}
 	ctx, cancel, client, err := h.commandBootstrap(parent, repo, installationID)
 	if err != nil {
 		// A GitHub App resolution failure inside the bootstrap is deterministic
@@ -670,6 +679,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
+		return false, nil
+	}
+	if rejected := h.assertPinnedHeadStillCurrent(ctx, repo, pr, installationID, schemaResult, result.ExpectedHeadSHA, confirmPRInfo.HeadSHA, environment, requestedBy, action.ApplyConfirm); rejected {
 		return false, nil
 	}
 

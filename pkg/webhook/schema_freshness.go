@@ -69,6 +69,56 @@ func (h *Handler) assertSchemaStillCurrent(
 	return true
 }
 
+// assertPinnedHeadStillCurrent enforces an externally pinned PR head
+// (CommandResult.ExpectedHeadSHA) inside a command core: when app-scoped
+// dispatch pins the head its databases must share, each database's core
+// rejects if the live head has moved off the pin — even if the core's own
+// discovery is internally consistent at the newer commit. An empty pin means
+// the command was not head-pinned and the check does not apply.
+//
+// Returns true to mean "rejected — caller must stop".
+func (h *Handler) assertPinnedHeadStillCurrent(
+	ctx context.Context,
+	repo string,
+	pr int,
+	installationID int64,
+	schema *ghclient.SchemaRequestResult,
+	pinnedSHA string,
+	freshHeadSHA string,
+	environment string,
+	requestedBy string,
+	action string,
+) bool {
+	if pinnedSHA == "" || pinnedSHA == freshHeadSHA {
+		return false
+	}
+
+	h.logger.Warn("rejected: PR HEAD advanced off the head pinned for this dispatch",
+		"repo", repo,
+		"pr", pr,
+		"environment", environment,
+		"database", schema.Database,
+		"database_type", schema.Type,
+		"pinned_sha", pinnedSHA,
+		"current_sha", freshHeadSHA,
+		"action", action,
+		"requested_by", requestedBy,
+	)
+
+	metrics.RecordSchemaFreshnessRejected(ctx, metricActionKey(action), environment)
+
+	h.postComment(repo, pr, installationID, templates.RenderStaleSchemaRejection(templates.StaleSchemaRejectionData{
+		RequestedBy:  requestedBy,
+		Database:     schema.Database,
+		Environment:  environment,
+		DiscoverySHA: pinnedSHA,
+		CurrentSHA:   freshHeadSHA,
+		Action:       action,
+	}))
+
+	return true
+}
+
 // metricActionKey converts a command-line action ("apply-confirm") to the
 // underscore form expected by the metric's cardinality allowlist ("apply_confirm").
 func metricActionKey(action string) string {

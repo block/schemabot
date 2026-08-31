@@ -65,10 +65,10 @@ type CommandSpec struct {
 var commandSpecs = []CommandSpec{
 	{Name: action.Help},
 	{Name: action.Plan, RequiresEnv: true, SupportsDB: true},
-	{Name: action.Apply, RequiresEnv: true, SupportsDB: true,
+	{Name: action.Apply, RequiresEnv: true, SupportsDB: true, SupportsApp: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
 		SupportsAllowUnsafe: true},
-	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
+	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true, SupportsApp: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
 	{Name: action.FixLint, SupportsDB: true},
