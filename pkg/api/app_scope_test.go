@@ -38,6 +38,7 @@ func TestValidateDatabaseApp(t *testing.T) {
 		{name: "unicode", app: "billíng", want: "lowercase alphanumeric"},
 		{name: "leading hyphen", app: "-billing", want: "start and end with a letter or digit"},
 		{name: "trailing hyphen", app: "billing-", want: "start and end with a letter or digit"},
+		{name: "consecutive hyphens", app: "billing--service", want: "consecutive hyphens"},
 		{name: "too long", app: strings.Repeat("a", maxAppNameChars+1), want: "exceeds"},
 	}
 	for _, tc := range invalid {
