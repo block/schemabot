@@ -204,6 +204,27 @@ func TestCheckSuiteWebhookQueuesWithGrace(t *testing.T) {
 	assert.WithinDuration(t, before.Add(defaultCheckSuiteRecoveryGrace), *row.RetryAfter, 10*time.Second)
 }
 
+func TestCheckSuiteWebhookCanonicalizesRepository(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"mixedcase/sample-repo": {}})
+
+	req := buildCheckSuiteWebhookRequest(t, "requested", "MixedCaseSHA", "MixedCaseBranch", 7)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	req.Body = io.NopCloser(strings.NewReader(strings.ReplaceAll(string(body), "octocat/hello-world", "MixedCase/Sample-Repo")))
+	req.Header.Set(headerDeliveryID, "mixed-case-check-suite")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-check-suite")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "mixedcase/sample-repo", row.Repository)
+	assert.Equal(t, "MixedCaseSHA", row.HeadSHA)
+}
+
 // Only "requested" carries recovery work: "rerequested" re-plans through
 // check_run.rerequested and "completed" is pure noise, so neither may occupy
 // an inbox row.
