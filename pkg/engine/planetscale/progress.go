@@ -571,7 +571,7 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 		return nil, 0
 	}
 
-	return aggregateShardProgress(allRows)
+	return aggregateShardProgress(allRows, time.Now())
 }
 
 // showVitessMigrationsForKeyspace connects to vtgate and runs
@@ -778,9 +778,27 @@ func parseInt64(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
+// estimateETASeconds projects a copy ETA from the copy rate so far:
+// elapsed * remaining / copied. The provider reports eta_seconds as -1 (or 0)
+// while it considers the ETA unknown, so an actively-copying shard could
+// otherwise show no ETA for its entire copy phase. Returns 0 (unknown) unless
+// the shard has a start time, positive elapsed time, and at least one copied
+// row to derive a rate from.
+func estimateETASeconds(startedAt *time.Time, now time.Time, rowsCopied, tableRows int64) int64 {
+	if startedAt == nil || rowsCopied <= 0 || tableRows <= rowsCopied {
+		return 0
+	}
+	elapsed := now.Sub(*startedAt).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return int64(elapsed * float64(tableRows-rowsCopied) / float64(rowsCopied))
+}
+
 // aggregateShardProgress groups SHOW VITESS_MIGRATIONS rows by migration_uuid
-// and produces per-table progress with per-shard breakdown.
-func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, int) {
+// and produces per-table progress with per-shard breakdown. now anchors the
+// copy-rate ETA estimate for shards whose provider-reported ETA is unknown.
+func aggregateShardProgress(rows []vitessMigrationRow, now time.Time) ([]engine.TableProgress, int) {
 	type tableKey struct {
 		keyspace string
 		table    string
@@ -846,9 +864,6 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 		tableState := state.Vitess.Complete
 		for i, sh := range shards {
 			tblTableRows += sh.tableRows
-			if sh.etaSeconds > maxETA {
-				maxETA = sh.etaSeconds
-			}
 			if !sh.isImmediate {
 				isInstant = false
 			}
@@ -871,6 +886,23 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 			// deploy request.
 			shardState := state.EffectiveVitessState(sh.status, sh.readyToComplete)
 
+			// A copy ETA is only meaningful while a shard is still copying:
+			// after ready_to_complete/complete the copy is done (any reported
+			// value is stale), and queued/failed shards have no copy to
+			// project. For a copying shard, prefer the provider-reported ETA,
+			// normalizing its -1 "unknown" sentinel to 0; while it is unknown,
+			// estimate one from the copy rate so far.
+			var shardETA int64
+			if shardState == state.Vitess.Running {
+				shardETA = max(sh.etaSeconds, 0)
+				if shardETA == 0 {
+					shardETA = estimateETASeconds(sh.startedAt, now, sh.rowsCopied, sh.tableRows)
+				}
+			}
+			if shardETA > maxETA {
+				maxETA = shardETA
+			}
+
 			shardPct := min(sh.progress, 100)
 			shardCopied := sh.rowsCopied
 			// When a shard is ready for cutover, the copy phase is complete.
@@ -890,7 +922,7 @@ func aggregateShardProgress(rows []vitessMigrationRow) ([]engine.TableProgress, 
 				Progress:        shardPct,
 				RowsCopied:      shardCopied,
 				RowsTotal:       sh.tableRows,
-				ETASeconds:      sh.etaSeconds,
+				ETASeconds:      shardETA,
 				CutoverAttempts: sh.cutoverAttempts,
 			}
 
