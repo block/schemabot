@@ -757,7 +757,12 @@ func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
 	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request:")
 }
 
-func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts — in the running summary and on the table's
+// progress line — so early progress on a huge table reads as the small
+// fraction it is instead of a rounded-up 1%. The bar still lights its first
+// segment so the copy reads as started.
+func TestRenderApplyStatusComment_SubPercentRowCopyShowsFraction(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
@@ -772,8 +777,8 @@ func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *te
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "1 running (1%)")
-	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, result, "1 running (0.19%)")
+	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, result, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, result, " 0%")
 }

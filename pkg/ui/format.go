@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -176,15 +177,37 @@ func ClampPercent(pct int) int {
 	return pct
 }
 
-// RowCopyDisplayPercent returns the percentage to show for row-copy progress.
-// A non-zero copied row count means copying has begun, so display at least 1%
-// even when integer progress rounds down to 0%.
+// RowCopyDisplayPercent returns the whole-number percentage for row-copy
+// progress bars and threshold comparisons. A non-zero copied row count means
+// copying has begun, so it reports at least 1% even when integer progress
+// rounds down to 0%. Textual percents render through FormatRowCopyPercent,
+// which shows the real sub-1% fraction instead of the bump.
 func RowCopyDisplayPercent(pct int, rowsCopied int64) int {
 	displayPercent := ClampPercent(pct)
 	if displayPercent == 0 && rowsCopied > 0 {
 		return 1
 	}
 	return displayPercent
+}
+
+// FormatRowCopyPercent renders row-copy progress as a percent string. Whole
+// percents render as integers; a copy that has begun but not yet reached 1%
+// shows two decimals computed from the row counts (e.g. "0.03%"), so early
+// progress on a huge table reads as the small fraction it is instead of a
+// rounded-up 1%. The fraction is clamped away from "0.00%" (copying has
+// begun) and away from "1.00%" (the engine's whole-number percent still says
+// 0). Without a row total to compute a fraction from, it falls back to "<1%".
+func FormatRowCopyPercent(pct int, rowsCopied, rowsTotal int64) string {
+	display := ClampPercent(pct)
+	if display > 0 || rowsCopied <= 0 {
+		return fmt.Sprintf("%d%%", display)
+	}
+	if rowsTotal <= 0 {
+		return "<1%"
+	}
+	frac := float64(rowsCopied) / float64(rowsTotal) * 100
+	frac = math.Min(math.Max(frac, 0.01), 0.99)
+	return fmt.Sprintf("%.2f%%", frac)
 }
 
 // NowFunc returns the current time. Override in previews for deterministic output.

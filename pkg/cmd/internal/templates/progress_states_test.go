@@ -638,14 +638,15 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (22%)")
 	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
 
-	// A verify that has only just begun still renders as visibly started: a
-	// non-zero checked count floors the display at 1% instead of showing an
-	// empty "not started" bar while verification is actively running.
+	// A verify that has only just begun still renders as visibly started: the
+	// bar shows a first segment, and the percent shows the true sub-1% fraction
+	// (floored away from 0.00%) instead of an empty "not started" display while
+	// verification is actively running.
 	justStarted := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 1, ChecksumRowsTotal: 1000000,
 	})
-	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (1%)")
+	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (0.01%)")
 	assert.Contains(t, justStarted, "🟦")
 }
 
@@ -843,7 +844,11 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	assert.NotContains(t, output, "Recovering state...")
 }
 
-func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts, with the bar's first segment lit so the
+// operator sees both that copying started and how little of a huge table has
+// actually copied.
+func TestFormatTableProgress_SubPercentRowCopyShowsFraction(t *testing.T) {
 	tp := TableProgress{
 		TableName:       "orders",
 		ChangeType:      "alter",
@@ -855,7 +860,7 @@ func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing
 
 	output := FormatTableProgress(tp)
 
-	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, output, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, output, " 0%")
 }

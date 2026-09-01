@@ -136,6 +136,26 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
+func TestFormatRowCopyPercent(t *testing.T) {
+	// Whole percents render as integers; nothing copied renders as 0%.
+	assert.Equal(t, "0%", FormatRowCopyPercent(0, 0, 1_000_000))
+	assert.Equal(t, "45%", FormatRowCopyPercent(45, 450_000, 1_000_000))
+	assert.Equal(t, "100%", FormatRowCopyPercent(100, 1_000_000, 1_000_000))
+	assert.Equal(t, "100%", FormatRowCopyPercent(145, 42, 1_000_000))
+
+	// Begun but sub-1%: the true fraction, computed from the row counts.
+	assert.Equal(t, "0.03%", FormatRowCopyPercent(0, 13_186_540, 43_234_523_345))
+	assert.Equal(t, "0.19%", FormatRowCopyPercent(0, 3_000, 1_604_159))
+
+	// Clamped away from 0.00% (copying has begun) and away from 1.00% (the
+	// whole-number percent still says 0).
+	assert.Equal(t, "0.01%", FormatRowCopyPercent(0, 1, 1_000_000))
+	assert.Equal(t, "0.99%", FormatRowCopyPercent(0, 9_999, 1_000_000))
+
+	// No row total to compute a fraction from.
+	assert.Equal(t, "<1%", FormatRowCopyPercent(0, 42, 0))
+}
+
 func TestLintReasons(t *testing.T) {
 	t.Run("splits engine-joined violations into cleaned messages", func(t *testing.T) {
 		assert.Equal(t,
