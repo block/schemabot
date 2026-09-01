@@ -347,6 +347,69 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, "remote-b", other.ExternalID)
 	})
 
+	// ApplyIdentifierForRemoteApply_NamesTheApplyThisPlaneDispatched verifies the
+	// correlation an operator depends on when another change holds their
+	// database: the data plane names the holder by its own identifier, and this
+	// turns it back into the handle the control-plane CLI accepts. Sibling
+	// operations of one deployment share the remote apply, so the shared shape is
+	// still one answer.
+	t.Run("ApplyIdentifierForRemoteApply_NamesTheApplyThisPlaneDispatched", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_holder_lookup_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_holder_lookup", 921)
+		first := createOperation(t, store, apply.ID, "region-a", "shard/-80")
+		sibling := createOperation(t, store, apply.ID, "region-a", "shard/80-")
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, first, "remote-holder"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, sibling, "remote-holder"))
+
+		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-holder")
+		require.NoError(t, err)
+		assert.Equal(t, "apply_operation_holder_lookup", identifier)
+	})
+
+	// ApplyIdentifierForRemoteApply_OffersNoHandleForWorkThisPlaneDidNotStart
+	// verifies the empty answer stays empty. A remote apply this control plane
+	// never dispatched belongs to a direct engine run or another control plane,
+	// and an operation that recorded no remote identifier must not be matched by
+	// a caller that has none either — both would name the wrong schema change.
+	t.Run("ApplyIdentifierForRemoteApply_OffersNoHandleForWorkThisPlaneDidNotStart", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_holder_unknown_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_holder_unknown", 922)
+		createOperation(t, store, apply.ID, "region-a", "shard/-80")
+
+		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-never-dispatched")
+		require.NoError(t, err)
+		assert.Empty(t, identifier)
+
+		identifier, err = store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "")
+		require.NoError(t, err)
+		assert.Empty(t, identifier, "an empty identifier correlates to nothing, not to every operation that recorded none")
+	})
+
+	// ApplyIdentifierForRemoteApply_RefusesToGuessBetweenTwoApplies verifies an
+	// already-broken correlation is reported rather than resolved. One remote
+	// apply belonging to two applies means the deployment invariant was violated
+	// upstream, and naming either would send an operator to the wrong change.
+	t.Run("ApplyIdentifierForRemoteApply_RefusesToGuessBetweenTwoApplies", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		firstLock := CreateLock(t, store, "operation_holder_ambiguous_db", storage.DatabaseTypeMySQL)
+		secondLock := CreateLock(t, store, "operation_holder_ambiguous_other_db", storage.DatabaseTypeMySQL)
+		first := CreateApply(t, store, firstLock, "apply_operation_holder_first", 923)
+		second := CreateApply(t, store, secondLock, "apply_operation_holder_second", 924)
+		firstOp := createOperation(t, store, first.ID, "region-a", "shard/-80")
+		secondOp := createOperation(t, store, second.ID, "region-a", "shard/-80")
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, first.ID, firstOp, "remote-shared"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, second.ID, secondOp, "remote-shared"))
+
+		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-shared")
+		require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
+		assert.Empty(t, identifier)
+	})
+
 	// FindNextApplyOperation_ConcurrentSingleWinner verifies contending drivers
 	// cannot claim one pending operation more than once.
 	t.Run("FindNextApplyOperation_ConcurrentSingleWinner", func(t *testing.T) {

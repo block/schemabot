@@ -61,6 +61,9 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Database = storage.CanonicalKey(req.Database)
+	req.DatabaseType = storage.CanonicalKey(req.DatabaseType)
+	req.Repository = storage.CanonicalKey(req.Repository)
 
 	if req.Database == "" || req.DatabaseType == "" || req.Owner == "" {
 		s.writeError(w, http.StatusBadRequest, "database, database_type, and owner are required")
@@ -129,6 +132,8 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Database = storage.CanonicalKey(req.Database)
+	req.DatabaseType = storage.CanonicalKey(req.DatabaseType)
 
 	if req.Database == "" || req.DatabaseType == "" {
 		s.writeError(w, http.StatusBadRequest, "database and database_type are required")
@@ -199,8 +204,8 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 
 // handleLockGet handles GET /api/locks/{database}/{dbtype}.
 func (s *Service) handleLockGet(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
-	dbType := r.PathValue("dbtype")
+	database := storage.CanonicalKey(r.PathValue("database"))
+	dbType := storage.CanonicalKey(r.PathValue("dbtype"))
 
 	if database == "" || dbType == "" {
 		s.writeError(w, http.StatusBadRequest, "database and dbtype path parameters are required")

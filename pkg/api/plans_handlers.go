@@ -46,9 +46,9 @@ func (s *Service) handlePlansList(w http.ResponseWriter, r *http.Request) {
 
 	opts := storage.ListPlansOptions{
 		Limit:       limit + 1,
-		Database:    r.URL.Query().Get("database"),
-		Environment: r.URL.Query().Get("environment"),
-		Repository:  r.URL.Query().Get("repository"),
+		Database:    storage.CanonicalKey(r.URL.Query().Get("database")),
+		Environment: storage.CanonicalKey(r.URL.Query().Get("environment")),
+		Repository:  storage.CanonicalKey(r.URL.Query().Get("repository")),
 		PullRequest: pullRequest,
 	}
 	if last > 0 {

@@ -61,7 +61,7 @@ var TerminalTaskStates = []string{
 // Stopped is NOT terminal — a stopped task can be resumed via Start.
 // FailedRetryable is NOT terminal — operator drivers may retry the task.
 func IsTerminalTaskState(s string) bool {
-	switch s {
+	switch NormalizeState(s) {
 	case Task.Completed, Task.Failed, Task.Reverted, Task.Cancelled:
 		return true
 	default:

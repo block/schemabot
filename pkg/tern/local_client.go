@@ -2647,9 +2647,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				return adopted, nil
 			}
 		}
+		// The conflict travels as structured facts beside the error text. The
+		// text is the engine's own and stays for the logs; a caller that must
+		// tell an operator why the database is busy renders the conflict.
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: conflictErr.Error(),
+			Conflict:     blocking.conflict(),
 		}, nil
 	}
 
@@ -2669,8 +2673,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 
 	// Build typed ApplyOptions for storage from the full wire option map, so
-	// every engine-relevant option the dispatch carried (branch, volume,
-	// rollback, ...) survives the round trip into the stored apply — the queued
+	// every engine-relevant option the dispatch carried (branch, rollback,
+	// ...) survives the round trip into the stored apply — the queued
 	// operator drive re-derives its options from the stored apply, not from this
 	// request. Revert window is ON by default — only disabled when skip_revert
 	// is explicitly set. The plan's validated target is authoritative over any
@@ -3124,7 +3128,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		resp.Metadata[k] = v
 	}
 
-	// Populate apply_id, engine, and volume from the apply record.
+	// Populate apply_id and engine from the apply record.
 	// The apply record's engine is the source of truth (set at apply creation time).
 	if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && apply != nil {
 		resp.ApplyId = apply.ApplyIdentifier
@@ -3140,7 +3144,6 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			resp.Engine = eng
 		}
 		opts := storage.ParseApplyOptions(apply.Options)
-		resp.Volume = int32(opts.Volume)
 		if opts.Branch != "" {
 			resp.Metadata = ensureMetadata(resp.Metadata)
 			resp.Metadata["existing_branch"] = opts.Branch

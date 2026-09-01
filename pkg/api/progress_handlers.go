@@ -180,7 +180,6 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 		ErrorCode:    deriveErrorCode(progressState, resp.ErrorMessage),
 		ErrorMessage: resp.ErrorMessage,
 		Summary:      resp.Summary,
-		Volume:       resp.Volume,
 	}
 
 	for _, t := range resp.Tables {
@@ -1021,10 +1020,6 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 			active.CompletedAt = op.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
 		}
 	}
-	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		active.Volume = opts.Volume
-	}
 	return active
 }
 
@@ -1269,12 +1264,9 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 	return nil
 }
 
-// overlayApplyOptions populates volume and options on the response from the apply record.
+// overlayApplyOptions populates the options map on the response from the apply record.
 func overlayApplyOptions(resp *apitypes.ProgressResponse, apply *storage.Apply) {
 	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		resp.Volume = int32(opts.Volume)
-	}
 	optMap := make(map[string]string)
 	if opts.DeferCutover {
 		optMap["defer_cutover"] = "true"

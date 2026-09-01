@@ -2,6 +2,7 @@ package ddl
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/spirit/pkg/parser"
@@ -45,6 +46,17 @@ type StatementParser interface {
 	// statement declares UNIQUE. Other statement shapes return an empty index
 	// name without an error.
 	CreateIndex(stmt string) (indexName, tableName string, unique bool, err error)
+
+	// CostScalesWithTableSize reports whether exactly one DDL statement's
+	// execution cost grows with the size of an existing table: an index
+	// build, a table copy or rebuild, or a full-table scan to validate a
+	// constraint. Whether a given ALTER runs as instant DDL is decided by the
+	// server at execution time, so this is a conservative statement-level
+	// judgement: it reports false only for clause shapes that are provably
+	// metadata-only, and true for anything it cannot prove cheap. Statements
+	// that don't touch an existing table's data (CREATE TABLE, DROP TABLE,
+	// ...) report false without an error.
+	CostScalesWithTableSize(stmt string) (bool, error)
 
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
@@ -135,6 +147,98 @@ func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 // currently needed only by the PostgreSQL storage bootstrapper.
 func (tidbStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, fmt.Errorf("CREATE INDEX inspection is not supported by the MySQL statement parser")
+}
+
+// CostScalesWithTableSize implements StatementParser. A standalone CREATE
+// INDEX always scans the table. An ALTER TABLE scales when any clause is not
+// provably metadata-only: index-backed constraint adds build an index, FOREIGN
+// KEY and CHECK adds validate every row, and column type changes, charset
+// conversions, and table-option rebuilds copy the table. Clause shapes MySQL
+// executes on metadata alone — plain column adds, renames, default changes,
+// constraint and index drops, visibility toggles, partition drops and
+// truncations, and comment-only option changes — report false.
+func (tidbStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
+	p := parser.New()
+	stmtNodes, _, err := p.Parse(stmt, "", "")
+	if err != nil {
+		return false, fmt.Errorf("parse statement %q: %w", statementPreview(stmt), err)
+	}
+	if len(stmtNodes) != 1 {
+		return false, fmt.Errorf(
+			"expected a single statement but %q parsed as %d statements; split with SplitStatements first",
+			statementPreview(stmt), len(stmtNodes),
+		)
+	}
+	switch node := stmtNodes[0].(type) {
+	case *ast.CreateIndexStmt:
+		return true, nil
+	case *ast.AlterTableStmt:
+		if slices.ContainsFunc(node.Specs, alterSpecScalesWithTableSize) {
+			return true, nil
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+// alterSpecScalesWithTableSize reports whether one ALTER TABLE clause forces
+// work proportional to the table's row count. The metadata-only cases are an
+// allowlist: a clause shape this function doesn't recognize is assumed to
+// scale, so a new or exotic clause over-reports size context rather than
+// hiding it on an expensive change.
+func alterSpecScalesWithTableSize(spec *ast.AlterTableSpec) bool {
+	switch spec.Tp { //nolint:exhaustive
+	case ast.AlterTableRenameColumn, ast.AlterTableRenameTable,
+		ast.AlterTableRenameIndex, ast.AlterTableAlterColumn, ast.AlterTableDropIndex,
+		ast.AlterTableDropForeignKey, ast.AlterTableDropCheck, ast.AlterTableIndexInvisible,
+		ast.AlterTableDropPartition, ast.AlterTableTruncatePartition:
+		return false
+	case ast.AlterTableAddPartitions:
+		// ADD PARTITION is two operations sharing one clause type, and the
+		// statement shows which: with partition definitions
+		// (ADD PARTITION (PARTITION p ...), the RANGE/LIST form) it attaches
+		// a new empty partition on metadata alone, while without them
+		// (ADD PARTITION PARTITIONS n, the HASH/KEY form) it changes the
+		// partition count and redistributes every existing row.
+		return len(spec.PartDefinitions) == 0
+	case ast.AlterTableAddColumns:
+		// A plain column add is metadata-only, but an inline PRIMARY KEY or
+		// UNIQUE builds an index and a STORED generated column is computed
+		// for every existing row.
+		for _, col := range spec.NewColumns {
+			for _, opt := range col.Options {
+				switch opt.Tp { //nolint:exhaustive
+				case ast.ColumnOptionPrimaryKey, ast.ColumnOptionUniqKey:
+					return true
+				case ast.ColumnOptionGenerated:
+					if opt.Stored {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	case ast.AlterTableOption:
+		// A table COMMENT change is metadata-only; other options (ENGINE=,
+		// ROW_FORMAT=, CONVERT TO CHARACTER SET, ...) can rebuild the table.
+		for _, opt := range spec.Options {
+			if opt.Tp != ast.TableOptionComment {
+				return true
+			}
+		}
+		return false
+	default:
+		// Index-backed constraint adds build an index; FOREIGN KEY and CHECK
+		// adds validate every existing row; MODIFY/CHANGE COLUMN can rebuild
+		// (a VARCHAR widening that crosses the length-byte boundary copies the
+		// table, and that boundary isn't visible from the statement alone).
+		// DROP COLUMN lands here too: it is instant only on MySQL 8.0.29+,
+		// only while the table's instant-change row-header budget lasts, not
+		// on ROW_FORMAT=COMPRESSED, and not without rebuilding any index on
+		// the column — none of which the statement shows.
+		return true
+	}
 }
 
 // statementTypeFromSpirit translates Spirit's parser-owned statement type into

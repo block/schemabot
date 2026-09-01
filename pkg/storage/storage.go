@@ -112,6 +112,7 @@ type Storage interface {
 // Locks prevent concurrent schema changes to the same database.
 // Lock key is database:type (not per-environment) to block concurrent changes
 // across environments and PRs.
+// Methods accepting a *Lock canonicalize its repository, database name, and database type in place before persisting.
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
@@ -150,6 +151,7 @@ type LockStore interface {
 // CheckStore manages SchemaBot's stored check state.
 // Per-database rows track internal status for a PR/environment/database.
 // Aggregate rows store the GitHub check_run_id for the visible GitHub Check Run.
+// Methods accepting a *Check canonicalize its repository, database name, database type, and environment in place before persisting.
 type CheckStore interface {
 	// Upsert creates or updates stored check state.
 	Upsert(ctx context.Context, check *Check) error
@@ -1163,6 +1165,22 @@ type ApplyOperationStore interface {
 	// ErrRemoteApplyDeploymentIDConflict.
 	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
 
+	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
+	// control plane dispatched as the given remote apply, or "" when it
+	// dispatched no such thing. It answers the question an operator asks about
+	// someone else's work: the data plane names the change holding a database by
+	// its own identifier, which resolves nowhere the operator can reach, and this
+	// turns that into the handle their CLI accepts.
+	//
+	// A remote apply this control plane did not start is the ordinary empty
+	// answer, not an error — another control plane or a direct engine run owns
+	// it, and there is no handle to offer. The correlation is read from the
+	// operation rows because a multi-operation apply has no single authoritative
+	// remote identifier; every operation carrying one remote apply id belongs to
+	// the same parent, so more than one parent matching means the correlation
+	// itself is broken and the store refuses to guess.
+	ApplyIdentifierForRemoteApply(ctx context.Context, externalID string) (string, error)
+
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
 
@@ -1350,7 +1368,7 @@ type ControlRequestStore interface {
 	// for use when that plane later reports the same operation succeeded. It
 	// only touches a failed row the mirror itself created: rows this plane
 	// queued are cleared by their own request lifecycle, and a row with no
-	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// lifecycle here — an operation this plane only proxies — would otherwise
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)

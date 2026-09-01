@@ -46,7 +46,7 @@ func classifyRunnerError(err error) error {
 // dynamically from there on throttler feedback, so apply throughput tracks
 // the target instance rather than a fixed constant.
 func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
-	threads, lockTimeout := e.copySettings()
+	threads, lockTimeout := e.threads, e.lockWaitTimeout
 	return &spiritmigration.Migration{
 		Host:                          host,
 		Username:                      username,

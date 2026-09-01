@@ -32,12 +32,45 @@ func (c *LocalClient) logApplyPausedForRetry(ctx context.Context, apply *storage
 		previousState, state.Apply.FailedRetryable)
 }
 
+// driveCancelled reports whether the drive's context has been cancelled, and
+// records in the server log that the apply is being handed back when it has.
+//
+// A cancelled drive is a process shutting down or a claim being released. From
+// that moment every engine call and storage write fails with the same
+// cancellation, so a failure observed under it describes the driver rather than
+// the schema change: the change itself is untouched and often still healthy on
+// the provider. Recording that failure would fail or pause a change that is
+// fine, and because the write recording it runs on the same cancelled context,
+// whether the false outcome lands at all is a race with the successor's claim.
+// That race is not the protection — this guard is. A settlement write detached
+// from the drive's context so it survives cancellation (context.WithoutCancel)
+// would record the false outcome reliably instead of rarely, so every
+// settlement write stays behind this guard whatever context it runs on.
+// The apply is left exactly as it stands, for the driver that reclaims it to
+// resume from its stored state.
+//
+// An operator-initiated stop or cancel does not rely on this path: the control
+// handler settles the tasks and the apply itself on its own request context,
+// and cancels the drive only so it stops iterating.
+func (c *LocalClient) driveCancelled(ctx context.Context, apply *storage.Apply, during string) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	c.logger.With(apply.IdentityLogAttrs()...).Info(
+		"drive cancelled "+during+"; handing the apply back for another driver to claim",
+		append(apply.MutableLogAttrs(), "error", ctx.Err())...)
+	return true
+}
+
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
 // If the apply is already in a terminal state (e.g., cancelled by Stop()), the
 // stored state is not overwritten; the settled state is adopted into the
 // in-memory apply so callers that notify observers afterwards report the
 // concurrent verdict instead of the stale pre-failure state.
 func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+	if c.driveCancelled(ctx, apply, "before recording that the apply failed") {
+		return
+	}
 	now := time.Now()
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
@@ -87,6 +120,9 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 // Non-terminal tasks move to failed_retryable so operator recovery can decide
 // which work to re-dispatch on the next attempt.
 func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+	if c.driveCancelled(ctx, apply, "before pausing the apply for retry") {
+		return
+	}
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
 			continue
