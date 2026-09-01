@@ -5020,6 +5020,7 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 		name        string
 		storedState string
 		remoteState string
+		remoteTasks []*ternv1.TableProgress
 		expected    string
 	}{
 		{
@@ -5106,16 +5107,37 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			remoteState: state.Apply.PreparingBranch,
 			expected:    state.Apply.Running,
 		},
+		{
+			name:        "a report with queued tables corrects a stored cutting_over to running",
+			storedState: state.Apply.CuttingOver,
+			remoteState: state.Apply.Running,
+			remoteTasks: []*ternv1.TableProgress{
+				{TableName: "users", Status: state.Task.Completed},
+				{TableName: "orders", Status: state.Task.Running},
+				{TableName: "payments", Status: state.Task.Pending},
+			},
+			expected: state.Apply.Running,
+		},
+		{
+			name:        "a stored cutting_over holds against a running report once no table is queued",
+			storedState: state.Apply.CuttingOver,
+			remoteState: state.Apply.Running,
+			remoteTasks: []*ternv1.TableProgress{
+				{TableName: "users", Status: state.Task.Completed},
+				{TableName: "orders", Status: state.Task.CuttingOver},
+			},
+			expected: state.Apply.CuttingOver,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState, false))
+			assert.Equal(t, tc.expected, applyStateFromRemoteProgress(tc.storedState, tc.remoteState, tc.remoteTasks, false))
 		})
 	}
 
 	assert.Equal(t, state.Apply.Running,
-		applyStateFromRemoteProgress(state.Apply.Stopped, state.Apply.Running, true),
+		applyStateFromRemoteProgress(state.Apply.Stopped, state.Apply.Running, nil, true),
 		"an operator-owned start may adopt active remote progress after a stale stopped write")
 }
 

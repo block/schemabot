@@ -279,6 +279,31 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.CuttingOver,
 		},
 		{
+			name: "queued work holds the apply in running over a sibling's cutover",
+			tasks: []*storage.Task{
+				{State: state.Task.CuttingOver},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "a rolling drive stays running while a table cuts over ahead of queued siblings",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+				{State: state.Task.Pending},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "cutover surfaces once no table is still queued",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+			},
+			wantState: state.Task.CuttingOver,
+		},
+		{
 			name: "running takes priority over revert_window",
 			tasks: []*storage.Task{
 				{State: state.Task.Running},

@@ -91,12 +91,13 @@ var Apply = struct {
 //  4. Any task REVERTED → Apply REVERTED
 //  5. All tasks COMPLETED → Apply COMPLETED
 //  6. Any task RECOVERING → Apply RECOVERING
-//  7. Any task CUTTING_OVER → Apply CUTTING_OVER
+//  7. Any task CUTTING_OVER, no task still PENDING → Apply CUTTING_OVER
 //  8. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
 //  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
 //  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
 //  11. Any task RUNNING → Apply RUNNING
-//  12. Any task in a post-copy phase while any task is still PENDING → Apply RUNNING
+//  12. Any task in a post-copy phase or cutting over while any task is still
+//     PENDING → Apply RUNNING
 //  13. Any task CATCHING_UP → Apply CATCHING_UP
 //  14. Any task CHECKSUMMING → Apply CHECKSUMMING
 //  15. Any task POST_CHECKSUM → Apply POST_CHECKSUM
@@ -106,7 +107,13 @@ var Apply = struct {
 // only once every table has started: while any table is still copying rows —
 // or still queued with its whole copy ahead of it — the apply is Running.
 // Once every table has at least begun and the active ones are draining or
-// verifying, the apply names that phase.
+// verifying, the apply names that phase. The cutover gate (7) waits for the
+// queue the same way: a sequential or rolling drive cuts tables over as each
+// finishes, so a table cutting over ahead of queued siblings keeps the apply
+// Running rather than announcing a cutover most tables have not reached.
+// This keeps the derived state monotone across a multi-table drive — it
+// never has to fall back from cutting_over to running when the next table
+// starts copying.
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -145,7 +152,7 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Recovering] > 0 {
 		return Apply.Recovering
 	}
-	if counts[Apply.CuttingOver] > 0 {
+	if counts[Apply.CuttingOver] > 0 && counts[Apply.Pending] == 0 {
 		return Apply.CuttingOver
 	}
 	waitingOrCompleted := counts[Apply.WaitingForCutover] + counts[Apply.Completed]
@@ -177,16 +184,17 @@ func DeriveApplyState(taskStates []string) string {
 	return Apply.Pending
 }
 
-// postCopyPhaseWithQueuedWork reports whether a task is draining or verifying
-// (catching up, checksumming, or post-checksum) while another task has not
-// started. Naming the phase at the apply level would overstate progress — the
-// queued tables still have their whole copy ahead — so the apply stays Running
-// until every table has begun.
+// postCopyPhaseWithQueuedWork reports whether a task is draining, verifying
+// (catching up, checksumming, or post-checksum), or cutting over while
+// another task has not started. Naming the phase at the apply level would
+// overstate progress — the queued tables still have their whole copy ahead —
+// so the apply stays Running until every table has begun.
 func postCopyPhaseWithQueuedWork(counts map[string]int) bool {
 	if counts[Apply.Pending] == 0 {
 		return false
 	}
-	return counts[Apply.CatchingUp] > 0 || counts[Apply.Checksumming] > 0 || counts[Apply.PostChecksum] > 0
+	return counts[Apply.CatchingUp] > 0 || counts[Apply.Checksumming] > 0 ||
+		counts[Apply.PostChecksum] > 0 || counts[Apply.CuttingOver] > 0
 }
 
 // RolloutChild is one apply_operation's contribution to the parent apply's

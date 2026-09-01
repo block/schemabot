@@ -917,10 +917,10 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 
 // deriveOverallState determines the overall state from a list of tasks.
 // Priority order:
-//  1. Active work: CUTTING_OVER, then the least-advanced active phase
-//     (RUNNING, CATCHING_UP, CHECKSUMMING, POST_CHECKSUM — the post-copy
-//     phases surfacing only once every table has started), then
-//     WAITING_FOR_CUTOVER once nothing is still working
+//  1. Active work: CUTTING_OVER once no table is still queued, then the
+//     least-advanced active phase (RUNNING, CATCHING_UP, CHECKSUMMING,
+//     POST_CHECKSUM — the post-copy phases surfacing only once every table
+//     has started), then WAITING_FOR_CUTOVER once nothing is still working
 //  2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
 //  3. FAILED_RETRYABLE - operator recovery may retry failed task work
 //  4. PENDING - more work queued
@@ -965,20 +965,22 @@ func deriveOverallState(tasks []*storage.Task) string {
 		}
 	}
 
-	// Active work, mirroring state.DeriveApplyState: once any table starts
-	// its cutover the apply is transitioning; otherwise surface the
-	// least-advanced active phase — while any table still copies rows the
-	// apply is running, the post-copy phases surface only once every table
-	// has started and is draining or verifying, and waiting_for_cutover only
-	// when nothing is still working. A queued table still has its whole copy
-	// ahead of it, so naming a sibling's post-copy phase would overstate
-	// progress.
+	// Active work, mirroring state.DeriveApplyState: a cutover surfaces only
+	// once no table is still queued; otherwise surface the least-advanced
+	// active phase — while any table still copies rows the apply is running,
+	// the post-copy phases surface only once every table has started and is
+	// draining or verifying, and waiting_for_cutover only when nothing is
+	// still working. A queued table still has its whole copy ahead of it, so
+	// naming a sibling's post-copy phase or cutover would overstate progress —
+	// a sequential or rolling drive cuts tables over as each finishes, and
+	// the derived state must not announce cutting_over only to fall back to
+	// running when the next table starts copying.
 	switch {
-	case hasCuttingOver:
+	case hasCuttingOver && !hasPending:
 		return state.Task.CuttingOver
 	case hasRunning:
 		return state.Task.Running
-	case hasPending && (hasCatchingUp || hasChecksumming || hasPostChecksum):
+	case hasPending && (hasCatchingUp || hasChecksumming || hasPostChecksum || hasCuttingOver):
 		return state.Task.Running
 	case hasCatchingUp:
 		return state.Task.CatchingUp
