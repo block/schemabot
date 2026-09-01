@@ -40,6 +40,7 @@ func TestValidateDatabaseApp(t *testing.T) {
 		{name: "trailing hyphen", app: "billing-", want: "start and end with a letter or digit"},
 		{name: "consecutive hyphens", app: "billing--service", want: "consecutive hyphens"},
 		{name: "too long", app: strings.Repeat("a", maxAppNameChars+1), want: "exceeds"},
+		{name: "multibyte over the length cap reports the charset violation", app: strings.Repeat("í", maxAppNameChars+1), want: "lowercase alphanumeric"},
 	}
 	for _, tc := range invalid {
 		t.Run(tc.name, func(t *testing.T) {
