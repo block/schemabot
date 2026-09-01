@@ -82,22 +82,32 @@ const maxTablesInFilterError = 20
 // successful pull.
 func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) error {
 	needle := strings.ToLower(filter)
-	available := make([]string, 0)
+	matched := make(map[string]map[string]string, len(resp.Namespaces))
 	var kept int32
 	for name, ns := range resp.Namespaces {
 		keptTables := make(map[string]string)
 		for table, ddl := range ns.Tables {
-			available = append(available, table)
 			if strings.Contains(strings.ToLower(table), needle) {
 				keptTables[table] = ddl
 			}
 		}
+		matched[name] = keptTables
+		kept += int32(len(keptTables))
+	}
+	if kept == 0 {
+		return errNoTableMatches(resp, filter)
+	}
+	for name, ns := range resp.Namespaces {
+		keptTables := matched[name]
 		if len(keptTables) == 0 {
 			delete(resp.Namespaces, name)
 			continue
 		}
 		ns.Tables = keptTables
 		ns.Artifacts = nil
+		if ns.NamespaceCatalog != nil {
+			ns.NamespaceCatalog.TableCount = int32(len(keptTables))
+		}
 		if ns.TableCatalog != nil {
 			keptCatalog := make(map[string]*apitypes.TableCatalog, len(keptTables))
 			for table, catalog := range ns.TableCatalog {
@@ -118,20 +128,29 @@ func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) er
 			}
 			ns.Lint = keptLint
 		}
-		kept += int32(len(keptTables))
-	}
-	if kept == 0 {
-		sort.Strings(available)
-		available = slices.Compact(available)
-		hint := fmt.Sprintf("%d tables available; run without --table to list them", len(available))
-		if len(available) <= maxTablesInFilterError {
-			hint = "available tables: " + strings.Join(available, ", ")
-		}
-		return fmt.Errorf("no table matching %q in database %s environment %s (%s)",
-			filter, resp.Database, resp.Environment, hint)
 	}
 	resp.TableCount = kept
 	return nil
+}
+
+// errNoTableMatches names the filter, the database, and the environment, and
+// lists the pulled table names when the list is short enough to read, so a
+// typo is a one-round-trip fix.
+func errNoTableMatches(resp *apitypes.PullSchemaResponse, filter string) error {
+	var available []string
+	for _, ns := range resp.Namespaces {
+		for table := range ns.Tables {
+			available = append(available, table)
+		}
+	}
+	sort.Strings(available)
+	available = slices.Compact(available)
+	hint := fmt.Sprintf("%d tables available; run without --table to list them", len(available))
+	if len(available) <= maxTablesInFilterError {
+		hint = "available tables: " + strings.Join(available, ", ")
+	}
+	return fmt.Errorf("no table matching %q in database %s environment %s (%s)",
+		filter, resp.Database, resp.Environment, hint)
 }
 
 func writePullSchemaResponse(w io.Writer, resp *apitypes.PullSchemaResponse) error {

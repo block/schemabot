@@ -100,7 +100,8 @@ func TestFilterPullSchemaTablesKeepsSubstringMatches(t *testing.T) {
 					"user_settings": "CREATE TABLE `user_settings` (`id` bigint NOT NULL);",
 					"payments":      "CREATE TABLE `payments` (`id` bigint NOT NULL);",
 				},
-				Artifacts: map[string]string{"vschema": "{}"},
+				Artifacts:        map[string]string{"vschema": "{}"},
+				NamespaceCatalog: &apitypes.NamespaceCatalog{Name: "orders", Engine: "mysql", TableCount: 3},
 				TableCatalog: map[string]*apitypes.TableCatalog{
 					"users":    {Name: "users"},
 					"payments": {Name: "payments"},
@@ -126,6 +127,8 @@ func TestFilterPullSchemaTablesKeepsSubstringMatches(t *testing.T) {
 		"user_settings": "CREATE TABLE `user_settings` (`id` bigint NOT NULL);",
 	}, ns.Tables)
 	assert.Nil(t, ns.Artifacts, "namespace-scoped artifacts must be omitted from a table-filtered pull")
+	require.NotNil(t, ns.NamespaceCatalog)
+	assert.Equal(t, int32(len(ns.Tables)), ns.NamespaceCatalog.TableCount, "the namespace catalog count must match the filtered tables")
 	assert.Equal(t, map[string]*apitypes.TableCatalog{"users": {Name: "users"}}, ns.TableCatalog)
 	require.Len(t, ns.Lint, 1)
 	assert.Equal(t, "users", ns.Lint[0].Table)
