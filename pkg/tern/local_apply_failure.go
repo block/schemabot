@@ -42,6 +42,10 @@ func (c *LocalClient) logApplyPausedForRetry(ctx context.Context, apply *storage
 // the provider. Recording that failure would fail or pause a change that is
 // fine, and because the write recording it runs on the same cancelled context,
 // whether the false outcome lands at all is a race with the successor's claim.
+// That race is not the protection — this guard is. A settlement write detached
+// from the drive's context so it survives cancellation (context.WithoutCancel)
+// would record the false outcome reliably instead of rarely, so every
+// settlement write stays behind this guard whatever context it runs on.
 // The apply is left exactly as it stands, for the driver that reclaims it to
 // resume from its stored state.
 //
