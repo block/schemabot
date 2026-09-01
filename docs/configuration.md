@@ -737,7 +737,18 @@ on the storage dialect:
   ```
 
   Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows.
+  one row, which slows claiming as apply history grows. And one bootstrapped
+  before refused applies started naming the schema change holding the
+  database needs:
+
+  ```sql
+  CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);
+  ```
+
+  Without it, resolving the holding change behind a refused apply scans the
+  full operation history for one remote identifier. The refusal still reads
+  correctly — the lookup is an optimization, never load-bearing — it just
+  gets slower to record as apply history grows.
 
 The rest of this section describes the MySQL flow.
 
