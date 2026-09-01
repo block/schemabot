@@ -24,6 +24,13 @@ func previewShardStatuses(ops []presentation.Operation) []ShardStatus {
 const (
 	previewMutesIndex      = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);"
 	previewMutesIndexDrift = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
+
+	// Copy figures for the mutes fixture's reporting shard. The shard percent
+	// is derived from the row figures so the summary line and the rows line
+	// cannot drift apart when either is edited.
+	previewMutesRowsCopied  = int64(914707)
+	previewMutesRowsTotal   = int64(1466232)
+	previewMutesCopyPercent = int(previewMutesRowsCopied * 100 / previewMutesRowsTotal)
 )
 
 func previewMutesCell(shard string) ShardCell {
@@ -40,8 +47,10 @@ func PreviewCommentShardedApplyInProgress() string {
 			Keyspace: "cdb_resolute_sharded",
 			Tables: []ShardedTableStatus{{
 				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: previewMutesRowsCopied, RowsTotal: previewMutesRowsTotal, ETASeconds: 195,
+				ShardsReporting: 1,
 				Shards: []ShardProgressData{
-					{Shard: "-40", Status: state.Task.Running, PercentComplete: 45},
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: previewMutesCopyPercent},
 					{Shard: "40-80", Status: state.Task.Pending},
 					{Shard: "80-c0", Status: state.Task.Pending},
 					{Shard: "c0-", Status: state.Task.Pending},
@@ -214,7 +223,7 @@ func PreviewCommentShardedApplyDivergent() string {
 			Tables: []ShardedTableStatus{{
 				Table: "mutes", Status: state.Task.Running,
 				Shards: []ShardProgressData{
-					{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: previewMutesCopyPercent},
 					{Shard: "40-80", Status: state.Task.Pending},
 					{Shard: "80-c0", Status: state.Task.Pending},
 				},
@@ -269,7 +278,9 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 				Keyspace: "cdb_resolute_lookup",
 				Tables: []ShardedTableStatus{{
 					Table: "outcomes_lookup", Status: state.Task.Running,
-					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
+					RowsCopied: 540211, RowsTotal: 2000780, ETASeconds: 480,
+					ShardsReporting: 1,
+					Shards:          []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
 				}},
 				Shards: []ShardStatus{unshard(shards[1], "-")},
 				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},

@@ -49,7 +49,7 @@ func vschemaDiffsFromChanges(changes []engine.SchemaChange) []vschemaKeyspaceDif
 // Apply starts executing a schema change plan.
 // Creates a PlanetScale branch, applies DDL via MySQL connection to the branch,
 // then creates and starts a deploy request.
-func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *engine.ApplyResult, retErr error) {
 	r := *req
 	r.Database = e.resolveDatabase(req.Credentials, req.Database)
 	req = &r
@@ -122,6 +122,34 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	var branchName string
 	branchStart := time.Now()
 
+	// A branch SchemaBot creates exists only to carry this apply's DDL into a
+	// deploy request. Once that deploy request exists it owns the teardown
+	// (AutoDeleteBranch); until then nothing does, so an apply that fails while
+	// preparing the branch would strand it. Branches are quota'd, and the
+	// failures in this window are the ordinary ones — DDL the engine refuses —
+	// so the strand accumulates until branch creation itself starts failing for
+	// unrelated schema changes. ownedBranch names the branch this apply is
+	// responsible for; it is cleared once the deploy request takes ownership,
+	// and it is never set for an operator-supplied branch, which SchemaBot does
+	// not own.
+	//
+	// A create-deploy-request response lost to a timeout leaves ownedBranch set
+	// even though the deploy request may exist server-side. Deleting the branch
+	// is still the right cleanup there, not a hazard: deploying is a separate,
+	// later call that only runs after the create succeeded client-side, so the
+	// orphan carries no running schema change, and the apply records the deploy
+	// request identifier only after a successful response, so no retry will
+	// ever drive it. Should the API refuse to delete a branch while its deploy
+	// request is open, the refusal surfaces on the cleanup's error path with
+	// the identifiers for manual reclamation.
+	ownedBranch := ""
+	defer func() {
+		if retErr == nil || ownedBranch == "" {
+			return
+		}
+		e.deleteOwnedBranch(ctx, client, org, req.Database, ownedBranch, retErr)
+	}()
+
 	if existingBranch != "" {
 		// Reuse existing branch: wait for ready, refresh schema from main, wait again
 		branchName = existingBranch
@@ -181,6 +209,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		if err != nil {
 			return nil, fmt.Errorf("create branch: %w", err)
 		}
+		ownedBranch = branchName
 
 		// Wait for branch to be ready
 		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
@@ -274,6 +303,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
+	// The deploy request now owns the branch's teardown.
+	ownedBranch = ""
 	emitEvent(deployRequestCreatedEvent(dr, branchName))
 	persistState(&psMetadata{
 		BranchName:            branchName,
