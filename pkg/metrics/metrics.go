@@ -1040,6 +1040,43 @@ func RecordApplyManifestHold(ctx context.Context, database, deployment, environm
 // a data plane running a version that predates sibling-operation attach —
 // so the operator action is to upgrade (or roll back) the named database's data
 // plane before retrying the blocked applies.
+var knownRemoteApplyDispatchRecoveryOutcomes = map[string]bool{
+	"attempted":  true,
+	"resolved":   true,
+	"unresolved": true,
+	"failed":     true,
+}
+
+// RecordRemoteApplyDispatchRecovery increments the counter for re-sent
+// dispatches of an apply left active with no remote apply id — a dispatch whose
+// response never reached storage. Outcome should be one of:
+//   - "attempted": a recovery was started. Its rate is the rate at which
+//     dispatch responses are being lost, which is the signal worth alerting on:
+//     a sustained rate means drives are dying or timing out between the Apply
+//     RPC and the write that records its id.
+//   - "resolved": the re-send returned a remote apply id, so the ambiguity is
+//     gone and the apply is tracked again. This is the expected outcome and
+//     should account for nearly all attempts.
+//   - "unresolved": the re-send learned nothing, so the apply was left
+//     claimable to be re-sent under the same key. A few are normal during a
+//     data-plane restart; a run of them on one apply means it is occupying a
+//     driver on every claim without progressing, so investigate the target.
+//   - "failed": the re-send was definitively refused, so the apply was failed
+//     closed. The refusal covers the request, not the target — an earlier
+//     dispatch of the same change may still be running there, so reconcile the
+//     named database.
+func RecordRemoteApplyDispatchRecovery(ctx context.Context, database, environment, outcome string) {
+	if !knownRemoteApplyDispatchRecoveryOutcomes[outcome] {
+		outcome = "unknown"
+	}
+	addCounter(ctx, "schemabot.remote_apply_dispatch_recovery_total",
+		"Total re-sent dispatches resolving an apply left active with no remote apply id", "{dispatch}",
+		attribute.String("database", database),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 func RecordRemoteApplyKeyEchoMismatch(ctx context.Context, database, environment string) {
 	addCounter(ctx, "schemabot.remote_apply_key_echo_mismatch_total",
 		"Total remote apply dispatches refused because the response's operation key did not match the dispatched operation", "{dispatch}",
