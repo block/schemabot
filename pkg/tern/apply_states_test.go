@@ -271,12 +271,12 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.PostChecksum,
 		},
 		{
-			name: "a table cutting over outranks a sibling's drain",
+			name: "a draining sibling holds the apply out of cutting_over",
 			tasks: []*storage.Task{
 				{State: state.Task.CuttingOver},
 				{State: state.Task.CatchingUp},
 			},
-			wantState: state.Task.CuttingOver,
+			wantState: state.Task.CatchingUp,
 		},
 		{
 			name: "queued work holds the apply in running over a sibling's cutover",
@@ -305,9 +305,17 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.Running,
 		},
 		{
-			name: "cutover surfaces once no table is still queued or copying",
+			name: "cutover surfaces once it is the least advanced active work",
 			tasks: []*storage.Task{
 				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+			},
+			wantState: state.Task.CuttingOver,
+		},
+		{
+			name: "a parked sibling does not hold a cutover back",
+			tasks: []*storage.Task{
+				{State: state.Task.WaitingForCutover},
 				{State: state.Task.CuttingOver},
 			},
 			wantState: state.Task.CuttingOver,

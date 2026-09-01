@@ -5129,7 +5129,27 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			expected: state.Apply.Running,
 		},
 		{
-			name:        "a stored cutting_over holds against a running report once every table finished copying",
+			name:        "a report with a verifying table corrects a stored cutting_over",
+			storedState: state.Apply.CuttingOver,
+			remoteState: state.Apply.CatchingUp,
+			remoteTasks: []*ternv1.TableProgress{
+				{TableName: "users", Status: state.Task.Completed},
+				{TableName: "orders", Status: state.Task.CatchingUp},
+			},
+			expected: state.Apply.CatchingUp,
+		},
+		{
+			name:        "a parked table does not contradict a stored cutting_over",
+			storedState: state.Apply.CuttingOver,
+			remoteState: state.Apply.WaitingForCutover,
+			remoteTasks: []*ternv1.TableProgress{
+				{TableName: "users", Status: state.Task.Completed},
+				{TableName: "orders", Status: state.Task.WaitingForCutover},
+			},
+			expected: state.Apply.CuttingOver,
+		},
+		{
+			name:        "a stored cutting_over holds once no table is in an earlier active phase",
 			storedState: state.Apply.CuttingOver,
 			remoteState: state.Apply.Running,
 			remoteTasks: []*ternv1.TableProgress{
