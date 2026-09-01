@@ -38,6 +38,8 @@ type Engine interface {
 }
 ```
 
+`pkg/engine/enginetest` pins the conformance decision for every interface method.
+
 **Plan** computes the DDL needed to transform the current schema into the desired schema. It fetches the live schema from the database, diffs it against the target `.sql` files, and returns DDL statements with lint warnings.
 
 **Apply** starts executing the DDL asynchronously. Call `Progress()` to poll for status.
