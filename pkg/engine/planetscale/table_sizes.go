@@ -15,8 +15,8 @@ import (
 )
 
 // tableRowEstimate aggregates one table's per-shard row estimates across a
-// keyspace: the summed total and the largest single shard (the write-blocking
-// blast radius of a shard-at-a-time apply). Values come from
+// keyspace: the summed total and the largest single shard (the biggest chunk
+// a shard-at-a-time apply works through at once). Values come from
 // information_schema TABLE_ROWS — approximate and possibly stale, display
 // only.
 type tableRowEstimate struct {
@@ -61,7 +61,12 @@ func (e *Engine) attachTableSizes(ctx context.Context, creds *engine.Credentials
 	shardCount := apiShardCount
 	var estimates map[string]*tableRowEstimate
 	if creds != nil && creds.DSN != "" {
-		probed, probedShards, err := e.fetchKeyspaceTableRowEstimates(ctx, creds.DSN, keyspace)
+		// One budget covers the keyspace's whole sequential shard walk: sizes
+		// are display-only, so a slow shard abandons the probe rather than
+		// stalling the plan.
+		probeCtx, cancelProbe := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+		probed, probedShards, err := e.fetchKeyspaceTableRowEstimates(probeCtx, creds.DSN, keyspace)
+		cancelProbe()
 		if err != nil {
 			e.logger.Warn("table row estimates unavailable; the plan will omit them for this keyspace",
 				"keyspace", keyspace, "error", err)

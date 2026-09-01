@@ -473,8 +473,8 @@ message TableChange {
   // Number of shards this table change spans. Zero when the target is not
   // sharded or the shard topology is unknown.
   int32 shard_count = 11;
-  // Approximate row count of the largest single shard — the write-blocking
-  // blast radius of a shard-at-a-time apply. Unset when the target is not
+  // Approximate row count of the largest single shard — the biggest chunk a
+  // shard-at-a-time apply works through at once. Unset when the target is not
   // sharded or no estimate is available. Approximate like estimated_rows.
   optional int64 largest_shard_rows = 12;
   // Approximate on-disk footprint of the table (data plus indexes), summed

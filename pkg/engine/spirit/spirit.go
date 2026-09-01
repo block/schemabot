@@ -571,9 +571,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	// Best-effort per-table row estimates for plan display. Sizes are
-	// informational — a failed read must not fail the plan, so log the miss
-	// and render the plan without them.
-	sizeEstimates, err := e.fetchTableSizeEstimates(ctx, req.Credentials.DSN)
+	// informational — a failed or slow read must not fail or stall the plan,
+	// so the probe runs under its own budget, and a miss logs and renders the
+	// plan without sizes.
+	probeCtx, cancelProbe := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+	sizeEstimates, err := e.fetchTableSizeEstimates(probeCtx, req.Credentials.DSN)
+	cancelProbe()
 	if err != nil {
 		e.logger.Warn("table size estimates unavailable; the plan will omit table sizes",
 			"database", database, "error", err)

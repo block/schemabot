@@ -1218,8 +1218,8 @@ type TableChange struct {
 	// Number of shards this table change spans. Zero when the target is not
 	// sharded or the shard topology is unknown.
 	ShardCount int32 `protobuf:"varint,11,opt,name=shard_count,json=shardCount,proto3" json:"shard_count,omitempty"`
-	// Approximate row count of the largest single shard — the write-blocking
-	// blast radius of a shard-at-a-time apply. Unset when the target is not
+	// Approximate row count of the largest single shard — the biggest chunk a
+	// shard-at-a-time apply works through at once. Unset when the target is not
 	// sharded or no estimate is available. Approximate like estimated_rows.
 	LargestShardRows *int64 `protobuf:"varint,12,opt,name=largest_shard_rows,json=largestShardRows,proto3,oneof" json:"largest_shard_rows,omitempty"`
 	// Approximate on-disk footprint of the table (data plus indexes), summed

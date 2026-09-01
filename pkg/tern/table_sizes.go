@@ -38,7 +38,8 @@ func (a *tableSizeAccumulator) sizes() (shardCount int, estimatedRows, largestSh
 // sharded plan keeps one TableChange per table while the same table repeats
 // across the keyspace's shards; this fold gives that single entry the
 // cross-shard totals — sum of per-shard estimates, largest single shard (the
-// write-blocking blast radius of a shard-at-a-time apply), and the number of
+// biggest chunk a shard-at-a-time apply works through at once), and the
+// number of
 // planned shards. Only sharded SchemaChanges (non-empty Shard.Name)
 // contribute: an engine that aggregates a sharded target itself emits
 // unsharded changes, and its own values pass through the namespace view

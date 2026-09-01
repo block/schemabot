@@ -338,6 +338,12 @@ type LintViolation struct {
 	Severity string // "warning" or "error"
 }
 
+// TableSizeProbeTimeout bounds the plan-time table-size statistics probe.
+// Size estimates are display-only, so a probe that cannot answer within this
+// budget is abandoned and the plan proceeds without sizes — a slow or wedged
+// statistics read must never extend plan latency past this bound.
+const TableSizeProbeTimeout = 5 * time.Second
+
 // TableChange describes a change to a single table within a SchemaChange namespace.
 type TableChange struct {
 	Table     string // Table name
@@ -375,7 +381,8 @@ type TableChange struct {
 	// the target is not sharded or the shard topology is unknown.
 	ShardCount int
 	// LargestShardRows is the approximate row count of the largest single
-	// shard — the write-blocking blast radius of a shard-at-a-time apply. Nil
+	// shard — the biggest chunk a shard-at-a-time apply works through at once.
+	// Nil
 	// when the target is not sharded or no estimate is available.
 	LargestShardRows *int64
 }
