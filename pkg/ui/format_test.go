@@ -253,7 +253,7 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 
 // A byte count reads as a magnitude: bytes below a kibibyte, and one decimal
 // place with a binary unit above it, so a table's footprint is scannable.
-func TestFormatBytes(t *testing.T) {
+func TestFormatBytesBinary(t *testing.T) {
 	tests := []struct {
 		name   string
 		input  int64
@@ -272,7 +272,7 @@ func TestFormatBytes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expect, FormatBytes(tt.input))
+			assert.Equal(t, tt.expect, FormatBytesBinary(tt.input))
 		})
 	}
 }
