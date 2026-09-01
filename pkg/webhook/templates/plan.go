@@ -27,6 +27,9 @@ type LintViolationData struct {
 type UnsafeChangeData struct {
 	Table  string
 	Reason string
+	// ChangeType is the engine's change type (e.g. "drop"), rendered when the
+	// change carries no parseable reason so the finding still explains itself.
+	ChangeType string
 	// Shards names the shards this unsafe change applies to, for a sharded plan
 	// where only some shards carry it. Empty for a non-sharded change (applies to
 	// the whole table).
@@ -1060,42 +1063,47 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
+	item := 0
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		writeUnsafeChangeItem(sb, table, c.Reason)
+		writeUnsafeChangeItem(sb, &item, table, c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, isMySQL)
 }
 
-// writeUnsafeChangeItem writes one table's unsafe findings as a list item:
-// a single "- table: reason" line for one finding, or a nested list when the
-// engine joined several, so each finding reads on its own line.
-func writeUnsafeChangeItem(sb *strings.Builder, table, reason string) {
+// writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
+// per finding, so the rendered list is exactly as long as the heading's count
+// and operators can reference a finding by its number. n carries the running
+// number across tables; a change with no parseable reason still gets a line,
+// carrying the engine's change type when one is known so the finding explains
+// itself.
+func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType string) {
 	reasons := ui.LintReasons(reason)
-	for i, r := range reasons {
-		reasons[i] = ui.CodeQuoteIdentifiers(r)
-	}
-	switch len(reasons) {
-	case 0:
-		fmt.Fprintf(sb, "- %s\n", table)
-	case 1:
-		fmt.Fprintf(sb, "- %s: %s\n", table, reasons[0])
-	default:
-		fmt.Fprintf(sb, "- %s:\n", table)
-		for _, r := range reasons {
-			fmt.Fprintf(sb, "  - %s\n", r)
+	if len(reasons) == 0 {
+		*n++
+		if changeType != "" {
+			fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, changeType)
+		} else {
+			fmt.Fprintf(sb, "%d. %s\n", *n, table)
 		}
+		return
+	}
+	for _, r := range reasons {
+		*n++
+		fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, ui.CodeQuoteIdentifiers(r))
 	}
 }
 
 // countUnsafeFindings sums the individual lint findings across changes, so
 // headers count what the list below actually shows: a table whose reason
 // carries several joined violations contributes each of them. A change with
-// no parseable reason still counts once.
+// no parseable reason still counts once. The CLI's countUnsafeFindings in
+// pkg/cmd/internal/templates mirrors this; the two must agree so the PR
+// comment and CLI report the same count for the same plan.
 func countUnsafeFindings(changes []UnsafeChangeData) int {
 	n := 0
 	for _, c := range changes {

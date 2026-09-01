@@ -270,20 +270,58 @@ func cleanSingleLintReason(reason string) string {
 	return reason
 }
 
-// Lint and safety messages quote SQL identifiers and types with single or
-// double quotes ('idx_category', "varchar"). The token pattern is restricted
-// to identifier and type characters so prose in quotes ("should not be
-// dropped") is left alone.
+// Lint and safety messages quote SQL identifiers and types with double
+// quotes ("idx_category", "varchar"). The token pattern is restricted to
+// identifier and type characters — including the comma and single quote that
+// parameterised and enumerated types carry ("decimal(10,2)",
+// "enum('active','archived')") — so prose in quotes ("should not be
+// dropped") is left alone. Two quoted shapes carry spaces and are still
+// unambiguously SQL: an operation or statement fragment led by a DDL keyword
+// ("DROP TABLE `t`", "TRUNCATE PARTITION"), and a type or key part followed
+// by attribute words ("int(11) unsigned", "created_at DESC").
 var (
-	singleQuotedIdentifier = regexp.MustCompile(`'([A-Za-z0-9_$.()]+)'`)
-	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.()]+)"`)
+	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.(),']+)"`)
+	quotedSQLFragment      = regexp.MustCompile(`"((?:ALTER|CREATE|DROP|RENAME|TRUNCATE|DISCARD|COALESCE)\b[^"]*)"`)
+	quotedTokenWithSuffix  = regexp.MustCompile(`"([A-Za-z0-9_$.(),']+(?: (?:unsigned|signed|zerofill|precision|varying|DESC))+)"`)
 )
 
-// CodeQuoteIdentifiers rewrites quoted SQL identifiers and types in a
-// human-authored message to markdown inline code, so index, column, and type
-// names read as code on markdown surfaces. Best-effort display formatting:
-// tokens that don't look like identifiers keep their original quotes.
+// codeSpan wraps content in a markdown inline code span. Content that itself
+// contains backticks (SQL fragments quote identifiers with them, doubling any
+// backtick embedded in a name) needs a delimiter run longer than the longest
+// backtick run in the content, plus padding spaces, or the span would close
+// mid-content.
+func codeSpan(content string) string {
+	if !strings.Contains(content, "`") {
+		return "`" + content + "`"
+	}
+	delimiter := strings.Repeat("`", longestBacktickRun(content)+1)
+	return delimiter + " " + content + " " + delimiter
+}
+
+// longestBacktickRun returns the length of the longest consecutive run of
+// backticks in s.
+func longestBacktickRun(s string) int {
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			longest = max(longest, run)
+			continue
+		}
+		run = 0
+	}
+	return longest
+}
+
+// CodeQuoteIdentifiers rewrites quoted SQL identifiers, types, and operation
+// fragments in a human-authored message to markdown inline code, so index,
+// column, and type names read as code on markdown surfaces. Best-effort
+// display formatting: tokens that don't look like SQL keep their original
+// quotes.
 func CodeQuoteIdentifiers(message string) string {
-	message = singleQuotedIdentifier.ReplaceAllString(message, "`$1`")
-	return doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	message = quotedSQLFragment.ReplaceAllStringFunc(message, func(quoted string) string {
+		return codeSpan(quoted[1 : len(quoted)-1])
+	})
+	message = doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	return quotedTokenWithSuffix.ReplaceAllString(message, "`$1`")
 }

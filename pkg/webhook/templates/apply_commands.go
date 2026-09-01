@@ -176,8 +176,9 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
+	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, "`"+c.Table+"`", c.Reason)
+		writeUnsafeChangeItem(&sb, &item, "`"+c.Table+"`", c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)

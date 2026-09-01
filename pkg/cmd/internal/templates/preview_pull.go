@@ -96,7 +96,7 @@ func pullSchemaPreviewResponse() *apitypes.PullSchemaResponse {
 					{
 						Table:    "orders",
 						Severity: "warning",
-						Message:  `Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`,
+						Message:  `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`,
 					},
 				},
 			},

@@ -264,7 +264,7 @@ func TestEngine_Plan_DropColumn(t *testing.T) {
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, "products", change.Table)
 	assert.True(t, change.IsUnsafe)
-	assert.Contains(t, change.UnsafeReason, "Unsafe operation detected: DROP COLUMN `deprecated_field`")
+	assert.Contains(t, change.UnsafeReason, "Unsafe operation detected: \"DROP COLUMN `deprecated_field`\"")
 	assert.True(t, result.HasErrors(), "Spirit unsafe drop lint should remain the blocking gate")
 }
 

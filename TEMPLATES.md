@@ -43,8 +43,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -130,10 +130,10 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 - Primary key column `order_ref` has type `varchar`
 
 **`order_events`**
-- Index `idx_status_created` has DATETIME column `created_at` in position 3 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
-- Index `idx_region_created` has DATETIME column `created_at` in position 4 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+- Index `idx_status_created` has `DATETIME` column `created_at` in position 3 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+- Index `idx_region_created` has `DATETIME` column `created_at` in position 4 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
 - Primary key column `event_id` has type `mediumint`
-- Index `idx_status_created` on columns (status, region, created_at, event_id, order_pk) has a redundant PRIMARY KEY suffix (order_pk) - a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (order_pk, event_id) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
+- Index `idx_status_created` on columns (`status`, `region`, `created_at`, `event_id`, `order_pk`) has a redundant PRIMARY KEY suffix `order_pk` — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (`order_pk`, `event_id`) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
 - Column `event_id` in table `order_events` has type `mediumint(9)` but 2 other table(s) use type `int(11)` (e.g. shipments, invoices)
 
 </details>
@@ -255,8 +255,8 @@ DROP TABLE `reconcile_state`;
 A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
 
 ⚠️ **Issues**: 2 unsafe changes detected
-- `orders`: DROP COLUMN discards the column's data
-- `reconcile_state`: DROP TABLE removes all data
+1. `orders`: DROP COLUMN discards the column's data
+2. `reconcile_state`: DROP TABLE removes all data
 
 **Destructive drop guidance:**
 
@@ -812,8 +812,8 @@ schemabot apply -e staging
 ```
 
 ⚠️ **Issues**: 2 unsafe changes detected
-- `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
-- `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
+1. `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
+2. `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
 
 📋 **Plan**: **1** vschema update
 
@@ -1215,8 +1215,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 </details>
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1404,7 +1404,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 ---
 
 **⛔ Apply rejected**: 1 unsafe change detected
-- `customers`: Unsafe operation detected: DROP COLUMN `nickname`
+1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
 **Destructive drop guidance:**
 
@@ -1437,7 +1437,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 ---
 
 **⛔ Apply rejected**: 1 unsafe change detected
-- `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
+1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
 **Destructive drop guidance:**
 
@@ -1472,10 +1472,9 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 ---
 
 **⛔ Apply rejected**: 3 unsafe changes detected
-- `orders`:
-  - Primary key column `id` has type `int`
-  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+1. `orders`: Primary key column `id` has type `int`
+2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+3. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -1627,8 +1626,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -7657,7 +7656,7 @@ ALTER TABLE `mutes`
 ```
 
 ⚠️ **Issues**: 1 unsafe change detected
-- `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
+1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
 **Destructive drop guidance:**
 
@@ -7906,8 +7905,8 @@ schemabot apply -e production
 | --- | --- |
 | `-40` | ✅ completed |
 | `40-80` | ✅ completed |
-| `80-c0` | ⛔ cancelled |
-| `c0-` | ⛔ cancelled |
+| `80-c0` | 🚫 cancelled |
+| `c0-` | 🚫 cancelled |
 
 ---
 
@@ -8508,12 +8507,11 @@ Lint violations: Non-blocking warnings during plan/apply
 
 Unsafe blocked: Destructive changes require --allow-unsafe
 
-⛔ Apply blocked: 3 unsafe change(s) detected
-  • users: DROP COLUMN email
-  • orders: DROP TABLE
-  • products:
-      - MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss)
-      - DROP INDEX idx_category
+⛔ Apply blocked: 4 unsafe change(s) detected
+  1. users: DROP COLUMN email
+  2. orders: DROP TABLE
+  3. products: MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss)
+  4. products: DROP INDEX idx_category
 
 🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
 
@@ -8534,8 +8532,8 @@ Unsafe allowed: Proceeding with --allow-unsafe flag
 🚨 Unsafe Changes (--allow-unsafe enabled)
 
 The following unsafe changes will be applied:
-  • users: DROP COLUMN email
-  • orders: DROP TABLE
+  1. users: DROP COLUMN email
+  2. orders: DROP TABLE
 
 ```
 </details>

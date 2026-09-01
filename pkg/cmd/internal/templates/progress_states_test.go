@@ -3,7 +3,9 @@ package templates
 import (
 	"io"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
@@ -408,6 +410,107 @@ func TestWriteStatusListFailedOnly(t *testing.T) {
 	assert.NotContains(t, output, "APPLY ID")
 	assert.NotContains(t, output, "REASON")
 	assert.NotContains(t, output, "Use 'schemabot status <apply_id>' to view details")
+}
+
+// TestWriteDatabaseHistoryTable pins the exact bytes of the history table: a
+// bold title, a dimmed header row, one row per apply with every cell padded
+// to its column's widest value and the state cell wrapped in the state's
+// color (the separator after it stays uncolored), and the detail hint footer.
+// A state the CLI does not recognize renders uncolored, an apply that never
+// recorded timestamps shows dashes for STARTED and DURATION, and an apply
+// that recorded neither state nor caller shows a dash in every empty cell —
+// the same "none recorded" rendering the status list uses.
+func TestWriteDatabaseHistoryTable(t *testing.T) {
+	now := time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC)
+	prevNow := nowFunc
+	prevUINow := ui.NowFunc
+	nowFunc = func() time.Time { return now }
+	ui.NowFunc = func() time.Time { return now }
+	t.Cleanup(func() {
+		nowFunc = prevNow
+		ui.NowFunc = prevUINow
+	})
+
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{
+			Database: "orders-db",
+			Applies: []ApplyHistoryData{
+				{ApplyID: "apply_abc123", Environment: "staging", State: state.Apply.Completed, Caller: "cli:jdoe@host", StartedAt: "2026-01-15T13:30:00Z", CompletedAt: "2026-01-15T13:45:00Z"},
+				{ApplyID: "apply_def456789", Environment: "production", State: state.Apply.Failed, Caller: "github:acme/shop#42", StartedAt: "2026-01-15T08:00:00Z", CompletedAt: "2026-01-15T08:30:00Z"},
+				{ApplyID: "apply_ghi", Environment: "staging", State: state.Apply.Running, Caller: "cli:ops@host", StartedAt: "2026-01-15T14:00:00Z"},
+				{ApplyID: "apply_unknown", Environment: "staging", State: "SOME_NEW_STATE", Caller: "cli:ops@host"},
+				{ApplyID: "apply_bare", Environment: "staging"},
+			},
+		})
+	})
+
+	expected := strings.Join([]string{
+		ANSIBold + "Schema change history for orders-db" + ANSIReset,
+		"",
+		"  " + ANSIDim + "APPLY ID         ENV         STATE           STARTED         DURATION  SOURCE" + ANSIReset,
+		"  apply_abc123     staging     " + ANSIGreen + "Completed     " + ANSIReset + "  1 hour ago      15m       cli:jdoe",
+		"  apply_def456789  production  " + ANSIRed + "Failed        " + ANSIReset + "  6 hours ago     30m       github:acme/shop#42",
+		"  apply_ghi        staging     " + ANSICyan + "Running       " + ANSIReset + "  30 minutes ago  30m       cli:ops",
+		"  apply_unknown    staging     SOME_NEW_STATE  -               -         cli:ops",
+		"  apply_bare       staging     -               -               -         -",
+		"",
+		ANSIDim + "Use 'schemabot status <apply_id>' to view details" + ANSIReset,
+		"",
+	}, "\n")
+	assert.Equal(t, expected, output)
+}
+
+// TestWriteDatabaseHistoryEmpty pins the dimmed one-line message a database
+// with no recorded schema changes renders instead of a table.
+func TestWriteDatabaseHistoryEmpty(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{Database: "new-db"})
+	})
+	assert.Equal(t, ANSIDim+"No schema changes found for database 'new-db'"+ANSIReset+"\n", output)
+}
+
+// TestWriteStatusListColoredStateCellBytes pins the colored STATE cell's
+// exact bytes: the color escape wraps the padded cell and closes before the
+// two-space separator, so the separator between columns is never colored —
+// the same composition the history table renders.
+func TestWriteStatusListColoredStateCellBytes(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{
+			ActiveCount: 1,
+			Limit:       20,
+			MaxLimit:    1000,
+			Applies: []ActiveApplyData{
+				{ApplyID: "apply-run", Database: "orders", Environment: "staging", State: state.Apply.Running, StartedAt: "2026-05-28T12:00:00Z", Caller: "cli"},
+				{ApplyID: "apply-done", Database: "orders", Environment: "staging", State: state.Apply.Completed, StartedAt: "2026-05-28T12:00:00Z", CompletedAt: "2026-05-28T12:00:02Z", Caller: "cli"},
+			},
+		})
+	})
+
+	assert.Contains(t, output, ANSICyan+"Running  "+ANSIReset+"  ",
+		"a state narrower than its column is padded inside the escape, with the separator outside")
+	assert.Contains(t, output, ANSIGreen+"Completed"+ANSIReset+"  ",
+		"the column-width state closes its escape before the separator")
+}
+
+// TestWriteDatabaseHistoryAlignsMultiByteCells pins that column widths count
+// terminal cells, not bytes: a CJK environment name occupies two cells per
+// rune but three bytes, so byte-counted padding would push every column to
+// its right out of line on one row and pad the ASCII rows too wide.
+func TestWriteDatabaseHistoryAlignsMultiByteCells(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteDatabaseHistory(DatabaseHistoryData{
+			Database: "orders-db",
+			Applies: []ApplyHistoryData{
+				{ApplyID: "apply_wide", Environment: "生産環境", State: state.Apply.Completed, Caller: "cli:jdoe"},
+				{ApplyID: "apply_ascii", Environment: "production", State: state.Apply.Failed, Caller: "cli:ops"},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "  apply_wide   生産環境    "+ANSIGreen+"Completed"+ANSIReset+"  ",
+		"an eight-cell CJK name in a ten-cell column gets two cells of padding")
+	assert.Contains(t, output, "  apply_ascii  production  "+ANSIRed+"Failed   "+ANSIReset+"  ",
+		"the ASCII row pads to the same visible width, not to the CJK value's byte length")
 }
 
 func captureStdout(t *testing.T, fn func()) string {

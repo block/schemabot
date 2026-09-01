@@ -33,6 +33,10 @@ func TestMySQLDialectIndexHint(t *testing.T) {
 	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
 }
 
+func TestMySQLDialectBinaryEquals(t *testing.T) {
+	assert.Equal(t, "owner COLLATE utf8mb4_0900_bin = ?", MySQLDialect{}.BinaryEquals("owner"))
+}
+
 func TestMySQLDialectJoinedUpdate(t *testing.T) {
 	assert.Equal(t,
 		"UPDATE apply_comments c JOIN applies a ON a.id = c.apply_id SET c.edit_count = c.edit_count + 1, c.updated_at = NOW() WHERE c.apply_id = ? AND a.lease_token = ?",
@@ -291,6 +295,10 @@ func TestPostgresDialect(t *testing.T) {
 		d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond))
 	assert.Equal(t, "now() + 2 * interval '1 day'",
 		d.RelativeTime(TimestampPrecisionDefault, AfterCurrentTime, LiteralIntervalAmount(2), IntervalDay))
+}
+
+func TestPostgresDialectBinaryEquals(t *testing.T) {
+	assert.Equal(t, "owner = ?", PostgresDialect{}.BinaryEquals("owner"))
 }
 
 func TestPostgresDialectInsertIfAbsent(t *testing.T) {
