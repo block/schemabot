@@ -150,8 +150,7 @@ jobs:
     # the job budget: a hung binary that starts early in the shard then
     # panics with its goroutine dump instead of the runner cancelling the
     # job first. The Test step's comment covers when that dump is and is not
-    # guaranteed. The budget also leaves the ./integration shard, whose
-    # normal wall time approaches ten minutes, real headroom.
+    # guaranteed.
     timeout-minutes: 12
     strategy:
       fail-fast: false
