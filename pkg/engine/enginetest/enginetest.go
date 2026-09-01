@@ -113,6 +113,8 @@ type contractCase struct {
 	name Case
 	// harnessField names the Harness fixture field this case consumes.
 	harnessField string
+	// fixtureType is the exact function signature required from harnessField.
+	fixtureType reflect.Type
 	// engineMethods names the engine.Engine methods whose cross-engine
 	// contract this case pins. A method no case names must carry a
 	// documented reason in engineMethodExclusions.
@@ -121,14 +123,14 @@ type contractCase struct {
 }
 
 var contractCases = []contractCase{
-	{name: CaseCancelAlreadyCompleted, harnessField: "CancelAlreadyCompleted", engineMethods: []string{"Cancel"}, run: runCancelAlreadyCompleted},
-	{name: CaseStopAlreadyCompleted, harnessField: "StopAlreadyCompleted", engineMethods: []string{"Stop"}, run: runStopAlreadyCompleted},
-	{name: CaseCancelNonexistent, harnessField: "CancelNonexistent", engineMethods: []string{"Cancel"}, run: runCancelNonexistent},
-	{name: CaseStopNonexistent, harnessField: "StopNonexistent", engineMethods: []string{"Stop"}, run: runStopNonexistent},
-	{name: CaseProgressTerminalTruth, harnessField: "TerminalProgress", engineMethods: []string{"Progress"}, run: runProgressTerminalTruth},
+	{name: CaseCancelAlreadyCompleted, harnessField: "CancelAlreadyCompleted", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Cancel"}, run: runCancelAlreadyCompleted},
+	{name: CaseStopAlreadyCompleted, harnessField: "StopAlreadyCompleted", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Stop"}, run: runStopAlreadyCompleted},
+	{name: CaseCancelNonexistent, harnessField: "CancelNonexistent", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Cancel"}, run: runCancelNonexistent},
+	{name: CaseStopNonexistent, harnessField: "StopNonexistent", fixtureType: reflect.TypeFor[func(*testing.T) ControlFixture](), engineMethods: []string{"Stop"}, run: runStopNonexistent},
+	{name: CaseProgressTerminalTruth, harnessField: "TerminalProgress", fixtureType: reflect.TypeFor[func(*testing.T) []ProgressFixture](), engineMethods: []string{"Progress"}, run: runProgressTerminalTruth},
 	// The not-ready fixture invokes an operation of the engine's choosing,
 	// so the case pins the rejection's error typing, not one method.
-	{name: CaseNotReadyDistinguishable, harnessField: "NotReady", run: runNotReadyDistinguishable},
+	{name: CaseNotReadyDistinguishable, harnessField: "NotReady", fixtureType: reflect.TypeFor[func(*testing.T) NotReadyFixture](), run: runNotReadyDistinguishable},
 }
 
 // engineMethodExclusions documents the engine.Engine methods this suite
@@ -241,7 +243,8 @@ func runNotReadyDistinguishable(t *testing.T, h Harness, c contractCase) {
 func fixtureField[T any](t *testing.T, h Harness, c contractCase) T {
 	t.Helper()
 	field := reflect.ValueOf(h).FieldByName(c.harnessField)
-	require.True(t, field.IsValid(), "case %q names missing Harness field %q", c.name, c.harnessField)
+	require.True(t, field.IsValid() && field.CanInterface(),
+		"case %q must name an exported Harness field, %q is missing or unexported", c.name, c.harnessField)
 	fixture, ok := field.Interface().(T)
 	require.True(t, ok, "case %q Harness field %q has type %s, not the fixture type its runner requires", c.name, c.harnessField, field.Type())
 	return fixture

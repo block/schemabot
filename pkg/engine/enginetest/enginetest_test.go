@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,8 +38,8 @@ func TestContractCaseCoverage(t *testing.T) {
 
 		field, ok := harnessType.FieldByName(c.harnessField)
 		require.True(t, ok, "case %q names Harness fixture field %q, which does not exist", c.name, c.harnessField)
-		require.Equal(t, reflect.Func, field.Type.Kind(),
-			"case %q names Harness field %q, which is not a fixture function", c.name, c.harnessField)
+		require.Equal(t, c.fixtureType, field.Type,
+			"case %q names Harness field %q with an unexpected fixture signature", c.name, c.harnessField)
 		prev, claimed := claimedFields[c.harnessField]
 		require.False(t, claimed, "Harness fixture %q is consumed by both case %q and case %q", c.harnessField, prev, c.name)
 		claimedFields[c.harnessField] = c.name
@@ -132,6 +133,8 @@ func TestCaseConstantCoverage(t *testing.T) {
 	assert.Empty(t, constants, "Case constants missing from contractCases")
 }
 
+// exportedInterfaces detects exported interface declarations written as named
+// type definitions. Interface type aliases are outside its syntactic scope.
 func exportedInterfaces(t *testing.T, dir string) map[string]bool {
 	t.Helper()
 	interfaces := make(map[string]bool)
@@ -149,6 +152,9 @@ func exportedInterfaces(t *testing.T, dir string) map[string]bool {
 	return interfaces
 }
 
+// caseConstants detects constants whose ValueSpec explicitly names Case and
+// whose value is a string literal. Untyped constants in grouped const blocks
+// are outside its syntactic scope, including declarations that inherit a type.
 func caseConstants(t *testing.T) map[Case]bool {
 	t.Helper()
 	constants := make(map[Case]bool)
@@ -195,10 +201,16 @@ func parsePackageFiles(t *testing.T, dir, packageName string, includeTests bool)
 
 func TestRunExecutesEveryRegisteredCase(t *testing.T) {
 	executed := make(map[Case]int)
+	recorders := make(map[Case]*methodRecorder, len(contractCases))
+	engineFor := func(c Case) fakeEngine {
+		recorder := &methodRecorder{}
+		recorders[c] = recorder
+		return fakeEngine{recorder: recorder}
+	}
 	markControl := func(c Case) func(*testing.T) ControlFixture {
 		return func(*testing.T) ControlFixture {
 			executed[c]++
-			return ControlFixture{Engine: fakeEngine{}, Req: &engine.ControlRequest{Database: string(c)}}
+			return ControlFixture{Engine: engineFor(c), Req: &engine.ControlRequest{Database: string(c)}}
 		}
 	}
 	Run(t, Harness{
@@ -208,7 +220,7 @@ func TestRunExecutesEveryRegisteredCase(t *testing.T) {
 		StopNonexistent:        markControl(CaseStopNonexistent),
 		TerminalProgress: func(*testing.T) []ProgressFixture {
 			executed[CaseProgressTerminalTruth]++
-			return []ProgressFixture{{Name: "completed", Engine: fakeEngine{}, Req: &engine.ProgressRequest{}, Want: engine.StateCompleted}}
+			return []ProgressFixture{{Name: "completed", Engine: engineFor(CaseProgressTerminalTruth), Req: &engine.ProgressRequest{}, Want: engine.StateCompleted}}
 		},
 		NotReady: func(*testing.T) NotReadyFixture {
 			executed[CaseNotReadyDistinguishable]++
@@ -217,45 +229,86 @@ func TestRunExecutesEveryRegisteredCase(t *testing.T) {
 	})
 	for _, c := range contractCases {
 		assert.Equal(t, 1, executed[c.name], "registered case %q did not execute exactly once", c.name)
+		var invoked []string
+		if recorder := recorders[c.name]; recorder != nil {
+			invoked = recorder.methods()
+		}
+		assert.ElementsMatch(t, c.engineMethods, invoked,
+			"registered case %q did not invoke exactly its declared engine.Engine methods", c.name)
 	}
 }
 
-type fakeEngine struct{}
+type methodRecorder struct {
+	mu      sync.Mutex
+	invoked []string
+}
 
-func (fakeEngine) Name() string { return "fake" }
-func (fakeEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+func (r *methodRecorder) record(method string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.invoked = append(r.invoked, method)
+}
+
+func (r *methodRecorder) methods() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.invoked...)
+}
+
+type fakeEngine struct {
+	recorder *methodRecorder
+}
+
+func (f fakeEngine) Name() string {
+	f.recorder.record("Name")
+	return "fake"
+}
+func (f fakeEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	f.recorder.record("Plan")
 	return nil, nil
 }
-func (fakeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (f fakeEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	f.recorder.record("Apply")
 	return nil, nil
 }
-func (fakeEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+func (f fakeEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	f.recorder.record("Progress")
 	return &engine.ProgressResult{State: engine.StateCompleted}, nil
 }
-func (fakeEngine) Stop(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+func (f fakeEngine) Stop(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	f.recorder.record("Stop")
 	if req.Database == string(CaseStopNonexistent) {
 		return nil, engine.NewPermanentError("not found")
 	}
 	return nil, engine.NewAlreadyCompletedError("completed")
 }
-func (fakeEngine) Cancel(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+func (f fakeEngine) Cancel(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	f.recorder.record("Cancel")
 	if req.Database == string(CaseCancelNonexistent) {
 		return nil, engine.NewPermanentError("not found")
 	}
 	return nil, engine.NewAlreadyCompletedError("completed")
 }
-func (fakeEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+func (f fakeEngine) Start(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	f.recorder.record("Start")
 	return nil, nil
 }
-func (fakeEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+func (f fakeEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	f.recorder.record("Cutover")
 	return nil, nil
 }
-func (fakeEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+func (f fakeEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	f.recorder.record("Revert")
 	return nil, nil
 }
-func (fakeEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+func (f fakeEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	f.recorder.record("SkipRevert")
 	return nil, nil
 }
-func (fakeEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+func (f fakeEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
+	f.recorder.record("Volume")
 	return nil, nil
 }
