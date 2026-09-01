@@ -85,3 +85,28 @@ storage:
 
 	requireDefaultInsertResumes(t, db)
 }
+
+// During the upgrade to a release that folds identity strings at the write
+// boundaries, the operator runs the canonicalization subcommand with the
+// storage DSN passed directly; afterwards rows written by earlier releases
+// carry the canonical lowercase spelling the folded lookups expect.
+func TestCanonicalizeIdentityKeysCmd_DSNFlag(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "schemabot")
+	require.NoError(t, api.EnsureSchema(dsn, slog.New(slog.DiscardHandler), api.WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(t.Context(),
+		`INSERT INTO locks (database_name, database_type, repository, pull_request, owner)
+		 VALUES ('MyDB', 'MySQL', 'Org/Repo', 42, 'Org/Repo#42')`)
+	require.NoError(t, err)
+
+	cmd := &CanonicalizeIdentityKeysCmd{DSN: dsn}
+	require.NoError(t, cmd.Run(t.Context(), &Globals{Version: "test"}))
+
+	var databaseName, databaseType, repository, owner string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT database_name, database_type, repository, owner FROM locks WHERE pull_request = 42`).
+		Scan(&databaseName, &databaseType, &repository, &owner))
+	require.Equal(t, "mydb", databaseName)
+	require.Equal(t, "mysql", databaseType)
+	require.Equal(t, "org/repo", repository)
+	require.Equal(t, "org/repo#42", owner)
+}
