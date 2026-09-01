@@ -157,6 +157,12 @@ func TestFormatRowCopyPercent(t *testing.T) {
 	assert.Equal(t, "0.01%", FormatRowCopyPercent(0, 1, 1_000_000))
 	assert.Equal(t, "100.00%", FormatRowCopyPercent(99, 1_100_000, 1_000_000))
 
+	// Capped at 99.99% while copied rows still trail the total: "100.00%"
+	// reads as done, and a copy in its final stretch is not.
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 999_999_999, 1_000_000_000))
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(100, 43_234_523_344, 43_234_523_345))
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 99_999, 100_000))
+
 	// Without row counts, the engine's whole-number percent renders clamped;
 	// a copy that has begun with no total falls back to "<1%".
 	assert.Equal(t, "0%", FormatRowCopyPercent(0, 0, 1_000_000))

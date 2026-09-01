@@ -207,13 +207,19 @@ func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
 // true precision. When the row counts are known the percent is recomputed
 // from them and rendered with two decimals (e.g. "0.03%", "45.37%"), so
 // progress on a huge table reads as the fraction it is instead of a rounded
-// whole number; the fraction is floored at 0.01% so an in-flight copy never
-// reads as 0.00%. Without row counts it falls back to the engine's
+// whole number. The rendering is bounded on both ends by what the counts say:
+// floored at 0.01% so an in-flight copy never reads as 0.00%, and capped at
+// 99.99% while copied rows still trail the total, so a copy never reads as
+// finished before it is — an operator deciding whether to keep waiting takes
+// "100.00%" as done. Without row counts it falls back to the engine's
 // whole-number percent, or "<1%" when copying has begun but there is no
 // total to compute a fraction from.
 func FormatRowCopyPercent(pct int, rowsCopied, rowsTotal int64) string {
 	if rowsCopied > 0 && rowsTotal > 0 {
 		frac := math.Max(RowCopyFraction(pct, rowsCopied, rowsTotal), 0.01)
+		if rowsCopied < rowsTotal {
+			frac = math.Min(frac, 99.99)
+		}
 		return fmt.Sprintf("%.2f%%", frac)
 	}
 	display := ClampPercent(pct)
