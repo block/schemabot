@@ -19,6 +19,7 @@ const lockColumns = `id, database_name, database_type, repository, pull_request,
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
 	db         *rebindDB
+	dialect    Dialect
 	classifier ErrorClassifier
 }
 
@@ -121,7 +122,7 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
 		SET pending_plan_id = ?, disclosed_copy_discard = ?, updated_at = NOW()
-		WHERE database_name = ? AND database_type = ? AND owner = ?
+		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
 	`, lock.PendingPlanID, lock.DisclosedCopyDiscard, lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	if err != nil {
 		return fmt.Errorf("refresh pending confirmation for %s/%s owner=%s: %w",
@@ -158,7 +159,7 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
-		WHERE database_name = ? AND database_type = ? AND owner = ?
+		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
 	`, database, dbType, owner)
 	if err != nil {
 		return err
@@ -189,7 +190,7 @@ func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
-		WHERE database_name = ? AND database_type = ? AND owner = ? AND pending_plan_id = ?
+		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
 	`, database, dbType, owner, pendingPlanID)
 	if err != nil {
 		return false, err
@@ -263,7 +264,7 @@ func (s *lockStore) Update(ctx context.Context, lock *storage.Lock) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
 		SET updated_at = NOW()
-		WHERE database_name = ? AND database_type = ? AND owner = ?
+		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
 	`, lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	if err != nil {
 		return fmt.Errorf("touch lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)

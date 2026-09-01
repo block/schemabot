@@ -52,8 +52,16 @@ func TestLocks(t *testing.T, h Harness) {
 			Owner: "org/repo#42",
 		}), storage.ErrLockHeld)
 		require.ErrorIs(t, store.Locks().Release(ctx, "ORDERS_DB", "MYSQL", "org/repo#42"), storage.ErrLockNotOwned)
+		require.ErrorIs(t, store.Locks().Update(ctx, &storage.Lock{
+			DatabaseName: "ORDERS_DB", DatabaseType: "MYSQL",
+			Owner: "org/repo#42",
+		}), storage.ErrLockNotOwned)
 
-		released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "Org/Repo#42", "plan-1")
+		released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "org/repo#42", "plan-1")
+		require.NoError(t, err)
+		assert.False(t, released)
+
+		released, err = store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "Org/Repo#42", "plan-1")
 		require.NoError(t, err)
 		assert.True(t, released)
 	})
