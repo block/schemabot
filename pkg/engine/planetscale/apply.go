@@ -132,6 +132,16 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// responsible for; it is cleared once the deploy request takes ownership,
 	// and it is never set for an operator-supplied branch, which SchemaBot does
 	// not own.
+	//
+	// A create-deploy-request response lost to a timeout leaves ownedBranch set
+	// even though the deploy request may exist server-side. Deleting the branch
+	// is still the right cleanup there, not a hazard: deploying is a separate,
+	// later call that only runs after the create succeeded client-side, so the
+	// orphan carries no running schema change, and the apply records the deploy
+	// request identifier only after a successful response, so no retry will
+	// ever drive it. Should the API refuse to delete a branch while its deploy
+	// request is open, the refusal surfaces on the cleanup's error path with
+	// the identifiers for manual reclamation.
 	ownedBranch := ""
 	defer func() {
 		if retErr == nil || ownedBranch == "" {
