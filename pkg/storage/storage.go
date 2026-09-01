@@ -112,6 +112,7 @@ type Storage interface {
 // Locks prevent concurrent schema changes to the same database.
 // Lock key is database:type (not per-environment) to block concurrent changes
 // across environments and PRs.
+// Methods accepting a *Lock canonicalize its repository, database name, and database type in place before persisting.
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
@@ -150,6 +151,7 @@ type LockStore interface {
 // CheckStore manages SchemaBot's stored check state.
 // Per-database rows track internal status for a PR/environment/database.
 // Aggregate rows store the GitHub check_run_id for the visible GitHub Check Run.
+// Methods accepting a *Check canonicalize its repository, database name, database type, and environment in place before persisting.
 type CheckStore interface {
 	// Upsert creates or updates stored check state.
 	Upsert(ctx context.Context, check *Check) error
@@ -1366,7 +1368,7 @@ type ControlRequestStore interface {
 	// for use when that plane later reports the same operation succeeded. It
 	// only touches a failed row the mirror itself created: rows this plane
 	// queued are cleared by their own request lifecycle, and a row with no
-	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// lifecycle here — an operation this plane only proxies — would otherwise
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)

@@ -199,8 +199,8 @@ func TestIsUnsupportedOperation(t *testing.T) {
 		// used as-is, never interpreted as a format string. The indirect call
 		// reflects a caller vet's printf checker cannot see.
 		construct := NewUnsupportedOperationError
-		err := construct("volume is capped at 100% for this engine")
-		assert.Equal(t, "volume is capped at 100% for this engine", err.Error())
+		err := construct("revert is capped at 100% for this engine")
+		assert.Equal(t, "revert is capped at 100% for this engine", err.Error())
 	})
 
 	t.Run("extractor returns the typed decline from a wrapped error", func(t *testing.T) {

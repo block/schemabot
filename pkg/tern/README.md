@@ -20,7 +20,6 @@ type Client interface {
     Cutover(ctx, *CutoverRequest) (*CutoverResponse, error)
     Stop(ctx, *StopRequest) (*StopResponse, error)
     Start(ctx, *StartRequest) (*StartResponse, error)
-    Volume(ctx, *VolumeRequest) (*VolumeResponse, error)
     Revert(ctx, *RevertRequest) (*RevertResponse, error)
     SkipRevert(ctx, *SkipRevertRequest) (*SkipRevertResponse, error)
     Health(ctx) error
@@ -76,7 +75,7 @@ Before starting an apply, `LocalClient` checks for active tasks that might confl
 | `client.go` | `Client` interface definition |
 | `local_client.go` | `LocalClient` — embedded engine, Plan/Apply/Progress |
 | `local_apply.go` | Apply execution: sequential/atomic modes, polling, heartbeats |
-| `local_control.go` | Control operations: Cutover, Stop, Start, Volume, Revert, ResumeApply |
+| `local_control.go` | Control operations: Cutover, Stop, Start, Revert, ResumeApply |
 | `grpc_client.go` | `GRPCClient` — delegates to remote Tern over gRPC |
 | `server.go` | gRPC server wrapper that exposes a `Client` as a Tern gRPC service |
 | `state_converters.go` | Helpers for converting between engine, storage, and proto state representations |

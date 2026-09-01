@@ -69,6 +69,10 @@ databases:
         dsn: "file:/run/secrets/prod-dsn"
 ```
 
+Database keys under `databases:` and environment keys under `environments:`
+must be lowercase. The server refuses to start if either contains uppercase
+characters.
+
 ### Building DSNs from separate secrets
 
 If your deployment stores database connection metadata separately from passwords,
@@ -201,6 +205,9 @@ tern_deployments:
     production: "tern-production:9090"
 ```
 
+Deployment keys and their nested environment keys under `tern_deployments:`
+must be lowercase. The server refuses to start otherwise.
+
 In gRPC mode, `target` is an opaque identifier understood by the remote Tern service. SchemaBot stores the resolved `target` and `deployment` on each plan, then reuses that stored route during apply. Callers do not send target or deployment in plan/apply requests.
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
@@ -245,12 +252,16 @@ Rules:
 
 - `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`.
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
+- Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
 - Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
 
 ### Deployment Order
 
 `deployment_order` defines the rollout order across the `deployments` map for an environment, analogous to the server-wide `environment_order`. When set, it MUST list every key in `deployments` exactly once (no empty, duplicate, or unknown entries) and MUST accompany a `deployments` map. `ResolveDatabaseTargets` then returns deployments in this order. When omitted, deployments resolve in alphabetical key order, which stays the deterministic default.
+
+Every deployment name in `deployment_order` must be lowercase; the server
+refuses to start otherwise.
 
 ## Environment Order
 
@@ -263,6 +274,10 @@ environment_order:
 ```
 
 If omitted, SchemaBot defaults to `staging` before `production`. Before applying production from a PR comment, SchemaBot checks staging first because the server-owned `environment_order` says staging precedes production.
+
+Every environment name in the top-level or per-database `environment_order`
+must be lowercase; the server refuses to start otherwise. Values in
+`allowed_environments` have the same lowercase requirement.
 
 There are two related but separate concepts:
 
@@ -332,6 +347,19 @@ The override is validated at startup, fail-fast in both directions:
 - Every `environment_order` entry owned by this instance (per `allowed_environments`; all entries when the instance is unscoped) must be configured under the database's `environments` — otherwise a later environment's apply would wait on a prior check that can never exist.
 
 Entries owned by another instance in the promotion chain (outside this instance's `allowed_environments`) may be absent from the database's local `environments`: the promotion gate verifies them through the peer's GitHub aggregate check, exactly as with the server-wide order. Instances sharing a database must declare the same effective order for it — render all instances' config from a single source.
+
+### Renaming identifiers
+
+When lowercasing an existing database key, rename the server config key, every
+consumer repository's `schemabot.yaml` `database:` value, and the schema
+directory in lockstep. Renaming while an apply is in flight is unsafe; drain
+all in-flight applies first.
+
+When upgrading to a release that folds repository identity at ingress, drain
+in-flight applies before upgrading. Lock rows written by earlier versions may
+have mixed-case owner values such as `Org/Repo#42`; on PostgreSQL, the folded
+owner cannot reacquire or release those locks. Use force-release for any locks
+stranded during the upgrade.
 
 ## Hybrid Mode
 
@@ -596,10 +624,8 @@ The defaults, and why they were chosen:
   instance and, with `enable_experimental_autoscaling` on, scales them
   dynamically from throttler feedback. A fixed thread count is the classic
   failure mode on large targets — throughput that made sense on one instance
-  class silently starves or overloads another. The operator control for copy
-  aggressiveness is the apply's `volume`, not a thread count — though on a
-  target where autoscaling is engaged, autoscaling's own thread counts take
-  over and `volume` has nothing left to tune. Set
+  class silently starves or overloads another, and autoscaling is why there is
+  no operator knob for copy aggressiveness. Set
   `enable_experimental_autoscaling: false` only as an incident kill switch when
   autoscaling misbehaves on a target fleet.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
@@ -822,6 +848,9 @@ rest of the hint on the PR page. When omitted, plan comments are unchanged.
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.
 
+Repository names in `repos:` and consumer `allowed_repos` lists are matched
+case-insensitively and normalized to lowercase when loaded.
+
 ```yaml
 # Local mode — repos as allowlist only
 repos:
@@ -981,7 +1010,7 @@ Approval is checked at the time of `schemabot apply` and `schemabot apply-confir
 By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated — every request is allowed, which suits local development and deployments where the network is the only boundary. Setting `auth.type` turns on per-request authentication and a two-tier authorization model:
 
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
-- **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`volume`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
+- **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
 
 Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
 
@@ -1063,7 +1092,7 @@ Which environments accept scoped writes is a deployment policy, uniform across d
 
 The two value namespaces do not overlap and are verified by different systems, so they are deliberately separate fields: a GitHub team slug has no meaning in the groups header, and a forwarded group name is not a GitHub team. Grant each lane explicitly.
 
-The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `volume`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
+The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`); a scoped operator can release only locks their own callers hold.
 

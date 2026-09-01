@@ -15,13 +15,13 @@ func TestRenderControlRejections(t *testing.T) {
 	t.Run("names every rejected command and its reason", func(t *testing.T) {
 		out := RenderControlRejections([]ControlRejectionData{
 			{Operation: "cutover", Message: "deploy request is not ready to cut over", RequestedBy: "octocat"},
-			{Operation: "volume", Message: "no active schema change"},
+			{Operation: "start", Message: "no stopped schema change to resume"},
 		})
 
 		assert.Contains(t, out, "[!WARNING]")
 		assert.Contains(t, out, "`cutover` was accepted but did not take effect (requested by `octocat`): deploy request is not ready to cut over")
-		assert.Contains(t, out, "`volume` was accepted but did not take effect: no active schema change")
-		assert.NotContains(t, out, "`volume` was accepted but did not take effect (requested by")
+		assert.Contains(t, out, "`start` was accepted but did not take effect: no stopped schema change to resume")
+		assert.NotContains(t, out, "`start` was accepted but did not take effect (requested by")
 	})
 
 	t.Run("an engine error cannot leak endpoints or escape the quote block", func(t *testing.T) {

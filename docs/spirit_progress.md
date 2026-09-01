@@ -184,7 +184,7 @@ apply level — while any table still copies rows the apply is `running`; once
 every active table is draining or verifying, the apply names that phase
 (`catching_up`, `checksumming`, `post_checksum`). All three are
 running-family: `state.IsRunningApplyState` matches them, so control gates
-(stop, start, volume, cutover readiness), the driver claim list, and check
+(stop, start, cutover readiness), the driver claim list, and check
 aggregation treat them exactly like `running`. On the wire they are the
 `STATE_CATCHING_UP` / `STATE_CHECKSUMMING` / `STATE_POST_CHECKSUM` proto
 values.
@@ -274,9 +274,7 @@ One Spirit runner per table, processed in order. `pollTaskToCompletion` polls ev
 ### API (`pkg/api/progress_handlers.go`)
 
 `progressResponseFromProto()` does a direct proto → JSON mapping. `handleProgressByApplyID()`
-adds apply-level fields: `apply_id`, `database`, `environment`, `volume`.
-
-Volume is read from the apply's stored options, not from the engine.
+adds apply-level fields: `apply_id`, `database`, `environment`.
 
 ### CLI/TUI (`pkg/cmd/commands/watch_tui.go`)
 
@@ -422,8 +420,7 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 
 | State | Footer |
 |-------|--------|
-| Running | `ESC detach · s stop · v volume` |
-| Running (volume mode) | `Volume: ████████░░░ 8/11` / `↑↓ adjust · 1-9 direct · ESC done` |
+| Running | `ESC detach • s stop` |
 | Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
 | Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
 | Cutting over | `Cutover in progress - please wait...` |

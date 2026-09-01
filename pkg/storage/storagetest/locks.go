@@ -16,6 +16,56 @@ import (
 // requires backdating the stored row via SQL, which is dialect-specific and
 // lives in each implementation's own integration tests.
 func TestLocks(t *testing.T, h Harness) {
+	t.Run("CanonicalIdentityKey", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := &storage.Lock{
+			DatabaseName:  "Orders_DB",
+			DatabaseType:  "MySQL",
+			Repository:    "Org/Repo",
+			PullRequest:   42,
+			Owner:         "Org/Repo#42",
+			PendingPlanID: "plan-1",
+		}
+		require.NoError(t, store.Locks().Acquire(ctx, lock))
+
+		stored, err := store.Locks().Get(ctx, "ORDERS_DB", "MYSQL")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "orders_db", stored.DatabaseName)
+		assert.Equal(t, "mysql", stored.DatabaseType)
+		assert.Equal(t, "org/repo", stored.Repository)
+		assert.Equal(t, "Org/Repo#42", stored.Owner)
+
+		locks, err := store.Locks().GetByPR(ctx, "ORG/REPO", 42)
+		require.NoError(t, err)
+		require.Len(t, locks, 1)
+
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "orders_db", DatabaseType: "mysql",
+			Repository: "org/repo", PullRequest: 42,
+			Owner: "Org/Repo#42",
+		}))
+		require.ErrorIs(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName: "ORDERS_DB", DatabaseType: "MYSQL",
+			Repository: "ORG/REPO", PullRequest: 42,
+			Owner: "org/repo#42",
+		}), storage.ErrLockHeld)
+		require.ErrorIs(t, store.Locks().Release(ctx, "ORDERS_DB", "MYSQL", "org/repo#42"), storage.ErrLockNotOwned)
+		require.ErrorIs(t, store.Locks().Update(ctx, &storage.Lock{
+			DatabaseName: "ORDERS_DB", DatabaseType: "MYSQL",
+			Owner: "org/repo#42",
+		}), storage.ErrLockNotOwned)
+
+		released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "org/repo#42", "plan-1")
+		require.NoError(t, err)
+		assert.False(t, released)
+
+		released, err = store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "Org/Repo#42", "plan-1")
+		require.NoError(t, err)
+		assert.True(t, released)
+	})
+
 	t.Run("Acquire", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

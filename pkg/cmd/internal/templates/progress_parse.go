@@ -33,9 +33,6 @@ type ProgressData struct {
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
-	// Volume is the apply's current volume level (1=slowest, 11=fastest).
-	// Zero means the operator never set one, so the display stays quiet.
-	Volume int
 	// Released is true when an operator has released a paused rollout open, so a
 	// deployment that failed under on_failure=pause no longer holds later
 	// deployments. Apply-level: it applies to every operation of the apply.
@@ -162,7 +159,6 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		CompletedAt:    result.CompletedAt,
 		Options:        result.Options,
 		Metadata:       result.Metadata,
-		Volume:         int(result.Volume),
 		Released:       result.Released,
 	}
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)

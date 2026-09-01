@@ -245,16 +245,11 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
 			require.NoError(t, err)
 
-			err = client.ThrottleDeployRequest(t.Context(), &ThrottleDeployRequestRequest{
-				Organization:  "block",
-				Database:      "orders",
-				Number:        132,
-				ThrottleRatio: 0.5,
-			})
+			_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "502 Bad Gateway")
-			assert.Contains(t, err.Error(), "/v1/organizations/block/databases/orders/deploy-requests/132/throttle")
+			assert.Contains(t, err.Error(), "/v1/organizations/block/databases/orders/deploy-requests/132")
 			assert.NotContains(t, err.Error(), srv.URL, "the endpoint host does not belong in an operator-facing message")
 			if tc.wantInError != "" {
 				assert.Contains(t, err.Error(), tc.wantInError)
