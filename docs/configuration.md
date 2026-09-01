@@ -784,7 +784,23 @@ on the storage dialect:
   index is not optional — `EnsureSchema` applies it as a startup `ALTER`
   under the budget described in the MySQL bullet above, and `apply_operations`
   grows with total apply history, so large deployments should pre-create it
-  there too.
+  there too. And one bootstrapped before the webhook inbox claim ordering on
+  `webhook_events` was indexed needs:
+
+  ```sql
+  CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);
+  ```
+
+  Without it, every webhook claim sorts the full claimable inbox before
+  taking one row, which slows claiming as delivery history grows. On MySQL
+  the same index arrives as a startup `ALTER` under the budget described in
+  the MySQL bullet above, and `webhook_events` grows with total delivery
+  history and has no retention sweep, so pre-create it there before rolling
+  out:
+
+  ```sql
+  ALTER TABLE `webhook_events` ADD INDEX `idx_created_id` (`created_at`, `id`);
+  ```
 
 The rest of this section describes the MySQL flow.
 

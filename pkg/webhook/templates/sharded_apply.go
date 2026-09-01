@@ -450,7 +450,7 @@ func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
 		fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", t.Table, ui.ProgressBarActivity(), shardedCopyCoverageSuffix(t))
 		fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
-		fmt.Fprintf(sb, "- ℹ️ _%s_\n", ui.EstimateExceededTooltip)
+		fmt.Fprintf(sb, "- %s _%s_\n", glyph.Info, ui.EstimateExceededTooltip)
 		return
 	}
 	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
