@@ -44,6 +44,20 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 		assert.Contains(t, body, "outside its revert window")
 	})
 
+	// A rejection recorded by a previous release for a retired operation names
+	// a command the operator can no longer issue: the notice's "re-issue the
+	// command" remedy is impossible, so nothing could ever clear it.
+	t.Run("a rejection for a retired operation adds no notice", func(t *testing.T) {
+		body := observer(&storage.ApplyControlRequest{
+			Operation:    storage.ControlOperation("volume"),
+			Status:       storage.ControlRequestFailed,
+			RequestedBy:  "octocat",
+			ErrorMessage: "the engine rejected the volume change",
+		}).formatStatusComment(apply, nil)
+
+		assert.NotContains(t, body, "Command not applied")
+	})
+
 	t.Run("a completed control request adds no notice", func(t *testing.T) {
 		body := observer(&storage.ApplyControlRequest{
 			Operation: storage.ControlOperationCutover,

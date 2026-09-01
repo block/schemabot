@@ -220,6 +220,11 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		"skip-revert": RenderSkipRevertSupersededProgressComment(shared),
 		"cutover":     RenderCutoverSupersededComment(shared),
 		"generic":     RenderSupersededProgressComment(shared),
+		// A volume-frozen body has no renderer anymore, but bodies written by a
+		// release that had one are still on GitHub and must stay recognizable.
+		"volume": renderSupersededFold(volumeSupersededPrefix+" **8/11** — progress continues in",
+			"Progress before the volume change",
+			shared.Repo, shared.PR, shared.NewCommentID, shared.PreviousBody),
 	}
 	for flavor, body := range frozen {
 		assert.Truef(t, IsSupersededProgressComment(body),

@@ -358,6 +358,14 @@ func RenderSupersededProgressComment(data SupersededProgressData) string {
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
+// volumeSupersededPrefix opens the frozen bodies written when a volume change
+// superseded a progress comment, back when volume was a control operation.
+// Nothing renders it anymore, but such bodies are still on GitHub wherever the
+// binary that wrote one failed to clear its freeze marker; the recognition
+// list keeps the prefix so a freeze retry does not fold one of those bodies a
+// second time.
+const volumeSupersededPrefix = "⏩ Volume changed to"
+
 // IsSupersededProgressComment reports whether a comment body is already a
 // frozen superseded rendering — any rotation flavor — so a freeze retry does
 // not wrap a frozen body in a second fold. A frozen body opens with a flavor
@@ -371,6 +379,7 @@ func IsSupersededProgressComment(body string) bool {
 		return false
 	}
 	for _, prefix := range []string{
+		volumeSupersededPrefix,
 		resumeSupersededPrefix,
 		revertSupersededPrefix,
 		skipRevertSupersededPrefix,
