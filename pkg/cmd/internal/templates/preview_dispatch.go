@@ -154,6 +154,10 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress())
 	case PreviewCommentReconcileCompleted:
 		fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted())
+	case PreviewCommentReconcileAutoNotice:
+		fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationAutoNotice())
+	case PreviewCommentChecksRefreshedAfterRollback:
+		fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedAfterRollback())
 	case PreviewCommentMultiEnv:
 		fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan())
 	case PreviewCommentMultiEnvDiff:

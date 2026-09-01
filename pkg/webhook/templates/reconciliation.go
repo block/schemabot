@@ -11,7 +11,11 @@ import (
 // reconciled before SchemaBot can treat an empty PR diff as clean.
 type SchemaChangeReconciliationData struct {
 	RequestedBy string
-	Timestamp   string
+	// Trigger describes the system event that produced the comment when no
+	// user requested it (e.g. "Triggered automatically by a pull request
+	// update"). When set, it replaces the requested-by attribution line.
+	Trigger   string
+	Timestamp string
 	// Tenant is the deployment's own tenant; when set, the pasteable stop,
 	// plan, and rollback hints carry it so the command addresses this deployment.
 	Tenant string
@@ -46,8 +50,12 @@ func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 // SchemaBot check state instead of running a plan.
 type NoManagedSchemaChangesChecksRefreshedData struct {
 	RequestedBy string
-	Timestamp   string
-	HeadSHA     string
+	// Trigger describes the system event that produced the comment when no
+	// user requested it (e.g. "Triggered automatically after the rollback
+	// completed"). When set, it replaces the requested-by attribution line.
+	Trigger   string
+	Timestamp string
+	HeadSHA   string
 	// GatedOnTenants marks the aggregate-leader case: the refreshed check
 	// gates on tenant deployments' own checks for the touched schema paths
 	// instead of passing unconditionally.
@@ -60,7 +68,7 @@ type NoManagedSchemaChangesChecksRefreshedData struct {
 func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChecksRefreshedData) string {
 	var sb strings.Builder
 	sb.WriteString("## ✅ No Managed Schema Changes\n\n")
-	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
+	writeTriggerOrRequestedLine(&sb, data.Trigger, data.RequestedBy, data.Timestamp)
 	if data.GatedOnTenants {
 		fmt.Fprintf(&sb, "\nThis PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `%s` and will pass once every tenant deployment's own check succeeds.\n", data.HeadSHA)
 		return sb.String()
@@ -75,7 +83,7 @@ func RenderSchemaChangeReconciliationRequired(data SchemaChangeReconciliationDat
 	var sb strings.Builder
 	sb.WriteString("## " + glyph.Attention + " Schema Change Reconciliation Required\n\n")
 	writeReconciliationMetadata(&sb, data.Items)
-	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
+	writeTriggerOrRequestedLine(&sb, data.Trigger, data.RequestedBy, data.Timestamp)
 	sb.WriteString("\n")
 
 	if reconciliationHasInProgressApply(data.Items) {
@@ -117,6 +125,17 @@ func writeReconciliationMetadata(sb *strings.Builder, items []SchemaChangeReconc
 	sb.WriteString("\n")
 }
 
+// writeTriggerOrRequestedLine writes the comment's attribution: the system
+// trigger description when the comment was not user-requested, otherwise the
+// requested-by line.
+func writeTriggerOrRequestedLine(sb *strings.Builder, trigger, requestedBy, timestamp string) {
+	if trigger != "" {
+		fmt.Fprintf(sb, "*%s at %s UTC*\n", trigger, timestamp)
+		return
+	}
+	writeRequestedLine(sb, requestedBy, timestamp)
+}
+
 func writeRequestedLine(sb *strings.Builder, requestedBy, timestamp string) {
 	if requestedBy == "" && timestamp == "" {
 		return
@@ -154,7 +173,7 @@ func writeInProgressReconciliation(sb *strings.Builder, tenant string, items []S
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", planCommand(tenant, items))
 	sb.WriteString("   - If the live schema change should not remain, roll it back:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
-	sb.WriteString("     After rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan.\n")
+	sb.WriteString("     After the rollback completes, SchemaBot refreshes this PR's checks automatically.\n")
 }
 
 func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []SchemaChangeReconciliationItem) {
@@ -169,7 +188,7 @@ func writeCompletedReconciliation(sb *strings.Builder, tenant string, items []Sc
 	sb.WriteString("\n2. Undo the live schema change:\n")
 	sb.WriteString("   - comment:\n")
 	fmt.Fprintf(sb, "     ```\n     %s\n     ```\n", rollbackCommand(tenant, items))
-	sb.WriteString("   - after rollback: push a no-op `schemabot.yaml` edit to trigger a fresh plan\n")
+	sb.WriteString("   - after the rollback completes, SchemaBot refreshes this PR's checks automatically\n")
 }
 
 func planCommand(tenant string, items []SchemaChangeReconciliationItem) string {

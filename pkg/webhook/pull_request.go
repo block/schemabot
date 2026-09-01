@@ -992,6 +992,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 	}
 
 	cleaned := false
+	var newlyBlocked []*storage.Check
 
 	for _, check := range checks {
 		if isAggregateCheck(check) {
@@ -1018,8 +1019,12 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			"previous_blocking_reason", check.BlockingReason, "apply_id", check.ApplyID)
 
 		if checkHasStartedApply(check) {
+			alreadyExplained := checkBlockedByRemovedSchemaAfterApply(check)
 			if h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check) {
 				cleaned = true
+				if !alreadyExplained {
+					newlyBlocked = append(newlyBlocked, check)
+				}
 			}
 			continue
 		}
@@ -1038,6 +1043,15 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			Repository: repo,
 			Status:     "noop",
 		})
+	}
+
+	// A retained started-apply block is invisible on the PR timeline until
+	// something explains it: the operator sees a blocked check with no comment
+	// saying why or what to do. Post the reconciliation notice for checks that
+	// just transitioned into the removed-schema block; checks already carrying
+	// it were explained when they transitioned.
+	if len(newlyBlocked) > 0 {
+		h.notifyRetainedStartedApplyBlocks(ctx, repo, pr, installationID, newlyBlocked)
 	}
 }
 

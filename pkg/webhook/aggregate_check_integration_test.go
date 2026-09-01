@@ -538,6 +538,149 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	}
 }
 
+// TestE2EStaleCleanupRetainedBlockPostsReconciliationNotice verifies the PR UX
+// when a push removes a schema change whose apply already started: stale-check
+// cleanup retains the block, and a reconciliation-required comment lands on the
+// PR timeline explaining why the check still blocks and how to reconcile. A
+// redelivered synchronize for the same head must not repeat the comment — the
+// stored blocking reason marks the block as already explained.
+func TestE2EStaleCleanupRetainedBlockPostsReconciliationNotice(t *testing.T) {
+	dbName := "webhook_stale_block_notice"
+	svc := setupE2EService(t, dbName)
+	ctx := t.Context()
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-retained-block",
+		Database:        dbName,
+		DatabaseType:    "mysql",
+		Environment:     "staging",
+		Repository:      "octocat/hello-world",
+		PullRequest:     1,
+		State:           state.Apply.Running,
+		Engine:          "spirit",
+	}
+	applyID, err := svc.Storage().Applies().Create(ctx, apply)
+	require.NoError(t, err)
+
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  "staging",
+		DatabaseType: "mysql",
+		DatabaseName: dbName,
+		CheckRunID:   100,
+		ApplyID:      applyID,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+	require.NoError(t, svc.Storage().Checks().Upsert(ctx, &storage.Check{
+		Repository:   "octocat/hello-world",
+		PullRequest:  1,
+		HeadSHA:      "oldsha111",
+		Environment:  aggregateSentinel,
+		DatabaseType: aggregateSentinel,
+		DatabaseName: aggregateSentinel,
+		CheckRunID:   200,
+		HasChanges:   true,
+		Status:       checkStatusInProgress,
+		Conclusion:   "",
+	}))
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{
+			State: new("open"),
+			Head: &gh.PullRequestBranch{
+				Ref: new("feature-branch"),
+				SHA: new("newsha222"),
+			},
+			Base: &gh.PullRequestBranch{
+				Ref: new("main"),
+				SHA: new("def456"),
+			},
+			User: &gh.User{Login: new("testuser")},
+		})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{})
+	})
+
+	checkRuns := make(chan checkRunCapture, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+	})
+	mux.HandleFunc("PATCH /repos/octocat/hello-world/check-runs/", func(w http.ResponseWriter, r *http.Request) {
+		var body checkRunCapture
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		checkRuns <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+	})
+
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	h := newE2EHandler(t, svc, client)
+
+	sendSynchronize := func() {
+		req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+			action:  "synchronize",
+			headSHA: "newsha222",
+		}, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	sendSynchronize()
+
+	notice := requireComment(t, comments, "reconciliation notice for retained started-apply block")
+	assert.Contains(t, notice, "Schema Change Reconciliation Required")
+	assert.Contains(t, notice, "Triggered automatically by a pull request update")
+	assert.NotContains(t, notice, "Requested by")
+	assert.Contains(t, notice, "apply-retained-block")
+	assert.Contains(t, notice, dbName)
+	assert.Contains(t, notice, "SchemaBot is still applying a schema change from this PR")
+
+	// The stored blocking reason is the durable marker that the notice was
+	// posted; it also keeps the check blocking the PR.
+	check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+	assert.Equal(t, applyID, check.ApplyID)
+
+	// A redelivered cleanup for the same head finds the block already
+	// explained: the check is re-blocked and the aggregate recomputed, but no
+	// second notice posts. Run cleanup directly (the webhook path launches it
+	// asynchronously) so the absence assertion below observes a finished pass.
+	for len(checkRuns) > 0 {
+		<-checkRuns
+	}
+	h.cleanupStaleChecks("octocat/hello-world", 1, "newsha222", 12345, nil)
+	select {
+	case body := <-comments:
+		t.Fatalf("redelivered cleanup must not repeat the reconciliation notice, got comment: %s", body)
+	default:
+	}
+	check, err = svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "staging", "mysql", dbName)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, check.BlockingReason)
+	assert.Equal(t, applyID, check.ApplyID)
+}
+
 // TestE2EPassingAggregateOnNonSchemaPR verifies that when a PR doesn't touch schema
 // files and allowed_environments is configured, passing aggregate checks are posted
 // so branch protection isn't blocked.

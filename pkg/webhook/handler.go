@@ -425,6 +425,15 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 		return
 	}
 	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+
+	// A completed rollback restored the target schema, so the PR may now match
+	// the live database with nothing left to apply. Converge the checks so the
+	// operator does not have to know to run a plan; the guard above (`updated`)
+	// means only the invocation that won the terminal check-state write gets
+	// here, keeping the refresh single-shot across pods and observer paths.
+	if isCompletedRollback(a) {
+		h.convergeChecksAfterCompletedRollback(ctx, ghInstClient, a)
+	}
 }
 
 // errGitHubAppResolution marks factoryForRepo failures. GitHub App resolution
