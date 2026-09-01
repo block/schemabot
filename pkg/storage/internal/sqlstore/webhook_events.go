@@ -379,6 +379,15 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	// locked; there the index spares the sort itself. Each dialect's schema
 	// file names that index by its own convention.
 	//
+	// The index bounds locking, not reads. The walk starts at the oldest row
+	// and evaluates the claimable predicate per row, and in a healthy inbox
+	// the oldest rows are terminal ones — so a claim reads across all retained
+	// terminal history before reaching the first claimable row. Leading the
+	// index with state instead would bound those reads but lose the ordering
+	// (the predicate ORs across states), reinstating the sort. Bounding the
+	// reads is a retention job: only purging terminal rows keeps the history
+	// the walk crosses finite.
+	//
 	// Claiming stays two-step — id here, then a primary-key load — so a plan
 	// that does sort (the planner may prefer another index, and an
 	// already-bootstrapped PostgreSQL database gains this index only by hand)
