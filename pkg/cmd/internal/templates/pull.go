@@ -78,7 +78,7 @@ func writeTableEstimates(table string, catalog *apitypes.TableCatalog) {
 	fmt.Println(annotation(fmt.Sprintf("-- Table %s — rows ~%s, size ~%s (engine estimates)",
 		emphasis("`"+table+"`"),
 		ui.FormatNumber(catalog.EstimatedRowCount),
-		ui.FormatBytes(catalog.DataSizeBytes))))
+		ui.FormatBytesBinary(catalog.DataSizeBytes))))
 }
 
 // annotation renders a "--" comment line dimmed on interactive terminals, so
