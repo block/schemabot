@@ -4225,10 +4225,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
-
-Cutover in progress — typically completes within seconds.
-
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
@@ -8318,7 +8314,6 @@ Defer cutover: Cutting over in progress
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-Cutover in progress. This typically completes within seconds.
 Tables are being renamed atomically...
 ```
 </details>
