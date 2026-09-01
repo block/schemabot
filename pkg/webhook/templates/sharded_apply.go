@@ -520,7 +520,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.Recovering:
 		return "🔄 Recovering state..."
 	case state.Task.Failed:
-		return "❌ Failed"
+		return glyph.Failed + " Failed"
 	case state.Task.FailedRetryable:
 		return "🔄 Interrupted — retrying automatically"
 	case state.Task.Stopped:

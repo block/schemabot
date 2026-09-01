@@ -81,6 +81,8 @@ type ShardProgressData struct {
 	Shard           string
 	Status          string // canonical lowercase shard/task state
 	PercentComplete int
+	RowsCopied      int64
+	RowsTotal       int64
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -460,6 +462,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 
 	var completed, running, catchingUp, checksumming, queued, waiting, failed, retrying, stopped, recovering, cutting, cancelled, other int
 	var runningPct int
+	var runningPctText string
 	var runningEstimateExceeded bool
 
 	for _, t := range tables {
@@ -479,6 +482,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 				runningEstimateExceeded = true
 			} else {
 				runningPct = ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
+				runningPctText = ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 			}
 		case state.Task.CatchingUp, state.Task.PostChecksum:
 			// Both binlog drains (before and after the verify) read as
@@ -525,7 +529,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 		if runningEstimateExceeded {
 			label += " (finalizing copy)"
 		} else if runningPct > 0 {
-			label += fmt.Sprintf(" (%d%%)", runningPct)
+			label += fmt.Sprintf(" (%s)", runningPctText)
 		}
 		parts = append(parts, label)
 	}
@@ -777,7 +781,8 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// show how far the verify has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)%s\n", table.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(table))
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%s)%s\n", table.TableName, ui.ProgressBarRowCopy(pct),
+				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), throttledSuffix(table))
 			writeDDLLine(sb, dialect, table.DDL)
 			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
@@ -805,7 +810,8 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		if recoveringIsCopyingRows(table) {
 			pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
-			fmt.Fprintf(sb, "**`%s`**: %s Row copy in progress (%d%%)\n", table.TableName, bar, pct)
+			fmt.Fprintf(sb, "**`%s`**: %s Row copy in progress (%s)\n", table.TableName, bar,
+				ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal))
 			writeDDLLine(sb, dialect, table.DDL)
 			writeRowsAndETA(sb, table)
 			break
@@ -917,8 +923,9 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 	if len(table.Shards) <= shardNamesInlineLimit {
 		parts := make([]string, 0, len(table.Shards))
 		for _, sh := range table.Shards {
-			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
-				parts = append(parts, fmt.Sprintf("%s %s %d%%", shardGlyph(sh.Status), sh.Shard, sh.PercentComplete))
+			if isCopyingShardStatus(sh.Status) && (sh.PercentComplete > 0 || sh.RowsCopied > 0) {
+				parts = append(parts, fmt.Sprintf("%s %s %s", shardGlyph(sh.Status), sh.Shard,
+					ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)))
 				continue
 			}
 			part := fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard)
@@ -934,8 +941,8 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 	}
 
 	var complete, copying, ready, failed, queued, other int
-	slowestShard := ""
-	slowestPct := -1
+	slowestShard, slowestText := "", ""
+	slowestFraction := -1.0
 	for _, sh := range table.Shards {
 		// Shards parked at the cutover barrier count through the shared
 		// readiness predicate, keeping the shard buckets consistent with the
@@ -954,9 +961,10 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		default:
 			if isCopyingShardStatus(sh.Status) {
 				copying++
-				if slowestPct < 0 || sh.PercentComplete < slowestPct {
-					slowestPct = sh.PercentComplete
+				if frac := ui.RowCopyFraction(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal); slowestFraction < 0 || frac < slowestFraction {
+					slowestFraction = frac
 					slowestShard = sh.Shard
+					slowestText = ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)
 				}
 			} else {
 				other++
@@ -983,8 +991,8 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		buckets = append(buckets, fmt.Sprintf("%d …", other))
 	}
 	line := fmt.Sprintf("  └ %d shards: %s", len(table.Shards), strings.Join(buckets, " · "))
-	if slowestShard != "" && slowestPct >= 0 {
-		line += fmt.Sprintf(" · slowest %s %d%%", slowestShard, slowestPct)
+	if slowestShard != "" && slowestFraction >= 0 {
+		line += fmt.Sprintf(" · slowest %s %s", slowestShard, slowestText)
 	}
 	sb.WriteString(line + "\n")
 }
@@ -1060,7 +1068,8 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 			return
 		}
 		bar := ui.ProgressBarRowCopy(pct)
-		fmt.Fprintf(sb, "**`%s`**: %s %d%%%s\n", table.TableName, bar, pct, throttledSuffix(table))
+		fmt.Fprintf(sb, "**`%s`**: %s %s%s\n", table.TableName, bar,
+			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal), throttledSuffix(table))
 		writeDDLLine(sb, dialect, table.DDL)
 		writeRowsAndETA(sb, table)
 	} else {
@@ -1106,17 +1115,24 @@ func recoveringIsCopyingRows(table TableProgressData) bool {
 	return table.RowsTotal > 0 && table.PercentComplete < 100
 }
 
-func recoveringCopyPercent(tables []TableProgressData) (int, bool) {
-	percent := 100
+// recoveringCopyPercent returns the least-progressed recovering table's copy
+// percent as display text, so the recovery summary never overstates how far
+// the slowest table has come.
+func recoveringCopyPercent(tables []TableProgressData) (string, bool) {
+	fraction := 0.0
+	text := ""
 	found := false
 	for _, table := range tables {
 		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !recoveringIsCopyingRows(table) {
 			continue
 		}
-		percent = min(percent, ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
+		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
+			fraction = frac
+			text = ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+		}
 		found = true
 	}
-	return percent, found
+	return text, found
 }
 
 // renderStoppedTable renders a table in the stopped state.
@@ -1128,7 +1144,8 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 	case table.PercentComplete > 0 || table.RowsCopied > 0:
 		pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
 		bar := ui.ProgressBarStopped(pct)
-		fmt.Fprintf(sb, "**`%s`**: %s \u23f9\ufe0f Stopped at %d%%\n", table.TableName, bar, pct)
+		fmt.Fprintf(sb, "**`%s`**: %s \u23f9\ufe0f Stopped at %s\n", table.TableName, bar,
+			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal))
 	default:
 		fmt.Fprintf(sb, "**`%s`**: \u23f9\ufe0f Stopped (not started)\n", table.TableName)
 	}
@@ -1211,7 +1228,7 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 	case state.Apply.Recovering:
 		sb.WriteString("\n---\n\n")
 		if pct, ok := recoveringCopyPercent(data.Tables); ok {
-			fmt.Fprintf(sb, "Recovering after restart. Row copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view.\n", pct)
+			fmt.Fprintf(sb, "Recovering after restart. Row copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view.\n", pct)
 		} else {
 			sb.WriteString("Recovering after restart. Cutover will be available once recovery completes.\n")
 		}
@@ -1710,13 +1727,13 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	case state.Task.Failed:
 		label := "Failed"
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
-			label = fmt.Sprintf("Failed at %d%%", ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
+			label = fmt.Sprintf("Failed at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case state.Task.Stopped:
 		label := "Stopped"
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
-			label = fmt.Sprintf("Stopped at %d%%", ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
+			label = fmt.Sprintf("Stopped at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		}
 		fmt.Fprintf(sb, "**`%s`** — %s\n", t.TableName, label)
 	case "reverted":

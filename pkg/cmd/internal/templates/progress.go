@@ -492,8 +492,10 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// source. On a large table this can run for hours, so show how far the
 		// verify has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
-			pct := ui.RowCopyDisplayPercent(int(math.Round(float64(t.ChecksumRowsChecked)*100/float64(t.ChecksumRowsTotal))), t.ChecksumRowsChecked)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)%s\n", t.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
+			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%s)%s\n", t.TableName, ui.ProgressBarRowCopy(pct),
+				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
@@ -536,7 +538,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if recoveringIsCopyingRows(t) {
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%d%%)\n", t.TableName, bar, pct)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%s)\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
@@ -633,7 +636,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🚫 Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🚫 Cancelled at %s\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: 🚫 Cancelled (not started)\n", t.TableName)
 		}
@@ -652,7 +656,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// At 100% = was waiting for cutover when stopped
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped at %d%%\n", t.TableName, bar, stoppedPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped at %s\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		default:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏹️ Stopped (not started)\n", t.TableName)
 		}
@@ -679,7 +684,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// Parsed successfully - show emoji progress bar with structured data
 			displayPercent := ui.RowCopyDisplayPercent(info.Percent, info.RowsCopied)
 			bar := ui.ProgressBarRowCopy(displayPercent)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(info.Percent, info.RowsCopied, info.RowsTotal), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
@@ -716,7 +722,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, bar,
+			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
 
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))

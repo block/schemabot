@@ -118,7 +118,10 @@ func TestFormatDurationSeconds(t *testing.T) {
 	}
 }
 
-func TestFormatShardLineDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copying shard that hasn't reached 1% shows the true fraction computed
+// from its row counts, so a shard's early progress on a huge table reads as
+// the small fraction it is instead of a rounded-up 1%.
+func TestFormatShardLineShowsSubPercentFraction(t *testing.T) {
 	line := formatShardLine(ShardProgress{
 		Shard:           "-80",
 		Status:          state.Task.Running,
@@ -127,8 +130,8 @@ func TestFormatShardLineDisplaysOnePercentAfterCopyStarts(t *testing.T) {
 		PercentComplete: 0,
 	})
 
-	assert.Contains(t, line, "1% (3,000/1,604,159 rows)")
-	assert.NotContains(t, line, "0%")
+	assert.Contains(t, line, "0.19% (3,000/1,604,159 rows)")
+	assert.NotContains(t, line, " 0%")
 }
 
 func TestIsPlanetScaleEngine(t *testing.T) {

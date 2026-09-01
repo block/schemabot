@@ -635,17 +635,18 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 	})
-	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (22%)")
+	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (21.92%)")
 	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
 
-	// A verify that has only just begun still renders as visibly started: a
-	// non-zero checked count floors the display at 1% instead of showing an
-	// empty "not started" bar while verification is actively running.
+	// A verify that has only just begun still renders as visibly started: the
+	// bar shows a first segment, and the percent shows the true sub-1% fraction
+	// (floored away from 0.00%) instead of an empty "not started" display while
+	// verification is actively running.
 	justStarted := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 1, ChecksumRowsTotal: 1000000,
 	})
-	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (1%)")
+	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (0.01%)")
 	assert.Contains(t, justStarted, "🟦")
 }
 
@@ -661,7 +662,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "redo-aware 4 > 3",
 	})
-	assert.Contains(t, copying, "45% (throttled)",
+	assert.Contains(t, copying, "45.00% (throttled)",
 		"the annotation lands on the header line next to the percent")
 	assert.Contains(t, copying, "ℹ️ Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget")
 
@@ -670,7 +671,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true,
 	})
-	assert.Contains(t, noReason, "45% (throttled)")
+	assert.Contains(t, noReason, "45.00% (throttled)")
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	unknownSignal := FormatTableProgress(TableProgress{
@@ -687,7 +688,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 		Throttled: true, ThrottleReason: "threads-running 21 > 18",
 	})
-	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (22%) (throttled)")
+	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
 
 	notThrottled := FormatTableProgress(TableProgress{
@@ -789,7 +790,7 @@ func TestFormatTableProgress_InstantAlterRendering(t *testing.T) {
 		PercentComplete: 25,
 	}
 	output := FormatTableProgress(copying)
-	assert.Contains(t, output, "25%", "a copying instant-flagged ALTER shows its real percent")
+	assert.Contains(t, output, "25.00%", "a copying instant-flagged ALTER shows its real percent")
 	assert.NotContains(t, output, "Applying instantly", "the instant label must not mask copy progress")
 
 	instant := TableProgress{
@@ -834,16 +835,22 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	assert.Contains(t, output, ui.ProgressBarRowCopy(45))
 	assert.NotContains(t, output, ui.ProgressBarRowCopy(100))
 
+	// Once row counts arrive, the displayed percent is computed from them
+	// rather than the engine's stale whole-number percent.
 	tp.RowsCopied = 420
 	tp.RowsTotal = 1000
 	tp.ETASeconds = 120
 	output = FormatTableProgress(tp)
-	assert.Contains(t, output, "Row copy in progress (45%)")
+	assert.Contains(t, output, "Row copy in progress (42.00%)")
 	assert.Contains(t, output, "Rows: 420 / 1,000 · ETA: 2m")
 	assert.NotContains(t, output, "Recovering state...")
 }
 
-func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts, with the bar's first segment lit so the
+// operator sees both that copying started and how little of a huge table has
+// actually copied.
+func TestFormatTableProgress_SubPercentRowCopyShowsFraction(t *testing.T) {
 	tp := TableProgress{
 		TableName:       "orders",
 		ChangeType:      "alter",
@@ -855,7 +862,7 @@ func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing
 
 	output := FormatTableProgress(tp)
 
-	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, output, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, output, " 0%")
 }
@@ -1053,7 +1060,7 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 		RowsCopied:      300,
 		RowsTotal:       1000,
 	})
-	assert.Contains(t, cancelled, "🚫 Cancelled at 30%")
+	assert.Contains(t, cancelled, "🚫 Cancelled at 30.00%")
 	assert.Contains(t, cancelled, ui.ColorOrange)
 	assert.NotContains(t, cancelled, ui.ColorRed)
 

@@ -255,7 +255,7 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; checksumming is table-level")
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%)")
 	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
 	assert.Contains(t, result, "1 checksumming")
 }
@@ -284,7 +284,7 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "45% (throttled)",
+	assert.Contains(t, result, "45.00% (throttled)",
 		"the annotation lands on the header line next to the percent")
 	assert.Contains(t, result, "- ℹ️ _Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
 		"the reason renders as a tooltip bullet with its tip and the doc link")
@@ -301,7 +301,7 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	data.Tables[0].ThrottleReason = ""
 	noReason := RenderApplyStatusComment(data)
-	assert.Contains(t, noReason, "45% (throttled)")
+	assert.Contains(t, noReason, "45.00% (throttled)")
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	data.Tables[0].Throttled = false
@@ -335,7 +335,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "🔍 Checksumming to verify data (21%) (throttled)")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_")
 }
 
@@ -498,7 +498,7 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.NotContains(t, result, "**Last updated**")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/3 complete")
-	assert.Contains(t, result, "1 running (45%)")
+	assert.Contains(t, result, "1 running (45.00%)")
 	assert.Contains(t, result, "1 queued")
 	assert.Contains(t, result, "**`users`**")
 
@@ -508,7 +508,7 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "🟩") // green bar for completed
 
 	assert.Contains(t, result, "**`users`**")
-	assert.Contains(t, result, "45%")
+	assert.Contains(t, result, "45.00%")
 	assert.Contains(t, result, "🟦") // blue bar for running
 	assert.Contains(t, result, "45,000 / 100,000")
 	assert.Contains(t, result, "ETA: 3m 15s")
@@ -757,7 +757,12 @@ func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
 	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request:")
 }
 
-func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts — in the running summary and on the table's
+// progress line — so early progress on a huge table reads as the small
+// fraction it is instead of a rounded-up 1%. The bar still lights its first
+// segment so the copy reads as started.
+func TestRenderApplyStatusComment_SubPercentRowCopyShowsFraction(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
@@ -772,8 +777,8 @@ func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *te
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "1 running (1%)")
-	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, result, "1 running (0.19%)")
+	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, result, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, result, " 0%")
 }
@@ -1303,7 +1308,7 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Stopped")
 	assert.Contains(t, result, "🟧") // orange bar for stopped
-	assert.Contains(t, result, "⏹️ Stopped at 72%")
+	assert.Contains(t, result, "⏹️ Stopped at 72.00%")
 	assert.Contains(t, result, "72,000 / 100,000")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/2 complete")
@@ -1449,9 +1454,9 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Row copy in progress (42%)")
+	assert.Contains(t, result, "Row copy in progress (42.00%)")
 	assert.Contains(t, result, "Rows: 420 / 1,000 · ETA: 2m")
-	assert.Contains(t, result, "Row copy is in progress (42%)")
+	assert.Contains(t, result, "Row copy is in progress (42.00%)")
 	assert.Contains(t, result, "progress returns to the normal row-copy view")
 	assert.Contains(t, result, "Recovering after restart")
 	assert.NotContains(t, result, "Cutover will be available once recovery completes")
@@ -1665,7 +1670,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`users`**")
 	assert.Contains(t, result, "**`products`**")
-	assert.Contains(t, result, "62%")
+	assert.Contains(t, result, "62.38%")
 	assert.Contains(t, result, "Queued")
 }
 
@@ -1702,7 +1707,7 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 
 	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Status**: Stopped")
-	assert.Contains(t, result, "Stopped at 72%")
+	assert.Contains(t, result, "Stopped at 72.00%")
 	assert.Contains(t, result, "schemabot start")
 }
 
@@ -1768,7 +1773,7 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "1 of 3 tables completed before failure.")
 	// Single namespace — no header, but table entries present
 	assert.NotContains(t, result, "### ")
-	assert.Contains(t, result, "**`users`** — Failed at 30%")
+	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
 }
@@ -1780,7 +1785,7 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	assert.Contains(t, result, "1 of 2 tables completed before stop.")
 	// Single namespace — no header
 	assert.NotContains(t, result, "### ")
-	assert.Contains(t, result, "**`users`** — Stopped at 72%")
+	assert.Contains(t, result, "**`users`** — Stopped at 72.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a stopped apply, the reader must be able to tell which tables made it")
 	// A stopped change is resumable.
 	assert.Contains(t, result, "schemabot start")

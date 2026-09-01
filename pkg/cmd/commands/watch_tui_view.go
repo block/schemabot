@@ -240,7 +240,7 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.Recovering):
 		b.WriteString("\n\n")
 		if pct, ok := recoveringCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
+			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
 		} else {
 			b.WriteString("SchemaBot is recovering after restart.\n")
 			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
@@ -277,17 +277,24 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-func recoveringCopyPercent(tables []templates.TableProgress) (int, bool) {
-	percent := 100
+// recoveringCopyPercent returns the least-progressed recovering table's copy
+// percent as display text, so the recovery footer never overstates how far
+// the slowest table has come.
+func recoveringCopyPercent(tables []templates.TableProgress) (string, bool) {
+	fraction := 0.0
+	text := ""
 	found := false
 	for _, table := range tables {
 		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.PercentComplete >= 100 {
 			continue
 		}
-		percent = min(percent, ui.ClampPercent(table.PercentComplete))
+		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
+			fraction = frac
+			text = ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+		}
 		found = true
 	}
-	return percent, found
+	return text, found
 }
 
 // renderTables renders tables with the shared FormatNamespacedTables /

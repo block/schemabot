@@ -440,7 +440,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
-		assert.Contains(t, edited.Body, "70%", "once running, the new comment shows real row-copy progress")
+		assert.Contains(t, edited.Body, "70.00%", "once running, the new comment shows real row-copy progress")
 	case created := <-capture.creates:
 		t.Fatalf("resume must rotate exactly once; got another new comment %d", created.ID)
 	case <-time.After(5 * time.Second):

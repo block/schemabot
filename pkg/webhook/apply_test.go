@@ -42,7 +42,7 @@ func TestFormatProgressComment(t *testing.T) {
 	assert.Contains(t, body, "staging")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
-	assert.Contains(t, body, "45%")
+	assert.Contains(t, body, "45.00%")
 	assert.Contains(t, body, "Schema Change Status")
 	// The running state is communicated on the always-present Status line.
 	assert.Contains(t, body, "**Status**: In Progress")

@@ -248,7 +248,7 @@ func TestWatchModel_ChecksummingShowsVerifyProgress(t *testing.T) {
 	model := updated.(WatchModel)
 
 	view := model.View()
-	assert.Contains(t, view, "Checksumming to verify data (9%)")
+	assert.Contains(t, view, "Checksumming to verify data (8.78%)")
 	assert.Contains(t, view, "Rows verified: 73,075,845 / 832,771,089")
 	assert.Contains(t, view, "(throttled)")
 }
@@ -270,9 +270,9 @@ func TestWatchModel_RecoveringShowsCopyingRows(t *testing.T) {
 	model := updated.(WatchModel)
 
 	view := model.View()
-	assert.Contains(t, view, "Row copy in progress (42%)")
+	assert.Contains(t, view, "Row copy in progress (42.00%)")
 	assert.Contains(t, view, "Rows: 420 / 1,000")
-	assert.Contains(t, view, "Row copy is in progress (42%)")
+	assert.Contains(t, view, "Row copy is in progress (42.00%)")
 	assert.Contains(t, view, "progress returns to the normal row-copy view")
 	assert.Contains(t, view, "SchemaBot is recovering after restart")
 	assert.NotContains(t, view, "Cutover will be available once recovery completes")

@@ -158,6 +158,8 @@ func shardProgressForTable(shardsByTable map[string][]*storage.Task, applyOperat
 			Shard:           r.Shard,
 			Status:          string(r.State),
 			PercentComplete: r.ProgressPercent,
+			RowsCopied:      r.RowsCopied,
+			RowsTotal:       r.RowsTotal,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Shard < out[j].Shard })
