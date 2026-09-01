@@ -13,7 +13,6 @@ func PreviewCommentAppScopedDispatch() string {
 	return RenderAppScopedDispatch(AppScopedDispatchData{
 		App:         "billing-service",
 		Environment: "staging",
-		CommandName: action.Apply,
 		RequestedBy: previewRequestedBy,
 		PinnedSHA:   previewHeadSHA,
 		Databases:   []string{"billing-invoices", "billing-ledger"},
@@ -35,7 +34,6 @@ func PreviewCommentAppScopedDispatchLarge() string {
 	return RenderAppScopedDispatch(AppScopedDispatchData{
 		App:         "tenants",
 		Environment: "production",
-		CommandName: action.Apply,
 		RequestedBy: previewRequestedBy,
 		PinnedSHA:   previewHeadSHA,
 		Databases:   databases,

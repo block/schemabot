@@ -204,7 +204,6 @@ type AppScopedSkippedDatabase struct {
 type AppScopedDispatchData struct {
 	App         string
 	Environment string
-	CommandName string
 	RequestedBy string
 	// PinnedSHA is the PR head the dispatch pinned; every database applies
 	// this commit. Empty omits the commit line.
@@ -216,23 +215,23 @@ type AppScopedDispatchData struct {
 	Skipped []AppScopedSkippedDatabase
 }
 
-// RenderAppScopedDispatch renders the expansion summary posted before an
-// app-scoped command runs against each database. Each database then gets its
-// own plan/progress comments, exactly as a single-database command would.
+// RenderAppScopedDispatch renders the fleet's status comment, posted when an
+// app-scoped command starts running against each database. It uses the same
+// headline, metadata line, and Status vocabulary as the single-database status
+// comments, with the app and pinned commit in place of a single database, so
+// a fleet apply reads like the apply flow operators already know.
 func RenderAppScopedDispatch(data AppScopedDispatchData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "App-Scoped Apply", data.Environment)
-	fmt.Fprintf(&sb, "**App**: `%s`\n", data.App)
-	if data.RequestedBy != "" {
-		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
-	}
+	writeEnvironmentTitle(&sb, "Schema Change Status", data.Environment)
+	parts := []string{fmt.Sprintf("**App**: `%s`", data.App)}
 	if data.PinnedSHA != "" {
-		fmt.Fprintf(&sb, "**Commit**: `%s` — every database applies this commit\n", data.PinnedSHA)
+		parts = append(parts, fmt.Sprintf("**Commit**: `%s`", data.PinnedSHA))
 	}
-	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "`schemabot %s -e %s --app %s` is applying to **%d** %s, one at a time in name order:\n\n",
-		data.CommandName, data.Environment, data.App, len(data.Databases), pluralize("database", len(data.Databases)))
+	fmt.Fprintf(&sb, "%s\n", strings.Join(parts, " | "))
+	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	fmt.Fprintf(&sb, "\n**Status**: Applying to **%d** %s, one at a time in name order\n\n",
+		len(data.Databases), pluralize("database", len(data.Databases)))
 	writeDatabaseList(&sb, len(data.Databases),
 		fmt.Sprintf("Show all %d databases", len(data.Databases)), func() {
 			for _, db := range data.Databases {
@@ -248,7 +247,7 @@ func RenderAppScopedDispatch(data AppScopedDispatchData) string {
 				}
 			})
 	}
-	sb.WriteString("\nEach database runs as its own apply and posts its own progress comments and Check Run below this comment. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.\n")
+	sb.WriteString("\nEvery database applies the pinned commit and runs as its own apply, posting its own progress comment and Check Run below. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.\n")
 
 	return sb.String()
 }
