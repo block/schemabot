@@ -67,9 +67,6 @@ func (m WatchModel) progressView() string {
 	// Status line with spinner for active states
 	// Note: spinner.Dot already includes trailing space
 	switch {
-	case m.volumeChanging:
-		// Volume change in progress
-		b.WriteString(m.spinner.View() + fmt.Sprintf("Changing volume to %d...\n", m.volumePending))
 	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled):
 		// Stop/cancel has been triggered but state hasn't updated yet
 		if m.isPlanetScale() {
@@ -243,20 +240,14 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.Recovering):
 		b.WriteString("\n\n")
 		if pct, ok := recoveringCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
+			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
 		} else {
 			b.WriteString("SchemaBot is recovering after restart.\n")
 			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 		}
 	case state.IsRunningApplyState(m.state):
 		b.WriteString("\n\n")
-		if m.volumeMode {
-			// Volume mode - show volume adjustment UI
-			b.WriteString(m.formatVolumeMode())
-		} else {
-			// Normal mode - simple footer without volume
-			b.WriteString(m.formatFooter())
-		}
+		b.WriteString(m.formatFooter())
 		b.WriteString("\n")
 	case state.IsSetupPhase(m.state):
 		b.WriteString("\n\n")
@@ -286,17 +277,24 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-func recoveringCopyPercent(tables []templates.TableProgress) (int, bool) {
-	percent := 100
+// recoveringCopyPercent returns the least-progressed recovering table's copy
+// percent as display text, so the recovery footer never overstates how far
+// the slowest table has come.
+func recoveringCopyPercent(tables []templates.TableProgress) (string, bool) {
+	fraction := 0.0
+	text := ""
 	found := false
 	for _, table := range tables {
 		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.PercentComplete >= 100 {
 			continue
 		}
-		percent = min(percent, ui.ClampPercent(table.PercentComplete))
+		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
+			fraction = frac
+			text = ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+		}
 		found = true
 	}
-	return percent, found
+	return text, found
 }
 
 // renderTables renders tables with the shared FormatNamespacedTables /
@@ -323,36 +321,19 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TablePro
 	}
 }
 
-// formatFooter returns the standard footer (no volume shown by default).
+// formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
 	stopHint := templates.StopKeyHint
 	if m.isPlanetScale() {
 		stopHint = "c cancel"
 	}
-	return dimStyle.Render("ESC detach • " + stopHint + " • v volume")
+	return dimStyle.Render("ESC detach • " + stopHint)
 }
 
 // isPlanetScale returns true if the current apply is using the PlanetScale engine.
 func (m WatchModel) isPlanetScale() bool {
 	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
-}
-
-// formatVolumeMode returns the footer when in volume adjustment mode.
-func (m WatchModel) formatVolumeMode() string {
-	var b strings.Builder
-	dimStyle := lipgloss.NewStyle().Faint(true)
-
-	// Simple volume display: just the number and a simple bar
-	vol := max(min(m.currentVolume, 11), 1)
-
-	// Simple bar using block characters
-	filled := strings.Repeat("█", vol)
-	empty := strings.Repeat("░", 11-vol)
-
-	fmt.Fprintf(&b, "Volume: %s%s %d/11\n", filled, empty, vol)
-	b.WriteString(dimStyle.Render("↑↓ adjust • 1-9 direct • ESC done"))
-	return b.String()
 }
 
 // elapsed returns a formatted elapsed time string for the status line.

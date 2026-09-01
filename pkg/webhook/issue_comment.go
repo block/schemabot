@@ -524,11 +524,6 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
-	case action.Volume:
-		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleVolumeCommand(repo, pr, installationID, requestedBy, result)
-		})
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "volume started"})
 	case action.SkipRevert:
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
@@ -574,7 +569,7 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 //   - unlock releases only the participant's own database locks (locks are
 //     keyed by database, not by apply);
 //   - rollback and the lifecycle controls (stop, cancel, start, release,
-//     cutover, volume, skip-revert, revert) route by apply identifier, which
+//     cutover, skip-revert, revert) route by apply identifier, which
 //     lives in exactly one deployment's storage — non-owners silently skip the
 //     lookup miss (see silentOnUnscopedFanOut) and only the owner acts;
 //   - rollback-confirm routes by the pinned pending rollback plan for the
@@ -587,7 +582,7 @@ func actionFansOutUnscoped(a string) bool {
 	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock,
 		action.Rollback, action.RollbackConfirm,
 		action.Stop, action.Cancel, action.Start, action.Release,
-		action.Cutover, action.Volume, action.SkipRevert, action.Revert:
+		action.Cutover, action.SkipRevert, action.Revert:
 		return true
 	default:
 		return false
@@ -641,10 +636,10 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.
-// Progress comments record the apply's volume level at post time — derived
+// Progress comments record the apply's control phase at post time — derived
 // here, matching the observer's variant, so no caller can post a progress
-// comment that silently disables volume-rotation detection — and other comment
-// states carry no level.
+// comment that silently disables phase-rotation detection — and other comment
+// states carry no phase.
 func (h *Handler) postAndTrackComment(
 	ctx context.Context, repo string, pr int, installationID int64,
 	apply *storage.Apply, commentState string, body string,
@@ -668,8 +663,6 @@ func (h *Handler) postAndTrackComment(
 		GitHubCommentID: commentID,
 	}
 	if commentState == state.Comment.Progress {
-		level := apply.GetOptions().Volume
-		comment.PostedVolume = &level
 		phase := controlPhase(apply.State)
 		comment.PostedPhase = &phase
 	}

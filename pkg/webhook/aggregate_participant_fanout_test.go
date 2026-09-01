@@ -181,7 +181,7 @@ func TestUnscopedCommandFansOut(t *testing.T) {
 	// while non-owners silently skip the lookup miss.
 	for _, a := range []string{
 		action.Rollback, action.RollbackConfirm, action.Stop, action.Cancel,
-		action.Start, action.Release, action.Cutover, action.Volume,
+		action.Start, action.Release, action.Cutover,
 		action.SkipRevert, action.Revert,
 	} {
 		assert.True(t, unscopedCommandFansOut(CommandResult{Found: true, Action: a}),

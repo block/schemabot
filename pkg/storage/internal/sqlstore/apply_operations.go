@@ -32,6 +32,12 @@ type applyOperationStore struct {
 	identity   identityInserter
 	locker     namedlock.Locker
 	classifier ErrorClassifier
+
+	// maxDriversPerApply caps how many operation leases one apply may hold at
+	// once; see freshLeaseCountSQL. Always positive — NewWithDependencies
+	// substitutes storage.DefaultMaxDriversPerApply for an unset value, so the
+	// claim path has no uncapped mode.
+	maxDriversPerApply int
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -514,6 +520,59 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
+// ApplyIdentifierForRemoteApply returns the identifier of the apply this control
+// plane dispatched as externalID, or "" when it dispatched no such thing.
+//
+// An empty externalID correlates to nothing by definition, and is answered
+// without a query so that stays true however the column spells "none". The
+// answer happens to be the same today, since an unrecorded id is stored as NULL
+// and NULL matches nothing; making it a property of the method instead means a
+// caller with no identifier can never be correlated to every operation that has
+// none, which would name an unrelated schema change as the one to go look at.
+//
+// Distinct parents are counted rather than taking the first row: sibling
+// operations of one deployment share a remote apply, so many rows for one
+// parent is the normal shape, but two parents for one remote apply means the
+// one-remote-apply-per-deployment invariant has already been violated. Naming
+// either one would send an operator to the wrong schema change, so the store
+// reports the ambiguity instead.
+func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context, externalID string) (string, error) {
+	if externalID == "" {
+		return "", nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT a.apply_identifier
+		FROM apply_operations o
+		JOIN applies a ON a.id = o.apply_id
+		WHERE o.external_id = ?
+	`, externalID)
+	if err != nil {
+		return "", fmt.Errorf("query apply identifier for remote apply %q: %w", externalID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var identifiers []string
+	for rows.Next() {
+		var identifier string
+		if err := rows.Scan(&identifier); err != nil {
+			return "", fmt.Errorf("scan apply identifier for remote apply %q: %w", externalID, err)
+		}
+		identifiers = append(identifiers, identifier)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate apply identifiers for remote apply %q: %w", externalID, err)
+	}
+	switch len(identifiers) {
+	case 0:
+		return "", nil
+	case 1:
+		return identifiers[0], nil
+	default:
+		return "", fmt.Errorf("remote apply %q correlates to %d applies (%s): %w",
+			externalID, len(identifiers), strings.Join(identifiers, ", "), storage.ErrRemoteApplyDeploymentIDConflict)
+	}
+}
+
 // SaveExternalID stores the remote data plane's apply_id on the operation row.
 // It refuses empty IDs so callers do not convert a missing remote field into an
 // apparent successful correlation.
@@ -683,6 +742,67 @@ const releasedFailureExemptionSQL = `NOT (
 	)
 )`
 
+// freshLeaseCountSQL counts the operation leases the candidate row's parent
+// apply already holds: sibling operations in an active state, owned by some
+// driver, whose heartbeat is still inside the staleness window. It is the
+// measure behind maxDriversPerApply: it is how many drivers the
+// apply occupies right now.
+//
+// Neither a stale-lease row nor a released one is counted. A stale row's driver
+// is gone and the row is claimable again by the recovery clauses, so counting it
+// would let a dead driver keep an apply capped out of the pool; a row released
+// at the cutover barrier clears its lease and backdates its heartbeat, so it is
+// parked, not occupying anything.
+//
+// The cap is a filter on the pending arm only, never a sort key. Sorting by the
+// count would replace the indexed (created_at, id) walk with a full sort that
+// evaluates a correlated subquery per row, which is the claim cost the ordering
+// index exists to avoid. Filtering keeps the index walk: a driver steps past a
+// capped apply's rows to the next apply's oldest claimable row, which is the
+// fairness the cap is for.
+//
+// It takes two format arguments in order: the occupying-state placeholder list
+// and the dialect's staleness cutoff expression, and one positional argument per
+// occupying state.
+const freshLeaseCountSQL = `(
+			SELECT COUNT(*)
+			FROM apply_operations AS busy
+			WHERE busy.apply_id = apply_operations.apply_id
+				AND busy.lease_owner <> ''
+				AND busy.state IN (%s)
+				AND busy.updated_at >= %s
+		)`
+
+// driverOccupyingOperationStates lists the operation states in which a driver
+// is holding the row and doing work on it. It is the question the fan-out cap
+// asks, and it is deliberately not claimableApplyStates(): "states an apply can
+// be claimed in" and "states in which a driver occupies an operation" are
+// different questions that only mostly overlap.
+//
+// failed_retryable is where they part. A redispatched operation keeps that
+// state for its whole drive — the claim rotates the lease and leaves the state
+// alone, and the row is not rewritten until the drive settles it — so a driver
+// really is occupying it the entire time. Counting it is what keeps a retry
+// sweep from running the apply at twice its cap.
+func driverOccupyingOperationStates() []string {
+	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
+}
+
+// driverCapClause renders the fan-out cap predicate and returns it with its
+// positional arguments, so an arm can be gated by appending both together.
+//
+// The clause is rendered here rather than spliced into the claim query as `%s`
+// verbs on purpose. The claim is a long hand-ordered query with many positional
+// arguments; adding the cap's arguments to that list at three separate sites
+// would put them in the middle of it, where one misplaced entry shifts every
+// later binding and silently corrupts eligibility for unrelated arms. Rendering
+// the count up front keeps each site's arguments to one named unit.
+func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, []any) {
+	occupyingStates := driverOccupyingOperationStates()
+	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff) + " < ?"
+	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
+}
+
 // releasedFailureExemptionArgs returns the positional arguments for
 // releasedFailureExemptionSQL, in placeholder order.
 func releasedFailureExemptionArgs() []any {
@@ -782,6 +902,11 @@ func releasedFailureExemptionArgs() []any {
 // option — the schema parity tests pin both dialects to the same index shape,
 // and MySQL has no partial indexes — so retention, not indexing, is the lever
 // for that remaining bound.
+//
+// Oldest-first is fair only between applies of comparable width. On its own it
+// lets one wide fan-out hold every driver on the plane for as long as its
+// slowest operation runs, so the pending arm is additionally capped at
+// maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL).
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
@@ -796,6 +921,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStatePlaceholders := placeholders(len(activeStates))
 	terminalStates := terminalApplyStates()
 	terminalStatePlaceholders := placeholders(len(terminalStates))
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	queryArgs = append(queryArgs, storage.ApplyOperationKindGroupFinalizer)
@@ -863,6 +990,27 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.Apply.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	// Fan-out cap: a pending row is claimable only while its apply holds fewer
+	// than maxDriversPerApply fresh operation leases.
+	//
+	// The cap gates every arm that *starts* work — this pending arm, the
+	// stopped+start resume arm, and the deferred-deploy arm — because all three
+	// admit an apply's siblings onto drivers, and an uncapped one is a way around
+	// the bound rather than an exception to it. A stop/start cycle is the shape
+	// that matters: stop bulk-moves every pending row to stopped, so an uncapped
+	// resume arm would make all of them claimable at once and hand one apply the
+	// whole pool durably, which is the starvation this exists to prevent.
+	//
+	// The recovery and control-request arms stay uncapped: a capped-out apply
+	// still has to be able to re-lease a crashed operation and to consume a
+	// pending stop or cancel, and gating those on the same count would make the
+	// cap itself the thing that wedges the apply it is bounding.
+	//
+	// Capping a start arm cannot wedge either, because the states it admits work
+	// into (resuming, running) are themselves counted: each resumed operation
+	// drops out of the count as it settles, so the rest drain behind it exactly
+	// as the pending arm's do.
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -883,6 +1031,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
@@ -897,6 +1046,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.Apply.WaitingForDeploy)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStart, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
@@ -946,7 +1096,6 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// non-completed, and
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
-	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
 	// The two guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
@@ -1028,6 +1177,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							)
 						)
 				)
+				AND `+driverCap+`
 			)
 			OR (
 				state IN (%s)
@@ -1052,6 +1202,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.operation = ?
 						AND cr.status = ?
 				)
+				AND `+driverCap+`
 			)
 			OR (
 				state = ?
@@ -1080,6 +1231,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 						AND `+deferredDeployGuard+`
 				)
+				AND `+driverCap+`
 			)
 			OR (
 				state = ?
@@ -1316,6 +1468,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // the sort itself on every dialect. Both claim queries draw from the same
 // driver pool, so a change to one claim's ordering or eligibility belongs in
 // the other.
+//
+// It carries no maxDriversPerApply cap, unlike the copy claim's
+// pending arm, because the start gate above already bounds an apply to one
+// concurrent cutover: an earlier sibling that is itself parked is not completed,
+// so it blocks every later cutover. A cap could only bind here by exceeding what
+// the ordering gate already allows. The recovery arm is uncapped for the same
+// reason it is there — a stale mid-cutover row must always be re-leasable.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)

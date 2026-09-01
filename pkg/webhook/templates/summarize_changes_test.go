@@ -13,7 +13,8 @@ import (
 func TestSummarizeChanges(t *testing.T) {
 	t.Run("counts create, alter, drop", func(t *testing.T) {
 		data := PlanCommentData{
-			IsMySQL: true,
+			DatabaseType: "mysql",
+			IsMySQL:      true,
 			Changes: []KeyspaceChangeData{{
 				Keyspace: "orders",
 				Statements: []string{
@@ -27,9 +28,26 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Equal(t, "2 creates, 1 alter, 1 drop", SummarizeChanges(data))
 	})
 
+	t.Run("counts PostgreSQL DDL under its own grammar", func(t *testing.T) {
+		// PostgreSQL column types the MySQL family's parser rejects must still
+		// classify, so the summary counts them instead of undercounting the plan.
+		data := PlanCommentData{
+			DatabaseType: "postgres",
+			Changes: []KeyspaceChangeData{{
+				Keyspace: "orders",
+				Statements: []string{
+					"CREATE TABLE a (id uuid, payload jsonb, created_at timestamptz)",
+					"ALTER TABLE b ADD COLUMN raw bytea",
+				},
+			}},
+		}
+		assert.Equal(t, "1 create, 1 alter", SummarizeChanges(data))
+	})
+
 	t.Run("appends vschema updates for non-MySQL", func(t *testing.T) {
 		data := PlanCommentData{
-			IsMySQL: false,
+			DatabaseType: "vitess",
+			IsMySQL:      false,
 			Changes: []KeyspaceChangeData{{
 				Keyspace:       "orders",
 				Statements:     []string{"CREATE TABLE a (id INT)"},
@@ -49,7 +67,8 @@ func TestSummarizeChanges(t *testing.T) {
 
 	t.Run("per-shard-only DDL falls back to a statement count", func(t *testing.T) {
 		data := PlanCommentData{
-			IsMySQL: false,
+			IsMySQL:      false,
+			DatabaseType: "vitess",
 			Changes: []KeyspaceChangeData{{
 				Keyspace: "orders",
 				Shards: []KeyspaceShardChange{

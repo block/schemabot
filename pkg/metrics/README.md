@@ -92,7 +92,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **reason** (source policy): `missing_server_config`, `missing_database_config`, `missing_repository`, `missing_pull_request`, `missing_schema_path`, `unauthorized_repo`, `unauthorized_schema_dir`, `unknown`
 
-**command** (PR command actor authorization): `apply`, `apply_confirm`, `rollback`, `rollback_confirm`, `unlock`, `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `unknown`
+**command** (PR command actor authorization): `apply`, `apply_confirm`, `rollback`, `rollback_confirm`, `unlock`, `cutover`, `stop`, `start`, `revert`, `skip_revert`, `unknown`
 
 **status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
 
@@ -104,7 +104,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (status checks): `success`, `error`, `skipped`, `stale`, `noop`, `blocked` (operation outcome, not GitHub Check Run conclusion)
 
-**operation** (control): `cutover`, `stop`, `start`, `volume`, `revert`, `skip_revert`, `release`, `rollback_plan`
+**operation** (control): `cutover`, `stop`, `start`, `revert`, `skip_revert`, `release`, `rollback_plan`
 
 **status** (control): `success`, `error`, `rejected`
 
@@ -304,7 +304,6 @@ Operation values:
 | `cutover` | Trigger cutover for an apply that is waiting for cutover confirmation. |
 | `stop` | Request that the engine stop an apply. |
 | `start` | Request that the engine start or resume an apply. |
-| `volume` | Change the engine's throttling or volume setting for an apply. |
 | `revert` | Request that the engine revert an apply. |
 | `skip_revert` | Skip the post-deploy revert window for an apply. |
 | `release` | Release a rollout paused after a failure so the remaining work proceeds. |

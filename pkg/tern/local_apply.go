@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/metrics"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -117,9 +118,14 @@ func (c *LocalClient) findBlockingTask(ctx context.Context, tasks []*storage.Tas
 			return newBlockingTask(t, nil), nil
 		}
 
-		// A pending task of a terminal apply can never start; cancel it so it
-		// stops blocking the database as phantom active work.
-		if c.tryResolveOrphanedPendingTask(ctx, t, apply) {
+		// A task of a terminal apply waits for a driver that will never arrive;
+		// settle it so it stops blocking the database as phantom active work.
+		c.settleOrphanedTask(ctx, t, apply)
+
+		// Settled terminal, the task is done and no longer blocks. Settled to
+		// stopped, it stays in play for the resting checks below, which own the
+		// takeover of its copy and the superseding of its apply.
+		if state.IsTerminalTaskState(t.State) {
 			continue
 		}
 
@@ -240,19 +246,69 @@ func (b blockingTask) applyStateName() string {
 	return b.apply.State
 }
 
-// describe renders the conflict for an operator: what holds the database, and
-// where to go to clear it.
+// describe renders the conflict for an operator: what holds the database, who
+// owns it, and what has to happen before the database is free.
+//
+// The holding change is named by its pull request or its caller, not by the
+// engine's apply identifier. That identifier belongs to the data plane alone:
+// the control plane resolves an apply only by its own identifier, so offering
+// the engine's as the handle sends an operator to a command that refuses them.
+// It stays in the logs, where every triage attribute already carries it.
 func (b blockingTask) describe() string {
 	if b.apply == nil {
-		return b.subject() + " is held by an apply that could not be loaded"
+		return b.subject() + " is held by a schema change that could not be loaded"
 	}
 
-	described := fmt.Sprintf("%s is held by apply %s (%s)",
-		b.subject(), b.apply.ApplyIdentifier, b.apply.State)
-	if resolution := b.resolution(); resolution != "" {
-		return described + "; " + resolution
+	described := fmt.Sprintf("%s is held by a schema change (%s)%s",
+		b.subject(), b.apply.State, b.holder())
+	if hold := state.Hold(b.apply.State); hold != "" {
+		return described + "; " + hold
 	}
 	return described
+}
+
+// holder names who owns the blocking change, preferring the pull request an
+// operator can open over the caller string. Both are empty for a change whose
+// provenance was not recorded, which leaves the conflict described by its work
+// and its state alone rather than by an identifier that resolves nowhere.
+func (b blockingTask) holder() string {
+	switch {
+	case b.apply.Repository != "" && b.apply.PullRequest > 0:
+		return fmt.Sprintf(" on %s#%d", b.apply.Repository, b.apply.PullRequest)
+	case b.apply.Caller != "":
+		return fmt.Sprintf(" started by %s", b.apply.Caller)
+	default:
+		return ""
+	}
+}
+
+// conflict renders the refusal as the structured facts a caller can present on
+// its own surfaces: the work being held, the state holding it, and who owns the
+// holding change.
+//
+// The holding apply's own identifier crosses too, but as a lookup key rather
+// than as text. A caller that dispatched this work recorded that identifier
+// against its own apply, so it can turn the key into a handle that resolves on
+// its side. That is the opposite of what describe() omits — this identifier is
+// never rendered, it is what lets the caller avoid rendering it.
+//
+// Returns nil when there is no conflict to report, or when the blocking task's
+// apply could not be loaded — the dispatch is still refused (the check fails
+// closed), but with nothing proven about the holder there is nothing to render
+// beyond the sanitized error the caller already has.
+func (b blockingTask) conflict() *ternv1.ApplyConflict {
+	if !b.blocks() || b.apply == nil {
+		return nil
+	}
+	return &ternv1.ApplyConflict{
+		Table:            b.table,
+		Shard:            b.shard,
+		BlockingState:    state.NormalizeState(b.apply.State),
+		Repository:       b.apply.Repository,
+		PullRequest:      int32(b.apply.PullRequest),
+		Caller:           b.apply.Caller,
+		HolderExternalId: b.apply.ApplyIdentifier,
+	}
 }
 
 // subject names the work being done, leading with the table an operator
@@ -270,50 +326,6 @@ func (b blockingTask) subject() string {
 		return fmt.Sprintf("table %s (task %s)", b.table, b.taskIdentifier)
 	default:
 		return fmt.Sprintf("table %s shard %s (task %s)", b.table, b.shard, b.taskIdentifier)
-	}
-}
-
-// resolution continues the sentence describe() opens, so it speaks of the apply
-// already named there rather than restating the state alongside it. The split is
-// between an apply that holds the database until someone decides its fate and one
-// that releases it on its own, which is the distinction that tells an operator
-// whether to act or to wait.
-//
-// The resting states differ only in which decision is owed: a stopped apply waits
-// to be started, a retryable failure to be retried, an apply at the cutover
-// barrier to be cut over, and one in its revert window to be reverted or
-// skip-reverted. The revert window is the one that offers no cancel: the change
-// has already cut over, so stop and cancel are permanently rejected there. It is
-// also the one whose wait is bounded without an operator, since the window's
-// expiry triggers the skip-revert itself rather than being a third way out.
-// A revert already under way, like a running apply, finishes on its own — with
-// the caveat that a running apply may still park, since a deferred or ordered
-// cutover moves it to waiting_for_cutover rather than to a terminal state, so
-// the running line promises progress, not release.
-//
-// Other active states (pending, cutting over, recovering, waiting for a deploy
-// that tern may be about to trigger itself) get no resolution line rather than a
-// guess — the state is still named, and inventing an action for a state whose
-// next move is not certain would send an operator the wrong way.
-func (b blockingTask) resolution() string {
-	if b.apply == nil {
-		return ""
-	}
-	switch {
-	case state.IsState(b.apply.State, state.Apply.Stopped):
-		return "it holds the database until it is started or cancelled"
-	case state.IsState(b.apply.State, state.Apply.FailedRetryable):
-		return "it holds the database until it is retried or cancelled"
-	case state.IsState(b.apply.State, state.Apply.WaitingForCutover):
-		return "it holds the database until it is cut over or cancelled"
-	case state.IsState(b.apply.State, state.Apply.RevertWindow):
-		return "it holds the database until it is reverted or skip-reverted"
-	case state.IsState(b.apply.State, state.Apply.Reverting, state.Apply.SkippingRevert):
-		return "it releases the database when the revert finishes, which it does on its own"
-	case state.IsRunningApplyState(b.apply.State):
-		return "it releases the database when it finishes, unless it parks for cutover first"
-	default:
-		return ""
 	}
 }
 
@@ -336,49 +348,107 @@ func (c *LocalClient) applyForConflictCheck(ctx context.Context, t *storage.Task
 	return apply, true
 }
 
-// tryResolveOrphanedPendingTask cancels a pending task whose parent apply has
-// already reached a terminal state. Such a task can never start: a terminal
-// apply is not claimable, so no drive will ever pick the task up, and pending
-// means no engine work or checkpoint exists to preserve. Left alone the task
-// would block every later apply targeting its database as phantom active work.
-// A non-pending state leaves the task untouched so it stays with the
-// engine-backed checks.
-// Returns true if the task was cancelled and no longer blocks.
-func (c *LocalClient) tryResolveOrphanedPendingTask(ctx context.Context, t *storage.Task, apply *storage.Apply) bool {
-	if !state.IsState(t.State, state.Task.Pending) {
-		// Only a pending task is provably unstarted; every other state may own
-		// engine work or a checkpoint and stays with the engine-backed checks.
-		return false
+// orphanedTaskSettlement returns the state an orphaned task settles to under a
+// terminal apply, and whether the task is one that can be settled at all.
+//
+// Only the states that wait for a driver settle here. Pending and
+// failed_retryable work is claimed unprompted, which is precisely what a
+// terminal apply guarantees will never happen again, so a task left in either
+// one has no way out on its own. Running and its phases may still own live
+// engine work, and stopped is already a resting state; both stay with the
+// checks that can tell.
+//
+// A stopped apply settles its retryable work to stopped rather than cancelled.
+// The operator asked for a stop, the copy on the target may still be resumable,
+// and stopped is the one state both start and the takeover path can act on —
+// cancelling would discard a copy the apply never decided to discard. Every
+// other terminal apply has ended for good, so its tasks are cancelled.
+func orphanedTaskSettlement(taskState, applyState string) (string, bool) {
+	switch {
+	case state.IsState(taskState, state.Task.Pending):
+		// Pending is provably unstarted: no engine work and no checkpoint
+		// exists to preserve, so there is nothing for a later start to resume.
+		return state.Task.Cancelled, true
+	case state.IsState(taskState, state.Task.FailedRetryable):
+		if state.IsState(applyState, state.Apply.Stopped) {
+			return state.Task.Stopped, true
+		}
+		return state.Task.Cancelled, true
+	default:
+		return "", false
+	}
+}
+
+// orphanedTaskSettlementLogMessage is the durable apply-log entry a settlement
+// records. Operators read it on the holding apply to see why a task moved
+// without a driver ever touching it.
+const orphanedTaskSettlementLogMessage = "Settled orphaned task: its apply was already terminal, so no driver could ever claim it"
+
+// settleOrphanedTask settles a task whose parent apply has already reached a
+// terminal state. Such a task is waiting for a driver that will never arrive: a
+// terminal apply is not claimable, so nothing picks the task up, and left alone
+// it blocks every later apply targeting its database as phantom active work.
+//
+// The sweep is written against the invariant — a terminal apply's tasks must be
+// settled — rather than against the single task state it was first needed for,
+// so a state that reaches a terminal apply by some other route is settled too
+// instead of moving the hole.
+//
+// The task is mutated in place and the caller re-reads its state: settled
+// terminal it is done, and settled to stopped it stays in play for the resting
+// checks that own the takeover of its copy. A refused write leaves the task
+// untouched and blocking, because reporting it settled would admit a new apply
+// while storage still records the orphan as active work.
+func (c *LocalClient) settleOrphanedTask(ctx context.Context, t *storage.Task, apply *storage.Apply) {
+	settledState, settles := orphanedTaskSettlement(t.State, apply.State)
+	if !settles {
+		return
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		c.logger.Debug("conflict check: pending task's apply is still active; the task blocks normally",
+		c.logger.Debug("conflict check: orphan candidate's apply is still active; the task blocks normally",
 			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
-		return false
+		return
 	}
-	c.logger.Info("conflict check: cancelling orphaned pending task; its apply is terminal so the task can never start",
-		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State)...)
-	previousState := t.State
+	// A terminal apply with a fresh lease is a driver mid-settlement of this
+	// same apply — its own task writes may still be in flight, and racing them
+	// leaves the row to whichever write lands last. This check holds no lease,
+	// so it defers: the task keeps blocking, and the sweep settles it on a
+	// later check once the lease has aged out.
+	if apply.HasFreshLease(time.Now()) {
+		c.logger.Debug("conflict check: orphan candidate's apply still holds a fresh lease; a driver may be settling it, so the task blocks normally",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "lease_owner", apply.LeaseOwner)...)
+		return
+	}
+	c.logger.Info("conflict check: settling orphaned task; its apply is terminal so no driver will ever claim the task",
+		append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "apply_state", apply.State, "settled_state", settledState)...)
+
+	previous := *t
 	now := time.Now()
-	t.State = state.Task.Cancelled
-	t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task started"
-	t.CompletedAt = &now
+	t.State = settledState
 	t.UpdatedAt = now
-	// The task only stops blocking once the cancellation is durably written:
-	// reporting it resolved on a failed write would admit the new apply while
-	// storage still records the orphan as active work.
+	// Every settled state is at rest, so the row must not carry a frozen ETA
+	// or render as paused with no copy in flight (the same clearing
+	// persistTaskStateTransition does). The rows this sweep repairs are
+	// precisely the ones written by paths that never got to clear them.
+	t.ETASeconds = 0
+	t.Throttled = false
+	t.ThrottleReason = ""
+	// A settlement that ends the task records why it ended. A settlement to
+	// stopped keeps the engine's own failure message instead: the change is
+	// resumable, and that message is why the copy stopped where it did.
+	if state.IsTerminalTaskState(settledState) {
+		t.ErrorMessage = "Task orphaned: its apply reached a terminal state before the task could be driven"
+		t.CompletedAt = &now
+	}
 	if err := c.storage.Tasks().Update(ctx, t); err != nil {
-		t.State = previousState
-		t.ErrorMessage = ""
-		t.CompletedAt = nil
-		c.logger.Error("conflict check: failed to persist orphaned task cancellation; the task keeps blocking the database",
-			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error", err)...)
-		return false
+		*t = previous
+		c.logger.Error("conflict check: failed to persist orphaned task settlement; the task keeps blocking the database",
+			append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error", err)...)
+		return
 	}
 	taskID := t.ID
 	c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-		"Cancelled orphaned pending task: its apply was already terminal, so the task could never start",
-		previousState, state.Task.Cancelled)
-	return true
+		orphanedTaskSettlementLogMessage, previous.State, settledState)
 }
 
 // restingTaskReleasesDatabase reports whether a stopped task has stopped
@@ -702,8 +772,13 @@ func (c *LocalClient) transitionTaskState(ctx context.Context, task *storage.Tas
 // log. A storage failure (including a lease-guarded write refused because the
 // drive's lease was lost to a peer) is returned without recording the log
 // event, so the durable log never claims a transition the task row does not
-// carry.
+// carry, and the task is rolled back to the values it arrived with, so nothing
+// downstream reads a state transition that did not happen. The rollback is to
+// the caller's own pre-call task rather than to storage: a caller that
+// refreshed display fields such as progress before calling keeps them, since
+// only the state gates control flow.
 func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *storage.Task, applyID int64, newState string, logMsg string) error {
+	previous := *task
 	oldState := task.State
 	task.State = newState
 	task.UpdatedAt = time.Now()
@@ -719,6 +794,7 @@ func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *stor
 		task.ThrottleReason = ""
 	}
 	if err := c.storage.Tasks().Update(ctx, task); err != nil {
+		*task = previous
 		return fmt.Errorf("update task %s state %s -> %s: %w", task.TaskIdentifier, oldState, newState, err)
 	}
 	if logMsg != "" && applyID > 0 {

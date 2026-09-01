@@ -126,97 +126,6 @@ func (m WatchModel) triggerSkipRevert() tea.Cmd {
 	}
 }
 
-// handleVolumeKeys handles keyboard input when in volume mode.
-func (m WatchModel) handleVolumeKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	key := msg.String()
-
-	switch key {
-	case "esc", "q":
-		// Exit volume mode without changing
-		m.volumeMode = false
-		return m, nil
-
-	case "up", "right":
-		// Increase volume by 1 (max 11)
-		newVol := min(m.currentVolume+1, 11)
-		if newVol != m.currentVolume && m.volumePending == 0 {
-			m.volumePending = newVol
-			m.volumeChanging = true
-			m.volumeMode = false
-			return m, m.triggerVolumeChange(newVol)
-		}
-		m.volumeMode = false
-		return m, nil
-
-	case "down", "left":
-		// Decrease volume by 1 (min 1)
-		newVol := max(m.currentVolume-1, 1)
-		if newVol != m.currentVolume && m.volumePending == 0 {
-			m.volumePending = newVol
-			m.volumeChanging = true
-			m.volumeMode = false
-			return m, m.triggerVolumeChange(newVol)
-		}
-		m.volumeMode = false
-		return m, nil
-
-	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-		// Direct set volume (1-9)
-		newVol := int(key[0] - '0')
-		if newVol != m.currentVolume && m.volumePending == 0 {
-			m.volumePending = newVol
-			m.volumeChanging = true
-			m.volumeMode = false
-			return m, m.triggerVolumeChange(newVol)
-		}
-		m.volumeMode = false
-		return m, nil
-
-	case "0":
-		// 0 sets to 10
-		if m.currentVolume != 10 && m.volumePending == 0 {
-			m.volumePending = 10
-			m.volumeChanging = true
-			m.volumeMode = false
-			return m, m.triggerVolumeChange(10)
-		}
-		m.volumeMode = false
-		return m, nil
-
-	case "-":
-		// - sets to 11 (max)
-		if m.currentVolume != 11 && m.volumePending == 0 {
-			m.volumePending = 11
-			m.volumeChanging = true
-			m.volumeMode = false
-			return m, m.triggerVolumeChange(11)
-		}
-		m.volumeMode = false
-		return m, nil
-	}
-
-	return m, nil
-}
-
-func (m WatchModel) triggerVolumeChange(volume int) tea.Cmd {
-	return func() tea.Msg {
-		result, err := client.CallVolumeAPI(m.endpoint, m.environment, m.applyID, volume)
-		if err != nil {
-			return volumeResultMsg{success: false, err: err}
-		}
-
-		if !result.Accepted {
-			errMsg := result.ErrorMessage
-			if errMsg == "" {
-				errMsg = "volume change not accepted"
-			}
-			return volumeResultMsg{success: false, err: fmt.Errorf("%s", errMsg)}
-		}
-
-		return volumeResultMsg{success: true, newVolume: int(result.NewVolume)}
-	}
-}
-
 // Helper functions
 
 func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
@@ -228,7 +137,6 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		operations:  data.Operations,
 		released:    data.Released,
 		errorMsg:    data.ErrorMessage,
-		volume:      int(result.Volume),
 		applyID:     result.ApplyID,
 		database:    result.Database,
 		environment: result.Environment,

@@ -21,6 +21,48 @@ import (
 // long two drivers can run the same engine work concurrently.
 const ApplyLeaseStaleAfter = time.Minute
 
+// DefaultMaxDriversPerApply is the per-apply driver cap used when a deployment
+// does not configure max_drivers_per_apply.
+//
+// The cap bounds how many operation leases one apply may hold at once. A wide
+// fan-out claims its operations oldest-first like any other work, so without a
+// bound a single apply takes every driver on the plane and holds them for as
+// long as its slowest operation runs — starving every other database behind it
+// with no limit. The cap is what keeps the plane available: capacity always
+// remains to claim another tenant's work and to consume control requests.
+//
+// It gates every claim that starts work — a first start, a resume after a stop,
+// and a deferred deploy — and no claim that recovers or controls. That split is
+// the whole design: recovering a crashed operation and consuming a stop or
+// cancel must never be capped, or the cap wedges the apply it is bounding, while
+// leaving any start path uncapped is a way around the bound rather than an
+// exception to it. A stop/start cycle is the case that makes this concrete: stop
+// moves every pending sibling to stopped at once, so an uncapped resume would
+// hand one apply the whole pool for the rest of its rollout.
+//
+// The count lives in storage, so the cap is plane-wide across pods with no
+// extra coordination, and both planes enforce it because both run these claim
+// queries against their own storage.
+//
+// It is deliberately soft, and softer than a ceiling of one over. Claims run at
+// READ COMMITTED and count sibling rows rather than the row they lock, so
+// concurrent claimers never exclude each other: every driver whose claim reads
+// the count before the others commit sees the same pre-claim value and claims on
+// it. The transient overshoot is therefore bounded by how many drivers claim in
+// that window, not by one. It is self-correcting rather than durable — once
+// those leases commit, the next claim counts them and the cap binds — so the
+// steady-state occupancy is the cap and the excess drains as operations finish.
+// Size the cap for the steady state; do not read it as a hard admission limit
+// that some other guard will hold to cap+1. Paying for a hard bound would mean
+// serializing every claim behind a per-apply lock, which is the contention the
+// cap exists to avoid.
+//
+// It is configurable because the value only means something relative to a
+// plane's pods x drivers: too high and it bounds nothing, too low and a wide
+// sharded fan-out serializes. The default suits a plane running the default
+// driver count on more than one pod; size it deliberately when either differs.
+const DefaultMaxDriversPerApply = 2
+
 // Storage provides access to all stores.
 type Storage interface {
 	// Locks returns the lock store.
@@ -70,6 +112,7 @@ type Storage interface {
 // Locks prevent concurrent schema changes to the same database.
 // Lock key is database:type (not per-environment) to block concurrent changes
 // across environments and PRs.
+// Methods accepting a *Lock canonicalize its repository, database name, and database type in place before persisting.
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
@@ -108,6 +151,7 @@ type LockStore interface {
 // CheckStore manages SchemaBot's stored check state.
 // Per-database rows track internal status for a PR/environment/database.
 // Aggregate rows store the GitHub check_run_id for the visible GitHub Check Run.
+// Methods accepting a *Check canonicalize its repository, database name, database type, and environment in place before persisting.
 type CheckStore interface {
 	// Upsert creates or updates stored check state.
 	Upsert(ctx context.Context, check *Check) error
@@ -1000,7 +1044,31 @@ type ApplyCommentStore interface {
 	// claim window. Deletes only the sentinel form of the marker — a recorded
 	// real comment is never released.
 	ReleaseSummaryClaim(ctx context.Context, applyID int64) error
+
+	// ClaimProgressCommentAuthority atomically claims — or renews for its
+	// current holder — the durable authority to edit the tracked progress
+	// comment of an apply whose parent apply lease is legitimately unheld
+	// because its work runs under operation leases. The claim is a conditional
+	// update on the tracked progress comment row: it succeeds when the row has
+	// no recorded observer, when the caller already holds it, or when the
+	// recorded observer's heartbeat is older than
+	// ProgressCommentAuthorityStaleAfter (a crashed holder). Exactly one of any
+	// set of concurrent claimants wins the same handover, so two observers can
+	// never both believe they own the comment. Returns true when the caller now
+	// holds the authority; false when another observer holds it or no tracked
+	// progress comment row exists to claim. Deliberately lease-agnostic — the
+	// claim itself is the authority, mirroring the terminal summary claim.
+	ClaimProgressCommentAuthority(ctx context.Context, applyID int64, owner string) (bool, error)
 }
+
+// ProgressCommentAuthorityStaleAfter is how long the progress-comment
+// authority may go without a renewal before its holder is considered gone and
+// another observer may take the authority over. Holders renew on every
+// admitted GitHub side effect (at least once per progress poll tick), so
+// anything older than this window is a stopped observer, not a slow one. It
+// matches the apply lease staleness bound so comment ownership hands over on
+// the same clock as drive ownership.
+const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 
 // SummaryClaimStaleAfter is how long a summary claim sentinel
 // (apply_comments row with github_comment_id = 0) may go without an update
@@ -1096,6 +1164,22 @@ type ApplyOperationStore interface {
 	// them from recording divergent ids. Divergence returns an error wrapping
 	// ErrRemoteApplyDeploymentIDConflict.
 	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
+
+	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
+	// control plane dispatched as the given remote apply, or "" when it
+	// dispatched no such thing. It answers the question an operator asks about
+	// someone else's work: the data plane names the change holding a database by
+	// its own identifier, which resolves nowhere the operator can reach, and this
+	// turns that into the handle their CLI accepts.
+	//
+	// A remote apply this control plane did not start is the ordinary empty
+	// answer, not an error — another control plane or a direct engine run owns
+	// it, and there is no handle to offer. The correlation is read from the
+	// operation rows because a multi-operation apply has no single authoritative
+	// remote identifier; every operation carrying one remote apply id belongs to
+	// the same parent, so more than one parent matching means the correlation
+	// itself is broken and the store refuses to guess.
+	ApplyIdentifierForRemoteApply(ctx context.Context, externalID string) (string, error)
 
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
@@ -1284,7 +1368,7 @@ type ControlRequestStore interface {
 	// for use when that plane later reports the same operation succeeded. It
 	// only touches a failed row the mirror itself created: rows this plane
 	// queued are cleared by their own request lifecycle, and a row with no
-	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// lifecycle here — an operation this plane only proxies — would otherwise
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)

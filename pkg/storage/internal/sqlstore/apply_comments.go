@@ -14,7 +14,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_volume, posted_phase, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -24,7 +24,7 @@ type applyCommentStore struct {
 
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
-// posted_volume, posted_phase, and pending_freeze_github_comment_id so the
+// posted_phase, and pending_freeze_github_comment_id so the
 // row always describes the currently tracked comment and the freeze it may
 // still owe. The conflict path also clears superseded_at (the row is live
 // again) and stamps updated_at: that column is the summary-claim freshness
@@ -39,7 +39,6 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 		[]string{"apply_id", "comment_state"},
 		[]UpsertAssignment{
 			{Column: "github_comment_id"},
-			{Column: "posted_volume"},
 			{Column: "posted_phase"},
 			{Column: "pending_freeze_github_comment_id"},
 			{Column: "superseded_at", Expr: "NULL"},
@@ -48,17 +47,17 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	)
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, `
-			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, posted_phase, pending_freeze_github_comment_id)
-			VALUES (?, ?, ?, ?, ?, ?)
-			`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PostedPhase, comment.PendingFreezeCommentID)
+			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id)
+			VALUES (?, ?, ?, ?, ?)
+			`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID)
 		return err
 	}
 
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_volume, posted_phase, pending_freeze_github_comment_id)
-		SELECT ?, ?, ?, ?, ?, ? FROM applies a
+		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id)
+		SELECT ?, ?, ?, ?, ? FROM applies a
 		WHERE a.id = ? AND a.lease_token = ?
-		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedVolume, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
+		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -322,6 +321,54 @@ func (s *applyCommentStore) ReclaimStaleSummaryClaim(ctx context.Context, applyI
 	return rows == 1, nil
 }
 
+// ClaimProgressCommentAuthority claims — or renews for its current holder —
+// the durable authority to edit an apply's tracked progress comment while the
+// parent apply lease is legitimately unheld. It is a single conditional update
+// on the tracked progress comment row, so concurrent claimants race on the row
+// lock and exactly one sees the affected row: the update lands when the row
+// records no observer, when the caller already holds the authority (a
+// renewal, which also refreshes the heartbeat), or when the recorded holder's
+// heartbeat is older than storage.ProgressCommentAuthorityStaleAfter (a
+// crashed holder being taken over). Zero affected rows means another observer
+// holds a fresh authority or no tracked progress comment row exists — either
+// way the caller must skip its GitHub side effect. Deliberately
+// lease-agnostic, mirroring ClaimSummaryComment: the claim is the authority.
+func (s *applyCommentStore) ClaimProgressCommentAuthority(ctx context.Context, applyID int64, owner string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_comments
+		SET observer_owner = ?, observer_heartbeat_at = NOW(), updated_at = NOW()
+		WHERE apply_id = ? AND comment_state = ?
+		  AND (observer_owner IS NULL
+		       OR observer_owner = ?
+		       OR observer_heartbeat_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
+	`, owner, applyID, state.Comment.Progress, owner, int64(storage.ProgressCommentAuthorityStaleAfter.Seconds()))
+	if err != nil {
+		return false, fmt.Errorf("claim progress-comment authority for apply %d owner %s: %w", applyID, owner, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read progress-comment authority claim rows affected for apply %d owner %s: %w", applyID, owner, err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+	// MySQL reports rows changed, not rows matched: a holder renewing inside
+	// the heartbeat column's timestamp granularity writes identical values and
+	// reports zero rows. Distinguish that held-by-the-caller no-op from a lost
+	// or unclaimable authority by re-reading the recorded owner.
+	var current sql.NullString
+	err = s.db.QueryRowContext(ctx, `
+		SELECT observer_owner FROM apply_comments WHERE apply_id = ? AND comment_state = ?
+	`, applyID, state.Comment.Progress).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify progress-comment authority for apply %d owner %s: %w", applyID, owner, err)
+	}
+	return current.Valid && current.String == owner, nil
+}
+
 // ReleaseSummaryClaim deletes the summary claim sentinel for an apply so a
 // later publisher can retry without waiting out the stale-claim window. Only
 // the sentinel form (github_comment_id = 0) is deleted — a marker that already
@@ -366,7 +413,7 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.PostedVolume, &comment.PostedPhase, &comment.PendingFreezeCommentID, &comment.EditCount,
+		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PendingFreezeCommentID, &comment.EditCount,
 		&comment.LastEditedAt, &comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {

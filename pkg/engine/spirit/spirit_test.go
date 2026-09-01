@@ -14,7 +14,7 @@ import (
 // TestProgressState verifies that a progress poll reports the tracked state
 // for every terminal outcome regardless of what a lingering runner's Spirit
 // status says, and that Spirit's status only refines non-terminal states
-// (sentinel wait for a deferred cutover, volume restarts).
+// (sentinel wait for a deferred cutover).
 func TestProgressState(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -90,25 +90,6 @@ func TestProgressState(t *testing.T) {
 			},
 			spiritState: status.WaitingOnSentinelTable,
 			want:        engine.StateRunning,
-		},
-		{
-			name: "volume restart reports stopped state as running",
-			rm: &runningSchemaChange{
-				state:                   engine.StateStopped,
-				volumeRestartInProgress: true,
-			},
-			spiritState: status.Close,
-			want:        engine.StateRunning,
-		},
-		{
-			name: "volume restart still surfaces deferred cutover",
-			rm: &runningSchemaChange{
-				state:                   engine.StateStopped,
-				volumeRestartInProgress: true,
-				deferCutover:            true,
-			},
-			spiritState: status.WaitingOnSentinelTable,
-			want:        engine.StateWaitingForCutover,
 		},
 	}
 

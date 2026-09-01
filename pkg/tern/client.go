@@ -108,9 +108,6 @@ type Client interface {
 	// Start resumes a stopped schema change.
 	Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error)
 
-	// Volume modifies the schema change speed/concurrency in-flight.
-	Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error)
-
 	// Revert reverts a completed schema change during the revert window.
 	// Only supported for Vitess (PlanetScale).
 	Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error)

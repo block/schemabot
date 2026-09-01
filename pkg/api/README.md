@@ -47,7 +47,6 @@ request bodies that try to send database or deployment fields.
 | POST | `/api/cutover` | `handleCutover` | Trigger cutover |
 | POST | `/api/stop` | `handleStop` | Pause schema change |
 | POST | `/api/start` | `handleStart` | Resume schema change |
-| POST | `/api/volume` | `handleVolume` | Adjust speed (1-11) |
 | POST | `/api/revert` | `handleRevert` | Revert completed change |
 | POST | `/api/skip-revert` | `handleSkipRevert` | Finalize change that's in the revert window |
 | POST | `/api/rollback/plan` | `handleRollbackPlan` | Plan a rollback |
@@ -109,7 +108,7 @@ See the top-level [README](../../README.md) for configuration examples.
 | `config.go` | `ServerConfig` loading and validation |
 | `operator.go` | Operator driver pool and background apply coordination |
 | `plan_handlers.go` | Plan and Apply HTTP handlers |
-| `control_handlers.go` | Cutover, Stop, Start, Volume, Revert handlers |
+| `control_handlers.go` | Cutover, Stop, Start, Revert handlers |
 | `progress_handlers.go` | Progress, Status, History handlers |
 | `health_handlers.go` | Health checks and JSON helpers |
 | `lock_handlers.go` | Lock acquire/release/list handlers |

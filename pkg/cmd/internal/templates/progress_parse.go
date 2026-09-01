@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -32,9 +33,6 @@ type ProgressData struct {
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata       map[string]string // Engine metadata (e.g., deploy_request_url, branch_name)
-	// Volume is the apply's current volume level (1=slowest, 11=fastest).
-	// Zero means the operator never set one, so the display stays quiet.
-	Volume int
 	// Released is true when an operator has released a paused rollout open, so a
 	// deployment that failed under on_failure=pause no longer holds later
 	// deployments. Apply-level: it applies to every operation of the apply.
@@ -62,6 +60,7 @@ type TableProgress struct {
 	TableName       string
 	Deployment      string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
+	Dialect         schema.Dialect
 	ChangeType      string // create, alter, drop
 	DDL             string
 	Status          string
@@ -160,9 +159,9 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		CompletedAt:    result.CompletedAt,
 		Options:        result.Options,
 		Metadata:       result.Metadata,
-		Volume:         int(result.Volume),
 		Released:       result.Released,
 	}
+	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	for _, op := range result.Operations {
 		data.Operations = append(data.Operations, ProgressOperation{
@@ -186,6 +185,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
 			Namespace:           tbl.Keyspace,
+			Dialect:             dialect,
 			ChangeType:          tbl.ChangeType,
 			DDL:                 tbl.DDL,
 			Status:              state.NormalizeTaskStatus(tbl.Status),

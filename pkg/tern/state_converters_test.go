@@ -27,6 +27,9 @@ func TestChangeTypeProtoRoundTrip(t *testing.T) {
 		ddl.StatementTypeToOp(ddl.StatementDropTable),
 		ddl.StatementTypeToOp(ddl.StatementCreateIndex),
 		ddl.StatementTypeToOp(ddl.StatementDropIndex),
+		ddl.StatementTypeToOp(ddl.StatementRenameTable),
+		ddl.StatementTypeToOp(ddl.StatementTruncateTable),
+		ddl.StatementTypeToOp(ddl.StatementCreateView),
 		"vschema_update",
 	} {
 		assert.Equal(t, op, protoChangeTypeToDDLAction(ddlActionToProtoChangeType(op)),
@@ -240,7 +243,7 @@ func TestPSDisplayMetadataStorageBlobEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 
-	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"volume": "2"})
+	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"not_a_display_key": "2"})
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 }

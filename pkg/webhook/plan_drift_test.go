@@ -7,6 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
 
@@ -69,11 +71,50 @@ func TestPlanCheckConclusion_DriftFailsClosed(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, true, false, false),
 		"a primary plan with errors fails closed")
 	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, true, false),
-		"a PostgreSQL engine refusal fails the plan check")
+		"a final engine refusal fails the plan check")
 	assert.Equal(t, checkConclusionActionRequired, planCheckConclusion(true, false, false, false),
-		"non-PostgreSQL changes retain the existing action-required policy")
+		"changes with no final refusal retain the existing action-required policy")
 	assert.Equal(t, checkConclusionSuccess, planCheckConclusion(false, false, false, false),
 		"a clean no-op plan with no drift passes")
+}
+
+// An engine that refuses a statement outright leaves the operator no apply to
+// run, so the PR must not be mergeable. Vitess refuses constructs it cannot
+// execute at all and PostgreSQL blocks a change it has no classifier verdict
+// for; both are properties of the statement, so the plan check fails. A MySQL
+// block previews a routing decision that apply time re-resolves against live
+// table size and policy, so it stays action-required.
+func TestPlanRefusalFailsCheck_FinalRefusalsOnly(t *testing.T) {
+	blocked := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "commerce",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:     "orders",
+				DDL:           "ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+				ExecutionMode: "blocked",
+				ModeReason:    "foreign key constraints are not supported",
+			}},
+		}},
+	}
+
+	assert.True(t, planRefusalFailsCheck(storage.DatabaseTypeVitess, blocked),
+		"a Vitess refusal cannot be lifted by a re-plan, so it fails the check")
+	assert.True(t, planRefusalFailsCheck(storage.DatabaseTypePostgres, blocked),
+		"a PostgreSQL refusal fails the check")
+	assert.False(t, planRefusalFailsCheck(storage.DatabaseTypeMySQL, blocked),
+		"a MySQL block is re-resolved at apply time, so the check stays action-required")
+
+	unblocked := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "commerce",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName: "orders",
+				DDL:       "ALTER TABLE `orders` ADD COLUMN `note` varchar(255) DEFAULT NULL",
+			}},
+		}},
+	}
+	assert.False(t, planRefusalFailsCheck(storage.DatabaseTypeVitess, unblocked),
+		"an ordinary Vitess change is not a refusal")
 }
 
 // A single-deployment database has nothing to compare, so the preview is nil and

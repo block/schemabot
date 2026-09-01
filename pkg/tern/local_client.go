@@ -1745,15 +1745,19 @@ func scopedDispatchDDLChanges(changes []*ternv1.TableChange) ([]storage.TableCha
 		if table == "" || ddl == "" {
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d has empty table or DDL", i)
 		}
-		op := protoChangeTypeToDDLAction(ch.ChangeType)
-		// A shard-scoped dispatch carries only table DDL (create/alter/drop) for one
-		// shard. A VSchema update is keyspace-wide, never shard-scoped — it is applied
-		// by the task-less group_finalizer path — so accepting it here would build a
-		// shard-tagged task with an unexpected operation. Reject it explicitly.
-		if op == "unknown" || op == "vschema_update" {
+		// A shard-scoped dispatch carries only the table DDL the plan-store shard
+		// gate admits — create/alter/drop for one shard — so allow exactly those and
+		// reject everything else. A VSchema update is keyspace-wide, never
+		// shard-scoped — it is applied by the task-less group_finalizer path — and
+		// any other change type would build a shard-tagged task the sharded path has
+		// no semantics for. An explicit allow-list keeps this gate's meaning fixed
+		// as the change-type vocabulary grows.
+		switch ch.ChangeType {
+		case ternv1.ChangeType_CHANGE_TYPE_CREATE, ternv1.ChangeType_CHANGE_TYPE_ALTER, ternv1.ChangeType_CHANGE_TYPE_DROP:
+		default:
 			return nil, fmt.Errorf("shard-scoped dispatch ddl_change %d (table %q) has unsupported change type %v", i, table, ch.ChangeType)
 		}
-		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, op))
+		out = append(out, StorageTableChangeFromProto(ch, namespace, table, ddl, protoChangeTypeToDDLAction(ch.ChangeType)))
 	}
 	return out, nil
 }
@@ -2049,6 +2053,10 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 // change). Attaching it unconditionally would create spurious vschema_update
 // tasks on DDL-only plans, since Vitess always ships a vschema.json schema file.
 func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, schemaFiles schema.SchemaFiles) (map[string]*storage.NamespacePlanData, error) {
+	parser, err := c.statementParser()
+	if err != nil {
+		return nil, err
+	}
 	namespaces := map[string]*storage.NamespacePlanData{}
 	vschemaChangedNamespaces := map[string]bool{}
 	ensure := func(ns string) *storage.NamespacePlanData {
@@ -2080,7 +2088,7 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 			}
 			continue
 		}
-		op, err := materializedTableChangeOperation(ch)
+		op, err := materializedTableChangeOperation(parser, ch)
 		if err != nil {
 			return nil, err
 		}
@@ -2110,20 +2118,30 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 // materializedTableChangeOperation recovers the storage operation for a
 // materialized table change. The proto change type is authoritative when it maps
 // to a known DDL action; otherwise the operation is classified from the request's
-// authoritative DDL so an unmapped change type does not persist an "unknown"
-// action that would resume as a no-op.
-func materializedTableChangeOperation(ch *ternv1.TableChange) (string, error) {
+// authoritative DDL with the target dialect's parser. DDL that classifies
+// outside the shared DDL vocabulary, or as DML, is rejected — never mapped to
+// an "unknown" action that would resume as a no-op. The two rejection causes
+// get distinct messages because they call for different remedies: DML has no
+// place in a schema change, while out-of-vocabulary SQL is a statement the
+// materialized plan has no name for.
+func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.TableChange) (string, error) {
 	if op := protoChangeTypeToDDLAction(ch.ChangeType); op != "unknown" {
 		return op, nil
 	}
 	if strings.TrimSpace(ch.Ddl) == "" {
 		return "", fmt.Errorf("table change for %q has an unrecognized change type and no DDL to classify", ch.TableName)
 	}
-	op, _, err := ddl.ClassifyStatementOp(ch.Ddl)
+	statementType, _, err := parser.Classify(ch.Ddl)
 	if err != nil {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
 	}
-	return op, nil
+	if statementType == ddl.StatementUnknown {
+		return "", fmt.Errorf("DDL for table %q classified outside the shared DDL vocabulary; cannot recover an operation", ch.TableName)
+	}
+	if !statementType.IsDDL() {
+		return "", fmt.Errorf("DDL for table %q is not a DDL statement, got %s", ch.TableName, statementType)
+	}
+	return ddl.StatementTypeToOp(statementType), nil
 }
 
 func rejectUnsafeDDLChangesWithoutOptIn(planIdentifier string, changes []storage.TableChange, applyOpts storage.ApplyOptions) error {
@@ -2614,9 +2632,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				return adopted, nil
 			}
 		}
+		// The conflict travels as structured facts beside the error text. The
+		// text is the engine's own and stays for the logs; a caller that must
+		// tell an operator why the database is busy renders the conflict.
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: conflictErr.Error(),
+			Conflict:     blocking.conflict(),
 		}, nil
 	}
 
@@ -2636,8 +2658,8 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 
 	// Build typed ApplyOptions for storage from the full wire option map, so
-	// every engine-relevant option the dispatch carried (branch, volume,
-	// rollback, ...) survives the round trip into the stored apply — the queued
+	// every engine-relevant option the dispatch carried (branch, rollback,
+	// ...) survives the round trip into the stored apply — the queued
 	// operator drive re-derives its options from the stored apply, not from this
 	// request. Revert window is ON by default — only disabled when skip_revert
 	// is explicitly set. The plan's validated target is authoritative over any
@@ -3091,7 +3113,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		resp.Metadata[k] = v
 	}
 
-	// Populate apply_id, engine, and volume from the apply record.
+	// Populate apply_id and engine from the apply record.
 	// The apply record's engine is the source of truth (set at apply creation time).
 	if apply, err := c.storage.Applies().Get(ctx, activeTask.ApplyID); err == nil && apply != nil {
 		resp.ApplyId = apply.ApplyIdentifier
@@ -3107,7 +3129,6 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 			resp.Engine = eng
 		}
 		opts := storage.ParseApplyOptions(apply.Options)
-		resp.Volume = int32(opts.Volume)
 		if opts.Branch != "" {
 			resp.Metadata = ensureMetadata(resp.Metadata)
 			resp.Metadata["existing_branch"] = opts.Branch

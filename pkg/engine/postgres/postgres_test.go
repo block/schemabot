@@ -186,10 +186,10 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 }
 
 // TestBlockMissingPrivilegesSkipsMissingTable proves that executable steps on
-// a table the target provably does not have are blocked with the dependency
-// as the reason — the table's creation is itself blocked — never with a
-// privilege probe's "table not found", which reads as a re-plan instruction
-// no re-plan can satisfy. The nil pool proves no probe runs.
+// a table the target provably does not have are blocked with their dependency
+// on the table's creation as the reason — never with a privilege probe's
+// "table not found", which reads as a re-plan instruction no re-plan can
+// satisfy. The nil pool proves no probe runs.
 func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
@@ -213,7 +213,7 @@ func TestBlockMissingPrivilegesSkipsMissingTable(t *testing.T) {
 	assert.Equal(t, "creation shape verdict", changes[0].ModeReason)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.Contains(t, changes[1].ModeReason, `table "users" does not exist on the target`)
-	assert.Contains(t, changes[1].ModeReason, "the statement that would create it is blocked")
+	assert.Contains(t, changes[1].ModeReason, "depends on the statement that creates it")
 }
 
 // TestBlockMissingPrivilegesSkipsFullyBlockedPlans proves the privilege check
@@ -245,6 +245,33 @@ func TestBlockMissingPrivilegesRequiresTargetTable(t *testing.T) {
 	}}
 
 	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{preflight.TierAlterInPlace})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "names no target table")
+}
+
+// TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent proves the unnamed-
+// target guard fires before dependent-step blocking rewrites verdicts: a
+// report that provably lacks its table but carries executable steps and no
+// target name must fail the plan closed, never launder the missing name into
+// a plan whose every step was blocked for a fabricated dependency.
+func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	exists := false
+	report.TableExists = &exists
+	changes := []engine.TableChange{
+		{
+			Table:         "users",
+			DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    "creation shape verdict",
+		},
+		{
+			Table: "users",
+			DDL:   "CREATE INDEX CONCURRENTLY idx_users_email ON public.users (email)",
+		},
+	}
+
+	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
 }
@@ -284,6 +311,51 @@ func TestBlockChangesAtTier(t *testing.T) {
 	assert.Equal(t, "index tier refused", changes[1].ModeReason)
 	assert.Equal(t, "creation shape verdict", changes[2].ModeReason,
 		"an existing verdict must never be overwritten")
+}
+
+// A fully blocked plan does not need a table-size answer. The nil pool proves
+// the guard returns before catalog access while preserving the prior verdict.
+func TestBlockOversizedTableSkipsFullyBlockedPlans(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table:         "users",
+		DDL:           "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+		ExecutionMode: engine.ExecutionModeBlocked,
+	}}
+
+	changes, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	require.NoError(t, err)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+}
+
+// An executable step without a named target fails the plan closed because a
+// size check cannot answer for an unidentified table.
+func TestBlockOversizedTableRequiresTargetTable(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
+	}}
+
+	_, err := blockOversizedTable(t.Context(), nil, report, changes, 1)
+	require.Error(t, err)
+	assert.EqualError(t, err, "plan report carries executable steps but names no target table")
+}
+
+// An operational size-check failure fails the plan closed instead of leaving
+// the step executable. A non-positive limit is rejected before catalog access.
+func TestBlockOversizedTableFailsClosedOnCheckError(t *testing.T) {
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	changes := []engine.TableChange{{
+		Table: "users",
+		DDL:   "ALTER TABLE public.users ADD COLUMN email text",
+	}}
+
+	_, err := blockOversizedTable(t.Context(), nil, report, changes, -1)
+	require.Error(t, err)
+	assert.EqualError(t, err, `check size for table "users": size limit must be positive, got -1`)
 }
 
 func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
@@ -337,11 +409,6 @@ func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
 		}},
 		{"skip-revert", func(t *testing.T) error {
 			result, err := eng.SkipRevert(t.Context(), &engine.ControlRequest{})
-			assert.Nil(t, result)
-			return err
-		}},
-		{"volume", func(t *testing.T) error {
-			result, err := eng.Volume(t.Context(), &engine.VolumeRequest{})
 			assert.Nil(t, result)
 			return err
 		}},

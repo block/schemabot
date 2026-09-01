@@ -32,7 +32,6 @@ const (
 	Tern_Stop_FullMethodName       = "/tern.v1.Tern/Stop"
 	Tern_Cancel_FullMethodName     = "/tern.v1.Tern/Cancel"
 	Tern_Start_FullMethodName      = "/tern.v1.Tern/Start"
-	Tern_Volume_FullMethodName     = "/tern.v1.Tern/Volume"
 )
 
 // TernClient is the client API for Tern service.
@@ -47,7 +46,7 @@ const (
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //
@@ -175,18 +174,6 @@ type TernClient interface {
 	//
 	// Execution resumes asynchronously (same as Apply). Use Progress to track.
 	Start(ctx context.Context, in *StartRequest, opts ...grpc.CallOption) (*StartResponse, error)
-	// Volume adjusts the schema change speed/concurrency while running.
-	//
-	// Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-	// throughput). Affects chunk size, lock hold time, and throttle parameters.
-	//
-	// Can be called multiple times during a running schema change. The engine
-	// is stopped and restarted internally to apply the new settings.
-	//
-	// Preconditions:
-	//   - Active schema change must exist for the database.
-	//   - Volume must be 1-11 inclusive.
-	Volume(ctx context.Context, in *VolumeRequest, opts ...grpc.CallOption) (*VolumeResponse, error)
 }
 
 type ternClient struct {
@@ -327,16 +314,6 @@ func (c *ternClient) Start(ctx context.Context, in *StartRequest, opts ...grpc.C
 	return out, nil
 }
 
-func (c *ternClient) Volume(ctx context.Context, in *VolumeRequest, opts ...grpc.CallOption) (*VolumeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(VolumeResponse)
-	err := c.cc.Invoke(ctx, Tern_Volume_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // TernServer is the server API for Tern service.
 // All implementations should embed UnimplementedTernServer
 // for forward compatibility.
@@ -349,7 +326,7 @@ func (c *ternClient) Volume(ctx context.Context, in *VolumeRequest, opts ...grpc
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //
@@ -477,18 +454,6 @@ type TernServer interface {
 	//
 	// Execution resumes asynchronously (same as Apply). Use Progress to track.
 	Start(context.Context, *StartRequest) (*StartResponse, error)
-	// Volume adjusts the schema change speed/concurrency while running.
-	//
-	// Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-	// throughput). Affects chunk size, lock hold time, and throttle parameters.
-	//
-	// Can be called multiple times during a running schema change. The engine
-	// is stopped and restarted internally to apply the new settings.
-	//
-	// Preconditions:
-	//   - Active schema change must exist for the database.
-	//   - Volume must be 1-11 inclusive.
-	Volume(context.Context, *VolumeRequest) (*VolumeResponse, error)
 }
 
 // UnimplementedTernServer should be embedded to have
@@ -536,9 +501,6 @@ func (UnimplementedTernServer) Cancel(context.Context, *CancelRequest) (*CancelR
 }
 func (UnimplementedTernServer) Start(context.Context, *StartRequest) (*StartResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Start not implemented")
-}
-func (UnimplementedTernServer) Volume(context.Context, *VolumeRequest) (*VolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Volume not implemented")
 }
 func (UnimplementedTernServer) testEmbeddedByValue() {}
 
@@ -794,24 +756,6 @@ func _Tern_Start_Handler(srv interface{}, ctx context.Context, dec func(interfac
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Tern_Volume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(VolumeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(TernServer).Volume(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Tern_Volume_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TernServer).Volume(ctx, req.(*VolumeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // Tern_ServiceDesc is the grpc.ServiceDesc for Tern service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -870,10 +814,6 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Start",
 			Handler:    _Tern_Start_Handler,
-		},
-		{
-			MethodName: "Volume",
-			Handler:    _Tern_Volume_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -198,7 +198,7 @@ type Config struct {
 // the remote-deployment outage monitor, which must observe an outage promptly
 // rather than ride it out.
 //
-// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Volume, Revert,
+// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
 // queue already owns redelivery for dispatch failures.
@@ -845,26 +845,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		if scope.usesOperationRemoteResume() {
-			// A multi-operation apply has one stop request shared by every
-			// deployment. Stopping this undispatched operation must not
-			// terminalize the parent or complete the apply-level request:
-			// sibling deployments with their own remote apply id still need to
-			// observe the durable stop. Stop only this operation and leave the
-			// request pending for the siblings.
-			if err := c.stopUndispatchedApplyOperation(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
-				return true, err
-			}
-			logOperationDriveLeavesParentStop(logger, apply, scope)
-			return true, nil
-		}
-		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
-			return true, err
-		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			return true, err
-		}
-		return true, nil
+		return c.settleUndispatchedControlRequest(ctx, apply, controlReq, scope, stopUndispatchedTerminalization(apply.DatabaseType), logOperationDriveLeavesParentStop)
 	}
 
 	// The data plane stores the stop durably on first receipt and its own
@@ -983,7 +964,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		return true, fmt.Errorf("cancel gRPC apply %s: remote apply id is not available", apply.ApplyIdentifier)
+		return c.settleUndispatchedControlRequest(ctx, apply, controlReq, scope, cancelUndispatchedTerminalization(), logOperationDriveLeavesParentCancel)
 	}
 	// The data plane stores the cancel durably on first receipt and its own
 	// driver consumes it, so retransmission is redelivery insurance on a bounded
@@ -1066,6 +1047,64 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			"requested_by", controlRequestCaller(controlReq),
 			"remote_state", remoteState)...)
 	return false, nil
+}
+
+// settleUndispatchedControlRequest settles a pending stop or cancel for an apply
+// that carries no remote apply id.
+//
+// Nothing remote exists to address exactly when
+// undispatchedControlRequestSettlesLocally holds: either the dispatch path
+// would treat this drive as a first dispatch — the same predicate dispatch
+// itself trusts to mean no remote apply was ever created — or the dispatch
+// state is stopped, which with no recorded remote apply id proves the work was
+// stopped before it was ever dispatched. In both shapes the request is
+// satisfied in control-plane storage alone and the operator's command
+// completes: there is nothing to orphan.
+//
+// Every other shape is the ambiguous one — a dispatch may have created a remote
+// apply whose response was lost. Settling locally would report the change
+// stopped or cancelled while it kept running on the target, and because that
+// leaves the apply terminal, nothing would ever revisit it to find out. So this
+// reports the request unhandled and lets the drive continue to the dispatch
+// ambiguity guard, which fails the apply closed and fails the pending stop and
+// cancel requests with the same ambiguity message, so the operator sees the
+// rejection rather than a command no later claim would ever answer. The guard
+// is where this apply was headed regardless — a pending request must not be
+// what routes around it.
+//
+// The request must never be answered with an error here: it stays pending across
+// the error, so every later claim would abort at this same point and the apply
+// would occupy a driver on every poll without ever resolving.
+func (c *GRPCClient) settleUndispatchedControlRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope, terminalization undispatchedTerminalization, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
+	logger := c.applyLogger(apply)
+	caller := controlRequestCaller(controlReq)
+	if !undispatchedControlRequestSettlesLocally(apply, scope) {
+		logger.WarnContext(ctx, "leaving pending gRPC control request to the dispatch ambiguity guard; remote dispatch state is ambiguous so the request cannot be satisfied locally",
+			append(apply.MutableLogAttrs(),
+				"control_operation", terminalization.controlOperation,
+				"requested_by", caller,
+				"dispatch_state", scope.dispatchState(apply))...)
+		return false, nil
+	}
+	if scope.usesOperationRemoteResume() {
+		// A multi-operation apply has one request shared by every deployment.
+		// Settling this undispatched operation must not terminalize the parent or
+		// complete the apply-level request: sibling deployments with their own
+		// remote apply id still need to observe the durable command.
+		if err := c.terminalizeUndispatchedApplyOperation(ctx, apply, caller, scope, terminalization); err != nil {
+			return true, err
+		}
+		leaveParentRequestPending(logger, apply, scope)
+		return true, nil
+	}
+	if err := c.terminalizeUndispatchedApply(ctx, apply, caller, scope, terminalization); err != nil {
+		return true, err
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, terminalization.controlOperation); err != nil {
+		return true, err
+	}
+	c.controlSendGate.clear(controlReq.ID)
+	return true, nil
 }
 
 // controlPathProgress polls remote progress on behalf of a control-request path
@@ -1231,123 +1270,165 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	return true, nil
 }
 
-func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope) error {
-	now := time.Now()
-	taskState := state.Task.Stopped
-	applyState := state.Apply.Stopped
-	if stopTerminatesChange(apply.DatabaseType) {
-		taskState = state.Task.Cancelled
-		applyState = state.Apply.Cancelled
+// undispatchedTerminalization describes how a drive settles work that was never
+// dispatched to the data plane. A control operation that arrives before dispatch
+// is satisfied entirely in control-plane storage — there is no remote apply to
+// address — so each operation supplies the states it terminalizes to and the
+// vocabulary its operator-facing log lines use.
+type undispatchedTerminalization struct {
+	taskState      string
+	applyState     string
+	operationState string
+	logEvent       string
+	// verb reads in "Remote apply <verb> before dispatch".
+	verb string
+	// controlOperation names the durable request being settled. It is the
+	// noun, so operator text reads "pending apply <controlOperation> request"
+	// where the verb would read as a state.
+	controlOperation storage.ControlOperation
+}
+
+// stopUndispatchedTerminalization is how a stop settles undispatched work. A
+// stop is resumable on database types that can pause a change and terminal on
+// those that cannot, so the states follow stopTerminatesChange.
+func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
+	terminalization := undispatchedTerminalization{
+		taskState:        state.Task.Stopped,
+		applyState:       state.Apply.Stopped,
+		operationState:   state.ApplyOperation.Stopped,
+		logEvent:         storage.LogEventStopRequested,
+		verb:             "stopped",
+		controlOperation: storage.ControlOperationStop,
 	}
+	if stopTerminatesChange(databaseType) {
+		terminalization.taskState = state.Task.Cancelled
+		terminalization.applyState = state.Apply.Cancelled
+		terminalization.operationState = state.ApplyOperation.Cancelled
+	}
+	return terminalization
+}
+
+// cancelUndispatchedTerminalization is how a cancel settles undispatched work.
+// A cancel is terminal on every database type, so it does not vary.
+func cancelUndispatchedTerminalization() undispatchedTerminalization {
+	return undispatchedTerminalization{
+		taskState:        state.Task.Cancelled,
+		applyState:       state.Apply.Cancelled,
+		operationState:   state.ApplyOperation.Cancelled,
+		logEvent:         storage.LogEventCancelRequested,
+		verb:             "cancelled",
+		controlOperation: storage.ControlOperationCancel,
+	}
+}
+
+// terminalizeUndispatchedApply settles a whole apply that never reached the data
+// plane: its tasks and the apply row move to the control operation's terminal
+// states in control-plane storage alone. Already-terminal tasks are left as they
+// are, so a partially settled apply is not rewritten.
+func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope, terminalization undispatchedTerminalization) error {
+	now := time.Now()
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		return fmt.Errorf("load tasks for undispatched stop %s: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("load tasks for undispatched %s %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
 	logger := c.applyLogger(apply)
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged during undispatched stop",
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched control request",
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
-				"task_state", task.State)
+				"task_state", task.State,
+				"control_operation", terminalization.controlOperation)
 			continue
 		}
-		task.State = taskState
-		if state.IsState(taskState, state.Task.Cancelled) {
+		task.State = terminalization.taskState
+		if state.IsState(terminalization.taskState, state.Task.Cancelled) {
 			task.CompletedAt = &now
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched stop %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("update task %s for undispatched %s %s: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, err)
 		}
 	}
 	oldState := apply.State
-	apply.State = applyState
+	apply.State = terminalization.applyState
 	apply.CompletedAt = nil
-	if state.IsState(applyState, state.Apply.Cancelled) {
+	if state.IsState(terminalization.applyState, state.Apply.Cancelled) {
 		apply.CompletedAt = &now
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("update undispatched stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("update undispatched %s gRPC apply %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
-	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply stopped before dispatch: %s%s", apply.State, callerApplyLogSuffix(caller)), oldState)
+	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply %s before dispatch: %s%s", terminalization.verb, apply.State, callerApplyLogSuffix(caller)), oldState)
 	return nil
 }
 
-// stopUndispatchedApplyOperation stops a single undispatched operation of a
-// multi-operation apply. It terminalizes only this operation's tasks and the
-// operation row, never the parent apply, and never completes the apply-level
-// stop request: that request is shared across deployments and must remain
-// pending so sibling operations with their own remote apply id still observe
-// the stop.
-func (c *GRPCClient) stopUndispatchedApplyOperation(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope) error {
+// terminalizeUndispatchedApplyOperation settles a single undispatched operation
+// of a multi-operation apply. It terminalizes only this operation's tasks and
+// the operation row, never the parent apply, and never completes the
+// apply-level control request: that request is shared across deployments and
+// must remain pending so sibling operations with their own remote apply id
+// still observe it.
+func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope, terminalization undispatchedTerminalization) error {
 	if !scope.usesOperationRemoteResume() {
-		return fmt.Errorf("undispatched operation stop for apply %s requires multi-operation scope", apply.ApplyIdentifier)
+		return fmt.Errorf("undispatched operation %s for apply %s requires multi-operation scope", terminalization.controlOperation, apply.ApplyIdentifier)
 	}
 	op := scope.operation
 	now := time.Now()
-	taskState := state.Task.Stopped
-	operationState := state.ApplyOperation.Stopped
-	if stopTerminatesChange(apply.DatabaseType) {
-		taskState = state.Task.Cancelled
-		operationState = state.ApplyOperation.Cancelled
-	}
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		return fmt.Errorf("load tasks for undispatched operation stop %s apply_operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+		return fmt.Errorf("load tasks for undispatched operation %s %s apply_operation %d: %w", terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
 	}
 	logger := c.applyLogger(apply)
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged during undispatched operation stop",
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched operation's control request",
 				"apply_operation_id", op.ID,
 				"deployment", op.Deployment,
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
-				"task_state", task.State)
+				"task_state", task.State,
+				"control_operation", terminalization.controlOperation)
 			continue
 		}
-		task.State = taskState
-		if state.IsState(taskState, state.Task.Cancelled) {
+		task.State = terminalization.taskState
+		if state.IsState(terminalization.taskState, state.Task.Cancelled) {
 			task.CompletedAt = &now
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched operation stop %s apply_operation %d: %w", task.TaskIdentifier, apply.ApplyIdentifier, op.ID, err)
+			return fmt.Errorf("update task %s for undispatched operation %s %s apply_operation %d: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
 		}
 	}
 	oldState := op.State
-	if state.IsState(operationState, state.ApplyOperation.Cancelled) {
-		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState); err != nil {
+	if state.IsState(terminalization.operationState, state.ApplyOperation.Cancelled) {
+		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, terminalization.operationState); err != nil {
 			return fmt.Errorf("mark undispatched gRPC apply_operation %d cancelled for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
 		}
 		op.CompletedAt = &now
 	} else {
-		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState); err != nil {
-			return fmt.Errorf("mark undispatched gRPC apply_operation %d stopped for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
+		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, terminalization.operationState); err != nil {
+			return fmt.Errorf("mark undispatched gRPC apply_operation %d %s for apply %s: %w", op.ID, terminalization.controlOperation, apply.ApplyIdentifier, err)
 		}
 		op.CompletedAt = nil
 	}
-	op.State = operationState
+	op.State = terminalization.operationState
 	op.UpdatedAt = now
-	logger.InfoContext(ctx, "stopped undispatched multi-operation gRPC apply operation; apply-level stop request remains pending for siblings",
+	logger.InfoContext(ctx, "settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings",
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
 		"requested_by", caller,
+		"control_operation", terminalization.controlOperation,
 		"old_operation_state", oldState,
-		"new_operation_state", operationState)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
-		fmt.Sprintf("Remote apply operation %d (deployment %s) stopped before dispatch: %s%s; pending apply stop request remains for sibling operations", op.ID, op.Deployment, operationState, callerApplyLogSuffix(caller)), "", "")
+		"new_operation_state", terminalization.operationState)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, terminalization.logEvent,
+		fmt.Sprintf("Remote apply operation %d (deployment %s) %s before dispatch: %s%s; pending apply %s request remains for sibling operations", op.ID, op.Deployment, terminalization.verb, terminalization.operationState, callerApplyLogSuffix(caller), terminalization.controlOperation), "", "")
 	return nil
 }
 
 func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return c.client.Start(ctx, req)
-}
-
-func (c *GRPCClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return c.client.Volume(ctx, req)
 }
 
 func (c *GRPCClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
@@ -1817,35 +1898,6 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	return blob
 }
 
-// mirrorRemoteVolume copies the volume level the data plane reports on a
-// progress response onto the in-memory apply options, so the poll's regular
-// parent-apply persistence records it. Volume changes are applied by the
-// data-plane driver against its own apply row, and the control plane only
-// learns the resulting level from progress responses — the PR comment and the
-// control-plane progress API both read the level from the control-plane apply
-// options. Returns true when the stored level changed so the caller can log
-// the transition. The logger is expected to carry the apply's identity
-// attributes already bound.
-func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume int32) bool {
-	if remoteVolume == 0 {
-		// The data plane reports 0 when no volume level was ever set on the
-		// apply; there is nothing to mirror.
-		return false
-	}
-	if remoteVolume < storage.MinVolume || remoteVolume > storage.MaxVolume {
-		logger.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
-			append(apply.MutableLogAttrs(), "remote_volume", remoteVolume)...)
-		return false
-	}
-	opts := apply.GetOptions()
-	if opts.Volume == int(remoteVolume) {
-		return false
-	}
-	opts.Volume = int(remoteVolume)
-	apply.SetOptions(opts)
-	return true
-}
-
 // mirrorRemoteControlRejections records, on the control plane, the control
 // requests the data plane accepted and then failed. Accepting a control RPC
 // only means the request was queued: the engine call happens later on the data
@@ -1878,6 +1930,15 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 			continue
 		}
 		operation := storage.ControlOperation(entry.Operation)
+		if operation.Retired() {
+			// A data plane on a previous release reports its settled retired
+			// requests on every poll until the apply finishes; there is nothing
+			// left to mirror for an operation this release removed, and the
+			// entry recurs for the life of the drive, so it logs at debug.
+			logger.Debug("data plane reported a settled control request for a retired operation; nothing to mirror",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
 		if !operation.Valid() {
 			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
 				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
@@ -1930,11 +1991,10 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 }
 
 // retireMirroredControlRejection clears a rejection this plane mirrored once the
-// data plane reports the same operation succeeded. It matters for an operation
-// this plane only proxies — volume, whose request lives entirely in the data
-// plane — because the mirrored row is the sole record here and no local request
-// lifecycle will ever reset it: without this the operator re-issues the command,
-// it works, and the PR keeps warning that it did not.
+// data plane reports the same operation succeeded. The mirrored row is this
+// plane's only record of that failure, so nothing else resets it: without this
+// the operator re-issues the command, it works, and the PR keeps warning that
+// it did not.
 func (c *GRPCClient) retireMirroredControlRejection(
 	ctx context.Context,
 	apply *storage.Apply,
@@ -2199,10 +2259,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
 		}
 		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
-			errMsg := fmt.Sprintf("remote %s apply was not accepted", kind)
-			if resp != nil && resp.ErrorMessage != "" {
-				errMsg = resp.ErrorMessage
-			}
+			holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+			errMsg := remoteApplyRejectionMessage(resp, holderApplyID, fmt.Sprintf("remote %s apply was not accepted", kind))
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 				return fmt.Errorf("mark %s apply_operation %d failed: %w", kind, op.ID, markErr)
 			}
@@ -2505,6 +2563,20 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		errMsg := fmt.Sprintf("gRPC apply %s is %s without a remote apply id; remote dispatch state is ambiguous", apply.ApplyIdentifier, scope.dispatchState(apply))
 		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
 			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
+		}
+		// A failed apply is never claimed again, so a stop or cancel left
+		// pending here would stay unanswered forever and a re-issued command
+		// would be refused as already requested. Fail the requests with the
+		// same ambiguity message the apply carries. An operation-only drive
+		// leaves the shared apply-level requests pending: sibling deployments
+		// still need to observe them, and the operator projection settles them
+		// once the parent apply derives terminal.
+		if !scope.suppressesDirectParentApplyWrites() {
+			for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+				if err := failPendingControlRequests(ctx, c.storage, apply, operation, errMsg); err != nil {
+					return fmt.Errorf("%s; fail pending %s control request: %w", errMsg, operation, err)
+				}
+			}
 		}
 		return errors.New(errMsg)
 	}
@@ -2897,6 +2969,21 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	return scope.usesOperationRemoteResume() && state.IsState(dispatchState, state.Apply.Running)
 }
 
+// undispatchedControlRequestSettlesLocally reports whether a pending stop or
+// cancel that addresses no remote apply id can be satisfied in control-plane
+// storage alone. Two shapes qualify. When the dispatch path would treat this
+// drive as a first dispatch, nothing remote was ever created. When the
+// dispatch state is stopped, the same fact is proven from the other side: a
+// remote apply id is persisted before an apply or operation can be recorded
+// stopped and is never cleared, so a stopped one without an id was stopped
+// before dispatch and has no remote work to address.
+func undispatchedControlRequestSettlesLocally(apply *storage.Apply, scope applyTaskScope) bool {
+	if shouldDispatchQueuedRemoteApply(apply, scope) {
+		return true
+	}
+	return scope.remoteApplyID(apply) == "" && state.IsState(scope.dispatchState(apply), state.Apply.Stopped)
+}
+
 func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope) bool {
 	if apply == nil {
 		return false
@@ -3004,10 +3091,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if !resp.Accepted {
-		errMsg := resp.ErrorMessage
-		if errMsg == "" {
-			errMsg = "remote apply was not accepted"
-		}
+		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -4322,10 +4407,6 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			apply.State = newState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
-			if mirrorRemoteVolume(logger, apply, resp.Volume) {
-				logger.Info("mirrored remote volume level onto control-plane apply options",
-					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
-			}
 			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
 			if remoteProgressIsTerminal(resp.State, resp.Tables) {

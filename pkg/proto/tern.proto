@@ -14,7 +14,7 @@ option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //   pending -> running -> waiting_for_cutover -> cutting_over -> completed
@@ -216,25 +216,6 @@ service Tern {
       body: "*"
     };
   }
-
-  // Volume adjusts the schema change speed/concurrency while running.
-  //
-  // Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-  // throughput). Affects chunk size, lock hold time, and throttle parameters.
-  //
-  // Can be called multiple times during a running schema change. The engine
-  // is stopped and restarted internally to apply the new settings.
-  //
-  // Preconditions:
-  //   - Active schema change must exist for the database.
-  //   - Volume must be 1-11 inclusive.
-  rpc Volume(VolumeRequest) returns (VolumeResponse) {
-    option (google.api.http) = {
-      post: "/v1/volume"
-      body: "*"
-    };
-  }
-
 }
 
 // Engine represents the schema change engine type.
@@ -293,6 +274,9 @@ enum ChangeType {
   CHANGE_TYPE_VSCHEMA = 4;
   CHANGE_TYPE_CREATE_INDEX = 5;
   CHANGE_TYPE_DROP_INDEX = 6;
+  CHANGE_TYPE_RENAME = 7;
+  CHANGE_TYPE_TRUNCATE = 8;
+  CHANGE_TYPE_CREATE_VIEW = 9;
 }
 
 // SchemaFiles contains the schema files for a namespace (e.g. schema name for MySQL, keyspace for Vitess).
@@ -630,6 +614,43 @@ message ApplyRequest {
   repeated string generation_operation_keys = 12;
 }
 
+// ApplyConflict names the active work that refused an apply, in the terms a
+// caller needs to explain the refusal on its own surfaces.
+//
+// error_message is the engine's own prose and is not safe to render: it can
+// carry dial failures, hostnames, and driver internals into a public pull
+// request. These fields are the sanitized alternative — facts the engine
+// derived rather than text it caught — so a caller can tell an operator what
+// holds the database without leaking what went wrong underneath.
+//
+// The engine's own identifiers are never rendered. They resolve only inside the
+// engine, so an operator who pastes one into the control-plane CLI is refused.
+// holder_external_id crosses for the opposite purpose: it is the key a caller
+// joins against its own record of what it dispatched, so it can name the
+// holding change by an identifier that resolves on the operator's side.
+message ApplyConflict {
+  // The table the blocking work is changing. Empty for a multi-table atomic
+  // change, which holds the database without naming a single table.
+  string table = 1;
+  // The shard held, for sharded engines. Empty when the whole database is held.
+  string shard = 2;
+  // The canonical state of the schema change holding the database, which is
+  // what decides whether an operator must act or can wait.
+  string blocking_state = 3;
+  // The pull request that owns the holding change, when one does.
+  string repository = 4;
+  int32 pull_request = 5;
+  // Who started the holding change (e.g. "cli:user@host"). Set when no pull
+  // request owns it.
+  string caller = 6;
+  // The engine's identifier for the holding change, for lookup only. A caller
+  // that dispatched the holding change recorded this identifier against its own
+  // apply, so it can resolve the handle an operator can actually use. A caller
+  // that finds no match did not start this work and has no handle to offer —
+  // this field is never the one rendered.
+  string holder_external_id = 7;
+}
+
 // ApplyResponse indicates whether the apply was accepted.
 message ApplyResponse {
   bool accepted = 1;
@@ -644,6 +665,10 @@ message ApplyResponse {
   // response without the caller's key must not be treated as that
   // operation's dispatch.
   string operation_key = 5;
+  // Set when the apply was refused because other work already holds the
+  // database, so the caller can render the refusal instead of the engine's
+  // unsafe error text. Absent for every other rejection.
+  ApplyConflict conflict = 6;
 }
 
 // ProgressRequest requests detailed progress for an active schema change.
@@ -731,8 +756,8 @@ message TableProgress {
 // queued, so the plane that accepted it learns here whether the operation
 // actually took effect.
 message SettledControlRequest {
-  // The control operation: "stop", "start", "cutover", "cancel", "volume",
-  // "revert", or "skip_revert".
+  // The control operation: "stop", "start", "cutover", "cancel", "revert", or
+  // "skip_revert".
   string operation = 1;
   // Terminal status of the request: "completed" or "failed".
   string status = 2;
@@ -754,7 +779,11 @@ message ProgressResponse {
   repeated TableProgress tables = 6;
   string started_at = 7;
   string completed_at = 8;
-  int32 volume = 9;
+  // Field 9 carried the operator-set volume level before the volume control
+  // operation was removed. Reserved so a future field cannot reuse the number
+  // while an embedded pre-removal data plane still emits it.
+  reserved 9;
+  reserved "volume";
   map<string, string> metadata = 10;
   // Control requests on this apply that have reached a terminal status.
   repeated SettledControlRequest settled_control_requests = 11;
@@ -884,29 +913,4 @@ message StartResponse {
   int64 started_count = 3;
   // Number of tasks skipped (not in stopped state).
   int64 skipped_count = 4;
-}
-
-// VolumeRequest modifies the schema change speed/concurrency.
-message VolumeRequest {
-  // Apply ID for the schema change to adjust.
-  string apply_id = 1;
-  // Environment: "staging" or "production".
-  string environment = 2;
-  // Volume level 1-11 (1=conservative, 11=aggressive).
-  int32 volume = 3;
-  // Caller identifies the operator who issued the command, as resolved by the
-  // plane that accepted it. The plane that records the durable control request
-  // may not be the one the operator talked to, and the request is what names
-  // the requester in the PR notice and the apply log.
-  string caller = 4;
-}
-
-// VolumeResponse indicates whether the volume change was accepted.
-message VolumeResponse {
-  bool accepted = 1;
-  string error_message = 2;
-  // Previous volume level.
-  int32 previous_volume = 3;
-  // New volume level.
-  int32 new_volume = 4;
 }

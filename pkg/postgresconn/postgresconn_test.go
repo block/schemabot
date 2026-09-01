@@ -263,14 +263,46 @@ func TestWithRootCAsLeavesNonTLSConnectionsUntouched(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, cfg.TLSConfig)
 }
-func TestWithConnectTimeout(t *testing.T) {
-	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))
-	require.NoError(t, err)
-	assert.Equal(t, 7*time.Second, cfg.ConnectTimeout)
 
-	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(0))
-	require.NoError(t, err)
-	assert.Equal(t, time.Duration(0), cfg.ConnectTimeout)
+// Every SchemaBot-managed connection gets a bounded connect timeout so an
+// unreachable target surfaces as an error instead of a hung dial. A positive
+// timeout carried in the DSN or supplied as an option wins over the package
+// default, while a non-positive value — absent, zero, or negative via a raw
+// option closure — is filled with the default so no managed connection
+// attempt is ever unbounded.
+func TestWithConnectTimeout(t *testing.T) {
+	t.Run("option overrides the default", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(7*time.Second))
+		require.NoError(t, err)
+		assert.Equal(t, 7*time.Second, cfg.ConnectTimeout)
+	})
+
+	t.Run("non-positive timeout falls back to the package default", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app", WithConnectTimeout(0))
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
+	})
+
+	t.Run("negative timeout from a raw option closure is replaced by the default", func(t *testing.T) {
+		cfg, err := connectionConfig(
+			"postgres://schemabot:secret@localhost:5432/app",
+			func(c *pgx.ConnConfig) { c.ConnectTimeout = -time.Second },
+		)
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
+	})
+
+	t.Run("plain DSN gets the default connect timeout", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
+		require.NoError(t, err)
+		assert.Equal(t, defaultConnectTimeout, cfg.ConnectTimeout)
+	})
+
+	t.Run("DSN-carried connect_timeout is preserved", func(t *testing.T) {
+		cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app?connect_timeout=3")
+		require.NoError(t, err)
+		assert.Equal(t, 3*time.Second, cfg.ConnectTimeout)
+	})
 }
 
 // Sessions are pinned to timezone=UTC so server-side now() is UTC on any

@@ -24,6 +24,14 @@ const refusalOrdersTable = "CREATE TABLE `orders` (\n" +
 	"  PRIMARY KEY (`id`)\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
+// refusalNoPrimaryKeyTable has no primary key, which Spirit cannot copy: every
+// ALTER against it is refused at classification time rather than failing
+// mid-run at table setup.
+const refusalNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
+	"  `note` varchar(100) DEFAULT NULL,\n" +
+	"  `name` varchar(100) DEFAULT NULL\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
 // The engine's refusal verdict is what plan-time execution modes and apply-time
 // routing are both built on, and it comes from Spirit rather than from anything
 // this repo can see in a diff. This pins the shapes each side of the verdict at
@@ -35,8 +43,21 @@ func TestStatementRefusalContract(t *testing.T) {
 	tests := []struct {
 		name       string
 		stmt       string
+		table      string
 		wantReason string
 	}{
+		{
+			name:       "add a column to a table without a primary key",
+			stmt:       "ALTER TABLE orders_log ADD COLUMN created_at DATETIME",
+			table:      refusalNoPrimaryKeyTable,
+			wantReason: "altering a table without a primary key is not supported",
+		},
+		{
+			name:       "widen a column on a table without a primary key",
+			stmt:       "ALTER TABLE orders_log MODIFY COLUMN name VARCHAR(255)",
+			table:      refusalNoPrimaryKeyTable,
+			wantReason: "altering a table without a primary key is not supported",
+		},
 		{
 			name:       "drop primary key",
 			stmt:       "ALTER TABLE orders DROP PRIMARY KEY, ADD PRIMARY KEY (name)",
@@ -125,7 +146,11 @@ func TestStatementRefusalContract(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, refusalOrdersTable, discardLogger())
+			table := tt.table
+			if table == "" {
+				table = refusalOrdersTable
+			}
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, table, discardLogger())
 			require.NoError(t, err)
 			if tt.wantReason == "" {
 				assert.False(t, refused, "statement must route to the engine, not be reported as refused")

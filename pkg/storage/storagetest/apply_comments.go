@@ -16,18 +16,19 @@ import (
 // pending-freeze marker, the exactly-once summary-claim machinery, and the
 // apply-lease guard on every lease-guarded mutation.
 //
-// Three claim behaviors can only be proven against an aged row and stay in
-// the dialect suites, which can backdate updated_at directly: the
-// stale-window takeover in ReclaimStaleSummaryClaim, its refusal to reclaim
-// a marker recording a posted comment, and the assertion that every mutation
-// renews updated_at (the claim machinery's freshness signal). The parity
-// suite covers the reclaim decisions that do not require aging a row.
+// Claim behaviors that can only be proven against an aged row stay in the
+// dialect suites, which can backdate timestamps directly: the stale-window
+// takeover in ReclaimStaleSummaryClaim, its refusal to reclaim a marker
+// recording a posted comment, the assertion that every mutation renews
+// updated_at (the claim machinery's freshness signal), and the stale-heartbeat
+// takeover in ClaimProgressCommentAuthority. The parity suite covers the
+// claim decisions that do not require aging a row.
 func TestApplyComments(t *testing.T, h Harness) {
 	// Upsert_And_Get verifies the tracked-comment round trip: an insert
-	// stores the posted level and control phase, a conflicting upsert for the
-	// same (apply_id, comment_state) slot rotates the recorded GitHub comment
-	// in place, and a summary comment — which carries no level or phase —
-	// reads back with nil pointers.
+	// stores the posted control phase, a conflicting upsert for the same
+	// (apply_id, comment_state) slot rotates the recorded GitHub comment in
+	// place, and a summary comment — which carries no phase — reads back with
+	// nil pointers.
 	t.Run("Upsert_And_Get", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -35,13 +36,11 @@ func TestApplyComments(t *testing.T, h Harness) {
 		lock := CreateLock(t, store, "comment_upsert_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_comment_upsert", 700)
 
-		postedVolume := 3
 		noPhase := ""
 		comment := &storage.ApplyComment{
 			ApplyID:         apply.ID,
 			CommentState:    state.Comment.Progress,
 			GitHubCommentID: 111222333,
-			PostedVolume:    &postedVolume,
 			PostedPhase:     &noPhase,
 		}
 		require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
@@ -52,8 +51,6 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.Equal(t, apply.ID, retrieved.ApplyID)
 		assert.Equal(t, state.Comment.Progress, retrieved.CommentState)
 		assert.Equal(t, int64(111222333), retrieved.GitHubCommentID)
-		require.NotNil(t, retrieved.PostedVolume)
-		assert.Equal(t, 3, *retrieved.PostedVolume)
 		require.NotNil(t, retrieved.PostedPhase)
 		assert.Empty(t, *retrieved.PostedPhase)
 		assert.NotZero(t, retrieved.ID)
@@ -61,10 +58,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.NotZero(t, retrieved.UpdatedAt)
 
 		// A rotation to a fresh comment upserts the same slot with the new
-		// comment ID, level, and control phase.
+		// comment ID and control phase.
 		comment.GitHubCommentID = 444555666
-		newVolume := 5
-		comment.PostedVolume = &newVolume
 		reverting := state.Apply.Reverting
 		comment.PostedPhase = &reverting
 		require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
@@ -73,13 +68,11 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
 		assert.Equal(t, int64(444555666), retrieved.GitHubCommentID)
-		require.NotNil(t, retrieved.PostedVolume)
-		assert.Equal(t, 5, *retrieved.PostedVolume)
 		require.NotNil(t, retrieved.PostedPhase)
 		assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
 
-		// A summary comment carries no level or control phase; the columns
-		// stay NULL and read back nil.
+		// A summary comment carries no control phase; the column stays NULL
+		// and reads back nil.
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID:         apply.ID,
 			CommentState:    state.Comment.Summary,
@@ -88,7 +81,6 @@ func TestApplyComments(t *testing.T, h Harness) {
 		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
-		assert.Nil(t, retrieved.PostedVolume)
 		assert.Nil(t, retrieved.PostedPhase)
 
 		// A missing slot reads back nil, not an error.
@@ -264,13 +256,13 @@ func TestApplyComments(t *testing.T, h Harness) {
 		lock := CreateLock(t, store, "comment_freeze_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_comment_freeze", 707)
 
-		postedVolume := 5
+		postedPhase := state.Apply.Reverting
 		supersededID := int64(100)
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID:                apply.ID,
 			CommentState:           state.Comment.Progress,
 			GitHubCommentID:        200,
-			PostedVolume:           &postedVolume,
+			PostedPhase:            &postedPhase,
 			PendingFreezeCommentID: &supersededID,
 		}))
 
@@ -287,8 +279,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NotNil(t, retrieved)
 		assert.Nil(t, retrieved.PendingFreezeCommentID)
 		assert.Equal(t, int64(200), retrieved.GitHubCommentID)
-		require.NotNil(t, retrieved.PostedVolume)
-		assert.Equal(t, 5, *retrieved.PostedVolume)
+		require.NotNil(t, retrieved.PostedPhase)
+		assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
 
 		require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
 		require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID+1000, state.Comment.Progress))
@@ -375,6 +367,52 @@ func TestApplyComments(t *testing.T, h Harness) {
 		won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
 		require.NoError(t, err)
 		assert.False(t, won, "a superseded claim sentinel is not reclaimable")
+	})
+
+	// ClaimProgressCommentAuthority verifies the durable progress-comment edit
+	// authority's fresh-row decisions on every dialect: an apply with no
+	// tracked progress comment row has nothing to claim, the first claim on an
+	// unowned row wins and records its owner, the holder renews its own
+	// authority (on MySQL an identical-value renewal reports zero changed rows
+	// and must still be recognized as held), a second owner loses while the
+	// holder's heartbeat is fresh, and claims for different applies are
+	// independent. The stale-heartbeat takeover needs an aged row and lives in
+	// the dialect suites.
+	t.Run("ClaimProgressCommentAuthority", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "comment_authority_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_comment_authority", 713)
+		otherLock := CreateLock(t, store, "comment_authority_other_db", storage.DatabaseTypeMySQL)
+		other := CreateApply(t, store, otherLock, "apply_comment_authority_other", 714)
+
+		held, err := store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+		require.NoError(t, err)
+		assert.False(t, held, "no tracked progress comment row means nothing to claim")
+
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: 555,
+		}))
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: other.ID, CommentState: state.Comment.Progress, GitHubCommentID: 556,
+		}))
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+		require.NoError(t, err)
+		assert.True(t, held, "first claim on an unowned progress comment must win")
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-a/1/comment-observer")
+		require.NoError(t, err)
+		assert.True(t, held, "the holder renews its own authority, including an identical-value renewal")
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, apply.ID, "pod-b/2/comment-observer")
+		require.NoError(t, err)
+		assert.False(t, held, "a second owner must lose while the holder's heartbeat is fresh")
+
+		held, err = store.ApplyComments().ClaimProgressCommentAuthority(ctx, other.ID, "pod-b/2/comment-observer")
+		require.NoError(t, err)
+		assert.True(t, held, "authorities for different applies are independent")
 	})
 
 	// ReclaimStaleSummaryClaim_RequiresStaleSentinel verifies the reclaim
@@ -577,6 +615,12 @@ func TestApplyComments(t *testing.T, h Harness) {
 	t.Run("ReclaimStaleSummaryClaim_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ApplyComments().ReclaimStaleSummaryClaim(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ClaimProgressCommentAuthority_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ApplyComments().ClaimProgressCommentAuthority(t.Context(), 1, "pod-a/1/comment-observer")
 		require.Error(t, err)
 	})
 

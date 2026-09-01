@@ -152,6 +152,31 @@ func TestPostgresParserCanonicalize(t *testing.T) {
 		assert.Contains(t, got, "NOT NULL")
 	})
 
+	t.Run("drop column keeps the explicit COLUMN keyword", func(t *testing.T) {
+		got := p.Canonicalize("alter table public.users drop column legacy")
+		assert.Equal(t, "ALTER TABLE public.users DROP COLUMN legacy", got)
+	})
+
+	t.Run("drop column keyword survives IF EXISTS and CASCADE", func(t *testing.T) {
+		got := p.Canonicalize("alter table users drop column if exists legacy cascade")
+		assert.Equal(t, "ALTER TABLE users DROP COLUMN IF EXISTS legacy CASCADE", got)
+	})
+
+	t.Run("quoted drop column identifiers keep the keyword", func(t *testing.T) {
+		got := p.Canonicalize(`alter table users drop column "Legacy"`)
+		assert.Equal(t, `ALTER TABLE users DROP COLUMN "Legacy"`, got)
+	})
+
+	t.Run("non-column drops are untouched", func(t *testing.T) {
+		got := p.Canonicalize("alter table users drop constraint users_pkey, alter column c drop default, alter column d drop not null")
+		assert.Equal(t, "ALTER TABLE users DROP CONSTRAINT users_pkey, ALTER COLUMN c DROP DEFAULT, ALTER COLUMN d DROP NOT NULL", got)
+	})
+
+	t.Run("mixed column and constraint drops rewrite only the column", func(t *testing.T) {
+		got := p.Canonicalize("alter table users drop column legacy, drop constraint users_pkey")
+		assert.Equal(t, "ALTER TABLE users DROP COLUMN legacy, DROP CONSTRAINT users_pkey", got)
+	})
+
 	t.Run("unparseable input is returned unchanged", func(t *testing.T) {
 		in := "THIS IS NOT SQL"
 		assert.Equal(t, in, p.Canonicalize(in))

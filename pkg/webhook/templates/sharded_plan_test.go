@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -151,6 +152,174 @@ func TestRenderPlanComment_ShardedOnlyPerShardDDLNotMiscounted(t *testing.T) {
 
 	assert.NotContains(t, out, "No schema changes", "per-shard-only DDL is still counted as a change")
 	assert.Contains(t, out, "```sql", "the per-shard DDL is rendered")
+}
+
+// A plan whose DDL is only per-shard still reports its raw statement count in
+// the summary when the same plan also carries a vschema update — the vschema
+// clause must not hide DDL the plan will run.
+func TestRenderPlanComment_PerShardDDLCountedAlongsideVSchema(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	out := RenderPlanComment(PlanCommentData{
+		Database: "orders", Environment: "staging", DatabaseType: "vitess",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "orders_sharded",
+			// No namespace-level Statements — only per-shard.
+			Shards: []KeyspaceShardChange{
+				{Shard: "-80", Statements: []string{stmt}},
+				{Shard: "80-", Statements: []string{stmt}},
+			},
+			VSchemaChanged: true,
+			VSchemaDiff:    `{"tables": {"mutes": {}}}`,
+		}},
+	})
+
+	assert.Contains(t, out, "📋 **Plan**: 1 DDL statement, **1** vschema update")
+}
+
+// A uniform plan across a wide keyspace leads with how much of the keyspace
+// the change covers instead of walling the comment with every range: the
+// heading reads "all N shards" and the names stay reachable behind a
+// collapsed block.
+func TestRenderPlanComment_ShardedUniformManyShardsCollapse(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	shards := make([]KeyspaceShardChange, 0, 32)
+	for i := range 32 {
+		shards = append(shards, KeyspaceShardChange{Shard: fmt.Sprintf("s%02d", i), Statements: []string{stmt}})
+	}
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{stmt},
+			Shards:     shards,
+		}},
+	})
+
+	assert.Contains(t, out, "<summary><b>all 32 shards</b></summary>", "a uniform wide keyspace leads with its coverage on one collapsed line")
+	assert.NotContains(t, out, "**shards `", "the heading does not enumerate ranges inline")
+	assert.Contains(t, out, "`s00`, `s01`", "the collapsed block lists the shard names")
+	assert.Contains(t, out, "`s31`", "the collapsed block lists every shard")
+	assert.Equal(t, 1, strings.Count(out, "```sql"), "the shared DDL is shown once")
+}
+
+// A divergent plan whose larger group is still a subset of the keyspace names
+// its coverage as a fraction ("N of M shards"), so the operator can tell at a
+// glance how much of the keyspace each change set touches.
+func TestRenderPlanComment_ShardedDivergentWideGroupShowsFraction(t *testing.T) {
+	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	drift := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255)"
+	shards := make([]KeyspaceShardChange, 0, 16)
+	for i := range 15 {
+		shards = append(shards, KeyspaceShardChange{Shard: fmt.Sprintf("s%02d", i), Statements: []string{idx}})
+	}
+	shards = append(shards, KeyspaceShardChange{Shard: "s15", Statements: []string{drift}})
+	out := RenderPlanComment(PlanCommentData{
+		Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "cdb_resolute_sharded",
+			Statements: []string{idx},
+			Shards:     shards,
+		}},
+	})
+
+	assert.Contains(t, out, "Shards diverge — what applies where:")
+	assert.Contains(t, out, "<summary><b>15 of 16 shards</b></summary>", "a wide subset names its coverage as a fraction on one collapsed line")
+	assert.Contains(t, out, "**shard `s15`**", "a small group still names its shards inline")
+	assert.Contains(t, out, "ADD COLUMN `reason`", "the divergent statement is shown")
+}
+
+// An unsafe change spanning a wide set of shards states its keyspace coverage
+// on the finding line — the line the reviewer consents against must never
+// leave a subset reading like whole-keyspace coverage — while the full names
+// stay reachable in the DDL section's collapsed shard groups.
+func TestRenderPlanComment_UnsafeChangeWideShardsStatesCoverage(t *testing.T) {
+	stmt := "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN `x`"
+	names := make([]string, 0, 12)
+	shards := make([]KeyspaceShardChange, 0, 12)
+	for i := range 12 {
+		name := fmt.Sprintf("s%02d", i)
+		names = append(names, name)
+		shards = append(shards, KeyspaceShardChange{Shard: name, Statements: []string{stmt}})
+	}
+	cases := []struct {
+		name        string
+		totalShards int
+		want        string
+	}{
+		{name: "a subset states its fraction of the keyspace", totalShards: 32, want: "`mutes` (12 of 32 shards)"},
+		{name: "whole-keyspace coverage says all", totalShards: 12, want: "`mutes` (all 12 shards)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderPlanComment(PlanCommentData{
+				Database: "cdb_resolute", Environment: "staging", DatabaseType: "strata",
+				HasUnsafeChanges: true,
+				UnsafeChanges:    []UnsafeChangeData{{Table: "mutes", Reason: "DROP COLUMN removes data", Shards: names, TotalShards: tc.totalShards}},
+				Changes: []KeyspaceChangeData{{
+					Keyspace: "cdb_resolute_sharded",
+					Shards:   shards,
+				}},
+			})
+
+			assert.Contains(t, out, tc.want, "the finding line states coverage against the keyspace")
+			assert.NotContains(t, out, "(shards `s00`", "the finding line does not enumerate ranges")
+		})
+	}
+}
+
+// The gate-line shard suffix reads inline names when few, and keyspace
+// coverage when wide; with no known total it falls back to a bare count
+// rather than overstating coverage.
+func TestPlanShardList(t *testing.T) {
+	wide := make([]string, 12)
+	for i := range wide {
+		wide[i] = fmt.Sprintf("s%02d", i)
+	}
+	cases := []struct {
+		name        string
+		shards      []string
+		totalShards int
+		want        string
+	}{
+		{name: "one shard reads inline", shards: []string{"-40"}, totalShards: 4, want: "shard `-40`"},
+		{name: "few shards read inline", shards: []string{"-40", "40-80"}, totalShards: 4, want: "shards `-40`, `40-80`"},
+		{name: "a wide subset states its fraction", shards: wide, totalShards: 32, want: "12 of 32 shards"},
+		{name: "a wide whole keyspace says all", shards: wide, totalShards: 12, want: "all 12 shards"},
+		{name: "an unknown total falls back to a bare count", shards: wide, totalShards: 0, want: "12 shards"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, planShardList(tc.shards, tc.totalShards))
+		})
+	}
+}
+
+// The inline/collapsed pivot sits exactly at shardNamesInlineLimit: a group
+// at the limit still names every shard inline, one past it leads with its
+// coverage on a collapsed line.
+func TestWriteShardGroupHeading_InlineLimitBoundary(t *testing.T) {
+	shardNames := func(n int) []string {
+		names := make([]string, n)
+		for i := range names {
+			names[i] = fmt.Sprintf("s%02d", i)
+		}
+		return names
+	}
+
+	t.Run("at the limit the shards read inline", func(t *testing.T) {
+		var sb strings.Builder
+		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit), shardNamesInlineLimit)
+		assert.Contains(t, sb.String(), "**shards `s00`", "the heading names shards inline")
+		assert.Contains(t, sb.String(), fmt.Sprintf("`s%02d`**", shardNamesInlineLimit-1), "every shard is named")
+		assert.NotContains(t, sb.String(), "<details>", "no collapsed block at the limit")
+	})
+
+	t.Run("past the limit the heading collapses to coverage", func(t *testing.T) {
+		var sb strings.Builder
+		writeShardGroupHeading(&sb, shardNames(shardNamesInlineLimit+1), shardNamesInlineLimit+1)
+		assert.Contains(t, sb.String(), fmt.Sprintf("<summary><b>all %d shards</b></summary>", shardNamesInlineLimit+1), "the heading leads with coverage")
+		assert.Contains(t, sb.String(), "`s00`, `s01`", "the collapsed block lists the names")
+	})
 }
 
 // An unsafe change confined to one shard is flagged with that shard in the

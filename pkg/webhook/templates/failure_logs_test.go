@@ -162,6 +162,16 @@ func TestRenderRecentFailureLogsRedactsEndpoints(t *testing.T) {
 	assert.Contains(t, rendered, "[ERR] dial tcp [endpoint redacted]: connection refused")
 }
 
+func TestRenderRecentFailureLogsRedactsTabSeparatedPostgresIdentity(t *testing.T) {
+	at := time.Date(2026, 7, 12, 16, 32, 1, 0, time.UTC)
+	rendered := RenderRecentFailureLogs([]LogEntryData{
+		{CreatedAt: at, Level: "error", Message: "\tALTER TABLE database\t\"orders\" DROP COLUMN legacy (SQLSTATE 42704)"},
+	}, GitHubIssueCommentMaxChars, false)
+
+	assert.Contains(t, rendered, "[ERR] \tALTER TABLE database \"[endpoint redacted]\" DROP COLUMN legacy (SQLSTATE 42704)")
+	assert.NotContains(t, rendered, "orders")
+}
+
 // Engine log lines can carry ANSI escape sequences and bidi override
 // characters that browsers still apply inside a fenced block, letting a log
 // line recolor or visually reorder the text an operator reads during a
@@ -175,4 +185,14 @@ func TestRenderRecentFailureLogsStripsControlCharacters(t *testing.T) {
 	assert.Contains(t, rendered, "[ERR] redalert renamed.txt")
 	assert.NotContains(t, rendered, "\x1b", "ANSI escapes are stripped")
 	assert.NotContains(t, rendered, "\u202e", "bidi overrides are stripped")
+}
+
+// TestSanitizeLogTextControlCharCannotFormFence verifies that stripping a
+// control character between backticks cannot join them into a fence marker:
+// control characters are removed before the fence check, so the joined run
+// is still split.
+func TestSanitizeLogTextControlCharCannotFormFence(t *testing.T) {
+	got := sanitizeLogText("``\x01`")
+	assert.NotContains(t, got, "```")
+	assert.Equal(t, "`` `", got)
 }

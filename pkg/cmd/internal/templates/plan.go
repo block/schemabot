@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -199,8 +200,9 @@ func WriteSQLChanges(changes []DDLChange) {
 	for _, change := range combined {
 		// Table name line: "     ~ tablename:"
 		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
-		// DDL indented below
-		fmt.Print(formatProgressDDL(change.DDL))
+		// DDL indented below. The plan view reconstructs statements under
+		// MySQL grammar (combineAlterStatements), so it renders MySQL-pinned.
+		fmt.Print(formatProgressDDLForDialect(schema.DialectMySQL, change.DDL))
 		fmt.Println()
 	}
 }
@@ -496,7 +498,7 @@ func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 // names the blocked apply, not the unsafeness of the changes.
 func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, schemaDir string) {
 	if len(changes) > 0 {
-		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", len(changes))
+		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", countUnsafeFindings(changes))
 		writeUnsafeChangesList(changes)
 		fmt.Println()
 	}
@@ -519,20 +521,39 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 	fmt.Println()
 }
 
-// writeUnsafeChangesList writes the list of unsafe changes, splitting multi-reason entries.
+// writeUnsafeChangesList writes the unsafe changes one numbered line per
+// finding, the same list shape as the PR plan comment, so a heading's count
+// always equals the number of lines below it and a finding can be referenced
+// by its number.
 func writeUnsafeChangesList(changes []UnsafeChange) {
+	n := 0
 	for _, c := range changes {
 		reasons := ui.LintReasons(c.Reason)
-		switch len(reasons) {
-		case 0:
-			fmt.Printf("  • %s: %s\n", c.Table, c.ChangeType)
-		case 1:
-			fmt.Printf("  • %s: %s\n", c.Table, reasons[0])
-		default:
-			fmt.Printf("  • %s:\n", c.Table)
-			for _, r := range reasons {
-				fmt.Printf("      - %s\n", r)
-			}
+		if len(reasons) == 0 {
+			n++
+			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
+			continue
+		}
+		for _, r := range reasons {
+			n++
+			fmt.Printf("  %d. %s: %s\n", n, c.Table, r)
 		}
 	}
+}
+
+// countUnsafeFindings sums the individual findings across changes so the
+// apply-blocked heading counts exactly what the list below shows; a change
+// with no parseable reason still counts once. The PR comment's
+// countUnsafeFindings in pkg/webhook/templates mirrors this; the two must
+// agree so the CLI and PR comment report the same count for the same plan.
+func countUnsafeFindings(changes []UnsafeChange) int {
+	n := 0
+	for _, c := range changes {
+		if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+			n += len(reasons)
+		} else {
+			n++
+		}
+	}
+	return n
 }

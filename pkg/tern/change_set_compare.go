@@ -208,7 +208,7 @@ func driftKeyForTableChange(parser ddl.StatementParser, namespace, shard string,
 	if tc.ChangeType == ternv1.ChangeType_CHANGE_TYPE_VSCHEMA {
 		return driftChangeKey{}, fmt.Errorf("table %q carries a vschema change; vschema is namespace-level, not table DDL", tc.TableName)
 	}
-	op, err := materializedTableChangeOperation(tc)
+	op, err := materializedTableChangeOperation(parser, tc)
 	if err != nil {
 		return driftChangeKey{}, err
 	}

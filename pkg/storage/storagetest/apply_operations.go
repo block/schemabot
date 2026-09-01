@@ -107,15 +107,14 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, first)
 		assert.Equal(t, shardA, first.ID, "concurrently claimable siblings are handed out in insertion order")
 
-		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
-		require.NoError(t, err)
-		require.NotNil(t, second, "a sibling shard is claimable while the first still runs")
-		assert.Equal(t, shardB, second.ID)
-		assert.NotEqual(t, first.LeaseToken, second.LeaseToken, "each shard claim rotates its own lease")
-
+		// Assert the finalizer's sibling gate while only one shard is occupied.
+		// With both shards running the apply is at the default fan-out cap, and a
+		// nil claim would prove nothing about the gate.
 		blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
 		require.NoError(t, err)
-		assert.Nil(t, blocked, "the group finalizer waits for every work sibling")
+		require.NotNil(t, blocked, "a sibling shard is claimable while the first still runs")
+		assert.Equal(t, shardB, blocked.ID, "the finalizer waits for every work sibling, so the next claim is the second shard")
+		assert.NotEqual(t, first.LeaseToken, blocked.LeaseToken, "each shard claim rotates its own lease")
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, shardA))
 
@@ -130,6 +129,39 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, claimed)
 		assert.Equal(t, finalizerID, claimed.ID)
 		assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+	})
+
+	// FindNextApplyOperation_CapsDriversPerApply verifies that one wide fan-out
+	// cannot take the whole driver pool. A sharded apply with more claimable
+	// shards than the cap allows occupies exactly the cap's worth of drivers, so
+	// other databases' work still gets claimed while it runs.
+	t.Run("FindNextApplyOperation_CapsDriversPerApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cap_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cap", 909)
+
+		shards := storage.DefaultMaxDriversPerApply + 2
+		for i := range shards {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a",
+				OperationKey:  fmt.Sprintf("commerce/shard-%d/users", i),
+				OperationKind: storage.ApplyOperationKindWork,
+			})
+			require.NoError(t, err)
+		}
+
+		claimed := 0
+		for range shards + 1 {
+			got, claimErr := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, claimErr)
+			if got == nil {
+				break
+			}
+			assert.Equal(t, apply.ID, got.ApplyID)
+			claimed++
+		}
+		assert.Equal(t, storage.DefaultMaxDriversPerApply, claimed, "a wide apply occupies exactly the cap's worth of drivers, not every claimable shard")
 	})
 
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
@@ -313,6 +345,69 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, other)
 		assert.Equal(t, "remote-b", other.ExternalID)
+	})
+
+	// ApplyIdentifierForRemoteApply_NamesTheApplyThisPlaneDispatched verifies the
+	// correlation an operator depends on when another change holds their
+	// database: the data plane names the holder by its own identifier, and this
+	// turns it back into the handle the control-plane CLI accepts. Sibling
+	// operations of one deployment share the remote apply, so the shared shape is
+	// still one answer.
+	t.Run("ApplyIdentifierForRemoteApply_NamesTheApplyThisPlaneDispatched", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_holder_lookup_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_holder_lookup", 921)
+		first := createOperation(t, store, apply.ID, "region-a", "shard/-80")
+		sibling := createOperation(t, store, apply.ID, "region-a", "shard/80-")
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, first, "remote-holder"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, sibling, "remote-holder"))
+
+		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-holder")
+		require.NoError(t, err)
+		assert.Equal(t, "apply_operation_holder_lookup", identifier)
+	})
+
+	// ApplyIdentifierForRemoteApply_OffersNoHandleForWorkThisPlaneDidNotStart
+	// verifies the empty answer stays empty. A remote apply this control plane
+	// never dispatched belongs to a direct engine run or another control plane,
+	// and an operation that recorded no remote identifier must not be matched by
+	// a caller that has none either — both would name the wrong schema change.
+	t.Run("ApplyIdentifierForRemoteApply_OffersNoHandleForWorkThisPlaneDidNotStart", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_holder_unknown_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_holder_unknown", 922)
+		createOperation(t, store, apply.ID, "region-a", "shard/-80")
+
+		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-never-dispatched")
+		require.NoError(t, err)
+		assert.Empty(t, identifier)
+
+		identifier, err = store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "")
+		require.NoError(t, err)
+		assert.Empty(t, identifier, "an empty identifier correlates to nothing, not to every operation that recorded none")
+	})
+
+	// ApplyIdentifierForRemoteApply_RefusesToGuessBetweenTwoApplies verifies an
+	// already-broken correlation is reported rather than resolved. One remote
+	// apply belonging to two applies means the deployment invariant was violated
+	// upstream, and naming either would send an operator to the wrong change.
+	t.Run("ApplyIdentifierForRemoteApply_RefusesToGuessBetweenTwoApplies", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		firstLock := CreateLock(t, store, "operation_holder_ambiguous_db", storage.DatabaseTypeMySQL)
+		secondLock := CreateLock(t, store, "operation_holder_ambiguous_other_db", storage.DatabaseTypeMySQL)
+		first := CreateApply(t, store, firstLock, "apply_operation_holder_first", 923)
+		second := CreateApply(t, store, secondLock, "apply_operation_holder_second", 924)
+		firstOp := createOperation(t, store, first.ID, "region-a", "shard/-80")
+		secondOp := createOperation(t, store, second.ID, "region-a", "shard/-80")
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, first.ID, firstOp, "remote-shared"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, second.ID, secondOp, "remote-shared"))
+
+		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-shared")
+		require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
+		assert.Empty(t, identifier)
 	})
 
 	// FindNextApplyOperation_ConcurrentSingleWinner verifies contending drivers

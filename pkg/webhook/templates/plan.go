@@ -3,12 +3,14 @@ package templates
 import (
 	"fmt"
 	"html"
+	"log/slog"
 	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -25,10 +27,17 @@ type LintViolationData struct {
 type UnsafeChangeData struct {
 	Table  string
 	Reason string
+	// ChangeType is the engine's change type (e.g. "drop"), rendered when the
+	// change carries no parseable reason so the finding still explains itself.
+	ChangeType string
 	// Shards names the shards this unsafe change applies to, for a sharded plan
 	// where only some shards carry it. Empty for a non-sharded change (applies to
 	// the whole table).
 	Shards []string
+	// TotalShards is how many shards the plan covers in the keyspace, so a
+	// rendering too wide to name every shard can state coverage ("12 of 32
+	// shards") instead of a bare count. Zero when unknown.
+	TotalShards int
 }
 
 // BlockedChangeData is a planned change the engine deterministically refuses:
@@ -39,6 +48,10 @@ type BlockedChangeData struct {
 	// Shards names the shards this blocked change applies to, for a sharded
 	// plan where only some shards carry it. Empty for a non-sharded change.
 	Shards []string
+	// TotalShards is how many shards the plan covers in the keyspace, so a
+	// rendering too wide to name every shard can state coverage ("12 of 32
+	// shards") instead of a bare count. Zero when unknown.
+	TotalShards int
 }
 
 // DirectChangeData is a planned change the database's direct execution policy
@@ -51,6 +64,10 @@ type DirectChangeData struct {
 	// Shards names the shards this direct change applies to, for a sharded
 	// plan where only some shards carry it. Empty for a non-sharded change.
 	Shards []string
+	// TotalShards is how many shards the plan covers in the keyspace, so a
+	// rendering too wide to name every shard can state coverage ("12 of 32
+	// shards") instead of a bare count. Zero when unknown.
+	TotalShards int
 }
 
 // AttributedChangeData is a table carrying a planned destructive change that
@@ -531,7 +548,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	// Count statement types (Terraform-style: X to create, Y to alter, Z to drop)
-	creates, alters, drops := countStatementTypes(data.Changes)
+	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
 
 	var parts []string
 	if creates > 0 {
@@ -542,6 +559,17 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 	if drops > 0 {
 		parts = append(parts, fmt.Sprintf("**%d** %s to drop", drops, pluralize("table", drops)))
+	}
+	// Last-resort total: when nothing classified as create/alter/drop — a plan
+	// of only index or rename DDL, or per-shard-only DDL that
+	// countStatementTypes does not walk — report the raw statement total so
+	// the plan never reads as "no changes", and report it before the vschema
+	// clause so a vschema update never hides DDL the plan will run. A mixed
+	// plan with a non-zero typed count renders only the typed counts, so its
+	// untyped statements are not reflected here; SummarizeChanges shares this
+	// behavior, keeping the two surfaces in agreement.
+	if len(parts) == 0 && totalStatements > 0 {
+		parts = append(parts, fmt.Sprintf("%d DDL %s", totalStatements, pluralize("statement", totalStatements)))
 	}
 	if keyspacesWithVSchema > 0 && !data.IsMySQL {
 		parts = append(parts, fmt.Sprintf("**%d** vschema %s", keyspacesWithVSchema, pluralize("update", keyspacesWithVSchema)))
@@ -644,7 +672,7 @@ func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 // create/alter/drop and vschema counting is identical to the plan comment's
 // summary (countStatementTypes / countChanges) so the two always agree.
 func SummarizeChanges(data PlanCommentData) string {
-	creates, alters, drops := countStatementTypes(data.Changes)
+	creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
 	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
 
 	var parts []string
@@ -677,12 +705,26 @@ func SummarizeChanges(data PlanCommentData) string {
 	return ddlSummary
 }
 
-// countStatementTypes counts CREATE, ALTER, and DROP statements across all keyspaces.
-func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops int) {
+// countStatementTypes counts CREATE, ALTER, and DROP statements across all
+// keyspaces, classifying each statement with its own dialect's parser so DDL
+// is never judged under another family's grammar. A database type with no
+// registered parser, or a statement its parser rejects, contributes nothing
+// to the typed counts — the callers' raw statement-total fallbacks keep the
+// summary honest — and each case is logged so a miscounted summary is
+// triageable from server logs.
+func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (creates, alters, drops int) {
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		slog.Warn("plan summary cannot classify statements; the summary will report raw statement totals instead of create/alter/drop counts",
+			"database_type", databaseType, "error", err)
+		return 0, 0, 0
+	}
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
-			stmtType, _, err := ddl.ClassifyStatement(stmt)
+			stmtType, _, err := parser.Classify(stmt)
 			if err != nil {
+				slog.Warn("plan summary could not classify a statement; it is left out of the create/alter/drop counts",
+					"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)
 				continue
 			}
 			switch stmtType {
@@ -699,9 +741,18 @@ func countStatementTypes(changes []KeyspaceChangeData) (creates, alters, drops i
 }
 
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
+	// The DDL blocks below format statements under the plan's own dialect so
+	// they are never reformatted under another family's grammar.
+	dialect := schema.DialectForDatabaseType(data.DatabaseType)
+
+	// PostgreSQL groups changes by schema, not keyspace, so it shares MySQL's
+	// "Schema Name" label and heading suppression; Vitess and Strata keep the
+	// keyspace vocabulary.
+	schemaNamespaces := data.IsMySQL || dialect == schema.DialectPostgres
+
 	// Skip the schema/keyspace heading when there's only one and it matches
 	// the database name — it's redundant with the metadata line.
-	singleKeyspace := len(data.Changes) == 1 && data.IsMySQL && data.Changes[0].Keyspace == data.Database
+	singleKeyspace := len(data.Changes) == 1 && schemaNamespaces && data.Changes[0].Keyspace == data.Database
 
 	// The VSchema diff budget is per comment, not per keyspace: split it
 	// across the keyspaces that will render a diff so a multi-keyspace plan
@@ -723,7 +774,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if !singleKeyspace {
 			label := "Keyspace"
-			if data.IsMySQL {
+			if schemaNamespaces {
 				label = "Schema Name"
 			}
 			fmt.Fprintf(sb, "#### %s: `%s`\n", label, ks.Keyspace)
@@ -740,19 +791,20 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
-				writeShardedPlanDDL(sb, ks.Shards)
+				writeShardedPlanDDL(sb, ks.Shards, dialect)
 			} else {
-				writePlanDDLBlock(sb, ks.Statements)
+				writePlanDDLBlock(sb, ks.Statements, dialect)
 			}
 		}
 	}
 }
 
-// writePlanDDLBlock writes a single fenced SQL block of statements.
-func writePlanDDLBlock(sb *strings.Builder, statements []string) {
+// writePlanDDLBlock writes a single fenced SQL block of statements, formatted
+// under the plan's own dialect.
+func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect) {
 	sb.WriteString("```sql\n")
 	for i, stmt := range statements {
-		sb.WriteString(ddl.FormatDDL(stmt))
+		sb.WriteString(ddl.FormatDDLForDialect(dialect, stmt))
 		if i < len(statements)-1 {
 			sb.WriteString("\n\n")
 		} else {
@@ -766,7 +818,7 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string) {
 // that need the same statements share one block, so a uniform keyspace shows the
 // DDL once and a divergent one shows "what applies where" — each distinct change
 // set with the shards it applies to.
-func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
+func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dialect schema.Dialect) {
 	groups := groupKeyspaceShardsByStatements(shards)
 	if len(groups) <= 1 {
 		// A single group of changing shards shows the DDL once, but still names the
@@ -775,21 +827,21 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange) {
 		// satisfied shards means nothing is changing, so render nothing rather than
 		// an empty code block.
 		if len(groups) == 1 && !groups[0].Satisfied {
-			fmt.Fprintf(sb, "**%s**\n\n", planShardList(groups[0].Shards))
-			writePlanDDLBlock(sb, groups[0].Statements)
+			writeShardGroupHeading(sb, groups[0].Shards, len(shards))
+			writePlanDDLBlock(sb, groups[0].Statements, dialect)
 		}
 		return
 	}
 	sb.WriteString("Shards diverge — what applies where:\n\n")
 	for _, g := range groups {
-		fmt.Fprintf(sb, "**%s**\n\n", planShardList(g.Shards))
+		writeShardGroupHeading(sb, g.Shards, len(shards))
 		// A satisfied group already matches the desired schema; say so instead
 		// of rendering an empty code block.
 		if g.Satisfied {
 			sb.WriteString("_Already applied — no change._\n\n")
 			continue
 		}
-		writePlanDDLBlock(sb, g.Statements)
+		writePlanDDLBlock(sb, g.Statements, dialect)
 	}
 }
 
@@ -835,16 +887,56 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 	return status + "\x02" + strings.Join(s.Statements, "\x01")
 }
 
-// planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`".
-func planShardList(shards []string) string {
-	quoted := make([]string, len(shards))
-	for i, s := range shards {
-		quoted[i] = fmt.Sprintf("`%s`", s)
+// shardNamesInlineLimit caps how many shard names render inline in a PR
+// comment. Beyond it, listing every range reads as a wall — a wide keyspace
+// collapses to a count, with the names behind a collapsed block where the
+// rendering has room for one.
+const shardNamesInlineLimit = 8
+
+// planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
+// when few enough to read inline, stating coverage beyond that — "12 of 32
+// shards", or "all 32 shards" when the group spans the keyspace. Used where
+// the list rides inside a line item and has no room for a collapsed name
+// list; the full names stay reachable in the DDL section's collapsed
+// shard-group blocks.
+func planShardList(shards []string, totalShards int) string {
+	if len(shards) > shardNamesInlineLimit {
+		return shardCoveragePhrase(len(shards), totalShards)
 	}
+	quoted := markdownInlineCodeList(shards)
 	if len(quoted) == 1 {
 		return "shard " + quoted[0]
 	}
 	return "shards " + strings.Join(quoted, ", ")
+}
+
+// shardCoveragePhrase states how much of a keyspace a shard group covers:
+// "all 32 shards" when it covers every planned shard, "12 of 32 shards" for
+// a subset, or a bare count when the keyspace total is unknown — a subset
+// must never read like whole-keyspace coverage.
+func shardCoveragePhrase(count, totalShards int) string {
+	if count == totalShards {
+		return fmt.Sprintf("all %d shards", count)
+	}
+	if totalShards > 0 {
+		return fmt.Sprintf("%d of %d shards", count, totalShards)
+	}
+	return fmt.Sprintf("%d shards", count)
+}
+
+// writeShardGroupHeading writes a shard group's bold heading above its DDL
+// block. Few shards read inline by name; a wide group leads with how much of
+// the keyspace it covers — "all 32 shards" when it covers every planned
+// shard, "19 of 32 shards" for a subset — as a single collapsed line that
+// expands into the full name list, so the names stay reachable without
+// walling the comment.
+func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards int) {
+	if len(shards) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "**%s**\n\n", planShardList(shards, totalShards))
+		return
+	}
+	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
+		shardCoveragePhrase(len(shards), totalShards), strings.Join(markdownInlineCodeList(shards), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
@@ -904,19 +996,20 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,
-// naming each table and the engine's reason verbatim. There is no opt-in flag
-// that lets these through — the remedy is whatever each reason names: an
-// unsupported shape needs a rewrite, a missing grant needs provisioning.
+// naming each table and a sanitized, Markdown-safe engine reason. There is no
+// opt-in flag that lets these through — the remedy is whatever each reason
+// names: an unsupported shape needs a rewrite, a missing grant needs
+// provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
 	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
 		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
 		} else {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
@@ -956,10 +1049,10 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
 		if c.Reason != "" {
-			fmt.Fprintf(sb, "- %s: %s\n", table, c.Reason)
+			fmt.Fprintf(sb, "- %s: %s\n", table, escapeInlineMarkdown(SanitizeInlineError(c.Reason)))
 		} else {
 			fmt.Fprintf(sb, "- %s\n", table)
 		}
@@ -970,42 +1063,47 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
+	item := 0
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards))
+			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
-		writeUnsafeChangeItem(sb, table, c.Reason)
+		writeUnsafeChangeItem(sb, &item, table, c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, isMySQL)
 }
 
-// writeUnsafeChangeItem writes one table's unsafe findings as a list item:
-// a single "- table: reason" line for one finding, or a nested list when the
-// engine joined several, so each finding reads on its own line.
-func writeUnsafeChangeItem(sb *strings.Builder, table, reason string) {
+// writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
+// per finding, so the rendered list is exactly as long as the heading's count
+// and operators can reference a finding by its number. n carries the running
+// number across tables; a change with no parseable reason still gets a line,
+// carrying the engine's change type when one is known so the finding explains
+// itself.
+func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType string) {
 	reasons := ui.LintReasons(reason)
-	for i, r := range reasons {
-		reasons[i] = ui.CodeQuoteIdentifiers(r)
-	}
-	switch len(reasons) {
-	case 0:
-		fmt.Fprintf(sb, "- %s\n", table)
-	case 1:
-		fmt.Fprintf(sb, "- %s: %s\n", table, reasons[0])
-	default:
-		fmt.Fprintf(sb, "- %s:\n", table)
-		for _, r := range reasons {
-			fmt.Fprintf(sb, "  - %s\n", r)
+	if len(reasons) == 0 {
+		*n++
+		if changeType != "" {
+			fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, changeType)
+		} else {
+			fmt.Fprintf(sb, "%d. %s\n", *n, table)
 		}
+		return
+	}
+	for _, r := range reasons {
+		*n++
+		fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, ui.CodeQuoteIdentifiers(r))
 	}
 }
 
 // countUnsafeFindings sums the individual lint findings across changes, so
 // headers count what the list below actually shows: a table whose reason
 // carries several joined violations contributes each of them. A change with
-// no parseable reason still counts once.
+// no parseable reason still counts once. The CLI's countUnsafeFindings in
+// pkg/cmd/internal/templates mirrors this; the two must agree so the PR
+// comment and CLI report the same count for the same plan.
 func countUnsafeFindings(changes []UnsafeChangeData) int {
 	n := 0
 	for _, c := range changes {

@@ -16,6 +16,6 @@ type Storage = sqlstore.Storage
 var _ storage.Storage = (*Storage)(nil)
 
 // New creates a new MySQL storage instance.
-func New(db *sql.DB) *Storage {
-	return sqlstore.NewMySQL(db)
+func New(db *sql.DB, opts ...storage.Option) *Storage {
+	return sqlstore.NewMySQL(db, opts...)
 }

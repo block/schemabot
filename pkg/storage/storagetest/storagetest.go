@@ -32,6 +32,10 @@
 package storagetest
 
 import (
+	"reflect"
+	"runtime"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,23 +65,82 @@ type Harness interface {
 	NewUnreachableStorage(t *testing.T) storage.Storage
 }
 
+type parityFamily struct {
+	storageMethod string
+	test          func(*testing.T, Harness)
+}
+
+var parityFamilies = []parityFamily{
+	{storageMethod: "Plans", test: TestPlans},
+	{storageMethod: "PlanComments", test: TestPlanComments},
+	{storageMethod: "Settings", test: TestSettings},
+	{storageMethod: "ApplyLogs", test: TestApplyLogs},
+	{storageMethod: "Locks", test: TestLocks},
+	{storageMethod: "Applies", test: TestApplies},
+	{storageMethod: "ApplyOperations", test: TestApplyOperations},
+	{storageMethod: "ApplyComments", test: TestApplyComments},
+	{storageMethod: "ControlRequests", test: TestControlRequests},
+	{storageMethod: "Tasks", test: TestTasks},
+	{storageMethod: "WebhookEvents", test: TestWebhookEvents},
+	{storageMethod: "Checks", test: TestChecks},
+}
+
 // Run executes every parity family against the harness. Implementations call
 // Run from a single integration test so a storage backend cannot silently
 // opt out of part of the contract — each new family is added here as it
 // lands.
 func Run(t *testing.T, h Harness) {
-	t.Run("Plans", func(t *testing.T) { TestPlans(t, h) })
-	t.Run("PlanComments", func(t *testing.T) { TestPlanComments(t, h) })
-	t.Run("Settings", func(t *testing.T) { TestSettings(t, h) })
-	t.Run("ApplyLogs", func(t *testing.T) { TestApplyLogs(t, h) })
-	t.Run("Locks", func(t *testing.T) { TestLocks(t, h) })
-	t.Run("Applies", func(t *testing.T) { TestApplies(t, h) })
-	t.Run("ApplyOperations", func(t *testing.T) { TestApplyOperations(t, h) })
-	t.Run("ApplyComments", func(t *testing.T) { TestApplyComments(t, h) })
-	t.Run("ControlRequests", func(t *testing.T) { TestControlRequests(t, h) })
-	t.Run("Tasks", func(t *testing.T) { TestTasks(t, h) })
-	t.Run("WebhookEvents", func(t *testing.T) { TestWebhookEvents(t, h) })
-	t.Run("Checks", func(t *testing.T) { TestChecks(t, h) })
+	for _, family := range parityFamilies {
+		t.Run(family.storageMethod, func(t *testing.T) { family.test(t, h) })
+	}
+}
+
+func assertParityFamilyCoverage(t *testing.T) {
+	t.Helper()
+
+	storageType := reflect.TypeFor[storage.Storage]()
+	allowedMethods := map[string]bool{
+		"Close": false,
+		"Ping":  false,
+	}
+	storageMethods := make(map[string]bool, storageType.NumMethod())
+	for method := range storageType.Methods() {
+		if _, allowed := allowedMethods[method.Name]; allowed {
+			allowedMethods[method.Name] = true
+			continue
+		}
+		storageMethods[method.Name] = false
+	}
+
+	for _, family := range parityFamilies {
+		covered, exists := storageMethods[family.storageMethod]
+		require.True(t, exists, "parity family %q does not match a storage.Storage method", family.storageMethod)
+		require.False(t, covered, "storage.Storage method %q has more than one parity family", family.storageMethod)
+		storageMethods[family.storageMethod] = true
+
+		testFunc := runtime.FuncForPC(reflect.ValueOf(family.test).Pointer())
+		require.NotNil(t, testFunc, "resolve parity family test for storage.Storage method %q", family.storageMethod)
+		require.True(t, strings.HasSuffix(testFunc.Name(), ".Test"+family.storageMethod),
+			"parity family for storage.Storage method %q uses %q; want Test%s", family.storageMethod, testFunc.Name(), family.storageMethod)
+	}
+
+	var uncovered []string
+	for method, covered := range storageMethods {
+		if !covered {
+			uncovered = append(uncovered, method)
+		}
+	}
+	sort.Strings(uncovered)
+	require.Empty(t, uncovered, "storage.Storage methods missing parity families")
+
+	var staleAllowlist []string
+	for method, exists := range allowedMethods {
+		if !exists {
+			staleAllowlist = append(staleAllowlist, method)
+		}
+	}
+	sort.Strings(staleAllowlist)
+	require.Empty(t, staleAllowlist, "allowlisted methods missing from storage.Storage")
 }
 
 // Fixture helpers. These build the canonical Lock/Apply rows used by the

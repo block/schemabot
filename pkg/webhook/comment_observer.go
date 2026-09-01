@@ -33,6 +33,7 @@ type CommentObserver struct {
 	supportChannel api.SupportChannelConfig
 	tenant         string
 	logger         interface {
+		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
@@ -55,6 +56,15 @@ type CommentObserver struct {
 	// apply-lease checks and lease-scoped storage writes accordingly.
 	aggregateTerminalCASWinner bool
 
+	// authorityOwner identifies this process to the durable progress-comment
+	// authority claim (see ClaimProgressCommentAuthority). It is
+	// process-scoped, not observer-instance-scoped, so a replacement observer
+	// in the same process (e.g. after a re-registration) takes the authority
+	// over immediately instead of waiting out its predecessor's staleness
+	// window, while observers on other pods still hand over only through the
+	// claim.
+	authorityOwner string
+
 	mu                sync.Mutex
 	lastProgressPost  time.Time
 	lastState         string
@@ -62,7 +72,6 @@ type CommentObserver struct {
 	stagnantTicks     int
 	hasCutoverComment bool
 	resumeRotated     bool
-	volumeRotatedTo   int
 
 	// resumeSupersedePending marks that this observer's resume rotation posted
 	// its fresh comment but failed to consume the summary marker. The marker is
@@ -84,33 +93,31 @@ type CommentObserver struct {
 	// re-read.
 	cutoverRotated bool
 
-	// trackedPostedVolume caches the tracked progress comment's recorded level
-	// (valid only when trackedPostedVolumeKnown) so the per-tick volume-change
-	// check answers from memory instead of a storage read under the mutex. The
-	// cache is safe for the duration of a drive: while this observer's apply
-	// holds its lease, the observer is the only writer of the tracked progress
-	// row. A missing row or nil level is never cached — the handler may still
-	// be posting the initial progress comment concurrently with early ticks.
-	trackedPostedVolume      int
-	trackedPostedVolumeKnown bool
-
 	// pendingRotation remembers a fresh progress comment that is live on the PR
 	// but whose tracking write failed, so later ticks adopt it (retry the write
 	// with the known comment ID) instead of posting a duplicate.
 	pendingRotation *pendingProgressRotation
+
+	// authorityMu guards the per-callback memo of the durable progress-comment
+	// authority decision below. It is separate from mu because OnProgress holds
+	// mu for its entire tick while OnTerminal runs without it, and the gate is
+	// reached from inside both.
+	authorityMu sync.Mutex
+	// authorityDecided marks that the authority decision was already made
+	// during the current observer callback, so the gate's later invocations on
+	// the same callback reuse authorityHeld instead of re-reading storage and
+	// re-writing the claim row. Each callback starts with a fresh decision.
+	authorityDecided bool
+	authorityHeld    bool
 }
 
 // pendingProgressRotation identifies a rotation progress comment that was
 // posted but not tracked: the comment exists on the PR while the stored row
 // still points at its predecessor. Adoption retries only the tracking write —
-// never another post — so duplicates stay bounded, and a level change while
-// the comment was untracked (an operator reverting the volume) is re-detected
-// against the adopted level on the same tick.
+// never another post — so duplicates stay bounded.
 type pendingProgressRotation struct {
 	// commentID is the posted comment's GitHub ID.
 	commentID int64
-	// volume is the level the comment was posted at.
-	volume int
 	// phase is the control phase the comment was posted in (empty when none),
 	// recorded on the tracked row at adoption so the durable rotation signal
 	// survives the retried write.
@@ -146,6 +153,7 @@ type CommentObserverConfig struct {
 	Tenant string
 
 	Logger interface {
+		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
@@ -218,6 +226,7 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
+		authorityOwner: storage.LeaseOwnerProcess() + "/comment-observer",
 	}
 }
 
@@ -240,6 +249,7 @@ func NewAggregateTerminalCommentObserver(cfg CommentObserverConfig) *CommentObse
 func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "progress") {
 		return
 	}
@@ -333,19 +343,6 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			return
 		}
 
-		// An applied volume change likewise gets a fresh progress comment: a new
-		// comment at the bottom of the PR timeline is where operators look for the
-		// effect of a command they just issued, rather than re-reading an older
-		// comment for an edited level. A level change while the comment was
-		// untracked (an operator reverting the volume) is re-detected against the
-		// just-adopted level on the same tick.
-		if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForVolumeChange(apply, tasks) {
-			o.lastState = currentState
-			o.lastProgressPost = now
-			o.stagnantTicks = 0
-			return
-		}
-
 		// A control operation taking effect (revert, skip-revert) likewise gets a
 		// fresh progress comment: the user just issued the command, so its effect
 		// belongs at the bottom of the PR timeline, with the old comment frozen at
@@ -398,6 +395,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 // Edits the active comment to final state, posts summary comment,
 // and updates check runs.
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return
 	}
@@ -725,9 +723,11 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 		lease = apply.Lease()
 	}
 	if !lease.Valid() {
-		o.logError(apply, "observer: apply lease unavailable; skipping GitHub side effect",
-			"operation", operation)
-		return false
+		// No parent apply lease exists anywhere — not on this observer and not
+		// on the apply row. For an apply whose work runs under operation
+		// leases, that is the normal shape between dispatch waves, so the
+		// durable progress-comment authority decides instead of the lease.
+		return o.progressCommentAuthorityOwnsObserver(apply, operation)
 	}
 
 	// GitHub comments and check updates are side effects outside MySQL's
@@ -737,6 +737,14 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {
+		if apply != nil && !apply.Lease().Valid() {
+			// This observer's construction-time lease no longer matches, and
+			// the apply row records no parent lease at all — the lease was
+			// released back (an operation-scoped drive holds the parent only
+			// transiently per dispatch wave), not claimed by a newer owner.
+			// The durable progress-comment authority decides instead.
+			return o.progressCommentAuthorityOwnsObserver(apply, operation)
+		}
 		o.logError(apply, "observer: apply lease no longer owns apply; skipping GitHub side effect",
 			"operation", operation,
 			"lease_owner", lease.Owner,
@@ -746,6 +754,163 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	return true
 }
 
+// progressCommentAuthorityOwnsObserver reports whether this observer may
+// perform a GitHub side effect for an apply whose parent apply lease is
+// legitimately unheld. An apply whose operations are dispatched under
+// operation leases holds the parent lease only transiently per dispatch wave,
+// so the progress comment would otherwise go silent for the whole rollout and
+// operators would read a live apply as dead. The authority granted here is
+// durable and cross-pod safe: a compare-and-swap ownership recorded on the
+// tracked progress comment row (see ClaimProgressCommentAuthority), so among
+// authority-path observers at most one at a time edits the comment and a
+// crashed holder hands over only after its heartbeat goes stale. A
+// lease-admitted observer is governed by the lease checks instead and never
+// touches the recorded authority. It is granted only while operation-scoped
+// work is in flight — an apply that holds (or should hold) a parent lease
+// stays governed by the lease checks.
+//
+// The decision is made once per observer callback against freshly read
+// storage rows — including a re-read of the parent lease columns, so a
+// dispatch wave that re-claimed the parent since the poller's snapshot denies
+// the authority — then reused by the callback's remaining side-effect checks.
+// Claiming once per callback also renews the holder's heartbeat well inside
+// its staleness window.
+func (o *CommentObserver) progressCommentAuthorityOwnsObserver(apply *storage.Apply, operation string) bool {
+	if apply == nil {
+		o.logError(apply, "observer: apply lease unavailable and no apply loaded to resolve progress-comment authority; skipping GitHub side effect",
+			"operation", operation)
+		return false
+	}
+	o.authorityMu.Lock()
+	if o.authorityDecided {
+		held := o.authorityHeld
+		o.authorityMu.Unlock()
+		if !held {
+			o.logger.Debug("observer: progress-comment authority already denied this callback; skipping GitHub side effect",
+				append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner)...)
+		}
+		return held
+	}
+	o.authorityMu.Unlock()
+
+	held := o.decideProgressCommentAuthority(apply, operation)
+	o.authorityMu.Lock()
+	o.authorityDecided, o.authorityHeld = true, held
+	o.authorityMu.Unlock()
+	return held
+}
+
+// resetProgressCommentAuthorityDecision discards the previous callback's
+// authority decision so the next gate invocation decides afresh.
+func (o *CommentObserver) resetProgressCommentAuthorityDecision() {
+	o.authorityMu.Lock()
+	o.authorityDecided = false
+	o.authorityHeld = false
+	o.authorityMu.Unlock()
+}
+
+// decideProgressCommentAuthority performs the storage reads and the claim
+// behind progressCommentAuthorityOwnsObserver, in fail-closed order: no
+// operation-scoped work in flight denies, a fresh parent-lease re-read
+// showing a holder or a terminal apply denies, and only then is the durable
+// claim attempted.
+func (o *CommentObserver) decideProgressCommentAuthority(apply *storage.Apply, operation string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	inFlight, err := o.operationScopedWorkInFlight(ctx, apply)
+	if err != nil {
+		o.logger.Error("observer: failed to determine whether operation-scoped work is in flight; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "error", err)...)
+		return false
+	}
+	if !inFlight {
+		o.logger.Error("observer: apply lease unavailable and no operation-scoped work in flight; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation)...)
+		return false
+	}
+
+	// The apply passed in is the poller's snapshot, up to a tick old. Re-read
+	// the row before claiming: a dispatch wave may have re-claimed the parent
+	// lease since the snapshot — its holder is governed by the lease checks
+	// and owns the comment while the lease lasts — or the projection may have
+	// settled the apply terminal, handing the comment to the terminal publish.
+	fresh, err := o.stor.Applies().Get(ctx, o.applyID)
+	if err != nil {
+		o.logger.Error("observer: failed to re-read the apply for the progress-comment authority; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "error", err)...)
+		return false
+	}
+	if fresh == nil {
+		o.logger.Error("observer: apply row no longer exists for the progress-comment authority; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation)...)
+		return false
+	}
+	if fresh.Lease().Valid() {
+		o.logger.Debug("observer: parent apply lease re-claimed since the poller snapshot; the lease holder owns the comment, skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "lease_owner", fresh.LeaseOwner)...)
+		return false
+	}
+	if state.IsTerminalApplyState(fresh.State) {
+		o.logger.Debug("observer: apply settled terminal since the poller snapshot; the terminal publish owns the comment, skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "fresh_state", fresh.State)...)
+		return false
+	}
+
+	held, err := o.stor.ApplyComments().ClaimProgressCommentAuthority(ctx, o.applyID, o.authorityOwner)
+	if err != nil {
+		o.logger.Error("observer: failed to claim progress-comment authority; skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner, "error", err)...)
+		return false
+	}
+	if !held {
+		// The claim was not won: either another observer holds a fresh
+		// authority (its edits carry the PR), or no tracked progress comment
+		// row exists yet to claim (nothing to edit either way). Expected on
+		// every peer pod polling the same apply, hence Debug.
+		o.logger.Debug("observer: progress-comment authority not won (held by another observer, or no tracked comment row yet); skipping GitHub side effect",
+			append(apply.LogAttrs(), "operation", operation, "authority_owner", o.authorityOwner)...)
+		return false
+	}
+	return true
+}
+
+// operationScopedWorkInFlight reports whether the apply's schema-change work
+// is still in flight under operation-scoped dispatch — the one shape whose
+// parent apply lease is legitimately unheld mid-apply. True when the apply is
+// non-terminal and either its generation manifest still lists keys with no
+// attached operation (the dispatcher owes more dispatch waves) or the apply
+// has multiple attached operations with a keyed row not yet terminal. A
+// single attached operation is deliberately not counted, matching the
+// operator's drive-mode split: that shape drives under the parent apply
+// lease, so an unheld lease there means no driver and the lease checks stay
+// authoritative. (The one single-operation drive that runs under the
+// operation lease — a task-less operation — fails closed here too; it has no
+// task progress to report and its terminal comment is published by the
+// aggregate projection winner.) Whole-deployment operations (empty key) are
+// likewise not counted, whatever their number.
+func (o *CommentObserver) operationScopedWorkInFlight(ctx context.Context, apply *storage.Apply) (bool, error) {
+	if state.IsTerminalApplyState(apply.State) {
+		return false, nil
+	}
+	ops, err := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	if err != nil {
+		return false, fmt.Errorf("load apply operations for progress-comment authority of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(apply.MissingExpectedOperationKeys(ops)) > 0 {
+		return true, nil
+	}
+	if len(ops) <= 1 {
+		return false, nil
+	}
+	for _, op := range ops {
+		if op.OperationKey != "" && !state.IsApplyOperationTerminal(op.State) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *storage.Apply) context.Context {
 	// The aggregate terminal observer holds the operation lease, not the parent
 	// apply lease. Attaching an apply lease it does not hold would make every
@@ -753,6 +918,13 @@ func (o *CommentObserver) contextWithApplyLease(ctx context.Context, apply *stor
 	// these writes take storage's no-apply-lease path; the won projection CAS,
 	// not an apply lease, authorizes this one terminal publish.
 	if o.aggregateTerminalCASWinner {
+		return ctx
+	}
+	// An apply row that records no parent lease has no lease to attach: the
+	// side-effect gate admitted this write under the progress-comment
+	// authority, so it takes storage's no-apply-lease path — the claim, not an
+	// apply lease, authorizes it, mirroring the aggregate CAS winner above.
+	if apply != nil && !apply.Lease().Valid() {
 		return ctx
 	}
 	// Storage writes that record GitHub side effects must use the same lease as
@@ -819,9 +991,9 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 // new progress comment — postAndTrackComment overwrites the tracked progress
 // comment id, so later progress edits land on the new comment while the prior
 // one is folded into a details block pointing at its successor (with the freeze
-// it owes recorded in the same tracking write, mirroring the volume rotation) —
-// and consumes the summary marker so it rotates exactly once and the eventual
-// terminal summary is posted fresh. Returns true when it rotated.
+// it owes recorded in the same tracking write) — and consumes the summary
+// marker so it rotates exactly once and the eventual terminal summary is
+// posted fresh. Returns true when it rotated.
 func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, tasks []*storage.Task) bool {
 	if o.resumeRotated {
 		// This observer already rotated for the current resume. Guard against
@@ -872,7 +1044,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 			// frozen rendering — the freeze edit failed or the pod died before it
 			// landed. Retry it now; on success the marker is cleared.
 			o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-				supersededByPriorRotation, 0)
+				supersededByPriorRotation)
 		}
 		pendingFreeze = &tracked.GitHubCommentID
 	}
@@ -889,7 +1061,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	o.resumeRotated = true
 
 	if trackedNew && tracked != nil {
-		o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByResume, 0)
+		o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByResume)
 	}
 	// When the fresh comment posted but its tracking write failed
 	// (postAndTrackComment logged it), the prior comment is still the tracked
@@ -1065,7 +1237,7 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		// this phase and no new rotation follows); on success the marker is
 		// cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
+			supersededByPriorRotation)
 	}
 	if trackedPhase(tracked) == phase {
 		// The tracked comment was posted while the apply was already in this
@@ -1090,7 +1262,6 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		// rotated once the row tracks it.
 		o.pendingRotation = &pendingProgressRotation{
 			commentID:           newCommentID,
-			volume:              apply.GetOptions().Volume,
 			phase:               phase,
 			reason:              supersededReasonForPhase(phase),
 			supersededCommentID: tracked.GitHubCommentID,
@@ -1101,7 +1272,7 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 	}
 	o.markPhaseRotated(phase)
 
-	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededReasonForPhase(phase), 0)
+	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededReasonForPhase(phase))
 
 	o.logger.Info("observer: posted fresh progress comment for control phase",
 		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State, "phase", phase)
@@ -1177,7 +1348,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		// Retry any fold still owed, then resume normal editing.
 		if tracked != nil && tracked.PendingFreezeCommentID != nil {
 			o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-				supersededByPriorRotation, 0)
+				supersededByPriorRotation)
 		}
 		if cutover.SupersededAt == nil {
 			o.supersedeCutoverComment(ctx, apply)
@@ -1192,7 +1363,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		// frozen rendering — the freeze edit failed or the pod died before it
 		// landed. Retry it now; on success the marker is cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
+			supersededByPriorRotation)
 	}
 
 	body := o.formatStatusComment(apply, tasks)
@@ -1216,7 +1387,6 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		// write, so a fold now could never be retried.
 		o.pendingRotation = &pendingProgressRotation{
 			commentID:           newCommentID,
-			volume:              apply.GetOptions().Volume,
 			phase:               controlPhase(apply.State),
 			reason:              supersededByCutover,
 			supersededCommentID: cutover.GitHubCommentID,
@@ -1228,7 +1398,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 	o.cutoverRotated = true
 	o.hasCutoverComment = false
 
-	o.freezeSupersededProgressComment(apply, cutover.GitHubCommentID, newCommentID, supersededByCutover, 0)
+	o.freezeSupersededProgressComment(apply, cutover.GitHubCommentID, newCommentID, supersededByCutover)
 	o.supersedeCutoverComment(ctx, apply)
 
 	o.logInfo(apply, "observer: posted fresh progress comment after deferred cutover", "state", apply.State)
@@ -1250,7 +1420,12 @@ func (o *CommentObserver) supersedeCutoverComment(ctx context.Context, apply *st
 type supersededProgressReason int
 
 const (
-	supersededByVolumeChange supersededProgressReason = iota
+	// supersededByPriorRotation is the retry reason: the pending-freeze marker
+	// records which comment is owed a fold but not which rotation superseded
+	// it, so a retry renders the generic fold instead of guessing a headline.
+	// It is the zero value, so an unset reason renders that generic fold
+	// rather than an unearned headline.
+	supersededByPriorRotation supersededProgressReason = iota
 	supersededByResume
 	supersededByRevert
 	supersededBySkipRevert
@@ -1258,172 +1433,29 @@ const (
 	// cutover completed into a still-active apply, pointing at the fresh
 	// progress comment that tracks the post-cutover phase.
 	supersededByCutover
-	// supersededByPriorRotation is the retry reason: the pending-freeze marker
-	// records which comment is owed a fold but not which rotation superseded
-	// it, so a retry renders the generic fold instead of guessing a headline.
-	supersededByPriorRotation
 )
 
 // frozenSupersededProgressBody renders the folded body written over a
 // superseded progress comment, headlined by the reason it was rotated away
-// from. volume is read only for the volume-change rendering.
-func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgressReason, volume int, newCommentID int64, previousBody string) string {
-	switch reason {
-	case supersededByResume:
-		return templates.RenderResumeSupersededProgressComment(templates.SupersededProgressData{
-			Repo:         o.repo,
-			PR:           o.pr,
-			NewCommentID: newCommentID,
-			PreviousBody: previousBody,
-		})
-	case supersededByRevert:
-		return templates.RenderRevertSupersededProgressComment(templates.SupersededProgressData{
-			Repo:         o.repo,
-			PR:           o.pr,
-			NewCommentID: newCommentID,
-			PreviousBody: previousBody,
-		})
-	case supersededBySkipRevert:
-		return templates.RenderSkipRevertSupersededProgressComment(templates.SupersededProgressData{
-			Repo:         o.repo,
-			PR:           o.pr,
-			NewCommentID: newCommentID,
-			PreviousBody: previousBody,
-		})
-	case supersededByCutover:
-		return templates.RenderCutoverSupersededComment(templates.SupersededProgressData{
-			Repo:         o.repo,
-			PR:           o.pr,
-			NewCommentID: newCommentID,
-			PreviousBody: previousBody,
-		})
-	case supersededByPriorRotation:
-		return templates.RenderSupersededProgressComment(templates.SupersededProgressData{
-			Repo:         o.repo,
-			PR:           o.pr,
-			NewCommentID: newCommentID,
-			PreviousBody: previousBody,
-		})
-	}
-	return templates.RenderVolumeSupersededProgressComment(templates.VolumeSupersededProgressData{
-		Volume:       volume,
+// from.
+func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgressReason, newCommentID int64, previousBody string) string {
+	data := templates.SupersededProgressData{
 		Repo:         o.repo,
 		PR:           o.pr,
 		NewCommentID: newCommentID,
 		PreviousBody: previousBody,
-	})
-}
-
-// rotateProgressCommentForVolumeChange posts a fresh progress comment when the
-// apply's volume level no longer matches the level the tracked progress comment
-// was posted at — the durable sign that a requested volume change has been
-// applied. The fresh comment is posted and tracked (with the freeze it owes its
-// predecessor recorded in the same write), so a later tick sees matching levels
-// and does not rotate again; the prior comment is frozen with a note pointing
-// at its successor. Returns true when it rotated.
-func (o *CommentObserver) rotateProgressCommentForVolumeChange(apply *storage.Apply, tasks []*storage.Task) bool {
-	currentVolume := apply.GetOptions().Volume
-	if currentVolume == 0 {
-		// The apply has no explicit volume level to compare — nothing changed.
-		return false
 	}
-	if o.volumeRotatedTo == currentVolume {
-		// This observer already rotated for this level — answered from memory
-		// without a storage read.
-		return false
+	switch reason {
+	case supersededByResume:
+		return templates.RenderResumeSupersededProgressComment(data)
+	case supersededByRevert:
+		return templates.RenderRevertSupersededProgressComment(data)
+	case supersededBySkipRevert:
+		return templates.RenderSkipRevertSupersededProgressComment(data)
+	case supersededByCutover:
+		return templates.RenderCutoverSupersededComment(data)
 	}
-	if o.trackedPostedVolumeKnown && o.trackedPostedVolume == currentVolume {
-		// The tracked comment already records the current level — the common
-		// path on every progress tick, answered from the cache without a
-		// storage read.
-		return false
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
-	if err != nil {
-		o.logError(apply, "observer: failed to load tracked progress comment before volume rotation", "error", err)
-		return false
-	}
-	if tracked == nil {
-		// No tracked progress comment yet — the handler may still be posting
-		// the initial one. Nothing to rotate away from; the next posted comment
-		// records the current level.
-		o.logInfo(apply, "observer: no tracked progress comment yet; skipping volume-rotation check",
-			"volume", currentVolume)
-		return false
-	}
-	if tracked.PostedVolume == nil {
-		// The row predates volume tracking, so there is no recorded level to
-		// compare. Backfill the current level so the next applied volume change
-		// rotates (and so this check answers from the cache instead of
-		// re-reading storage every tick for the apply's remaining lifetime).
-		// Upsert overwrites every tracked field, so the row's other recorded
-		// state is carried through unchanged.
-		backfill := &storage.ApplyComment{
-			ApplyID:                o.applyID,
-			CommentState:           state.Comment.Progress,
-			GitHubCommentID:        tracked.GitHubCommentID,
-			PostedVolume:           &currentVolume,
-			PostedPhase:            tracked.PostedPhase,
-			PendingFreezeCommentID: tracked.PendingFreezeCommentID,
-		}
-		if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), backfill); err != nil {
-			o.logError(apply, "observer: failed to backfill tracked progress comment volume; volume rotation stays disabled for this apply until the backfill lands",
-				"volume", currentVolume, "error", err)
-			return false
-		}
-		o.trackedPostedVolume = currentVolume
-		o.trackedPostedVolumeKnown = true
-		o.logInfo(apply, "observer: backfilled tracked progress comment volume for a row predating volume tracking; the next applied volume change rotates",
-			"volume", currentVolume)
-		return false
-	}
-	if tracked.PendingFreezeCommentID != nil {
-		// A superseded comment from an earlier rotation is still owed its
-		// frozen rendering — the freeze edit failed or the pod died before it
-		// landed. Retry it now; on success the marker is cleared.
-		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
-			supersededByPriorRotation, 0)
-	}
-	o.trackedPostedVolume = *tracked.PostedVolume
-	o.trackedPostedVolumeKnown = true
-	if *tracked.PostedVolume == currentVolume {
-		// The level is unchanged since the comment was posted — the common
-		// path on the first tick of a drive, before the cache is primed.
-		return false
-	}
-
-	body := o.formatStatusComment(apply, tasks)
-	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID)
-	if !posted {
-		// postAndTrackComment logged the failure; the level mismatch persists,
-		// so the next tick retries the rotation.
-		return false
-	}
-	if !trackedNew {
-		// The fresh comment is on the PR, but the tracked row still points at
-		// the prior comment. Remember it so later ticks retry only the tracking
-		// write — adoption — instead of posting a duplicate; until it lands,
-		// progress edits continue on the prior comment.
-		o.pendingRotation = &pendingProgressRotation{
-			commentID:           newCommentID,
-			volume:              currentVolume,
-			phase:               controlPhase(apply.State),
-			reason:              supersededByVolumeChange,
-			supersededCommentID: tracked.GitHubCommentID,
-		}
-		o.logError(apply, "observer: fresh progress comment posted for volume change but not tracked; progress edits continue on the prior comment until the next tick adopts it",
-			"volume", currentVolume, "github_comment_id", newCommentID)
-		return true
-	}
-	o.volumeRotatedTo = currentVolume
-	o.logInfo(apply, "observer: posted fresh progress comment for volume change",
-		"previous_volume", *tracked.PostedVolume, "volume", currentVolume)
-	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededByVolumeChange, currentVolume)
-	return true
+	return templates.RenderSupersededProgressComment(data)
 }
 
 // adoptPendingRotationComment retries the tracking write for a fresh progress
@@ -1440,25 +1472,21 @@ func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool
 		ApplyID:                o.applyID,
 		CommentState:           state.Comment.Progress,
 		GitHubCommentID:        p.commentID,
-		PostedVolume:           &p.volume,
 		PostedPhase:            &p.phase,
 		PendingFreezeCommentID: &p.supersededCommentID,
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to adopt posted-but-untracked progress comment; progress edits continue on the prior comment until a retry lands",
-			"github_comment_id", p.commentID, "volume", p.volume, "phase", p.phase, "error", err)
+			"github_comment_id", p.commentID, "phase", p.phase, "error", err)
 		return false
 	}
 	o.pendingRotation = nil
-	o.trackedPostedVolume = p.volume
-	o.trackedPostedVolumeKnown = true
-	o.volumeRotatedTo = p.volume
 	if p.phase != phaseNone {
 		o.markPhaseRotated(p.phase)
 	}
 	o.logInfo(apply, "observer: adopted posted-but-untracked progress comment; progress edits now land on it",
-		"github_comment_id", p.commentID, "volume", p.volume, "phase", p.phase)
-	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, p.reason, p.volume)
+		"github_comment_id", p.commentID, "phase", p.phase)
+	o.freezeSupersededProgressComment(apply, p.supersededCommentID, p.commentID, p.reason)
 	return true
 }
 
@@ -1467,12 +1495,11 @@ func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool
 // the comment that replaced it. Collapsing rather than deleting keeps the
 // pre-change progress on the PR as a record while decluttering the timeline;
 // without the fold a reader has no way to tell a frozen comment from a live
-// one. reason selects the fold's headline (volume is read only for the
-// volume-change rendering). A failure leaves the tracked row's pending-freeze
-// marker in place (it is written alongside the successor's tracking), so a
-// later tick or a later drive's observer retries; the marker is cleared only
-// once the frozen rendering is on GitHub.
-func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, oldCommentID, newCommentID int64, reason supersededProgressReason, volume int) {
+// one. reason selects the fold's headline. A failure leaves the tracked row's
+// pending-freeze marker in place (it is written alongside the successor's
+// tracking), so a later tick or a later drive's observer retries; the marker is
+// cleared only once the frozen rendering is on GitHub.
+func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, oldCommentID, newCommentID int64, reason supersededProgressReason) {
 	if !o.leaseStillOwnsObserver(apply, "create GitHub client before freezing superseded comment") {
 		return
 	}
@@ -1497,7 +1524,7 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 		if !o.leaseStillOwnsObserver(apply, "freeze superseded progress comment") {
 			return
 		}
-		frozen := o.frozenSupersededProgressBody(reason, volume, newCommentID, oldBody)
+		frozen := o.frozenSupersededProgressBody(reason, newCommentID, oldBody)
 		if err := client.EditIssueComment(ctx, o.repo, oldCommentID, frozen); err != nil {
 			o.logError(apply, "observer: failed to freeze superseded progress comment; the pending-freeze marker stays set and the next observer pass that reads the tracked row retries",
 				"error", err, "github_comment_id", oldCommentID)
@@ -1511,12 +1538,11 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 }
 
 // postAndTrackComment creates a comment and stores its ID, recording the
-// apply's volume level and control phase on progress comments so a later
-// applied volume change or control operation is detectable. pendingFreezeCommentID, when
-// non-nil, records in the same
-// tracking write that the named predecessor comment is still owed its frozen
-// rendering; pass nil for posts that supersede nothing. Returns the GitHub
-// comment ID, whether the post landed on the PR, and whether the tracking row
+// apply's control phase on progress comments so a later control operation is
+// detectable. pendingFreezeCommentID, when non-nil, records in the same tracking
+// write that the named predecessor comment is still owed its frozen rendering;
+// pass nil for posts that supersede nothing. Returns the GitHub comment ID,
+// whether the post landed on the PR, and whether the tracking row
 // was updated to point at it — a posted but untracked comment exists on the PR
 // while later edits still target the prior comment.
 func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState string, body string, pendingFreezeCommentID *int64) (commentID int64, posted, tracked bool) {
@@ -1554,23 +1580,12 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		PendingFreezeCommentID: pendingFreezeCommentID,
 	}
 	if commentState == state.Comment.Progress {
-		level := apply.GetOptions().Volume
-		comment.PostedVolume = &level
 		phase := controlPhase(apply.State)
 		comment.PostedPhase = &phase
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to store comment ID", "error", err, "comment_state", commentState)
-		if commentState == state.Comment.Progress {
-			// The tracked row still describes the prior comment; drop the
-			// cached level so the next volume check re-reads storage.
-			o.trackedPostedVolumeKnown = false
-		}
 		return commentID, true, false
-	}
-	if commentState == state.Comment.Progress {
-		o.trackedPostedVolume = *comment.PostedVolume
-		o.trackedPostedVolumeKnown = true
 	}
 	return commentID, true, true
 }
