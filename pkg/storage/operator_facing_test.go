@@ -29,8 +29,8 @@ func TestApplyOperatorFacingMessage(t *testing.T) {
 		{
 			name:    "rewrites the remote identifier the data plane named",
 			apply:   &Apply{ApplyIdentifier: operatorApplyID, ExternalID: remoteApplyID},
-			message: "Schema change " + remoteApplyID + " is completed; volume can only be adjusted while it is running",
-			want:    "Schema change " + operatorApplyID + " is completed; volume can only be adjusted while it is running",
+			message: "Schema change " + remoteApplyID + " is completed; it can only be stopped while it is running",
+			want:    "Schema change " + operatorApplyID + " is completed; it can only be stopped while it is running",
 		},
 		{
 			name:    "rewrites every occurrence in one message",

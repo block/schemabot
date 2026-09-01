@@ -11,15 +11,15 @@ import (
 // and then could not carry out.
 type ControlRejectionData struct {
 	// Operation is the control operation as the operator issued it (stop,
-	// cutover, volume, revert, …).
+	// cutover, revert, …).
 	Operation string
 	// Message is the engine or driver explanation for the rejection. It is
 	// sanitized before rendering.
 	Message string
 	// RequestedBy identifies who issued the command, when known. Requests that
-	// only ever carry SchemaBot's internal forwarding caller — volume is one —
-	// name no operator, and the notice omits the attribution rather than
-	// crediting the command to an internal path.
+	// only ever carry SchemaBot's internal forwarding caller name no operator,
+	// and the notice omits the attribution rather than crediting the command to
+	// an internal path.
 	RequestedBy string
 }
 

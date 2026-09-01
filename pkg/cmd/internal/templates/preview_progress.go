@@ -2,7 +2,6 @@ package templates
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
@@ -1060,51 +1059,4 @@ func previewStartCommandOutput() {
 	WriteProgress(data)
 
 	fmt.Println(FormatWatchFooter())
-}
-
-func previewVolumeBarOutput() {
-	fmt.Println("Volume bar: Visual representation at different levels")
-	fmt.Println()
-
-	fmt.Println("Volume levels 1-11:")
-	fmt.Println()
-
-	for _, vol := range []int{1, 4, 7, 11} {
-		filled := strings.Repeat("█", vol)
-		empty := strings.Repeat("░", 11-vol)
-		fmt.Printf("  Volume: %s%s %d/11\n", filled, empty, vol)
-	}
-	fmt.Println()
-
-	fmt.Println("--- Standard footer (volume hidden by default): ---")
-	fmt.Println()
-	fmt.Println(FormatWatchFooter())
-}
-
-func previewVolumeModeOutput() {
-	fmt.Println("Volume mode: Interactive volume adjustment")
-	fmt.Println("(Press 'v' during apply to enter volume mode)")
-	fmt.Println()
-
-	// Helper to render simple volume mode
-	renderVolumeMode := func(vol int) {
-		filled := strings.Repeat("█", vol)
-		empty := strings.Repeat("░", 11-vol)
-		fmt.Printf("Volume: %s%s %d/11\n", filled, empty, vol)
-		fmt.Printf("%s↑↓ adjust • 1-9 direct • ESC done%s\n", ANSIDim, ANSIReset)
-	}
-
-	fmt.Println("--- In volume mode (default 4): ---")
-	fmt.Println()
-	renderVolumeMode(4)
-
-	fmt.Println()
-	fmt.Println("--- After adjusting to 8: ---")
-	fmt.Println()
-	renderVolumeMode(8)
-
-	fmt.Println()
-	fmt.Println("--- After adjusting to 2: ---")
-	fmt.Println()
-	renderVolumeMode(2)
 }

@@ -85,11 +85,6 @@ func (c *databaseCapturingClient) SkipRevertDeployRequest(_ context.Context, req
 	return &ps.DeployRequest{Number: req.Number}, nil
 }
 
-func (c *databaseCapturingClient) ThrottleDeployRequest(_ context.Context, req *psclient.ThrottleDeployRequestRequest) error {
-	c.record(req.Database)
-	return nil
-}
-
 // The database a target is registered under is an arbitrary routing key; when
 // the credential metadata carries the PlanetScale database name, every
 // PlanetScale API call made by every exported engine method must address that
@@ -144,13 +139,6 @@ func TestEngine_AddressesPlanetScaleDatabaseFromCredentialMetadata(t *testing.T)
 			name: "Progress",
 			call: func(t *testing.T, e *Engine, creds *engine.Credentials) error {
 				_, err := e.Progress(t.Context(), &engine.ProgressRequest{Database: "mydb", ResumeState: activeResume(), Credentials: creds})
-				return err
-			},
-		},
-		{
-			name: "Volume",
-			call: func(t *testing.T, e *Engine, creds *engine.Credentials) error {
-				_, err := e.Volume(t.Context(), &engine.VolumeRequest{Database: "mydb", Volume: 2, ResumeState: activeResume(), Credentials: creds})
 				return err
 			},
 		},

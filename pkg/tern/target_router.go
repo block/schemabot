@@ -303,11 +303,6 @@ func (r *TargetRouter) Start(ctx context.Context, req *ternv1.StartRequest) (*te
 	return routeStoredApply(ctx, r, req, "start", Client.Start)
 }
 
-// Volume modifies a stored apply by routing through its target.
-func (r *TargetRouter) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return routeStoredApply(ctx, r, req, "volume", Client.Volume)
-}
-
 // Revert reverts a stored apply by routing through its target.
 func (r *TargetRouter) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	return routeStoredApply(ctx, r, req, "revert", Client.Revert)

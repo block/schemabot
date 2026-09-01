@@ -2229,41 +2229,6 @@ func PreviewCommentApplySingleProgress() string {
 	return RenderApplyStatusComment(sampleSingleApplyData(state.Apply.Running, table))
 }
 
-// PreviewCommentApplySingleProgressVolume renders a single-table apply in
-// progress with a tuned volume level shown on the status line.
-func PreviewCommentApplySingleProgressVolume() string {
-	table := sampleSingleTable()
-	table.Status = state.Task.Running
-	table.RowsCopied = 3500000
-	table.RowsTotal = 7200000
-	table.PercentComplete = 48
-	table.ETASeconds = 330
-	data := sampleSingleApplyData(state.Apply.Running, table)
-	data.Volume = 8
-	return RenderApplyStatusComment(data)
-}
-
-// PreviewCommentVolumeSupersededProgress renders an old progress comment after
-// a volume change froze it: the final pre-change progress collapses into a
-// details block under a pointer to the fresh comment now tracking the apply.
-func PreviewCommentVolumeSupersededProgress() string {
-	table := sampleSingleTable()
-	table.Status = state.Task.Running
-	table.RowsCopied = 2300000
-	table.RowsTotal = 7200000
-	table.PercentComplete = 32
-	table.ETASeconds = 780
-	data := sampleSingleApplyData(state.Apply.Running, table)
-	data.Volume = 3
-	return RenderVolumeSupersededProgressComment(VolumeSupersededProgressData{
-		Volume:       8,
-		Repo:         "acme/testapp",
-		PR:           42,
-		NewCommentID: 2222222222,
-		PreviousBody: RenderApplyStatusComment(data),
-	})
-}
-
 // PreviewCommentResumeSupersededProgress renders an old progress comment after
 // a resume froze it: the final pre-stop progress collapses into a details
 // block under a pointer to the fresh comment now tracking the apply.

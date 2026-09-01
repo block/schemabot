@@ -243,7 +243,7 @@ func TestPSDisplayMetadataStorageBlobEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 
-	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"volume": "2"})
+	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"not_a_display_key": "2"})
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 }

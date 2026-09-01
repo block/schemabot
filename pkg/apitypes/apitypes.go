@@ -445,13 +445,6 @@ type ControlRequest struct {
 	Caller      string `json:"caller,omitempty"`
 }
 
-// VolumeRequest is the HTTP request body for POST /api/volume.
-type VolumeRequest struct {
-	ApplyID     string `json:"apply_id"`
-	Environment string `json:"environment"`
-	Volume      int32  `json:"volume"`
-}
-
 // =============================================================================
 // Response Types
 // =============================================================================
@@ -937,14 +930,6 @@ type ReleaseResponse struct {
 	Status       string `json:"status,omitempty"`
 }
 
-// VolumeResponse is the HTTP response for POST /api/volume.
-type VolumeResponse struct {
-	Accepted       bool   `json:"accepted"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	PreviousVolume int32  `json:"previous_volume"`
-	NewVolume      int32  `json:"new_volume"`
-}
-
 // ProgressResponse is the HTTP response for GET /api/progress/apply/{apply_id}.
 type ProgressResponse struct {
 	State        string `json:"state"`
@@ -964,7 +949,6 @@ type ProgressResponse struct {
 	ErrorCode    string                       `json:"error_code,omitempty"`
 	ErrorMessage string                       `json:"error_message,omitempty"`
 	Summary      string                       `json:"summary,omitempty"`  // Combined status with ETA
-	Volume       int32                        `json:"volume,omitempty"`   // Current volume setting (1-11)
 	Options      map[string]string            `json:"options,omitempty"`  // Apply options (defer_cutover, skip_revert, etc.)
 	Metadata     map[string]string            `json:"metadata,omitempty"` // Engine-specific data
 	// Released is true when an operator has released a paused rollout open via a
@@ -1080,7 +1064,6 @@ type ActiveApplyResponse struct {
 	StartedAt           string `json:"started_at,omitempty"`
 	CompletedAt         string `json:"completed_at,omitempty"`
 	UpdatedAt           string `json:"updated_at"`
-	Volume              int    `json:"volume,omitempty"`
 }
 
 // StatusResponse is the HTTP response for GET /api/status.

@@ -61,9 +61,6 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", model.Label})
-	if row, ok := volumeBoxRow(data.Volume, model.State); ok {
-		rows = append(rows, row)
-	}
 	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if data.StartedAt != "" {
 		if started, err := time.Parse(time.RFC3339, data.StartedAt); err == nil {

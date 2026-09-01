@@ -55,27 +55,12 @@ type PSClient interface {
 	// models auto_cutover on the create request but on neither response, so this
 	// uses raw HTTP via baseURL; it returns an error if baseURL is not set.
 	DeployRequestAutoCutover(ctx context.Context, org, database string, number uint64) (bool, error)
-
-	// ThrottleDeployRequest sets the throttle ratio for a running deploy request.
-	// This controls the speed of the online DDL copy phase (0.0 = full speed,
-	// 0.95 = max throttle). The PlanetScale API supports this endpoint but the
-	// Go SDK (planetscale-go) does not expose it, so we use raw HTTP via baseURL.
-	// Requires NewPSClientWithBaseURL; returns an error if baseURL is not set.
-	ThrottleDeployRequest(ctx context.Context, req *ThrottleDeployRequestRequest) error
-}
-
-// ThrottleDeployRequestRequest is the request for setting a deploy request's throttle ratio.
-type ThrottleDeployRequestRequest struct {
-	Organization  string
-	Database      string
-	Number        uint64
-	ThrottleRatio float64 // 0.0 (full speed) to 0.95 (max throttle). PlanetScale API caps at 0.95.
 }
 
 // psClientWrapper wraps the real PlanetScale client to implement PSClient.
 type psClientWrapper struct {
 	client     *ps.Client
-	baseURL    string // for endpoints not in the SDK (throttle)
+	baseURL    string // for endpoints not in the SDK
 	tokenName  string
 	tokenValue string
 }
@@ -368,22 +353,4 @@ func (w *psClientWrapper) SkipRevertDeployRequest(ctx context.Context, req *ps.S
 
 func (w *psClientWrapper) ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error) {
 	return w.client.DeployRequests.List(ctx, req)
-}
-
-// ThrottleDeployRequest sets the throttle ratio via a raw HTTP PUT.
-// Not yet available in the PlanetScale SDK.
-func (w *psClientWrapper) ThrottleDeployRequest(ctx context.Context, req *ThrottleDeployRequestRequest) error {
-	if w.baseURL == "" {
-		return fmt.Errorf("throttle not supported without base URL")
-	}
-	path := fmt.Sprintf("/v1/organizations/%s/databases/%s/deploy-requests/%d/throttle",
-		req.Organization, req.Database, req.Number)
-	body, err := json.Marshal(map[string]float64{"throttle_ratio": req.ThrottleRatio})
-	if err != nil {
-		return fmt.Errorf("marshal throttle payload for %s/%s deploy request #%d: %w", req.Organization, req.Database, req.Number, err)
-	}
-	if _, err := w.doRawJSON(ctx, http.MethodPut, path, body); err != nil {
-		return fmt.Errorf("throttle %s/%s deploy request #%d to %.2f: %w", req.Organization, req.Database, req.Number, req.ThrottleRatio, err)
-	}
-	return nil
 }

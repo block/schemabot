@@ -155,6 +155,9 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Database = storage.CanonicalKey(req.Database)
+	req.Environment = storage.CanonicalKey(req.Environment)
+	req.Type = storage.CanonicalKey(req.Type)
 
 	if req.Database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
@@ -518,6 +521,10 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Database = storage.CanonicalKey(req.Database)
+	req.Environment = storage.CanonicalKey(req.Environment)
+	req.Type = storage.CanonicalKey(req.Type)
+	req.Repository = storage.CanonicalKey(req.Repository)
 
 	if req.Database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
@@ -891,6 +898,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Environment = storage.CanonicalKey(req.Environment)
 
 	if req.PlanID == "" {
 		s.writeError(w, http.StatusBadRequest, "plan_id is required")
