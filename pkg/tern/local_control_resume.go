@@ -509,7 +509,7 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
 	out := make(map[shardTableKey]string)
 	for _, sc := range result.Changes {
 		for _, tc := range sc.TableChanges {
-			out[shardTableKey{namespace: sc.Namespace, shard: sc.Shard.Name, table: tc.Table}] = tc.DDL
+			out[shardTableKey{namespace: sc.Namespace, shard: sc.ShardName(), table: tc.Table}] = tc.DDL
 		}
 	}
 	return out

@@ -6214,6 +6214,45 @@ func TestGRPCClient_SyncStoredTasksFromRemoteTasksMirrorsPerTableError(t *testin
 	}
 }
 
+func TestGRPCClient_SyncStoredTasksFromRemoteTasksAttributesEachStatementToItsOwnTask(t *testing.T) {
+	// A remote apply that runs two statements against one table reports one
+	// TableProgress row per statement. Each stored task mirrors the row for
+	// its own statement, so the finished statement reads completed while the
+	// one still running reads running — instead of both tasks taking whichever
+	// row for the table the data plane happened to list last.
+	now := time.Date(2026, 8, 31, 9, 0, 0, 0, time.UTC)
+	const (
+		addEmailDDL = "ALTER TABLE public.users ADD COLUMN email text"
+		addNameDDL  = "ALTER TABLE public.users ADD COLUMN name text"
+	)
+	storedApply := &storage.Apply{ID: 61, ApplyIdentifier: "apply-two-statements", State: state.Apply.Running}
+	addEmail := &storage.Task{
+		ID: 62, TaskIdentifier: "task-add-email", ApplyID: storedApply.ID,
+		Namespace: "public", TableName: "users", DDL: addEmailDDL, State: state.Task.Running,
+	}
+	addName := &storage.Task{
+		ID: 63, TaskIdentifier: "task-add-name", ApplyID: storedApply.ID,
+		Namespace: "public", TableName: "users", DDL: addNameDDL, State: state.Task.Pending,
+	}
+	client := &GRPCClient{
+		storage: &mockStorage{
+			tasks: &mockTaskStore{tasks: []*storage.Task{addEmail, addName}},
+			logs:  &mockApplyLogStore{},
+		},
+	}
+
+	err := client.syncStoredTasksFromRemoteTasks(t.Context(), storedApply, []*storage.Task{addEmail, addName}, []*ternv1.TableProgress{
+		{TaskId: "remote-1", Namespace: "public", TableName: "users", Ddl: addEmailDDL, Status: state.Task.Completed, PercentComplete: 100},
+		{TaskId: "remote-2", Namespace: "public", TableName: "users", Ddl: addNameDDL, Status: state.Task.Running, PercentComplete: 40},
+	}, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, state.Task.Completed, addEmail.State)
+	assert.Equal(t, 100, addEmail.ProgressPercent)
+	assert.Equal(t, state.Task.Running, addName.State)
+	assert.Equal(t, 40, addName.ProgressPercent)
+}
+
 func TestGRPCClient_SyncShardProgressFromRemote(t *testing.T) {
 	// A remote Tern Progress response carries per-shard ShardProgress. The control
 	// plane is a reader/mirror, so it must encode those into per-(table, shard) task

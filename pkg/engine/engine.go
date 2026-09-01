@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -320,6 +321,21 @@ type SchemaChange struct {
 	Metadata              map[string]string
 	OriginalFiles         map[string]string // Declarative schema files and artifacts for this namespace before applying
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
+}
+
+// ShardName returns the shard this change targets, trimmed of surrounding
+// whitespace. Empty when the change targets the whole namespace.
+func (sc SchemaChange) ShardName() string {
+	return strings.TrimSpace(sc.Shard.Name)
+}
+
+// Sharded reports whether the change targets one shard of its namespace. A
+// sharded engine plans one SchemaChange per changed shard, so the same table
+// repeats across a keyspace's shards; a non-sharded change lists each
+// statement once, and a table may legitimately appear more than once when its
+// change is a multi-statement sequence.
+func (sc SchemaChange) Sharded() bool {
+	return sc.ShardName() != ""
 }
 
 // Shard identifies a shard within a namespace for a sharded schema change. It is
