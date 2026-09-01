@@ -261,10 +261,13 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			}
 			change.UnsafeReason = strings.Join(msgs, "; ")
 		}
-		// Only a CREATE TABLE or an ALTER TABLE can declare a foreign key, and
-		// gating on the type keeps the verdict — an informational field — from
-		// ever failing the plan on a statement the refusal check's own parser
-		// does not accept.
+		// Only a CREATE TABLE or an ALTER TABLE can declare a foreign key.
+		// Gating on the type keeps the verdict — an informational field — off
+		// the statement types the refusal check's own parser rejects outright.
+		// The classifier and the check parse with the same parser, so a
+		// statement classified as either type parses for both; what remains is
+		// the check's own post-parse analysis, and an error there fails the
+		// plan rather than guessing, matching the MySQL engine's refusal gate.
 		if stmtType == ddl.StatementCreateTable || stmtType == ddl.StatementAlterTable {
 			declaresFK, fkErr := ddl.DeclaresForeignKey(pc.Statement)
 			if fkErr != nil {
