@@ -46,6 +46,10 @@ func (f fakeStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, nil
 }
 
+func (f fakeStatementParser) CostScalesWithTableSize(string) (bool, error) {
+	return false, nil
+}
+
 func (f fakeStatementParser) Canonicalize(string) string {
 	return f.canonicalized
 }
@@ -221,4 +225,66 @@ func TestRestoreCanonicalMultiStatementUnchanged(t *testing.T) {
 			assert.Equal(t, tt.input, restoreCanonical(tt.input))
 		})
 	}
+}
+
+// CostScalesWithTableSize scopes the plan comment's table-size section: a
+// statement reports true when it builds an index, copies or rebuilds the
+// table, or scans it to validate a constraint, so a size line renders exactly
+// for the changes whose cost grows with the table. Provably metadata-only
+// clauses stay quiet.
+func TestTiDBCostScalesWithTableSize(t *testing.T) {
+	p := tidbStatementParser{}
+
+	tests := []struct {
+		name string
+		stmt string
+		want bool
+	}{
+		{"add index", "ALTER TABLE `mutes` ADD INDEX `idx_created_at` (`created_at`)", true},
+		{"add key", "ALTER TABLE `mutes` ADD KEY `idx_created_at` (`created_at`)", true},
+		{"add unique key", "ALTER TABLE `mutes` ADD UNIQUE KEY `uniq_slug` (`slug`)", true},
+		{"add fulltext index", "ALTER TABLE `mutes` ADD FULLTEXT INDEX `ft_body` (`body`)", true},
+		{"add spatial index", "ALTER TABLE `mutes` ADD SPATIAL INDEX `sp_location` (`location`)", true},
+		{"add primary key", "ALTER TABLE `mutes` ADD PRIMARY KEY (`id`)", true},
+		{"index add among metadata-only clauses", "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255), ADD INDEX `idx_reason` (`reason`)", true},
+		{"standalone create index", "CREATE INDEX `idx_created_at` ON `mutes` (`created_at`)", true},
+		{"modify column widening", "ALTER TABLE `mutes` MODIFY COLUMN `reason` varchar(500)", true},
+		{"modify column type change", "ALTER TABLE `mutes` MODIFY COLUMN `count` bigint", true},
+		{"change column", "ALTER TABLE `mutes` CHANGE COLUMN `reason` `cause` varchar(255)", true},
+		{"add foreign key", "ALTER TABLE `mutes` ADD CONSTRAINT `fk_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)", true},
+		{"add check constraint", "ALTER TABLE `mutes` ADD CONSTRAINT `chk_positive` CHECK (`count` > 0)", true},
+		{"convert charset", "ALTER TABLE `mutes` CONVERT TO CHARACTER SET utf8mb4", true},
+		{"engine rebuild", "ALTER TABLE `mutes` ENGINE=InnoDB", true},
+		{"add column with inline unique", "ALTER TABLE `mutes` ADD COLUMN `slug` varchar(64) UNIQUE", true},
+		{"add stored generated column", "ALTER TABLE `mutes` ADD COLUMN `total` int AS (`a` + `b`) STORED", true},
+		{"add column only", "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)", false},
+		{"add virtual generated column", "ALTER TABLE `mutes` ADD COLUMN `total` int AS (`a` + `b`) VIRTUAL", false},
+		{"drop column", "ALTER TABLE `mutes` DROP COLUMN `reason`", false},
+		{"rename column", "ALTER TABLE `mutes` RENAME COLUMN `reason` TO `cause`", false},
+		{"rename table", "ALTER TABLE `mutes` RENAME TO `silences`", false},
+		{"set default", "ALTER TABLE `mutes` ALTER COLUMN `count` SET DEFAULT 0", false},
+		{"drop index", "ALTER TABLE `mutes` DROP INDEX `idx_created_at`", false},
+		{"drop foreign key", "ALTER TABLE `mutes` DROP FOREIGN KEY `fk_user`", false},
+		{"index invisible", "ALTER TABLE `mutes` ALTER INDEX `idx_created_at` INVISIBLE", false},
+		{"comment only", "ALTER TABLE `mutes` COMMENT='muted things'", false},
+		{"create table with index", "CREATE TABLE `mutes` (`id` bigint, KEY `idx_id` (`id`))", false},
+		{"drop table", "DROP TABLE `mutes`", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.CostScalesWithTableSize(tt.stmt)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("unparseable statement is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("ALTER TABLE ADD INDEX WHAT")
+		assert.Error(t, err)
+	})
+
+	t.Run("multi-statement input is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("ALTER TABLE `a` ADD INDEX `i` (`c`); DROP TABLE `b`")
+		assert.Error(t, err)
+	})
 }
