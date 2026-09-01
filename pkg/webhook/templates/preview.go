@@ -53,6 +53,9 @@ func previewPlanData() PlanCommentData {
 					"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 					"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 				},
+				TableSizes: []TableSizeData{
+					{Table: "products", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)},
+				},
 			},
 		},
 		LintViolations: sampleLintWarnings(),
@@ -67,6 +70,37 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	data.LintViolations = nil
 	data.IgnoredNamespaces = []string{"local_fixtures"}
 	return RenderPlanComment(data)
+}
+
+// previewRows returns a pointer to a sample row-count estimate.
+//
+//go:fix inline
+func previewRows(n int64) *int64 {
+	return new(n)
+}
+
+// PreviewCommentPlanColumnOnlyAlter renders a sample plan whose only alter
+// adds a plain column — a metadata-only change whose cost doesn't scale with
+// the table — so the comment carries no table-size section.
+func PreviewCommentPlanColumnOnlyAlter() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;",
+				},
+			},
+		},
+	})
 }
 
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
@@ -928,6 +962,9 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedRows: previewRows(2_340_000), EstimatedBytes: previewRows(1_130_000_000)},
+			},
 		},
 	}
 }
@@ -1214,6 +1251,10 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 			Keyspace: "commerce_sharded",
 			Statements: []string{
 				"CREATE TABLE `addresses` (\n  `id` bigint unsigned NOT NULL,\n  `customer_id` bigint unsigned NOT NULL,\n  `street` varchar(255) NOT NULL,\n  `city` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`),\n  INDEX `idx_customer_id` (`customer_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier` (`loyalty_tier`);",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "customers", EstimatedRows: previewRows(48_200_000), EstimatedBytes: previewRows(23_400_000_000), ShardCount: 2, LargestShardRows: previewRows(24_600_000)},
 			},
 			VSchemaChanged: true,
 			VSchemaDiff: `--- a/commerce_sharded.json
@@ -1275,6 +1316,34 @@ func PreviewCommentVitessPlan() string {
 		IsMySQL:      false,
 		DatabaseType: "vitess",
 		Changes:      sampleVitessPlanChanges(),
+	})
+}
+
+// PreviewCommentVitessPlanBytesOnlySizes renders a sample Vitess plan comment
+// whose size context carries storage bytes with no row counts — the shape a
+// PlanetScale target produces, where the branch table metrics report each
+// table's bytes but nothing counts rows.
+func PreviewCommentVitessPlanBytesOnlySizes() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "commerce",
+		SchemaName:   "commerce",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      false,
+		DatabaseType: "vitess",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "commerce_sharded",
+				Statements: []string{
+					"ALTER TABLE `addresses` ADD INDEX `idx_region` (`region`);",
+				},
+				TableSizes: []TableSizeData{
+					{Table: "addresses", EstimatedBytes: previewRows(48_000_000_000), ShardCount: 4},
+				},
+			},
+		},
 	})
 }
 

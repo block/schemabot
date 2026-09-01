@@ -320,6 +320,9 @@ func PreviewCommentShardedPlanDivergent() string {
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "cdb_resolute_sharded",
 			Statements: []string{idx},
+			TableSizes: []TableSizeData{
+				{Table: "mutes", EstimatedRows: previewRows(48_200_000), ShardCount: 4, LargestShardRows: previewRows(13_100_000)},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Statements: []string{idx}},
 				{Shard: "80-c0", Statements: []string{idx}},
@@ -377,6 +380,12 @@ func PreviewCommentShardedPlanPartiallyApplied() string {
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
+			// A nil row estimate renders as explicitly unavailable — the size
+			// probe failing must never read as "small table". The satisfied
+			// shard needs no change, so the change spans three shards.
+			TableSizes: []TableSizeData{
+				{Table: "mutes", ShardCount: 3},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Satisfied: true},
 				{Shard: "40-80", Statements: []string{idx}},

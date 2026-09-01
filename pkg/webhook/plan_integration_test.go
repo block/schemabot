@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -525,6 +526,101 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 		assert.Contains(t, body, "No SchemaBot Configuration Found")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+// A plan that adds an index to an existing table renders the table's
+// approximate size in the plan comment — rows and bytes read from the target's
+// statistics at plan time — so an operator sees the scale of the index build
+// before applying. Only statements whose cost scales with the table carry a
+// size line: metadata-only alters and tables being created are not listed.
+func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
+	dbName := "webhook_plan_table_sizes"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	// Seed an existing table with enough rows that statistics report a
+	// meaningful estimate, and refresh statistics so the estimate is current.
+	dsnConfig, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	dsnConfig.DBName = dbName
+	appDB, err := sql.Open("mysql", dsnConfig.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = appDB.Close() })
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `name` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `notes` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `body` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	var values strings.Builder
+	for i := range 1200 {
+		if i > 0 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "('name-%d')", i)
+	}
+	_, err = appDB.ExecContext(t.Context(), "INSERT INTO `items` (`name`) VALUES "+values.String())
+	require.NoError(t, err)
+	_, err = appDB.ExecContext(t.Context(), "ANALYZE TABLE `items`")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		// One existing table gains an index (a size line), another gains only a
+		// column (no size line), and a new table is created (no size line).
+		"items.sql":   "CREATE TABLE `items` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"notes.sql":   "CREATE TABLE `notes` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `body` varchar(255) NOT NULL,\n  `priority` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "📊 **Table sizes**:")
+		assert.Contains(t, body, "- `items`: ~1.2k rows · ~", "the size line carries rows then a byte estimate")
+		assert.NotContains(t, body, "- `notes`:", "a column-only alter carries no size line")
+		assert.NotContains(t, body, "- `widgets`:", "a table being created is not listed in the size section")
+		sizesAt := strings.Index(body, "📊 **Table sizes**")
+		summaryAt := strings.Index(body, "📋 **Plan**:")
+		assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
 	}
 }
 
