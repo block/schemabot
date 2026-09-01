@@ -658,7 +658,7 @@ func PreviewCommentErrorGeneric() string {
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
 		CommandName: action.Plan,
-		ErrorDetail: "Failed to prepare the schema change request. Internal SchemaBot error — retry (error reference `" + previewErrorReference + "`).",
+		ErrorDetail: "Failed to prepare the schema change request. Internal SchemaBot error. Retry (error reference `" + previewErrorReference + "`).",
 	})
 }
 
@@ -670,7 +670,7 @@ func PreviewCommentErrorGenericAutoPlan() string {
 		Timestamp:    "2026-01-15 14:30:00",
 		Environments: []string{"staging"},
 		CommandName:  action.Plan,
-		ErrorDetail:  "Failed to prepare the schema change request. Internal SchemaBot error — retry (error reference `" + previewErrorReference + "`).",
+		ErrorDetail:  "Failed to prepare the schema change request. Internal SchemaBot error. Retry (error reference `" + previewErrorReference + "`).",
 	})
 }
 
@@ -806,7 +806,7 @@ func PreviewCommentReviewGateError() string {
 		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed. Internal SchemaBot error — retry (error reference `" + previewErrorReference + "`). If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+		ErrorDetail: "Review gate check failed. Internal SchemaBot error. Retry (error reference `" + previewErrorReference + "`). If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
 	})
 }
 

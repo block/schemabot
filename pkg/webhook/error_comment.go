@@ -80,10 +80,10 @@ func newErrorReference() string {
 // recorded the raw error.
 //
 // The sentence is a fixed, machine-matchable pattern — agents driving schema
-// changes parse retryability ("— retry" present or absent) and the backticked
+// changes parse retryability ("Retry" present or absent) and the backticked
 // reference from it, so any rewording must keep both facts regex-stable.
 func internalErrorDetail(summary, errorRef string) string {
-	return summary + " Internal SchemaBot error — retry (error reference `" + errorRef + "`)."
+	return summary + " Internal SchemaBot error. Retry (error reference `" + errorRef + "`)."
 }
 
 // internalErrorDetailNoRetry is internalErrorDetail for failures where

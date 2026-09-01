@@ -109,7 +109,7 @@ func TestInternalErrorDetail(t *testing.T) {
 	t.Run("retry variant renders retry guidance and the reference", func(t *testing.T) {
 		detail := internalErrorDetail("Failed to acquire the apply lock.", "ab12cd34")
 
-		assert.Equal(t, "Failed to acquire the apply lock. Internal SchemaBot error — retry (error reference `ab12cd34`).", detail)
+		assert.Equal(t, "Failed to acquire the apply lock. Internal SchemaBot error. Retry (error reference `ab12cd34`).", detail)
 	})
 
 	t.Run("no-retry variant omits the retry guidance", func(t *testing.T) {
