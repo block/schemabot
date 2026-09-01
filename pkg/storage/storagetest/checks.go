@@ -15,6 +15,45 @@ import (
 // upserts, aggregate and per-database row isolation, apply ownership, and
 // review-time deployment drift disposition.
 func TestChecks(t *testing.T, h Harness) {
+	t.Run("CanonicalIdentityKey", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		check := &storage.Check{
+			Repository: "MixedCase/Sample-Repo", PullRequest: 123, HeadSHA: "abc123",
+			Environment: "Staging", DatabaseType: "MySQL", DatabaseName: "Orders_DB",
+			Status: "completed", Conclusion: "success",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		stored, err := store.Checks().Get(ctx, "MIXEDCASE/SAMPLE-REPO", 123, "STAGING", "MYSQL", "ORDERS_DB")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "mixedcase/sample-repo", stored.Repository)
+		assert.Equal(t, "staging", stored.Environment)
+		assert.Equal(t, "mysql", stored.DatabaseType)
+		assert.Equal(t, "orders_db", stored.DatabaseName)
+
+		check.Repository = "MIXEDCASE/SAMPLE-REPO"
+		check.Environment = "STAGING"
+		check.DatabaseType = "MYSQL"
+		check.DatabaseName = "ORDERS_DB"
+		check.HeadSHA = "def456"
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		checks, err := store.Checks().GetByDatabase(ctx, "MixedCase/Sample-Repo", "Staging", "MySQL", "Orders_DB")
+		require.NoError(t, err)
+		require.Len(t, checks, 1)
+		assert.Equal(t, "def456", checks[0].HeadSHA)
+
+		checks, err = store.Checks().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 123)
+		require.NoError(t, err)
+		require.Len(t, checks, 1)
+		require.NoError(t, store.Checks().DeleteByPRRetainingBlockingApplyOwned(ctx, "MixedCase/Sample-Repo", 123, false))
+		checks, err = store.Checks().GetByPR(ctx, "mixedcase/sample-repo", 123)
+		require.NoError(t, err)
+		assert.Empty(t, checks)
+	})
+
 	t.Run("Upsert", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

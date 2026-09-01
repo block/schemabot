@@ -1021,3 +1021,102 @@ func TestConflictCheckKeepsRestingTaskWhenControlRequestsAreUnconfigured(t *test
 		assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
 	})
 }
+
+// strandedRetryableTask is the shape a stop leaves behind when it settles the
+// apply row but its task writes are refused: the apply says stopped, the task
+// still carries the engine failure that paused it, and no driver will ever
+// claim the task again because a terminal apply is never claimable.
+func strandedRetryableTask() (*storage.Task, *storage.Apply) {
+	task, apply := restingStoppedTask()
+	task.TaskIdentifier = "task-stranded"
+	task.State = state.Task.FailedRetryable
+	task.ErrorMessage = "error writing checkpoint: too many connections"
+	return task, apply
+}
+
+// A task waiting for a driver under a stopped apply is stranded: the stop
+// decided the outcome, but the task row never moved, so start cannot resume it
+// and the takeover path cannot release it. Settling it into the state the stop
+// meant to write puts it back on both paths at once — the copy on the target
+// stays resumable, and the dispatch that meets it takes it over instead of
+// being refused by it for as long as the row sits there.
+func TestConflictCheckSettlesStrandedTaskIntoTheStopItMissed(t *testing.T) {
+	stranded, holdingApply := strandedRetryableTask()
+	client := restingTaskClient(stranded, holdingApply, nil)
+	plan := restingTaskPlan()
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stranded}, plan, "production", "", 0, newConflictScanMemo())
+	assert.False(t, blocking.blocks(), "a stranded task settled into the stop no longer holds the database")
+
+	require.Len(t, released, 1, "the settled holder is named so the dispatch can record a takeover of its copy")
+	assert.Equal(t, "apply-holding-testdb", released[0].applyIdentifier)
+	assert.Equal(t, "users", released[0].table)
+
+	assert.Equal(t, state.Task.Stopped, stranded.State, "the stranded task settles to the stop's own resting state")
+	assert.Equal(t, "error writing checkpoint: too many connections", stranded.ErrorMessage,
+		"the engine failure that paused the copy is why it stopped where it did, so it is preserved")
+	assert.Nil(t, stranded.CompletedAt, "a resumable task has not completed")
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", "", 0)
+	require.NoError(t, err, "a new apply proceeds past a settled stranded task")
+}
+
+// An apply that ended for good decided against its remaining work, so a task
+// still waiting for a driver under it is cancelled rather than left resumable:
+// there is no outcome left for a start to resume toward.
+func TestConflictCheckCancelsStrandedTaskOfAnEndedApply(t *testing.T) {
+	for _, applyState := range []string{
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.Cancelled,
+	} {
+		t.Run(applyState, func(t *testing.T) {
+			stranded, holdingApply := strandedRetryableTask()
+			holdingApply.State = applyState
+			client := restingTaskClient(stranded, holdingApply, nil)
+			plan := restingTaskPlan()
+
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", "", 0)
+			require.NoError(t, err, "a stranded task of an ended apply must not refuse a new apply")
+			assert.Equal(t, state.Task.Cancelled, stranded.State)
+			assert.Contains(t, stranded.ErrorMessage, "orphaned")
+			assert.NotNil(t, stranded.CompletedAt)
+		})
+	}
+}
+
+// A retryable task under a still-claimable apply is work a driver will pick up
+// unprompted. The settlement must not touch it: cancelling or stopping live
+// work would race the driver that is about to retry it.
+func TestConflictCheckLeavesRetryableTaskOfAClaimableApply(t *testing.T) {
+	stranded, holdingApply := strandedRetryableTask()
+	holdingApply.State = state.Apply.Running
+	client := restingTaskClient(stranded, holdingApply, nil)
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stranded}, restingTaskPlan(), "production", "", 0, newConflictScanMemo())
+
+	require.True(t, blocking.blocks(), "a retryable task of a claimable apply still holds the database")
+	assert.Empty(t, released)
+	assert.Equal(t, state.Task.FailedRetryable, stranded.State, "the task is left for its driver to retry")
+}
+
+// The settlement only stops the task blocking once it is durably written.
+// Reporting it settled on a refused write would admit a new apply while storage
+// still records the stranded task as active work — the same divergence that
+// stranded it in the first place.
+func TestConflictCheckKeepsStrandedTaskWhenSettlementWriteFails(t *testing.T) {
+	stranded, holdingApply := strandedRetryableTask()
+	client := restingTaskClient(stranded, holdingApply, nil)
+	stor := client.storage.(*exactProgressStorage)
+	stor.tasks = &updateFailingTaskStore{
+		exactProgressTaskStore: stor.tasks.(*exactProgressTaskStore),
+		updateErr:              errors.New("storage down"),
+	}
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), restingTaskPlan(), "production", "", 0)
+	require.Error(t, err, "the stranded task must keep blocking when its settlement cannot be written")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.FailedRetryable, stranded.State, "the task is restored for a clean retry")
+	assert.Equal(t, "error writing checkpoint: too many connections", stranded.ErrorMessage)
+	assert.Nil(t, stranded.CompletedAt)
+}

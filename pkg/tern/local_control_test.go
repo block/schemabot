@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1600,4 +1601,292 @@ func TestProcessPendingStopControlRequest_LogsCarryApplyIdentity(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, settled)
 	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+}
+
+// leaseLostTaskStore refuses every task write the way a lease-guarded UPDATE
+// does once the operation lease has moved to a peer driver — the apply lease
+// the control operation holds is a different lease, so the apply-level write
+// that follows would still land.
+type leaseLostTaskStore struct {
+	*controlTestTaskStore
+}
+
+func (s *leaseLostTaskStore) Update(context.Context, *storage.Task) error {
+	return storage.ErrApplyLeaseLost
+}
+
+// A stop holds the apply lease, but each task write is guarded by the operation
+// lease, and driver churn can hand that one to a peer mid-stop. When the task
+// writes are refused the stop must fail rather than settle the apply on its
+// own: an apply recorded as stopped over task rows that still read as active
+// work detaches the apply from its tasks, and the tasks left behind hold the
+// database with neither start nor a later apply able to act on them. An
+// operator re-issuing the stop is the recoverable outcome.
+func TestLocalClient_StopFailsWhenTaskWritesAreRefused(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-stop-refused",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-refused",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+	stor := client.storage.(*controlTestStorage)
+	stor.tasks = &leaseLostTaskStore{controlTestTaskStore: stor.tasks.(*controlTestTaskStore)}
+
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.Error(t, err, "a stop whose task writes were all refused must not report success")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost, "the refusal's cause must survive for triage")
+	assert.Contains(t, err.Error(), "testdb")
+	assert.Nil(t, resp)
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must not be settled over task rows that never moved")
+	assert.Equal(t, state.Task.Running, task.State)
+}
+
+// A cancel splits the same two leases as a stop, and an apply recorded as
+// cancelled over task rows that never moved detaches it from its tasks the same
+// way.
+func TestLocalClient_CancelFailsWhenTaskWritesAreRefused(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-cancel-refused",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-refused",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+	stor := client.storage.(*controlTestStorage)
+	stor.tasks = &leaseLostTaskStore{controlTestTaskStore: stor.tasks.(*controlTestTaskStore)}
+
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.Error(t, err, "a cancel whose task writes were all refused must not report success")
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.Nil(t, resp)
+	assert.Equal(t, state.Apply.Running, apply.State)
+	assert.Equal(t, state.Task.Running, task.State)
+}
+
+// A control operation reports what it persisted: a task write that lands is
+// counted, one that is refused is not, because the counts become the
+// operator-facing "N tasks stopped" event and response. Every task is still
+// attempted, so a retry has only the refused ones left to write.
+func TestLocalClient_ControlOperationCountsOnlyLandedTaskWrites(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              44,
+		ApplyIdentifier: "apply-partial-stop",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+	}
+	landing := &storage.Task{
+		ID: 9, ApplyID: apply.ID, TaskIdentifier: "task-lands",
+		Database: "testdb", Namespace: "testdb", State: state.Task.Running,
+	}
+	refused := &storage.Task{
+		ID: 10, ApplyID: apply.ID, TaskIdentifier: "task-refused",
+		Database: "testdb", Namespace: "testdb", State: state.Task.Running,
+	}
+	alreadyDone := &storage.Task{
+		ID: 11, ApplyID: apply.ID, TaskIdentifier: "task-done",
+		Database: "testdb", Namespace: "testdb", State: state.Task.Completed,
+	}
+	client := newMySQLControlTestClient(apply, nil, &controlCaptureEngine{})
+	stor := client.storage.(*controlTestStorage)
+	stor.tasks = &selectivelyFailingTaskStore{
+		controlTestTaskStore: &controlTestTaskStore{tasks: []*storage.Task{landing, refused, alreadyDone}},
+		failIdentifier:       refused.TaskIdentifier,
+	}
+
+	marked, skipped, applyID, err := client.markTasksWithState(t.Context(),
+		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, nil, state.Task.Stopped)
+
+	require.Error(t, err, "a refused task write must be reported, not absorbed into the count")
+	assert.Contains(t, err.Error(), "failed to settle 1 of 2 tasks",
+		"the count in the message is the failures, and it must read as such")
+	assert.Equal(t, int64(1), marked, "only the landed write is counted")
+	assert.Equal(t, int64(1), skipped, "the already-terminal task is skipped, not marked")
+	assert.Equal(t, apply.ID, applyID)
+	assert.Equal(t, state.Task.Stopped, landing.State, "every task is still attempted")
+	assert.Equal(t, state.Task.Completed, alreadyDone.State)
+}
+
+// selectivelyFailingTaskStore refuses the write for one named task and serves
+// the rest normally, standing in for a lease that moves partway through a
+// control operation's task writes.
+type selectivelyFailingTaskStore struct {
+	*controlTestTaskStore
+	failIdentifier string
+}
+
+func (s *selectivelyFailingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if task.TaskIdentifier == s.failIdentifier {
+		return storage.ErrApplyLeaseLost
+	}
+	return s.controlTestTaskStore.Update(ctx, task)
+}
+
+// restingStartApply builds a stopped apply and its resting task, last written
+// `age` ago, for exercising how start resolves resumable work.
+func restingStartApply(taskState string, age time.Duration) (*storage.Apply, *storage.Task) {
+	apply := &storage.Apply{
+		ID:              90,
+		ApplyIdentifier: "apply-resume-target",
+		State:           state.Apply.Stopped,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             91,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-resume-target",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		TableName:      "users",
+		State:          taskState,
+		UpdatedAt:      time.Now().Add(-age),
+	}
+	return apply, task
+}
+
+// The window that keeps an unqualified start from reaching back forever is a
+// way of choosing among candidates, not a rule about what may be resumed. An
+// operator who names the apply has already chosen, so the change resumes however
+// long it has been resting — refusing it here reads as the change not existing.
+func TestLocalClient_StartResumesANamedApplyOlderThanTheDiscoveryWindow(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Stopped, stoppedApplyDiscoveryWindow+48*time.Hour)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	resolved, startedCount, skippedCount, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a named apply resumes however long it has been resting")
+	require.NotNil(t, resolved)
+	assert.Equal(t, apply.ApplyIdentifier, resolved.ApplyIdentifier)
+	assert.Equal(t, int64(1), startedCount)
+	assert.Equal(t, int64(0), skippedCount)
+}
+
+// An unqualified start picks among candidates, so it does keep the window — but
+// it must say that is why it passed over the change, and point at the command
+// that resumes it anyway. Reporting it as "nothing to resume" sends the operator
+// looking for a change that is sitting right there.
+func TestLocalClient_StartOutsideTheDiscoveryWindowNamesTheWayForward(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Stopped, stoppedApplyDiscoveryWindow+48*time.Hour)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(), &ternv1.StartRequest{})
+
+	require.Error(t, err, "an unqualified start passes over a change older than the window")
+	assert.Contains(t, err.Error(), apply.ApplyIdentifier,
+		"the refusal names the change it passed over, not just that nothing was found")
+	assert.Contains(t, err.Error(), "re-issue the start naming",
+		"the refusal points at the command that resumes the change anyway")
+}
+
+// Task states arrive in proto form for terminal states too, so a finished
+// table must be counted as skipped rather than reported as a state start
+// cannot act on — the latter tells the operator something is wedged when the
+// change is simply done.
+func TestLocalClient_StartSkipsProtoFormattedTerminalTasks(t *testing.T) {
+	apply, task := restingStartApply("STATE_COMPLETED", time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already reached a terminal state",
+		"a proto-formatted completed state is still a finished table")
+	assert.NotContains(t, err.Error(), "state start cannot act on")
+}
+
+// A task that is neither terminal nor resting is not something a start can act
+// on, and saying only "nothing to resume" hides which state it is actually in.
+// The refusal names the states so an operator can tell a task awaiting its
+// driver from one stranded under a terminal apply.
+func TestLocalClient_StartNamesTheStatesItCannotResume(t *testing.T) {
+	apply, task := restingStartApply(state.Task.FailedRetryable, time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "state start cannot act on")
+	assert.Contains(t, err.Error(), state.Task.FailedRetryable, "the refusal names the state it found")
+	assert.Contains(t, err.Error(), apply.ApplyIdentifier)
+}
+
+// Task states arrive in proto form ("STATE_STOPPED") as well as canonical
+// lowercase, so start must compare them normalized. A raw comparison silently
+// finds no resumable work and refuses a change that is sitting ready.
+func TestLocalClient_StartResolvesProtoFormattedTaskStates(t *testing.T) {
+	apply, task := restingStartApply("STATE_STOPPED", time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	resolved, startedCount, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a proto-formatted stopped state is still stopped")
+	require.NotNil(t, resolved)
+	assert.Equal(t, int64(1), startedCount)
+}
+
+// Tables that finished before the stop are skipped, not resumed, and the count
+// is what tells the operator how much of the change is already done.
+func TestLocalClient_StartSkipsTerminalTablesOfTheSameApply(t *testing.T) {
+	apply, resting := restingStartApply(state.Task.Stopped, time.Minute)
+	done := &storage.Task{
+		ID: 92, ApplyID: apply.ID, TaskIdentifier: "task-already-done",
+		Database: "testdb", Namespace: "testdb", TableName: "orders",
+		State: state.Task.Completed, UpdatedAt: time.Now(),
+	}
+	otherApply := &storage.Task{
+		ID: 93, ApplyID: 999, TaskIdentifier: "task-other-apply",
+		Database: "testdb", Namespace: "testdb", TableName: "shipments",
+		State: state.Task.Stopped, UpdatedAt: time.Now(),
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{resting, done, otherApply}, &controlCaptureEngine{})
+
+	_, startedCount, skippedCount, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), startedCount, "only the resting table is resumed")
+	assert.Equal(t, int64(1), skippedCount, "the finished table is reported as skipped, not silently dropped")
+}
+
+// Every task of the apply already finished, so there is nothing to resume — but
+// that is a completed change, not a missing one, and the refusal must say which.
+func TestLocalClient_StartDistinguishesAFinishedApplyFromAMissingOne(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Completed, time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, _, _, err := client.resolveStartRequest(t.Context(),
+		&ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already reached a terminal state")
+	assert.NotContains(t, err.Error(), "state start cannot act on")
 }
