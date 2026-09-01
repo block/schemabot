@@ -183,7 +183,6 @@ func (h *Handler) appScopedApplyCore(parent context.Context, repo string, pr int
 	h.postComment(repo, pr, installationID, templates.RenderAppScopedDispatch(templates.AppScopedDispatchData{
 		App:         app,
 		Environment: environment,
-		CommandName: commandName,
 		RequestedBy: requestedBy,
 		PinnedSHA:   pinnedSHA,
 		Databases:   expansion.databases,

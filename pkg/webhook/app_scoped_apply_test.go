@@ -269,10 +269,9 @@ func TestAppScopedApplyDispatchSummaryListsTargetsAndSkips(t *testing.T) {
 	assert.Contains(t, err.Error(), "tenants-shard-01")
 
 	body := requireComment(t, comments, "dispatch summary")
-	assert.Contains(t, body, "App-Scoped Apply")
-	assert.Contains(t, body, "**App**: `tenants`")
-	assert.Contains(t, body, "is applying to **1** database")
-	assert.Contains(t, body, "**Commit**: `abc123`")
+	assert.Contains(t, body, "Schema Change Status — Staging")
+	assert.Contains(t, body, "**App**: `tenants` | **Commit**: `abc123`")
+	assert.Contains(t, body, "Applying to **1** database")
 	assert.Contains(t, body, "- `tenants-shard-01`")
 	assert.Contains(t, body, "**Skipped** (2):")
 	assert.Contains(t, body, "- `tenants-shard-02` — environment `staging` is not configured")
@@ -335,7 +334,7 @@ func TestAppScopedApplyHaltsWhenHeadAdvancesMidDispatch(t *testing.T) {
 	assert.NotContains(t, err.Error(), "tenants-shard-02", "the halted database was never dispatched")
 
 	summary := requireComment(t, comments, "dispatch summary")
-	assert.Contains(t, summary, "App-Scoped Apply")
+	assert.Contains(t, summary, "Schema Change Status — Staging")
 	halt := requireComment(t, comments, "dispatch halt")
 	assert.Contains(t, halt, "App-Scoped Dispatch Halted")
 	assert.Contains(t, halt, "`abc123`")
