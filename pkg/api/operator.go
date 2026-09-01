@@ -610,6 +610,14 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 //
 // The shutdown test is the driver context rather than the error, so a
 // cancellation that did not come from shutdown still reports as a real failure.
+//
+// The shutdown branch logs at Debug, not Warn, because every deploy cancels
+// every rung of every driver mid-ladder — any louder level rebuilds the noise
+// floor this split exists to remove. The cost is that a failure which
+// manifests only under shutdown leaves no default-level trace; a genuine,
+// persisting failure is not that case, because the successor's claim replays
+// it on a live context and reports it at Error with the counter. Chasing the
+// shutdown-only class means enabling Debug, not promoting this branch.
 func (s *Service) logClaimFailure(ctx context.Context, msg, reason string, attrs ...any) {
 	if ctx.Err() != nil {
 		s.logger.Debug(msg+"; the operator is shutting down and a successor driver will retry the claim", attrs...)
